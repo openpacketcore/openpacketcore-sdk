@@ -6,19 +6,24 @@ claim completion of the downstream ePDG #181 production SLO.
 
 The persistent revision-2 qualification contract is recorded in v7. The
 published v6 profile remains the unchanged revision-1 contract. This evidence
-qualifies `PersistentSessionConsumerClient` as the required warm fixed-pool
-primitive for #695/ePDG latency. Production deployments requiring warm reuse
-should use it. `StatelessSessionConsumerClient` remains a public,
+exercises `PersistentSessionConsumerClient` as a warm fixed-pool primitive; it
+does not qualify #695 production latency. `StatelessSessionConsumerClient`
+remains a public,
 source-compatible production/compatibility fresh-authentication typed
 least-authority surface required by #649, #688, and #691; it is neither hidden,
 deprecated, nor test-only.
 
-A stateless clone lineage shares a fail-fast physical-admission cap of 16
-request connections. The retained 16 Watch transport permits are deliberately
-unavailable to typed tenant/NF consumer calls: `open_watch` rejects locally
-with stable `Unsupported` before resolution, TCP, TLS, or cursor exposure.
-Independent stateless constructors define independent logical clients, as
-independent persistent constructors do.
+A stateless clone lineage has family-specific fail-fast caps: 16 `/1`-family
+permits shared by general `/1` and an opted-in protected-roster `/3` clone, and
+an independent 16 ordinary-fenced `/2` permits (32 request permits in total),
+plus a separate 16-watch cap. Ordinary persistent `/1` and `/2` pools share one
+aggregate width and may reclaim an idle opposite-protocol lane. A protected
+`/3` pool is constructed from the opted-in roster stateless profile, cannot
+relabel an ordinary retained lane, and admits only protected-roster operations;
+it does not enable ordinary `/1` or `/2` operations. Typed tenant/NF
+`open_watch` remains locally `Unsupported` before resolution, TCP, TLS, or
+cursor exposure. Independent stateless constructors define independent logical
+clients, as independent persistent constructors do.
 
 ## Current-main successor audit (2026-08-22)
 
@@ -48,9 +53,8 @@ superseded_setup_drops_losing_io_before_releasing_reconnect_lane
   required serialized admission only after the losing I/O future was destroyed
 ```
 
-The causal correction is consumer transport revision 5. It retains the
-tenant-scoped mTLS/SPIFFE/ALPN/Hello authority and all fixed resource bounds,
-while adding five generic guarantees:
+The causal correction retains tenant-scoped mTLS/SPIFFE/ALPN/Hello authority
+and all fixed resource bounds, while adding five generic guarantees:
 
 - explicit prewarm rolls every configured lane through a fresh
   resolver/TCP/TLS/Hello exchange and preserves refreshed plus unprocessed
@@ -71,14 +75,63 @@ while adding five generic guarantees:
   lower write, while adapter-only plaintext buffering over zero lower writes
   remains exactly `NotTransmitted`.
 
-The tracked v8 exact-head evidence schema now binds transport revision 6. It
-continues to require `experimental=true` and
-`qualification_complete=false`; it is a structural wire-binding schema, not a
-production qualification certificate. No new latency samples were collected
-for this successor, no shared-host latency gate was launched, and no cluster or
-ePDG state was changed. The bounded raw distribution below remains the earlier
-historical synthetic loopback observation and is not used as closure evidence
-or as a production/ePDG SLO claim.
+The frozen v8 exact-head schema binds the historical general `/1` transport
+revision 5, digest
+`sha256:5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd`.
+The current v9 schema binds `/1` transport revision 6 and application revision
+4, digest
+`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
+The ordinary fenced `/2` wire remains revision 5 and the protected-roster `/3`
+wire is independently revision 5; general `/1` is revision 6. When roster
+support is enabled, the listener deliberately advertises all three consumer
+ALPNs concurrently: `opc-session-consumer/1`, `/2`, and `/3`. This is not a
+coordinated no-coexistence cutover. Voter-to-voter consensus remains
+`opc-session-consensus/2` at revision 5.
+
+V9 is an exact-head evidence schema, not a latency, ePDG, or production-SLO
+claim. A generated V9 record is `experimental:true`; it is
+`qualification_complete:true` only after the complete external gate has
+succeeded and all strict artifacts validate. This document records the
+procedure, not a preclaimed result.
+
+The closed V9 contract binds more than source provenance and artifact digests.
+It records the canonical absolute testkit `CARGO_TARGET_DIR`, the canonical
+absolute external V9 evidence root, the canonical owner-private fs-verity
+snapshot base, and the pair directory derived from the evidence root; each raw
+path has its own domain-separated commitment. The snapshot base additionally
+commits its descriptor-captured device/inode so a same-path replacement cannot
+reuse the release identity. It separately
+records the exact normalized absolute Cargo invocation alias (for example, a
+rustup-managed `.../cargo`), the canonical backing executable path resolved
+from that alias, and a SHA-256 commitment to that backing file's content. The
+alias, not the backing path, is the process `argv[0]`, followed by the 14
+canonical tail arguments. The normalized recorded vector has exactly 15
+elements and begins `cargo`; the POSIX-escaped, environment-prefixed
+reproduction command executes the alias. The V1/V9 pair keeps the unchanged
+two exact leaves, `batch-release-gate-v1.json` and
+`persistent-consumer-v9.json`.
+
+Its symmetric pair run-ID uses domain
+`opc-session-ha-persistent-consumer-v9-pair-run/v4\0`. It binds canonical V1,
+the existing provenance/invocation fields, and a canonical full V9 claims
+preimage in which only `invocation.run_id_sha256` is replaced with
+`sha256:` plus 64 zeroes. It therefore does not hash the final,
+self-containing V9 bytes. The command digest orders backing path, alias,
+backing-content SHA-256, executable mode as unsigned 16-bit big-endian, then
+argv. Run-ID v4 binds 20 ordered provenance strings: the prior 16 ending
+alias, backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`,
+plus the fs-verity snapshot-base path, commitment, device, and inode. It then
+binds the u16-BE executable mode, followed by the existing
+V1/V9/argv/recipe/canonical-V1/claims-preimage material. Neither leaf can be
+transferred to a different qualifying pair.
+
+The `/3` pool is rebound to a readiness-proven live quorum leader after each
+recorded loss and restart. Its foreign-tenant bracket requires exactly three
+endpoint/authority observations, one from every voter, each returning the
+non-oracular typed `Unavailable`. For retained receipt recovery, only
+`NotFound` and backend `Unavailable` remain retryable; a typed rejection,
+authorization/scope/protocol failure, or durable negative receipt is terminal
+for that exact request body.
 
 The current-main successor's bounded GREEN gates were run with all
 `opc-session-net` features on 2026-08-22:
@@ -103,6 +156,154 @@ and fixed request/physical-admission bounds. They are
 correctness evidence;
 they do not replace the still-required production three-voter network latency
 qualification.
+
+## External exact-head release procedure
+
+This is a local SDK qualification procedure, never an ePDG execution or a
+latency/SLO claim. Use one clean, signed, committed exact-HEAD checkout. Before
+starting, verify the release signature with the approved keyring, require no
+`MERGE_HEAD`, and require empty staged, modified, untracked, ignored, and
+submodule state. The wrapper captures this one strict provenance before build
+and rechecks it before publication; the V1/V9 pair and store artifact must
+bind that same exact provenance rather than mixed qualifying runs.
+
+The host must remain quiet from lease acquisition through evidence completion:
+there may be functional tests elsewhere, but no competing Cargo or `rustc` job
+may run while this release/latency gate runs. The fixed Git, build, and release
+deadlines are correctness boundaries, not latency relaxations. Do not increase
+them or use a busy-host observation as a performance claim.
+
+Prepare absolute canonical external paths. The SDK worktree, actual
+linked-worktree gitdir, common gitdir, testkit Cargo target, V9 evidence root,
+wrapper Cargo target, attestation namespace, store-evidence namespace, lease
+leaf, and fs-verity snapshot base must be pairwise disjoint; the V9 pair child
+is contained only by its V9 evidence root. One canonical owner-private (mode
+`0700`) external fs-verity snapshot base may be shared as a parent authority by
+the V9 producer and wrapper, but each creates and descriptor-pins its own fresh
+private direct child below that base. Neither producer uses the base itself as
+an actual snapshot namespace.
+The base must support the fixed fs-verity profile. The testkit and wrapper
+Cargo targets, V9 ordinary workspace, and store `tempfile` workspace must be
+on filesystems distinct from the snapshot base, so build, SQLite, WAL, socket,
+and general scratch I/O remain ordinary. The wrapper target, attestation
+namespace, and store-evidence namespace must each be absent and external; no
+unpassed wrapper work-root exists. Provision an owner-private external V9 evidence root
+whose
+`session-ha-persistent-consumer-v9` child is absent; it will become the exact
+two-leaf pair. Creating `target/`, evidence, a lease, temporary fs-verity
+data, or logs inside the source tree poisons the clean-source gate.
+
+First produce the V9 pair in that owner-private root. The environment prefixes
+are part of the invocation environment, not Cargo argv; retain the following
+Cargo arguments exactly:
+
+```text
+CARGO_TARGET_DIR=/external/testkit-target OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY=/external/testkit-v9-root OPC_FS_VERITY_QUALIFICATION=required OPC_FS_VERITY_SNAPSHOT_ROOT=/external/testkit-fsverity-snapshots cargo test --locked --release -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_persistent_v2_batch_release_gate -- --ignored --exact --test-threads=1 --nocapture
+```
+
+Here `cargo` is the illustrative command token; an actual closed record binds
+and replays its exact absolute Cargo invocation alias as `argv[0]`.
+
+Only a complete gate publishes the no-clobber
+`/external/testkit-v9-root/session-ha-persistent-consumer-v9` namespace with
+exactly `persistent-consumer-v9.json` and `batch-release-gate-v1.json`. Its
+compact V2 record and V9 record are accepted only after typed and full-schema
+validation of canonical bytes. V9 is `experimental:true` and is
+`qualification_complete:true` only after this full gate. The pair is the
+external prerequisite for the wrapper; it is never inferred from stdout,
+stderr, or an `eprintln!` line.
+
+The V9 record's reproduction field is stricter than the display recipe: it is
+the POSIX-escaped command with `CARGO=<absolute-cargo-alias>`, the canonical
+target, evidence-root, required fs-verity marker, and snapshot-root environment
+prefixes, and that same absolute Cargo alias followed by the 14 canonical tail
+arguments; its normalized recorded vector has 15 elements beginning `cargo`.
+It does not execute the canonical
+backing path. The rendering uses
+standard POSIX single-quote escaping, while every bound path rejects control
+characters and NUL. Consumers recompute it rather than accepting a look-alike
+shell command. This documents only the exact quoting regression; it makes no
+general shell-injection claim.
+
+Then run only this released recipe, with an absolute trusted Cargo invocation
+alias (the illustrative placeholder below is the executable to invoke, not a
+claim that its canonical backing path is invoked):
+
+```text
+OPC_FS_VERITY_QUALIFICATION=required OPC_FS_VERITY_SNAPSHOT_ROOT=/external/testkit-fsverity-snapshots /usr/bin/python3 ci/sdk702-release-attest.py --cargo /absolute/trusted/cargo --target-dir /absent/external/wrapper-target --snapshot-root /external/testkit-fsverity-snapshots --attestation-namespace /absent/external/attestation --evidence /absent/external/store-evidence --process-loss-evidence /external/testkit-v9-root/session-ha-persistent-consumer-v9/persistent-consumer-v9.json --lease /external/lease/sdk702.lock
+```
+
+The wrapper consumes that exact V1/V9 pair while creating and pinning a fresh
+external wrapper target distinct from the producer's testkit target. Its
+required canonical `--snapshot-root` must byte-match the ambient
+`OPC_FS_VERITY_SNAPSHOT_ROOT`, and the ambient
+`OPC_FS_VERITY_QUALIFICATION=required` marker is mandatory. It sets only its
+canonical absolute `CARGO_TARGET_DIR` for the build, then creates, pins, and
+gives the release child only a fresh deterministic direct child of that
+explicit fs-verity root. The release fixture keeps its ordinary
+`tempfile` database, WAL, and general scratch paths untouched and routes only
+fixed-quorum snapshots through that wrapper-owned root. It builds the exact
+release test there, writes a create-new fsynced build attestation, and executes
+the pinned test descriptor directly. It deliberately handles libtest
+`--nocapture` itself;
+there is no obsolete Cargo-output or `eprintln!` extraction path. The store
+gate atomically create-new writes and fsyncs canonical V1 evidence plus its
+accepted marker in the absent external evidence namespace only after all
+assertions, graceful shutdown, provenance rechecks, and typed/schema/canonical
+validation; only then is its `qualification_complete:true` meaningful. Preserve
+its generated artifacts, wrapper output, raw logs, SHA-256 digests, and exit
+status without clobbering any existing path.
+
+V9 deliberately calls `TempDir::keep()` for each random fs-verity campaign
+child, and the wrapper preserves its create-new target and deterministic
+snapshot child on both success and failure. This prevents an identity-failure
+unwind from recursively deleting a replacement pathname. Cleanup is deferred
+to trusted loop teardown or operator action only after descriptors and child
+processes have closed. Each wrapper rerun therefore needs a fresh target and
+the 4G loop can accumulate preserved snapshot children.
+
+The lease is also a pinned-inode contract, not a pathname lock. The Python
+wrapper retains the exact nofollow private lease inode through
+`/proc/<wrapper-pid>/fd/<fd>` for the direct test child's lifetime, without
+passing the raw descriptor to that child. Rust opens and exclusively locks that
+exact procfd inode, then revalidates the procfd, parent, name, and canonical
+path before evidence-namespace `mkdir`, before publication, and at completion.
+Those checks close the A-to-B replacement/split-lock seam; they do not grant
+authority over unrelated processes or files.
+
+Validate the generated store artifact with the strict existing-artifact
+validator, not an ad-hoc parser:
+
+```text
+OPC_QUAL_EVIDENCE_VALIDATE=/absolute/external/store-evidence CARGO_TARGET_DIR=/absolute/external/wrapper-target cargo test --locked -p opc-session-store --release --test fenced_transition_v2_qualification -- --ignored --exact validate_existing_release_evidence_artifact --nocapture
+```
+
+Its separately causal ambiguity witness is acknowledged after durable execution
+and held past that caller's bounded deadline before pressure starts. The batch
+therefore records five held/released responses in all (one causal and four
+pressure), twelve status-only ambiguous IDs, and the pressure arithmetic of
+four held lanes, sixty-four queued callers, and the typed sixty-ninth
+rejection.
+
+The batch record separates normal listener headroom from its bounded capacity
+probe: all three listeners prove a seventeenth projected-mTLS/Hello status
+connection while the sixteen normal lanes stay open. One named listener then
+fills the remaining three admissions (high-water exactly 20), records exactly
+zero admission waits and one typed twenty-first rejection from process-local
+listener counters, and closes every probe back to sixteen active normal lanes.
+Immediately before and after that probe, every retained normal lane performs a
+status read and its pool setup/reconnect/active/idle counters are unchanged;
+this rules out eviction or replacement. The capacity-phase high-water is
+therefore not misreported as ordinary headroom.
+
+Snapshot cleanup/restart evidence has an explicitly limited threat model:
+the snapshot directory is a private SDK-owned namespace with cooperative SDK
+writers only. Within that contract, the retained descriptor, serialized
+namespace lease, bounded survivor capacity, and reclaim behavior support the
+claimed cleanup/restart bounds. They do not protect against arbitrary same-UID
+namespace forgery, exact-grammar but non-admitted files, or substitution after
+final pathname/identity authentication. Do not extend the bounded-capacity or
+reclaim claim beyond that cooperative namespace contract.
 
 The historical protocol count above predates the #719 global-cursor
 contraction. It is not current Watch evidence: those wire fixtures are
@@ -234,5 +435,12 @@ on 2026-08-17; elapsed time is only a fixture guard, not a widened production
 timeout or an SLO claim:
 
 ```text
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_boundaries expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call -- --exact --test-threads=1
+cargo test --locked -p opc-session-net --test persistent_consumer_boundaries expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call -- --exact --test-threads=1
 ```
+
+### Downstream handoff
+
+The only downstream ePDG handoff is the externally recorded SDK provenance,
+attestation, V9 pair, and accepted store evidence for independent downstream
+review. It does not authorize an ePDG call path, configuration, cluster
+operation, readiness decision, timeout change, or performance/SLO claim.

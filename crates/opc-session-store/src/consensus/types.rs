@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use opc_consensus::engine::LogId;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -2136,6 +2137,66 @@ pub enum SessionMutationIntent {
         /// Digest of [`crate::fenced_mutation_roster::Profile::v2`].
         profile_digest: [u8; 32],
     },
+    /// Versioned operator-recovery finalization intent. The original
+    /// `FinalizeOperatorRecovery` remains decode-only so every previously
+    /// published Postcard discriminant stays stable; this terminal enum
+    /// variant is the only intent new recovery campaigns may propose.
+    ///
+    /// This is deliberately appended after the already-published
+    /// absent-predecessor roster V2 intents. The boxed payload keeps this
+    /// capability from increasing the size of every existing in-process
+    /// proposal envelope. Serde/Postcard serializes a `Box<T>` as `T`, so it
+    /// does not alter the terminal variant's durable field sequence.
+    #[doc(hidden)]
+    FinalizeOperatorRecoveryV2(Box<FinalizeOperatorRecoveryV2Intent>),
+}
+
+/// Exact, self-contained precondition and effect request for the appended
+/// operator-recovery V2 terminal intent. This lives outside the historical
+/// enum so the enum can remain compact while all old Postcard discriminants
+/// and payload layouts stay untouched.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeOperatorRecoveryV2Intent {
+    /// Monotonic operator recovery epoch.
+    pub recovery_epoch: u64,
+    /// Digest of the exact inspected and confirmed recovery plan.
+    pub plan_digest: [u8; 32],
+    /// Highest fence observed across every inspected replica.
+    pub fence_high_water: u64,
+    /// Highest credential ID observed across every inspected replica.
+    pub credential_high_water: u64,
+    /// Exact global application sequence high-water selected by the plan.
+    pub application_sequence_high_water: u64,
+    /// Exact global watch/invalidated-cursor floor selected by the plan.
+    pub watch_cursor_invalidation_floor: u64,
+    /// Exact completed recovery epoch sealed in the selected source predecessor.
+    pub predecessor_recovery_epoch: u64,
+    /// Exact completed plan digest for that predecessor epoch.
+    pub predecessor_plan_digest: [u8; 32],
+    /// Exact predecessor durable watch invalidation floor.
+    pub predecessor_watch_cursor_invalidation_floor: u64,
+    /// Exact fully applied Raft predecessor from which this recovery command may advance.
+    pub predecessor_baseline_log_id: LogId<SessionConsensusNodeId>,
+    /// Exact source machine application sequence before recovery staging.
+    pub predecessor_application_sequence: u64,
+    /// Exact source state-machine digest before recovery staging.
+    pub predecessor_last_digest: [u8; 32],
+    /// Exact source logical time before recovery staging.
+    pub predecessor_logical_time: Option<opc_types::Timestamp>,
+    /// Exact source replication/watch sequence before recovery staging.
+    pub predecessor_watch_sequence: u64,
+    /// Commitment of exact identity/membership/authority/roster predecessor state.
+    pub predecessor_authority_commitment: [u8; 32],
+    /// Commitment of every predecessor logical-state byte which V2 must not
+    /// mutate.  It excludes only lease activation and the two allocator
+    /// values whose exact V2 postconditions are checked separately.
+    pub predecessor_recovery_v2_invariant_state_digest: [u8; 32],
+    /// Exact canonical payload digest of a retained Membership entry at
+    /// `predecessor_baseline_log_id`. It is required for both current and
+    /// legacy predecessors whenever that exact physical baseline is a
+    /// Membership row; `None` is reserved for a proven non-Membership or
+    /// snapshot/purge-covered baseline.
+    pub predecessor_bootstrap_membership_digest: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -5125,6 +5186,47 @@ pub(crate) mod tests {
                 .expect("protected roster profile preflight intent")[0],
             26
         );
+        for predecessor_bootstrap_membership_digest in [None, Some([0x83; 32])] {
+            let recovery_v2 = SessionMutationIntent::FinalizeOperatorRecoveryV2(Box::new(
+                FinalizeOperatorRecoveryV2Intent {
+                    recovery_epoch: 1,
+                    plan_digest: [0x71; 32],
+                    fence_high_water: 4,
+                    credential_high_water: 5,
+                    application_sequence_high_water: 6,
+                    watch_cursor_invalidation_floor: 7,
+                    predecessor_recovery_epoch: 0,
+                    predecessor_plan_digest: [0; 32],
+                    predecessor_watch_cursor_invalidation_floor: 0,
+                    predecessor_baseline_log_id: LogId::new(
+                        opc_consensus::engine::CommittedLeaderId::new(
+                            1,
+                            SessionConsensusNodeId::new(7).expect("recovery V2 node"),
+                        ),
+                        0,
+                    ),
+                    predecessor_application_sequence: 0,
+                    predecessor_last_digest: [0; 32],
+                    predecessor_logical_time: None,
+                    predecessor_watch_sequence: 0,
+                    predecessor_authority_commitment: [0x81; 32],
+                    predecessor_recovery_v2_invariant_state_digest: [0x82; 32],
+                    predecessor_bootstrap_membership_digest,
+                },
+            ));
+            let encoded = postcard::to_allocvec(&recovery_v2)
+                .expect("appended recovery V2 intent postcard encoding");
+            assert_eq!(
+                encoded[0], 31,
+                "recovery V2 is appended after every already-published roster V2 intent"
+            );
+            assert_eq!(
+                postcard::from_bytes::<SessionMutationIntent>(&encoded)
+                    .expect("appended recovery V2 intent postcard decoding"),
+                recovery_v2,
+                "the explicit legacy bootstrap option round-trips exactly"
+            );
+        }
         assert_eq!(
             postcard::to_allocvec(&SessionMutationIntent::RosterAdmissionV2(Box::new(
                 admission_command.clone()

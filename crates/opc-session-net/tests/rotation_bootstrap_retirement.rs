@@ -561,7 +561,7 @@ async fn consensus_client_defers_authenticated_bootstrap_retirement_to_later_cal
     assert_eq!(
         peer.call(request.clone()).await,
         Err(SessionConsensusPeerError::Unavailable),
-        "the immediate same-epoch call is negative-admission only"
+        "the immediate same-epoch call cannot reach the fixed boundary and remains promptly NotTransmitted"
     );
     assert_eq!(
         MetricSnapshot::capture().since(before).attempts,

@@ -166,11 +166,15 @@ cap of 128 rather than that planning estimate.
 
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
-The exact consensus contract is transport/wire-schema revision 4 and error-set
-revision 6. Revision 4 makes the forwarded consumer scope explicit, so a peer
-cannot silently downgrade a consumer-scoped operation to an internal call;
-error revision 6 binds that semantic boundary into the exact profile. Revision
-3/error revision 5 or older peers fail before dispatch;
+The exact consensus contract is transport/wire-schema revision 5, application
+revision 4, and error-set revision 6. The revision-5 transport profile retains
+the explicit forwarded consumer scope, so a peer cannot silently downgrade a
+consumer-scoped operation to an internal call; application revision 4 also
+fences the former 728bc5 application-revision-3 Postcard tag-27
+`FinalizeOperatorRecoveryV2` encoding, which conflicts with the merged roster
+profile's tags 27 through 30. Error revision 6 binds that semantic boundary
+into the exact profile. Any other transport, application, or error-set revision
+fails before dispatch;
 upgrade every consensus member together while traffic and writers are drained.
 This is not a rolling mixed-profile transition.
 
@@ -245,13 +249,13 @@ and compatibility fresh-authentication typed least-authority surface required by
 #649, #688, and #691; it is neither hidden, deprecated, nor test-only.
 `PersistentSessionConsumerClient` with `SessionQuorumConsumerServer` is the
 required warm fixed-pool primitive for #695/ePDG latency. Production deployments
-that require warm reuse should use it. Both use mutual TLS with the unchanged
-`opc-session-consumer/1` ALPN and exact consumer transport revision 5 for the
-existing V1 family. Earlier V1 revisions will not fall back or interoperate.
-The unreleased V1 SDK requires one coordinated, drained client/listener cutover;
-there is no V1 dual mode. Revision-4 features remain present, while revision-5
-private JSON DTO bytes are canonical; reordered or otherwise noncanonical
-encodings, aliases, omissions, and unknown fields fail closed.
+that require warm reuse should use it. The general family uses mutual TLS with
+the unchanged `opc-session-consumer/1` ALPN and exact consumer transport
+revision 6. Earlier general revisions will not fall back or interoperate. The
+unreleased general SDK requires one coordinated, drained client/listener
+cutover; there is no general-lane dual mode. Its private JSON DTO bytes are
+canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
+and unknown fields fail closed.
 
 The additive V2 epoch-fenced-transition family uses only
 `opc-session-consumer/2` with transport revision 5. A V2 offer never falls back
@@ -263,6 +267,13 @@ listener and client; the server rejects every other V2 revision before dispatch,
 and a V1-only peer fails before V2 dispatch. Deploy listener support and any
 required V2 store/journal provisioning before enabling the explicit V2 API,
 then drain V2 callers before removing it.
+
+The separately authorized protected-roster family uses only
+`opc-session-consumer/3` with transport revision 5. When roster ingress is
+enabled, the listener advertises `/3` before `/2` and `/1`; a client offers
+exactly one ALPN. `/3` accepts only its roster operation set and exact
+tenant/scope/fence authority, never shares a lane or fallback path with `/1`
+or `/2`, and is excluded from `/2` capacity accounting and idle reclaim.
 
 This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
@@ -298,13 +309,21 @@ ordinary admission; exact replay and status return it as a closed
 restore effect. Frozen legacy session-net v5 maps it fail-closed as an unknown
 capability without a wire-enum change.
 
-Each request connection carries a nonzero, monotonically increasing
-connection-local `u32` sequence with no wrap plus a fresh unpredictable UUID
-nonce. The request is serialized before that complete correlation, the server
-admits the exact next sequence, and the client accepts only the exact composite
-value. A lane retires after at most 4,096 sequential calls and admits only one
+Each V2 request connection carries a nonzero, monotonically increasing
+connection-local `u32` sequence with no wrap, a fresh full-width 128-bit
+OS-CSPRNG nonce, and the fixed 32-byte request commitment. That commitment is
+SHA-256 of `opc-session-consumer-v2-call-phase`, the big-endian `/2` revision
+5, and the exact serialized V2 request bytes. The server admits the exact next
+sequence, and the client accepts only the exact composite response tuple. A V2
+lane retires after at most 4,096 sequential calls and admits only one
 in-flight call: no multiplexing is permitted, because cancellation,
 pre-staged/late-response isolation, and write-position ambiguity are structural.
+The `/2` HelloAck request-frame ceiling is independently bounded: every
+nonzero value through the fixed 16 MiB ceiling is valid, and the exact bounded
+encoder rejects an oversized Call before writing its length prefix. The
+response-frame capacity retains the larger fixed minimum needed for bounded
+batch results.
+
 The fair request pool defaults to four connections, allows at most
 16 configured connections, and bounds pending calls to 64 by default and 256
 absolutely; queue wait/age is at most 250 ms. The retained Watch transport has
@@ -312,13 +331,16 @@ two reserved slots by default and at most 16 configured slots, but the public
 tenant/NF consumer Watch does not acquire them while its global cursor remains
 unsupported.
 
-`PersistentSessionConsumerClient` keeps an additional, independent fixed V2
-request pool of the same configured width. `prewarm_v2` establishes those
-revision-5 lanes without a V2 operation, `execute_v2` uses only a V2 lane, and
+`PersistentSessionConsumerClient` keeps an ALPN-specific V2 idle pool.
+V1 and V2 share one configured request width, pending queue, and prewarm gate;
+`prewarm_v2` establishes those revision-5 lanes within that aggregate width
+without a V2 operation, `execute_v2` uses only a V2 lane, and
 `v2_diagnostics` reports only that pool's redaction-safe counters. Each V1 or
-V2 lane still permits one in-flight request. Their queues and sockets are never
-cross-reused, but both pools share a bounded physical request-admission ceiling
-sized so their legal V1 and V2 widths can coexist. This preserves least
+V2 lane still permits one in-flight request. Their authenticated idle sockets
+are never cross-reused; lane and pending-call admission is aggregate. At the
+aggregate physical ceiling, a requested protocol
+may retire an opposite-protocol idle lane (never active work or V2 poison debt)
+and rebalance within the existing setup deadline. This preserves least
 authority without adding per-subscriber connections, tasks, channels, or pools.
 DNS resolution, TCP, TLS, and the authenticated Hello occur only while
 establishing or re-establishing that lane, never while reusing an established
@@ -331,7 +353,8 @@ Authenticated unsolicited plaintext creates bounded, front-priority protocol
 debt. That debt survives reaping and prewarm, never counts as an authenticated
 lane or ready capacity, and the next logical checkout consumes it as
 `NotTransmitted` before selecting, reconnecting, or writing on a lane; prewarm
-independently restores the configured physical lane width.
+restores the configured aggregate physical lane width without doubling it
+across ALPNs.
 
 An establishment has a 1,500 ms setup limit and a call makes at most two
 pre-write attempts. Resolution occurs only when establishing or
@@ -356,10 +379,12 @@ digest used only to compute bounded jitter; neither identities nor digest bytes
 enter diagnostics. A rejected same-epoch material publication retains the
 authenticated lane.
 
-One stateless client lineage shares a bounded physical-admission ceiling across
-its clones: request admission is sized for the legal simultaneous fixed V1 and
-V2 persistent widths, and watch admission remains capped at 16. The permits are
-acquired before resolve/TCP and remain held for the physical connection
+One stateless client lineage shares bounded physical admission across its
+clones. The V1 family, including protected-roster `/3`, has 16 request permits;
+ordinary V2 `/2` has an independent 16 request permits so either capability
+cannot starve the other. The lineage therefore admits at most 32 request
+connections, while watch admission remains separately capped at 16. Permits
+are acquired before resolve/TCP and remain held for the physical connection
 lifetime, including for persistent clients derived from that lineage.
 Independent stateless constructors create independent logical clients, as
 independent persistent constructors do. The typed persistent watch surface

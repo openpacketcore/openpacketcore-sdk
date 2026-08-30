@@ -69,6 +69,7 @@ QUIESCENT_INTEGRATION_TESTS = (
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
+    "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
     "persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running",
     "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
 )
@@ -81,6 +82,7 @@ OPTIMIZED_QUIESCENT_INTEGRATION_TESTS = frozenset(
     {
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
+        "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
         "persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running",
         "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
     }
@@ -93,7 +95,8 @@ if not OPTIMIZED_QUIESCENT_INTEGRATION_TESTS.issubset(QUIESCENT_INTEGRATION_TEST
 
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
-# (249 today).
+# (verify the live inventory with `test-shards.py verify`; keep this floor
+# deliberately below it).
 MIN_INTEGRATION_TARGETS = 240
 
 

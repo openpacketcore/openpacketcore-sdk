@@ -27,7 +27,6 @@ pub use network::{
 #[cfg(feature = "test-control")]
 #[doc(hidden)]
 pub use store::test_support;
-pub(crate) use store::OperatorRecoveryCommitError;
 #[cfg(any(test, feature = "test-control"))]
 #[doc(hidden)]
 pub use store::ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest;
@@ -40,6 +39,7 @@ pub use store::{
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,
 };
+pub(crate) use store::{OperatorRecoveryCommitError, OperatorRecoveryCommitRequest};
 
 pub use types::{
     SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,

@@ -44,6 +44,7 @@ use super::types::{
     validate_fenced_transition_v2_batch, ConsensusRosterAdmissionCommand,
     ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
     ConsensusRosterTerminalCommandV2, ConsensusRosterTerminalOutcome,
+    FinalizeOperatorRecoveryV2Intent,
 };
 use super::{
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
@@ -442,6 +443,16 @@ pub(crate) enum OperatorRecoveryCommitError {
     Unavailable,
 }
 
+/// One complete V2 recovery-finalization proposal. Keeping the request as an
+/// authenticated payload makes the call boundary mirror the replicated
+/// command and prevents the recovery API from growing an error-prone list of
+/// independent high-water and predecessor arguments.
+#[derive(Clone)]
+pub(crate) struct OperatorRecoveryCommitRequest {
+    pub(crate) request_id: SessionConsensusRequestId,
+    pub(crate) intent: FinalizeOperatorRecoveryV2Intent,
+}
+
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
@@ -719,6 +730,7 @@ impl fmt::Debug for ForwardMutationReply {
 enum ConsensusPeerCallFailure {
     BeforeTransmission,
     AfterTransmission,
+    AuthenticatedRejection(SessionConsensusPeerError),
 }
 
 /// Proven placement of a mutation relative to the leader proposal boundary.
@@ -820,6 +832,13 @@ enum FencedTransitionV2CapabilityReply {
         profile_digest: [u8; 32],
     },
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedTransitionV2CapabilityProbeOutcome {
+    Exact,
+    Unsupported,
+    Unavailable,
 }
 
 fn fenced_transition_v2_capability_probe_reply(
@@ -1007,6 +1026,20 @@ enum LinearizableBarrierFailure {
     Unavailable,
 }
 
+/// Recovery-gate result at a local readiness boundary.
+///
+/// This deliberately keeps immutable terminal proof failures separate from
+/// retryable backend unavailability.  Both deny traffic, but only the latter
+/// is a transient observation; a durable Active latch and corrupt terminal
+/// evidence require explicit recovery handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorRecoveryGate {
+    Clear,
+    Active,
+    Corrupt,
+    Unavailable,
+}
+
 /// Fixed-cardinality, redaction-safe diagnostic counters for one consensus
 /// store instance.
 ///
@@ -1085,6 +1118,10 @@ pub struct ConsensusStoreDiagnosticSnapshot {
     pub consensus_log_prune_busy_retries: u64,
     /// Permanent physical log-prune failures; the worker stops until reopen.
     pub consensus_log_prune_permanent_failures: u64,
+    /// Whether this fixed lane is permanently degraded until the store is
+    /// reopened. This has no identifying error detail.
+    #[serde(default)]
+    pub consensus_log_prune_degraded: bool,
     /// Physical consensus-log rows deleted by completed prune turns.
     pub consensus_log_prune_rows_deleted: u64,
     /// Encoded consensus-log bytes deleted by completed prune turns.
@@ -1231,6 +1268,7 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     consensus_log_prune_drained_turns: AtomicU64,
     consensus_log_prune_busy_retries: AtomicU64,
     consensus_log_prune_permanent_failures: AtomicU64,
+    consensus_log_prune_degraded: AtomicBool,
     consensus_log_prune_rows_deleted: AtomicU64,
     consensus_log_prune_encoded_bytes_deleted: AtomicU64,
     consensus_log_prune_backlog_turns: AtomicU64,
@@ -1519,6 +1557,13 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_sub(1, Ordering::Relaxed);
         self.consensus_log_prune_permanent_failures
             .fetch_add(1, Ordering::Relaxed);
+        self.consensus_log_prune_degraded
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn clear_consensus_log_prune_degraded(&self) {
+        self.consensus_log_prune_degraded
+            .store(false, Ordering::Release);
     }
 
     /// End an active physical-prune turn cancelled by store shutdown. This is
@@ -1611,6 +1656,7 @@ impl ConsensusStoreDiagnosticCounters {
             consensus_log_prune_permanent_failures: self
                 .consensus_log_prune_permanent_failures
                 .load(Ordering::Relaxed),
+            consensus_log_prune_degraded: self.consensus_log_prune_degraded.load(Ordering::Acquire),
             consensus_log_prune_rows_deleted: self
                 .consensus_log_prune_rows_deleted
                 .load(Ordering::Relaxed),
@@ -1743,6 +1789,13 @@ impl ConsensusStoreDiagnosticCounters {
 struct ConsensusSessionStoreInner {
     raft: SessionRaft,
     storage_shutdown: storage::ConsensusStorageShutdownObserver,
+    terminal_recovery_handoff_consumer: storage::LiveTerminalRecoveryHandoffConsumer,
+    #[cfg(test)]
+    terminal_recovery_gate_checks: AtomicU64,
+    #[cfg(test)]
+    remote_forward_authority_gate: Arc<RemoteForwardAuthorityGate>,
+    #[cfg(test)]
+    remote_forward_attempts: AtomicU64,
     raft_handler: SessionRaftRpcHandler,
     backend: SqliteSessionBackend,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
@@ -1856,6 +1909,112 @@ async fn await_consensus_session_store_shutdown(
                 }
             }
         }
+    }
+}
+
+/// Test-only causal seam at the authority revalidation which immediately
+/// precedes a remote forwarded mutation. It makes recovery-latch races
+/// reproducible without changing production scheduling or transport.
+#[cfg(test)]
+struct RemoteForwardAuthorityGate {
+    state: Mutex<RemoteForwardAuthorityGateState>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RemoteForwardAuthorityGateState {
+    armed: bool,
+    entered: bool,
+}
+
+#[cfg(test)]
+impl RemoteForwardAuthorityGate {
+    fn new() -> Self {
+        let (release, _) = tokio::sync::watch::channel(true);
+        Self {
+            state: Mutex::new(RemoteForwardAuthorityGateState::default()),
+            entered: tokio::sync::Notify::new(),
+            release,
+        }
+    }
+
+    fn arm(self: &Arc<Self>) -> RemoteForwardAuthorityHoldForTest {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state.armed,
+            "only one remote-forward authority hold may be armed"
+        );
+        state.armed = true;
+        state.entered = false;
+        self.release.send_replace(false);
+        RemoteForwardAuthorityHoldForTest {
+            gate: Arc::clone(self),
+        }
+    }
+
+    async fn wait_before_authority(&self) {
+        let mut release = self.release.subscribe();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.armed {
+                return;
+            }
+            state.entered = true;
+            self.entered.notify_waiters();
+        }
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entered
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        self.release.send_replace(true);
+    }
+}
+
+/// RAII release for a test-only remote forwarding authority hold.
+#[cfg(test)]
+struct RemoteForwardAuthorityHoldForTest {
+    gate: Arc<RemoteForwardAuthorityGate>,
+}
+
+#[cfg(test)]
+impl Drop for RemoteForwardAuthorityHoldForTest {
+    fn drop(&mut self) {
+        self.gate.release();
     }
 }
 
@@ -2024,9 +2183,17 @@ impl Drop for RaftShutdownHoldForTest {
 /// preserves the production proposal-admission lifetime while making the
 /// caller-visible receiver result deterministic.
 #[cfg(test)]
-#[derive(Clone, Copy)]
+#[derive(Default)]
+struct AcceptedClientWriteReceiverHoldForTest {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 enum AcceptedClientWriteReceiverTestOutcome {
     ForwardToLeader,
+    HoldUntilReleased(Arc<AcceptedClientWriteReceiverHoldForTest>),
 }
 
 /// One bounded status response awaiting a shared exact-scope acceptance read.
@@ -2993,6 +3160,8 @@ impl ConsensusSessionStore {
             .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let terminal_recovery_handoff_consumer =
+            log_store.live_terminal_recovery_handoff_consumer();
         let storage_shutdown = state_machine
             .shutdown_observer()
             .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
@@ -3062,6 +3231,13 @@ impl ConsensusSessionStore {
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
             storage_shutdown,
+            terminal_recovery_handoff_consumer,
+            #[cfg(test)]
+            terminal_recovery_gate_checks: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_forward_authority_gate: Arc::new(RemoteForwardAuthorityGate::new()),
+            #[cfg(test)]
+            remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -3215,6 +3391,8 @@ impl ConsensusSessionStore {
             .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let terminal_recovery_handoff_consumer =
+            log_store.live_terminal_recovery_handoff_consumer();
         let storage_shutdown = state_machine
             .shutdown_observer()
             .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
@@ -3270,6 +3448,13 @@ impl ConsensusSessionStore {
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
             storage_shutdown,
+            terminal_recovery_handoff_consumer,
+            #[cfg(test)]
+            terminal_recovery_gate_checks: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_forward_authority_gate: Arc::new(RemoteForwardAuthorityGate::new()),
+            #[cfg(test)]
+            remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -3360,6 +3545,13 @@ impl ConsensusSessionStore {
     #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
     fn hold_raft_shutdown_before_core_for_test(&self) -> RaftShutdownHoldForTest {
         install_raft_shutdown_gate_for_test(&self.inner)
+    }
+
+    /// Hold a test-only forwarding turn after it has selected a remote leader
+    /// and before it revalidates source-replica authority for transmission.
+    #[cfg(test)]
+    fn hold_remote_forward_before_authority_for_test(&self) -> RemoteForwardAuthorityHoldForTest {
+        self.inner.remote_forward_authority_gate.arm()
     }
 
     /// Reset the fixed proactive-checkpoint write cadence for an isolated VFS
@@ -4061,29 +4253,38 @@ impl ConsensusSessionStore {
             .copied()
             .filter(|member| *member != self.inner.local_node_id)
             .map(|member| async move {
-                self.call_peer::<_, FencedTransitionV2CapabilityReply>(
-                    member,
-                    SessionConsensusRpcFamily::ReadBarrier,
-                    &FencedTransitionV2CapabilityProbe {
-                        schema_version: FENCED_TRANSITION_SCHEMA_V2,
-                        profile_digest,
-                    },
-                    deadline,
-                )
-                .await
-            });
-        if futures_util::future::join_all(probes)
-            .await
-            .into_iter()
-            .any(|reply| {
-                !matches!(
-                    reply,
+                match self
+                    .call_peer::<_, FencedTransitionV2CapabilityReply>(
+                        member,
+                        SessionConsensusRpcFamily::ReadBarrier,
+                        &FencedTransitionV2CapabilityProbe {
+                            schema_version: FENCED_TRANSITION_SCHEMA_V2,
+                            profile_digest,
+                        },
+                        deadline,
+                    )
+                    .await
+                {
                     Ok(FencedTransitionV2CapabilityReply::V2 {
                         profile_digest: received,
-                    }) if received == profile_digest
-                )
-            })
-        {
+                    }) if received == profile_digest => {
+                        FencedTransitionV2CapabilityProbeOutcome::Exact
+                    }
+                    Ok(FencedTransitionV2CapabilityReply::V2 { .. })
+                    | Ok(FencedTransitionV2CapabilityReply::Unsupported) => {
+                        FencedTransitionV2CapabilityProbeOutcome::Unsupported
+                    }
+                    Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                        SessionConsensusPeerError::Protocol,
+                    )) => FencedTransitionV2CapabilityProbeOutcome::Unsupported,
+                    Err(_) => FencedTransitionV2CapabilityProbeOutcome::Unavailable,
+                }
+            });
+        let outcomes = futures_util::future::join_all(probes).await;
+        if outcomes.contains(&FencedTransitionV2CapabilityProbeOutcome::Unavailable) {
+            return Err(consensus_unavailable());
+        }
+        if outcomes.contains(&FencedTransitionV2CapabilityProbeOutcome::Unsupported) {
             return Err(unsupported_fenced_transition_v2());
         }
         if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
@@ -5397,6 +5598,35 @@ impl ConsensusSessionStore {
         &self.inner.bootstrap_members
     }
 
+    /// Acquire the live core's snapshot transaction for the complete
+    /// operator-recovery finalization transaction.
+    ///
+    /// The recovery manager obtains this before it pins the selected S1
+    /// artifact and retains it through Terminal(PendingHandoff) publication
+    /// and descriptor-bound consumption.  This prevents a live build/install
+    /// from publishing S2 between those irreversible boundaries.
+    pub(crate) async fn acquire_live_operator_recovery_terminal_handoff_gate(
+        &self,
+    ) -> Result<storage::LiveTerminalRecoveryHandoffGate, SessionConsensusStorageError> {
+        self.inner
+            .terminal_recovery_handoff_consumer
+            .acquire_gate()
+            .await
+    }
+
+    /// Consume a terminal recovery handoff while the recovery manager still
+    /// owns the gate returned by
+    /// [`Self::acquire_live_operator_recovery_terminal_handoff_gate`].
+    pub(crate) async fn consume_live_operator_recovery_terminal_handoff_with_gate(
+        &self,
+        gate: &storage::LiveTerminalRecoveryHandoffGate,
+    ) -> Result<(), SessionConsensusStorageError> {
+        self.inner
+            .terminal_recovery_handoff_consumer
+            .consume_with_gate(gate)
+            .await
+    }
+
     /// Static, fail-closed engine profile admitted from descriptor shape.
     ///
     /// Time-bound HA evidence cannot safely produce a static quorum claim, so
@@ -5597,25 +5827,66 @@ impl ConsensusSessionStore {
         }
     }
 
-    async fn operator_recovery_pending_before(
+    async fn operator_recovery_gate_before(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<bool, StoreError> {
+    ) -> OperatorRecoveryGate {
+        #[cfg(test)]
+        self.inner
+            .terminal_recovery_gate_checks
+            .fetch_add(1, Ordering::Relaxed);
+        // Do not preflight through the backend's pathname-only terminal
+        // classifier.  If recovery published S1 and a parent operator then
+        // replaces configured D1 with D2, that preflight could resolve D2
+        // before this retained consumer admits S1 through D1.  The live core
+        // classifier below carries the lease-opened descriptor instead.
         match tokio::time::timeout_at(
             deadline,
-            self.inner
-                .backend
-                .consensus_operator_recovery_pending(self.inner.storage_identity),
+            self.inner.terminal_recovery_handoff_consumer.reconcile(),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err(consensus_unavailable()),
+            Ok(Ok(storage::LiveTerminalRecoveryHandoffState::Active)) => {
+                OperatorRecoveryGate::Active
+            }
+            Ok(Ok(
+                storage::LiveTerminalRecoveryHandoffState::Clear
+                | storage::LiveTerminalRecoveryHandoffState::Consumed,
+            )) => OperatorRecoveryGate::Clear,
+            Ok(Err(SessionConsensusStorageError::BackendUnavailable)) | Err(_) => {
+                OperatorRecoveryGate::Unavailable
+            }
+            Ok(Err(_)) => OperatorRecoveryGate::Corrupt,
         }
     }
 
-    /// Revalidate every durable application-traffic authority immediately
-    /// before an ordinary result or proposal crosses its acceptance boundary.
+    /// Preserve Fixed's persistent authority checks at every historical
+    /// checkpoint while avoiding repeated Dynamic terminal-sidecar probes
+    /// inside one leader-owned proposal turn.
+    ///
+    /// Dynamic ingress performs a full recovery gate before transmission, and
+    /// `propose_on_local_leader` performs the full leader gate immediately
+    /// before enqueue. The topology operation guard spans the intermediate
+    /// checkpoints, so exact live membership is sufficient there. Pending
+    /// recovery may still exchange Raft/read-index traffic, while the final
+    /// gate prevents it from admitting an ordinary mutation.
+    async fn require_application_traffic_intermediate_authority_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
+            return self
+                .require_application_traffic_authority_before(deadline)
+                .await;
+        }
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await
+    }
+
+    /// Revalidate every durable application-traffic authority before an
+    /// ordinary operation can first transmit or a leader proposal crosses its
+    /// acceptance boundary. A validated committed reply uses the narrower
+    /// result policy above so known effect is never converted into ambiguity.
     /// Operator Recovery uses a separate explicitly authorized path.
     async fn require_application_traffic_authority_before(
         &self,
@@ -5647,9 +5918,11 @@ impl ConsensusSessionStore {
         }
         self.require_durable_fixed_quorum_admission_before(deadline)
             .await?;
-        match self.operator_recovery_pending_before(deadline).await {
-            Ok(false) => Ok(()),
-            Ok(true) | Err(_) => Err(consensus_unavailable()),
+        match self.operator_recovery_gate_before(deadline).await {
+            OperatorRecoveryGate::Clear => Ok(()),
+            OperatorRecoveryGate::Active
+            | OperatorRecoveryGate::Corrupt
+            | OperatorRecoveryGate::Unavailable => Err(consensus_unavailable()),
         }
     }
 
@@ -5811,21 +6084,33 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> DurableReadinessReport {
-        if let Some(report) = self.fatal_engine_readiness_report() {
+        if let Some(report) = self.local_authoritative_recovery_report() {
             return report;
         }
-        match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_record_is_exact())
-            .await
-        {
+        let scope_record =
+            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_record_is_exact())
+                .await;
+        if let Some(report) = self.local_authoritative_recovery_report() {
+            return report;
+        }
+        match scope_record {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => return self.topology_invalid_readiness_report(),
             Ok(Err(_)) | Err(_) => return self.unavailable_durable_readiness_report(),
         }
         let report = self.probe_durable_readiness_before(deadline).await;
+        if let Some(report) = self.local_authoritative_recovery_report() {
+            return report;
+        }
         if report.state() != DurableReadinessState::Ready {
             return report;
         }
-        match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await {
+        let exact_scope =
+            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await;
+        if let Some(report) = self.local_authoritative_recovery_report() {
+            return report;
+        }
+        match exact_scope {
             Ok(Ok(true)) => report,
             Ok(Ok(false)) => self.topology_invalid_readiness_report(),
             Ok(Err(_)) | Err(_) => self.unavailable_durable_readiness_report(),
@@ -5939,7 +6224,7 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> DurableReadinessReport {
-        if let Some(report) = self.fatal_engine_readiness_report() {
+        if let Some(report) = self.local_authoritative_recovery_report() {
             return report;
         }
         let configured = self.current_member_count().unwrap_or(0);
@@ -5968,31 +6253,26 @@ impl ConsensusSessionStore {
                 metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
-        let recovery_pending = match tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .backend
-                .consensus_operator_recovery_pending(self.inner.storage_identity),
-        )
-        .await
-        {
-            Ok(Ok(recovery_pending)) => recovery_pending,
-            Ok(Err(_)) | Err(_) => return self.unavailable_durable_readiness_report(),
-        };
-        if recovery_pending {
-            let metrics = self.inner.raft.metrics();
-            let metrics = metrics.borrow();
-            let recovery_progress = DurableRecoveryProgress::new(
-                DurableRecoveryState::RecoveryRequired,
-                metrics.last_log_index,
-                metrics.last_applied.as_ref().map(|log_id| log_id.index),
-                metrics.snapshot.as_ref().map(|log_id| log_id.index),
-                metrics.purged.as_ref().map(|log_id| log_id.index),
-            );
-            return report_without_barrier(
-                DurableReadinessState::RecoveryRequired,
-                recovery_progress,
-            );
+        match self.operator_recovery_gate_before(deadline).await {
+            OperatorRecoveryGate::Clear => {}
+            OperatorRecoveryGate::Active | OperatorRecoveryGate::Corrupt => {
+                let metrics = self.inner.raft.metrics();
+                let metrics = metrics.borrow();
+                let recovery_progress = DurableRecoveryProgress::new(
+                    DurableRecoveryState::RecoveryRequired,
+                    metrics.last_log_index,
+                    metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                    metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                    metrics.purged.as_ref().map(|log_id| log_id.index),
+                );
+                return report_without_barrier(
+                    DurableReadinessState::RecoveryRequired,
+                    recovery_progress,
+                );
+            }
+            OperatorRecoveryGate::Unavailable => {
+                return self.unavailable_durable_readiness_report();
+            }
         }
         if !self.exact_membership_is_admitted() {
             let progress = progress();
@@ -6306,7 +6586,7 @@ impl ConsensusSessionStore {
     /// quorum failure unless the local Openraft engine has already supplied
     /// authoritative fatal evidence.
     fn unavailable_durable_readiness_report(&self) -> DurableReadinessReport {
-        if let Some(report) = self.fatal_engine_readiness_report() {
+        if let Some(report) = self.local_authoritative_recovery_report() {
             return report;
         }
         let configured = self.current_member_count().unwrap_or(0);
@@ -6336,31 +6616,48 @@ impl ConsensusSessionStore {
     /// known recovery-required state cannot be downgraded to transient
     /// no-quorum.
     fn fatal_engine_readiness_report(&self) -> Option<DurableReadinessReport> {
-        let metrics = self.inner.raft.metrics();
-        let metrics = metrics.borrow();
-        if metrics.running_state.is_ok() {
+        if self.inner.raft.metrics().borrow().running_state.is_ok() {
             return None;
         }
+        Some(self.recovery_required_durable_readiness_report())
+    }
+
+    /// Return locally authoritative recovery evidence before classifying any
+    /// asynchronous durable observation. A permanent physical-prune failure
+    /// is store-scoped and cannot be downgraded to transient no-quorum or a
+    /// traffic grant merely because it became visible while that observation
+    /// was in flight.
+    fn local_authoritative_recovery_report(&self) -> Option<DurableReadinessReport> {
+        self.fatal_engine_readiness_report().or_else(|| {
+            self.inner
+                .consensus_log_prune_lane
+                .as_ref()
+                .is_some_and(|lane| lane.is_degraded())
+                .then(|| self.recovery_required_durable_readiness_report())
+        })
+    }
+
+    fn recovery_required_durable_readiness_report(&self) -> DurableReadinessReport {
         let configured = self.current_member_count().unwrap_or(0);
         let quorum = (configured / 2) + 1;
-        Some(
-            DurableReadinessReport::new(
-                DurableReadinessState::RecoveryRequired,
-                configured,
-                0,
-                0,
-                quorum,
-                None,
-                Vec::new(),
-            )
-            .with_recovery_progress(DurableRecoveryProgress::new(
-                DurableRecoveryState::RecoveryRequired,
-                metrics.last_log_index,
-                metrics.last_applied.as_ref().map(|log_id| log_id.index),
-                metrics.snapshot.as_ref().map(|log_id| log_id.index),
-                metrics.purged.as_ref().map(|log_id| log_id.index),
-            )),
+        let metrics = self.inner.raft.metrics();
+        let metrics = metrics.borrow();
+        DurableReadinessReport::new(
+            DurableReadinessState::RecoveryRequired,
+            configured,
+            0,
+            0,
+            quorum,
+            None,
+            Vec::new(),
         )
+        .with_recovery_progress(DurableRecoveryProgress::new(
+            DurableRecoveryState::RecoveryRequired,
+            metrics.last_log_index,
+            metrics.last_applied.as_ref().map(|log_id| log_id.index),
+            metrics.snapshot.as_ref().map(|log_id| log_id.index),
+            metrics.purged.as_ref().map(|log_id| log_id.index),
+        ))
     }
 
     async fn submit_intent(
@@ -6484,6 +6781,28 @@ impl ConsensusSessionStore {
                     Err(error) => return ConsensusSubmissionEffect::NotTransmitted(error),
                 },
             };
+            // Fixed recovery is replica-local durable authority. Re-read it
+            // after route discovery or refresh and immediately before every
+            // remote forwarding attempt. The local-leader path already
+            // revalidates authority at its proposal boundary, so an earlier
+            // local read here cannot close that path's barrier window. A prior
+            // possibly delivered remote attempt retains ambiguity; otherwise
+            // this failure is still proven pre-transmission.
+            if !fixed_raw_v2_consumer_warm_route
+                && leader != self.inner.local_node_id
+                && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+            {
+                if let Err(error) = self
+                    .require_application_traffic_authority_before(deadline)
+                    .await
+                {
+                    return if outcome_may_be_unavailable {
+                        ConsensusSubmissionEffect::OutcomeUnknown
+                    } else {
+                        ConsensusSubmissionEffect::NotTransmitted(error)
+                    };
+                }
+            }
             let reply = if leader == self.inner.local_node_id {
                 self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
                     .await
@@ -6501,7 +6820,8 @@ impl ConsensusSessionStore {
                     .await
                 } {
                     Ok(reply) => reply,
-                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                    Err(ConsensusPeerCallFailure::AfterTransmission)
+                    | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                         // The peer abstraction cannot prove that a failed call
                         // stopped before delivery. Retrying this same durable
                         // request ID is safe; returning a generic unavailable
@@ -6545,14 +6865,6 @@ impl ConsensusSessionStore {
             match reply {
                 ForwardMutationReply::Applied(response) => {
                     if committed_response_matches_intent(&request.intent, &response) {
-                        if !fixed_raw_v2_consumer_warm_route
-                            && self
-                                .require_application_traffic_authority_before(deadline)
-                                .await
-                                .is_err()
-                        {
-                            return ConsensusSubmissionEffect::OutcomeUnknown;
-                        }
                         return ConsensusSubmissionEffect::Committed(*response);
                     }
                     if !outcome_may_be_unavailable
@@ -6669,6 +6981,20 @@ impl ConsensusSessionStore {
                 Some(leader) => leader,
                 None => self.wait_for_known_leader(deadline).await?,
             };
+            // Recovery authority is replica-local. Route discovery and every
+            // route-refresh retry can await long enough for this follower to
+            // enter recovery, so prove authority again at the remote
+            // transmission boundary. A failed check is necessarily before
+            // this activation request reaches a peer.
+            if leader != self.inner.local_node_id {
+                #[cfg(test)]
+                self.inner
+                    .remote_forward_authority_gate
+                    .wait_before_authority()
+                    .await;
+                self.require_application_traffic_authority_before(deadline)
+                    .await?;
+            }
             let reply = if leader == self.inner.local_node_id {
                 self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
                     .await
@@ -6686,7 +7012,8 @@ impl ConsensusSessionStore {
                     // The deterministic cluster-scope request ID makes a
                     // later startup retry idempotent, but this invocation
                     // does not replay after an ambiguous transmit boundary.
-                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                    Err(ConsensusPeerCallFailure::AfterTransmission)
+                    | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                         return Err(consensus_unavailable());
                     }
                     Err(ConsensusPeerCallFailure::BeforeTransmission) => {
@@ -6786,6 +7113,19 @@ impl ConsensusSessionStore {
                 Some(leader) => leader,
                 None => self.wait_for_known_leader(deadline).await?,
             };
+            // As with ordinary mutation forwarding, recovery authority must
+            // be revalidated after each selected or refreshed remote route
+            // and immediately before the preflight can transmit an
+            // effectful logical-time proposal to the leader.
+            if leader != self.inner.local_node_id {
+                #[cfg(test)]
+                self.inner
+                    .remote_forward_authority_gate
+                    .wait_before_authority()
+                    .await;
+                self.require_application_traffic_authority_before(deadline)
+                    .await?;
+            }
             let reply = if leader == self.inner.local_node_id {
                 let ForwardRequest::RecordExpiryPreflight {
                     preflights,
@@ -6812,7 +7152,8 @@ impl ConsensusSessionStore {
                     .await
                 {
                     Ok(reply) => reply,
-                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                    Err(ConsensusPeerCallFailure::AfterTransmission)
+                    | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                         // A valid preflight may have committed only its logical
                         // time floor. Never run provider work without a
                         // definitive acknowledgement; an outer retry is safe.
@@ -7000,7 +7341,7 @@ impl ConsensusSessionStore {
             self.require_durable_fixed_quorum_admission_before(deadline)
                 .await
         } else {
-            self.require_application_traffic_authority_before(deadline)
+            self.require_application_traffic_intermediate_authority_before(deadline)
                 .await
         };
         if initial_authority.is_err() {
@@ -7106,7 +7447,7 @@ impl ConsensusSessionStore {
                         self.require_durable_fixed_quorum_admission_before(deadline)
                             .await
                     } else {
-                        self.require_application_traffic_authority_before(deadline)
+                        self.require_application_traffic_intermediate_authority_before(deadline)
                             .await
                     };
                     if authority.is_err() {
@@ -7204,7 +7545,7 @@ impl ConsensusSessionStore {
             self.require_durable_fixed_quorum_admission_before(deadline)
                 .await
         } else {
-            self.require_application_traffic_authority_before(deadline)
+            self.require_application_traffic_intermediate_authority_before(deadline)
                 .await
         };
         if authority.is_err() {
@@ -7500,7 +7841,7 @@ impl ConsensusSessionStore {
             && !allow_operator_recovery
             && fenced_transition_admission.is_none()
             && self
-                .require_application_traffic_authority_before(deadline)
+                .require_application_traffic_intermediate_authority_before(deadline)
                 .await
                 .is_err()
         {
@@ -7570,9 +7911,8 @@ impl ConsensusSessionStore {
                 ForwardMutationReply::NotLeader { leader } => {
                     ForwardMutationReply::NotLeader { leader }
                 }
-                ForwardMutationReply::Unavailable | ForwardMutationReply::OutcomeUnknown => {
-                    ForwardMutationReply::Unavailable
-                }
+                ForwardMutationReply::Unavailable => ForwardMutationReply::Unavailable,
+                ForwardMutationReply::OutcomeUnknown => ForwardMutationReply::OutcomeUnknown,
                 ForwardMutationReply::RecordExpiryPreflight(_)
                 | ForwardMutationReply::FencedTransitionActivation(_) => {
                     ForwardMutationReply::Unavailable
@@ -7638,6 +7978,7 @@ impl ConsensusSessionStore {
         let roster_terminal = matches!(&request.intent, SessionMutationIntent::RosterTerminal(_));
         let intent = match request.intent {
             intent @ SessionMutationIntent::FinalizeOperatorRecovery { .. }
+            | intent @ SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
             | intent @ SessionMutationIntent::MaintainFencedTransitionV2History { .. }
                 if authority.allows_operator_recovery =>
             {
@@ -7761,22 +8102,14 @@ impl ConsensusSessionStore {
                 }
             };
         #[cfg(test)]
-        let accepted_receiver_test_error = self
+        let accepted_receiver_test_outcome = self
             .inner
             .accepted_receiver_test_outcomes
             .lock()
             .expect("accepted receiver test outcomes lock")
-            .pop_front()
-            .map(|outcome| match outcome {
-                AcceptedClientWriteReceiverTestOutcome::ForwardToLeader => {
-                    ClientWriteError::ForwardToLeader(
-                        opc_consensus::engine::error::ForwardToLeader::new(
-                            self.inner.local_node_id,
-                            EmptyNode::new(),
-                        ),
-                    )
-                }
-            });
+            .pop_front();
+        #[cfg(test)]
+        let accepted_receiver_test_local_node_id = self.inner.local_node_id;
         // A detached supervisor owns the proposal permit until Openraft
         // resolves the receiver, so caller cancellation, peer EOF, or a
         // response deadline cannot admit an unbounded queue of detached
@@ -7784,29 +8117,46 @@ impl ConsensusSessionStore {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             #[cfg(test)]
-            if let Some(error) = accepted_receiver_test_error {
-                // The test replaces only the receiver's observable result.
-                // Keep the actual accepted receiver supervised exactly as in
-                // production, including its proposal-admission lifetime.
-                let injected_observation = roster_response_observation.clone();
-                tokio::spawn(async move {
-                    if matches!(response.await, Ok(Ok(_))) {
-                        if let Some((diagnostics, terminal, started)) = injected_observation {
-                            diagnostics.observe_protected_roster_proposal_to_applied_response(
-                                terminal,
-                                false,
-                                started.elapsed(),
-                            );
-                        }
+            if let Some(outcome) = accepted_receiver_test_outcome {
+                match outcome {
+                    AcceptedClientWriteReceiverTestOutcome::ForwardToLeader => {
+                        let error = ClientWriteError::ForwardToLeader(
+                            opc_consensus::engine::error::ForwardToLeader::new(
+                                accepted_receiver_test_local_node_id,
+                                EmptyNode::new(),
+                            ),
+                        );
+                        // The test replaces only the receiver's observable
+                        // result. Keep the actual accepted receiver supervised
+                        // exactly as in production, including its
+                        // proposal-admission lifetime.
+                        let injected_observation = roster_response_observation.clone();
+                        tokio::spawn(async move {
+                            if matches!(response.await, Ok(Ok(_))) {
+                                if let Some((diagnostics, terminal, started)) = injected_observation
+                                {
+                                    diagnostics
+                                        .observe_protected_roster_proposal_to_applied_response(
+                                            terminal,
+                                            false,
+                                            started.elapsed(),
+                                        );
+                                }
+                            }
+                            drop(proposal_permit);
+                            drop(operation_guard);
+                        });
+                        let _ = completion_tx.send(client_write_receiver_error_reply(
+                            error,
+                            reroute_receiver_forward_to_leader,
+                        ));
+                        return;
                     }
-                    drop(proposal_permit);
-                    drop(operation_guard);
-                });
-                let _ = completion_tx.send(client_write_receiver_error_reply(
-                    error,
-                    reroute_receiver_forward_to_leader,
-                ));
-                return;
+                    AcceptedClientWriteReceiverTestOutcome::HoldUntilReleased(hold) => {
+                        hold.entered.notify_one();
+                        hold.release.notified().await;
+                    }
+                }
             }
             let (reply, applied_observation) = match response.await {
                 Err(_) => (ForwardMutationReply::OutcomeUnknown, None),
@@ -7996,11 +8346,7 @@ impl ConsensusSessionStore {
 
     pub(crate) async fn commit_operator_recovery(
         &self,
-        request_id: SessionConsensusRequestId,
-        recovery_epoch: u64,
-        plan_digest: [u8; 32],
-        fence_high_water: u64,
-        credential_high_water: u64,
+        request: OperatorRecoveryCommitRequest,
     ) -> Result<(), OperatorRecoveryCommitError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
@@ -8008,7 +8354,7 @@ impl ConsensusSessionStore {
         self.require_durable_fixed_quorum_admission_before(deadline)
             .await
             .map_err(|_| OperatorRecoveryCommitError::Unavailable)?;
-        if recovery_epoch == 0 {
+        if request.intent.recovery_epoch == 0 {
             return Err(OperatorRecoveryCommitError::Rejected);
         }
         let metrics = self.inner.raft.metrics();
@@ -8018,13 +8364,10 @@ impl ConsensusSessionStore {
         let reply = self
             .apply_on_local_leader_inner(
                 ForwardMutationRequest {
-                    request_id,
-                    intent: SessionMutationIntent::FinalizeOperatorRecovery {
-                        recovery_epoch,
-                        plan_digest,
-                        fence_high_water,
-                        credential_high_water,
-                    },
+                    request_id: request.request_id,
+                    intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(Box::new(
+                        request.intent,
+                    )),
                     required_consumer_scope: ForwardConsumerScope::Internal,
                 },
                 self.inner.local_node_id,
@@ -8181,6 +8524,12 @@ impl ConsensusSessionStore {
         Req: Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
+        #[cfg(test)]
+        if family == SessionConsensusRpcFamily::ForwardMutation {
+            self.inner
+                .remote_forward_attempts
+                .fetch_add(1, Ordering::SeqCst);
+        }
         // Roster-sized envelopes require a structural proof supplied by the
         // dedicated forwarding path below. Generic callers must never widen
         // an arbitrary application request to the roster payload ceiling.
@@ -8214,7 +8563,7 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
         let payload = response
             .result
-            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+            .map_err(ConsensusPeerCallFailure::AuthenticatedRejection)?;
         decode_bounded(&payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
     }
 
@@ -8265,10 +8614,12 @@ impl ConsensusSessionStore {
         {
             return ReadBarrierReply::Unavailable;
         }
-        match self.operator_recovery_pending_before(deadline).await {
-            Ok(true) => return ReadBarrierReply::RecoveryRequired,
-            Ok(false) => {}
-            Err(_) => return ReadBarrierReply::Unavailable,
+        match self.operator_recovery_gate_before(deadline).await {
+            OperatorRecoveryGate::Clear => {}
+            OperatorRecoveryGate::Active | OperatorRecoveryGate::Corrupt => {
+                return ReadBarrierReply::RecoveryRequired;
+            }
+            OperatorRecoveryGate::Unavailable => return ReadBarrierReply::Unavailable,
         }
         match self.inner.read_barrier.admit(deadline).await {
             Ok(admit) => {
@@ -8279,10 +8630,12 @@ impl ConsensusSessionStore {
                 {
                     return ReadBarrierReply::Unavailable;
                 }
-                match self.operator_recovery_pending_before(deadline).await {
-                    Ok(false) => ReadBarrierReply::Ready(admit.read_log_id()),
-                    Ok(true) => ReadBarrierReply::RecoveryRequired,
-                    Err(_) => ReadBarrierReply::Unavailable,
+                match self.operator_recovery_gate_before(deadline).await {
+                    OperatorRecoveryGate::Clear => ReadBarrierReply::Ready(admit.read_log_id()),
+                    OperatorRecoveryGate::Active | OperatorRecoveryGate::Corrupt => {
+                        ReadBarrierReply::RecoveryRequired
+                    }
+                    OperatorRecoveryGate::Unavailable => ReadBarrierReply::Unavailable,
                 }
             }
             Err(LinearizableReadBarrierError::Unavailable) => ReadBarrierReply::Unavailable,
@@ -8302,10 +8655,14 @@ impl ConsensusSessionStore {
         self.require_durable_fixed_quorum_admission_before(deadline)
             .await
             .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
-        match self.operator_recovery_pending_before(deadline).await {
-            Ok(false) => {}
-            Ok(true) => return Err(LinearizableBarrierFailure::RecoveryRequired),
-            Err(_) => return Err(LinearizableBarrierFailure::Unavailable),
+        match self.operator_recovery_gate_before(deadline).await {
+            OperatorRecoveryGate::Clear => {}
+            OperatorRecoveryGate::Active | OperatorRecoveryGate::Corrupt => {
+                return Err(LinearizableBarrierFailure::RecoveryRequired);
+            }
+            OperatorRecoveryGate::Unavailable => {
+                return Err(LinearizableBarrierFailure::Unavailable);
+            }
         }
         let mut preferred = None;
         loop {
@@ -8349,10 +8706,14 @@ impl ConsensusSessionStore {
                     self.require_durable_fixed_quorum_admission_before(deadline)
                         .await
                         .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
-                    match self.operator_recovery_pending_before(deadline).await {
-                        Ok(false) => {}
-                        Ok(true) => return Err(LinearizableBarrierFailure::RecoveryRequired),
-                        Err(_) => return Err(LinearizableBarrierFailure::Unavailable),
+                    match self.operator_recovery_gate_before(deadline).await {
+                        OperatorRecoveryGate::Clear => {}
+                        OperatorRecoveryGate::Active | OperatorRecoveryGate::Corrupt => {
+                            return Err(LinearizableBarrierFailure::RecoveryRequired);
+                        }
+                        OperatorRecoveryGate::Unavailable => {
+                            return Err(LinearizableBarrierFailure::Unavailable);
+                        }
                     }
                     return Ok(log_id);
                 }
@@ -8543,7 +8904,8 @@ impl ConsensusSessionStore {
             // the frozen cohort or retain a ticket/authority cache to make a
             // subsequent attempt appear safe.
             Err(ConsensusPeerCallFailure::BeforeTransmission)
-            | Err(ConsensusPeerCallFailure::AfterTransmission) => {
+            | Err(ConsensusPeerCallFailure::AfterTransmission)
+            | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                 FencedTransitionV2StatusLogicalTimeTicketReply::Unavailable
             }
         }
@@ -9308,9 +9670,12 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
         || matches!(
             &request.intent,
             SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::ActivateFencedTransition { .. }
                 | SessionMutationIntent::PreflightFencedTransitionCapability
                 | SessionMutationIntent::PreflightProtectedRosterProfile
+                | SessionMutationIntent::PreflightProtectedRosterProfileV2
                 | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
+                | SessionMutationIntent::ActivateProtectedRosterProfileV2 { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
@@ -9418,6 +9783,10 @@ fn committed_response_matches_intent(
         | (
             Ok(SessionMutationOutcome::Unit),
             SessionMutationIntent::FinalizeOperatorRecovery { .. },
+        )
+        | (
+            Ok(SessionMutationOutcome::Unit),
+            SessionMutationIntent::FinalizeOperatorRecoveryV2(_),
         )
         | (
             Ok(SessionMutationOutcome::Unit),
@@ -10092,7 +10461,8 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
                 | StoreError::FencedTransitionRetentionExhausted
                 | StoreError::FencedTransitionStorageExhausted
         ),
-        SessionMutationIntent::FinalizeOperatorRecovery { .. } => {
+        SessionMutationIntent::FinalizeOperatorRecovery { .. }
+        | SessionMutationIntent::FinalizeOperatorRecoveryV2(_) => {
             matches!(error, StoreError::InvalidKey(reason) if reason == "operator_recovery_epoch_rejected")
         }
         SessionMutationIntent::PrepareTopologyTransition { .. }
@@ -10248,6 +10618,7 @@ fn validate_consensus_intent_with_recovery(
     if matches!(
         intent,
         SessionMutationIntent::FinalizeOperatorRecovery { .. }
+            | SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
             | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
     ) && !allow_operator_recovery
     {
@@ -10966,6 +11337,46 @@ impl ConsensusSessionConsumerService {
             SessionMutationOutcome::Unit => Ok(()),
             _ => Err(StoreError::CasIdempotencyOutcomeUnavailable),
         }
+    }
+
+    /// Persist only the ordinary consumer request binding for conformance
+    /// qualification.
+    ///
+    /// This is available solely with `test-control`. It validates the same
+    /// request, authorization, and scope admission as the normal consumer
+    /// mutation path, then commits the exact durable idempotency binding. It
+    /// deliberately does not submit, replay, or otherwise execute the
+    /// request's effect.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub async fn prepare_consumer_request_binding_for_test(
+        &self,
+        authorization: &SessionConsumerAuthorization,
+        request: &SessionConsumerRequest,
+    ) -> Result<(), StoreError> {
+        let deadline = self
+            .operation_deadline()
+            .map_err(|_| consensus_unavailable())?;
+        request.validate().map_err(|_| consensus_unavailable())?;
+        validate_consumer_operation(request.operation()).map_err(|_| consensus_unavailable())?;
+        authorization
+            .authorize_operation(request.operation())
+            .map_err(|_| consensus_unavailable())?;
+        let admission = self
+            .store
+            .admit_consumer_scope(request.scope(), deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        drop(admission);
+        let request_commitment =
+            consumer_request_commitment(request).map_err(|_| consensus_unavailable())?;
+        self.bind_consumer_request(
+            authorization.identity(),
+            request,
+            request_commitment,
+            deadline,
+        )
+        .await
     }
 
     async fn submit_consumer_intent(
@@ -14481,6 +14892,12 @@ impl SessionLeaseManager for ConsensusSessionStore {
 
 #[cfg(test)]
 mod membership_tests {
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    use std::fs;
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    use std::os::fd::AsRawFd;
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    use std::os::unix::fs::PermissionsExt;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -14522,6 +14939,7 @@ mod membership_tests {
     };
     use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
     use crate::record::EncryptedSessionPayload;
+    use crate::sqlite::consensus::{ensure_operator_recovery_latch_sync, OperatorRecoveryLatch};
     use crate::topology::{
         QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
         ReplicaId, ReplicaTlsIdentity,
@@ -14634,6 +15052,7 @@ mod membership_tests {
                 consensus_log_prune_drained_turns: 1,
                 consensus_log_prune_busy_retries: 1,
                 consensus_log_prune_permanent_failures: 1,
+                consensus_log_prune_degraded: true,
                 consensus_log_prune_rows_deleted: 20,
                 consensus_log_prune_encoded_bytes_deleted: 40,
                 consensus_log_prune_backlog_turns: 1,
@@ -14654,6 +15073,16 @@ mod membership_tests {
         assert!(encoded.contains("route_metrics_watch_closed"));
         assert!(encoded.contains("fixed_raw_v2_acceptance_snapshots"));
         assert!(encoded.contains("consensus_log_prune_permanent_failures"));
+        assert!(encoded.contains("consensus_log_prune_degraded"));
+
+        let mut legacy = serde_json::to_value(snapshot).expect("encode legacy diagnostic value");
+        legacy
+            .as_object_mut()
+            .expect("diagnostic snapshot is a JSON object")
+            .remove("consensus_log_prune_degraded");
+        let decoded: ConsensusStoreDiagnosticSnapshot =
+            serde_json::from_value(legacy).expect("decode diagnostic snapshot without new field");
+        assert!(!decoded.consensus_log_prune_degraded);
     }
 
     #[test]
@@ -15608,6 +16037,40 @@ mod membership_tests {
 
     #[cfg(all(target_os = "linux", feature = "test-vfs"))]
     #[tokio::test]
+    async fn fixed_store_admits_an_inherited_procfd_snapshot_leaf() {
+        let workspace = tempfile::tempdir().expect("create procfd snapshot workspace");
+        let snapshots = workspace.path().join("snapshots");
+        fs::create_dir(&snapshots).expect("create private procfd snapshot leaf");
+        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o700))
+            .expect("make procfd snapshot leaf owner-private");
+        let snapshot_fd = nix::fcntl::open(
+            &snapshots,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .expect("open no-follow inherited snapshot leaf");
+        let snapshot_path = PathBuf::from(format!("/proc/self/fd/{}/", snapshot_fd.as_raw_fd()));
+        let topology = fixed_shutdown_topology();
+        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+            topology.clone(),
+            SqliteSessionBackend::open(workspace.path().join("store.sqlite"))
+                .expect("open procfd fixed-store backend"),
+            snapshot_path,
+            unavailable_fixed_shutdown_peers(&topology),
+        )
+        .await
+        .expect("full fixed-store admission through inherited procfd snapshot leaf");
+        store
+            .shutdown()
+            .await
+            .expect("shutdown procfd fixed-store admission");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[tokio::test]
     async fn shutdown_stops_maintenance_lanes_before_a_held_raft_shutdown_and_reopens() {
         let directory = tempfile::tempdir().expect("shutdown-order directory");
         let database_path = directory.path().join("store.sqlite");
@@ -15675,6 +16138,11 @@ mod membership_tests {
             .expect("shutdown task completes")
             .expect("shutdown succeeds after releasing the core gate");
 
+        // The snapshot namespace lease is exclusive for the lifetime of every
+        // store clone, including handles that have completed their core
+        // shutdown. Reopen only after this fixture releases its last old
+        // store handle, exactly as a process restart does.
+        drop(store);
         let reopened = ConsensusSessionStore::open_fixed_durable_quorum(
             topology.clone(),
             SqliteSessionBackend::open(&database_path).expect("reopen file-backed backend"),
@@ -17077,6 +17545,29 @@ mod membership_tests {
         );
     }
 
+    fn v1_test_request(request_id: u8) -> FencedTransitionRequest {
+        let key = SessionKey {
+            tenant: TenantId::new("accepted-v1-transition").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"accepted-v1-transition")
+                .try_into()
+                .expect("stable ID"),
+        };
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("accepted-v1-transition-owner").expect("owner"),
+                FenceToken::new(0),
+                Duration::from_secs(60),
+            )
+            .expect("lease action"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("V1 transition request")
+    }
+
     fn v2_test_request(epoch: u64) -> FencedTransitionV2Request {
         let key = SessionKey {
             tenant: TenantId::new("fenced-v2-request-binding").expect("tenant"),
@@ -17125,16 +17616,34 @@ mod membership_tests {
     }
 
     #[test]
-    fn roster_mutations_require_exact_status_resolution_without_consumer_scope() {
+    fn protected_mutations_require_exact_status_resolution_without_consumer_scope() {
         let admission = roster_response_admission();
         let authority = roster_response_authority(&admission);
-        let mutations = [
+        let profile_v2 = crate::fenced_mutation_roster::Profile::v2();
+        let mutations = vec![
             SessionMutationIntent::RosterAdmission(Box::new(
                 roster_response_production_admission_command(admission.clone(), authority.clone()),
             )),
             SessionMutationIntent::RosterTerminal(Box::new(roster_response_terminal_command(
                 &admission, authority,
             ))),
+            SessionMutationIntent::PreflightProtectedRosterProfileV2,
+            SessionMutationIntent::ActivateFencedTransition {
+                request: Box::new(v1_test_request(0x53)),
+                scope_identity: singleton_topology()
+                    .consensus_identity()
+                    .expect("singleton consensus identity"),
+                voter_set_digest: [0x40; 32],
+            },
+            SessionMutationIntent::ActivateProtectedRosterProfileV2 {
+                schema_version: profile_v2.schema(),
+                consumer_revision: profile_v2.consumer_revision(),
+                scope_identity: singleton_topology()
+                    .consensus_identity()
+                    .expect("singleton consensus identity"),
+                voter_set_digest: [0x41; 32],
+                profile_digest: profile_v2.digest(),
+            },
         ];
 
         for intent in mutations {
@@ -17145,7 +17654,7 @@ mod membership_tests {
             };
             assert!(
                 mutation_requires_exact_status_resolution(&request),
-                "protected roster mutations must not reroute after transport ambiguity"
+                "protected mutations must not reroute after transport ambiguity"
             );
         }
     }
@@ -17303,6 +17812,228 @@ mod membership_tests {
             Some(before + 1),
             "the accepted batch receiver error cannot reroute or repropose"
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_receiver_unknown_is_terminal_for_first_v1_transition() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("accepted V1 transition directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("accepted V1 transition backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open accepted V1 transition store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize accepted V1 transition store");
+
+        let request = v1_test_request(0x54);
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        store.inject_accepted_client_write_receiver_outcome(
+            AcceptedClientWriteReceiverTestOutcome::ForwardToLeader,
+        );
+        assert_eq!(
+            store.fenced_transition(request.clone()).await,
+            Err(StoreError::FencedTransitionOutcomeUnknown),
+            "an accepted first V1 transition is ambiguous and must never be rerouted in-invocation"
+        );
+        wait_for_log_index_after(&store, before, "accepted first V1 transition proposal").await;
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "the accepted first V1 transition must append exactly once"
+        );
+        assert!(matches!(
+            store.fenced_transition_status(&request).await,
+            Ok(FencedTransitionStatus::Recorded(result))
+                if result.as_ref() == &Err(StoreError::CasConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_receiver_unknown_is_terminal_for_all_capability_activations() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("activation receiver effect directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("activation receiver effect backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open activation receiver effect store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize activation receiver effect store");
+
+        for (label, activation) in [
+            (
+                "fenced transition V1",
+                CapabilityActivationKind::FencedTransitionV1,
+            ),
+            (
+                "protected roster V1",
+                CapabilityActivationKind::ProtectedRosterV1,
+            ),
+            (
+                "protected roster V2",
+                CapabilityActivationKind::ProtectedRosterV2,
+            ),
+        ] {
+            let before = store
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index
+                .unwrap_or(0);
+            store.inject_accepted_client_write_receiver_outcome(
+                AcceptedClientWriteReceiverTestOutcome::ForwardToLeader,
+            );
+            let result = match activation {
+                CapabilityActivationKind::FencedTransitionV1 => {
+                    store.activate_fenced_transition_capability().await
+                }
+                CapabilityActivationKind::ProtectedRosterV1 => {
+                    store.activate_protected_roster_profile().await
+                }
+                CapabilityActivationKind::ProtectedRosterV2 => {
+                    store.activate_protected_roster_profile_v2().await
+                }
+            };
+            wait_for_log_index_after(&store, before, "accepted activation receiver proposal").await;
+            assert_eq!(
+                store.inner.raft.metrics().borrow().last_log_index,
+                Some(before + 1),
+                "{label} must append exactly one proposal after an accepted receiver becomes ambiguous"
+            );
+            assert_eq!(
+                result,
+                Err(consensus_unavailable()),
+                "{label} must terminate this invocation after an accepted receiver becomes ambiguous"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_receiver_deadline_is_terminal_for_all_capability_activations() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("deadline activation receiver directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("deadline activation receiver backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open deadline activation receiver store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize deadline activation receiver store");
+
+        for (label, activation) in [
+            (
+                "fenced transition V1",
+                CapabilityActivationKind::FencedTransitionV1,
+            ),
+            (
+                "protected roster V1",
+                CapabilityActivationKind::ProtectedRosterV1,
+            ),
+            (
+                "protected roster V2",
+                CapabilityActivationKind::ProtectedRosterV2,
+            ),
+        ] {
+            let before = store
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index
+                .unwrap_or(0);
+            let hold = Arc::new(AcceptedClientWriteReceiverHoldForTest::default());
+            store.inject_accepted_client_write_receiver_outcome(
+                AcceptedClientWriteReceiverTestOutcome::HoldUntilReleased(Arc::clone(&hold)),
+            );
+            let entered = hold.entered.notified();
+            tokio::pin!(entered);
+            let activation_call = async {
+                match activation {
+                    CapabilityActivationKind::FencedTransitionV1 => {
+                        store.activate_fenced_transition_capability().await
+                    }
+                    CapabilityActivationKind::ProtectedRosterV1 => {
+                        store.activate_protected_roster_profile().await
+                    }
+                    CapabilityActivationKind::ProtectedRosterV2 => {
+                        store.activate_protected_roster_profile_v2().await
+                    }
+                }
+            };
+            tokio::pin!(activation_call);
+            tokio::select! {
+                () = &mut entered => {}
+                result = &mut activation_call => {
+                    panic!("{label} completed before reaching the accepted receiver hold: {result:?}");
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut activation_call).await;
+            hold.release.notify_one();
+            assert_eq!(
+                result.unwrap_or_else(|_| panic!("{label} did not honor its caller deadline")),
+                Err(consensus_unavailable()),
+                "{label} must classify a passed post-acceptance deadline as terminal ambiguity"
+            );
+            wait_for_log_index_after(&store, before, "deadline activation receiver proposal").await;
+            assert_eq!(
+                store.inner.raft.metrics().borrow().last_log_index,
+                Some(before + 1),
+                "{label} must append exactly once across the passed receiver deadline"
+            );
+
+            let resolved = match activation {
+                CapabilityActivationKind::FencedTransitionV1 => {
+                    store.activate_fenced_transition_capability().await
+                }
+                CapabilityActivationKind::ProtectedRosterV1 => {
+                    store.activate_protected_roster_profile().await
+                }
+                CapabilityActivationKind::ProtectedRosterV2 => {
+                    store.activate_protected_roster_profile_v2().await
+                }
+            };
+            assert_eq!(resolved, Ok(()), "{label} exact durable status resolves");
+            assert_eq!(
+                store.inner.raft.metrics().borrow().last_log_index,
+                Some(before + 1),
+                "{label} status resolution must not propose again"
+            );
+        }
     }
 
     #[tokio::test]
@@ -21638,6 +22369,142 @@ mod membership_tests {
         );
     }
 
+    #[tokio::test]
+    async fn dynamic_active_recovery_latch_rejects_before_any_proposal() {
+        let directory = tempfile::tempdir().expect("dynamic active-latch directory");
+        let database = directory.path().join("store.sqlite");
+        let topology = singleton_topology();
+        let identity = topology
+            .consensus_identity()
+            .expect("dynamic active-latch identity");
+        let store = ConsensusSessionStore::open(
+            topology,
+            SqliteSessionBackend::open(&database).expect("dynamic active-latch backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open dynamic active-latch store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize dynamic active-latch store");
+
+        let before_log = store.inner.raft.metrics().borrow().last_log_index;
+        let before_sequence = store
+            .inner
+            .backend
+            .consensus_max_replication_sequence()
+            .await
+            .expect("read application sequence before active latch");
+        ensure_operator_recovery_latch_sync(
+            &database,
+            OperatorRecoveryLatch {
+                identity,
+                recovery_epoch: 1,
+                plan_digest: [0xA7; 32],
+                audit_pending: false,
+            },
+        )
+        .expect("publish active recovery latch");
+        store
+            .inner
+            .terminal_recovery_gate_checks
+            .store(0, Ordering::Relaxed);
+
+        let effect = store
+            .submit_request_effect_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AdvanceLogicalTime,
+                Some(identity),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(
+            effect,
+            ConsensusSubmissionEffect::NotTransmitted(StoreError::BackendUnavailable(_))
+        ));
+        assert_eq!(
+            store
+                .inner
+                .terminal_recovery_gate_checks
+                .load(Ordering::Relaxed),
+            1,
+            "origin ingress performs one recovery reconciliation before transmission"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            before_log,
+            "an Active origin recovery latch cannot append a log entry"
+        );
+        assert_eq!(
+            store
+                .inner
+                .backend
+                .consensus_max_replication_sequence()
+                .await
+                .expect("read application sequence after active latch"),
+            before_sequence,
+            "an Active origin recovery latch cannot mutate application state"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_clear_submission_gates_origin_and_leader_once() {
+        let directory = tempfile::tempdir().expect("dynamic clear submission directory");
+        let topology = singleton_topology();
+        let identity = topology
+            .consensus_identity()
+            .expect("dynamic clear submission identity");
+        let store = ConsensusSessionStore::open(
+            topology,
+            SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+                .expect("dynamic clear submission backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open dynamic clear submission store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize dynamic clear submission store");
+        let before_log = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .expect("initialized Dynamic log index");
+        store
+            .inner
+            .terminal_recovery_gate_checks
+            .store(0, Ordering::Relaxed);
+
+        let effect = store
+            .submit_request_effect_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AdvanceLogicalTime,
+                Some(identity),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(effect, ConsensusSubmissionEffect::Committed(_)));
+        assert_eq!(
+            store
+                .inner
+                .terminal_recovery_gate_checks
+                .load(Ordering::Relaxed),
+            2,
+            "one clear Dynamic submission reconciles only origin ingress and leader acceptance"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before_log + 1),
+            "one clear Dynamic submission appends exactly one Raft entry"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_retry_after_cancellation_waits_for_detached_snapshot_capture() {
         let directory = tempfile::tempdir().expect("shutdown retry directory");
@@ -21769,6 +22636,145 @@ mod membership_tests {
             DurableRecoveryState::RecoveryRequired,
             "a failed auxiliary Recovery read must not downgrade known fatal engine state"
         );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_readiness_prune_degradation_wins_during_scope_read_and_over_deadline() {
+        let directory = tempfile::tempdir().expect("fixed prune-readiness directory");
+        let database_path = directory.path().join("store.sqlite");
+        let snapshot_path = directory.path().join("snapshots");
+        let topology = fixed_shutdown_topology();
+        let backend = SqliteSessionBackend::open(&database_path)
+            .expect("file-backed prune-readiness backend");
+        let inspection_backend = backend.clone();
+        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+            topology.clone(),
+            backend,
+            &snapshot_path,
+            unavailable_fixed_shutdown_peers(&topology),
+        )
+        .await
+        .expect("open fixed prune-readiness store");
+        let lane = Arc::clone(
+            store
+                .inner
+                .consensus_log_prune_lane
+                .as_ref()
+                .expect("fixed store owns a physical-prune lane"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let diagnostics = store.inner.diagnostics.snapshot();
+                if diagnostics.consensus_log_prune_attempts >= 1
+                    && store
+                        .inner
+                        .diagnostics
+                        .consensus_log_prune_gauges_for_test()
+                        .0
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup prune recovery becomes quiescent");
+
+        // Hold the primary backend lock after the fixed-readiness call has
+        // announced its first durable scope read. This creates an exact
+        // observation window in which the independent prune connection can
+        // establish permanent local recovery evidence.
+        let primary = inspection_backend.lock_connection_for_test().await;
+        let purge_floor = LogId::new(CommittedLeaderId::new(1, store.inner.local_node_id), 1);
+        let encoded_purge_floor =
+            serde_json::to_vec(&purge_floor).expect("encode causal prune floor");
+        let configuration_epoch =
+            i64::try_from(store.inner.storage_identity.configuration_epoch().get())
+                .expect("fixed configuration epoch fits SQLite");
+        primary
+            .execute(
+                "INSERT INTO consensus_purged (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, 1, 1, ?2)",
+                rusqlite::params![configuration_epoch, encoded_purge_floor],
+            )
+            .expect("seed a causal physical-prune floor");
+        primary
+            .execute(
+                "INSERT INTO consensus_log (log_index, configuration_epoch, term, entry_json) VALUES (1, ?1, 1, X'7B7D')",
+                [configuration_epoch],
+            )
+            .expect("seed one row beneath the causal prune floor");
+        let checks_before = inspection_backend
+            .fixed_quorum_durable_check_count
+            .load(Ordering::SeqCst);
+        let probe_store = store.clone();
+        let probe = tokio::spawn(async move {
+            probe_store
+                .probe_fixed_durable_readiness_before(
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inspection_backend
+                .fixed_quorum_durable_check_count
+                .load(Ordering::SeqCst)
+                == checks_before
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixed readiness blocks inside its durable scope read");
+
+        primary
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = 2 WHERE singleton = 1",
+                [],
+            )
+            .expect("tamper fixed prune authority inside the observation window");
+        lane.signal();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !lane.is_degraded() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prune authority failure permanently degrades the lane");
+        primary
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = 1 WHERE singleton = 1",
+                [],
+            )
+            .expect("restore exact fixed authority before releasing the scope read");
+        drop(primary);
+
+        let raced = probe.await.expect("fixed readiness probe task");
+        assert_eq!(raced.state(), DurableReadinessState::RecoveryRequired);
+        assert_eq!(
+            raced.recovery_progress().state(),
+            DurableRecoveryState::RecoveryRequired,
+            "permanent prune failure observed during a durable read cannot be downgraded"
+        );
+
+        inspection_backend.inject_consensus_operator_recovery_failure(true);
+        let expired = store
+            .probe_fixed_durable_readiness_before(tokio::time::Instant::now())
+            .await;
+        assert_eq!(expired.state(), DurableReadinessState::RecoveryRequired);
+        assert_eq!(
+            expired.recovery_progress().state(),
+            DurableRecoveryState::RecoveryRequired,
+            "backend failure and an expired deadline cannot mask known prune degradation"
+        );
+        inspection_backend.inject_consensus_operator_recovery_failure(false);
+
+        store
+            .shutdown()
+            .await
+            .expect("shut down degraded fixed prune-readiness store");
     }
 
     #[tokio::test]
@@ -22718,6 +23724,111 @@ mod membership_tests {
             .expect("valid applied entry");
         assert_eq!(applied.sequence, 1);
         assert!(matches!(applied.op, ReplicationOp::AcquireLease { .. }));
+    }
+
+    #[cfg(feature = "test-control")]
+    #[tokio::test]
+    async fn padding_receipt_resolves_accepted_timeout_without_reproposal() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("padding receipt directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("padding receipt SQLite backend");
+        let apply_gate = Arc::clone(&backend.consensus_apply_gate);
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("open padding receipt store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize padding receipt store");
+
+        let held_apply = apply_gate
+            .acquire_owned()
+            .await
+            .expect("hold padding receipt state-machine apply");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let request_id = *b"OPCPADRECEIPT001";
+        let submit_store = store.clone();
+        let submission = tokio::spawn(async move {
+            submit_store
+                .submit_request(
+                    SessionConsensusRequestId::from_bytes(request_id),
+                    SessionMutationIntent::AdvanceLogicalTime,
+                )
+                .await
+        });
+        wait_for_log_index_after(&store, before, "accepted padding receipt proposal").await;
+        assert_eq!(
+            submission.await.expect("padding receipt submit task"),
+            Err(StoreError::BackendOperationOutcomeUnavailable),
+            "an accepted command whose apply result missed its deadline is ambiguous"
+        );
+        assert_eq!(
+            crate::test_support::consensus_padding_receipt_status_for_test(&store, request_id)
+                .await
+                .expect("read held padding receipt"),
+            crate::test_support::ConsensusPaddingReceiptStatusForTest::NotFound,
+            "an accepted but unapplied command has no durable outcome receipt"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "the ambiguous caller submitted exactly one command"
+        );
+
+        drop(held_apply);
+        let recorded_index = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match crate::test_support::consensus_padding_receipt_status_for_test(
+                    &store, request_id,
+                )
+                .await
+                .expect("read applied padding receipt")
+                {
+                    crate::test_support::ConsensusPaddingReceiptStatusForTest::NotFound => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    crate::test_support::ConsensusPaddingReceiptStatusForTest::Recorded {
+                        raft_log_index,
+                    } => break raft_log_index,
+                    crate::test_support::ConsensusPaddingReceiptStatusForTest::Conflict => {
+                        panic!("the exact padding receipt cannot conflict")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("padding receipt becomes visible after apply");
+        assert_eq!(recorded_index, before + 1);
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "receipt recovery never reproposes the ambiguous command"
+        );
+        let permits = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
+                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                    .expect("proposal slot count fits u32"),
+            ),
+        )
+        .await
+        .expect("padding receipt supervisor releases admission after apply")
+        .expect("padding receipt proposal admission remains open");
+        drop(permits);
     }
 
     #[tokio::test]

@@ -374,7 +374,8 @@ async fn authorizer_and_scope(
         .expect("local voter authority");
     let store = ConsensusSessionStore::open(
         topology,
-        SqliteSessionBackend::in_memory().expect("SQLite backend"),
+        SqliteSessionBackend::open(snapshots.path().join("sessions.sqlite"))
+            .expect("file-backed SQLite backend"),
         snapshots.path(),
         Default::default(),
     )
@@ -394,6 +395,7 @@ async fn authorizer_and_scope(
         .expect("consumer authorization manifest");
     assert_eq!(manifest.scope(), scope, "manifest preserves topology scope");
     let authorizer = SessionConsumerAuthorizer::try_new(manifest).expect("consumer authorizer");
+    store.shutdown().await.expect("shutdown store");
     (authorizer, scope, authority)
 }
 

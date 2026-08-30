@@ -1443,7 +1443,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use opc_consensus::engine::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    use opc_consensus::engine::storage::{
+        RaftLogStorage, RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine,
+    };
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
     use opc_consensus::{durable_openraft_config, DurableOpenraftDomain};
     use opc_types::Timestamp;
@@ -1923,6 +1925,32 @@ mod tests {
             .expect("admit desired voting after joint proof");
     }
 
+    /// A follower that is about to be cut over by a final snapshot may already
+    /// retain that boundary locally, but must not apply it before the snapshot
+    /// replaces its state machine. Keep the test fixture at that honest Raft
+    /// frontier so the strict physical-prune proof has the exact floor row.
+    async fn append_uncommitted_uniform_entry(fixture: &RealFollowerFixture) {
+        let previous = LogId::new(CommittedLeaderId::new(1, fixture.leader), 5);
+        assert_append_success(
+            call_append_handler(
+                fixture,
+                fixture.current,
+                append_request(
+                    fixture,
+                    Some(previous),
+                    vec![membership_entry(
+                        fixture.leader,
+                        6,
+                        vec![fixture.desired_members.clone()],
+                        fixture.desired_members.clone(),
+                    )],
+                    Some(previous),
+                ),
+            )
+            .await,
+        );
+    }
+
     async fn wait_for_membership_writer(directory: &SessionRaftPeerDirectory) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
@@ -2055,6 +2083,7 @@ mod tests {
 
         let target = real_follower_fixture().await;
         apply_through_joint(&target).await;
+        append_uncommitted_uniform_entry(&target).await;
         let held_predecessor_rpc = target.directory.begin_engine_rpc().await;
         let final_chunk = InstallSnapshotRequest {
             vote: Vote::new_committed(1, target.leader),
@@ -2117,6 +2146,7 @@ mod tests {
 
         let cancelled = real_follower_fixture().await;
         apply_through_joint(&cancelled).await;
+        append_uncommitted_uniform_entry(&cancelled).await;
         let held_cancelled_predecessor = cancelled.directory.begin_engine_rpc().await;
         let cancelled_chunk = InstallSnapshotRequest {
             vote: Vote::new_committed(1, cancelled.leader),
@@ -2303,7 +2333,7 @@ mod tests {
         .expect("fixed follower network");
         let directory = network.peer_directory();
         let bindings = member_bindings(&members);
-        let (log_store, mut state_machine, storage_identity) =
+        let (mut log_store, mut state_machine, storage_identity) =
             storage::open_fixed_with_member_bindings(
                 &backend,
                 temp.path().join("snapshots"),
@@ -2316,13 +2346,17 @@ mod tests {
             .await
             .expect("fixed follower storage");
         if admitted {
+            let membership = membership_entry(leader, 0, vec![members.clone()], members.clone());
+            log_store
+                .blocking_append([membership.clone()])
+                .await
+                .expect("append exact fixed membership");
+            log_store
+                .save_committed(Some(membership.log_id))
+                .await
+                .expect("commit exact fixed membership");
             state_machine
-                .apply([membership_entry(
-                    leader,
-                    0,
-                    vec![members.clone()],
-                    members.clone(),
-                )])
+                .apply([membership])
                 .await
                 .expect("apply exact fixed membership");
         }

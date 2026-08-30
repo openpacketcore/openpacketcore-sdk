@@ -986,7 +986,7 @@ other survivors' explicit and local-material-epoch retirement counters must
 remain unchanged. All lifecycle drains and every still-live survivor
 availability episode must be settled before the next traffic baseline, then
 all-voter readiness and canary progress complete without restarting that
-process. Schedule profile `member-scoped-reauth-settled-baseline/v3` makes that
+process. Schedule profile `member-scoped-reauth-settled-baseline/v4` makes that
 boundary explicit: the atomic projected-data rename starts the 86-second
 fail-safe and 60-second two-stage server tail, while a final 2.5-second quiet
 interval covers cold connect plus maximum reconnect backoff. A prepublication
@@ -994,10 +994,11 @@ common-key pulse and 13-second observation checkpoints require one active key
 to advance on every survivor observer and conservatively bound that pulse's
 worst-case actual event gap to 26 seconds. An independent 26-second checkpoint
 requires every active key on every observer and cannot be reset by a faster key.
-Availability counters
-may advance by at most one interruption/recovery pair per survivor while the
-expired member rejoins; the pair must settle inside the 26-second SLO, and a
-second or late episode fails closed. Fault-era new-attempt and reconnect deltas
+Availability evidence may advance by at most one episode per survivor while
+the expired member rejoins. Consecutive typed retry outcomes inside that
+episode remain separately bounded by the unchanged eight-outcome ceiling; all
+must settle inside the 26-second SLO, and a second or late episode fails
+closed. Fault-era new-attempt and reconnect deltas
 remain within the fixed 85/161 per-node bound: ordinary 24/40, fifteen
 five-second refresh rounds over four/eight incident paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved
@@ -1058,13 +1059,15 @@ closed until those campaigns pass.
 `StatelessSessionConsumerClient` remains a public, source-compatible
 production/compatibility fresh-authentication typed least-authority surface
 required by #649, #688, and #691; it is neither hidden, deprecated, nor
-test-only. `PersistentSessionConsumerClient` remains the required warm
-fixed-pool primitive for #695/ePDG latency, and production deployments
-requiring warm reuse should use it. Its mutual-TLS ALPN remains
-`opc-session-consumer/1`, while its exact transport
-revision is now 6 with no fallback or dual mode. Drain consumer clients and
-listeners for one coordinated cutover; different consumer revisions must never
-coexist. Revision-6 private JSON DTO bytes, including the complete
+test-only. `PersistentSessionConsumerClient` is a bounded SDK fixed-pool
+primitive; this document makes no ePDG deployment, latency, or production-SLO
+claim. General consumer ingress is `opc-session-consumer/1` revision 6,
+ordinary fenced ingress is `opc-session-consumer/2` revision 5, and the
+opted-in protected-roster ingress is `opc-session-consumer/3` revision 5.
+When roster support is enabled, listeners advertise all three concurrently;
+this is not a coordinated no-coexistence cutover. Voter-to-voter traffic is
+separately `opc-session-consensus/2` revision 5. Revision-6 private JSON DTO
+bytes, including the complete
 sequence-plus-nonce correlation envelope, are canonical; reordered or otherwise
 noncanonical encodings, aliases, omissions, and unknown fields fail closed. This
 does not admit the legacy
@@ -1152,12 +1155,18 @@ opaque and absent from labels, logs, errors, fixtures, and diagnostics. The task
 count must not scale with lanes or subscribers, and a rejected same-epoch
 material publication must retain healthy authenticated capacity.
 
-Enforce the clone-lineage shared fail-fast physical-admission cap of 16 request
-connections. The 16 reserved Watch transport permits remain unavailable to the
-typed tenant/NF consumer surface: `open_watch` returns stable `Unsupported`
-before resolution, TCP, TLS, a request frame, or cursor exposure. Do not treat
-watch-cap exhaustion or reconnect as a production consumer contract until an
-identity-and-scope-bound cursor is specified.
+Enforce the clone-lineage family-specific fail-fast request caps: general `/1`
+and an opted-in protected `/3` clone share 16 `/1`-family connections, while
+ordinary fenced `/2` has an independent 16. The resulting
+32-request-connection ceiling prevents one family from starving the other.
+Ordinary persistent `/1` and `/2` share aggregate width and may reclaim an idle
+opposite-protocol lane. A protected `/3` pool is a distinct opted-in profile,
+not an ordinary lane relabelled as `/3`, and does not enable ordinary `/1` or
+`/2` operations. The 16 reserved Watch transport permits remain
+unavailable to the typed tenant/NF consumer surface: `open_watch` returns
+stable `Unsupported` before resolution, TCP, TLS, a request frame, or cursor
+exposure. Do not treat watch-cap exhaustion or reconnect as a production
+consumer contract until an identity-and-scope-bound cursor is specified.
 
 Validate the complete operation timeout as strictly greater than zero and no
 greater than 10 seconds. The configured idle bound is at most 5 seconds and
@@ -1185,9 +1194,54 @@ Any performance evidence is synthetic only and is not an ePDG production-SLO
 claim. Warm accept/reuse assertions gate only that synthetic method; elapsed
 samples are non-gating. The revision-2 persistent-consumer qualification
 contract remains v7, while the published v6 profile remains the unchanged
-revision-1 contract. The live v8 exact-head schema binds revision 6 but remains
-experimental and fixes `qualification_complete=false`; it does not convert the
-historical loopback samples into a production SLO claim.
+revision-1 contract. The retained v8 exact-head schema binds historical
+revision `5` and remains experimental with `qualification_complete=false`;
+current revision-`6` evidence uses v9. V9 remains `experimental:true` and can
+become `qualification_complete:true` only after the full external exact-head
+gate succeeds and validates its strict artifacts; this document records no
+such result. Neither schema converts historical loopback samples into a
+production SLO claim.
+
+The closed V9 pair records canonical absolute producer-target, external
+evidence-root, and owner-private fs-verity snapshot-base paths, the pair
+directory derived from the evidence root, separate domain-separated commitments
+for each raw path, and the snapshot-base device/inode. It separately fixes the exact
+normalized absolute Cargo invocation alias, canonical backing path, and
+backing-content SHA-256. The alias (including a rustup-managed `.../cargo`
+spelling), rather than the backing path, is `argv[0]` followed by 14 canonical
+tail arguments; the normalized recorded vector has 15 elements beginning
+`cargo`, and the POSIX-escaped env-prefixed reproduction command executes that
+alias. Bound paths reject control
+characters and NUL; standard POSIX single-quote escaping is an exact-regression
+property, not a general shell-injection claim. The exact pair leaves remain
+`batch-release-gate-v1.json` and `persistent-consumer-v9.json`; symmetric
+pair run-ID uses the v4 domain. It binds canonical V1, the existing
+provenance/invocation fields, and a canonical full V9 claims preimage with only
+`run_id_sha256` replaced by `sha256:` plus 64 zeroes; it does not hash final
+self-containing V9 bytes. The command digest orders backing path, alias,
+backing SHA-256, u16-BE executable mode, then argv. Run-ID v4 binds 20 ordered
+provenance strings: the prior 16 ending alias, backing path, backing SHA-256,
+`cargo_profile`, and `opt_level`, plus the fs-verity snapshot path,
+commitment, device, and inode. It then binds u16-BE mode before the
+existing V1/V9/argv/recipe/canonical-V1/claims-preimage material. The wrapper
+consumes the pair using a fresh distinct target. Its private lease is
+held by the Python wrapper as the exact nofollow inode via
+`/proc/<wrapper-pid>/fd/<fd>` throughout the direct child, without raw-FD
+inheritance; Rust opens/locks that inode and revalidates procfd, parent, name,
+and path before mkdir, publication, and completion to close the A-to-B
+split-lock seam. The V9 schema digest is
+`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
+
+The protected `/3` pool is rebound to a readiness-proven live leader after each
+loss/restart. Its tenant-negative evidence is exactly three per-voter,
+non-oracular `Unavailable` observations. For receipt recovery, only `NotFound`
+and backend `Unavailable` are retryable; typed rejection and durable negative
+receipt status are terminal for the retained body.
+
+The downstream ePDG handoff is limited to independent review of the external
+exact-head SDK provenance, attestation, V9 pair, and accepted store evidence.
+It does not authorize an ePDG call path, configuration, cluster action,
+readiness decision, timeout change, or performance claim.
 
 ### Legacy direct-backend session-net v5 rollout boundary
 

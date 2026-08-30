@@ -312,6 +312,19 @@ impl fmt::Debug for ConsensusConfigStore {
 }
 
 impl ConsensusConfigStore {
+    /// Ask Openraft to start one normal campaign for deterministic integration
+    /// qualification. Openraft owns vote creation, persistence, and transport.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn trigger_election_for_test(&self) -> Result<(), PersistError> {
+        self.inner
+            .raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|_| consensus_unavailable())
+    }
+
     /// Start a durable node. Install [`Self::rpc_handler`] on an authenticated
     /// shared consensus listener before calling [`Self::initialize_cluster`].
     pub async fn open(

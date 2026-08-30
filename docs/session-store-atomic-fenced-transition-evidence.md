@@ -478,17 +478,78 @@ node-local state-machine fault. Exact replay, status, changed-body conflict,
 snapshot/reopen, replica convergence, and a following log entry remain
 deterministic at the boundary.
 
-The public consumer wire revision is `5` for both one-shot and bounded
-persistent transports. Frozen v7/#695 qualification remains the historical
-revision-2 contract; the live runner emits a separate v8 exact-head evidence
-document whose schema pins revision `5` to the compiled handshake constant.
+The general public `/1` consumer wire is revision `6` for both one-shot and
+bounded persistent transports. The separate epoch-fenced `/2` wire remains
+revision `5`; it is not substituted for, or counted as, the general `/1`
+transport. Frozen v7/#695 qualification remains the historical revision-2
+contract. The retained v8 exact-head schema is also immutable historical
+evidence and pins the then-current `/1` revision-5 compiled handshake constant;
+the current runner may record a separate v9 artifact for `/1` revision `6`
+only through the external exact-head gate. V9 is `experimental:true` and is
+`qualification_complete:true` only after that complete gate succeeds and its
+strict artifacts validate; this committed document does not assert a result.
 The immutable schema digests are:
 
 ```text
 3ce5f0e622508ba89820742514eddfd2c0575265754c0bdd1a726e5b3335ecca  qualification/v7/session-ha-profile.schema.json
 0b02633f0118283f425c4b60d8540de4503023d3759b7c6939ebaf2d16365772  qualification/v7/session-ha-evidence.schema.json
 5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd  qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json
+65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018  qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json
 ```
+
+The closed V9 external-pair contract records canonical absolute raw paths for
+the producer Cargo target, owner-private evidence root, owner-private fs-verity
+snapshot base, and the pair directory derived from the evidence root; each path
+has a separate domain-separated commitment. The snapshot base also records its
+descriptor-captured device/inode, so a same-path replacement is rejected. It
+separately binds the exact normalized absolute Cargo invocation
+alias, its canonical backing executable path, a SHA-256 of the backing content,
+and executable mode. The alias (including a rustup-managed `.../cargo`
+spelling), not the backing path, is `argv[0]` followed by 14 canonical tail
+arguments; its normalized recorded vector has 15 elements beginning `cargo`.
+The POSIX-escaped environment-prefixed reproduction command executes that
+alias. Bound paths reject control
+characters and NUL; the standard POSIX single-quote rendering is covered only
+by its exact regression and makes no broader shell-injection claim. The pair
+still contains only the unchanged exact leaves
+`batch-release-gate-v1.json` and `persistent-consumer-v9.json`; its symmetric
+run-ID uses the v4 domain and binds canonical V1, existing provenance/invocation
+fields, and the canonical full V9 claims preimage whose only replacement is
+`run_id_sha256 = sha256:` plus 64 zeroes—not final self-containing V9 bytes.
+The command digest orders backing path, alias, backing SHA-256, u16-BE
+executable mode, then argv. Run-ID v4 binds 20 ordered provenance strings: the
+prior 16 ending alias, backing path, backing SHA-256, `cargo_profile`, and
+`opt_level`, plus the fs-verity snapshot path, commitment, device, and inode.
+It then binds u16-BE mode before the existing
+V1/V9/argv/recipe/canonical-V1/claims-preimage material. The pair cannot be
+transplanted. The downstream wrapper consumes that pair
+with a fresh target distinct from the producer target. Its Python parent retains the
+nofollow private lease inode through `/proc/<wrapper-pid>/fd/<fd>` for the
+direct child without inheriting the raw FD; Rust opens/locks that procfd inode
+and revalidates procfd, parent, name, and path before mkdir, publication, and
+completion, closing the A-to-B split-lock seam. This is a contract update, not
+an assertion that qualification ran or completed.
+
+The frozen consumer set is general `/1` revision 6, ordinary fenced `/2`
+revision 5, and protected-roster `/3` revision 5. A roster-enabled listener
+advertises all three ALPNs concurrently; voter consensus remains
+`opc-session-consensus/2` revision 5. Stateless admission is family-specific:
+`/1` and opted-in `/3` share the 16 `/1`-family cap, while `/2` has its own
+16-cap. Ordinary persistent `/1` and `/2` share aggregate width and can reclaim
+an idle opposite-protocol lane. A protected `/3` pool is an opted-in distinct
+profile, not a relabelled ordinary lane. After every loss/restart it rebinds to
+a readiness-proven live leader; its exact foreign-tenant bracket is three
+per-voter typed `Unavailable` observations. Only `NotFound` and backend
+`Unavailable` receipt status are retryable; typed and durable negative receipt
+outcomes are terminal.
+
+## D90 supersession record
+
+Do not cherry-pick commit `d90def1f627705f837312076f02673bb48ab4693`
+(patch-id `58cace4be390bfb8175ed39c7fbe0833bf41b81e`). The current
+`consensus_openraft` harness and end-to-end test strictly supersede it: every
+voter is probed; a mismatch fails before proposal with no receipt and
+`NotFound` status; and exact replies are verified through durable activation.
 
 Request admission separately requires byte-identical public outer/nested IDs
 and derived internal consensus outer/nested IDs. Transport response validation

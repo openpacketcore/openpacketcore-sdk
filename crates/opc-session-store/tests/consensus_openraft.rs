@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -84,6 +84,37 @@ const PLAINTEXT_CANARY_BEFORE_ROTATION: &[u8] =
 const PLAINTEXT_CANARY_AFTER_ROTATION: &[u8] =
     b"opc-session-consensus-plaintext-canary-after-key-rotation";
 const RAW_KEY_MATERIAL_CANARY: &[u8; AES_256_GCM_SIV_KEY_LEN] = &[0x5a; AES_256_GCM_SIV_KEY_LEN];
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+/// Create a snapshot-only fixture root on CI's prepared fs-verity mount.
+///
+/// SQLite databases intentionally continue to use the normal tempfile root,
+/// so their mutable database, WAL, and journal I/O never share the loop mount.
+fn fs_verity_snapshot_tempdir(prefix: &str) -> TempDir {
+    let qualification_required = std::env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref()
+        == Some(std::ffi::OsStr::new("required"));
+    match std::env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute(),
+                "{FS_VERITY_SNAPSHOT_ROOT_ENV} must be an absolute fs-verity snapshot root"
+            );
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(&root)
+                .expect("create fs-verity snapshot fixture directory")
+        }
+        None if qualification_required => {
+            panic!("required fs-verity qualification requires {FS_VERITY_SNAPSHOT_ROOT_ENV}")
+        }
+        None => tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create local snapshot fixture directory"),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct AppendEntriesRequestDelay {
@@ -161,6 +192,8 @@ struct LoopbackPeer {
     append_entries_max_payload_bytes: Arc<AtomicUsize>,
     install_snapshot_responses_to_drop: Arc<AtomicUsize>,
     dropped_install_snapshot_responses: Arc<AtomicUsize>,
+    install_snapshot_requests: Arc<AtomicUsize>,
+    rejected_install_snapshot_requests: Arc<AtomicUsize>,
     install_snapshot_observations: Arc<StdMutex<Vec<InstallSnapshotObservation>>>,
     dropped_install_snapshot_observation: Arc<StdMutex<Option<InstallSnapshotObservation>>>,
     install_snapshot_observation_notify: Arc<tokio::sync::Notify>,
@@ -189,6 +222,8 @@ impl LoopbackPeer {
             append_entries_max_payload_bytes: Arc::new(AtomicUsize::new(0)),
             install_snapshot_responses_to_drop: Arc::new(AtomicUsize::new(0)),
             dropped_install_snapshot_responses: Arc::new(AtomicUsize::new(0)),
+            install_snapshot_requests: Arc::new(AtomicUsize::new(0)),
+            rejected_install_snapshot_requests: Arc::new(AtomicUsize::new(0)),
             install_snapshot_observations: Arc::new(StdMutex::new(Vec::new())),
             dropped_install_snapshot_observation: Arc::new(StdMutex::new(None)),
             install_snapshot_observation_notify: Arc::new(tokio::sync::Notify::new()),
@@ -335,6 +370,15 @@ impl LoopbackPeer {
 
     fn dropped_install_snapshot_responses(&self) -> usize {
         self.dropped_install_snapshot_responses
+            .load(Ordering::SeqCst)
+    }
+
+    fn install_snapshot_requests(&self) -> usize {
+        self.install_snapshot_requests.load(Ordering::SeqCst)
+    }
+
+    fn rejected_install_snapshot_requests(&self) -> usize {
+        self.rejected_install_snapshot_requests
             .load(Ordering::SeqCst)
     }
 
@@ -671,9 +715,14 @@ impl SessionConsensusPeer for LoopbackPeer {
             .flatten();
         let response = handler.handle(sender, request).await;
 
-        if family == SessionConsensusRpcFamily::InstallSnapshot
-            && install_snapshot_engine_accepted(&response)
-        {
+        if family == SessionConsensusRpcFamily::InstallSnapshot {
+            self.install_snapshot_requests
+                .fetch_add(1, Ordering::SeqCst);
+            if !install_snapshot_engine_accepted(&response) {
+                self.rejected_install_snapshot_requests
+                    .fetch_add(1, Ordering::SeqCst);
+                return Ok(response);
+            }
             if let Some(observation) = snapshot_observation {
                 let mut observations = self
                     .install_snapshot_observations
@@ -735,6 +784,7 @@ struct TestCluster {
     stores: Vec<ConsensusSessionStore>,
     _backends: Vec<SqliteSessionBackend>,
     _directory: TempDir,
+    _snapshot_directory: TempDir,
     _test_permit: tokio::sync::SemaphorePermit<'static>,
 }
 
@@ -862,7 +912,8 @@ impl TestCluster {
         test_permit: tokio::sync::SemaphorePermit<'static>,
     ) -> Self {
         assert_eq!(topologies.len(), MEMBER_COUNT);
-        let directory = tempfile::tempdir().expect("create fleet directory");
+        let directory = tempfile::tempdir().expect("create fleet database directory");
+        let snapshot_directory = fs_verity_snapshot_tempdir("consensus-openraft-snapshots-");
         let backends = (0..MEMBER_COUNT)
             .map(|index| {
                 SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
@@ -900,7 +951,7 @@ impl TestCluster {
             let store = ConsensusSessionStore::open_with_clock(
                 topologies[index].clone(),
                 backends[index].clone(),
-                directory.path().join(format!("snapshots-{index}")),
+                snapshot_directory.path().join(format!("snapshots-{index}")),
                 peers,
                 clock.clone(),
                 operation_timeout,
@@ -915,6 +966,7 @@ impl TestCluster {
             stores,
             _backends: backends,
             _directory: directory,
+            _snapshot_directory: snapshot_directory,
             _test_permit: test_permit,
         };
 
@@ -1675,6 +1727,284 @@ fn consensus_sqlite_progress(database: &Path) -> (Option<u64>, Option<u64>, Opti
             })
             .expect("read consensus snapshot row count"),
     )
+}
+
+/// The durable recovery pointers together with the full LogId of the selected
+/// snapshot cut.  Snapshot filenames and checksums are deliberately local
+/// artifacts; the portable consensus invariant is the exact replicated cut.
+fn consensus_sqlite_selected_recovery_state(
+    database: &Path,
+) -> (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<opc_consensus::engine::LogId<SessionConsensusNodeId>>,
+) {
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open consensus selected recovery state");
+    let optional_index = |sql: &str| {
+        connection
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .optional()
+            .expect("read optional consensus recovery index")
+            .and_then(|value| u64::try_from(value).ok())
+    };
+    let selected_snapshot = connection
+        .query_row(
+            "SELECT meta_json FROM consensus_snapshot WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .expect("read selected consensus snapshot")
+        .and_then(|encoded_meta| {
+            serde_json::from_slice::<
+                opc_consensus::engine::SnapshotMeta<
+                    SessionConsensusNodeId,
+                    opc_consensus::engine::EmptyNode,
+                >,
+            >(&encoded_meta)
+            .expect("decode selected consensus snapshot metadata")
+            .last_log_id
+        });
+    (
+        optional_index("SELECT log_index FROM consensus_committed WHERE singleton = 1"),
+        optional_index("SELECT log_index FROM consensus_applied WHERE singleton = 1"),
+        optional_index("SELECT log_index FROM consensus_purged WHERE singleton = 1"),
+        selected_snapshot,
+    )
+}
+
+#[derive(Debug)]
+struct SnapshotCatchUpVoterDiagnostic {
+    committed: Option<opc_consensus::engine::LogId<SessionConsensusNodeId>>,
+    applied: Option<opc_consensus::engine::LogId<SessionConsensusNodeId>>,
+    purged: Option<opc_consensus::engine::LogId<SessionConsensusNodeId>>,
+    selected_snapshot: Option<opc_consensus::engine::LogId<SessionConsensusNodeId>>,
+    retained_log_min: Option<u64>,
+    retained_log_max: Option<u64>,
+    retained_log_count: u64,
+}
+
+impl fmt::Display for SnapshotCatchUpVoterDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "C={:?}; A={:?}; P={:?}; S={:?}; log_min={:?}; log_max={:?}; log_count={}",
+            self.committed,
+            self.applied,
+            self.purged,
+            self.selected_snapshot,
+            self.retained_log_min,
+            self.retained_log_max,
+            self.retained_log_count,
+        )
+    }
+}
+
+fn consensus_sqlite_snapshot_catch_up_diagnostic(
+    database: &Path,
+) -> SnapshotCatchUpVoterDiagnostic {
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open consensus snapshot catch-up diagnostic database");
+    let read_pointer = |table: &str| {
+        connection
+            .query_row(
+                &format!("SELECT log_id_json FROM {table} WHERE singleton = 1"),
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .expect("read consensus snapshot catch-up pointer")
+            .map(|encoded| {
+                serde_json::from_slice::<opc_consensus::engine::LogId<SessionConsensusNodeId>>(
+                    &encoded,
+                )
+                .expect("decode consensus snapshot catch-up pointer")
+            })
+    };
+    let selected_snapshot = connection
+        .query_row(
+            "SELECT meta_json FROM consensus_snapshot WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .expect("read selected consensus snapshot diagnostic")
+        .and_then(|encoded_meta| {
+            serde_json::from_slice::<
+                opc_consensus::engine::SnapshotMeta<
+                    SessionConsensusNodeId,
+                    opc_consensus::engine::EmptyNode,
+                >,
+            >(&encoded_meta)
+            .expect("decode selected consensus snapshot diagnostic")
+            .last_log_id
+        });
+    let (retained_log_min, retained_log_max, retained_log_count) = connection
+        .query_row(
+            "SELECT MIN(log_index), MAX(log_index), COUNT(*) FROM consensus_log",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
+        )
+        .expect("read retained consensus log range");
+    SnapshotCatchUpVoterDiagnostic {
+        committed: read_pointer("consensus_committed"),
+        applied: read_pointer("consensus_applied"),
+        purged: read_pointer("consensus_purged"),
+        selected_snapshot,
+        retained_log_min: retained_log_min.and_then(|index| u64::try_from(index).ok()),
+        retained_log_max: retained_log_max.and_then(|index| u64::try_from(index).ok()),
+        retained_log_count,
+    }
+}
+
+fn snapshot_catch_up_failure_diagnostic(cluster: &TestCluster, lagging: usize) -> String {
+    let voters = (0..MEMBER_COUNT)
+        .map(|index| {
+            (
+                index,
+                consensus_sqlite_snapshot_catch_up_diagnostic(
+                    &cluster
+                        ._directory
+                        .path()
+                        .join(format!("node-{index}.sqlite")),
+                )
+                .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let install_snapshot_paths = cluster
+        .paths
+        .iter()
+        .filter(|((_, target), _)| *target == lagging)
+        .map(|((source, target), path)| {
+            (
+                *source,
+                *target,
+                path.install_snapshot_requests(),
+                path.rejected_install_snapshot_requests(),
+                path.install_snapshot_observations
+                    .lock()
+                    .expect("snapshot observation mutex")
+                    .len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let statuses = cluster
+        .stores
+        .iter()
+        .map(ConsensusSessionStore::status)
+        .collect::<Vec<_>>();
+    format!(
+        "voters={voters:?}; statuses={statuses:?}; install_snapshot_paths=(source,target,attempts,rejected,accepted_chunks)={install_snapshot_paths:?}"
+    )
+}
+
+/// Fully stop the old engines before reopening the same SQLite and snapshot
+/// paths.  Reusing the existing loopback peers makes this a real durable
+/// restart, rather than merely rebuilding a second in-memory network.
+async fn restart_test_cluster_from_durable_state(mut cluster: TestCluster) -> TestCluster {
+    for path in cluster.paths.values() {
+        path.clear_handler();
+    }
+    for result in
+        futures_util::future::join_all(cluster.stores.iter().map(ConsensusSessionStore::shutdown))
+            .await
+    {
+        result.expect("fully drain consensus engine before durable reopen");
+    }
+    cluster.stores.clear();
+    cluster._backends.clear();
+
+    let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+    let identity = consensus_identity(&members);
+    let topologies = (0..MEMBER_COUNT)
+        .map(|index| {
+            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                replica_id(index),
+                members.clone(),
+                identity,
+            ))
+            .expect("validate reopened consensus topology")
+        })
+        .collect::<Vec<_>>();
+    let node_ids = topologies
+        .iter()
+        .map(|topology| {
+            topology
+                .local_consensus_node_id()
+                .expect("reopened consensus node ID")
+        })
+        .collect::<Vec<_>>();
+    cluster._backends = (0..MEMBER_COUNT)
+        .map(|index| {
+            SqliteSessionBackend::open(
+                cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+            .expect("reopen file-backed SQLite node")
+        })
+        .collect::<Vec<_>>();
+    for (index, topology) in topologies.iter().enumerate() {
+        let peers = (0..MEMBER_COUNT)
+            .filter(|target| *target != index)
+            .map(|target| {
+                let peer: Arc<dyn SessionConsensusPeer> = cluster
+                    .paths
+                    .get(&(index, target))
+                    .expect("reopened loopback path")
+                    .clone();
+                (node_ids[target], peer)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let store = ConsensusSessionStore::open_with_clock(
+            topology.clone(),
+            cluster._backends[index].clone(),
+            cluster
+                ._snapshot_directory
+                .path()
+                .join(format!("snapshots-{index}")),
+            peers,
+            Arc::new(SystemClock),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+        )
+        .await
+        .expect("reopen consensus node from durable state");
+        cluster.stores.push(store);
+    }
+    for ((_, target), path) in &cluster.paths {
+        path.install(cluster.stores[*target].rpc_handler());
+    }
+    for result in futures_util::future::join_all(
+        cluster
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::initialize_cluster),
+    )
+    .await
+    {
+        result.expect("reinitialize durable consensus membership");
+    }
+    cluster
+        .wait_all_ready(SNAPSHOT_RECOVERY_TIMEOUT)
+        .await
+        .expect("fully restarted cluster reaches durable readiness");
+    cluster
 }
 
 /// Count the two durable artifacts whose one-for-one growth proves an applied
@@ -2937,7 +3267,7 @@ async fn encryption_wrapper_keeps_plaintext_above_consensus_and_durable_authorit
                 .join(format!("node-{index}.sqlite")),
         );
     }
-    assert_file_tree_is_sealed(cluster._directory.path());
+    assert_file_tree_is_sealed(cluster._snapshot_directory.path());
 }
 
 #[tokio::test]
@@ -4862,6 +5192,66 @@ async fn protected_roster_profile_activation_requires_every_voter_to_be_availabl
 }
 
 #[tokio::test]
+async fn fenced_transition_v2_current_voter_probe_treats_unavailable_as_transient_before_proposal()
+{
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let unavailable_voter = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[leader];
+    let key = session_key(b"fenced-transition-v2-current-voter-unavailable");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe V2 key before unavailable current-voter probe");
+    let (request, _) = fenced_v2_acquire_create_request(
+        key,
+        owner("fenced-transition-v2-current-voter-unavailable-owner"),
+        observation.current_fence(),
+        [0x71; 16],
+        b"sealed-fenced-transition-v2-current-voter-unavailable",
+    );
+    let applications_before = replication_logs(&cluster).await;
+    let leader_log_before = store.status().last_log_index;
+
+    // One remaining remote voter can still satisfy the ordinary read quorum,
+    // but V2 activation requires an exact reply from every current voter. A
+    // failed authenticated transport path is unavailable, not affirmative
+    // evidence that the peer implements a different immutable profile.
+    cluster
+        .paths
+        .get(&(leader, unavailable_voter))
+        .expect("leader outbound peer path")
+        .set_enabled(false);
+    assert!(matches!(
+        store.fenced_transition_v2(request.clone()).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(
+        store.status().last_log_index,
+        leader_log_before,
+        "a transient V2 probe failure appends neither an activation nor a mutation"
+    );
+    cluster
+        .paths
+        .get(&(leader, unavailable_voter))
+        .expect("leader outbound peer path")
+        .set_enabled(true);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("all voters reconverge after the transient V2 probe failure");
+    assert_eq!(
+        replication_logs(&cluster).await,
+        applications_before,
+        "a transient V2 probe failure creates neither an activation nor a mutation application"
+    );
+    assert!(matches!(
+        store.fenced_transition_v2_status(&request).await,
+        Ok(FencedTransitionV2Status::NotFound)
+    ));
+}
+
+#[tokio::test]
 async fn fenced_transition_v2_current_voter_probe_fails_closed_then_activates_on_exact_replies() {
     let cluster = TestCluster::start().await;
     let (leader, _, _) = cluster.observed_leader();
@@ -5886,6 +6276,217 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         recovered_progress.snapshot_index(),
         "follower snapshot index converges after the lost snapshot response retry"
     );
+}
+
+#[tokio::test]
+async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart() {
+    let _timing_permit = ELECTION_AND_SNAPSHOT_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("qualification semaphore remains open");
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
+    let (initial_leader, _, _) = cluster.observed_leader();
+    let lagging = (0..MEMBER_COUNT)
+        .find(|index| *index != initial_leader)
+        .expect("three-voter cluster has a follower");
+    let survivors = (0..MEMBER_COUNT)
+        .filter(|index| *index != lagging)
+        .collect::<Vec<_>>();
+
+    // First make every voter compact, publish, and purge its predecessor
+    // phase. The later isolated voter keeps its selected predecessor P, but
+    // has no retained P+1..S log interval from which it can catch up.
+    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
+        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
+    })
+    .await
+    .expect("predecessor snapshot command batch completes within its aggregate bound");
+    let predecessor = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            let progress = futures_util::future::join_all(
+                cluster
+                    .stores
+                    .iter()
+                    .map(ConsensusSessionStore::probe_durable_readiness),
+            )
+            .await
+            .into_iter()
+            .map(|report| report.recovery_progress())
+            .collect::<Vec<_>>();
+            if progress.iter().all(|current| {
+                current.snapshot_index().is_some() && current.purged_index().is_some()
+            }) {
+                break progress[lagging]
+                    .snapshot_index()
+                    .expect("lagging voter selected predecessor snapshot");
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("every voter publishes and purges the predecessor snapshot");
+
+    let lagging_before_successor = cluster.stores[lagging]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress();
+    assert_eq!(Some(predecessor), lagging_before_successor.snapshot_index());
+    assert!(
+        lagging_before_successor.purged_index().is_some(),
+        "lagging voter purges its predecessor compaction phase"
+    );
+    cluster.isolate(lagging);
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            let reports = futures_util::future::join_all(
+                survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
+            )
+            .await;
+            if reports.iter().all(DurableReadinessReport::is_ready) {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving majority remains ready while predecessor voter is isolated");
+
+    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
+        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
+    })
+    .await
+    .expect("successor snapshot command batch completes within its aggregate bound");
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            let progress = futures_util::future::join_all(
+                survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
+            )
+            .await
+            .into_iter()
+            .map(|report| report.recovery_progress())
+            .collect::<Vec<_>>();
+            if progress.iter().all(|current| {
+                current
+                    .snapshot_index()
+                    .is_some_and(|index| index > predecessor)
+                    && current.purged_index().is_some_and(|index| {
+                        index
+                            > lagging_before_successor
+                                .local_applied_index()
+                                .expect("lagging predecessor applied index")
+                    })
+            }) {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving majority publishes and purges a later successor snapshot");
+    let lagging_while_isolated = cluster.stores[lagging]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress();
+    assert_eq!(
+        lagging_before_successor.local_applied_index(),
+        lagging_while_isolated.local_applied_index(),
+        "isolated voter cannot apply the missing predecessor-successor interval"
+    );
+    assert_eq!(
+        Some(predecessor),
+        lagging_while_isolated.snapshot_index(),
+        "isolated voter retains P while the majority has advanced to S"
+    );
+
+    cluster.heal(lagging);
+    if cluster
+        .wait_all_ready(SNAPSHOT_RECOVERY_TIMEOUT)
+        .await
+        .is_err()
+    {
+        panic!(
+            "lagging predecessor voter did not install the successor snapshot: {}",
+            snapshot_catch_up_failure_diagnostic(&cluster, lagging)
+        );
+    }
+    let recovered = cluster.stores[lagging]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress();
+    assert_eq!(DurableRecoveryState::Synchronized, recovered.state());
+    assert!(
+        recovered
+            .snapshot_index()
+            .is_some_and(|index| index > predecessor),
+        "recovered voter selects a successor snapshot beyond P"
+    );
+    assert!(
+        recovered.purged_index().is_some(),
+        "recovered voter retains a durable successor purge"
+    );
+
+    let recovered_state = consensus_sqlite_selected_recovery_state(
+        &cluster
+            ._directory
+            .path()
+            .join(format!("node-{lagging}.sqlite")),
+    );
+    let recovered_cut = recovered_state
+        .3
+        .expect("recovered voter persists its selected successor snapshot cut");
+    assert!(
+        recovered_cut.index > predecessor,
+        "recovered selected full LogId is a successor of P"
+    );
+
+    let restarted = restart_test_cluster_from_durable_state(cluster).await;
+    let restarted_state = consensus_sqlite_selected_recovery_state(
+        &restarted
+            ._directory
+            .path()
+            .join(format!("node-{lagging}.sqlite")),
+    );
+    assert_eq!(
+        recovered_state, restarted_state,
+        "restarted voter retains exact recovered durable state"
+    );
+    let key = session_key(b"snapshot-successor-post-restart");
+    let lease = restarted.stores[lagging]
+        .acquire(
+            &key,
+            owner("snapshot-successor-post-restart-owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("full restart retains a functional voter quorum");
+    let record = sealed_record(key.clone(), 1, &lease, b"sealed-snapshot-successor-restart");
+    assert_eq!(
+        CompareAndSetResult::Success,
+        restarted.stores[restarted.observed_leader().0]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: record.clone(),
+            })
+            .await
+            .expect("full restart commits a new quorum mutation")
+    );
+    for store in &restarted.stores {
+        assert_eq!(
+            Some(record.clone()),
+            store
+                .get(&key)
+                .await
+                .expect("full restart cluster converges after new mutation")
+        );
+    }
 }
 
 #[tokio::test]

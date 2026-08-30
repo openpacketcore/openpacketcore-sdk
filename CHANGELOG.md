@@ -3932,7 +3932,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may record at most one new
   availability episode while the expired member rejoins; it must recover
   inside the existing 26-second SLO and be fully settled before the clean
-  baseline. A second or late episode fails closed. The complete expiry/rejoin
+  baseline. Consecutive typed retry outcomes retain the separate exact
+  eight-outcome ceiling without being misclassified as new episodes. A second
+  or late episode fails closed. The complete expiry/rejoin
   interval has an 85/161 per-node new-attempt and reconnect bound: the ordinary
   24/40 allowance, at most fifteen five-second refresh rounds over the
   four/eight incident directed paths, and one scheduled post-hard-expiry
@@ -3944,7 +3946,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this as `new-attempts-plus-baseline-outstanding/v1`. Cancellation-classified
   `abandoned` outcomes, protocol/backend outcomes, and drain overruns remain
   forbidden throughout the fault and clean intervals. Schedule v6 advances the
-  checkpoint to `member-scoped-reauth-settled-baseline/v3` and binds its rolling
+  checkpoint to `member-scoped-reauth-settled-baseline/v4` and binds its rolling
   proof as `common-key-pulse-all-active-key-coverage/v1`. Recovery continuity
   polls use a
   non-intrusive workload snapshot; authoritative watch-head settlement keeps

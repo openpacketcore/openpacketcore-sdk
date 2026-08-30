@@ -113,6 +113,107 @@ pub async fn trigger_consensus_snapshot_for_test(
         .map_err(|_| "test consensus snapshot capture rejected".to_owned())
 }
 
+/// Append one acknowledged, otherwise inert consensus command for a test.
+///
+/// The supplied request ID is retained by the normal durable idempotency
+/// path. A successful return therefore proves that this exact command was
+/// committed and applied at the returned nonzero Raft log index.
+pub async fn append_consensus_padding_entry_for_test(
+    store: &ConsensusSessionStore,
+    request_id: [u8; 16],
+) -> Result<u64, StoreError> {
+    match store
+        .submit_request(
+            SessionConsensusRequestId::from_bytes(request_id),
+            SessionMutationIntent::AdvanceLogicalTime,
+        )
+        .await
+    {
+        Ok(SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            raft_log_index,
+            ..
+        }) if raft_log_index != 0 => Ok(raft_log_index),
+        Ok(SessionConsensusResponse {
+            result: Err(error), ..
+        }) => Err(error),
+        Ok(_) => Err(StoreError::Serialization(
+            "consensus padding response shape is invalid".into(),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// Test-only voter-local classification for an exact padding command receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusPaddingReceiptStatusForTest {
+    /// This voter has not durably applied the exact authenticated command.
+    NotFound,
+    /// The exact command was durably applied at its original nonzero index.
+    Recorded {
+        /// Original Openraft log index retained by the durable receipt.
+        raft_log_index: u64,
+    },
+    /// The request ID is already bound to another authenticated payload.
+    Conflict,
+}
+
+/// Read one exact voter-local padding receipt without entering proposal
+/// admission. The supplied ID is bound to this store's current authenticated
+/// authority and the fixed `AdvanceLogicalTime` test command.
+pub async fn consensus_padding_receipt_status_for_test(
+    store: &ConsensusSessionStore,
+    request_id: [u8; 16],
+) -> Result<ConsensusPaddingReceiptStatusForTest, StoreError> {
+    let (authority_identity, _) = store.current_scope()?;
+    let status = store
+        .inner
+        .backend
+        .consensus_padding_receipt_status_for_test(
+            store.inner.storage_identity,
+            authority_identity,
+            SessionConsensusRequestId::from_bytes(request_id),
+        )
+        .await?;
+    Ok(match status {
+        crate::sqlite::consensus::ConsensusPaddingReceiptStatus::NotFound => {
+            ConsensusPaddingReceiptStatusForTest::NotFound
+        }
+        crate::sqlite::consensus::ConsensusPaddingReceiptStatus::Recorded { raft_log_index } => {
+            ConsensusPaddingReceiptStatusForTest::Recorded { raft_log_index }
+        }
+        crate::sqlite::consensus::ConsensusPaddingReceiptStatus::Conflict => {
+            ConsensusPaddingReceiptStatusForTest::Conflict
+        }
+    })
+}
+
+/// Request an engine-owned log purge through one exact local log index after
+/// proving that the engine has already recorded a snapshot which covers it.
+/// This exercises OpenRaft's real compaction path without exposing a
+/// production purge control.
+pub async fn trigger_consensus_log_purge_through_for_test(
+    store: &ConsensusSessionStore,
+    index: u64,
+) -> Result<(), String> {
+    let metrics = store.inner.raft.metrics();
+    let snapshot_covers = metrics
+        .borrow()
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.index >= index);
+    if !snapshot_covers {
+        return Err("test consensus purge is not covered by a local snapshot".to_owned());
+    }
+    store
+        .inner
+        .raft
+        .trigger()
+        .purge_log(index)
+        .await
+        .map_err(|_| "test consensus log purge trigger rejected".to_owned())
+}
+
 /// Fixed test-only classification of the local consensus engine state.
 ///
 /// Failure sources and internal error text are deliberately discarded.

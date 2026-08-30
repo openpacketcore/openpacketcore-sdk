@@ -18,18 +18,21 @@ use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use opc_config_model::{RequestId, TransportType, TrustedPrincipal};
+use opc_consensus::engine::LogId;
 use opc_mgmt_audit::{
     AuditEvent, AuditOperation, AuditOutcome, AuditReasonCode, AuditSink, AuditTxId, SchemaNodePath,
 };
+use opc_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::consensus::snapshot::{SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES};
+use crate::consensus::storage::{LiveTerminalRecoveryHandoffGate, SessionConsensusStorageError};
 use crate::consensus::{
-    OperatorRecoveryCommitError, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusRequestId,
+    OperatorRecoveryCommitError, OperatorRecoveryCommitRequest, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusRequestId,
 };
 use crate::topology::{
     ReplicaBackingIdentity, ReplicaId, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
@@ -37,12 +40,16 @@ use crate::topology::{
 use crate::ConsensusSessionStore;
 
 use self::sqlite::{
-    backup_and_reset_replica, clear_fleet_latches, inspect_replica, replica_has_recovery_latch,
-    resume_audit_state, resume_execution_state, seal_plan, set_fleet_latches_audit_pending,
-    verify_plan_seal, InspectionInput, ResetInput,
+    acquire_finalization_pins, backup_and_reset_replica, classify_finalization_pins,
+    clear_fleet_latches_pinned, inspect_replica, legacy_finalization_predecessor,
+    record_rejoined_with_terminal_proof, recovery_v2_intent_from_plan, replica_has_recovery_latch,
+    resume_audit_state, resume_execution_state, revalidate_finalization_pins,
+    revalidate_finalization_pins_after_terminal_consumed, seal_plan,
+    set_fleet_latches_audit_pending, set_fleet_latches_audit_pending_pinned, verify_plan_seal,
+    FinalizationTransitionState, InspectionInput, ResetInput,
 };
 
-const RECOVERY_PLAN_VERSION: u16 = 1;
+const RECOVERY_PLAN_VERSION: u16 = 4;
 const RECOVERY_PATH: &str = "/opc-session-store:legacy-recovery";
 const LEGACY_ACKNOWLEDGEMENT: &str = "ACKNOWLEDGE-UNPROVEN-LEGACY-BRANCH-DISCARD";
 const PRINCIPAL_DESCRIPTOR_MAX_BYTES: usize = 2_048;
@@ -51,6 +58,13 @@ const PRINCIPAL_DESCRIPTOR_MAX_BYTES: usize = 2_048;
 /// physical extent instead of leaving a smaller stale logical-ledger limit.
 const RECOVERY_DEFAULT_VALUE_SCAN_MULTIPLIER: u64 = 8;
 const RECOVERY_DEFAULT_MAX_TOTAL_VALUE_BYTES: u64 =
+    SNAPSHOT_DATABASE_MAX_BYTES * RECOVERY_DEFAULT_VALUE_SCAN_MULTIPLIER;
+// These are protocol capacities, not caller-selected inspection policy. V2
+// apply recomputes the invariant digest under these same bounds, so accepting
+// a wider workflow here would create a deterministic finalization wedge.
+const RECOVERY_V2_INVARIANT_PROTOCOL_MAX_ROWS: u64 = 10_000_000;
+const RECOVERY_V2_INVARIANT_PROTOCOL_MAX_VALUE_BYTES: u64 = 16 * 1024 * 1024;
+const RECOVERY_V2_INVARIANT_PROTOCOL_MAX_TOTAL_VALUE_BYTES: u64 =
     SNAPSHOT_DATABASE_MAX_BYTES * RECOVERY_DEFAULT_VALUE_SCAN_MULTIPLIER;
 
 /// Purpose-separated integrity key for plans, workflow journals, and backups.
@@ -103,6 +117,15 @@ impl RecoveryDigest {
     pub fn to_hex(self) -> String {
         crate::hex::encode_lower(&self.0)
     }
+}
+
+/// Shared canonical V2 predecessor projection for consensus apply.  Its
+/// implementation remains beside offline recovery inspection so both paths
+/// use the identical row encoding and legacy-lease normalization.
+pub(crate) fn recovery_v2_invariant_state_digest_for_apply(
+    conn: &rusqlite::Connection,
+) -> Result<[u8; 32], RecoveryError> {
+    sqlite::recovery_v2_invariant_state_digest_for_apply(conn)
 }
 
 impl fmt::Debug for RecoveryDigest {
@@ -393,8 +416,10 @@ impl RecoveryLimits {
             || max_snapshot_bytes == 0
             || max_snapshot_bytes > SNAPSHOT_ENVELOPE_MAX_BYTES
             || max_rows == 0
+            || max_rows > RECOVERY_V2_INVARIANT_PROTOCOL_MAX_ROWS
             || max_value_bytes == 0
             || max_value_bytes > i64::MAX as u64
+            || max_value_bytes > RECOVERY_V2_INVARIANT_PROTOCOL_MAX_VALUE_BYTES
         {
             return Err(RecoveryError::InvalidRequest);
         }
@@ -432,6 +457,7 @@ impl RecoveryLimits {
         // constructor, not only `Default`.
         if max_total_value_bytes == 0
             || max_total_value_bytes > limits.max_total_value_bytes
+            || max_total_value_bytes > RECOVERY_V2_INVARIANT_PROTOCOL_MAX_TOTAL_VALUE_BYTES
             || max_duration.is_zero()
         {
             return Err(RecoveryError::InvalidRequest);
@@ -519,6 +545,20 @@ fn default_recovery_limits_share_the_snapshot_physical_envelope() {
         Duration::from_secs(1),
     )
     .is_err());
+    assert!(RecoveryLimits::try_new(
+        SNAPSHOT_DATABASE_MAX_BYTES,
+        SNAPSHOT_ENVELOPE_MAX_BYTES,
+        RECOVERY_V2_INVARIANT_PROTOCOL_MAX_ROWS + 1,
+        1,
+    )
+    .is_err());
+    assert!(RecoveryLimits::try_new(
+        SNAPSHOT_DATABASE_MAX_BYTES,
+        SNAPSHOT_ENVELOPE_MAX_BYTES,
+        1,
+        RECOVERY_V2_INVARIANT_PROTOCOL_MAX_VALUE_BYTES + 1,
+    )
+    .is_err());
 }
 
 /// Persisted replica format found during inspection.
@@ -532,6 +572,30 @@ pub enum RecoveryReplicaFormat {
     LegacyUnproven,
 }
 
+/// Persisted consensus authority model authenticated during offline recovery.
+///
+/// This deliberately does not deserialize an unknown value as a permissive
+/// default.  Recovery must not infer whether an artifact needs immutable
+/// fs-verity handling from its pathname or a target replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAuthorityProfile {
+    /// The ordinary dynamic-membership authority model.
+    Dynamic,
+    /// The permanently fixed quorum authority model.
+    FixedImmutable,
+}
+
+/// Persisted placement policy coupled to fixed recovery authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryFixedPlacementPolicy {
+    /// Independent failure domains are required for the resilience claim.
+    RequireIndependentFailureDomains,
+    /// An explicit reduced-resilience placement claim is permitted.
+    AllowReducedResilience,
+}
+
 /// Redaction-safe evidence for one completely inspected replica.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryReplicaEvidence {
@@ -543,12 +607,52 @@ pub struct RecoveryReplicaEvidence {
     cluster_digest: Option<RecoveryDigest>,
     configuration_digest: Option<RecoveryDigest>,
     configuration_epoch: Option<u64>,
+    authority_profile: RecoveryAuthorityProfile,
+    fixed_placement_policy: Option<RecoveryFixedPlacementPolicy>,
+    /// Exact inode commitment for the snapshot selected by this replica's
+    /// current checkpoint, when one exists.  It is distinct from the
+    /// envelope checksum so byte-identical pathname replacement cannot cross
+    /// plan → checkpoint handoff.
+    current_snapshot_identity: Option<RecoveryDigest>,
     recovery_epoch: u64,
+    /// Exact durable plan digest completed at `recovery_epoch`.  This is
+    /// separate evidence from the epoch: a voter at the same epoch but with
+    /// another campaign's plan must never inherit this campaign's terminal
+    /// readiness record.
+    last_plan_digest: RecoveryDigest,
     pending_recovery_epoch: Option<u64>,
     pending_plan_digest: Option<RecoveryDigest>,
+    /// Exact V2 Raft identity that committed this recovery epoch.  This is
+    /// separate from the current head: later ordinary commands may advance
+    /// the head without weakening the proof of the recovery effect.
+    finalize_log_id: Option<LogId<SessionConsensusNodeId>>,
     watch_cursor_invalidation_floor: u64,
     application_sequence: u64,
+    /// Exact state-machine digest at the inspected predecessor.  This is
+    /// deliberately distinct from the offline logical-state digest: V2 apply
+    /// must reject a queued normal command even when its sequence remains
+    /// below a fleet-wide recovery high-water.
+    machine_last_digest: RecoveryDigest,
+    /// Exact state-machine logical time at the inspected predecessor.
+    machine_logical_time: Option<Timestamp>,
     watch_sequence: u64,
+    /// Domain-separated commitment of the persisted identity, membership
+    /// scope, authority policy, and protected-roster state.  It is carried
+    /// into V2 so untouched voters cannot inherit a recovery command after a
+    /// locally valid but different authority transition.
+    authority_commitment: RecoveryDigest,
+    /// Exact durable committed Raft identity. The legacy numeric projection
+    /// remains for diagnostics, but never authorizes a plan transition.
+    committed_log_id: Option<LogId<SessionConsensusNodeId>>,
+    /// Canonical digest of the exact committed predecessor when that physical
+    /// row is a retained Membership entry.  `None` is explicit evidence that
+    /// inspection did not retain a Membership at this full LogId; V2 apply
+    /// independently re-proves that absence against its own descriptors.
+    predecessor_bootstrap_membership_digest: Option<RecoveryDigest>,
+    /// Exact durable applied Raft identity.
+    applied_log_id: Option<LogId<SessionConsensusNodeId>>,
+    /// Exact physical local Raft head, including an unapplied suffix.
+    local_head_log_id: Option<LogId<SessionConsensusNodeId>>,
     committed_index: Option<u64>,
     applied_index: Option<u64>,
     local_head_index: Option<u64>,
@@ -556,6 +660,49 @@ pub struct RecoveryReplicaEvidence {
     fence_high_water: u64,
     credential_high_water: u64,
     logical_state_digest: RecoveryDigest,
+    /// Projection of logical state which excludes only V2's deliberate lease
+    /// activation and allocator changes.  It binds the application, lease
+    /// identity, and every other logical byte across finalization without
+    /// treating V2's own transactional effects as corruption.
+    recovery_v2_invariant_state_digest: RecoveryDigest,
+    protected_roster_digest: RecoveryDigest,
+}
+
+/// Exact current-format predecessor captured only after a legacy fleet has
+/// been bootstrapped under the retained finalization descriptors.  A legacy
+/// recovery plan deliberately contains no OpenRaft predecessor; this MACed
+/// workflow capsule makes the one admitted bootstrap state durable before a
+/// V2 finalize entry can be proposed or retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct FinalizationPredecessorCapsule {
+    pub(super) recovery_epoch: u64,
+    pub(super) last_plan_digest: RecoveryDigest,
+    pub(super) watch_cursor_invalidation_floor: u64,
+    pub(super) baseline_log_id: LogId<SessionConsensusNodeId>,
+    pub(super) application_sequence: u64,
+    pub(super) machine_last_digest: RecoveryDigest,
+    pub(super) machine_logical_time: Option<Timestamp>,
+    pub(super) watch_sequence: u64,
+    pub(super) authority_commitment: RecoveryDigest,
+    pub(super) recovery_v2_invariant_state_digest: RecoveryDigest,
+    /// Canonical JSON digest of the exact predecessor Membership payload when
+    /// that row is retained. It binds the physical entry in addition to the
+    /// scope covered by `authority_commitment`; this is not legacy-only.
+    pub(super) bootstrap_membership_digest: Option<RecoveryDigest>,
+    /// The fixed legacy bootstrap Membership may precede the V2 predecessor
+    /// (OpenRaft normally follows it with a committed Blank).  Preserve that
+    /// physical authority separately: it must not be overloaded into the V2
+    /// predecessor commitment, whose `None` is meaningful for that Blank.
+    #[serde(default)]
+    pub(super) legacy_bootstrap_membership: Option<LegacyBootstrapMembershipCapsule>,
+}
+
+/// Exact legacy Membership retained as authority evidence when it is not the
+/// immediate V2 predecessor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LegacyBootstrapMembershipCapsule {
+    pub(super) log_id: LogId<SessionConsensusNodeId>,
+    pub(super) digest: RecoveryDigest,
 }
 
 impl RecoveryReplicaEvidence {
@@ -584,9 +731,36 @@ impl RecoveryReplicaEvidence {
         self.configuration_epoch
     }
 
+    /// Persisted authority profile for this inspected replica.
+    pub const fn authority_profile(&self) -> RecoveryAuthorityProfile {
+        self.authority_profile
+    }
+
+    /// Placement policy authenticated with fixed authority.
+    pub const fn fixed_placement_policy(&self) -> Option<RecoveryFixedPlacementPolicy> {
+        self.fixed_placement_policy
+    }
+
+    /// Exact inode commitment for the current snapshot selected during
+    /// inspection.
+    pub const fn current_snapshot_identity(&self) -> Option<RecoveryDigest> {
+        self.current_snapshot_identity
+    }
+
     /// Durable operator-recovery epoch.
     pub const fn recovery_epoch(&self) -> u64 {
         self.recovery_epoch
+    }
+
+    /// Exact durable plan digest completed at the observed recovery epoch.
+    pub const fn last_plan_digest(&self) -> RecoveryDigest {
+        self.last_plan_digest
+    }
+
+    /// Exact persisted V2 finalization log identity, when this replica has
+    /// completed a current-format operator recovery epoch.
+    pub const fn finalize_log_id(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        self.finalize_log_id
     }
 
     /// Pending recovery epoch left by an incomplete exact workflow.
@@ -609,9 +783,40 @@ impl RecoveryReplicaEvidence {
         self.application_sequence
     }
 
+    /// Exact state-machine digest at the inspected predecessor.
+    pub const fn machine_last_digest(&self) -> RecoveryDigest {
+        self.machine_last_digest
+    }
+
+    /// Exact state-machine logical time at the inspected predecessor.
+    pub const fn machine_logical_time(&self) -> Option<Timestamp> {
+        self.machine_logical_time
+    }
+
     /// Highest application-journal/watch sequence observed on this replica.
     pub const fn watch_sequence(&self) -> u64 {
         self.watch_sequence
+    }
+
+    /// Exact durable authority/membership/roster commitment at the inspected
+    /// predecessor.
+    pub const fn authority_commitment(&self) -> RecoveryDigest {
+        self.authority_commitment
+    }
+
+    /// Full committed Raft identity sealed into the plan.
+    pub const fn committed_log_id(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        self.committed_log_id
+    }
+
+    /// Full applied Raft identity sealed into the plan.
+    pub const fn applied_log_id(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        self.applied_log_id
+    }
+
+    /// Full physical local-log head sealed into the plan.
+    pub const fn local_head_log_id(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        self.local_head_log_id
     }
 
     /// Persisted committed Openraft index, when present.
@@ -648,6 +853,20 @@ impl RecoveryReplicaEvidence {
     pub const fn logical_state_digest(&self) -> RecoveryDigest {
         self.logical_state_digest
     }
+
+    /// Canonical digest of the protected roster layout, verifier root, and
+    /// activated roster projections.
+    pub const fn protected_roster_digest(&self) -> RecoveryDigest {
+        self.protected_roster_digest
+    }
+
+    fn has_valid_authority_descriptor(&self) -> bool {
+        matches!(
+            (self.authority_profile, self.fixed_placement_policy),
+            (RecoveryAuthorityProfile::Dynamic, None)
+                | (RecoveryAuthorityProfile::FixedImmutable, Some(_))
+        )
+    }
 }
 
 /// Evidence basis under which one source may be selected.
@@ -671,6 +890,9 @@ struct RecoveryPlanBody {
     source_token: RecoveryDigest,
     target_tokens: Vec<RecoveryDigest>,
     source_branch_digest: RecoveryDigest,
+    source_authority_profile: RecoveryAuthorityProfile,
+    source_fixed_placement_policy: Option<RecoveryFixedPlacementPolicy>,
+    source_protected_roster_digest: RecoveryDigest,
     next_recovery_epoch: u64,
     application_sequence_high_water: u64,
     watch_sequence_high_water: u64,
@@ -824,6 +1046,41 @@ impl RecoveryExecutionReport {
     }
 }
 
+/// Consume a terminal handoff through the already-open local core.  A storage
+/// transport failure is retryable; every identity, descriptor, namespace, or
+/// snapshot validation failure is evidence corruption and must stay
+/// fail-closed rather than being retried as ordinary consensus lag.
+fn map_live_terminal_recovery_handoff_error(error: SessionConsensusStorageError) -> RecoveryError {
+    match error {
+        SessionConsensusStorageError::BackendUnavailable => RecoveryError::ConsensusUnavailable,
+        SessionConsensusStorageError::UnsupportedPlatform
+        | SessionConsensusStorageError::RecoveryRequired
+        | SessionConsensusStorageError::IdentityMismatch
+        | SessionConsensusStorageError::SchemaVersionMismatch
+        | SessionConsensusStorageError::CorruptState
+        | SessionConsensusStorageError::InvalidIdentity => RecoveryError::BackupCorrupt,
+    }
+}
+
+async fn acquire_live_terminal_recovery_handoff_gate(
+    store: &ConsensusSessionStore,
+) -> Result<LiveTerminalRecoveryHandoffGate, RecoveryError> {
+    store
+        .acquire_live_operator_recovery_terminal_handoff_gate()
+        .await
+        .map_err(map_live_terminal_recovery_handoff_error)
+}
+
+async fn consume_live_terminal_recovery_handoff(
+    store: &ConsensusSessionStore,
+    gate: &LiveTerminalRecoveryHandoffGate,
+) -> Result<(), RecoveryError> {
+    store
+        .consume_live_operator_recovery_terminal_handoff_with_gate(gate)
+        .await
+        .map_err(map_live_terminal_recovery_handoff_error)
+}
+
 /// Coarse, redaction-safe recovery failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -892,6 +1149,24 @@ enum RecoveryFinalizeFailpoint {
     AfterEpochCommit,
     BeforeRejoinBarrier,
     AfterRejoinBarrier,
+    /// Interrupt publication after this many exact Active -> PendingHandoff
+    /// sidecars have been durably terminalized.  This models a process loss
+    /// in the sequential fleet publication loop without consuming any live
+    /// handoff.
+    AfterTerminalizingSidecars(usize),
+}
+
+#[cfg(test)]
+impl RecoveryFinalizeFailpoint {
+    fn terminalized_sidecars(self) -> Option<usize> {
+        match self {
+            Self::AfterTerminalizingSidecars(count) => Some(count),
+            Self::BeforeEpochCommit
+            | Self::AfterEpochCommit
+            | Self::BeforeRejoinBarrier
+            | Self::AfterRejoinBarrier => None,
+        }
+    }
 }
 
 /// Authorized coordinator for deterministic inspection and explicit recovery.
@@ -1041,6 +1316,12 @@ where
         {
             return Err(RecoveryError::RecoveryInProgress);
         }
+        if evidence
+            .iter()
+            .any(|item| !item.has_valid_authority_descriptor())
+        {
+            return Err(RecoveryError::CorruptReplica);
+        }
         let source_token = replica_token(&self.integrity_key, source)?;
         let mut target_tokens = targets
             .iter()
@@ -1052,6 +1333,9 @@ where
             .find(|item| item.replica_token == source_token)
             .ok_or(RecoveryError::InvalidRequest)?;
         let source_branch_digest = source_evidence.branch_digest;
+        let source_authority_profile = source_evidence.authority_profile;
+        let source_fixed_placement_policy = source_evidence.fixed_placement_policy;
+        let source_protected_roster_digest = source_evidence.protected_roster_digest;
 
         match basis {
             RecoveryDecisionBasis::VerifiedCommittedMajority => {
@@ -1063,8 +1347,9 @@ where
                 {
                     return Err(RecoveryError::InsufficientAuthority);
                 }
-                if source_evidence.committed_index.is_none()
-                    || source_evidence.applied_index != source_evidence.committed_index
+                if source_evidence.committed_log_id.is_none()
+                    || source_evidence.applied_log_id != source_evidence.committed_log_id
+                    || source_evidence.local_head_log_id != source_evidence.committed_log_id
                 {
                     return Err(RecoveryError::InsufficientAuthority);
                 }
@@ -1072,9 +1357,13 @@ where
                     .iter()
                     .filter(|item| {
                         item.format == RecoveryReplicaFormat::Openraft
-                            && item.applied_index == item.committed_index
-                            && item.committed_index == source_evidence.committed_index
+                            && item.applied_log_id == item.committed_log_id
+                            && item.local_head_log_id == item.committed_log_id
+                            && item.committed_log_id == source_evidence.committed_log_id
                             && item.branch_digest == source_evidence.branch_digest
+                            && item.authority_profile == source_authority_profile
+                            && item.fixed_placement_policy == source_fixed_placement_policy
+                            && item.protected_roster_digest == source_protected_roster_digest
                     })
                     .count();
                 let quorum = (expected_members.len() / 2) + 1;
@@ -1089,6 +1378,24 @@ where
                             .is_none_or(|item| item.branch_digest == source_evidence.branch_digest)
                     })
                 {
+                    return Err(RecoveryError::InsufficientAuthority);
+                }
+                // Every voter left untouched by a verified-majority campaign
+                // must start on the exact clean committed source branch.  The
+                // finalization classifier may later permit its one exact
+                // recovery command to replicate before state-machine apply;
+                // accepting an arbitrary pre-existing tail here would make
+                // that narrow transition proof indistinguishable from a
+                // divergent durable branch.
+                if evidence.iter().any(|item| {
+                    !target_tokens.contains(&item.replica_token)
+                        && (item.committed_log_id != source_evidence.committed_log_id
+                            || item.applied_log_id != source_evidence.committed_log_id
+                            || item.local_head_log_id != source_evidence.committed_log_id
+                            || item.branch_digest != source_evidence.branch_digest
+                            || item.recovery_v2_invariant_state_digest
+                                != source_evidence.recovery_v2_invariant_state_digest)
+                }) {
                     return Err(RecoveryError::InsufficientAuthority);
                 }
             }
@@ -1155,6 +1462,9 @@ where
             source_token,
             target_tokens,
             source_branch_digest,
+            source_authority_profile,
+            source_fixed_placement_policy,
+            source_protected_roster_digest,
             next_recovery_epoch,
             application_sequence_high_water,
             watch_sequence_high_water,
@@ -1228,13 +1538,20 @@ where
                         });
                         return Err(error);
                     }
+                    // Clear the durable sidecar audit bit before publishing
+                    // the authenticated workflow transition.  Reversing
+                    // these writes leaves a crash-resume image which claims
+                    // `resume` while the fleet still requires a success
+                    // audit, and terminalization must correctly reject it.
+                    // Repeating the sidecar transition while the workflow is
+                    // still `AuditPending` is idempotent.
+                    set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, false)?;
                     sqlite::transition_after_audit(
                         &self.integrity_key,
                         plan,
                         backup_root.as_ref(),
                         resume,
                     )?;
-                    set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, false)?;
                     state = resume;
                     audit_completed = true;
                 } else if matches!(
@@ -1388,6 +1705,7 @@ where
         if store.recovery_members() != &plan.body.expected_members {
             return Err(RecoveryError::StalePlan);
         }
+        let limits = sqlite::workflow_limits(&self.integrity_key, plan, backup_root)?;
         let current = resume_execution_state(&self.integrity_key, plan, backup_root)?;
         if !matches!(
             current,
@@ -1398,17 +1716,94 @@ where
         ) {
             return Err(RecoveryError::StalePlan);
         }
+        // Keep this core's admitted snapshot namespace frozen before pinning
+        // the installed artifacts.  Otherwise a live publisher could advance
+        // S1 to S2 between terminal-sidecar publication and descriptor-bound
+        // handoff consumption, permanently wedging a correct recovery.
+        let terminal_handoff_gate = acquire_live_terminal_recovery_handoff_gate(store).await?;
+        // Keep the exact installed target inodes alive across the entire
+        // finalization transaction.  The workflow commits each target's
+        // database/snapshot inode; every irreversible boundary below proves
+        // that the pathname still resolves to those same descriptors.
+        let mut finalization_pins =
+            acquire_finalization_pins(&self.integrity_key, plan, replicas, backup_root, limits)?;
+        // Legacy plans predate OpenRaft and therefore cannot carry a durable
+        // Raft predecessor.  Under the frozen descriptors, capture (or
+        // re-prove) the sole canonical bootstrap predecessor and MAC it into
+        // the workflow before any V2 proposal is possible.
+        let legacy_predecessor = legacy_finalization_predecessor(
+            &self.integrity_key,
+            plan,
+            &mut finalization_pins,
+            backup_root,
+            limits,
+        )?;
         let mut current = current;
         if current == RecoveryExecutionState::AuditPending {
             let resume = resume_audit_state(&self.integrity_key, plan, backup_root)?
                 .ok_or(RecoveryError::BackupCorrupt)?;
+            revalidate_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+                resume != RecoveryExecutionState::AwaitingEpochCommit,
+            )?;
             self.audit_plan_completion(context, plan)?;
+            // Clear the active latch's audit bit before advancing the
+            // authenticated workflow out of AuditPending.  A process loss in
+            // the opposite order would durably advertise Awaiting while
+            // retaining an audit-pending sidecar; later terminalization then
+            // quite correctly rejects that mismatch and wedges resume.
+            // Repeating this operation while the workflow is still
+            // AuditPending is idempotent and remains fenced by the held
+            // finalization descriptors.
+            set_fleet_latches_audit_pending_pinned(plan, &finalization_pins, false)?;
+            revalidate_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+                resume != RecoveryExecutionState::AwaitingEpochCommit,
+            )?;
             sqlite::transition_after_audit(&self.integrity_key, plan, backup_root, resume)?;
-            set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, false)?;
             current = resume;
         }
         if current == RecoveryExecutionState::Rejoined {
-            clear_fleet_latches(&self.integrity_key, plan, replicas)?;
+            revalidate_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+                true,
+            )?;
+            clear_fleet_latches_pinned(
+                plan,
+                &finalization_pins,
+                #[cfg(test)]
+                failpoint.and_then(RecoveryFinalizeFailpoint::terminalized_sidecars),
+            )?;
+            // PendingHandoff is still fenced.  Re-prove the strict suffix at
+            // the actual release boundary, after publishing the terminal
+            // sidecar but before the live core consumes it.
+            revalidate_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+                true,
+            )?;
+            // The live local core opened while the latch was Active, so it
+            // cannot have captured the descriptor-bound terminal handoff.
+            // Consume the newly published handoff through the retained
+            // snapshot namespace before reporting this node rejoined.
+            consume_live_terminal_recovery_handoff(store, &terminal_handoff_gate).await?;
+            revalidate_finalization_pins_after_terminal_consumed(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+            )?;
             return Ok(RecoveryExecutionReport {
                 plan_digest: plan.plan_digest,
                 state: RecoveryExecutionState::Rejoined,
@@ -1419,14 +1814,44 @@ where
             return Err(RecoveryError::InjectedFailure);
         }
         if current == RecoveryExecutionState::AwaitingEpochCommit {
+            // A crash after the leader durably commits the epoch but before
+            // the workflow fsync intentionally leaves Awaiting in the
+            // journal.  It is not safe to issue a fresh transition based on
+            // that stale label.  First distinguish the only resumable case:
+            // the exact held descriptors already satisfy every finalized
+            // predicate.  Any other failed installed-state proof remains
+            // fatal.
+            match classify_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+            )? {
+                FinalizationTransitionState::AllInstalled => {}
+                FinalizationTransitionState::AllFinalized => {
+                    sqlite::record_epoch_committed(&self.integrity_key, plan, backup_root)?;
+                    current = RecoveryExecutionState::EpochCommitted;
+                }
+                FinalizationTransitionState::ExactFinalizeInFlight => {
+                    return Err(RecoveryError::ConsensusUnavailable);
+                }
+                // The leader may have committed immediately before a crash
+                // while one follower has not applied it yet.  Every pinned
+                // descriptor still passed either the exact installed or the
+                // exact finalized predicate above; do not advance the
+                // workflow, rejoin, or latch state until a later attempt
+                // observes a complete finalized fleet.
+                FinalizationTransitionState::MixedConverging => {
+                    return Err(RecoveryError::ConsensusUnavailable);
+                }
+            }
+        }
+        if current == RecoveryExecutionState::AwaitingEpochCommit {
             store
-                .commit_operator_recovery(
-                    recovery_request_id(plan.plan_digest),
-                    plan.body.next_recovery_epoch,
-                    plan.plan_digest.0,
-                    plan.body.fence_high_water,
-                    plan.body.credential_high_water,
-                )
+                .commit_operator_recovery(OperatorRecoveryCommitRequest {
+                    request_id: recovery_request_id(plan.plan_digest),
+                    intent: recovery_v2_intent_from_plan(plan, legacy_predecessor.as_ref())?,
+                })
                 .await
                 .map_err(|error| match error {
                     OperatorRecoveryCommitError::Rejected => RecoveryError::RecoveryEpochRejected,
@@ -1435,6 +1860,34 @@ where
                         RecoveryError::ConsensusUnavailable
                     }
                 })?;
+            match classify_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+            )? {
+                FinalizationTransitionState::AllFinalized => {}
+                // A successful leader reply is not proof that every pinned
+                // follower has applied the command.  Preserve the workflow
+                // at Awaiting and require a full exact proof on retry.
+                FinalizationTransitionState::MixedConverging => {
+                    return Err(RecoveryError::ConsensusUnavailable);
+                }
+                // The local leader reported an applied epoch command, so a
+                // fleet with no finalized descriptor is not an eventual
+                // propagation state.
+                FinalizationTransitionState::AllInstalled => {
+                    return Err(RecoveryError::BackupCorrupt);
+                }
+                // The command is already durably committed but at least one
+                // held state machine has not applied it. Re-proposing would
+                // reuse the deterministic request ID with different command
+                // timing bytes, so preserve Awaiting and let Raft apply
+                // progress on a later retry.
+                FinalizationTransitionState::ExactFinalizeInFlight => {
+                    return Err(RecoveryError::ConsensusUnavailable);
+                }
+            }
             #[cfg(test)]
             if failpoint == Some(RecoveryFinalizeFailpoint::AfterEpochCommit) {
                 return Err(RecoveryError::InjectedFailure);
@@ -1443,11 +1896,27 @@ where
                 .session_operator_recovery_epoch
                 .store(plan.body.next_recovery_epoch, Ordering::Relaxed);
             sqlite::record_epoch_committed(&self.integrity_key, plan, backup_root)?;
+            revalidate_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+                true,
+            )?;
             self.observer.observe(RecoverySignal {
                 state: RecoveryExecutionState::EpochCommitted,
                 alarm: Some(RecoveryAlarm::RecoveryRequired),
             });
         }
+        // An already-committed retry reaches the rejoin barrier without the
+        // branch above, so prove its descriptors here as well.
+        revalidate_finalization_pins(
+            &self.integrity_key,
+            plan,
+            &mut finalization_pins,
+            limits,
+            true,
+        )?;
         #[cfg(test)]
         if failpoint == Some(RecoveryFinalizeFailpoint::BeforeRejoinBarrier) {
             return Err(RecoveryError::InjectedFailure);
@@ -1464,22 +1933,84 @@ where
                 .fetch_add(1, Ordering::Relaxed);
             return Err(RecoveryError::ConsensusUnavailable);
         }
+        revalidate_finalization_pins(
+            &self.integrity_key,
+            plan,
+            &mut finalization_pins,
+            limits,
+            true,
+        )?;
         #[cfg(test)]
         if failpoint == Some(RecoveryFinalizeFailpoint::AfterRejoinBarrier) {
             return Err(RecoveryError::InjectedFailure);
         }
         sqlite::record_rejoin_proven(&self.integrity_key, plan, backup_root)?;
+        revalidate_finalization_pins(
+            &self.integrity_key,
+            plan,
+            &mut finalization_pins,
+            limits,
+            true,
+        )?;
         if let Err(error) = self.audit_plan_completion(context, plan) {
             sqlite::record_audit_pending(&self.integrity_key, plan, backup_root)?;
-            set_fleet_latches_audit_pending(&self.integrity_key, plan, replicas, true)?;
+            set_fleet_latches_audit_pending_pinned(plan, &finalization_pins, true)?;
+            revalidate_finalization_pins(
+                &self.integrity_key,
+                plan,
+                &mut finalization_pins,
+                limits,
+                true,
+            )?;
             self.observer.observe(RecoverySignal {
                 state: RecoveryExecutionState::AuditPending,
                 alarm: Some(RecoveryAlarm::AuditPending),
             });
             return Err(error);
         }
-        sqlite::record_rejoined(&self.integrity_key, plan, backup_root)?;
-        clear_fleet_latches(&self.integrity_key, plan, replicas)?;
+        // Capture and HMAC-seal a common full-log-id terminal proof while all
+        // voters still have the strict Active suffix, then atomically advance
+        // the workflow to Rejoined before publishing any terminal sidecar.
+        record_rejoined_with_terminal_proof(
+            &self.integrity_key,
+            plan,
+            backup_root,
+            &mut finalization_pins,
+            limits,
+        )?;
+        revalidate_finalization_pins(
+            &self.integrity_key,
+            plan,
+            &mut finalization_pins,
+            limits,
+            true,
+        )?;
+        clear_fleet_latches_pinned(
+            plan,
+            &finalization_pins,
+            #[cfg(test)]
+            failpoint.and_then(RecoveryFinalizeFailpoint::terminalized_sidecars),
+        )?;
+        // The strict pre-release proof must be the final observation before
+        // Terminal(PendingHandoff) becomes Consumed and ordinary commands
+        // are permitted again.
+        revalidate_finalization_pins(
+            &self.integrity_key,
+            plan,
+            &mut finalization_pins,
+            limits,
+            true,
+        )?;
+        // See the Rejoined-resume path above.  Terminal(PendingHandoff) is
+        // intentionally not readiness-open until the already-admitted live
+        // core consumes it through its retained snapshot descriptor.
+        consume_live_terminal_recovery_handoff(store, &terminal_handoff_gate).await?;
+        revalidate_finalization_pins_after_terminal_consumed(
+            &self.integrity_key,
+            plan,
+            &mut finalization_pins,
+            limits,
+        )?;
         self.observer.observe(RecoverySignal {
             state: RecoveryExecutionState::Rejoined,
             alarm: None,
@@ -1666,6 +2197,27 @@ fn validate_confirmation(
 
 fn verify_plan(key: &RecoveryIntegrityKey, plan: &RecoveryPlan) -> Result<(), RecoveryError> {
     if plan.body.version != RECOVERY_PLAN_VERSION {
+        return Err(RecoveryError::StalePlan);
+    }
+    if plan
+        .body
+        .evidence
+        .iter()
+        .any(|item| !item.has_valid_authority_descriptor())
+    {
+        return Err(RecoveryError::StalePlan);
+    }
+    let source = plan
+        .body
+        .evidence
+        .iter()
+        .find(|item| item.replica_token == plan.body.source_token)
+        .ok_or(RecoveryError::StalePlan)?;
+    if source.branch_digest != plan.body.source_branch_digest
+        || source.authority_profile != plan.body.source_authority_profile
+        || source.fixed_placement_policy != plan.body.source_fixed_placement_policy
+        || source.protected_roster_digest != plan.body.source_protected_roster_digest
+    {
         return Err(RecoveryError::StalePlan);
     }
     let encoded = serde_json::to_vec(&plan.body).map_err(|_| RecoveryError::StalePlan)?;

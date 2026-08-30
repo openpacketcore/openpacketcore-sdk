@@ -65,9 +65,12 @@ an SCTP-terminating CNF is in scope:
 1. **`opc-libsctp-sys`** provides thin FFI over Linux SCTP socket UAPI and
    minimal `libsctp` helpers where required. It is the **only SCTP workspace
    crate** permitted to contain `unsafe`; follow-on Linux kernel UAPI exceptions
-   such as `opc-linux-xfrm-sys` and `opc-linux-gtpu-sys`, and narrow reviewed
-   FFI boundaries such as `opc-sqlite-file-control-sys`, must be separately and
-   explicitly allowlisted by the same mechanical gate. The SQLite production
+   such as `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`, and
+   `opc-fs-verity-sys`, and narrow reviewed FFI boundaries such as
+   `opc-sqlite-file-control-sys`, must be separately and explicitly allowlisted
+   by the same mechanical gate. The fs-verity boundary is limited to enabling
+   and measuring the fixed version-1, SHA-256, 4096-byte-block profile through
+   already-open file descriptors; it accepts no paths or file contents. The SQLite production
    boundary is limited to `SQLITE_FCNTL_HAS_MOVED`, `SQLITE_FCNTL_VFSNAME`,
    `SQLITE_FCNTL_FILE_POINTER`, and `SQLITE_FCNTL_JOURNAL_POINTER`: it returns
    only movement state or owned duplicate descriptors after authenticating the
@@ -91,8 +94,9 @@ an SCTP-terminating CNF is in scope:
    `scripts/check-management-plane-policy.py --check` token-scans OpenPacketCore
    workspace crate sources and asserts `unsafe` appears only in explicitly
    allowlisted sys crates (`opc-libsctp-sys` and later, reviewed kernel-UAPI
-   boundaries such as `opc-linux-xfrm-sys` and `opc-linux-gtpu-sys`, plus the
-   pinned file-control and test-only VFS boundary in
+   boundaries such as `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`, and the
+   fixed-profile descriptor-only `opc-fs-verity-sys`, plus the pinned
+   file-control and test-only VFS boundary in
    `opc-sqlite-file-control-sys`); the same gate also rejects each allowed sys
    crate if it
    inherits `[workspace.lints]`, rejects it if it lacks the required local unsafe
@@ -100,8 +104,12 @@ an SCTP-terminating CNF is in scope:
    documented by an adjacent `SAFETY:` comment. The CI job runs this gate, so the
    exception cannot silently spread or become undocumented.
 4. **ABI safety.** Every C struct crossing the boundary has a struct-layout
-   (size/alignment/offset) test; the sys crate builds on Linux in CI and
-   compiles to a clean "unsupported platform" stub elsewhere.
+   (size/alignment/offset) test. Kernel-UAPI sys crates build on their admitted
+   targets in CI and fail explicitly elsewhere. In particular,
+   `opc-fs-verity-sys` exposes its descriptor API only on Unix: Linux provides
+   the reviewed ioctl implementation, non-Linux Unix targets compile an
+   explicit unsupported result, and non-Unix targets are outside this crate's
+   admitted platform surface.
 5. **This exception pattern does not reopen ADR 0013.** It authorizes FFI only
    to explicitly reviewed **trusted Linux kernel UAPI** boundaries such as SCTP
    socket/XFRM netlink calls and minimal helper calls that wrap those UAPIs. FFI

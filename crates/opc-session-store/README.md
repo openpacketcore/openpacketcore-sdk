@@ -561,6 +561,32 @@ handshake does not make an opaque `OPCH` payload readable by an older binary.
 
 ### Validated HA construction
 
+#### Snapshot namespace trust contract
+
+The consensus snapshot directory is a private SDK namespace, not a general
+scratch directory. On Linux, admission retains an
+`O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` directory descriptor.
+The admitted descriptor's `fstat` owner must equal the effective UID and its
+mode must satisfy `mode & 022 == 0`; an insecure pre-existing directory is
+rejected. The SDK creates a missing namespace with mode `0700` and creates
+snapshot artifacts with mode `0600`.
+
+After admission, namespace work is directory-FD-relative, so a replacement of
+the parent pathname cannot redirect admitted cleanup, receive, build, install,
+or validation work into a replacement directory. The durable metadata keeps
+logical basenames rather than treating a mutable parent pathname as authority.
+The supported writer model is cooperative SDK processes running under one
+dedicated service UID and serialized by the namespace/database leases.
+
+This is deliberately not a privileged-attacker boundary. It excludes `root`,
+`CAP_DAC_OVERRIDE`, `CAP_FOWNER`, non-cooperating processes with the same
+effective UID, and writable aliases of the retained directory from the trust
+model. POSIX ACLs must not grant an effective group-class write path: the ACL
+group-class mask and the directory mode must remain non-writable. Operators
+must use a dedicated UID, a private parent directory, and no untrusted shared
+UID; owner or mode mismatch fails closed. The contract does not claim universal
+unlink-by-FD semantics or resistance to a privileged actor.
+
 All public durable consensus constructors are Linux-only. Dynamic construction
 returns `DynamicConsensusUnsupportedPlatform` before consensus-owned filesystem
 or schema initialization; fixed construction retains its distinct
@@ -863,7 +889,8 @@ backward. It never selects a branch by counting application rows visible now.
 Snapshot receive/build/promote staging is file-backed and bounded. On restart,
 the adapter validates the one metadata-referenced snapshot before Openraft
 starts, removes only SDK-named interrupted staging files and unreferenced
-promoted snapshots, and fails closed above 8,192 directory entries
+promoted snapshots, and fails closed after inspecting more than 32 directory
+entries (including unrecognized entries)
 or the current snapshot is missing, corrupt, or inconsistent. Snapshot table
 replacement remains one SQLite transaction, so retry after interruption is
 idempotent. Because Openraft schedules snapshot apply and covered-log purge on
@@ -871,6 +898,24 @@ separate workers, purge waits at most ten seconds for the persisted applied
 floor and otherwise fails closed. Fences, lease credentials, application
 sequence, request outcomes, and logical time move together with the
 authoritative state-machine image.
+
+The fixed-immutable authority profile additionally requires Linux fs-verity on
+the snapshot filesystem. The SDK closes all writable aliases, reopens the
+final inode read-only with `O_NOFOLLOW`, enables the fixed v1/SHA-256/4 KiB
+profile with no salt or signature, and only then performs the bounded envelope
+scan outside the primary SQLite lock. Metadata publication remeasures the
+sealed inode in constant time. Build, install, startup, and offline recovery
+fail closed when the filesystem does not support that exact profile or when a
+fixed snapshot is unsealed; a byte-identical mutable replacement is not valid
+fixed-profile evidence. Dynamic authority retains bounded corruption
+detection and does not claim kernel-enforced immutability.
+
+This is not an online repair or upgrade path. An existing pre-fixed or
+unsealed metadata-referenced artifact is never sealed, repaired, or accepted
+automatically on open. Preserve it and perform the reviewed offline
+reseed/recovery/migration procedure before reopening; retrying startup, editing
+snapshot metadata, or copying in a byte-identical replacement does not satisfy
+the fixed-profile boundary.
 
 Runbook: keep traffic and ownership publication closed unless readiness is
 `Ready`. During `catching_up` or `awaiting_quorum`, restore authenticated peer

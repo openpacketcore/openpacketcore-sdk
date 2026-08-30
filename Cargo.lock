@@ -2831,6 +2831,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-fs-verity-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "linux-raw-sys",
+ "tempfile",
+]
+
+[[package]]
 name = "opc-gnmi-server"
 version = "0.2.0"
 dependencies = [
@@ -3696,9 +3705,11 @@ dependencies = [
  "opc-config-model",
  "opc-consensus",
  "opc-crypto",
+ "opc-fs-verity-sys",
  "opc-key",
  "opc-mgmt-audit",
  "opc-redaction",
+ "opc-schema-validate",
  "opc-sqlite-file-control-sys",
  "opc-types",
  "p256 0.14.0",
@@ -3706,6 +3717,7 @@ dependencies = [
  "proptest",
  "rand 0.10.2",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3736,6 +3748,7 @@ dependencies = [
  "opc-session-store",
  "opc-tls",
  "opc-types",
+ "p256 0.14.0",
  "rcgen",
  "rustix",
  "rustls-pki-types",

@@ -82,6 +82,11 @@ jobs:
           python3 scripts/check-management-plane-policy.py --self-test
           python3 scripts/check-management-plane-policy.py --check
 
+      - name: Test SDK-702 release-attestation wrapper environment
+        run: |
+          python3 ci/test-sdk702-release-attest.py
+          bash -n ci/setup-fsverity-tmp.sh
+
       - name: Run opc-proto-diameter corpus generator self-test
         run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
 
@@ -167,6 +172,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
 
       # Each shard builds only its own test targets, so the tree stays far
       # below the former single-job peak that forced `cargo clean` between
@@ -508,6 +516,13 @@ jobs:
         with:
           targets: i686-unknown-linux-gnu
 
+      # The protected-roster snapshot/restart contracts seal their snapshot
+      # artifacts on the dedicated fs-verity filesystem. Build output,
+      # TMPDIR, databases, WALs, sockets, and general process scratch remain
+      # on ordinary storage.
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
         with:
@@ -529,6 +544,7 @@ jobs:
           optimized_roster_contracts=(
             persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal
             persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart
+            persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
             persistent_three_voter_protected_roster_survives_real_os_process_loss
             persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running
             persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart

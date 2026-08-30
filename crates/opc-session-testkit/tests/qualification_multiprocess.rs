@@ -1514,6 +1514,9 @@ impl CanonicalConfigurationManifest {
                 workspace_directory: root.to_path_buf(),
                 database_path: root.join(&paths.database_relative_path),
                 snapshot_directory: root.join(&paths.snapshot_relative_path),
+                snapshot_root_directory: None,
+                snapshot_root_device: None,
+                snapshot_root_inode: None,
                 operation_timeout_millis: self.operation_timeout_millis,
                 transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
             };

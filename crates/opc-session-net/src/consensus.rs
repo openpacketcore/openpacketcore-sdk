@@ -38,7 +38,7 @@ use crate::lifecycle::{
 use crate::membership::SessionMembershipAdmission;
 use crate::protocol::{
     checked_frame_size, checked_wire_frame_size, negotiate_response_frame_size,
-    read_authenticated_frame_within, read_frame, read_frame_within, write_frame_bounded_until,
+    read_authenticated_frame_within, read_frame, write_frame_bounded_until,
     write_frame_bounded_until_cancellable, SessionConsensusBootstrapAck,
     SessionConsensusBootstrapHello, SessionConsensusBootstrapRequest,
     SessionConsensusBootstrapResponse, SessionConsensusTransportRequest,
@@ -349,6 +349,11 @@ struct ConsensusConnection {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     response_frame_size: usize,
     request_frame_size: usize,
+    // Installed only when the cold coordinator publishes this exact
+    // authenticated bootstrap. Cached-lane retirement carries the token back
+    // to the coordinator so a delayed predecessor cannot reopen a probe gate
+    // after a same-epoch successor was already accepted.
+    admission_attempt_id: Option<uuid::Uuid>,
     lifecycle: ConnectionLifecycle,
     // This is set only after a complete response has passed call-ID
     // correlation and payload validation. TCP/TLS establishment and attempted
@@ -383,6 +388,28 @@ struct ConsensusColdConnectionEpoch {
     material_epoch: Option<opc_tls::TlsMaterialEpoch>,
 }
 
+impl ConsensusColdConnectionEpoch {
+    /// Return whether this is a causally later connector epoch for the same
+    /// coordinator. Reauthentication generations fence every preceding
+    /// connector; within one generation TLS material publication epochs are
+    /// monotonically ordered. A material-tracking mode change is deliberately
+    /// not ordered, so it cannot displace a still-relevant negative gate.
+    fn is_strictly_newer_than(self, other: Self) -> bool {
+        if self.consensus_identity != other.consensus_identity
+            || self.remote_node_id != other.remote_node_id
+        {
+            return false;
+        }
+        if self.reauthentication_generation != other.reauthentication_generation {
+            return self.reauthentication_generation > other.reauthentication_generation;
+        }
+        match (self.material_epoch, other.material_epoch) {
+            (Some(current), Some(previous)) => current > previous,
+            (None, None) | (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ConsensusColdAttemptReceipt {
     terminal: std::sync::Mutex<Option<SessionConsensusPeerError>>,
@@ -395,6 +422,13 @@ struct ConsensusColdAttemptReceipt {
 struct ConsensusRemoteRetirementProbeGate {
     epoch: ConsensusColdConnectionEpoch,
     next_probe_at: Option<tokio::time::Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConsensusAcceptedConnection {
+    epoch: ConsensusColdConnectionEpoch,
+    attempt_id: uuid::Uuid,
+    peer_certificate_effective_expiry: Option<opc_types::Timestamp>,
 }
 
 impl ConsensusRemoteRetirementProbeGate {
@@ -410,6 +444,21 @@ impl ConsensusRemoteRetirementProbeGate {
             && self
                 .next_probe_at
                 .is_some_and(|next_probe_at| now >= next_probe_at)
+    }
+
+    fn waitable_probe_at(
+        self,
+        epoch: ConsensusColdConnectionEpoch,
+        call_deadline: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        if self.epoch != epoch {
+            return None;
+        }
+        let probe_at = self.next_probe_at?;
+        probe_at
+            .checked_add(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout())
+            .filter(|complete_probe_deadline| *complete_probe_deadline <= call_deadline)
+            .map(|_| probe_at)
     }
 }
 
@@ -467,6 +516,7 @@ struct ConsensusColdConnectionState {
     phase: ConsensusColdConnectionPhase,
     no_admission_marker: uuid::Uuid,
     remote_retirement_probe_gate: Option<ConsensusRemoteRetirementProbeGate>,
+    latest_accepted_connection: Option<ConsensusAcceptedConnection>,
 }
 
 struct ConsensusColdConnectionCoordinator {
@@ -494,6 +544,57 @@ impl ConsensusColdClaimLockHook {
     }
 }
 
+// This test-only task-local seam pauses an outbound setup only after its
+// complete bootstrap has been accepted and validated. It lets the regression
+// test advance time between physical establishment and cold-pool admission
+// without exposing a production control surface.
+#[cfg(test)]
+struct ConsensusPostAcceptedBootstrapHook {
+    entered: Notify,
+    release: Notify,
+    arrived: AtomicBool,
+}
+
+#[cfg(test)]
+impl ConsensusPostAcceptedBootstrapHook {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Notify::new(),
+            release: Notify::new(),
+            arrived: AtomicBool::new(false),
+        })
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CONSENSUS_POST_ACCEPTED_BOOTSTRAP_HOOK: Arc<ConsensusPostAcceptedBootstrapHook>;
+    static CONSENSUS_PRE_READY_PUBLICATION_HOOK: Arc<ConsensusPostAcceptedBootstrapHook>;
+}
+
+#[cfg(test)]
+async fn pause_after_accepted_consensus_bootstrap() {
+    let Ok(hook) = CONSENSUS_POST_ACCEPTED_BOOTSTRAP_HOOK.try_with(Arc::clone) else {
+        return;
+    };
+    hook.arrived.store(true, Ordering::Release);
+    hook.entered.notify_one();
+    hook.release.notified().await;
+}
+
+// This second test-only seam is deliberately after the detached attempt's
+// outer deadline fence and before the coordinator lock. It makes the lock-wait
+// deadline crossing deterministic without changing production scheduling.
+#[cfg(test)]
+async fn pause_before_consensus_ready_publication() {
+    let Ok(hook) = CONSENSUS_PRE_READY_PUBLICATION_HOOK.try_with(Arc::clone) else {
+        return;
+    };
+    hook.arrived.store(true, Ordering::Release);
+    hook.entered.notify_one();
+    hook.release.notified().await;
+}
+
 #[derive(Clone, Copy)]
 enum ConsensusStagedConnectionInvalidation {
     Shutdown,
@@ -505,7 +606,8 @@ enum ConsensusStagedConnectionInvalidation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConsensusPublishReadyOutcome {
     Published,
-    Retired,
+    TimedOut,
+    Retired(RetirementReason),
     Superseded,
 }
 
@@ -516,6 +618,7 @@ impl ConsensusColdConnectionCoordinator {
                 phase: ConsensusColdConnectionPhase::Idle,
                 no_admission_marker: uuid::Uuid::nil(),
                 remote_retirement_probe_gate: None,
+                latest_accepted_connection: None,
             }),
             changed: Notify::new(),
             #[cfg(test)]
@@ -527,50 +630,86 @@ impl ConsensusColdConnectionCoordinator {
         &self,
         attempt_id: uuid::Uuid,
         epoch: ConsensusColdConnectionEpoch,
-        connection: Box<ConsensusConnection>,
+        mut connection: Box<ConsensusConnection>,
     ) -> ConsensusPublishReadyOutcome {
         let mut state = self.state.lock().await;
-        let Some(receipt) = (match &state.phase {
+        let Some((receipt, attempt_deadline)) = (match &state.phase {
             ConsensusColdConnectionPhase::Connecting {
                 attempt_id: current_attempt_id,
                 epoch: current_epoch,
                 receipt,
+                attempt_deadline,
                 ..
             } if *current_attempt_id == attempt_id && *current_epoch == epoch => {
-                Some(Arc::clone(receipt))
+                Some((Arc::clone(receipt), *attempt_deadline))
             }
             _ => None,
         }) else {
             return ConsensusPublishReadyOutcome::Superseded;
         };
-        if connection
-            .lifecycle
-            .retirement(tokio::time::Instant::now())
-            .is_some()
-        {
+        let now = tokio::time::Instant::now();
+        let no_admission = if now >= attempt_deadline {
+            Some((
+                SessionConsensusPeerError::Timeout,
+                ConsensusPublishReadyOutcome::TimedOut,
+            ))
+        } else {
+            connection.lifecycle.retirement(now).map(|reason| {
+                (
+                    SessionConsensusPeerError::Unavailable,
+                    ConsensusPublishReadyOutcome::Retired(reason),
+                )
+            })
+        };
+        if let Some((error, outcome)) = no_admission {
             // Accepted bootstrap bytes are not Call admission. Every caller
             // joined to this exact setup must observe one no-admission edge;
             // only a genuinely later logical call may start another setup.
             state.phase = ConsensusColdConnectionPhase::Failed {
                 attempt_id,
                 epoch,
-                error: SessionConsensusPeerError::Unavailable,
+                error,
             };
-            receipt.publish(SessionConsensusPeerError::Unavailable);
+            receipt.publish(error);
             state.no_admission_marker = attempt_id;
-            Self::arm_remote_retirement_probe_gate(&mut state, epoch);
+            // Only credential lifecycle retirement justifies the durable
+            // probe gate. A local deadline or maximum-age overrun retains any
+            // existing gate but must not create one; the ordinary reconnect
+            // gate already bounds a later setup attempt.
+            if matches!(
+                outcome,
+                ConsensusPublishReadyOutcome::Retired(reason)
+                    if is_credential_lifecycle_retirement(reason)
+            ) {
+                Self::arm_remote_retirement_probe_gate(&mut state, epoch);
+            }
             drop(state);
             self.changed.notify_waiters();
-            return ConsensusPublishReadyOutcome::Retired;
+            return outcome;
         }
+        connection.admission_attempt_id = Some(attempt_id);
+        state.latest_accepted_connection = Some(ConsensusAcceptedConnection {
+            epoch,
+            attempt_id,
+            peer_certificate_effective_expiry: connection
+                .lifecycle
+                .peer_certificate_effective_expiry(),
+        });
         state.phase = ConsensusColdConnectionPhase::Ready {
             attempt_id,
             epoch,
             connection,
         };
         // A usable authenticated Accepted bootstrap proves that this exact
-        // peer/epoch is no longer remotely retired.
-        state.remote_retirement_probe_gate = None;
+        // peer/epoch is no longer remotely retired. A delayed older attempt
+        // cannot, however, erase a causally newer or incomparable gate that
+        // arrived while its physical setup was in flight.
+        let clear_remote_retirement_probe_gate = state
+            .remote_retirement_probe_gate
+            .is_none_or(|gate| gate.epoch == epoch || epoch.is_strictly_newer_than(gate.epoch));
+        if clear_remote_retirement_probe_gate {
+            state.remote_retirement_probe_gate = None;
+        }
         drop(state);
         self.changed.notify_waiters();
         ConsensusPublishReadyOutcome::Published
@@ -662,6 +801,15 @@ impl ConsensusColdConnectionCoordinator {
         state: &mut ConsensusColdConnectionState,
         epoch: ConsensusColdConnectionEpoch,
     ) {
+        if state
+            .remote_retirement_probe_gate
+            .is_some_and(|gate| gate.epoch != epoch && !epoch.is_strictly_newer_than(gate.epoch))
+        {
+            // An authenticated result is authoritative only for the epoch
+            // that produced it. A delayed old attempt cannot replace a gate
+            // for newer reauthentication or TLS material.
+            return;
+        }
         let now = tokio::time::Instant::now();
         state.remote_retirement_probe_gate = Some(ConsensusRemoteRetirementProbeGate {
             epoch,
@@ -674,13 +822,45 @@ impl ConsensusColdConnectionCoordinator {
     fn seed_credential_retirement_probe_gate(
         state: &mut ConsensusColdConnectionState,
         epoch: ConsensusColdConnectionEpoch,
+        admission_attempt_id: Option<uuid::Uuid>,
+        peer_certificate_effective_expiry: Option<opc_types::Timestamp>,
+        reason: RetirementReason,
     ) {
+        let retirement_is_superseded = state.latest_accepted_connection.is_some_and(|accepted| {
+            if epoch != accepted.epoch {
+                return accepted.epoch.is_strictly_newer_than(epoch);
+            }
+            matches!(
+                reason,
+                RetirementReason::PeerLeafExpiry | RetirementReason::PeerCertificateChainExpiry
+            ) && admission_attempt_id.is_some_and(|attempt_id| attempt_id != accepted.attempt_id)
+                && peer_certificate_effective_expiry
+                    .zip(accepted.peer_certificate_effective_expiry)
+                    .is_some_and(|(retired, current)| current > retired)
+        });
+        if retirement_is_superseded {
+            // Primary and overflow lanes can hold different authenticated
+            // connections under one local epoch because remote certificate
+            // replacement is not part of that epoch. Once a later bootstrap
+            // is accepted, retirement of an older cached lane is stale
+            // evidence and must not reopen the just-cleared probe gate. A
+            // missing/equal credential evidence stays conservative, local
+            // credential expiry under the same material epoch always remains
+            // applicable, and retirement of the latest accepted connection
+            // still seeds normally.
+            return;
+        }
         if state
             .remote_retirement_probe_gate
-            .is_some_and(|gate| gate.epoch == epoch)
+            .is_some_and(|gate| gate.epoch == epoch || !epoch.is_strictly_newer_than(gate.epoch))
         {
-            // A failed due-now probe owns the future window. A concurrent
-            // lane retirement cannot shorten, reset, or extend it.
+            // A credential reaper reports the epoch its cached connection
+            // was admitted under, which can lag a newer connector epoch.
+            // Preserve an equal gate without shortening, resetting, or
+            // extending its failed-probe window; preserve a causally newer
+            // gate against a delayed stale reaper. A later connector epoch,
+            // however, must replace an older exact-epoch gate so its own
+            // cached credential retirement has one immediate probe.
             return;
         }
         state.remote_retirement_probe_gate = Some(ConsensusRemoteRetirementProbeGate {
@@ -694,13 +874,21 @@ impl ConsensusColdConnectionCoordinator {
     async fn seed_credential_retirement_probe(
         &self,
         epoch: ConsensusColdConnectionEpoch,
+        admission_attempt_id: Option<uuid::Uuid>,
+        peer_certificate_effective_expiry: Option<opc_types::Timestamp>,
         reason: RetirementReason,
     ) {
         if !is_credential_lifecycle_retirement(reason) {
             return;
         }
         let mut state = self.state.lock().await;
-        Self::seed_credential_retirement_probe_gate(&mut state, epoch);
+        Self::seed_credential_retirement_probe_gate(
+            &mut state,
+            epoch,
+            admission_attempt_id,
+            peer_certificate_effective_expiry,
+            reason,
+        );
         drop(state);
         self.changed.notify_waiters();
     }
@@ -751,7 +939,13 @@ impl ConsensusColdConnectionCoordinator {
                 state.no_admission_marker = current_attempt_id;
             }
             if credential_retirement.is_some_and(is_credential_lifecycle_retirement) {
-                Self::seed_credential_retirement_probe_gate(&mut state, epoch);
+                Self::seed_credential_retirement_probe_gate(
+                    &mut state,
+                    epoch,
+                    connection.admission_attempt_id,
+                    connection.lifecycle.peer_certificate_effective_expiry(),
+                    credential_retirement.expect("credential retirement reason"),
+                );
             }
             let seeded = credential_retirement.is_some_and(is_credential_lifecycle_retirement);
             drop(state);
@@ -914,7 +1108,7 @@ async fn reap_cached_consensus_connection(
     tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     reauthentication: SessionReauthenticationControl,
     edge_key: [u8; 32],
-    epoch: ConsensusColdConnectionEpoch,
+    peer_epoch: ConsensusColdConnectionEpoch,
     reconnect_gate: Arc<ReconnectGate>,
 ) {
     let mut reauthentication_rx = reauthentication.subscribe();
@@ -952,16 +1146,38 @@ async fn reap_cached_consensus_connection(
                     &edge_key,
                 );
                 if let Some(reason) = connection.lifecycle.retirement(now) {
-                    let credential_retirement = is_credential_lifecycle_retirement(reason)
-                        && connection.lifecycle.admitted_generation()
-                            == epoch.reauthentication_generation
-                        && connection.lifecycle.admitted_material_epoch() == epoch.material_epoch;
+                    let credential_retirement =
+                        is_credential_lifecycle_retirement(reason).then(|| {
+                            (
+                                ConsensusColdConnectionEpoch {
+                                    // The reaper is fixed to one lane and its peer
+                                    // identity never changes. Its cached connection
+                                    // may, however, be replaced by a later admitted
+                                    // successor before this retirement is observed.
+                                    consensus_identity: peer_epoch.consensus_identity,
+                                    remote_node_id: peer_epoch.remote_node_id,
+                                    reauthentication_generation: connection
+                                        .lifecycle
+                                        .admitted_generation(),
+                                    material_epoch: connection.lifecycle.admitted_material_epoch(),
+                                },
+                                connection.admission_attempt_id,
+                                connection.lifecycle.peer_certificate_effective_expiry(),
+                            )
+                        });
                     let retired = cached.take();
                     drop(cached);
                     drop(retired);
-                    if credential_retirement {
+                    if let Some((epoch, admission_attempt_id, peer_certificate_effective_expiry)) =
+                        credential_retirement
+                    {
                         pool.cold_connection
-                            .seed_credential_retirement_probe(epoch, reason)
+                            .seed_credential_retirement_probe(
+                                epoch,
+                                admission_attempt_id,
+                                peer_certificate_effective_expiry,
+                                reason,
+                            )
                             .await;
                     }
                     continue;
@@ -1140,6 +1356,7 @@ impl ConsensusColdConnector {
                 writer,
                 response_frame_size,
                 request_frame_size,
+                admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
                 idle_deadline_origin: tls_completed_at,
@@ -1164,6 +1381,7 @@ impl ConsensusColdConnector {
             writer: Box::new(writer),
             response_frame_size,
             request_frame_size,
+            admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(
                 self.lifecycle_policy,
                 established_at,
@@ -1247,6 +1465,9 @@ enum ConsensusColdConnectionAction {
     Failed(SessionConsensusPeerError),
     NoAdmission(SessionConsensusPeerError),
     Retry,
+    WaitForRemoteRetirementProbe {
+        probe_at: tokio::time::Instant,
+    },
     Wait {
         attempt_id: uuid::Uuid,
         epoch: ConsensusColdConnectionEpoch,
@@ -1345,9 +1566,12 @@ async fn run_detached_consensus_connection_attempt(
             return;
         }
         Some(ReconnectAdmission::Superseded) | None => {
-            coordinator
-                .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Unavailable)
-                .await;
+            let error = if tokio::time::Instant::now() >= attempt_deadline {
+                SessionConsensusPeerError::Timeout
+            } else {
+                SessionConsensusPeerError::Unavailable
+            };
+            coordinator.publish_failure(attempt_id, epoch, error).await;
             return;
         }
     };
@@ -1397,6 +1621,13 @@ async fn run_detached_consensus_connection_attempt(
             ),
         }
     };
+    #[cfg(test)]
+    if matches!(
+        &outcome,
+        DetachedConsensusConnectionOutcome::Established(Ok(_))
+    ) {
+        pause_after_accepted_consensus_bootstrap().await;
+    }
 
     let connection = match outcome {
         DetachedConsensusConnectionOutcome::Established(Ok(connection))
@@ -1454,6 +1685,27 @@ async fn run_detached_consensus_connection_attempt(
         }
     };
 
+    // `timeout_at` and scheduling races are not sufficient at the exact
+    // boundary: publish itself is the admission point.  Fence it again here.
+    if tokio::time::Instant::now() >= attempt_deadline {
+        coordinator
+            .publish_no_admission(attempt_id, epoch, SessionConsensusPeerError::Timeout)
+            .await;
+        record_consensus_client_connection_failure(SessionConsensusPeerError::Timeout);
+        METRICS
+            .session_net_reconnect_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .session_net_reconnect_failures
+            .fetch_add(1, Ordering::Relaxed);
+        reconnect_attempt.failed();
+        attempt_metrics.finish();
+        return;
+    }
+
+    #[cfg(test)]
+    pause_before_consensus_ready_publication().await;
+
     match coordinator
         .publish_ready(attempt_id, epoch, connection)
         .await
@@ -1465,7 +1717,19 @@ async fn run_detached_consensus_connection_attempt(
             attempt_metrics.finish();
             reconnect_attempt.succeeded();
         }
-        ConsensusPublishReadyOutcome::Retired => {
+        ConsensusPublishReadyOutcome::TimedOut => {
+            record_consensus_client_connection_failure(SessionConsensusPeerError::Timeout);
+            METRICS
+                .session_net_reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .session_net_reconnect_failures
+                .fetch_add(1, Ordering::Relaxed);
+            attempt_metrics.finish();
+            reconnect_attempt.failed();
+            return;
+        }
+        ConsensusPublishReadyOutcome::Retired(_) => {
             // The authenticated setup completed, but its own immutable
             // lifecycle evidence forbade a Call before the lock-held publish
             // transition. Keep the reconnect cooldown failed and give every
@@ -1796,7 +2060,7 @@ impl RemoteSessionConsensusPeer {
 
     async fn claim_or_start_cold_connection(
         &self,
-        connect_deadline: tokio::time::Instant,
+        call_deadline: tokio::time::Instant,
     ) -> Result<ConsensusConnection, SessionConsensusPeerError> {
         let connector = self.cold_connector();
         let coordinator = &self.connection_pool.cold_connection;
@@ -1809,6 +2073,11 @@ impl RemoteSessionConsensusPeer {
         let mut joined_attempt_id = None;
         let mut joined_attempt_epoch = None;
         let mut joined_receipt = None;
+        // The remote-retirement gate is pre-Call admission state, so it may
+        // consume the whole logical deadline. Once this caller has actually
+        // admitted or joined a setup, fix its cold budget once; notification
+        // wakeups and successor epochs must not replenish it.
+        let mut cold_connect_deadline = None;
         loop {
             let epoch = connector.epoch();
             if joined_attempt_epoch == Some(epoch) {
@@ -1819,7 +2088,7 @@ impl RemoteSessionConsensusPeer {
                     return Err(error);
                 }
             }
-            if tokio::time::Instant::now() >= connect_deadline {
+            if tokio::time::Instant::now() >= call_deadline {
                 return Err(SessionConsensusPeerError::Timeout);
             }
             self.connection_pool
@@ -1871,17 +2140,45 @@ impl RemoteSessionConsensusPeer {
                     joined_receipt = None;
                 }
                 let now = tokio::time::Instant::now();
+                if now >= call_deadline {
+                    // The caller may have reached its exact logical boundary
+                    // while awaiting the coordinator lock. Do not let that
+                    // scheduler delay launch a detached physical probe beyond
+                    // the deadline that admitted the wait.
+                    return Err(SessionConsensusPeerError::Timeout);
+                }
                 if state
                     .remote_retirement_probe_gate
                     .is_some_and(|gate| gate.blocks(epoch, now))
                 {
-                    // A remote peer authenticated this exact epoch and
-                    // declined bootstrap. This is a shared negative
-                    // admission result, so no blocked caller can reach an
-                    // Openraft Call or begin another physical setup.
-                    ConsensusColdConnectionAction::NoAdmission(
-                        SessionConsensusPeerError::Unavailable,
-                    )
+                    match state
+                        .remote_retirement_probe_gate
+                        .and_then(|gate| gate.waitable_probe_at(epoch, call_deadline))
+                    {
+                        Some(probe_at) => {
+                            // Do not hold the coordinator lock while this
+                            // logical caller awaits the one fixed probe
+                            // boundary. Admission reserves the full fixed cold
+                            // setup budget after that boundary, so short
+                            // Openraft RPCs can never be parked in the tail of
+                            // a retirement window. A newer local epoch or
+                            // coordinator publication wakes it to re-evaluate
+                            // early.
+                            ConsensusColdConnectionAction::WaitForRemoteRetirementProbe { probe_at }
+                        }
+                        None => {
+                            // This caller's original logical budget cannot
+                            // contain both the shared probe boundary and a
+                            // complete cold setup. Preserve a prompt pre-Call
+                            // no-admission result instead of occupying a short
+                            // Openraft RPC until Timeout; doing so keeps the
+                            // healthy-quorum path live while still admitting
+                            // zero physical setups.
+                            ConsensusColdConnectionAction::NoAdmission(
+                                SessionConsensusPeerError::Unavailable,
+                            )
+                        }
+                    }
                 } else if joined_no_admission_marker
                     .is_some_and(|marker| marker != state.no_admission_marker)
                     && !terminal_receipt_is_superseded
@@ -1960,10 +2257,17 @@ impl RemoteSessionConsensusPeer {
                         } if current_epoch == epoch => {
                             let now = tokio::time::Instant::now();
                             if let Some(reason) = connection.lifecycle.retirement(now) {
+                                let admission_attempt_id = connection.admission_attempt_id;
+                                let peer_certificate_effective_expiry =
+                                    connection.lifecycle.peer_certificate_effective_expiry();
                                 drop(connection);
                                 if is_credential_lifecycle_retirement(reason) {
                                     ConsensusColdConnectionCoordinator::seed_credential_retirement_probe_gate(
-                                        &mut state, epoch,
+                                        &mut state,
+                                        epoch,
+                                        admission_attempt_id,
+                                        peer_certificate_effective_expiry,
+                                        reason,
                                     );
                                 } else {
                                     self.connection_pool
@@ -2062,6 +2366,7 @@ impl RemoteSessionConsensusPeer {
                 }
             };
 
+            let mut probe_wait = None;
             match action {
                 ConsensusColdConnectionAction::Ready(connection) => {
                     coordinator.changed.notify_waiters();
@@ -2078,6 +2383,9 @@ impl RemoteSessionConsensusPeer {
                     return Err(error);
                 }
                 ConsensusColdConnectionAction::Retry => continue,
+                ConsensusColdConnectionAction::WaitForRemoteRetirementProbe { probe_at } => {
+                    probe_wait = Some(probe_at);
+                }
                 ConsensusColdConnectionAction::Spawn {
                     attempt_id,
                     epoch,
@@ -2089,6 +2397,9 @@ impl RemoteSessionConsensusPeer {
                     joined_attempt_id = Some(attempt_id);
                     joined_attempt_epoch = Some(epoch);
                     joined_receipt = Some(receipt);
+                    cold_connect_deadline.get_or_insert_with(|| {
+                        contained_cold_connect_deadline(tokio::time::Instant::now(), call_deadline)
+                    });
                     let attempt = run_detached_consensus_connection_attempt(
                         connector.clone(),
                         Arc::clone(coordinator),
@@ -2126,8 +2437,19 @@ impl RemoteSessionConsensusPeer {
                     joined_attempt_id = Some(attempt_id);
                     joined_attempt_epoch = Some(epoch);
                     joined_receipt = Some(receipt);
+                    cold_connect_deadline.get_or_insert_with(|| {
+                        contained_cold_connect_deadline(tokio::time::Instant::now(), call_deadline)
+                    });
                 }
             }
+
+            let (wait_deadline, probe_boundary_wins) = match probe_wait {
+                Some(probe_at) => (probe_at.min(call_deadline), probe_at <= call_deadline),
+                None => (
+                    cold_connect_deadline.expect("cold setup actions install a bounded deadline"),
+                    false,
+                ),
+            };
 
             tokio::select! {
                 biased;
@@ -2146,8 +2468,10 @@ impl RemoteSessionConsensusPeer {
                         material_epoch,
                     );
                 }
-                _ = tokio::time::sleep_until(connect_deadline) => {
-                    return Err(SessionConsensusPeerError::Timeout);
+                _ = tokio::time::sleep_until(wait_deadline) => {
+                    if !probe_boundary_wins {
+                        return Err(SessionConsensusPeerError::Timeout);
+                    }
                 }
             }
         }
@@ -2201,27 +2525,33 @@ impl RemoteSessionConsensusPeer {
                         *connection_slot = Some(connection);
                     } else if let Some(reason) = connection.lifecycle.retirement(now) {
                         let epoch = self.connection_epoch(&connection);
-                        self.seed_connection_credential_retirement_probe(epoch, reason)
-                            .await;
+                        self.seed_connection_credential_retirement_probe(
+                            epoch,
+                            connection.admission_attempt_id,
+                            connection.lifecycle.peer_certificate_effective_expiry(),
+                            reason,
+                        )
+                        .await;
                     }
                 }
                 return result;
             }
             if let Some(reason) = connection.lifecycle.retirement(now) {
                 let epoch = self.connection_epoch(&connection);
-                self.seed_connection_credential_retirement_probe(epoch, reason)
-                    .await;
+                self.seed_connection_credential_retirement_probe(
+                    epoch,
+                    connection.admission_attempt_id,
+                    connection.lifecycle.peer_certificate_effective_expiry(),
+                    reason,
+                )
+                .await;
             }
             METRICS
                 .session_net_reconnect_attempts
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        let connect_deadline =
-            contained_cold_connect_deadline(tokio::time::Instant::now(), deadline);
-        let mut connection = self
-            .claim_or_start_cold_connection(connect_deadline)
-            .await?;
+        let mut connection = self.claim_or_start_cold_connection(deadline).await?;
         let now = tokio::time::Instant::now();
         let current_generation = self.reauthentication.generation();
         let current_material_epoch = self
@@ -2248,8 +2578,13 @@ impl RemoteSessionConsensusPeer {
             } else if let Some(reason) = retirement {
                 if is_credential_lifecycle_retirement(reason) {
                     let epoch = self.connection_epoch(&connection);
-                    self.seed_connection_credential_retirement_probe(epoch, reason)
-                        .await;
+                    self.seed_connection_credential_retirement_probe(
+                        epoch,
+                        connection.admission_attempt_id,
+                        connection.lifecycle.peer_certificate_effective_expiry(),
+                        reason,
+                    )
+                    .await;
                 } else {
                     self.connection_pool
                         .reconnect_gate
@@ -2290,8 +2625,13 @@ impl RemoteSessionConsensusPeer {
                 *connection_slot = Some(connection);
             } else if let Some(reason) = connection.lifecycle.retirement(now) {
                 let epoch = self.connection_epoch(&connection);
-                self.seed_connection_credential_retirement_probe(epoch, reason)
-                    .await;
+                self.seed_connection_credential_retirement_probe(
+                    epoch,
+                    connection.admission_attempt_id,
+                    connection.lifecycle.peer_certificate_effective_expiry(),
+                    reason,
+                )
+                .await;
             }
         }
         result
@@ -2371,11 +2711,18 @@ impl RemoteSessionConsensusPeer {
     async fn seed_connection_credential_retirement_probe(
         &self,
         epoch: ConsensusColdConnectionEpoch,
+        admission_attempt_id: Option<uuid::Uuid>,
+        peer_certificate_effective_expiry: Option<opc_types::Timestamp>,
         reason: RetirementReason,
     ) {
         self.connection_pool
             .cold_connection
-            .seed_credential_retirement_probe(epoch, reason)
+            .seed_credential_retirement_probe(
+                epoch,
+                admission_attempt_id,
+                peer_certificate_effective_expiry,
+                reason,
+            )
             .await;
     }
 
@@ -2532,6 +2879,8 @@ pub struct SessionConsensusServer {
     rpc_timeout: Duration,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
+    #[cfg(test)]
+    post_accept_setup_hook: Option<Arc<ConsensusAcceptedSetupHook>>,
 }
 
 impl fmt::Debug for SessionConsensusServer {
@@ -2622,6 +2971,8 @@ impl SessionConsensusServer {
             rpc_timeout: DEFAULT_CONSENSUS_RPC_TIMEOUT,
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
+            #[cfg(test)]
+            post_accept_setup_hook: None,
         }
     }
 
@@ -2752,6 +3103,8 @@ impl SessionConsensusServer {
         let rpc_timeout = self.rpc_timeout;
         let lifecycle_policy = self.lifecycle_policy;
         let reauthentication = self.reauthentication;
+        #[cfg(test)]
+        let post_accept_setup_hook = self.post_accept_setup_hook;
         let accept_cancellation = cancellation.clone();
         let task_registry = connection_tasks.clone();
 
@@ -2763,6 +3116,15 @@ impl SessionConsensusServer {
                 };
                 let accepted = listener.accept().await;
                 let Ok((stream, _peer_addr)) = accepted else {
+                    continue;
+                };
+                // One accepted socket gets one non-renewable setup interval.
+                // Capture it before registry contention or child scheduling so
+                // TLS, Hello, authority admission, and Accepted cannot each
+                // replenish the listener's setup budget.
+                let Some(setup_deadline) = tokio::time::Instant::now().checked_add(idle_timeout)
+                else {
+                    // A later unrepresentable instant must fail closed.
                     continue;
                 };
                 let mut registry = task_registry
@@ -2779,8 +3141,15 @@ impl SessionConsensusServer {
                 let cancellation = accept_cancellation.clone();
                 let shutdown_rx = shutdown_rx.clone();
                 let reauthentication = reauthentication.clone();
+                #[cfg(test)]
+                let post_accept_setup_hook = post_accept_setup_hook.clone();
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
+                    #[cfg(test)]
+                    if let Some(hook) = post_accept_setup_hook {
+                        hook.entered.notify_one();
+                        hook.release.notified().await;
+                    }
                     let mut attempt_metrics = ConnectionAttemptMetricGuard::started();
                     let result = handle_consensus_connection(
                         stream,
@@ -2790,6 +3159,7 @@ impl SessionConsensusServer {
                         handler_executions,
                         max_frame_size,
                         idle_timeout,
+                        setup_deadline,
                         rpc_timeout,
                         cancellation,
                         shutdown_rx,
@@ -2817,6 +3187,22 @@ impl SessionConsensusServer {
             },
             bound_addr,
         ))
+    }
+}
+
+#[cfg(test)]
+struct ConsensusAcceptedSetupHook {
+    entered: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl ConsensusAcceptedSetupHook {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Notify::new(),
+            release: Notify::new(),
+        })
     }
 }
 
@@ -3085,12 +3471,16 @@ async fn handle_consensus_connection(
     handler_executions: Arc<Semaphore>,
     max_frame_size: usize,
     idle_timeout: Duration,
+    setup_deadline: tokio::time::Instant,
     rpc_timeout: Duration,
     cancellation: Arc<AtomicBool>,
     server_shutdown: tokio::sync::watch::Receiver<bool>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 ) -> Result<(), ProtocolError> {
+    if tokio::time::Instant::now() >= setup_deadline {
+        return Err(consensus_setup_timeout_error());
+    }
     configure_consensus_tcp_socket(&stream).map_err(ProtocolError::Io)?;
     if let Some(tls_config) = tls_config {
         let generation = reauthentication.generation();
@@ -3099,14 +3489,9 @@ async fn handle_consensus_connection(
             .map_err(|_| ProtocolError::Authentication)?;
         let acceptor =
             tokio_rustls::TlsAcceptor::from(consensus_server_tls_config(handshake.rustls_config()));
-        let tls_stream = tokio::time::timeout(idle_timeout, acceptor.accept(stream))
+        let tls_stream = tokio::time::timeout_at(setup_deadline, acceptor.accept(stream))
             .await
-            .map_err(|_| {
-                ProtocolError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "consensus TLS handshake timed out",
-                ))
-            })?
+            .map_err(|_| consensus_setup_timeout_error())?
             .map_err(classify_tls_io_error)?;
         let established_at = tokio::time::Instant::now();
         if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
@@ -3144,6 +3529,7 @@ async fn handle_consensus_connection(
             handler_executions,
             max_frame_size,
             idle_timeout,
+            setup_deadline,
             rpc_timeout,
             &cancellation,
             server_shutdown,
@@ -3163,6 +3549,7 @@ async fn handle_consensus_connection(
             handler_executions,
             max_frame_size,
             idle_timeout,
+            setup_deadline,
             rpc_timeout,
             &cancellation,
             server_shutdown,
@@ -3173,10 +3560,17 @@ async fn handle_consensus_connection(
     }
 }
 
+fn consensus_setup_timeout_error() -> ProtocolError {
+    ProtocolError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "consensus connection setup timed out",
+    ))
+}
+
 async fn reject_consensus_bootstrap<W>(
     writer: &mut W,
     error: SessionConsensusPeerError,
-    idle_timeout: Duration,
+    setup_deadline: tokio::time::Instant,
     cancellation: &AtomicBool,
 ) -> Result<(), ProtocolError>
 where
@@ -3189,14 +3583,11 @@ where
     if error == SessionConsensusPeerError::Rejected {
         return Err(ProtocolError::InvalidWireValue);
     }
-    let deadline = tokio::time::Instant::now()
-        .checked_add(idle_timeout)
-        .ok_or(ProtocolError::InvalidWireValue)?;
     write_frame_bounded_until_cancellable(
         writer,
         &SessionConsensusBootstrapResponse::Rejected(error),
         MAX_HANDSHAKE_FRAME_SIZE,
-        deadline,
+        setup_deadline,
         cancellation,
     )
     .await
@@ -3204,7 +3595,7 @@ where
 
 async fn retire_consensus_bootstrap<W>(
     writer: &mut W,
-    idle_timeout: Duration,
+    setup_deadline: tokio::time::Instant,
     cancellation: &AtomicBool,
 ) -> Result<(), ProtocolError>
 where
@@ -3214,14 +3605,11 @@ where
         reason = "rotation_bootstrap_retired",
         "retiring authenticated consensus connection before request admission"
     );
-    let deadline = tokio::time::Instant::now()
-        .checked_add(idle_timeout)
-        .ok_or(ProtocolError::InvalidWireValue)?;
     write_frame_bounded_until_cancellable(
         writer,
         &SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected),
         MAX_HANDSHAKE_FRAME_SIZE,
-        deadline,
+        setup_deadline,
         cancellation,
     )
     .await
@@ -3268,6 +3656,7 @@ async fn dispatch_consensus<R, W>(
     handler_executions: Arc<Semaphore>,
     max_frame_size: usize,
     idle_timeout: Duration,
+    setup_deadline: tokio::time::Instant,
     rpc_timeout: Duration,
     global_cancellation: &AtomicBool,
     server_shutdown: tokio::sync::watch::Receiver<bool>,
@@ -3308,7 +3697,8 @@ where
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
     let hello: SessionConsensusBootstrapRequest = {
-        let hello_read = read_frame_within(reader, MAX_HANDSHAKE_FRAME_SIZE, idle_timeout);
+        let hello_read =
+            tokio::time::timeout_at(setup_deadline, read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE));
         tokio::pin!(hello_read);
         loop {
             let now = tokio::time::Instant::now();
@@ -3322,17 +3712,20 @@ where
             );
             if let Some(reason) = mismatch {
                 bootstrap_lifecycle.record_forced_retirement(reason);
-                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+                return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation)
+                    .await;
             }
             if !material_status_matches_admission(
                 bootstrap_lifecycle.admitted_material_epoch(),
                 current_material_status,
             ) {
                 bootstrap_lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
-                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+                return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation)
+                    .await;
             }
             if bootstrap_lifecycle.retirement(now).is_some() {
-                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+                return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation)
+                    .await;
             }
             tokio::select! {
                 biased;
@@ -3349,7 +3742,13 @@ where
                 }
                 _ = wait_consensus_material_change(&mut bootstrap_material_rx) => {}
                 _ = tokio::time::sleep_until(bootstrap_lifecycle.retire_at()) => {}
-                result = &mut hello_read => break result?,
+                result = &mut hello_read => {
+                    let result = result.map_err(|_| consensus_setup_timeout_error())?;
+                    if tokio::time::Instant::now() >= setup_deadline {
+                        return Err(consensus_setup_timeout_error());
+                    }
+                    break result?;
+                },
             }
         }
     };
@@ -3360,7 +3759,7 @@ where
         reject_consensus_bootstrap(
             writer,
             SessionConsensusPeerError::Protocol,
-            idle_timeout,
+            setup_deadline,
             server_cancellation,
         )
         .await?;
@@ -3373,7 +3772,7 @@ where
                 reject_consensus_bootstrap(
                     writer,
                     SessionConsensusPeerError::Protocol,
-                    idle_timeout,
+                    setup_deadline,
                     server_cancellation,
                 )
                 .await?;
@@ -3385,7 +3784,7 @@ where
         reject_consensus_bootstrap(
             writer,
             SessionConsensusPeerError::Protocol,
-            idle_timeout,
+            setup_deadline,
             server_cancellation,
         )
         .await?;
@@ -3399,7 +3798,7 @@ where
             reject_consensus_bootstrap(
                 writer,
                 SessionConsensusPeerError::Protocol,
-                idle_timeout,
+                setup_deadline,
                 server_cancellation,
             )
             .await?;
@@ -3412,7 +3811,7 @@ where
             reject_consensus_bootstrap(
                 writer,
                 SessionConsensusPeerError::Protocol,
-                idle_timeout,
+                setup_deadline,
                 server_cancellation,
             )
             .await?;
@@ -3423,39 +3822,43 @@ where
         ConnectionPeerIdentity::Authenticated(actual) => Some(actual),
         ConnectionPeerIdentity::InsecureTest => None,
     };
-    let membership_scope = match membership
-        .admit_engine_bootstrap(
+    let membership_scope = match tokio::time::timeout_at(
+        setup_deadline,
+        membership.admit_engine_bootstrap(
             &sender_replica_id,
             &expected_server_replica_id,
             hello.identity,
             hello.sender_node_id,
             hello.expected_server_node_id,
             authenticated_spiffe,
-        )
-        .await
+        ),
+    )
+    .await
     {
-        Ok(scope) => scope,
-        Err(error) => {
-            reject_consensus_bootstrap(writer, error, idle_timeout, server_cancellation).await?;
+        Ok(Ok(scope)) if tokio::time::Instant::now() < setup_deadline => scope,
+        Err(_) | Ok(Ok(_)) => return Err(consensus_setup_timeout_error()),
+        Ok(Err(error)) => {
+            reject_consensus_bootstrap(writer, error, setup_deadline, server_cancellation).await?;
             return Err(ProtocolError::Authentication);
         }
     };
     let binding = membership_scope.binding().clone();
 
     let mut admission_reauthentication_rx = reauthentication.subscribe();
-    let (mut lifecycle, lifecycle_tls_config) =
-        match pending_lifecycle.admit(lifecycle_policy, reauthentication.generation()) {
-            Ok(admitted) => admitted,
-            // Authentication and scope already succeeded. Prove the local
-            // epoch/generation retirement before any Openraft request can be
-            // dispatched, allowing exactly this cold-connect attempt to be
-            // retried safely.
-            Err(PendingConsensusAdmissionError::Retired(reason)) => {
-                bootstrap_lifecycle.record_forced_retirement(reason);
-                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
-            }
-            Err(PendingConsensusAdmissionError::Protocol(error)) => return Err(error),
-        };
+    let (mut lifecycle, lifecycle_tls_config) = match pending_lifecycle
+        .admit(lifecycle_policy, reauthentication.generation())
+    {
+        Ok(admitted) => admitted,
+        // Authentication and scope already succeeded. Prove the local
+        // epoch/generation retirement before any Openraft request can be
+        // dispatched, allowing exactly this cold-connect attempt to be
+        // retried safely.
+        Err(PendingConsensusAdmissionError::Retired(reason)) => {
+            bootstrap_lifecycle.record_forced_retirement(reason);
+            return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation).await;
+        }
+        Err(PendingConsensusAdmissionError::Protocol(error)) => return Err(error),
+    };
     drop(bootstrap_lifecycle);
     let mut admission_material_rx = lifecycle_tls_config
         .as_ref()
@@ -3481,26 +3884,29 @@ where
         current_material_status.map(|status| status.epoch()),
     ) {
         lifecycle.record_forced_retirement(reason);
-        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+        return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation).await;
     }
     if admission_reauthentication_rx.has_changed().unwrap_or(true) {
         lifecycle.record_forced_retirement(RetirementReason::Explicit);
-        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+        return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation).await;
     }
     if !material_status_matches_admission(admitted_material_epoch, current_material_status) {
         lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
-        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+        return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation).await;
     }
     if lifecycle.retirement(now).is_some() {
-        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+        return retire_consensus_bootstrap(writer, setup_deadline, server_cancellation).await;
     }
-    let bootstrap_membership_lease = match membership
-        .revalidate_bootstrap_scope(&membership_scope)
-        .await
+    let bootstrap_membership_lease = match tokio::time::timeout_at(
+        setup_deadline,
+        membership.revalidate_bootstrap_scope(&membership_scope),
+    )
+    .await
     {
-        Ok(lease) => lease,
-        Err(error) => {
-            reject_consensus_bootstrap(writer, error, idle_timeout, server_cancellation).await?;
+        Ok(Ok(lease)) if tokio::time::Instant::now() < setup_deadline => lease,
+        Err(_) | Ok(Ok(_)) => return Err(consensus_setup_timeout_error()),
+        Ok(Err(error)) => {
+            reject_consensus_bootstrap(writer, error, setup_deadline, server_cancellation).await?;
             return Err(ProtocolError::Authentication);
         }
     };
@@ -3516,9 +3922,6 @@ where
         server_shutdown,
         connection_cancellation.clone(),
     );
-    let write_deadline = tokio::time::Instant::now()
-        .checked_add(idle_timeout)
-        .ok_or(ProtocolError::InvalidWireValue)?;
     let accepted = SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
         transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
         contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
@@ -3541,17 +3944,29 @@ where
         pre_ack_material_status.map(|status| status.epoch()),
     ) {
         lifecycle.record_forced_retirement(reason);
-        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
-            .await;
+        return retire_consensus_bootstrap(
+            writer,
+            setup_deadline,
+            connection_cancellation.as_ref(),
+        )
+        .await;
     }
     if !material_status_matches_admission(admitted_material_epoch, pre_ack_material_status) {
         lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
-        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
-            .await;
+        return retire_consensus_bootstrap(
+            writer,
+            setup_deadline,
+            connection_cancellation.as_ref(),
+        )
+        .await;
     }
     if *retirement_rx.borrow() || *hard_rx.borrow() {
-        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
-            .await;
+        return retire_consensus_bootstrap(
+            writer,
+            setup_deadline,
+            connection_cancellation.as_ref(),
+        )
+        .await;
     }
     #[cfg(test)]
     if expire_at_final_ack_boundary {
@@ -3560,15 +3975,19 @@ where
         lifecycle.expire_at_final_ack_boundary_for_test();
     }
     if lifecycle.retirement(tokio::time::Instant::now()).is_some() {
-        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
-            .await;
+        return retire_consensus_bootstrap(
+            writer,
+            setup_deadline,
+            connection_cancellation.as_ref(),
+        )
+        .await;
     }
     {
         let acknowledgement = write_frame_bounded_until_cancellable(
             writer,
             &accepted,
             MAX_HANDSHAKE_FRAME_SIZE,
-            write_deadline,
+            setup_deadline,
             connection_cancellation.as_ref(),
         );
         tokio::pin!(acknowledgement);
@@ -3595,6 +4014,9 @@ where
                 _ = retirement_rx.changed() => return Ok(()),
                 result = &mut acknowledgement => {
                     result?;
+                    if tokio::time::Instant::now() >= setup_deadline {
+                        return Err(consensus_setup_timeout_error());
+                    }
                     break;
                 }
             }
@@ -3755,13 +4177,42 @@ mod tests {
     };
     use crate::protocol::{write_frame, Request, SessionConsensusContractProfile};
 
-    async fn make_remote_retirement_probe_due(peer: &RemoteSessionConsensusPeer) {
+    /// The published 728bc5/PR #732 profile must stay explicit here: the
+    /// application revision alone was insufficient to distinguish its
+    /// Postcard tag-27 `FinalizeOperatorRecoveryV2` from the merged roster
+    /// profile, so a future revision bump must not turn this regression into a
+    /// merely adjacent-profile check.
+    fn former_728bc5_application_revision_3_profile() -> SessionConsensusContractProfile {
+        SessionConsensusContractProfile {
+            wire_schema_revision: 5,
+            application_revision: 3,
+            error_set_revision: 6,
+            max_rpc_payload_bytes: 2_097_152,
+            max_roster_rpc_payload_bytes: 2_253_338,
+            min_frame_size: 9_437_184,
+            max_frame_size: 16_777_216,
+        }
+    }
+
+    async fn set_remote_retirement_probe_boundary(
+        peer: &RemoteSessionConsensusPeer,
+        probe_at: tokio::time::Instant,
+    ) {
         let mut state = peer.connection_pool.cold_connection.state.lock().await;
         let gate = state
             .remote_retirement_probe_gate
             .as_mut()
             .expect("authenticated retirement must arm the shared probe gate");
-        gate.next_probe_at = Some(tokio::time::Instant::now());
+        gate.next_probe_at = Some(probe_at);
+        drop(state);
+        peer.connection_pool
+            .cold_connection
+            .changed
+            .notify_waiters();
+    }
+
+    async fn make_remote_retirement_probe_due(peer: &RemoteSessionConsensusPeer) {
+        set_remote_retirement_probe_boundary(peer, tokio::time::Instant::now()).await;
     }
 
     fn test_cold_epoch() -> ConsensusColdConnectionEpoch {
@@ -3992,6 +4443,120 @@ mod tests {
     }
 
     #[cfg(feature = "insecure-test")]
+    #[tokio::test(start_paused = true)]
+    async fn accepted_setup_deadline_expires_before_a_delayed_child_can_poll_hello() {
+        let (server_binding, client_binding) = bindings();
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let hook = ConsensusAcceptedSetupHook::new();
+        let setup_timeout = Duration::from_millis(20);
+        let mut server = SessionConsensusServer::new_insecure(handler.clone(), server_binding)
+            .with_idle_timeout(setup_timeout);
+        server.post_accept_setup_hook = Some(Arc::clone(&hook));
+        let (handle, address) = server
+            .listen("127.0.0.1:0".parse().expect("consensus bind address"))
+            .await
+            .expect("start consensus listener");
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect accepted consensus client");
+        hook.entered.notified().await;
+        write_frame(
+            &mut client,
+            &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+                transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                sender_replica_id: client_binding.local_replica_id().as_str().to_owned(),
+                expected_server_replica_id: client_binding.remote_replica_id().as_str().to_owned(),
+                identity: client_binding.consensus_identity(),
+                sender_node_id: client_binding.local_consensus_node_id(),
+                expected_server_node_id: client_binding.remote_consensus_node_id(),
+                handshake_nonce: uuid::Uuid::new_v4(),
+                requested_response_frame_size: u32::try_from(MIN_SESSION_CONSENSUS_FRAME_SIZE)
+                    .expect("minimum frame size fits wire field"),
+            }),
+        )
+        .await
+        .expect("queue Hello while accepted child is held");
+
+        tokio::time::advance(setup_timeout).await;
+        hook.release.notify_one();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut eof = [0_u8; 1];
+        assert!(
+            match tokio::time::timeout(Duration::from_millis(1), client.read(&mut eof)).await {
+                Ok(Ok(0)) => true,
+                Ok(Err(error)) => error.kind() == io::ErrorKind::ConnectionReset,
+                Ok(Ok(_)) | Err(_) => false,
+            },
+            "the accept-time deadline closes before TLS or Hello work can start"
+        );
+        assert_eq!(
+            handler.0.load(Ordering::Relaxed),
+            0,
+            "an accepted child released at its exact setup boundary admits no Hello or handler work"
+        );
+        handle.abort_and_wait().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_deadline_is_not_renewed_after_tls_budget_reaches_accepted() {
+        let (server_binding, client_binding) = bindings();
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        let mut reader = std::io::Cursor::new(valid_consensus_hello_bytes(&client_binding).await);
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let wrote_first_chunk = Arc::new(Notify::new());
+        let first_chunk = wrote_first_chunk.notified();
+        tokio::pin!(first_chunk);
+        let mut writer = PartialConsensusAcknowledgementWriter {
+            bytes,
+            first_chunk_written: false,
+            wrote_first_chunk: Arc::clone(&wrote_first_chunk),
+        };
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let setup_timeout = Duration::from_millis(20);
+        let setup_deadline = tokio::time::Instant::now() + setup_timeout;
+
+        // Model a TLS completion that leaves precisely one millisecond for
+        // Hello, authority admission, and Accepted. Those later stages must
+        // retain the accept-time deadline instead of receiving a fresh window.
+        tokio::time::advance(setup_timeout - Duration::from_millis(1)).await;
+        let dispatch = dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            SessionMembershipAdmission::from_current_binding(server_binding),
+            Arc::new(CountingHandler(AtomicUsize::new(0))),
+            Arc::new(Semaphore::new(1)),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            setup_timeout,
+            setup_deadline,
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication,
+        );
+        tokio::pin!(dispatch);
+        tokio::select! {
+            _ = &mut first_chunk => {}
+            result = &mut dispatch => panic!("Accepted did not begin before the setup boundary: {result:?}"),
+        }
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            dispatch.await,
+            Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[cfg(feature = "insecure-test")]
     fn membership_manifest(epoch: u64, members: &[u16]) -> Arc<SessionReplicationManifest> {
         Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
@@ -4050,6 +4615,95 @@ mod tests {
             call_deadline.duration_since(connect_deadline),
             Duration::from_millis(8_500)
         );
+    }
+
+    #[test]
+    fn remote_retirement_wait_reserves_the_boundary_plus_a_complete_cold_setup() {
+        let epoch = test_cold_epoch();
+        let now = tokio::time::Instant::now();
+        let probe_at = now + Duration::from_millis(100);
+        let gate = ConsensusRemoteRetirementProbeGate {
+            epoch,
+            next_probe_at: Some(probe_at),
+        };
+        let complete_probe_deadline =
+            probe_at + DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout();
+
+        assert_eq!(
+            gate.waitable_probe_at(epoch, complete_probe_deadline),
+            Some(probe_at)
+        );
+        assert_eq!(
+            gate.waitable_probe_at(epoch, complete_probe_deadline - Duration::from_nanos(1),),
+            None,
+            "a caller that cannot contain one complete post-boundary setup must remain prompt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_retirement_probe_claim_at_the_exact_call_deadline_starts_zero_setup() {
+        let (_server_binding, client_binding) = bindings();
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let resolutions = Arc::clone(&resolutions);
+            Arc::new(move || {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::pending::<io::Result<SocketAddr>>())
+            })
+        };
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding,
+            Some(Duration::from_secs(10)),
+        );
+        let coordinator = Arc::clone(&peer.connection_pool.cold_connection);
+        let epoch = peer.cold_connector().epoch();
+        let now = tokio::time::Instant::now();
+        let probe_at = now + Duration::from_millis(100);
+        coordinator.state.lock().await.remote_retirement_probe_gate =
+            Some(ConsensusRemoteRetirementProbeGate {
+                epoch,
+                next_probe_at: Some(probe_at),
+            });
+
+        let hook = ConsensusColdClaimLockHook::new();
+        hook.armed.store(false, Ordering::Release);
+        *coordinator
+            .pre_claim_state_lock_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hook));
+        let call_deadline = probe_at + DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout();
+        let claim = {
+            let peer = peer.clone();
+            tokio::spawn(async move { peer.claim_or_start_cold_connection(call_deadline).await })
+        };
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!claim.is_finished());
+        assert_eq!(resolutions.load(Ordering::SeqCst), 0);
+
+        hook.armed.store(true, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        hook.entered.notified().await;
+        tokio::time::advance(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout()).await;
+        hook.release.notify_one();
+
+        assert!(matches!(
+            claim.await.expect("join exact-deadline claim"),
+            Err(SessionConsensusPeerError::Timeout)
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            0,
+            "an exact-deadline claimant must not start a detached physical setup"
+        );
+        assert!(matches!(
+            coordinator.state.lock().await.phase,
+            ConsensusColdConnectionPhase::Idle
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4114,6 +4768,499 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn post_accepted_bootstrap_deadline_records_one_global_timeout_terminal() {
+        const CHILD_MARKER: &str = "OPC_SESSION_NET_POST_ACCEPTED_BOOTSTRAP_METRICS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current session-net test executable"),
+            )
+            .args([
+                "--exact",
+                "consensus::tests::post_accepted_bootstrap_deadline_records_one_global_timeout_terminal",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated post-bootstrap metrics child");
+            assert!(
+                status.success(),
+                "isolated post-bootstrap metrics child passes"
+            );
+            return;
+        }
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let (server_binding, client_binding) = bindings();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind authenticated bootstrap server");
+        let address = listener
+            .local_addr()
+            .expect("read authenticated bootstrap address");
+        let server_release = Arc::new(Notify::new());
+        let server_release_for_task = Arc::clone(&server_release);
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener
+                .accept()
+                .await
+                .expect("accept authenticated bootstrap");
+            let hello: SessionConsensusBootstrapRequest =
+                read_frame(&mut tcp, MAX_HANDSHAKE_FRAME_SIZE)
+                    .await
+                    .expect("read bootstrap Hello");
+            let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+            write_frame(
+                &mut tcp,
+                &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                    transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                    contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                    identity: hello.identity,
+                    server_node_id: server_binding.local_consensus_node_id(),
+                    accepted_sender_node_id: hello.sender_node_id,
+                    handshake_nonce: hello.handshake_nonce,
+                    accepted_response_frame_size: hello.requested_response_frame_size,
+                    server_request_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                }),
+            )
+            .await
+            .expect("write bootstrap Accepted");
+            server_release_for_task.notified().await;
+        });
+        let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding,
+            Some(Duration::from_secs(5)),
+        );
+        let connector = peer.cold_connector();
+        let coordinator = Arc::clone(&peer.connection_pool.cold_connection);
+        let attempt_id = uuid::Uuid::new_v4();
+        let epoch = connector.epoch();
+        let attempt_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let receipt = Arc::new(ConsensusColdAttemptReceipt::default());
+        coordinator.state.lock().await.phase = ConsensusColdConnectionPhase::Connecting {
+            attempt_id,
+            epoch,
+            attempt_deadline,
+            receipt: Arc::clone(&receipt),
+            remote_retirement_probe: false,
+        };
+        let metrics = || {
+            (
+                METRICS
+                    .session_net_connection_attempts
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_successes
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_transport
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_authentication
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_timeout
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_protocol
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_backend
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_superseded
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_abandoned
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_reconnect_attempts
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_reconnect_failures
+                    .load(Ordering::Relaxed),
+            )
+        };
+        let before = metrics();
+        let hook = ConsensusPostAcceptedBootstrapHook::new();
+        let mut attempt = {
+            let connector = connector.clone();
+            let coordinator = Arc::clone(&coordinator);
+            let reconnect_gate = Arc::clone(&peer.connection_pool.reconnect_gate);
+            let shutdown = peer.connection_pool.shutdown.subscribe();
+            let hook = Arc::clone(&hook);
+            tokio::spawn(async move {
+                CONSENSUS_POST_ACCEPTED_BOOTSTRAP_HOOK
+                    .scope(
+                        hook,
+                        run_detached_consensus_connection_attempt(
+                            connector,
+                            coordinator,
+                            reconnect_gate,
+                            shutdown,
+                            attempt_id,
+                            epoch,
+                            attempt_deadline,
+                        ),
+                    )
+                    .await;
+            })
+        };
+
+        tokio::select! {
+            _ = hook.entered.notified() => {}
+            result = &mut attempt => {
+                result.expect("join setup that ended before its accepted bootstrap hook");
+                let state = coordinator.state.lock().await;
+                let error = match state.phase {
+                    ConsensusColdConnectionPhase::Failed { error, .. } => Some(error),
+                    _ => None,
+                };
+                panic!("setup ended before its accepted bootstrap hook: {error:?}");
+            }
+        }
+        tokio::time::advance(Duration::from_secs(10) + Duration::from_millis(1)).await;
+        hook.release.notify_one();
+        server_release.notify_one();
+        attempt.await.expect("join post-bootstrap deadline attempt");
+        server.await.expect("join authenticated bootstrap server");
+
+        assert_eq!(receipt.terminal(), Some(SessionConsensusPeerError::Timeout));
+        let after = metrics();
+        assert_eq!(after.0 - before.0, 1, "one setup starts exactly once");
+        assert_eq!(after.4 - before.4, 1, "deadline is a timeout terminal");
+        assert_eq!(
+            after.9 - before.9,
+            1,
+            "timeout consumes one reconnect attempt"
+        );
+        assert_eq!(
+            after.10 - before.10,
+            1,
+            "timeout records one reconnect failure"
+        );
+        assert_eq!(after.8 - before.8, 0, "finished timeout is never abandoned");
+        assert_eq!(after.1 - before.1, 0, "expired setup is never successful");
+        assert_eq!(after.2 - before.2, 0);
+        assert_eq!(after.3 - before.3, 0);
+        assert_eq!(after.5 - before.5, 0);
+        assert_eq!(after.6 - before.6, 0);
+        assert_eq!(after.7 - before.7, 0);
+        let terminal_delta = (after.1 - before.1)
+            + (after.2 - before.2)
+            + (after.3 - before.3)
+            + (after.4 - before.4)
+            + (after.5 - before.5)
+            + (after.6 - before.6)
+            + (after.7 - before.7)
+            + (after.8 - before.8);
+        assert_eq!(
+            terminal_delta,
+            after.0 - before.0,
+            "global terminal conservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_accepted_bootstrap_deadline_during_ready_lock_wait_records_one_global_timeout_terminal(
+    ) {
+        const CHILD_MARKER: &str = "OPC_SESSION_NET_POST_ACCEPTED_READY_LOCK_METRICS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current session-net test executable"),
+            )
+            .args([
+                "--exact",
+                "consensus::tests::post_accepted_bootstrap_deadline_during_ready_lock_wait_records_one_global_timeout_terminal",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated ready-lock deadline metrics child");
+            assert!(
+                status.success(),
+                "isolated ready-lock deadline metrics child passes"
+            );
+            return;
+        }
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let (server_binding, client_binding) = bindings();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind authenticated bootstrap server");
+        let address = listener
+            .local_addr()
+            .expect("read authenticated bootstrap address");
+        let server_release = Arc::new(Notify::new());
+        let server_release_for_task = Arc::clone(&server_release);
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener
+                .accept()
+                .await
+                .expect("accept authenticated bootstrap");
+            let hello: SessionConsensusBootstrapRequest =
+                read_frame(&mut tcp, MAX_HANDSHAKE_FRAME_SIZE)
+                    .await
+                    .expect("read bootstrap Hello");
+            let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+            write_frame(
+                &mut tcp,
+                &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                    transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                    contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                    identity: hello.identity,
+                    server_node_id: server_binding.local_consensus_node_id(),
+                    accepted_sender_node_id: hello.sender_node_id,
+                    handshake_nonce: hello.handshake_nonce,
+                    accepted_response_frame_size: hello.requested_response_frame_size,
+                    server_request_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                }),
+            )
+            .await
+            .expect("write bootstrap Accepted");
+            server_release_for_task.notified().await;
+        });
+        let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding,
+            Some(Duration::from_secs(5)),
+        );
+        let connector = peer.cold_connector();
+        let coordinator = Arc::clone(&peer.connection_pool.cold_connection);
+        let attempt_id = uuid::Uuid::new_v4();
+        let epoch = connector.epoch();
+        let attempt_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let receipt = Arc::new(ConsensusColdAttemptReceipt::default());
+        coordinator.state.lock().await.phase = ConsensusColdConnectionPhase::Connecting {
+            attempt_id,
+            epoch,
+            attempt_deadline,
+            receipt: Arc::clone(&receipt),
+            remote_retirement_probe: false,
+        };
+        let metrics = || {
+            (
+                METRICS
+                    .session_net_connection_attempts
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_successes
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_transport
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_authentication
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_timeout
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_protocol
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_backend
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_superseded
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_abandoned
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_reconnect_attempts
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_reconnect_failures
+                    .load(Ordering::Relaxed),
+            )
+        };
+        let before = metrics();
+        let accepted_hook = ConsensusPostAcceptedBootstrapHook::new();
+        let ready_hook = ConsensusPostAcceptedBootstrapHook::new();
+        let mut attempt = {
+            let connector = connector.clone();
+            let coordinator = Arc::clone(&coordinator);
+            let reconnect_gate = Arc::clone(&peer.connection_pool.reconnect_gate);
+            let shutdown = peer.connection_pool.shutdown.subscribe();
+            let accepted_hook = Arc::clone(&accepted_hook);
+            let ready_hook = Arc::clone(&ready_hook);
+            tokio::spawn(async move {
+                CONSENSUS_POST_ACCEPTED_BOOTSTRAP_HOOK
+                    .scope(
+                        accepted_hook,
+                        CONSENSUS_PRE_READY_PUBLICATION_HOOK.scope(
+                            ready_hook,
+                            run_detached_consensus_connection_attempt(
+                                connector,
+                                coordinator,
+                                reconnect_gate,
+                                shutdown,
+                                attempt_id,
+                                epoch,
+                                attempt_deadline,
+                            ),
+                        ),
+                    )
+                    .await;
+            })
+        };
+
+        tokio::select! {
+            _ = accepted_hook.entered.notified() => {}
+            result = &mut attempt => {
+                result.expect("join setup that ended before its accepted-bootstrap hook");
+                let state = coordinator.state.lock().await;
+                let error = match state.phase {
+                    ConsensusColdConnectionPhase::Failed { error, .. } => Some(error),
+                    _ => None,
+                };
+                panic!("setup ended before its accepted-bootstrap hook: {error:?}");
+            }
+        }
+        tokio::time::pause();
+        let remaining_until_deadline =
+            attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining_until_deadline.is_zero(),
+            "Accepted bootstrap must precede the controlled deadline crossing"
+        );
+        let state_guard = coordinator.state.lock().await;
+        accepted_hook.release.notify_one();
+        for _ in 0..10_000 {
+            if ready_hook.arrived.load(Ordering::Acquire) {
+                break;
+            }
+            assert!(
+                !attempt.is_finished(),
+                "setup ended before its ready-publication hook"
+            );
+            // Keeping this controller future runnable prevents Tokio's paused
+            // clock from auto-advancing to the attempt deadline between the
+            // two deterministic test-only seams.
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ready_hook.arrived.load(Ordering::Acquire),
+            "setup did not reach its ready-publication hook within the bounded scheduler turns"
+        );
+        ready_hook.release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(
+            !attempt.is_finished(),
+            "ready publication must remain behind the held coordinator lock"
+        );
+        tokio::time::advance(remaining_until_deadline + Duration::from_millis(1)).await;
+        drop(state_guard);
+        server_release.notify_one();
+        attempt.await.expect("join ready-lock deadline attempt");
+        server.await.expect("join authenticated bootstrap server");
+
+        assert_eq!(receipt.terminal(), Some(SessionConsensusPeerError::Timeout));
+        let after = metrics();
+        assert_eq!(after.0 - before.0, 1, "one setup starts exactly once");
+        assert_eq!(after.4 - before.4, 1, "deadline is a timeout terminal");
+        assert_eq!(
+            after.9 - before.9,
+            1,
+            "timeout consumes one reconnect attempt"
+        );
+        assert_eq!(
+            after.10 - before.10,
+            1,
+            "timeout records one reconnect failure"
+        );
+        assert_eq!(after.8 - before.8, 0, "finished timeout is never abandoned");
+        assert_eq!(after.1 - before.1, 0, "expired setup is never successful");
+        assert_eq!(after.2 - before.2, 0);
+        assert_eq!(after.3 - before.3, 0);
+        assert_eq!(after.5 - before.5, 0);
+        assert_eq!(after.6 - before.6, 0);
+        assert_eq!(after.7 - before.7, 0);
+        let terminal_delta = (after.1 - before.1)
+            + (after.2 - before.2)
+            + (after.3 - before.3)
+            + (after.4 - before.4)
+            + (after.5 - before.5)
+            + (after.6 - before.6)
+            + (after.7 - before.7)
+            + (after.8 - before.8);
+        assert_eq!(
+            terminal_delta,
+            after.0 - before.0,
+            "global terminal conservation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_ready_at_the_contained_deadline_is_never_published() {
+        let coordinator = ConsensusColdConnectionCoordinator::new();
+        let epoch = test_cold_epoch();
+        let attempt_id = uuid::Uuid::new_v4();
+        let now = tokio::time::Instant::now();
+        coordinator.state.lock().await.phase = ConsensusColdConnectionPhase::Connecting {
+            attempt_id,
+            epoch,
+            attempt_deadline: now,
+            receipt: Arc::new(ConsensusColdAttemptReceipt::default()),
+            remote_retirement_probe: false,
+        };
+        let lifecycle = ConnectionLifecycle::new(
+            ConnectionLifecyclePolicy::try_new(
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::ZERO,
+            )
+            .expect("deadline publication lifecycle"),
+            now,
+            None,
+            None,
+            epoch.reauthentication_generation,
+            epoch.material_epoch,
+        )
+        .expect("deadline publication connection lifecycle");
+        let connection = Box::new(ConsensusConnection {
+            reader: Box::new(tokio::io::empty()),
+            writer: Box::new(tokio::io::sink()),
+            response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
+            request_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
+            admission_attempt_id: None,
+            lifecycle,
+            last_successful_correlated_use: None,
+            idle_deadline_origin: now,
+        });
+        assert_eq!(
+            coordinator
+                .publish_ready(attempt_id, epoch, connection)
+                .await,
+            ConsensusPublishReadyOutcome::TimedOut
+        );
+        let state = coordinator.state.lock().await;
+        assert!(matches!(
+            state.phase,
+            ConsensusColdConnectionPhase::Failed {
+                error: SessionConsensusPeerError::Timeout,
+                ..
+            }
+        ));
+        assert!(
+            state.remote_retirement_probe_gate.is_none(),
+            "a local deadline overrun is not authenticated remote-retirement evidence"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cold_ready_publication_rechecks_lifecycle_after_coordinator_lock_wait() {
         let (_server_binding, client_binding) = bindings();
         let coordinator = ConsensusColdConnectionCoordinator::new();
@@ -4140,6 +5287,7 @@ mod tests {
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
                 request_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
+                admission_attempt_id: None,
                 lifecycle: ConnectionLifecycle::new(
                     lifecycle_policy,
                     established_at,
@@ -4180,7 +5328,7 @@ mod tests {
         drop(state);
         assert_eq!(
             publish.await.expect("join lifecycle-fenced publication"),
-            ConsensusPublishReadyOutcome::Retired
+            ConsensusPublishReadyOutcome::Retired(RetirementReason::MaximumAge)
         );
         let state = coordinator.state.lock().await;
         assert!(matches!(
@@ -4192,6 +5340,63 @@ mod tests {
             } if current_attempt_id == attempt_id && current_epoch == epoch
         ));
         assert_eq!(state.no_admission_marker, attempt_id);
+        assert!(
+            state.remote_retirement_probe_gate.is_none(),
+            "local maximum-age retirement is not authenticated remote-retirement evidence"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_ready_peer_credential_retirement_seeds_the_exact_epoch_probe_gate() {
+        let coordinator = ConsensusColdConnectionCoordinator::new();
+        let epoch = test_cold_epoch();
+        let attempt_id = uuid::Uuid::new_v4();
+        let now = tokio::time::Instant::now();
+        let expired = opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
+        );
+        let peer_expiry = CertificateExpiryEvidence::capture(expired, expired, now);
+        let lifecycle = ConnectionLifecycle::new(
+            ConnectionLifecyclePolicy::default(),
+            now,
+            None,
+            Some(peer_expiry),
+            epoch.reauthentication_generation,
+            epoch.material_epoch,
+        )
+        .expect("peer-expired publication lifecycle");
+        coordinator.state.lock().await.phase = ConsensusColdConnectionPhase::Connecting {
+            attempt_id,
+            epoch,
+            attempt_deadline: now + Duration::from_secs(1),
+            receipt: Arc::new(ConsensusColdAttemptReceipt::default()),
+            remote_retirement_probe: false,
+        };
+
+        assert_eq!(
+            coordinator
+                .publish_ready(
+                    attempt_id,
+                    epoch,
+                    Box::new(cached_consensus_connection(lifecycle)),
+                )
+                .await,
+            ConsensusPublishReadyOutcome::Retired(RetirementReason::PeerLeafExpiry)
+        );
+        let state = coordinator.state.lock().await;
+        assert!(matches!(
+            state.phase,
+            ConsensusColdConnectionPhase::Failed {
+                error: SessionConsensusPeerError::Unavailable,
+                ..
+            }
+        ));
+        assert!(
+            state
+                .remote_retirement_probe_gate
+                .is_some_and(|gate| gate.epoch == epoch),
+            "authenticated peer credential retirement seeds the exact-epoch probe gate"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4355,7 +5560,7 @@ mod tests {
         let coordinator = ConsensusColdConnectionCoordinator::new();
         let epoch = test_cold_epoch();
         coordinator
-            .seed_credential_retirement_probe(epoch, RetirementReason::PeerLeafExpiry)
+            .seed_credential_retirement_probe(epoch, None, None, RetirementReason::PeerLeafExpiry)
             .await;
         let now = tokio::time::Instant::now();
         assert!(coordinator
@@ -4384,7 +5589,12 @@ mod tests {
             .expect("failed immediate probe must re-arm")
             .next_probe_at;
         coordinator
-            .seed_credential_retirement_probe(epoch, RetirementReason::PeerCertificateChainExpiry)
+            .seed_credential_retirement_probe(
+                epoch,
+                None,
+                None,
+                RetirementReason::PeerCertificateChainExpiry,
+            )
             .await;
         assert_eq!(
             coordinator
@@ -4400,10 +5610,10 @@ mod tests {
 
         let other = ConsensusColdConnectionCoordinator::new();
         other
-            .seed_credential_retirement_probe(epoch, RetirementReason::IdleTimeout)
+            .seed_credential_retirement_probe(epoch, None, None, RetirementReason::IdleTimeout)
             .await;
         other
-            .seed_credential_retirement_probe(epoch, RetirementReason::MaximumAge)
+            .seed_credential_retirement_probe(epoch, None, None, RetirementReason::MaximumAge)
             .await;
         assert!(other
             .state
@@ -4411,6 +5621,511 @@ mod tests {
             .await
             .remote_retirement_probe_gate
             .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_same_epoch_peer_credential_successor_suppresses_only_strictly_older_lane() {
+        let coordinator = ConsensusColdConnectionCoordinator::new();
+        let epoch = test_cold_epoch();
+        let old_attempt = uuid::Uuid::new_v4();
+        let accepted_attempt = uuid::Uuid::new_v4();
+        let now = tokio::time::Instant::now();
+        let wall_now = time::OffsetDateTime::now_utc();
+        let old_peer_expiry =
+            opc_types::Timestamp::from_offset_datetime(wall_now + time::Duration::seconds(30));
+        let accepted_peer_expiry =
+            opc_types::Timestamp::from_offset_datetime(wall_now + time::Duration::seconds(60));
+        let accepted_peer_evidence =
+            CertificateExpiryEvidence::capture(accepted_peer_expiry, accepted_peer_expiry, now);
+        {
+            let mut state = coordinator.state.lock().await;
+            state.phase = ConsensusColdConnectionPhase::Connecting {
+                attempt_id: accepted_attempt,
+                epoch,
+                attempt_deadline: now + Duration::from_secs(1),
+                receipt: Arc::new(ConsensusColdAttemptReceipt::default()),
+                remote_retirement_probe: true,
+            };
+            state.remote_retirement_probe_gate = Some(ConsensusRemoteRetirementProbeGate {
+                epoch,
+                next_probe_at: Some(now),
+            });
+        }
+        let accepted = cached_consensus_connection(
+            ConnectionLifecycle::new(
+                ConnectionLifecyclePolicy::default(),
+                now,
+                None,
+                Some(accepted_peer_evidence),
+                epoch.reauthentication_generation,
+                epoch.material_epoch,
+            )
+            .expect("accepted successor lifecycle"),
+        );
+        assert_eq!(
+            coordinator
+                .publish_ready(accepted_attempt, epoch, Box::new(accepted))
+                .await,
+            ConsensusPublishReadyOutcome::Published
+        );
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .remote_retirement_probe_gate
+                .is_none(),
+            "the accepted same-epoch successor clears its existing probe gate"
+        );
+
+        coordinator
+            .seed_credential_retirement_probe(
+                epoch,
+                Some(old_attempt),
+                Some(old_peer_expiry),
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .remote_retirement_probe_gate
+                .is_none(),
+            "a delayed lane with strictly older peer-credential evidence cannot reopen the gate"
+        );
+
+        coordinator
+            .seed_credential_retirement_probe(
+                epoch,
+                Some(accepted_attempt),
+                Some(accepted_peer_expiry),
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        assert!(coordinator
+            .state
+            .lock()
+            .await
+            .remote_retirement_probe_gate
+            .is_some_and(|gate| gate.probe_is_due(epoch, tokio::time::Instant::now())));
+
+        coordinator.state.lock().await.remote_retirement_probe_gate = None;
+        coordinator
+            .seed_credential_retirement_probe(
+                epoch,
+                Some(old_attempt),
+                Some(accepted_peer_expiry),
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .remote_retirement_probe_gate
+                .is_some(),
+            "equal peer-credential evidence is incomparable and must seed fail-closed"
+        );
+
+        coordinator.state.lock().await.remote_retirement_probe_gate = None;
+        coordinator
+            .seed_credential_retirement_probe(
+                epoch,
+                Some(old_attempt),
+                Some(old_peer_expiry),
+                RetirementReason::LocalLeafExpiry,
+            )
+            .await;
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .remote_retirement_probe_gate
+                .is_some(),
+            "same-epoch local-credential retirement remains applicable"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_newer_epoch_suppresses_delayed_older_epoch_credential_retirement() {
+        let coordinator = ConsensusColdConnectionCoordinator::new();
+        let older_epoch = test_cold_epoch();
+        let accepted_epoch = ConsensusColdConnectionEpoch {
+            reauthentication_generation: older_epoch.reauthentication_generation + 1,
+            ..older_epoch
+        };
+        coordinator.state.lock().await.latest_accepted_connection =
+            Some(ConsensusAcceptedConnection {
+                epoch: accepted_epoch,
+                attempt_id: uuid::Uuid::new_v4(),
+                peer_certificate_effective_expiry: None,
+            });
+
+        coordinator
+            .seed_credential_retirement_probe(
+                older_epoch,
+                None,
+                None,
+                RetirementReason::LocalLeafExpiry,
+            )
+            .await;
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .remote_retirement_probe_gate
+                .is_none(),
+            "an older connector epoch cannot reopen a gate after a newer Accepted bootstrap"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_incomparable_material_tracking_mode_keeps_retirement_fail_closed() {
+        let coordinator = ConsensusColdConnectionCoordinator::new();
+        let retired_epoch = test_cold_epoch();
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let accepted_epoch = ConsensusColdConnectionEpoch {
+            material_epoch: Some(material.config().material_status().epoch()),
+            ..retired_epoch
+        };
+        assert!(!accepted_epoch.is_strictly_newer_than(retired_epoch));
+        assert!(!retired_epoch.is_strictly_newer_than(accepted_epoch));
+        coordinator.state.lock().await.latest_accepted_connection =
+            Some(ConsensusAcceptedConnection {
+                epoch: accepted_epoch,
+                attempt_id: uuid::Uuid::new_v4(),
+                peer_certificate_effective_expiry: None,
+            });
+
+        coordinator
+            .seed_credential_retirement_probe(
+                retired_epoch,
+                None,
+                None,
+                RetirementReason::LocalLeafExpiry,
+            )
+            .await;
+        assert!(coordinator
+            .state
+            .lock()
+            .await
+            .remote_retirement_probe_gate
+            .is_some_and(|gate| {
+                gate.epoch == retired_epoch
+                    && gate.probe_is_due(retired_epoch, tokio::time::Instant::now())
+            }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn older_ready_publication_preserves_a_newer_retirement_gate() {
+        let coordinator = ConsensusColdConnectionCoordinator::new();
+        let older_epoch = test_cold_epoch();
+        let newer_epoch = ConsensusColdConnectionEpoch {
+            reauthentication_generation: older_epoch.reauthentication_generation + 1,
+            ..older_epoch
+        };
+        let attempt_id = uuid::Uuid::new_v4();
+        let now = tokio::time::Instant::now();
+        {
+            let mut state = coordinator.state.lock().await;
+            state.phase = ConsensusColdConnectionPhase::Connecting {
+                attempt_id,
+                epoch: older_epoch,
+                attempt_deadline: now + Duration::from_secs(1),
+                receipt: Arc::new(ConsensusColdAttemptReceipt::default()),
+                remote_retirement_probe: false,
+            };
+            state.remote_retirement_probe_gate = Some(ConsensusRemoteRetirementProbeGate {
+                epoch: newer_epoch,
+                next_probe_at: Some(now + DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL),
+            });
+        }
+        let connection = cached_consensus_connection(
+            ConnectionLifecycle::new(
+                ConnectionLifecyclePolicy::default(),
+                now,
+                None,
+                None,
+                older_epoch.reauthentication_generation,
+                older_epoch.material_epoch,
+            )
+            .expect("older accepted connection lifecycle"),
+        );
+        assert_eq!(
+            coordinator
+                .publish_ready(attempt_id, older_epoch, Box::new(connection))
+                .await,
+            ConsensusPublishReadyOutcome::Published
+        );
+        assert!(coordinator
+            .state
+            .lock()
+            .await
+            .remote_retirement_probe_gate
+            .is_some_and(|gate| gate.epoch == newer_epoch));
+    }
+
+    #[tokio::test]
+    async fn delayed_stale_credential_retirement_cannot_replace_current_remote_retirement_gate() {
+        let (_server_binding, client_binding) = bindings();
+        let (address, server) =
+            bootstrap_retirement_then_consensus_response_server(client_binding.clone()).await;
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolve: RemoteAddrResolver = {
+            let resolutions = Arc::clone(&resolutions);
+            Arc::new(move || {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(address) })
+            })
+        };
+        let reauthentication = SessionReauthenticationControl::new();
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolve),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(10)),
+        )
+        .with_reauthentication_control(reauthentication.clone());
+        let request = || {
+            SessionConsensusWireRequest::try_new(
+                client_binding.consensus_identity(),
+                client_binding.local_consensus_node_id(),
+                ConsensusRpcFamily::Vote,
+                b"stale-retirement-cannot-displace-current-gate".to_vec(),
+            )
+            .expect("bounded request")
+        };
+
+        let stale_epoch = peer.cold_connector().epoch();
+        reauthentication
+            .request_reauthentication()
+            .expect("advance to the current connector epoch");
+        let current_epoch = peer.cold_connector().epoch();
+        assert_ne!(stale_epoch, current_epoch);
+
+        assert_eq!(
+            peer.call(request()).await,
+            Err(SessionConsensusPeerError::Unavailable),
+            "the current authenticated bootstrap rejection arms its own gate"
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+
+        peer.connection_pool
+            .cold_connection
+            .seed_credential_retirement_probe(
+                stale_epoch,
+                None,
+                None,
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        let now = tokio::time::Instant::now();
+        assert!(
+            peer.connection_pool
+                .cold_connection
+                .state
+                .lock()
+                .await
+                .remote_retirement_probe_gate
+                .is_some_and(|gate| {
+                    gate.epoch == current_epoch && gate.blocks(current_epoch, now)
+                }),
+            "a delayed stale-lane retirement must not displace the current protected window"
+        );
+
+        let waiting_peer = peer.clone();
+        let waiting_request = request();
+        let waiting_call = tokio::spawn(async move { waiting_peer.call(waiting_request).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting_call.is_finished(),
+            "a current-epoch caller waits for the fixed probe boundary rather than failing at operation rate"
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            1,
+            "the waiting current call performs zero physical setups before the boundary"
+        );
+
+        make_remote_retirement_probe_due(&peer).await;
+        assert_eq!(
+            waiting_call.await.expect("waiting current-epoch call"),
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"stale-retirement-cannot-displace-current-gate".to_vec()),
+            }),
+            "the waiting same-epoch call is admitted at the fixed boundary"
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            2,
+            "exactly one physical setup starts at the probe boundary"
+        );
+        assert_eq!(
+            server.await.expect("bootstrap retirement recovery server"),
+            (2, 1),
+            "the protected window sends no Call and the boundary recovery sends one"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_credential_retirement_replaces_an_older_exact_epoch_probe_gate() {
+        let (_server_binding, client_binding) = bindings();
+        let (address, server) =
+            bootstrap_retirement_then_consensus_response_server(client_binding.clone()).await;
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolve: RemoteAddrResolver = {
+            let resolutions = Arc::clone(&resolutions);
+            Arc::new(move || {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(address) })
+            })
+        };
+        let reauthentication = SessionReauthenticationControl::new();
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolve),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(10)),
+        )
+        .with_reauthentication_control(reauthentication.clone());
+        let request = || {
+            SessionConsensusWireRequest::try_new(
+                client_binding.consensus_identity(),
+                client_binding.local_consensus_node_id(),
+                ConsensusRpcFamily::Vote,
+                b"newer-retirement-replaces-older-gate".to_vec(),
+            )
+            .expect("bounded request")
+        };
+
+        let stale_epoch = peer.cold_connector().epoch();
+        peer.connection_pool
+            .cold_connection
+            .seed_credential_retirement_probe(
+                stale_epoch,
+                None,
+                None,
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        reauthentication
+            .request_reauthentication()
+            .expect("advance to the current connector epoch");
+        let current_epoch = peer.cold_connector().epoch();
+        peer.connection_pool
+            .cold_connection
+            .seed_credential_retirement_probe(
+                current_epoch,
+                None,
+                None,
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        assert!(
+            peer.connection_pool
+                .cold_connection
+                .state
+                .lock()
+                .await
+                .remote_retirement_probe_gate
+                .is_some_and(|gate| {
+                    gate.epoch == current_epoch
+                        && gate.probe_is_due(current_epoch, tokio::time::Instant::now())
+                }),
+            "a current cached credential retirement replaces the old exact-epoch gate"
+        );
+
+        assert_eq!(
+            peer.call(request()).await,
+            Err(SessionConsensusPeerError::Unavailable),
+            "the current due-now probe observes authenticated bootstrap retirement"
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        let waiting_peer = peer.clone();
+        let waiting_request = request();
+        let waiting_call = tokio::spawn(async move { waiting_peer.call(waiting_request).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting_call.is_finished(),
+            "the current gate holds later callers until the fixed probe boundary"
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            1,
+            "the protected current window starts zero extra physical setups before the boundary"
+        );
+
+        make_remote_retirement_probe_due(&peer).await;
+        assert_eq!(
+            waiting_call.await.expect("waiting current caller"),
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"newer-retirement-replaces-older-gate".to_vec()),
+            }),
+            "the waiting current caller starts the one probe at the fixed boundary"
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            server.await.expect("bootstrap retirement recovery server"),
+            (2, 1),
+            "only the boundary recovery transmits a Call"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newer_material_epoch_replaces_an_equal_reauthentication_probe_gate() {
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let config = material.config();
+        let previous_epoch = ConsensusColdConnectionEpoch {
+            material_epoch: Some(config.material_status().epoch()),
+            ..test_cold_epoch()
+        };
+        material.rotate();
+        let current_epoch = ConsensusColdConnectionEpoch {
+            material_epoch: Some(config.material_status().epoch()),
+            ..previous_epoch
+        };
+        assert_eq!(
+            current_epoch.reauthentication_generation, previous_epoch.reauthentication_generation,
+            "replacement is ordered by material publication, not reauthentication"
+        );
+        assert!(current_epoch.is_strictly_newer_than(previous_epoch));
+
+        let mut state = ConsensusColdConnectionState {
+            phase: ConsensusColdConnectionPhase::Idle,
+            no_admission_marker: uuid::Uuid::nil(),
+            remote_retirement_probe_gate: None,
+            latest_accepted_connection: None,
+        };
+        state.remote_retirement_probe_gate = Some(ConsensusRemoteRetirementProbeGate {
+            epoch: previous_epoch,
+            next_probe_at: Some(
+                tokio::time::Instant::now() + DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
+            ),
+        });
+        ConsensusColdConnectionCoordinator::seed_credential_retirement_probe_gate(
+            &mut state,
+            current_epoch,
+            None,
+            None,
+            RetirementReason::PeerLeafExpiry,
+        );
+        assert!(state.remote_retirement_probe_gate.is_some_and(|gate| {
+            gate.epoch == current_epoch
+                && gate.probe_is_due(current_epoch, tokio::time::Instant::now())
+        }));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4553,6 +6268,7 @@ mod tests {
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
                 request_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
+                admission_attempt_id: None,
                 lifecycle: ConnectionLifecycle::new(
                     lifecycle_policy,
                     established_at,
@@ -4810,6 +6526,7 @@ mod tests {
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
                 idle_deadline_origin: now,
@@ -4877,6 +6594,7 @@ mod tests {
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
                 idle_deadline_origin: now,
@@ -4935,6 +6653,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
             last_successful_correlated_use: None,
@@ -4992,6 +6711,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(
                 policy,
                 now,
@@ -5048,6 +6768,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
             last_successful_correlated_use: None,
@@ -5111,12 +6832,284 @@ mod tests {
         assert_eq!(
             accounting.snapshot(),
             (2, 1, 1, 0),
-            "caller cancellation must not cancel or abandon pre-dispatch establishment"
+            "cancelling the caller must leave its detached replacement setup alive"
         );
-        tokio::time::advance(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout()).await;
-        tokio::task::yield_now().await;
-        assert_eq!(accounting.snapshot(), (2, 2, 1, 0));
         drop(pool_owner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accounting.snapshot().1 < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pool shutdown must settle the detached replacement setup");
+        assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_remote_retirement_probe_is_superseded_without_waiting_for_its_deadline() {
+        let (_server_binding, client_binding) = bindings();
+        let control = SessionReauthenticationControl::new();
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    entered_tx.send(attempt).expect("report resolver entry");
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                })
+            })
+        };
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(1)),
+        )
+        .with_reauthentication_control(control.clone());
+        let old_epoch = peer.cold_connector().epoch();
+        peer.connection_pool
+            .cold_connection
+            .seed_credential_retirement_probe(
+                old_epoch,
+                None,
+                None,
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::Vote,
+            b"supersede-active-retirement-probe".to_vec(),
+        )
+        .expect("bounded request");
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        let pool_owner = peer.clone();
+        let call = tokio::spawn(crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING.scope(
+            Arc::clone(&accounting),
+            async move { peer.call(request).await },
+        ));
+
+        assert_eq!(entered_rx.recv().await, Some(0));
+        {
+            let state = pool_owner
+                .connection_pool
+                .cold_connection
+                .state
+                .lock()
+                .await;
+            assert!(matches!(
+                state.phase,
+                ConsensusColdConnectionPhase::Connecting {
+                    epoch,
+                    remote_retirement_probe: true,
+                    ..
+                } if epoch == old_epoch
+            ));
+        }
+
+        control.request_reauthentication().expect("advance epoch");
+        assert_eq!(entered_rx.recv().await, Some(1));
+        let new_epoch = pool_owner.cold_connector().epoch();
+        let state = pool_owner
+            .connection_pool
+            .cold_connection
+            .state
+            .lock()
+            .await;
+        assert!(matches!(
+            state.phase,
+            ConsensusColdConnectionPhase::Connecting {
+                epoch,
+                remote_retirement_probe: false,
+                ..
+            } if epoch == new_epoch
+        ));
+        assert_eq!(
+            accounting.snapshot(),
+            (2, 1, 1, 0),
+            "the live claimant owns exactly one new-epoch setup while the old active probe terminalizes as superseded"
+        );
+        drop(state);
+
+        call.abort();
+        assert!(call
+            .await
+            .expect_err("call must be cancelled")
+            .is_cancelled());
+        assert_eq!(
+            accounting.snapshot(),
+            (2, 1, 1, 0),
+            "caller cancellation must not supersede the detached new-epoch setup"
+        );
+        drop(pool_owner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accounting.snapshot().1 < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pool shutdown must settle the detached new-epoch setup");
+        assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_remote_retirement_probe_is_superseded_by_material_epoch_without_waiting_for_its_deadline(
+    ) {
+        let (_server_binding, client_binding) = bindings();
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let tls_config = material.config();
+        let reauthentication = SessionReauthenticationControl::new();
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    entered_tx.send(attempt).expect("report resolver entry");
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                })
+            })
+        };
+        let peer = RemoteSessionConsensusPeer::new_with_resolver(
+            client_binding.clone(),
+            resolver,
+            tls_config.clone(),
+            Some(Duration::from_secs(1)),
+        )
+        .with_reauthentication_control(reauthentication.clone());
+        let old_epoch = peer.cold_connector().epoch();
+        assert_eq!(
+            old_epoch.material_epoch,
+            Some(tls_config.material_status().epoch())
+        );
+        peer.connection_pool
+            .cold_connection
+            .seed_credential_retirement_probe(
+                old_epoch,
+                None,
+                None,
+                RetirementReason::PeerLeafExpiry,
+            )
+            .await;
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::Vote,
+            b"supersede-active-retirement-probe-material-epoch".to_vec(),
+        )
+        .expect("bounded request");
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        let pool_owner = peer.clone();
+        let call = tokio::spawn(crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING.scope(
+            Arc::clone(&accounting),
+            async move { peer.call(request).await },
+        ));
+
+        assert_eq!(entered_rx.recv().await, Some(0));
+        let (old_attempt_id, old_attempt_deadline, old_receipt) = {
+            let state = pool_owner
+                .connection_pool
+                .cold_connection
+                .state
+                .lock()
+                .await;
+            match &state.phase {
+                ConsensusColdConnectionPhase::Connecting {
+                    attempt_id,
+                    epoch,
+                    attempt_deadline,
+                    receipt,
+                    remote_retirement_probe,
+                } => {
+                    assert_eq!(*epoch, old_epoch);
+                    assert!(remote_retirement_probe);
+                    (*attempt_id, *attempt_deadline, Arc::clone(receipt))
+                }
+                _ => panic!("expected an active old-epoch retirement probe"),
+            }
+        };
+        let rotated_at = tokio::time::Instant::now();
+        material.rotate();
+        assert_eq!(
+            reauthentication.generation(),
+            old_epoch.reauthentication_generation,
+            "the causal successor is authenticated TLS material, not reauthentication"
+        );
+
+        assert_eq!(entered_rx.recv().await, Some(1));
+        let new_epoch = pool_owner.cold_connector().epoch();
+        assert_eq!(
+            new_epoch.reauthentication_generation, old_epoch.reauthentication_generation,
+            "material rotation must not advance reauthentication"
+        );
+        assert!(new_epoch.is_strictly_newer_than(old_epoch));
+        assert!(
+            tokio::time::Instant::now() < old_attempt_deadline,
+            "the replacement must start before the active old probe's original deadline"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            rotated_at,
+            "the material successor must start without advancing paused time"
+        );
+        let state = pool_owner
+            .connection_pool
+            .cold_connection
+            .state
+            .lock()
+            .await;
+        assert!(matches!(
+            state.phase,
+            ConsensusColdConnectionPhase::Connecting {
+                attempt_id,
+                epoch,
+                remote_retirement_probe: false,
+                ..
+            } if attempt_id != old_attempt_id && epoch == new_epoch
+        ));
+        drop(state);
+        assert_eq!(
+            old_receipt.terminal(),
+            Some(SessionConsensusPeerError::Unavailable),
+            "the superseded old probe must terminalize its exact stale receipt"
+        );
+        assert_eq!(
+            accounting.snapshot(),
+            (2, 1, 1, 0),
+            "the live original claimant starts one material-successor attempt while the old probe records exactly one terminal supersession"
+        );
+        assert!(
+            !call.is_finished(),
+            "the original claimant remains alive while its new material-epoch attempt connects"
+        );
+
+        call.abort();
+        assert!(call
+            .await
+            .expect_err("call must be cancelled")
+            .is_cancelled());
+        assert_eq!(
+            accounting.snapshot(),
+            (2, 1, 1, 0),
+            "cancelling the original caller must not terminalize the material-successor attempt"
+        );
+        drop(pool_owner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accounting.snapshot().1 < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pool shutdown must settle the detached material-successor attempt");
+        assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -5389,6 +7382,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_millis(20),
+            tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
             &cancellation,
             shutdown_rx,
@@ -5463,6 +7457,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_millis(20),
+            tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
             &cancellation,
             shutdown_rx,
@@ -5507,6 +7502,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
             &cancellation,
             shutdown_rx,
@@ -5574,6 +7570,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
             &cancellation,
             shutdown_rx,
@@ -5678,6 +7675,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
             &cancellation,
             shutdown_rx,
@@ -5986,7 +7984,7 @@ mod tests {
             ConsensusTarget::resolved(&client_binding, resolve),
             None,
             client_binding.clone(),
-            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(10)),
         )
         .with_connection_lifecycle(
             ConnectionLifecyclePolicy::try_new(
@@ -6018,68 +8016,122 @@ mod tests {
             "one logical call performs exactly one physical setup"
         );
 
-        let (first_blocked, second_blocked, third_blocked, fourth_blocked) = tokio::join!(
-            peer.call(request()),
-            peer.call(request()),
-            peer.call(request()),
-            peer.call(request()),
+        assert_eq!(
+            peer.call_with_timeout(request(), Duration::from_millis(100))
+                .await,
+            Err(SessionConsensusPeerError::Unavailable),
+            "a caller that cannot reach the fixed boundary retains a prompt pre-Call no-admission result"
         );
-        for outcome in [first_blocked, second_blocked, third_blocked, fourth_blocked] {
-            assert_eq!(
-                outcome,
-                Err(SessionConsensusPeerError::Unavailable),
-                "every later call inside one retirement-probe window has the same fixed no-admission outcome"
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            1,
+            "a short inside-window caller performs zero physical setups"
+        );
+
+        set_remote_retirement_probe_boundary(
+            &peer,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(
+            peer.call_with_timeout(
+                request(),
+                DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout(),
+            )
+            .await,
+            Err(SessionConsensusPeerError::Unavailable),
+            "an Openraft-sized caller stays prompt even when its deadline crosses the probe boundary"
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            1,
+            "a caller without a complete post-boundary cold budget performs zero physical setups"
+        );
+        set_remote_retirement_probe_boundary(
+            &peer,
+            tokio::time::Instant::now() + DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
+        )
+        .await;
+
+        let first_blocked = {
+            let peer = peer.clone();
+            let request = request();
+            tokio::spawn(async move { peer.call(request).await })
+        };
+        let second_blocked = {
+            let peer = peer.clone();
+            let request = request();
+            tokio::spawn(async move { peer.call(request).await })
+        };
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        for blocked in [&first_blocked, &second_blocked] {
+            assert!(
+                !blocked.is_finished(),
+                "same-epoch callers remain pending until the shared fixed probe boundary"
             );
         }
         assert_eq!(
             resolutions.load(Ordering::SeqCst),
             1,
-            "many concurrent and later calls inside one window perform no physical setup or Openraft Call"
+            "many concurrent same-epoch calls start no setup before the fixed boundary"
         );
 
         make_remote_retirement_probe_due(&peer).await;
-        let (first_due, second_due) = tokio::join!(peer.call(request()), peer.call(request()));
-        assert_eq!(
-            first_due,
-            Err(SessionConsensusPeerError::Unavailable),
-            "the due probe retains its pre-Call unavailable result"
-        );
-        assert_eq!(
-            second_due,
-            Err(SessionConsensusPeerError::Unavailable),
-            "a concurrent due caller joins the one probe and remains pre-Call unavailable"
-        );
+        for outcome in [
+            first_blocked.await.expect("first blocked caller"),
+            second_blocked.await.expect("second blocked caller"),
+        ] {
+            assert_eq!(
+                outcome,
+                Err(SessionConsensusPeerError::Unavailable),
+                "all boundary callers share the failed probe's pre-Call receipt"
+            );
+        }
         assert_eq!(
             resolutions.load(Ordering::SeqCst),
             2,
             "at the fixed boundary exactly one same-epoch caller owns the physical probe"
         );
 
+        let rearmed_peer = peer.clone();
+        let rearmed_request = request();
+        let rearmed_call = tokio::spawn(async move { rearmed_peer.call(rearmed_request).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
-            peer.call(request()).await,
-            Err(SessionConsensusPeerError::Unavailable),
-            "a failed same-epoch probe re-arms the fixed window"
+            resolutions.load(Ordering::SeqCst),
+            2,
+            "the failed probe re-arms its fixed window without another setup"
         );
-        assert_eq!(resolutions.load(Ordering::SeqCst), 2);
-
         make_remote_retirement_probe_due(&peer).await;
         assert_eq!(
-            peer.call(request()).await,
+            rearmed_call.await.expect("rearmed waiting caller"),
             Err(SessionConsensusPeerError::Unavailable),
-            "the re-armed window permits one later probe"
+            "a failed same-epoch probe re-arms the fixed window"
         );
         assert_eq!(
             resolutions.load(Ordering::SeqCst),
             3,
             "the re-armed boundary permits exactly one physical setup"
         );
+
+        let recovering_peer = peer.clone();
+        let recovering_request = request();
+        let recovering_call =
+            tokio::spawn(async move { recovering_peer.call(recovering_request).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         make_remote_retirement_probe_due(&peer).await;
         assert_eq!(
-            peer.call(request()).await,
+            recovering_call.await.expect("recovering waiting caller"),
             Ok(SessionConsensusWireResponse {
                 result: Ok(b"bounded-consensus-retirement".to_vec()),
             }),
-            "a distinct later call may recover after the bounded failed cold wave"
+            "a waiting same-epoch call recovers at the re-armed fixed boundary"
         );
         assert_eq!(resolutions.load(Ordering::SeqCst), 4);
         assert!(
@@ -6174,7 +8226,7 @@ mod tests {
             reject_consensus_bootstrap(
                 &mut sink,
                 SessionConsensusPeerError::Rejected,
-                Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(1),
                 &cancellation,
             )
             .await,
@@ -6182,9 +8234,13 @@ mod tests {
         ));
 
         let (mut writer, mut reader) = tokio::io::duplex(1024);
-        retire_consensus_bootstrap(&mut writer, Duration::from_secs(1), &cancellation)
-            .await
-            .expect("write reserved bootstrap retirement");
+        retire_consensus_bootstrap(
+            &mut writer,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &cancellation,
+        )
+        .await
+        .expect("write reserved bootstrap retirement");
         assert!(matches!(
             read_frame::<_, SessionConsensusBootstrapResponse>(
                 &mut reader,
@@ -6304,7 +8360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consensus_bootstrap_rejects_prior_transport_or_application_revision_before_handler() {
+    async fn consensus_bootstrap_rejects_former_pr_732_tag_27_app3_profile_before_handler() {
         let (server_binding, client_binding) = bindings();
         let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
         let server = SessionConsensusServer::from_transport(
@@ -6322,10 +8378,13 @@ mod tests {
                 SESSION_CONSENSUS_TRANSPORT_REVISION - 1,
                 CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
             ),
+            (5, former_728bc5_application_revision_3_profile()),
             (
                 SESSION_CONSENSUS_TRANSPORT_REVISION,
                 SessionConsensusContractProfile {
-                    application_revision: 1,
+                    error_set_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                        .error_set_revision
+                        - 1,
                     ..CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
                 },
             ),
@@ -6362,6 +8421,91 @@ mod tests {
         }
         assert_eq!(handler.0.load(Ordering::Relaxed), 0);
         handle.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn consensus_client_rejects_former_pr_732_tag_27_app3_profile_before_call() {
+        let (_server_binding, client_binding) = bindings();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind incompatible HelloAck listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_binding = client_binding.clone();
+        let server = tokio::spawn(async move {
+            let mut calls = 0;
+            for (transport_revision, contract_profile) in [
+                (5, former_728bc5_application_revision_3_profile()),
+                (
+                    SESSION_CONSENSUS_TRANSPORT_REVISION,
+                    SessionConsensusContractProfile {
+                        error_set_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                            .error_set_revision
+                            - 1,
+                        ..CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                    },
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let SessionConsensusBootstrapRequest::Hello(hello) =
+                    read_frame(&mut stream, MAX_HANDSHAKE_FRAME_SIZE)
+                        .await
+                        .expect("read Hello");
+                write_frame(
+                    &mut stream,
+                    &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                        transport_revision,
+                        contract_profile,
+                        identity: hello.identity,
+                        server_node_id: server_binding.remote_consensus_node_id(),
+                        accepted_sender_node_id: hello.sender_node_id,
+                        handshake_nonce: hello.handshake_nonce,
+                        accepted_response_frame_size: hello.requested_response_frame_size,
+                        server_request_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                    }),
+                )
+                .await
+                .expect("write incompatible HelloAck");
+                if matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        read_frame::<_, SessionConsensusTransportRequest>(
+                            &mut stream,
+                            MAX_NEGOTIATED_FRAME_SIZE,
+                        ),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ) {
+                    calls += 1;
+                }
+            }
+            calls
+        });
+        let resolve: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolve),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(1)),
+        );
+        let request = || {
+            SessionConsensusWireRequest::try_new(
+                client_binding.consensus_identity(),
+                client_binding.local_consensus_node_id(),
+                SessionConsensusRpcFamily::Vote,
+                b"reject-adjacent-hello-ack-profile".to_vec(),
+            )
+            .expect("bounded request")
+        };
+        assert_eq!(
+            peer.call(request()).await,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        assert_eq!(
+            peer.call(request()).await,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        assert_eq!(server.await.expect("incompatible HelloAck server"), 0);
     }
 
     #[tokio::test]
@@ -6885,6 +9029,7 @@ mod tests {
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
                 idle_deadline_origin: established_at,
@@ -6918,6 +9063,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            admission_attempt_id: None,
             lifecycle,
             last_successful_correlated_use: None,
             idle_deadline_origin: tokio::time::Instant::now(),
@@ -7069,6 +9215,136 @@ mod tests {
                 .remote_retirement_probe_gate
                 .is_some_and(|gate| gate.probe_is_due(epoch, tokio::time::Instant::now())),
             "concurrent primary/overflow credential retirements publish one due-now exact-peer gate"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_successor_credential_retirement_seeds_its_own_exact_probe_epoch() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let tls_config = material.config();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::ZERO,
+        )
+        .expect("successor credential retirement lifecycle policy");
+        let now = tokio::time::Instant::now();
+        let material_epoch = Some(tls_config.material_status().epoch());
+        let first_epoch = ConsensusColdConnectionEpoch {
+            material_epoch,
+            ..test_cold_epoch()
+        };
+        let successor_epoch = ConsensusColdConnectionEpoch {
+            reauthentication_generation: 1,
+            ..first_epoch
+        };
+        let first_lifecycle = ConnectionLifecycle::new(
+            policy,
+            now,
+            None,
+            None,
+            first_epoch.reauthentication_generation,
+            first_epoch.material_epoch,
+        )
+        .expect("first cached lifecycle");
+        let pool = Arc::new(ConsensusConnectionPool::new(policy));
+        *pool.primary.connection.lock().await = Some(cached_consensus_connection(first_lifecycle));
+        let reauthentication = SessionReauthenticationControl::new();
+        pool.ensure_cached_connection_reaper(
+            ConsensusConnectionLane::Primary,
+            Some(tls_config.clone()),
+            reauthentication.clone(),
+            [10; 32],
+            first_epoch,
+        );
+        pool.primary.changed.notify_one();
+        tokio::task::yield_now().await;
+
+        let expires_at = opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(2),
+        );
+        let peer_expiry = CertificateExpiryEvidence::capture(expires_at, expires_at, now);
+        let successor_lifecycle = ConnectionLifecycle::new(
+            policy,
+            now,
+            None,
+            Some(peer_expiry),
+            successor_epoch.reauthentication_generation,
+            successor_epoch.material_epoch,
+        )
+        .expect("successor cached lifecycle");
+        let successor_retirement = successor_lifecycle.clone();
+        *pool.primary.connection.lock().await =
+            Some(cached_consensus_connection(successor_lifecycle));
+        pool.primary.changed.notify_one();
+        reauthentication
+            .request_reauthentication()
+            .expect("advance to the successor generation");
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+        assert_eq!(
+            successor_retirement.recorded_retirement_reason(),
+            Some(RetirementReason::PeerLeafExpiry),
+            "the successor must retire at its credential lifecycle boundary"
+        );
+
+        let gate = pool
+            .cold_connection
+            .state
+            .lock()
+            .await
+            .remote_retirement_probe_gate
+            .expect("credential retirement must seed a probe gate");
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            gate.epoch, successor_epoch,
+            "the gate follows the successor admission"
+        );
+        assert_eq!(
+            gate.epoch.consensus_identity,
+            first_epoch.consensus_identity
+        );
+        assert_eq!(gate.epoch.remote_node_id, first_epoch.remote_node_id);
+        assert!(gate.probe_is_due(successor_epoch, now));
+        assert!(
+            !gate.probe_is_due(first_epoch, now),
+            "the stale first-reaper epoch must bypass the successor gate"
+        );
+        let pending_gate = ConsensusRemoteRetirementProbeGate {
+            next_probe_at: Some(now + Duration::from_secs(1)),
+            ..gate
+        };
+        assert!(pending_gate.blocks(successor_epoch, now));
+        assert!(
+            !pending_gate.blocks(first_epoch, now),
+            "the stale first-reaper epoch must not block a successor admission"
+        );
+
+        material.rotate();
+        let current_different_epoch = ConsensusColdConnectionEpoch {
+            material_epoch: Some(tls_config.material_status().epoch()),
+            ..successor_epoch
+        };
+        assert_ne!(
+            current_different_epoch.material_epoch,
+            successor_epoch.material_epoch
+        );
+        assert!(
+            !gate.probe_is_due(current_different_epoch, now),
+            "a current, different material epoch must bypass the old exact-epoch gate"
+        );
+        assert!(
+            !pending_gate.blocks(current_different_epoch, now),
+            "a new material epoch must not be blocked by the old exact-epoch gate"
         );
     }
 

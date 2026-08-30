@@ -1386,6 +1386,8 @@ impl ConsensusSessionStore {
             .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let terminal_recovery_handoff_consumer =
+            log_store.live_terminal_recovery_handoff_consumer();
         let storage_shutdown = state_machine
             .shutdown_observer()
             .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
@@ -1439,6 +1441,13 @@ impl ConsensusSessionStore {
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
             storage_shutdown,
+            terminal_recovery_handoff_consumer,
+            #[cfg(test)]
+            terminal_recovery_gate_checks: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_forward_authority_gate: Arc::new(RemoteForwardAuthorityGate::new()),
+            #[cfg(test)]
+            remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,

@@ -1045,6 +1045,14 @@ impl ConnectionLifecycle {
         self.evidence.material_epoch
     }
 
+    pub(crate) fn peer_certificate_effective_expiry(&self) -> Option<opc_types::Timestamp> {
+        self.evidence.peer_certificate_expiry.map(|evidence| {
+            evidence
+                .leaf_expires_at
+                .min(evidence.certificate_chain_expires_at)
+        })
+    }
+
     #[cfg(feature = "legacy-session-net-compat")]
     pub(crate) const fn rotation_was_observed(&self) -> bool {
         self.rotation_retire_at.is_some()

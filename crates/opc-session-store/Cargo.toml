@@ -32,6 +32,7 @@ opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-mgmt-audit = { path = "../opc-mgmt-audit", version = "0.2.0" }
+opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 postcard = { workspace = true }
@@ -49,7 +50,8 @@ hmac = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 libc = "0.2"
-nix = { workspace = true, features = ["fs", "user"] }
+nix = { workspace = true, features = ["fs", "socket", "user"] }
+rustix = { version = "1", features = ["fs"] }
 aes-gcm-siv = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
@@ -61,6 +63,7 @@ rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks", "limits
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["test-vfs"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }

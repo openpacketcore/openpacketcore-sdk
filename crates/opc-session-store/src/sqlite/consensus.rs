@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+use rusqlite::types::ValueRef;
 use rusqlite::OpenFlags;
 use rusqlite::{
     backup::StepResult, params, Connection, DropBehavior, InterruptHandle, OptionalExtension,
@@ -32,7 +33,7 @@ use crate::backend::{
     ReplicationTxId, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 use crate::capability::BackendCapabilities;
-use crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
+use crate::consensus::snapshot::{SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES};
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::store::ConsensusStoreDiagnosticCounters;
 use crate::consensus::types::{
@@ -41,11 +42,12 @@ use crate::consensus::types::{
     roster_registration_handle, validate_fenced_transition_v2_batch,
     validate_fenced_transition_v2_batch_outcomes, ConsensusRosterAdmissionCommand,
     ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
-    ConsensusRosterTerminalCommandV2, ConsensusRosterTerminalOutcome, SessionConsensusCommand,
-    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
-    SessionMutationOutcome, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
+    ConsensusRosterTerminalCommandV2, ConsensusRosterTerminalOutcome,
+    FinalizeOperatorRecoveryV2Intent, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyMemberBinding,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
@@ -123,6 +125,9 @@ use crate::fenced_transition::{
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
     FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
 };
+
+#[cfg(test)]
+type PathOnceHook = Box<dyn FnOnce(&Path)>;
 use crate::readiness::PlacementResiliencePolicy;
 use crate::record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 use crate::{
@@ -143,6 +148,21 @@ const PROTECTED_ROSTER_MAX_CANONICAL_BUSINESS_BYTES: usize = 1_052_672;
 const PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS: i128 = 24 * 60 * 60 * 1_000_000_000;
 const PROTECTED_ROSTER_RECOVERY_TRUST_ROOT_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/protected-roster/recovery-trust-root/v1\0";
+const OPERATOR_RECOVERY_V2_AUTHORITY_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/operator-recovery/v2/authority-predecessor/v1\0";
+const OPERATOR_RECOVERY_V2_LEGACY_BOOTSTRAP_MEMBERSHIP_DOMAIN: &[u8] =
+    b"openpacketcore/session-recovery/legacy-bootstrap-membership/v1\0";
+const OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_REVISION: u16 = 1;
+const OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_DOMAIN: &str =
+    "openpacketcore/session-consensus/operator-recovery/v2/finalize-certificate/v1";
+// A V2 recovery finalization entry contains only fixed-size identities,
+// digests, counters, and timestamps.  Keep its separately retained
+// certificate far below the generic durable-log ceiling so snapshot/import
+// validation has an independent, protocol-specific allocation bound.
+const OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_MAX_BYTES: usize = 16 * 1024;
+const OPERATOR_RECOVERY_V2_AUTHORITY_COMMITMENT_MAX_ROWS: usize = 1_000_000;
+const OPERATOR_RECOVERY_V2_AUTHORITY_COMMITMENT_MAX_BYTES: usize = 256 * 1024 * 1024;
+const OPERATOR_RECOVERY_V2_MAX_BLANK_PREDECESSOR_ENTRIES: usize = 1_000_000;
 
 /// Return the immutable protected-roster canonical record and business value
 /// caps for recovery's bounded preflight, without duplicating protocol limits.
@@ -518,8 +538,31 @@ const FENCED_TRANSITION_V2_MUTATION_TTL_REFRESHED: u8 = 4;
 // canonical in-memory schema is deliberately one-time: append and apply run
 // this classifier for every command, including snapshot catch-up logs.
 static ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
-const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL001";
+// A V2 finalization certificate turns the recovery row and the generic
+// outcome namespace into one durable authorization object.  The historical
+// add-on and ALTER-based operator-recovery products remain supported, but
+// only their exact emitted DDL is admitted once that object is populated.
+static OPERATOR_RECOVERY_CERTIFICATE_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
+// Recovery sidecars are self-bound to their persistent Linux file handle.
+// Earlier unbound OPCRL001/OPCRL002 records are intentionally not accepted:
+// a same-byte copy at the public pathname must remain invalid after a retry
+// or restart, rather than becoming fresh recovery authority.
+const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL003";
+const OPERATOR_RECOVERY_TERMINAL_MAGIC: &[u8; 8] = b"OPCRL004";
 const OPERATOR_RECOVERY_LATCH_BYTES: usize = 8 + 32 + 32 + 8 + 8 + 32 + 1;
+const OPERATOR_RECOVERY_TERMINAL_DATABASE_BYTES: usize =
+    16 + 4 + 1 + opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES;
+const OPERATOR_RECOVERY_ACTIVE_BYTES: usize =
+    OPERATOR_RECOVERY_LATCH_BYTES + OPERATOR_RECOVERY_TERMINAL_DATABASE_BYTES;
+const OPERATOR_RECOVERY_TERMINAL_MIN_BYTES: usize =
+    OPERATOR_RECOVERY_ACTIVE_BYTES + OPERATOR_RECOVERY_TERMINAL_DATABASE_BYTES + 1;
+const OPERATOR_RECOVERY_TERMINAL_SNAPSHOT_MAX_PATH_BYTES: usize = 4096;
+const OPERATOR_RECOVERY_TERMINAL_MAX_BYTES: usize = OPERATOR_RECOVERY_TERMINAL_MIN_BYTES
+    + 2
+    + OPERATOR_RECOVERY_TERMINAL_SNAPSHOT_MAX_PATH_BYTES
+    + 32
+    + 1
+    + OPERATOR_RECOVERY_TERMINAL_DATABASE_BYTES;
 #[cfg(all(test, target_os = "linux"))]
 static SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS: AtomicBool = AtomicBool::new(false);
 
@@ -529,6 +572,214 @@ pub(crate) struct OperatorRecoveryLatch {
     pub(crate) recovery_epoch: u64,
     pub(crate) plan_digest: [u8; 32],
     pub(crate) audit_pending: bool,
+}
+
+/// Crash-stable kernel incarnation for a terminal recovery record.
+///
+/// This uses the filesystem's externally assigned UUID and an opaque
+/// comparison-only `AT_HANDLE_FID` file handle.  In contrast, device/inode
+/// and Linux mount IDs are only suitable for a live-descriptor fence: mount
+/// IDs change at remount and inode numbers can be recycled after a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperatorRecoveryFileIncarnation {
+    filesystem_uuid: [u8; 16],
+    handle_type: i32,
+    handle_length: u8,
+    handle: [u8; opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperatorRecoveryLatchRecord {
+    Active(OperatorRecoveryLatch),
+    Terminal(Box<OperatorRecoveryTerminalRecord>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperatorRecoveryTerminalRecord {
+    latch: OperatorRecoveryLatch,
+    database: OperatorRecoveryFileIncarnation,
+    phase: OperatorRecoveryTerminalPhase,
+    snapshot: Option<OperatorRecoveryTerminalSnapshot>,
+}
+
+impl OperatorRecoveryLatchRecord {
+    fn terminal(
+        latch: OperatorRecoveryLatch,
+        database: OperatorRecoveryFileIncarnation,
+        phase: OperatorRecoveryTerminalPhase,
+        snapshot: Option<OperatorRecoveryTerminalSnapshot>,
+    ) -> Self {
+        Self::Terminal(Box::new(OperatorRecoveryTerminalRecord {
+            latch,
+            database,
+            phase,
+            snapshot,
+        }))
+    }
+}
+
+/// A terminal latch begins as a one-time handoff from offline recovery to the
+/// first normal consensus initialization.  Only that initialization may
+/// consume the snapshot-bound form.  The resulting database-only terminal
+/// remains as a durable readiness tombstone while normal snapshot publication
+/// is free to advance its selected filename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorRecoveryTerminalPhase {
+    PendingHandoff,
+    Consumed,
+}
+
+/// Descriptor-bound phase of a recovery sidecar observed by offline recovery.
+/// The value is deliberately not inferred from another replica or workflow
+/// state: each database/sidecar pair is independently re-opened and fenced
+/// before it can select the recovery proof regime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperatorRecoveryLatchPhase {
+    Active,
+    PendingHandoff,
+    Consumed,
+}
+
+/// Exact selected-snapshot evidence carried by a terminal recovery latch.
+/// The pathname is an auditable locator only. Initial latch classification
+/// opens it nofollow, but after storage admits a retained snapshot-directory
+/// descriptor, terminal validation uses the supplied descriptor rather than
+/// resolving this logical name again. SQLite's selected snapshot name must
+/// still equal its basename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperatorRecoveryTerminalSnapshot {
+    path: PathBuf,
+    digest: [u8; 32],
+    fixed_immutable: bool,
+    incarnation: OperatorRecoveryFileIncarnation,
+}
+
+/// One in-process handoff from a snapshot-bound terminal recovery latch to
+/// the first consensus core that reopens the recovered database.  The held
+/// descriptor is intentionally not cloneable: it is the exact object which
+/// the snapshot directory opener must validate before the terminal record can
+/// become database-only and later snapshot publication is permitted.
+pub(crate) struct OperatorRecoveryTerminalHandoff {
+    latch: OperatorRecoveryLatch,
+    database: OperatorRecoveryFileIncarnation,
+    snapshot: Option<OperatorRecoveryTerminalSnapshot>,
+    snapshot_file: Option<File>,
+    // The sidecar is evidence too.  It remains open from connection-aware
+    // classification through the one-shot pending-to-consumed transition so
+    // a same-byte pathname replacement cannot change the terminal authority
+    // between those two phases.
+    sidecar_file: Option<File>,
+    sidecar_incarnation: Option<OperatorRecoveryFileIncarnation>,
+}
+
+/// A consumed terminal remains distinct from an absent sidecar while a live
+/// core reconciles an offline-recovery retry.  The classifier retains both
+/// the exact sidecar descriptor and the database incarnation which it just
+/// matched, so this is not a readiness inference from a missing latch.
+///
+/// The descriptor is intentionally private evidence: no caller may turn it
+/// back into a pending handoff or use it to admit a different database.
+pub(crate) struct OperatorRecoveryConsumedTerminal {
+    _latch: OperatorRecoveryLatch,
+    _database: OperatorRecoveryFileIncarnation,
+    _sidecar_file: File,
+    _sidecar_incarnation: OperatorRecoveryFileIncarnation,
+}
+
+/// A decoded recovery sidecar together with the exact regular file that
+/// supplied it.  The persistent incarnation is durable across process
+/// boundaries; retaining the descriptor additionally fences the live
+/// classify/consume path against same-process replacement.
+struct PinnedOperatorRecoveryLatchRecord {
+    record: OperatorRecoveryLatchRecord,
+    file: File,
+    incarnation: OperatorRecoveryFileIncarnation,
+}
+
+/// Connection-aware recovery-latch classification.  Pending terminal records
+/// remain active to ordinary backend work until a consensus core consumes the
+/// exact descriptor handoff.
+pub(crate) struct OperatorRecoveryLatchClassification {
+    latch: Option<OperatorRecoveryLatch>,
+    terminal_handoff: Option<OperatorRecoveryTerminalHandoff>,
+    consumed_terminal: Option<OperatorRecoveryConsumedTerminal>,
+}
+
+impl OperatorRecoveryLatchClassification {
+    pub(crate) const fn latch(&self) -> Option<OperatorRecoveryLatch> {
+        self.latch
+    }
+
+    pub(crate) fn into_terminal_handoff(self) -> Option<OperatorRecoveryTerminalHandoff> {
+        self.terminal_handoff
+    }
+
+    /// True only when this classifier held and revalidated an exact consumed
+    /// terminal sidecar bound to the same SQLite main-file incarnation.
+    pub(crate) const fn has_consumed_terminal(&self) -> bool {
+        self.consumed_terminal.is_some()
+    }
+}
+
+/// Result of classifying a recovery sidecar for a core that was already open
+/// when recovery published its terminal handoff.  This separates an ordinary
+/// active gate from corruption: callers must keep Active closed, while a
+/// descriptor, namespace, or terminal mismatch is a fail-closed error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveTerminalRecoveryHandoffInstallOutcome {
+    /// A descriptor-bound pending terminal handoff was retained by the core.
+    Installed,
+    /// The durable sidecar remains an active recovery gate.
+    Active,
+    /// A descriptor- and database-incarnation-bound consumed terminal was
+    /// observed. This is accepted only by the recovery-manager retry path;
+    /// it is deliberately distinct from ordinary startup readiness.
+    AlreadyConsumed,
+    /// No sidecar is present.
+    Clear,
+}
+
+/// Cheap descriptor-bound observation of a live recovery sidecar.
+///
+/// `Clear` is returned only after the SQLite main descriptor, configured
+/// database pathname, recovery rows, and repeated sidecar absence all agree.
+/// A terminal record deliberately remains unresolved here: its selected
+/// snapshot must be opened through the retained namespace and classified by
+/// the full handoff path before application traffic can proceed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveTerminalRecoveryHandoffProbe {
+    Clear,
+    Active,
+    TerminalNeedsSnapshot,
+}
+
+pub(crate) fn operator_recovery_terminal_snapshot(
+    path: &Path,
+    file: &File,
+    fixed_immutable: bool,
+) -> io::Result<OperatorRecoveryTerminalSnapshot> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let length = path.as_os_str().as_bytes().len();
+        if length == 0 || length > OPERATOR_RECOVERY_TERMINAL_SNAPSHOT_MAX_PATH_BYTES {
+            return Err(invalid_data(
+                "session operator recovery terminal snapshot path is invalid",
+            ));
+        }
+    }
+    Ok(OperatorRecoveryTerminalSnapshot {
+        path: path.to_path_buf(),
+        // Workflow artifacts use a domain-separated digest.  A terminal is
+        // deliberately independent of that workflow encoding: it binds the
+        // raw complete envelope consumed by normal snapshot initialization.
+        // Derive it from this retained descriptor so a caller cannot supply
+        // the differently-scoped workflow digest by mistake.
+        digest: terminal_snapshot_raw_digest(file)?,
+        fixed_immutable,
+        incarnation: operator_recovery_file_incarnation(file)?,
+    })
 }
 
 pub(crate) fn operator_recovery_latch_path(database: &Path) -> io::Result<PathBuf> {
@@ -552,6 +803,103 @@ fn encode_operator_recovery_latch(
     encoded[88..120].copy_from_slice(&latch.plan_digest);
     encoded[120] = u8::from(latch.audit_pending);
     encoded
+}
+
+fn encode_operator_recovery_terminal(
+    latch: OperatorRecoveryLatch,
+    sidecar: OperatorRecoveryFileIncarnation,
+    database: OperatorRecoveryFileIncarnation,
+    phase: OperatorRecoveryTerminalPhase,
+    snapshot: Option<&OperatorRecoveryTerminalSnapshot>,
+) -> Vec<u8> {
+    let mut encoded = encode_operator_recovery_latch(latch).to_vec();
+    encoded[..8].copy_from_slice(OPERATOR_RECOVERY_TERMINAL_MAGIC);
+    append_terminal_incarnation(&mut encoded, sidecar);
+    append_terminal_incarnation(&mut encoded, database);
+    match (phase, snapshot) {
+        (OperatorRecoveryTerminalPhase::Consumed, None) => encoded.push(2),
+        // The consumed form deliberately has no snapshot: retaining its
+        // former name would make an ordinary later snapshot publication look
+        // corrupt.  This branch is unreachable for every constructor, but a
+        // malformed in-memory record must never turn into an empty sidecar.
+        (OperatorRecoveryTerminalPhase::Consumed, Some(_)) => {
+            unreachable!("a consumed operator recovery terminal cannot retain a snapshot")
+        }
+        (OperatorRecoveryTerminalPhase::PendingHandoff, None) => encoded.push(0),
+        (OperatorRecoveryTerminalPhase::PendingHandoff, Some(snapshot)) => {
+            encoded.push(1);
+            #[cfg(unix)]
+            use std::os::unix::ffi::OsStrExt as _;
+            #[cfg(unix)]
+            let path = snapshot.path.as_os_str().as_bytes();
+            #[cfg(not(unix))]
+            let path: &[u8] =
+                unreachable!("operator recovery terminal snapshot paths require Unix bytes");
+            let length = u16::try_from(path.len()).expect("terminal snapshot path was bounded");
+            encoded.extend_from_slice(&length.to_be_bytes());
+            encoded.extend_from_slice(path);
+            encoded.extend_from_slice(&snapshot.digest);
+            encoded.push(u8::from(snapshot.fixed_immutable));
+            append_terminal_incarnation(&mut encoded, snapshot.incarnation);
+        }
+    }
+    encoded
+}
+
+fn append_terminal_incarnation(
+    encoded: &mut Vec<u8>,
+    incarnation: OperatorRecoveryFileIncarnation,
+) {
+    encoded.extend_from_slice(&incarnation.filesystem_uuid);
+    encoded.extend_from_slice(&incarnation.handle_type.to_be_bytes());
+    encoded.push(incarnation.handle_length);
+    encoded.extend_from_slice(&incarnation.handle);
+}
+
+fn read_terminal_incarnation(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> io::Result<OperatorRecoveryFileIncarnation> {
+    let take = |offset: &mut usize, length: usize| -> io::Result<&[u8]> {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| invalid_data("session operator recovery terminal is invalid"))?;
+        let value = bytes
+            .get(*offset..end)
+            .ok_or_else(|| invalid_data("session operator recovery terminal is invalid"))?;
+        *offset = end;
+        Ok(value)
+    };
+    let filesystem_uuid = take(offset, 16)?
+        .try_into()
+        .map_err(|_| invalid_data("session operator recovery terminal is invalid"))?;
+    let handle_type = i32::from_be_bytes(
+        take(offset, 4)?
+            .try_into()
+            .map_err(|_| invalid_data("session operator recovery terminal is invalid"))?,
+    );
+    let handle_length = *take(offset, 1)?
+        .first()
+        .ok_or_else(|| invalid_data("session operator recovery terminal is invalid"))?;
+    let handle: [u8; opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES] =
+        take(offset, opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES)?
+            .try_into()
+            .map_err(|_| invalid_data("session operator recovery terminal is invalid"))?;
+    let length = usize::from(handle_length);
+    if length == 0
+        || length > opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES
+        || handle[length..].iter().any(|byte| *byte != 0)
+    {
+        return Err(invalid_data(
+            "session operator recovery terminal is invalid",
+        ));
+    }
+    Ok(OperatorRecoveryFileIncarnation {
+        filesystem_uuid,
+        handle_type,
+        handle_length,
+        handle,
+    })
 }
 
 fn decode_operator_recovery_latch(
@@ -596,28 +944,199 @@ fn decode_operator_recovery_latch(
     })
 }
 
-fn open_nofollow_read(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
+fn decode_operator_recovery_terminal(
+    encoded: &[u8],
+) -> io::Result<(
+    OperatorRecoveryLatch,
+    OperatorRecoveryFileIncarnation,
+    OperatorRecoveryFileIncarnation,
+    OperatorRecoveryTerminalPhase,
+    Option<OperatorRecoveryTerminalSnapshot>,
+)> {
+    if encoded.len() < OPERATOR_RECOVERY_TERMINAL_MIN_BYTES
+        || &encoded[..8] != OPERATOR_RECOVERY_TERMINAL_MAGIC
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        return Err(invalid_data(
+            "session operator recovery terminal is invalid",
+        ));
     }
-    options.open(path)
+    let mut active = [0_u8; OPERATOR_RECOVERY_LATCH_BYTES];
+    active.copy_from_slice(&encoded[..OPERATOR_RECOVERY_LATCH_BYTES]);
+    active[..8].copy_from_slice(OPERATOR_RECOVERY_LATCH_MAGIC);
+    let latch = decode_operator_recovery_latch(&active)?;
+    let mut offset = OPERATOR_RECOVERY_LATCH_BYTES;
+    let sidecar = read_terminal_incarnation(encoded, &mut offset)?;
+    let database = read_terminal_incarnation(encoded, &mut offset)?;
+    let snapshot_tag = *encoded
+        .get(offset)
+        .ok_or_else(|| invalid_data("session operator recovery terminal is invalid"))?;
+    offset += 1;
+    let (phase, snapshot) = match snapshot_tag {
+        0 if offset == encoded.len() => (OperatorRecoveryTerminalPhase::PendingHandoff, None),
+        2 if offset == encoded.len() => (OperatorRecoveryTerminalPhase::Consumed, None),
+        1 => {
+            let length_end = offset
+                .checked_add(2)
+                .ok_or_else(|| invalid_data("session operator recovery terminal is invalid"))?;
+            let length = usize::from(u16::from_be_bytes(
+                encoded
+                    .get(offset..length_end)
+                    .ok_or_else(|| invalid_data("session operator recovery terminal is invalid"))?
+                    .try_into()
+                    .map_err(|_| invalid_data("session operator recovery terminal is invalid"))?,
+            ));
+            offset = length_end;
+            if length == 0
+                || length > OPERATOR_RECOVERY_TERMINAL_SNAPSHOT_MAX_PATH_BYTES
+                || offset.checked_add(length + 32 + 1 + OPERATOR_RECOVERY_TERMINAL_DATABASE_BYTES)
+                    != Some(encoded.len())
+            {
+                return Err(invalid_data(
+                    "session operator recovery terminal is invalid",
+                ));
+            }
+            let path_bytes = &encoded[offset..offset + length];
+            offset += length;
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::ffi::OsStringExt as _;
+                PathBuf::from(std::ffi::OsString::from_vec(path_bytes.to_vec()))
+            };
+            #[cfg(not(unix))]
+            let path = PathBuf::from(
+                std::str::from_utf8(path_bytes)
+                    .map_err(|_| invalid_data("session operator recovery terminal is invalid"))?,
+            );
+            let digest = encoded[offset..offset + 32]
+                .try_into()
+                .map_err(|_| invalid_data("session operator recovery terminal is invalid"))?;
+            offset += 32;
+            let fixed_immutable = match encoded[offset] {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(invalid_data(
+                        "session operator recovery terminal is invalid",
+                    ));
+                }
+            };
+            offset += 1;
+            let incarnation = read_terminal_incarnation(encoded, &mut offset)?;
+            if offset != encoded.len() {
+                return Err(invalid_data(
+                    "session operator recovery terminal is invalid",
+                ));
+            }
+            (
+                OperatorRecoveryTerminalPhase::PendingHandoff,
+                Some(OperatorRecoveryTerminalSnapshot {
+                    path,
+                    digest,
+                    fixed_immutable,
+                    incarnation,
+                }),
+            )
+        }
+        _ => {
+            return Err(invalid_data(
+                "session operator recovery terminal is invalid",
+            ));
+        }
+    };
+    Ok((latch, sidecar, database, phase, snapshot))
 }
 
-pub(crate) fn read_operator_recovery_latch_sync(
+fn open_nofollow_read(path: &Path) -> io::Result<File> {
+    super::open_regular_read_nofollow(path)
+}
+
+#[cfg(test)]
+fn read_operator_recovery_latch_record(
     database: &Path,
-) -> io::Result<Option<OperatorRecoveryLatch>> {
+) -> io::Result<Option<OperatorRecoveryLatchRecord>> {
+    Ok(read_operator_recovery_latch_record_pinned(database)?.map(|pinned| pinned.record))
+}
+
+/// Open and decode a recovery sidecar while retaining the exact source
+/// descriptor.  Callers that make an admission decision must subsequently
+/// use [`revalidate_operator_recovery_latch_record_path`] before returning
+/// that decision, rather than reopening an unbound pathname later.
+fn read_operator_recovery_latch_record_pinned(
+    database: &Path,
+) -> io::Result<Option<PinnedOperatorRecoveryLatchRecord>> {
     let path = operator_recovery_latch_path(database)?;
     let mut file = match open_nofollow_read(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    let incarnation = operator_recovery_file_incarnation(&file)?;
+    let record = read_operator_recovery_latch_record_from_file(&mut file)?;
+    Ok(Some(PinnedOperatorRecoveryLatchRecord {
+        record,
+        file,
+        incarnation,
+    }))
+}
+
+/// Prove that the public sidecar pathname still names the exact descriptor
+/// that supplied `expected`.  The held descriptor is decoded again as well:
+/// a same-inode rewrite cannot evade this check by retaining its old handle.
+fn revalidate_operator_recovery_latch_record_path(
+    database: &Path,
+    expected: &mut PinnedOperatorRecoveryLatchRecord,
+) -> io::Result<()> {
+    revalidate_operator_recovery_latch_record_at_path(
+        &operator_recovery_latch_path(database)?,
+        expected,
+    )
+}
+
+/// Verify a held sidecar against one exact public/private pathname.  Keeping
+/// the pathname parameter separate lets promotion prove the temporary creator
+/// before rename and the final public name afterwards without ever treating a
+/// fresh path open as authority.
+fn revalidate_operator_recovery_latch_record_at_path(
+    path: &Path,
+    expected: &mut PinnedOperatorRecoveryLatchRecord,
+) -> io::Result<()> {
+    expected.file.seek(SeekFrom::Start(0))?;
+    let held_record = read_operator_recovery_latch_record_from_file(&mut expected.file)?;
+    if held_record != expected.record
+        || operator_recovery_file_incarnation(&expected.file)? != expected.incarnation
+    {
+        return Err(invalid_data("session operator recovery latch changed"));
+    }
+
+    let mut path_file = open_nofollow_read(path)?;
+    let path_record = read_operator_recovery_latch_record_from_file(&mut path_file)?;
+    if path_record != expected.record
+        || operator_recovery_file_incarnation(&path_file)? != expected.incarnation
+    {
+        return Err(invalid_data(
+            "session operator recovery latch pathname changed",
+        ));
+    }
+    Ok(())
+}
+
+/// Decode one sidecar through its already-open regular descriptor.
+///
+/// Retry paths use this alongside the descriptor's persistent incarnation so
+/// a pre-directory-sync crash can be repaired without re-admitting a later
+/// same-byte sidecar replacement by pathname.
+fn read_operator_recovery_latch_record_from_file(
+    file: &mut File,
+) -> io::Result<OperatorRecoveryLatchRecord> {
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() != OPERATOR_RECOVERY_LATCH_BYTES as u64 {
+    if !metadata.is_file()
+        || !matches!(
+            metadata.len(),
+            value if value == OPERATOR_RECOVERY_ACTIVE_BYTES as u64
+                || (value >= OPERATOR_RECOVERY_TERMINAL_MIN_BYTES as u64
+                    && value <= OPERATOR_RECOVERY_TERMINAL_MAX_BYTES as u64)
+        )
+    {
         return Err(invalid_data("session operator recovery latch is invalid"));
     }
     #[cfg(unix)]
@@ -629,18 +1148,764 @@ pub(crate) fn read_operator_recovery_latch_sync(
             ));
         }
     }
-    let mut encoded = [0_u8; OPERATOR_RECOVERY_LATCH_BYTES];
+    let mut encoded = vec![
+        0_u8;
+        usize::try_from(metadata.len()).map_err(|_| invalid_data(
+            "session operator recovery latch is invalid"
+        ))?
+    ];
     file.read_exact(&mut encoded)?;
     let mut trailing = [0_u8; 1];
     if file.read(&mut trailing)? != 0 {
         return Err(invalid_data("session operator recovery latch is oversized"));
     }
-    decode_operator_recovery_latch(&encoded).map(Some)
+    if encoded.starts_with(OPERATOR_RECOVERY_LATCH_MAGIC) {
+        let active: [u8; OPERATOR_RECOVERY_LATCH_BYTES] = encoded
+            .get(..OPERATOR_RECOVERY_LATCH_BYTES)
+            .ok_or_else(|| invalid_data("session operator recovery latch is invalid"))?
+            .try_into()
+            .map_err(|_| invalid_data("session operator recovery latch is invalid"))?;
+        let mut offset = OPERATOR_RECOVERY_LATCH_BYTES;
+        let sidecar = read_terminal_incarnation(&encoded, &mut offset)?;
+        if offset != encoded.len() || operator_recovery_file_incarnation(file)? != sidecar {
+            return Err(invalid_data(
+                "session operator recovery latch self-incarnation does not match",
+            ));
+        }
+        return decode_operator_recovery_latch(&active).map(OperatorRecoveryLatchRecord::Active);
+    }
+    if encoded.starts_with(OPERATOR_RECOVERY_TERMINAL_MAGIC) {
+        let (latch, sidecar, database, phase, snapshot) =
+            decode_operator_recovery_terminal(&encoded)?;
+        if operator_recovery_file_incarnation(file)? != sidecar {
+            return Err(invalid_data(
+                "session operator recovery latch self-incarnation does not match",
+            ));
+        }
+        return Ok(OperatorRecoveryLatchRecord::terminal(
+            latch, database, phase, snapshot,
+        ));
+    }
+    Err(invalid_data("session operator recovery latch is invalid"))
 }
 
-fn write_latch_file(path: &Path, latch: OperatorRecoveryLatch, create_new: bool) -> io::Result<()> {
+#[cfg(target_os = "linux")]
+fn operator_recovery_file_incarnation(file: &File) -> io::Result<OperatorRecoveryFileIncarnation> {
+    use std::os::fd::AsFd as _;
+
+    let persistent = opc_fs_verity_sys::persistent_file_identity(file.as_fd()).map_err(|_| {
+        invalid_data("session operator recovery database incarnation is unavailable")
+    })?;
+    let handle_length = persistent.handle_bytes().len();
+    if handle_length == 0 || handle_length > opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES {
+        return Err(invalid_data(
+            "session operator recovery database incarnation is invalid",
+        ));
+    }
+    let mut handle = [0_u8; opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES];
+    handle[..handle_length].copy_from_slice(persistent.handle_bytes());
+    Ok(OperatorRecoveryFileIncarnation {
+        filesystem_uuid: *persistent.filesystem_uuid(),
+        handle_type: persistent.handle_type(),
+        handle_length: u8::try_from(handle_length).map_err(|_| {
+            invalid_data("session operator recovery database incarnation is invalid")
+        })?,
+        handle,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn operator_recovery_file_incarnation(_file: &File) -> io::Result<OperatorRecoveryFileIncarnation> {
+    Err(invalid_data(
+        "session operator recovery terminal is unsupported",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_latch_is_coherent_with_connection(
+    connection: &Connection,
+    database_file: &File,
+    latch: OperatorRecoveryLatch,
+    expected_incarnation: OperatorRecoveryFileIncarnation,
+    expected_snapshot: Option<&OperatorRecoveryTerminalSnapshot>,
+    snapshot_file: Option<&File>,
+) -> io::Result<Option<File>> {
+    terminal_latch_database_is_coherent_with_connection(
+        connection,
+        database_file,
+        latch,
+        expected_incarnation,
+    )?;
+    terminal_snapshot_is_coherent(connection, latch.identity, expected_snapshot, snapshot_file)
+}
+
+/// Validate the terminal's descriptor and recovery-row binding without
+/// constraining the selected snapshot. A Consumed tombstone deliberately
+/// discards its old snapshot locator, so normal snapshot publication (or the
+/// original still-selected snapshot) must not make the durable terminal
+/// unreadable on retry.
+#[cfg(target_os = "linux")]
+fn terminal_latch_database_is_coherent_with_connection(
+    connection: &Connection,
+    database_file: &File,
+    latch: OperatorRecoveryLatch,
+    expected_incarnation: OperatorRecoveryFileIncarnation,
+) -> io::Result<()> {
+    if operator_recovery_file_incarnation(database_file)? != expected_incarnation {
+        return Err(invalid_data(
+            "session operator recovery terminal database does not match",
+        ));
+    }
+    let identity = read_storage_identity_sync(connection)
+        .map_err(|_| invalid_data("session operator recovery terminal identity is unavailable"))?;
+    if identity != latch.identity {
+        return Err(invalid_data(
+            "session operator recovery terminal identity does not match",
+        ));
+    }
+    let recovery = read_operator_recovery_sync(connection, identity)?;
+    if recovery.recovery_epoch != latch.recovery_epoch
+        || recovery.last_plan_digest != latch.plan_digest
+        || recovery.pending_epoch.is_some()
+        || recovery.pending_plan_digest.is_some()
+    {
+        return Err(invalid_data(
+            "session operator recovery terminal state is incoherent",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_snapshot_is_coherent(
+    connection: &Connection,
+    identity: SessionConsensusIdentity,
+    expected: Option<&OperatorRecoveryTerminalSnapshot>,
+    supplied_file: Option<&File>,
+) -> io::Result<Option<File>> {
+    let selected = read_current_snapshot_sync(connection, identity)?;
+    match (selected, expected) {
+        (None, None) => Ok(None),
+        (Some((_, selected_name, _, _)), Some(expected)) => {
+            if expected.path.file_name().and_then(|name| name.to_str()) != Some(&selected_name) {
+                return Err(invalid_data(
+                    "session operator recovery terminal snapshot name does not match",
+                ));
+            }
+            // Classification owns the initial canonical pathname fence.  Once
+            // storage has admitted its snapshot-directory lease, later
+            // coherence checks must instead use the descriptor it supplied:
+            // reopening `expected.path` could resolve a D2 replacement of the
+            // lease-admitted D1 namespace.
+            let opened = supplied_file
+                .is_none()
+                .then(|| open_nofollow_read(&expected.path))
+                .transpose()?;
+            let file = supplied_file.or(opened.as_ref()).ok_or_else(|| {
+                invalid_data("session operator recovery terminal snapshot is unavailable")
+            })?;
+            validate_terminal_snapshot_descriptor(expected, file)?;
+            let digest = terminal_snapshot_raw_digest(file)?;
+            if digest != expected.digest {
+                return Err(invalid_data(
+                    "session operator recovery terminal snapshot digest does not match",
+                ));
+            }
+            if opened.is_some() {
+                let post = open_nofollow_read(&expected.path)?;
+                validate_terminal_snapshot_descriptor(expected, &post).map_err(|_| {
+                    invalid_data("session operator recovery terminal snapshot changed")
+                })?;
+            }
+            // A lease-admitted descriptor must cross classification into the
+            // pending handoff as well.  Returning `None` here would make the
+            // later core validation reopen a mutable snapshot pathname after
+            // recovery published Terminal(PendingHandoff).
+            supplied_file
+                .map(File::try_clone)
+                .transpose()
+                .map(|retained| retained.or(opened))
+        }
+        _ => Err(invalid_data(
+            "session operator recovery terminal snapshot state does not match",
+        )),
+    }
+}
+
+/// Hash exactly the retained on-disk snapshot envelope under the terminal
+/// handoff capacity bound.  This intentionally does not use recovery's
+/// domain-separated workflow digest: normal startup consumes raw envelope
+/// bytes and terminal evidence must bind those same bytes.
+fn terminal_snapshot_raw_digest(file: &File) -> io::Result<[u8; 32]> {
+    let mut reader = file.try_clone()?;
+    // `try_clone` duplicates the descriptor but not its open-file
+    // description. Classification, recovery, or storage may have consumed
+    // the shared cursor already, so always rewind this exact retained inode.
+    reader.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(u64::try_from(read).map_err(|_| {
+                invalid_data("session operator recovery terminal snapshot bound is invalid")
+            })?)
+            .ok_or_else(|| {
+                invalid_data("session operator recovery terminal snapshot is oversized")
+            })?;
+        validate_terminal_snapshot_envelope_bytes(bytes)?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Validate the immutable identity/profile portion of terminal snapshot
+/// evidence against an already-admitted descriptor.  Callers which own a
+/// namespace lease deliberately use this instead of reopening the logical
+/// terminal pathname after the lease has pinned its parent directory.
+fn validate_terminal_snapshot_descriptor(
+    expected: &OperatorRecoveryTerminalSnapshot,
+    file: &File,
+) -> io::Result<()> {
+    if !file.metadata()?.is_file()
+        || operator_recovery_file_incarnation(file)? != expected.incarnation
+    {
+        return Err(invalid_data(
+            "session operator recovery terminal snapshot does not match",
+        ));
+    }
+    if expected.fixed_immutable {
+        use std::os::fd::AsFd as _;
+        opc_fs_verity_sys::measure_exact_profile(file.as_fd()).map_err(|_| {
+            invalid_data("session operator recovery terminal snapshot seal is invalid")
+        })?;
+    }
+    Ok(())
+}
+
+/// The terminal handoff hashes the complete snapshot artifact, including the
+/// authenticated footer.  Keep its capacity check in `u64` so a 32-bit
+/// process rejects only a genuinely oversized envelope rather than failing a
+/// valid maximum-sized artifact during an unnecessary `usize` conversion.
+fn validate_terminal_snapshot_envelope_bytes(bytes: u64) -> io::Result<()> {
+    if bytes > SNAPSHOT_ENVELOPE_MAX_BYTES {
+        return Err(invalid_data(
+            "session operator recovery terminal snapshot is oversized",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminal_latch_is_coherent_with_connection(
+    _connection: &Connection,
+    _database_file: &File,
+    _latch: OperatorRecoveryLatch,
+    _expected_incarnation: OperatorRecoveryFileIncarnation,
+    _expected_snapshot: Option<&OperatorRecoveryTerminalSnapshot>,
+    _snapshot_file: Option<&File>,
+) -> io::Result<Option<File>> {
+    Err(invalid_data(
+        "session operator recovery terminal is unsupported",
+    ))
+}
+
+/// Read a recovery sidecar only while binding it to SQLite's *actual* main
+/// descriptor.  The VFS may have opened the database before this call, so a
+/// second pathname open is not authority: it is only a post-open fence which
+/// must name the same object as the descriptor SQLite admitted.  This closes
+/// the A/B substitution where SQLite has B while a latch classifier inspects
+/// A.
+pub(crate) fn classify_operator_recovery_latch_with_connection_sync(
+    database: &Path,
+    connection: &Connection,
+) -> io::Result<OperatorRecoveryLatchClassification> {
+    classify_operator_recovery_latch_with_connection_and_admitted_snapshot_sync(
+        database, connection, None,
+    )
+}
+
+/// Prove the cheap live-recovery state for one already-open SQLite core.
+///
+/// This does not select or open a current snapshot.  A terminal sidecar is
+/// therefore not admitted here; it is returned as `TerminalNeedsSnapshot` so
+/// the caller can take the snapshot transaction gate and run the existing
+/// descriptor-bound terminal classifier.  Clear remains a fresh, fail-closed
+/// observation on every call rather than an in-memory readiness cache.
+pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
+    database: &Path,
+    connection: &Connection,
+) -> io::Result<LiveTerminalRecoveryHandoffProbe> {
+    #[cfg(target_os = "linux")]
+    {
+        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+        {
+            return Err(invalid_data("session operator recovery descriptor moved"));
+        }
+        let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
+        let incarnation = operator_recovery_file_incarnation(&database_file)?;
+        let path_file = open_nofollow_read(database)?;
+        if !path_file.metadata()?.is_file()
+            || operator_recovery_file_incarnation(&path_file)? != incarnation
+        {
+            return Err(invalid_data(
+                "session operator recovery pathname does not match SQLite descriptor",
+            ));
+        }
+
+        // Retain the descriptor across the final sidecar and database fences.
+        // The terminal branches intentionally stop here: their snapshot
+        // binding is proved only by the full retained-namespace path.
+        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
+        let probe = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
+            Some(OperatorRecoveryLatchRecord::Active(latch)) => {
+                active_latch_is_coherent_with_admitted_connection(connection, *latch)?;
+                LiveTerminalRecoveryHandoffProbe::Active
+            }
+            Some(OperatorRecoveryLatchRecord::Terminal(_)) => {
+                LiveTerminalRecoveryHandoffProbe::TerminalNeedsSnapshot
+            }
+            None => {
+                ensure_absent_operator_recovery_latch_is_ready(connection)?;
+                LiveTerminalRecoveryHandoffProbe::Clear
+            }
+        };
+
+        // Preserve the classifier's final descriptor/path/sidecar fence for
+        // both Clear and Active.  In particular, a sidecar which appears
+        // after the first absent read must fail closed rather than becoming a
+        // cached Clear observation.
+        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+        {
+            return Err(invalid_data("session operator recovery descriptor moved"));
+        }
+        let post_path_file = open_nofollow_read(database)?;
+        if !post_path_file.metadata()?.is_file()
+            || operator_recovery_file_incarnation(&post_path_file)? != incarnation
+        {
+            return Err(invalid_data(
+                "session operator recovery pathname changed during classification",
+            ));
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
+        match pinned_sidecar.as_mut() {
+            Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
+            None => {
+                if read_operator_recovery_latch_record_pinned(database)?.is_some() {
+                    return Err(invalid_data(
+                        "session operator recovery latch appeared during classification",
+                    ));
+                }
+            }
+        }
+        revalidate_terminal_database_path_binding(database, connection, incarnation)?;
+        Ok(probe)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (database, connection);
+        Err(invalid_data(
+            "session operator recovery descriptor binding is unsupported",
+        ))
+    }
+}
+
+/// Classify a recovery latch while retaining the snapshot descriptor which an
+/// already-admitted snapshot-directory namespace supplied.  Normal backend
+/// admission has no retained namespace and delegates with `None`; a live
+/// consensus core uses this variant after recovery has published a pending
+/// terminal so it never resolves the terminal snapshot through a mutable
+/// configured pathname.
+pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snapshot_sync(
+    database: &Path,
+    connection: &Connection,
+    admitted_snapshot_file: Option<&File>,
+) -> io::Result<OperatorRecoveryLatchClassification> {
+    #[cfg(target_os = "linux")]
+    {
+        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+        {
+            return Err(invalid_data("session operator recovery descriptor moved"));
+        }
+        let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
+        let incarnation = operator_recovery_file_incarnation(&database_file)?;
+        let path_file = open_nofollow_read(database)?;
+        if !path_file.metadata()?.is_file()
+            || operator_recovery_file_incarnation(&path_file)? != incarnation
+        {
+            return Err(invalid_data(
+                "session operator recovery pathname does not match SQLite descriptor",
+            ));
+        }
+        let mut terminal_handoff = None;
+        let mut consumed_terminal = None;
+        // Keep the sidecar descriptor through every semantic check below.
+        // It is only moved into a pending handoff after the final path fence.
+        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
+        let latch = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
+            Some(OperatorRecoveryLatchRecord::Active(latch)) => {
+                active_latch_is_coherent_with_connection(connection, *latch)?;
+                Some(*latch)
+            }
+            Some(OperatorRecoveryLatchRecord::Terminal(terminal)) => {
+                let OperatorRecoveryTerminalRecord {
+                    latch,
+                    database: expected_incarnation,
+                    phase,
+                    snapshot,
+                } = terminal.as_ref().clone();
+                match phase {
+                    OperatorRecoveryTerminalPhase::PendingHandoff => {
+                        let snapshot_file = terminal_latch_is_coherent_with_connection(
+                            connection,
+                            &database_file,
+                            latch,
+                            expected_incarnation,
+                            snapshot.as_ref(),
+                            admitted_snapshot_file,
+                        )?;
+                        terminal_handoff = Some(OperatorRecoveryTerminalHandoff {
+                            latch,
+                            database: expected_incarnation,
+                            snapshot,
+                            snapshot_file,
+                            sidecar_file: None,
+                            sidecar_incarnation: None,
+                        });
+                        // Do not admit ordinary backend traffic between the
+                        // terminal proof and consensus initialization.  The
+                        // core consumes this exact descriptor and atomically
+                        // converts the sidecar to a database-only tombstone.
+                        Some(latch)
+                    }
+                    OperatorRecoveryTerminalPhase::Consumed => {
+                        terminal_latch_database_is_coherent_with_connection(
+                            connection,
+                            &database_file,
+                            latch,
+                            expected_incarnation,
+                        )?;
+                        // Do not collapse a proven consumed tombstone into
+                        // the same readiness result as an absent sidecar.
+                        // The exact pinned descriptor is retained after the
+                        // final path fence below for recovery-manager retry.
+                        consumed_terminal = Some((latch, expected_incarnation));
+                        None
+                    }
+                }
+            }
+            None => {
+                ensure_absent_operator_recovery_latch_is_ready(connection)?;
+                None
+            }
+        };
+        // `main_file_has_moved` validates SQLite's VFS object and the fresh
+        // nofollow descriptor validates the public pathname.  Both must
+        // remain exact through semantic inspection, not merely before it.
+        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+        {
+            return Err(invalid_data("session operator recovery descriptor moved"));
+        }
+        let post_path_file = open_nofollow_read(database)?;
+        if !post_path_file.metadata()?.is_file()
+            || operator_recovery_file_incarnation(&post_path_file)? != incarnation
+        {
+            return Err(invalid_data(
+                "session operator recovery pathname changed during classification",
+            ));
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
+        match pinned_sidecar.as_mut() {
+            Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
+            None => {
+                // A pristine database is ready only while the latch remains
+                // absent.  Otherwise a concurrent recovery can create an
+                // Active sidecar after the first read and have ordinary
+                // startup incorrectly return ready.
+                if read_operator_recovery_latch_record_pinned(database)?.is_some() {
+                    return Err(invalid_data(
+                        "session operator recovery latch appeared during classification",
+                    ));
+                }
+            }
+        }
+        // Sidecar evidence is now final, so take one last exact fence over
+        // the SQLite VFS descriptor and the public database name.  Without
+        // this, an absent or already-consumed sidecar could return ready for
+        // an unlinked SQLite object after the prior path check but before the
+        // final sidecar/absence check.
+        revalidate_terminal_database_path_binding(database, connection, incarnation)?;
+        if let Some(handoff) = terminal_handoff.as_mut() {
+            let sidecar = pinned_sidecar.take().ok_or_else(|| {
+                invalid_data("session operator recovery terminal sidecar is unavailable")
+            })?;
+            handoff.sidecar_file = Some(sidecar.file);
+            handoff.sidecar_incarnation = Some(sidecar.incarnation);
+        }
+        let consumed_terminal = if let Some((latch, database)) = consumed_terminal {
+            let sidecar = pinned_sidecar.take().ok_or_else(|| {
+                invalid_data("session operator recovery consumed sidecar is unavailable")
+            })?;
+            Some(OperatorRecoveryConsumedTerminal {
+                _latch: latch,
+                _database: database,
+                _sidecar_file: sidecar.file,
+                _sidecar_incarnation: sidecar.incarnation,
+            })
+        } else {
+            None
+        };
+        Ok(OperatorRecoveryLatchClassification {
+            latch,
+            terminal_handoff,
+            consumed_terminal,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (database, connection, admitted_snapshot_file);
+        Err(invalid_data(
+            "session operator recovery descriptor binding is unsupported",
+        ))
+    }
+}
+
+/// An absent sidecar is ready only for a database that has never entered
+/// operator recovery. A crash after a durable recovery transition must not
+/// turn sidecar removal or loss into ordinary application admission.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn ensure_absent_operator_recovery_latch_is_ready(connection: &Connection) -> io::Result<()> {
+    let has_identity = table_exists(connection, "consensus_identity").map_err(db_error)?;
+    let has_recovery = table_exists(connection, "consensus_operator_recovery").map_err(db_error)?;
+    if has_identity != has_recovery {
+        return Err(invalid_data(
+            "session operator recovery schema is incomplete",
+        ));
+    }
+    if has_identity {
+        let identity = read_storage_identity_sync(connection)
+            .map_err(|_| invalid_data("session operator recovery identity is unavailable"))?;
+        // A live Clear probe is an authority read, not a schema-migration
+        // boundary. Re-entering migration here would execute DDL and a
+        // singleton INSERT on every readiness/traffic check, contend with an
+        // independent prune writer, and turn SQLITE_BUSY into false
+        // corruption. Preserve the post-migration cardinality, identity,
+        // recovery, applied, and machine validation without any write.
+        let recovery = validate_current_operator_recovery_image_sync(connection, identity)?;
+        if recovery.recovery_epoch != 0
+            || recovery.last_plan_digest != [0; 32]
+            || recovery.pending_epoch.is_some()
+            || recovery.pending_plan_digest.is_some()
+        {
+            return Err(invalid_data("session operator recovery latch is missing"));
+        }
+    }
+    Ok(())
+}
+
+/// An Active sidecar remains a closed readiness gate only while it names this
+/// exact durable recovery state.  Treat a stale or substituted identity,
+/// epoch, or plan digest as corruption rather than letting it masquerade as
+/// an ordinary active recovery hold.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn active_latch_is_coherent_with_connection(
+    connection: &Connection,
+    latch: OperatorRecoveryLatch,
+) -> io::Result<()> {
+    active_latch_is_coherent_with_reader(connection, latch, true, read_operator_recovery_sync)
+}
+
+/// A live core has already admitted and migrated its schema. Its cheap Active
+/// probe must therefore retain the same strict semantic projection without
+/// re-entering a writer transaction on every readiness/traffic check.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn active_latch_is_coherent_with_admitted_connection(
+    connection: &Connection,
+    latch: OperatorRecoveryLatch,
+) -> io::Result<()> {
+    active_latch_is_coherent_with_reader(
+        connection,
+        latch,
+        false,
+        validate_current_operator_recovery_image_sync,
+    )
+}
+
+fn active_latch_is_coherent_with_reader(
+    connection: &Connection,
+    latch: OperatorRecoveryLatch,
+    allow_legacy_without_schema: bool,
+    read_recovery: fn(&Connection, SessionConsensusIdentity) -> io::Result<OperatorRecoveryState>,
+) -> io::Result<()> {
+    let has_identity = table_exists(connection, "consensus_identity").map_err(db_error)?;
+    let has_recovery = table_exists(connection, "consensus_operator_recovery").map_err(db_error)?;
+    if has_identity != has_recovery {
+        return Err(invalid_data(
+            "session operator recovery active schema is incomplete",
+        ));
+    }
+    if !has_identity {
+        // Recovery publishes the Active sidecar before migrating an admitted
+        // legacy database. With no current-schema authority to compare, that
+        // pinned sidecar remains the closed readiness gate; standalone
+        // traffic is still denied until recovery replaces the legacy image.
+        if allow_legacy_without_schema {
+            return Ok(());
+        }
+        return Err(invalid_data(
+            "session operator recovery active schema is unavailable",
+        ));
+    }
+    let identity = read_storage_identity_sync(connection)
+        .map_err(|_| invalid_data("session operator recovery active identity is unavailable"))?;
+    if identity != latch.identity {
+        return Err(invalid_data(
+            "session operator recovery active identity does not match",
+        ));
+    }
+    let recovery = read_recovery(connection, identity)?;
+    let finalized_matches = recovery.recovery_epoch == latch.recovery_epoch
+        && recovery.last_plan_digest == latch.plan_digest
+        && recovery.pending_epoch.is_none()
+        && recovery.pending_plan_digest.is_none();
+    let pending_matches = recovery.pending_epoch == Some(latch.recovery_epoch)
+        && recovery.pending_plan_digest == Some(latch.plan_digest);
+    if !finalized_matches && !pending_matches {
+        return Err(invalid_data(
+            "session operator recovery active state is incoherent",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn active_operator_recovery_latch_sync(
+    database: &Path,
+) -> io::Result<Option<OperatorRecoveryLatch>> {
+    match read_operator_recovery_latch_record_pinned(database)? {
+        Some(PinnedOperatorRecoveryLatchRecord {
+            record: OperatorRecoveryLatchRecord::Active(latch),
+            ..
+        }) => Ok(Some(latch)),
+        Some(PinnedOperatorRecoveryLatchRecord {
+            record: OperatorRecoveryLatchRecord::Terminal(_),
+            ..
+        })
+        | None => Ok(None),
+    }
+}
+
+/// Read one recovery sidecar while holding its descriptor through all
+/// semantic checks.  Offline recovery already owns the exact database and
+/// selected-snapshot descriptors; this helper binds the sidecar to those
+/// descriptors and revalidates both public pathnames before returning its
+/// phase.  A caller must refresh this observation after any operation which
+/// can publish a sidecar transition.
+pub(crate) fn operator_recovery_latch_phase_sync(
+    database: &Path,
+    expected: OperatorRecoveryLatch,
+    database_file: &File,
+    expected_snapshot: Option<Option<&OperatorRecoveryTerminalSnapshot>>,
+) -> io::Result<OperatorRecoveryLatchPhase> {
+    let database_incarnation = operator_recovery_file_incarnation(database_file)?;
+    let path_file = open_nofollow_read(database)?;
+    if !path_file.metadata()?.is_file()
+        || operator_recovery_file_incarnation(&path_file)? != database_incarnation
+    {
+        return Err(invalid_data(
+            "session operator recovery pathname does not match pinned database",
+        ));
+    }
+    let mut pinned = read_operator_recovery_latch_record_pinned(database)?
+        .ok_or_else(|| invalid_data("session operator recovery latch is missing"))?;
+    let phase = match &pinned.record {
+        OperatorRecoveryLatchRecord::Active(latch) => {
+            if *latch != expected {
+                return Err(invalid_data(
+                    "session operator recovery latch does not match",
+                ));
+            }
+            OperatorRecoveryLatchPhase::Active
+        }
+        OperatorRecoveryLatchRecord::Terminal(terminal) => {
+            if terminal.latch != expected || terminal.database != database_incarnation {
+                return Err(invalid_data(
+                    "session operator recovery terminal database does not match",
+                ));
+            }
+            match terminal.phase {
+                OperatorRecoveryTerminalPhase::PendingHandoff => {
+                    if expected_snapshot
+                        .is_some_and(|expected| terminal.snapshot.as_ref() != expected)
+                    {
+                        return Err(invalid_data(
+                            "session operator recovery terminal snapshot does not match",
+                        ));
+                    }
+                    OperatorRecoveryLatchPhase::PendingHandoff
+                }
+                OperatorRecoveryTerminalPhase::Consumed => {
+                    if terminal.snapshot.is_some() {
+                        return Err(invalid_data(
+                            "session operator recovery terminal is invalid",
+                        ));
+                    }
+                    OperatorRecoveryLatchPhase::Consumed
+                }
+            }
+        }
+    };
+    revalidate_operator_recovery_latch_record_path(database, &mut pinned)?;
+    let post_path_file = open_nofollow_read(database)?;
+    if !post_path_file.metadata()?.is_file()
+        || operator_recovery_file_incarnation(&post_path_file)? != database_incarnation
+    {
+        return Err(invalid_data(
+            "session operator recovery pathname changed during classification",
+        ));
+    }
+    Ok(phase)
+}
+
+#[cfg(test)]
+pub(crate) fn read_operator_recovery_latch_sync(
+    database: &Path,
+) -> io::Result<Option<OperatorRecoveryLatch>> {
+    match read_operator_recovery_latch_record(database)? {
+        Some(OperatorRecoveryLatchRecord::Active(latch)) => Ok(Some(latch)),
+        Some(OperatorRecoveryLatchRecord::Terminal(terminal)) => {
+            // Callers without the live SQLite connection cannot safely admit
+            // a terminal record: a separately opened pathname could be A
+            // while their eventual SQLite connection is B.  Only the
+            // connection-aware classifier above may make a terminal ready.
+            let _ = terminal;
+            Err(invalid_data(
+                "session operator recovery terminal requires descriptor binding",
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
+fn write_latch_file(
+    path: &Path,
+    record: OperatorRecoveryLatchRecord,
+    create_new: bool,
+) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
+        .read(true)
         .write(true)
         .create(true)
         .truncate(!create_new)
@@ -653,35 +1918,503 @@ fn write_latch_file(path: &Path, latch: OperatorRecoveryLatch, create_new: bool)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = options.open(path)?;
-    file.write_all(&encode_operator_recovery_latch(latch))?;
+    let sidecar_incarnation = operator_recovery_file_incarnation(&file)?;
+    match record {
+        OperatorRecoveryLatchRecord::Active(latch) => {
+            let mut encoded = encode_operator_recovery_latch(latch).to_vec();
+            append_terminal_incarnation(&mut encoded, sidecar_incarnation);
+            file.write_all(&encoded)?
+        }
+        OperatorRecoveryLatchRecord::Terminal(terminal) => {
+            file.write_all(&encode_operator_recovery_terminal(
+                terminal.latch,
+                sidecar_incarnation,
+                terminal.database,
+                terminal.phase,
+                terminal.snapshot.as_ref(),
+            ))?
+        }
+    }
     file.flush()?;
     file.sync_all()?;
     std::fs::File::open(
         path.parent()
             .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
     )?
-    .sync_all()
+    .sync_all()?;
+    Ok(file)
+}
+
+/// Publish a first recovery latch without ever exposing a partially written
+/// public sidecar.  The creator writes and syncs a private inode first, then
+/// hard-links that exact inode into the public name. `link(2)` is an atomic
+/// no-clobber publication: a concurrent creator (or an incomplete/malformed
+/// public sidecar) is never overwritten.  The retained creator descriptor is
+/// revalidated against the public name before and after the directory sync.
+fn create_latch_file_atomically(
+    database: &Path,
+    record: OperatorRecoveryLatchRecord,
+) -> io::Result<()> {
+    let path = operator_recovery_latch_path(database)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_data("session recovery latch has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid_data("session recovery latch name is invalid"))?;
+    // A failed creator is deliberately non-authoritative, but it must not
+    // accumulate indefinitely after repeated crash/retry cycles.  Keep one
+    // deterministic private name for this exact public latch.  The name is
+    // never consulted as recovery authority; it is only an O_EXCL staging
+    // location for the descriptor that we later hard-link into the public
+    // name.
+    let temporary = latch_creation_temporary_path(parent, name);
+    cleanup_latch_creation_temporary(parent, &temporary)?;
+    let creator = write_latch_file(&temporary, record.clone(), true)?;
+    let incarnation = operator_recovery_file_incarnation(&creator)?;
+    let mut pinned = PinnedOperatorRecoveryLatchRecord {
+        record,
+        file: creator,
+        incarnation,
+    };
+    revalidate_operator_recovery_latch_record_at_path(&temporary, &mut pinned)?;
+    #[cfg(test)]
+    fail_latch_create_at_boundary(LatchCreateFailureBoundary::AfterTemporarySync)?;
+
+    match link_held_latch_creator_noreplace(&pinned.file, &path) {
+        Ok(()) => {}
+        Err(_error) if _error.kind() == io::ErrorKind::AlreadyExists => {
+            // The creator is private and exact; only clean up that held
+            // inode. The existing public name is authority for the retry and
+            // must never be modified by this failed initial publication.
+            drop(pinned);
+            cleanup_latch_creation_temporary(parent, &temporary)?;
+            return Err(invalid_data(
+                "session operator recovery latch appeared during creation",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    revalidate_operator_recovery_latch_record_at_path(&path, &mut pinned)?;
+    #[cfg(test)]
+    fail_latch_create_at_boundary(LatchCreateFailureBoundary::AfterPublish)?;
+
+    pinned.file.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    #[cfg(test)]
+    run_latch_create_after_directory_sync_hook(&path);
+    revalidate_operator_recovery_latch_record_at_path(&path, &mut pinned)?;
+
+    // The public hard link is already durably acknowledged.  Complete the
+    // bounded private lifecycle before success, then fence the public name
+    // once more because the parent sync is also a pathname-race boundary.
+    cleanup_latch_creation_temporary(parent, &temporary)?;
+    revalidate_operator_recovery_latch_record_at_path(&path, &mut pinned)?;
+    Ok(())
+}
+
+fn latch_creation_temporary_path(parent: &Path, name: &str) -> PathBuf {
+    parent.join(format!(".{name}.create.tmp"))
+}
+
+/// Remove the one explicitly non-authoritative first-publication artifact
+/// and durably record its absence.  This never examines or repairs the
+/// public latch: malformed public bytes remain fail-closed, while a private
+/// file left by a pre-publication crash is safe to discard before retrying.
+fn cleanup_latch_creation_temporary(parent: &Path, temporary: &Path) -> io::Result<()> {
+    match std::fs::remove_file(temporary) {
+        Ok(()) => File::open(parent)?.sync_all(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// A valid existing public record is the retry authority. Clear a stale
+/// pre-publication creator only after that exact record has been synced and
+/// revalidated, then bind the public record again after the cleanup directory
+/// sync.
+fn cleanup_latch_creation_temporary_for_database(
+    database: &Path,
+    expected: &mut PinnedOperatorRecoveryLatchRecord,
+) -> io::Result<()> {
+    let path = operator_recovery_latch_path(database)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_data("session recovery latch has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid_data("session recovery latch name is invalid"))?;
+    cleanup_latch_creation_temporary(parent, &latch_creation_temporary_path(parent, name))?;
+    revalidate_operator_recovery_latch_record_path(database, expected)
+}
+
+/// Hard-link a descriptor-held creator into a previously absent public name.
+/// Linux `linkat()` follows this process's `/proc/self/fd/N` magic link, so
+/// the source is the retained creator inode rather than the mutable temporary
+/// pathname. The destination creation is atomic and fails if any public
+/// sidecar already exists.
+#[cfg(target_os = "linux")]
+fn link_held_latch_creator_noreplace(creator: &File, public: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let creator_path = format!("/proc/self/fd/{}", creator.as_raw_fd());
+    nix::unistd::linkat(
+        nix::fcntl::AT_FDCWD,
+        creator_path.as_str(),
+        nix::fcntl::AT_FDCWD,
+        public,
+        nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn link_held_latch_creator_noreplace(_creator: &File, _public: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-bound recovery latch publication requires Linux",
+    ))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LATCH_REPLACE_AFTER_DIRECTORY_SYNC_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LatchCreateFailureBoundary {
+    AfterTemporarySync,
+    AfterPublish,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LATCH_CREATE_FAILURE_BOUNDARY: std::cell::Cell<Option<LatchCreateFailureBoundary>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn fail_next_latch_create_at_boundary(boundary: LatchCreateFailureBoundary) {
+    LATCH_CREATE_FAILURE_BOUNDARY.with(|slot| {
+        assert!(
+            slot.get().is_none(),
+            "recovery latch create failure already armed"
+        );
+        slot.set(Some(boundary));
+    });
+}
+
+#[cfg(test)]
+fn fail_latch_create_at_boundary(boundary: LatchCreateFailureBoundary) -> io::Result<()> {
+    if LATCH_CREATE_FAILURE_BOUNDARY.with(|slot| {
+        if slot.get().is_some_and(|armed| armed == boundary) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::other(
+            "injected recovery latch creation interruption",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_latch_replace_after_directory_sync_hook(hook: impl FnOnce(&Path) + 'static) {
+    LATCH_REPLACE_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "recovery latch replacement test hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_latch_replace_after_directory_sync_hook(path: &Path) {
+    let hook = LATCH_REPLACE_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LATCH_TRANSITION_BEFORE_REPLACE_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LATCH_TRANSITION_AFTER_TEMPORARY_VALIDATION_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_latch_transition_before_replace_hook(hook: impl FnOnce(&Path) + 'static) {
+    LATCH_TRANSITION_BEFORE_REPLACE_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "recovery latch transition test hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_latch_transition_before_replace_hook(path: &Path) {
+    let hook = LATCH_TRANSITION_BEFORE_REPLACE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_latch_transition_after_temporary_validation_hook(hook: impl FnOnce(&Path) + 'static) {
+    LATCH_TRANSITION_AFTER_TEMPORARY_VALIDATION_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "recovery latch temporary-transition hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_latch_transition_after_temporary_validation_hook(path: &Path) {
+    let hook =
+        LATCH_TRANSITION_AFTER_TEMPORARY_VALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LATCH_CREATE_AFTER_DIRECTORY_SYNC_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_latch_create_after_directory_sync_hook(hook: impl FnOnce(&Path) + 'static) {
+    LATCH_CREATE_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "recovery latch creation test hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_latch_create_after_directory_sync_hook(path: &Path) {
+    let hook = LATCH_CREATE_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LATCH_RESYNC_AFTER_DIRECTORY_SYNC_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_latch_resync_after_directory_sync_hook(hook: impl FnOnce(&Path) + 'static) {
+    LATCH_RESYNC_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "recovery latch resync test hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_latch_resync_after_directory_sync_hook(path: &Path) {
+    let hook = LATCH_RESYNC_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static LATCH_CLASSIFY_BEFORE_FINAL_REVALIDATION_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_latch_classify_before_final_revalidation_hook(hook: impl FnOnce(&Path) + 'static) {
+    LATCH_CLASSIFY_BEFORE_FINAL_REVALIDATION_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "recovery latch classify test hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn run_latch_classify_before_final_revalidation_hook(path: &Path) {
+    let hook = LATCH_CLASSIFY_BEFORE_FINAL_REVALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LATCH_CONSUME_BEFORE_FINAL_REVALIDATION_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_latch_consume_before_final_revalidation_hook(hook: impl FnOnce(&Path) + 'static) {
+    LATCH_CONSUME_BEFORE_FINAL_REVALIDATION_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "recovery latch consume test hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_latch_consume_before_final_revalidation_hook(path: &Path) {
+    let hook = LATCH_CONSUME_BEFORE_FINAL_REVALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+/// Idempotently finish the durability boundary for an existing sidecar.
+///
+/// An interrupted creator can leave a valid sidecar dentry visible before
+/// its parent directory was synced. Retrying recovery must not merely accept
+/// that record: it holds the exact sidecar descriptor, syncs it and its
+/// parent, then proves the public name is still the same inode and bytes.
+/// This is used only after the caller has compared the semantic record.
+fn resync_existing_latch_record(
+    database: &Path,
+    expected: &mut PinnedOperatorRecoveryLatchRecord,
+) -> io::Result<()> {
+    let path = operator_recovery_latch_path(database)?;
+    #[cfg(test)]
+    run_latch_transition_before_replace_hook(&path);
+    revalidate_operator_recovery_latch_record_path(database, expected)?;
+    expected.file.sync_all()?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
+    )?
+    .sync_all()?;
+    #[cfg(test)]
+    run_latch_resync_after_directory_sync_hook(&path);
+    revalidate_operator_recovery_latch_record_path(database, expected)
+}
+
+/// Atomically replace one sidecar only after proving that the public old name
+/// is still the exact descriptor and bytes on which the transition decision
+/// was made.  This detects a finite L1 -> L2 substitution before rename;
+/// without it an audit/terminal transition could silently overwrite L2.
+fn replace_latch_file_from_pinned(
+    database: &Path,
+    expected_old: &mut PinnedOperatorRecoveryLatchRecord,
+    record: OperatorRecoveryLatchRecord,
+) -> io::Result<()> {
+    let path = operator_recovery_latch_path(database)?;
+    let temporary = path.with_extension("opc-recovery-latch.tmp");
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let temporary_file = write_latch_file(&temporary, record.clone(), true)?;
+    // The creator descriptor is retained across rename: this turns the
+    // private temporary name into a durable, exact object rather than
+    // allowing a replacement at that pathname to become the sidecar we
+    // promote.  Sidecar records are small, but their recovery authority is
+    // not; verify both names against the held object's stable incarnation.
+    let temporary_incarnation = operator_recovery_file_incarnation(&temporary_file)?;
+    let mut pinned = PinnedOperatorRecoveryLatchRecord {
+        record,
+        file: temporary_file,
+        incarnation: temporary_incarnation,
+    };
+    revalidate_operator_recovery_latch_record_at_path(&temporary, &mut pinned)?;
+    #[cfg(test)]
+    run_latch_transition_after_temporary_validation_hook(&temporary);
+    #[cfg(test)]
+    run_latch_transition_before_replace_hook(&path);
+    revalidate_operator_recovery_latch_record_path(database, expected_old)?;
+    std::fs::rename(&temporary, &path)?;
+    revalidate_operator_recovery_latch_record_path(database, &mut pinned)?;
+    pinned.file.sync_all()?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
+    )?
+    .sync_all()?;
+    #[cfg(test)]
+    run_latch_replace_after_directory_sync_hook(&path);
+    // A directory sync only proves durability of the directory state it
+    // observed.  Check the public name once more afterwards: otherwise a
+    // replacement racing the sync could leave this function reporting a
+    // successful terminal transition for a different sidecar inode.
+    revalidate_operator_recovery_latch_record_path(database, &mut pinned)?;
+    Ok(())
 }
 
 pub(crate) fn ensure_operator_recovery_latch_sync(
     database: &Path,
     expected: OperatorRecoveryLatch,
 ) -> io::Result<()> {
-    match read_operator_recovery_latch_sync(database)? {
-        Some(observed)
-            if observed == expected
-                || (observed
-                    == OperatorRecoveryLatch {
-                        audit_pending: !expected.audit_pending,
-                        ..expected
-                    }) =>
-        {
-            Ok(())
+    match read_operator_recovery_latch_record_pinned(database)? {
+        Some(mut pinned) => match &pinned.record {
+            OperatorRecoveryLatchRecord::Active(observed)
+                if *observed == expected
+                    || (*observed
+                        == OperatorRecoveryLatch {
+                            audit_pending: !expected.audit_pending,
+                            ..expected
+                        }) =>
+            {
+                resync_existing_latch_record(database, &mut pinned)?;
+                cleanup_latch_creation_temporary_for_database(database, &mut pinned)
+            }
+            OperatorRecoveryLatchRecord::Active(_) => Err(invalid_data(
+                "a different session operator recovery latch is active",
+            )),
+            OperatorRecoveryLatchRecord::Terminal(terminal) => {
+                // A new recovery creates a distinct active plan only after its
+                // own descriptor-pinned planning/inspection pass.  This path has
+                // no SQLite connection to classify the old terminal against, so
+                // it may not admit the old database; it merely atomically fences
+                // it with the new active latch.
+                if terminal.latch.audit_pending {
+                    return Err(invalid_data(
+                        "session operator recovery terminal audit state is invalid",
+                    ));
+                }
+                replace_latch_file_from_pinned(
+                    database,
+                    &mut pinned,
+                    OperatorRecoveryLatchRecord::Active(expected),
+                )
+            }
+        },
+        None => {
+            create_latch_file_atomically(database, OperatorRecoveryLatchRecord::Active(expected))
         }
-        Some(_) => Err(invalid_data(
-            "a different session operator recovery latch is active",
-        )),
-        None => write_latch_file(&operator_recovery_latch_path(database)?, expected, true),
     }
 }
 
@@ -690,8 +2423,25 @@ pub(crate) fn set_operator_recovery_latch_audit_pending_sync(
     expected: OperatorRecoveryLatch,
     audit_pending: bool,
 ) -> io::Result<()> {
-    let observed = read_operator_recovery_latch_sync(database)?
-        .ok_or_else(|| invalid_data("session operator recovery latch is missing"))?;
+    let mut pinned = match read_operator_recovery_latch_record_pinned(database)? {
+        Some(
+            pinned @ PinnedOperatorRecoveryLatchRecord {
+                record: OperatorRecoveryLatchRecord::Active(_),
+                ..
+            },
+        ) => pinned,
+        Some(PinnedOperatorRecoveryLatchRecord {
+            record: OperatorRecoveryLatchRecord::Terminal(_),
+            ..
+        })
+        | None => {
+            return Err(invalid_data("session operator recovery latch is missing"));
+        }
+    };
+    let observed = match &pinned.record {
+        OperatorRecoveryLatchRecord::Active(latch) => *latch,
+        OperatorRecoveryLatchRecord::Terminal(_) => unreachable!("matched active latch"),
+    };
     if observed.identity != expected.identity
         || observed.recovery_epoch != expected.recovery_epoch
         || observed.plan_digest != expected.plan_digest
@@ -700,35 +2450,76 @@ pub(crate) fn set_operator_recovery_latch_audit_pending_sync(
             "session operator recovery latch does not match",
         ));
     }
-    let path = operator_recovery_latch_path(database)?;
-    let temporary = path.with_extension("opc-recovery-latch.tmp");
-    match std::fs::remove_file(&temporary) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    write_latch_file(
-        &temporary,
-        OperatorRecoveryLatch {
+    replace_latch_file_from_pinned(
+        database,
+        &mut pinned,
+        OperatorRecoveryLatchRecord::Active(OperatorRecoveryLatch {
             audit_pending,
             ..observed
-        },
-        true,
-    )?;
-    std::fs::rename(&temporary, &path)?;
-    std::fs::File::open(
-        path.parent()
-            .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
-    )?
-    .sync_all()
+        }),
+    )
 }
 
-pub(crate) fn clear_operator_recovery_latch_sync(
+pub(crate) fn terminalize_operator_recovery_latch_sync(
     database: &Path,
     expected: OperatorRecoveryLatch,
+    database_file: &File,
+    snapshot: Option<OperatorRecoveryTerminalSnapshot>,
 ) -> io::Result<()> {
-    let Some(observed) = read_operator_recovery_latch_sync(database)? else {
-        return Ok(());
+    let mut pinned = match read_operator_recovery_latch_record_pinned(database)? {
+        Some(mut pinned) => match &pinned.record {
+            OperatorRecoveryLatchRecord::Active(_) => pinned,
+            OperatorRecoveryLatchRecord::Terminal(terminal) => {
+                let latch = terminal.latch;
+                let incarnation = terminal.database;
+                let phase = terminal.phase;
+                let observed_snapshot = terminal.snapshot.clone();
+                if latch.identity != expected.identity
+                    || latch.recovery_epoch != expected.recovery_epoch
+                    || latch.plan_digest != expected.plan_digest
+                    || latch.audit_pending
+                {
+                    return Err(invalid_data(
+                        "session operator recovery latch cannot be terminalized",
+                    ));
+                }
+                if operator_recovery_file_incarnation(database_file)? != incarnation {
+                    return Err(invalid_data(
+                        "session operator recovery terminal database does not match",
+                    ));
+                }
+                match phase {
+                    // Repeating a completed Active -> Pending publication is
+                    // exact and harmless only when its snapshot evidence is
+                    // byte-for-byte the original handoff.
+                    OperatorRecoveryTerminalPhase::PendingHandoff
+                        if observed_snapshot != snapshot =>
+                    {
+                        return Err(invalid_data(
+                            "session operator recovery terminal database does not match",
+                        ));
+                    }
+                    OperatorRecoveryTerminalPhase::PendingHandoff => {}
+                    // A Rejoined retry may reach a locally consumed terminal
+                    // while remote voters are still pending.  The consumed
+                    // tombstone has intentionally discarded the mutable
+                    // snapshot locator, so it is an exact terminal no-op
+                    // once the latch and database incarnation match.
+                    OperatorRecoveryTerminalPhase::Consumed if observed_snapshot.is_none() => {}
+                    OperatorRecoveryTerminalPhase::Consumed => {
+                        return Err(invalid_data(
+                            "session operator recovery terminal is invalid",
+                        ));
+                    }
+                }
+                return resync_existing_latch_record(database, &mut pinned);
+            }
+        },
+        None => return Err(invalid_data("session operator recovery latch is missing")),
+    };
+    let observed = match &pinned.record {
+        OperatorRecoveryLatchRecord::Active(latch) => *latch,
+        OperatorRecoveryLatchRecord::Terminal(_) => unreachable!("matched active latch"),
     };
     if observed.identity != expected.identity
         || observed.recovery_epoch != expected.recovery_epoch
@@ -736,16 +2527,117 @@ pub(crate) fn clear_operator_recovery_latch_sync(
         || observed.audit_pending
     {
         return Err(invalid_data(
-            "session operator recovery latch cannot be cleared",
+            "session operator recovery latch cannot be terminalized",
         ));
     }
-    let path = operator_recovery_latch_path(database)?;
-    std::fs::remove_file(&path)?;
-    std::fs::File::open(
-        path.parent()
-            .ok_or_else(|| invalid_data("session recovery latch has no parent"))?,
-    )?
-    .sync_all()
+    replace_latch_file_from_pinned(
+        database,
+        &mut pinned,
+        OperatorRecoveryLatchRecord::terminal(
+            observed,
+            operator_recovery_file_incarnation(database_file)?,
+            OperatorRecoveryTerminalPhase::PendingHandoff,
+            snapshot,
+        ),
+    )
+}
+
+/// Bind a terminal recovery transition to SQLite's exact live main file and
+/// to the public database name at the same instant.  The VFS descriptor is
+/// the writer authority; the no-follow path open prevents a recovery sidecar
+/// transition from succeeding after an attacker has redirected the public
+/// database name to a different, even byte-identical, inode.
+fn revalidate_terminal_database_path_binding(
+    database: &Path,
+    connection: &Connection,
+    expected: OperatorRecoveryFileIncarnation,
+) -> io::Result<File> {
+    if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+    {
+        return Err(invalid_data("session operator recovery descriptor moved"));
+    }
+    let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
+        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
+    if operator_recovery_file_incarnation(&database_file)? != expected {
+        return Err(invalid_data(
+            "session operator recovery terminal database does not match",
+        ));
+    }
+    let path_file = open_nofollow_read(database)?;
+    if operator_recovery_file_incarnation(&path_file)? != expected {
+        return Err(invalid_data(
+            "session operator recovery pathname does not match SQLite descriptor",
+        ));
+    }
+    Ok(database_file)
+}
+
+/// Consume a pending snapshot-bound terminal latch after the first normal
+/// consensus core has revalidated the *same* SQLite connection and retained
+/// snapshot descriptor.  The replacement is durable and atomic: crashes
+/// before it leave the pending record for a full replay; crashes after it
+/// retain the database-bound tombstone while normal snapshot publication may
+/// advance filenames.
+pub(crate) fn consume_operator_recovery_terminal_handoff_sync(
+    database: &Path,
+    connection: &Connection,
+    handoff: &OperatorRecoveryTerminalHandoff,
+    admitted_snapshot_file: Option<&File>,
+) -> io::Result<()> {
+    let database_file =
+        revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
+    let sidecar_file = handoff
+        .sidecar_file
+        .as_ref()
+        .ok_or_else(|| invalid_data("session operator recovery terminal sidecar is unavailable"))?;
+    let sidecar_incarnation = handoff
+        .sidecar_incarnation
+        .ok_or_else(|| invalid_data("session operator recovery terminal sidecar is unavailable"))?;
+    let expected_record = OperatorRecoveryLatchRecord::terminal(
+        handoff.latch,
+        handoff.database,
+        OperatorRecoveryTerminalPhase::PendingHandoff,
+        handoff.snapshot.clone(),
+    );
+    let mut pinned_sidecar = PinnedOperatorRecoveryLatchRecord {
+        record: expected_record,
+        file: sidecar_file.try_clone()?,
+        incarnation: sidecar_incarnation,
+    };
+    terminal_latch_is_coherent_with_connection(
+        connection,
+        &database_file,
+        handoff.latch,
+        handoff.database,
+        handoff.snapshot.as_ref(),
+        admitted_snapshot_file,
+    )?;
+    #[cfg(test)]
+    run_latch_consume_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
+    // The handoff's original sidecar descriptor and the public sidecar name
+    // must still be the one classified above immediately before atomic
+    // replacement.  A byte-identical substitute has a distinct persistent
+    // handle and therefore cannot be consumed as this recovery terminal.
+    revalidate_operator_recovery_latch_record_path(database, &mut pinned_sidecar)?;
+    revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
+    replace_latch_file_from_pinned(
+        database,
+        &mut pinned_sidecar,
+        OperatorRecoveryLatchRecord::terminal(
+            handoff.latch,
+            handoff.database,
+            OperatorRecoveryTerminalPhase::Consumed,
+            None,
+        ),
+    )?;
+    // The sidecar replacement includes a directory fsync.  Recheck after
+    // that irreversible publication boundary as well: a public database
+    // substitution during the sidecar transition must leave the live VFS
+    // connection fenced rather than returning a ready core for an unlinked
+    // old database.
+    revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
+    Ok(())
 }
 
 pub(crate) type ConsensusAppliedMembership = (
@@ -1686,9 +3578,28 @@ CREATE TABLE consensus_operator_recovery (
         pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
     ),
     watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0),
+    finalize_log_id_json BLOB CHECK (
+        finalize_log_id_json IS NULL
+        OR length(finalize_log_id_json) BETWEEN 1 AND 1024
+    ),
+    finalize_entry_json BLOB CHECK (
+        finalize_entry_json IS NULL
+        OR length(finalize_entry_json) BETWEEN 1 AND 16384
+    ),
+    recovery_v2_activated INTEGER NOT NULL DEFAULT 0 CHECK (
+        recovery_v2_activated IN (0, 1)
+    ),
     CHECK (
         (pending_epoch IS NULL AND pending_plan_digest IS NULL)
         OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    CHECK (
+        (recovery_v2_activated = 0
+            AND finalize_log_id_json IS NULL
+            AND finalize_entry_json IS NULL)
+        OR (recovery_v2_activated = 1
+            AND finalize_log_id_json IS NOT NULL
+            AND finalize_entry_json IS NOT NULL)
     ),
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
 );
@@ -1724,6 +3635,12 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
     conn.execute_batch(PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA)
         .map_err(db_error)?;
     conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
+        .map_err(db_error)?;
+    conn.execute_batch(OPERATOR_RECOVERY_FINALIZE_LOG_MIGRATION)
+        .map_err(db_error)?;
+    conn.execute_batch(OPERATOR_RECOVERY_FINALIZE_CERTIFICATE_MIGRATION)
+        .map_err(db_error)?;
+    conn.execute_batch(OPERATOR_RECOVERY_V2_ACTIVATION_MIGRATION)
         .map_err(db_error)
 }
 
@@ -1800,6 +3717,8 @@ struct ConsensusLogPruneTurnGateState {
     released: bool,
     preempted: bool,
     progress_preempted: bool,
+    hold_progress_preemption: bool,
+    progress_preemption_released: bool,
     progress_steps_before_preempt: usize,
     progress_steps_seen: usize,
     completed: bool,
@@ -1811,6 +3730,7 @@ enum ConsensusLogPruneTurnGatePoint {
     BeforeTransaction,
     BeforeActiveInterrupt,
     AfterWriterAcquired,
+    AfterBeginSuccessBeforeSyntheticInterrupt,
     BeforeAuthorityRead,
     BeforeReadPurged,
     BeforeDelete,
@@ -1900,19 +3820,19 @@ impl ConsensusLogPruneTurnGate {
         state.preempted
     }
 
-    fn wait_at(&self, point: ConsensusLogPruneTurnGatePoint) {
+    fn wait_at(&self, point: ConsensusLogPruneTurnGatePoint) -> bool {
         if self.point != point
             && !(self.point == ConsensusLogPruneTurnGatePoint::MidDelete
                 && point == ConsensusLogPruneTurnGatePoint::BeforeDelete)
         {
-            return;
+            return false;
         }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.armed {
-            return;
+            return false;
         }
         state.entered = true;
         self.entered.notify_all();
@@ -1923,6 +3843,7 @@ impl ConsensusLogPruneTurnGate {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         state.armed = false;
+        true
     }
 
     fn release(&self) {
@@ -1949,6 +3870,21 @@ impl ConsensusLogPruneTurnGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.progress_preempted = true;
+        self.entered.notify_all();
+        while state.hold_progress_preemption && !state.progress_preemption_released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release_progress_preemption(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.progress_preemption_released = true;
         self.released.notify_all();
     }
 
@@ -2044,10 +3980,6 @@ pub(crate) struct ConsensusLogPruneTurnGateForTest {
 
 #[cfg(all(test, target_os = "linux"))]
 impl ConsensusLogPruneTurnGateForTest {
-    fn install(directory: &Path) -> Self {
-        Self::install_at(directory, ConsensusLogPruneTurnGatePoint::BeforeTransaction)
-    }
-
     pub(crate) fn install_after_writer_acquired(directory: &Path) -> Self {
         Self::install_at(
             directory,
@@ -2062,12 +3994,26 @@ impl ConsensusLogPruneTurnGateForTest {
         )
     }
 
+    pub(crate) fn install_after_begin_success_before_synthetic_interrupt(directory: &Path) -> Self {
+        Self::install_at(
+            directory,
+            ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt,
+        )
+    }
+
     pub(crate) fn install_before_delete(directory: &Path) -> Self {
         Self::install_at(directory, ConsensusLogPruneTurnGatePoint::BeforeDelete)
     }
 
     pub(crate) fn install_before_authority_read(directory: &Path) -> Self {
         Self::install_at(
+            directory,
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+    }
+
+    fn install_before_authority_read_with_progress_handoff(directory: &Path) -> Self {
+        Self::install_at_with_progress_handoff(
             directory,
             ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
         )
@@ -2086,6 +4032,21 @@ impl ConsensusLogPruneTurnGateForTest {
     }
 
     fn install_at(directory: &Path, point: ConsensusLogPruneTurnGatePoint) -> Self {
+        Self::install_at_inner(directory, point, false)
+    }
+
+    fn install_at_with_progress_handoff(
+        directory: &Path,
+        point: ConsensusLogPruneTurnGatePoint,
+    ) -> Self {
+        Self::install_at_inner(directory, point, true)
+    }
+
+    fn install_at_inner(
+        directory: &Path,
+        point: ConsensusLogPruneTurnGatePoint,
+        hold_progress_preemption: bool,
+    ) -> Self {
         let directory =
             std::fs::canonicalize(directory).expect("canonicalize prune gate directory");
         let gate = Arc::new(ConsensusLogPruneTurnGate {
@@ -2096,6 +4057,8 @@ impl ConsensusLogPruneTurnGateForTest {
                 released: false,
                 preempted: false,
                 progress_preempted: false,
+                hold_progress_preemption,
+                progress_preemption_released: false,
                 progress_steps_before_preempt: usize::from(
                     point == ConsensusLogPruneTurnGatePoint::MidDelete,
                 ) * 8,
@@ -2145,6 +4108,9 @@ impl ConsensusLogPruneTurnGateForTest {
 #[cfg(all(test, target_os = "linux"))]
 impl Drop for ConsensusLogPruneTurnGateForTest {
     fn drop(&mut self) {
+        // A failed assertion must also release the progress-callback handoff;
+        // otherwise the blocking SQLite worker can outlive the failed test.
+        self.gate.release_progress_preemption();
         self.release();
         consensus_log_prune_turn_gates()
             .lock()
@@ -2170,6 +4136,61 @@ impl Drop for ConsensusLogPrunePrimaryPreemption {
     }
 }
 
+/// Read-only foreground-pressure signal for descriptor-pinned snapshot work.
+///
+/// The signal shares the fixed durable store's existing primary-writer
+/// accounting, but owns no writer permit and can neither admit nor interrupt
+/// a primary operation. Snapshot workers use it only to insert bounded pauses
+/// between bulk-copy work units while a consensus writer is pending.
+#[derive(Clone, Default)]
+pub(crate) struct ConsensusSnapshotForegroundPacer {
+    primary_writers: Option<Arc<AtomicUsize>>,
+    writer_generation: Option<Arc<AtomicU64>>,
+    observed_writer_generation: Arc<AtomicU64>,
+}
+
+impl ConsensusSnapshotForegroundPacer {
+    fn new(primary_writers: Arc<AtomicUsize>, writer_generation: Arc<AtomicU64>) -> Self {
+        let observed_writer_generation = writer_generation.load(Ordering::Acquire);
+        Self {
+            primary_writers: Some(primary_writers),
+            writer_generation: Some(writer_generation),
+            observed_writer_generation: Arc::new(AtomicU64::new(observed_writer_generation)),
+        }
+    }
+
+    fn pace_with(&self, pause: impl FnOnce(Duration)) -> bool {
+        let writer_generation_advanced =
+            self.writer_generation.as_ref().is_some_and(|generation| {
+                let current = generation.load(Ordering::Acquire);
+                self.observed_writer_generation
+                    .swap(current, Ordering::AcqRel)
+                    != current
+            });
+        if writer_generation_advanced
+            || self
+                .primary_writers
+                .as_ref()
+                .is_some_and(|writers| writers.load(Ordering::Acquire) != 0)
+        {
+            pause(SNAPSHOT_FOREGROUND_PACING_PAUSE);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pace(&self) {
+        let _ = self.pace_with(std::thread::sleep);
+    }
+}
+
+#[derive(Clone)]
+struct ConsensusLogPruneActiveInterrupt {
+    handle: Arc<InterruptHandle>,
+    preemption_requested: Arc<AtomicBool>,
+}
+
 /// One descriptor-pinned, coalescing physical log-prune lane.  It is only
 /// installed for the fixed durable authority profile; the unsupported
 /// in-memory shape retains the historical synchronous delete path.
@@ -2177,18 +4198,21 @@ pub(crate) struct ConsensusLogPruneLane {
     sender: tokio::sync::mpsc::Sender<()>,
     stop: tokio::sync::watch::Sender<bool>,
     stopping: AtomicBool,
+    degraded: AtomicBool,
     /// One writer turn owns this from its pre-publication recheck through its
     /// SQLite transaction rollback or commit. Primary writers hold an owned
     /// permit through their transaction; the prune lane only try-acquires it
     /// so it can never queue ahead of a primary writer.
     turn_ownership: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes cross-thread interrupt delivery with transaction cleanup so
-    /// a late sqlite3_interrupt cannot land inside the rollback it requested.
+    /// Serializes cross-thread interrupt delivery with complete turn cleanup
+    /// so a late sqlite3_interrupt cannot land inside rollback or escape into
+    /// the next turn after a successful commit.
     interrupt_delivery: Arc<Mutex<()>>,
-    active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
+    active_interrupt: Mutex<Option<ConsensusLogPruneActiveInterrupt>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     primary_writers: Arc<AtomicUsize>,
+    writer_generation: Arc<AtomicU64>,
     #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
@@ -2225,15 +4249,20 @@ impl ConsensusLogPruneLane {
             sender,
             stop,
             stopping: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
             turn_ownership: Arc::new(tokio::sync::Mutex::new(())),
             interrupt_delivery: Arc::new(Mutex::new(())),
             active_interrupt: Mutex::new(None),
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
             primary_writers: Arc::new(AtomicUsize::new(0)),
+            writer_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(all(test, target_os = "linux"))]
             turn_gate: consensus_log_prune_turn_gate_for_source(&source),
         });
+        if let Some(diagnostics) = &lane.diagnostics {
+            diagnostics.clear_consensus_log_prune_degraded();
+        }
         let worker = tokio::spawn(run_consensus_log_prune_lane(
             receiver,
             stop_receiver,
@@ -2249,17 +4278,36 @@ impl ConsensusLogPruneLane {
             .worker
             .try_lock()
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? = Some(worker);
+        lane.signal();
         Ok(lane)
     }
 
     pub(crate) fn signal(&self) {
-        if self.stopping.load(Ordering::Acquire) {
+        if self.stopping.load(Ordering::Acquire) || self.degraded.load(Ordering::Acquire) {
             return;
         }
         if self.sender.try_send(()).is_ok() {
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.observe_consensus_log_prune_signal();
             }
+        }
+    }
+
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+
+    fn snapshot_foreground_pacer(&self) -> ConsensusSnapshotForegroundPacer {
+        ConsensusSnapshotForegroundPacer::new(
+            Arc::clone(&self.primary_writers),
+            Arc::clone(&self.writer_generation),
+        )
+    }
+
+    fn fail_permanently(&self) {
+        self.degraded.store(true, Ordering::Release);
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.fail_consensus_log_prune_turn();
         }
     }
 
@@ -2275,6 +4323,7 @@ impl ConsensusLogPruneLane {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let primary_writers = Arc::clone(&self.primary_writers);
         primary_writers.fetch_add(1, Ordering::AcqRel);
+        self.writer_generation.fetch_add(1, Ordering::AcqRel);
         let mut preemption = ConsensusLogPrunePrimaryPreemption {
             primary_writers: Some(primary_writers),
             turn_ownership: None,
@@ -2285,11 +4334,18 @@ impl ConsensusLogPruneLane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(interrupt) = active_interrupt {
+            // Retain exact active-turn provenance even if the waiting primary
+            // is cancelled before the secondary transaction returns. A real
+            // corruption which coincides with this preemption is rolled back
+            // and detected again by the next unpreempted strict validation.
+            interrupt
+                .preemption_requested
+                .store(true, Ordering::Release);
             #[cfg(all(test, target_os = "linux"))]
             if let Some(gate) = &self.turn_gate {
                 gate.notify_preemption();
             }
-            interrupt.interrupt();
+            interrupt.handle.interrupt();
         }
         drop(interrupt_delivery);
         // This local permit acknowledges that an interrupted prune turn has
@@ -2312,7 +4368,7 @@ impl ConsensusLogPruneLane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
-            interrupt.interrupt();
+            interrupt.handle.interrupt();
         }
         drop(interrupt_delivery);
         let _ = self.stop.send(true);
@@ -2405,13 +4461,17 @@ async fn run_consensus_log_prune_lane(
             lane.signal();
             continue;
         }
-        let interrupt = Arc::new(connection.get_interrupt_handle());
+        let preemption_requested = Arc::new(AtomicBool::new(false));
+        let interrupt = ConsensusLogPruneActiveInterrupt {
+            handle: Arc::new(connection.get_interrupt_handle()),
+            preemption_requested: Arc::clone(&preemption_requested),
+        };
         let primary_writer_waiting = {
             let mut active_interrupt = lane
                 .active_interrupt
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *active_interrupt = Some(Arc::clone(&interrupt));
+            *active_interrupt = Some(interrupt);
             if lane.primary_writers.load(Ordering::Acquire) != 0 {
                 *active_interrupt = None;
                 true
@@ -2466,13 +4526,14 @@ async fn run_consensus_log_prune_lane(
                 ConsensusLogPruneTurnControl {
                     primary_writers: Arc::clone(&primary_writers),
                     interrupt_delivery: Arc::clone(&interrupt_delivery),
+                    preemption_requested: Arc::clone(&preemption_requested),
                     #[cfg(all(test, target_os = "linux"))]
                     turn_gate: turn_gate.clone(),
                 },
             );
             let result = match result {
                 Err(ConsensusLogPruneTurnError::Interrupted)
-                    if primary_writers.load(Ordering::Acquire) != 0 =>
+                    if preemption_requested.load(Ordering::Acquire) =>
                 {
                     Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
                 }
@@ -2481,6 +4542,10 @@ async fn run_consensus_log_prune_lane(
             (connection, result)
         })
         .await;
+        let interrupt_cleanup = lane
+            .interrupt_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
             let mut active_interrupt = lane
                 .active_interrupt
@@ -2506,9 +4571,7 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
-                }
+                lane.fail_permanently();
                 return;
             }
             Err(_) => {
@@ -2521,12 +4584,11 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
-                }
+                lane.fail_permanently();
                 return;
             }
         };
+        drop(interrupt_cleanup);
         match turn {
             Ok(completion) => {
                 if let Some(diagnostics) = &lane.diagnostics {
@@ -2605,9 +4667,7 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
-                }
+                lane.fail_permanently();
                 return;
             }
         }
@@ -2658,6 +4718,7 @@ async fn wait_consensus_log_prune_pacing(
 struct ConsensusLogPruneTurnControl {
     primary_writers: Arc<AtomicUsize>,
     interrupt_delivery: Arc<Mutex<()>>,
+    preemption_requested: Arc<AtomicBool>,
     #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
@@ -2716,11 +4777,10 @@ fn prune_consensus_log_turn_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     control: ConsensusLogPruneTurnControl,
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
-    let observed_preemption = Arc::new(AtomicBool::new(false));
     let progress = ConsensusLogPruneProgressGuard::install(
         conn,
         Arc::clone(&control.primary_writers),
-        Arc::clone(&observed_preemption),
+        Arc::clone(&control.preemption_requested),
         #[cfg(all(test, target_os = "linux"))]
         control.turn_gate.clone(),
     );
@@ -2759,10 +4819,46 @@ fn prune_consensus_log_turn_sync(
         drop(progress);
         return Err(error);
     }
-    let mut tx = match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+    let begin = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
+    #[cfg(all(test, target_os = "linux"))]
+    let begin = begin.and_then(|mut tx| {
+        let synthetic_interrupt = control.turn_gate.as_deref().is_some_and(|gate| {
+            if gate.point
+                != ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt
+            {
+                return false;
+            }
+            gate.wait_at(ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt)
+        });
+        if synthetic_interrupt {
+            // This seam reaches the early-BEGIN error arm while preserving
+            // the real transaction SQLite has just opened. It models the
+            // observed Err + !autocommit postcondition without claiming an
+            // opcode-timing reproduction across SQLite builds.
+            tx.set_drop_behavior(DropBehavior::Ignore);
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                None,
+            ))
+        } else {
+            Ok(tx)
+        }
+    });
+    let mut tx = match begin {
         Ok(tx) => tx,
         Err(error) => {
+            // SQLite can report an interrupted BEGIN after it has opened the
+            // transaction. Keep primary interrupt delivery closed while the
+            // progress callback is removed and restore autocommit before the
+            // connection returns to the lane.
+            let interrupt_delivery = control
+                .interrupt_delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             drop(progress);
+            let rollback = rollback_consensus_log_prune_transaction(conn);
+            drop(interrupt_delivery);
+            rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
             return Err(classify_consensus_log_prune_sqlite_error(&error));
         }
     };
@@ -2803,6 +4899,12 @@ fn prune_consensus_log_turn_sync(
             });
         };
         preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())?;
+        // This is intentionally inside the IMMEDIATE transaction and after
+        // the fixed-topology proof: a live file-backed worker must never use
+        // a stale or numerically-only floor to authorize a physical delete.
+        validate_exact_log_prune_lineage_in_tx(&tx, identity, &floor)
+            .map_err(consensus_log_prune_permanent)?;
+        preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())?;
         let completion = prune_consensus_log_rows_in_tx(
             &tx,
             &floor,
@@ -2825,17 +4927,18 @@ fn prune_consensus_log_turn_sync(
                 .execute_batch("COMMIT")
                 .map_err(|error| classify_consensus_log_prune_sqlite_error(&error));
             tx.set_drop_behavior(DropBehavior::Ignore);
-            drop(progress);
             if commit.is_err() {
                 let interrupt_delivery = control
                     .interrupt_delivery
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(progress);
                 let rollback = rollback_consensus_log_prune_transaction(conn);
                 drop(tx);
                 drop(interrupt_delivery);
                 rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
             } else {
+                drop(progress);
                 drop(tx);
             }
             commit.map(|()| completion)
@@ -2845,11 +4948,11 @@ fn prune_consensus_log_turn_sync(
             // it before the rollback/transaction drop so cleanup itself is
             // never interrupted and cannot strand the write lock.
             tx.set_drop_behavior(DropBehavior::Ignore);
-            drop(progress);
             let interrupt_delivery = control
                 .interrupt_delivery
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(progress);
             let rollback = rollback_consensus_log_prune_transaction(conn);
             drop(tx);
             drop(interrupt_delivery);
@@ -2859,8 +4962,7 @@ fn prune_consensus_log_turn_sync(
     };
     match result {
         Err(ConsensusLogPruneTurnError::Interrupted | ConsensusLogPruneTurnError::Permanent)
-            if observed_preemption.load(Ordering::Acquire)
-                && control.primary_writers.load(Ordering::Acquire) != 0 =>
+            if control.preemption_requested.load(Ordering::Acquire) =>
         {
             Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
         }
@@ -2874,8 +4976,17 @@ fn rollback_consensus_log_prune_transaction(
     if conn.is_autocommit() {
         return Ok(());
     }
-    conn.execute_batch("ROLLBACK")
-        .map_err(|rollback_error| classify_consensus_log_prune_sqlite_error(&rollback_error))
+    let result = conn
+        .execute_batch("ROLLBACK")
+        .map_err(|rollback_error| classify_consensus_log_prune_sqlite_error(&rollback_error));
+    if result.is_ok() && !conn.is_autocommit() {
+        // A successful ROLLBACK must restore connection ownership. Keep this
+        // invariant local to the cleanup helper instead of relying only on
+        // the worker's outer fail-closed ownership check.
+        Err(ConsensusLogPruneTurnError::Permanent)
+    } else {
+        result
+    }
 }
 
 fn preempt_consensus_log_prune_if_requested(
@@ -3418,9 +5529,63 @@ fn verify_proactive_checkpoint_connection(
 
 /// Shared persistence resources used by the log store, state machine, and
 /// snapshot builder. One async mutex serializes every vote/log/state write.
+///
+/// This guard makes terminal-handoff extraction transactional with respect to
+/// core construction.  A failed constructor cannot discard the descriptor
+/// pin captured by backend open: drop puts that exact handoff back into the
+/// backend's one-shot slot for the next storage-open attempt.
+struct TerminalRecoveryHandoffRestoreGuard<'a> {
+    backend: &'a SqliteSessionBackend,
+    handoff: Option<OperatorRecoveryTerminalHandoff>,
+}
+
+impl<'a> TerminalRecoveryHandoffRestoreGuard<'a> {
+    fn new(
+        backend: &'a SqliteSessionBackend,
+        handoff: Option<OperatorRecoveryTerminalHandoff>,
+    ) -> Self {
+        Self { backend, handoff }
+    }
+
+    fn disarm(mut self) -> Option<OperatorRecoveryTerminalHandoff> {
+        self.handoff.take()
+    }
+}
+
+impl Drop for TerminalRecoveryHandoffRestoreGuard<'_> {
+    fn drop(&mut self) {
+        let Some(handoff) = self.handoff.take() else {
+            return;
+        };
+        // Poisoned/backend-concurrent slots are already fail-closed at their
+        // next use.  Drop cannot surface an error, so never overwrite a slot
+        // that might contain a newer exact handoff.
+        let _ = self.backend.restore_terminal_recovery_handoff(handoff);
+    }
+}
+
+/// Whether the core owns snapshot-directory path admission or inherits the
+/// exact canonical logical key from storage's retained directory lease.
+enum SnapshotDirectoryInitialization {
+    #[cfg(test)]
+    CreateAndCanonicalize(PathBuf),
+    AlreadyAdmitted(PathBuf),
+}
+
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    /// A pending recovery terminal remains descriptor-bound until the
+    /// snapshot-directory opener has validated the current selected image
+    /// through a duplicate of this exact file descriptor.  Keeping it on the
+    /// core, rather than consuming it during schema initialization, closes
+    /// the gap between latch classification and the storage layer's envelope
+    /// validation.
+    terminal_recovery_handoff: Arc<Mutex<Option<OperatorRecoveryTerminalHandoff>>>,
+    /// The backend's original one-shot slot.  If storage initialization fails
+    /// after core construction but before terminal consumption, `Drop`
+    /// returns the same descriptor-bound handoff here for a safe retry.
+    terminal_recovery_handoff_restore_slot: Arc<Mutex<Option<OperatorRecoveryTerminalHandoff>>>,
     /// Store-scoped fixed-cardinality diagnostics. They are observational
     /// only and never cross the replicated command or snapshot wire.
     pub(crate) diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
@@ -3446,6 +5611,12 @@ pub(crate) struct SqliteConsensusCore {
     /// A cancellation-safe staging cleanup failure. It is consumed only by a
     /// later operation holding the single snapshot gate.
     pub(crate) snapshot_cleanup_failed: Arc<AtomicBool>,
+    /// A metadata publication reported an error after SQLite may have
+    /// committed it, and this live core could not prove the singleton's exact
+    /// outcome.  This is deliberately never cleared in-process: only a fresh
+    /// core, whose open path reads and validates authoritative metadata, may
+    /// resume snapshot publication.
+    pub(crate) snapshot_publication_indeterminate: Arc<AtomicBool>,
     pub(crate) caps: BackendCapabilities,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     /// Only one unvalidated receiver may own disk space for this core.
@@ -3458,7 +5629,241 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_capture_gate: Arc<SnapshotCaptureGate>,
 }
 
+impl Drop for SqliteConsensusCore {
+    fn drop(&mut self) {
+        // `SqliteConsensusCore` is cloned into the store's workers.  Only
+        // the final clone may return a pending handoff; an earlier clone
+        // dropping during normal startup must not steal it from a live core.
+        if Arc::strong_count(&self.terminal_recovery_handoff) != 1 {
+            return;
+        }
+        let Ok(mut handoff) = self.terminal_recovery_handoff.lock() else {
+            return;
+        };
+        let Some(handoff) = handoff.take() else {
+            return;
+        };
+        let Ok(mut backend_slot) = self.terminal_recovery_handoff_restore_slot.lock() else {
+            return;
+        };
+        // A populated backend slot means a concurrent lifecycle error.  Do
+        // not overwrite it; any subsequent backend attempt fails closed on
+        // the existing pending sidecar rather than admitting this core.
+        if backend_slot.is_none() {
+            *backend_slot = Some(handoff);
+        }
+    }
+}
+
 impl SqliteConsensusCore {
+    /// Test-only observer for storage's failure-path assertions.  It exposes
+    /// no descriptor or terminal contents: callers can prove only that a
+    /// failed validation has not consumed the pending handoff.
+    #[cfg(test)]
+    pub(crate) fn terminal_recovery_handoff_pending_for_test(&self) -> bool {
+        self.terminal_recovery_handoff
+            .lock()
+            .map(|handoff| handoff.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Whether this already-open core retains an unconsumed, descriptor-bound
+    /// terminal recovery handoff.  A live consumer uses this to retry a
+    /// failed lease validation without reclassifying a sidecar which has
+    /// already been pinned into this core.
+    pub(crate) fn terminal_recovery_handoff_pending(
+        &self,
+    ) -> Result<bool, SessionConsensusStorageError> {
+        self.terminal_recovery_handoff
+            .lock()
+            .map(|handoff| handoff.is_some())
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)
+    }
+
+    /// Adopt a terminal handoff which offline recovery published after this
+    /// core was already open.  The supplied snapshot descriptor must have
+    /// been opened through the caller's retained snapshot-directory lease;
+    /// this method never resolves the terminal's logical snapshot pathname.
+    ///
+    /// The handoff is only installed here.  The caller must subsequently run
+    /// the complete lease-bound snapshot validation and invoke
+    /// [`Self::consume_terminal_recovery_handoff_after_snapshot_validation`]
+    /// before ordinary readiness is allowed to observe the consumed record.
+    pub(crate) async fn install_live_terminal_recovery_handoff_from_admitted_snapshot(
+        &self,
+        selected_name: Option<&str>,
+        admitted_snapshot_file: Option<&File>,
+    ) -> Result<LiveTerminalRecoveryHandoffInstallOutcome, SessionConsensusStorageError> {
+        let conn = self.conn.lock().await;
+        self.install_live_terminal_recovery_handoff_from_admitted_snapshot_with_connection(
+            &conn,
+            selected_name,
+            admitted_snapshot_file,
+        )
+    }
+
+    /// Connection-held form of live terminal handoff classification. Snapshot
+    /// metadata publishers call this while retaining the exact SQLite
+    /// connection they will use for the following durable current-record
+    /// write, so terminalization cannot slip between a separate classifier
+    /// lock and that irreversible publication. `admitted_snapshot_file` is
+    /// opened by the caller's retained D1 namespace lease; this method never
+    /// resolves the terminal snapshot path itself.
+    pub(crate) fn install_live_terminal_recovery_handoff_from_admitted_snapshot_with_connection(
+        &self,
+        conn: &Connection,
+        selected_name: Option<&str>,
+        admitted_snapshot_file: Option<&File>,
+    ) -> Result<LiveTerminalRecoveryHandoffInstallOutcome, SessionConsensusStorageError> {
+        let database = self
+            .database_file
+            .as_ref()
+            .map(|file| file.path())
+            .ok_or(SessionConsensusStorageError::CorruptState)?;
+        let classification =
+            classify_operator_recovery_latch_with_connection_and_admitted_snapshot_sync(
+                database,
+                conn,
+                admitted_snapshot_file,
+            )
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        let active = classification.latch().is_some();
+        let already_consumed = classification.has_consumed_terminal();
+        let Some(handoff) = classification.into_terminal_handoff() else {
+            return Ok(if active {
+                LiveTerminalRecoveryHandoffInstallOutcome::Active
+            } else if already_consumed {
+                LiveTerminalRecoveryHandoffInstallOutcome::AlreadyConsumed
+            } else {
+                LiveTerminalRecoveryHandoffInstallOutcome::Clear
+            });
+        };
+        self.validate_terminal_recovery_snapshot_selection(&handoff, selected_name)?;
+        let mut handoffs = self
+            .terminal_recovery_handoff
+            .lock()
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        if handoffs.is_some() {
+            return Err(SessionConsensusStorageError::CorruptState);
+        }
+        *handoffs = Some(handoff);
+        Ok(LiveTerminalRecoveryHandoffInstallOutcome::Installed)
+    }
+
+    /// Duplicate the exact selected snapshot descriptor retained by terminal
+    /// recovery classification.  The caller must be holding this core's
+    /// snapshot-directory lease, pass a descriptor opened through that lease,
+    /// and validate its envelope/checksum using the returned duplicate before calling
+    /// [`Self::consume_terminal_recovery_handoff_after_snapshot_validation`].
+    ///
+    /// `selected_name` comes from the same live SQLite connection that names
+    /// the current snapshot.  Matching it to the core's canonical snapshot
+    /// directory prevents a terminal record from lending a valid descriptor
+    /// to a different pathname or directory.
+    pub(crate) fn terminal_recovery_snapshot_handoff_file(
+        &self,
+        selected_name: Option<&str>,
+        admitted_snapshot_file: Option<&File>,
+    ) -> Result<Option<File>, SessionConsensusStorageError> {
+        let handoffs = self
+            .terminal_recovery_handoff
+            .lock()
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let Some(handoff) = handoffs.as_ref() else {
+            return Ok(None);
+        };
+        self.validate_terminal_recovery_snapshot_selection(handoff, selected_name)?;
+        match (
+            &handoff.snapshot,
+            &handoff.snapshot_file,
+            admitted_snapshot_file,
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(expected), Some(held), Some(admitted)) => {
+                // Both descriptors must name the original terminal image.
+                // `admitted` comes from storage's retained directory FD and
+                // is the only descriptor handed to its envelope reader; this
+                // never reopens the configurable logical path after lease
+                // admission.
+                validate_terminal_snapshot_descriptor(expected, held)
+                    .and_then(|()| validate_terminal_snapshot_descriptor(expected, admitted))
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+                admitted
+                    .try_clone()
+                    .map(Some)
+                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)
+            }
+            _ => Err(SessionConsensusStorageError::CorruptState),
+        }
+    }
+
+    /// Atomically convert a pending terminal recovery record into the
+    /// database-only consumed tombstone.  Storage calls this only after its
+    /// directory lease has validated the snapshot envelope using
+    /// [`Self::terminal_recovery_snapshot_handoff_file`].  This method
+    /// rechecks the same live SQLite connection, the held original descriptor,
+    /// storage's lease-admitted snapshot descriptor, digest and fixed seal
+    /// immediately before replacement.
+    pub(crate) async fn consume_terminal_recovery_handoff_after_snapshot_validation(
+        &self,
+        selected_name: Option<&str>,
+        admitted_snapshot_file: Option<&File>,
+    ) -> Result<(), SessionConsensusStorageError> {
+        let conn = self.conn.lock().await;
+        let mut handoffs = self
+            .terminal_recovery_handoff
+            .lock()
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let Some(handoff) = handoffs.as_ref() else {
+            return Ok(());
+        };
+        self.validate_terminal_recovery_snapshot_selection(handoff, selected_name)?;
+        match (
+            &handoff.snapshot,
+            &handoff.snapshot_file,
+            admitted_snapshot_file,
+        ) {
+            (None, None, None) => {}
+            (Some(expected), Some(held), Some(admitted)) => {
+                validate_terminal_snapshot_descriptor(expected, held)
+                    .and_then(|()| validate_terminal_snapshot_descriptor(expected, admitted))
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            }
+            _ => return Err(SessionConsensusStorageError::CorruptState),
+        }
+        let database = self
+            .database_file
+            .as_ref()
+            .map(|file| file.path())
+            .ok_or(SessionConsensusStorageError::CorruptState)?;
+        consume_operator_recovery_terminal_handoff_sync(
+            database,
+            &conn,
+            handoff,
+            admitted_snapshot_file,
+        )
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        handoffs.take();
+        Ok(())
+    }
+
+    fn validate_terminal_recovery_snapshot_selection(
+        &self,
+        handoff: &OperatorRecoveryTerminalHandoff,
+        selected_name: Option<&str>,
+    ) -> Result<(), SessionConsensusStorageError> {
+        match (&handoff.snapshot, selected_name) {
+            (None, None) if handoff.snapshot_file.is_none() => Ok(()),
+            (Some(expected), Some(selected_name))
+                if expected.path == self.snapshot_dir.join(selected_name)
+                    && expected.path.parent() == Some(self.snapshot_dir.as_ref()) =>
+            {
+                Ok(())
+            }
+            _ => Err(SessionConsensusStorageError::CorruptState),
+        }
+    }
+
     /// Request non-blocking PASSIVE checkpoint work after a primary commit.
     pub(crate) fn signal_proactive_checkpoint(&self) {
         if let Some(lane) = &self.proactive_checkpoint_lane {
@@ -3474,6 +5879,14 @@ impl SqliteConsensusCore {
 
     pub(crate) fn consensus_log_prune_lane(&self) -> Option<Arc<ConsensusLogPruneLane>> {
         self.consensus_log_prune_lane.clone()
+    }
+
+    pub(crate) fn snapshot_foreground_pacer(&self) -> ConsensusSnapshotForegroundPacer {
+        self.consensus_log_prune_lane
+            .as_ref()
+            .map_or_else(ConsensusSnapshotForegroundPacer::default, |lane| {
+                lane.snapshot_foreground_pacer()
+            })
     }
 
     /// Keep this core's low-priority physical-prune lane yielded for the
@@ -3511,6 +5924,35 @@ impl SqliteConsensusCore {
         .await
     }
 
+    /// Initialize after storage has acquired and descriptor-bound the
+    /// snapshot directory lease.  `admitted_snapshot_dir` is that lease's
+    /// canonical logical key, not a pathname to resolve again: a parent
+    /// replacement between lease acquisition and core initialization must
+    /// not redirect this core's snapshot/latch namespace.
+    #[cfg(test)]
+    pub(crate) async fn initialize_with_admitted_snapshot_directory(
+        backend: &SqliteSessionBackend,
+        admitted_snapshot_dir: PathBuf,
+        identity: SessionConsensusIdentity,
+        expected_members: BTreeSet<SessionConsensusNodeId>,
+        expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+        authority_profile: ConsensusAuthorityProfile,
+        fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    ) -> Result<Self, SessionConsensusStorageError> {
+        Self::initialize_with_roster_attestation_root_with_admitted_snapshot_directory(
+            backend,
+            admitted_snapshot_dir,
+            identity,
+            expected_members,
+            expected_bindings,
+            authority_profile,
+            fixed_placement_policy,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn initialize_with_roster_attestation_root(
         backend: &SqliteSessionBackend,
@@ -3524,7 +5966,7 @@ impl SqliteConsensusCore {
     ) -> Result<Self, SessionConsensusStorageError> {
         Self::initialize_inner(
             backend,
-            snapshot_dir,
+            SnapshotDirectoryInitialization::CreateAndCanonicalize(snapshot_dir),
             identity,
             expected_members,
             expected_bindings,
@@ -3537,10 +5979,46 @@ impl SqliteConsensusCore {
         .await
     }
 
+    /// Descriptor-lease counterpart to
+    /// [`Self::initialize_with_roster_attestation_root`].  The caller must
+    /// pass the canonical logical directory captured while acquiring the
+    /// retained directory descriptor; this method deliberately performs no
+    /// directory creation or path resolution before core initialization.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn initialize_with_pending_and_roster_attestation_root(
+    pub(crate) async fn initialize_with_roster_attestation_root_with_admitted_snapshot_directory(
         backend: &SqliteSessionBackend,
-        snapshot_dir: PathBuf,
+        admitted_snapshot_dir: PathBuf,
+        identity: SessionConsensusIdentity,
+        expected_members: BTreeSet<SessionConsensusNodeId>,
+        expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+        authority_profile: ConsensusAuthorityProfile,
+        fixed_placement_policy: Option<PlacementResiliencePolicy>,
+        roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    ) -> Result<Self, SessionConsensusStorageError> {
+        Self::initialize_inner(
+            backend,
+            SnapshotDirectoryInitialization::AlreadyAdmitted(admitted_snapshot_dir),
+            identity,
+            expected_members,
+            expected_bindings,
+            None,
+            None,
+            authority_profile,
+            fixed_placement_policy,
+            roster_attestation_trust_root,
+        )
+        .await
+    }
+
+    /// Descriptor-lease counterpart to
+    /// [`Self::initialize_with_pending_and_roster_attestation_root`].  It
+    /// preserves the acquisition-time canonical key exactly so a replaced
+    /// parent cannot redirect pending-membership initialization to a new
+    /// snapshot namespace before storage validates its retained descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn initialize_with_pending_and_roster_attestation_root_with_admitted_snapshot_directory(
+        backend: &SqliteSessionBackend,
+        admitted_snapshot_dir: PathBuf,
         storage_identity: SessionConsensusIdentity,
         current_identity: SessionConsensusIdentity,
         current_members: BTreeSet<SessionConsensusNodeId>,
@@ -3552,7 +6030,7 @@ impl SqliteConsensusCore {
     ) -> Result<Self, SessionConsensusStorageError> {
         Self::initialize_inner(
             backend,
-            snapshot_dir,
+            SnapshotDirectoryInitialization::AlreadyAdmitted(admitted_snapshot_dir),
             current_identity,
             current_members,
             current_bindings,
@@ -3568,7 +6046,7 @@ impl SqliteConsensusCore {
     #[allow(clippy::too_many_arguments)]
     async fn initialize_inner(
         backend: &SqliteSessionBackend,
-        snapshot_dir: PathBuf,
+        snapshot_directory: SnapshotDirectoryInitialization,
         identity: SessionConsensusIdentity,
         expected_members: BTreeSet<SessionConsensusNodeId>,
         expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
@@ -3585,12 +6063,40 @@ impl SqliteConsensusCore {
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
         validate_member_bindings(&expected_members, &expected_bindings)
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
-        tokio::fs::create_dir_all(&snapshot_dir)
-            .await
-            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-        let canonical_snapshot_dir = tokio::fs::canonicalize(&snapshot_dir)
-            .await
-            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let canonical_snapshot_dir = match snapshot_directory {
+            #[cfg(test)]
+            SnapshotDirectoryInitialization::CreateAndCanonicalize(snapshot_dir) => {
+                tokio::fs::create_dir_all(&snapshot_dir)
+                    .await
+                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+                tokio::fs::canonicalize(&snapshot_dir)
+                    .await
+                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+            }
+            SnapshotDirectoryInitialization::AlreadyAdmitted(admitted_snapshot_dir) => {
+                // This is a lease-proven canonical absolute spelling.  Never
+                // inspect or resolve it here: resolving after the lease's
+                // retained FD check would allow a D1 -> D2 parent/path swap
+                // to choose a different namespace before storage's own
+                // descriptor-bound validation runs.
+                if !admitted_snapshot_dir.is_absolute() {
+                    return Err(SessionConsensusStorageError::BackendUnavailable);
+                }
+                admitted_snapshot_dir
+            }
+        };
+        // `finish_file_open` may have classified a terminal recovery record
+        // and retained its selected snapshot descriptor.  Take that one-shot
+        // handoff before any ordinary consensus initialization can observe a
+        // mutable snapshot pathname.  If initialization fails, the handoff is
+        // dropped but the durable pending sidecar remains and the next
+        // process must repeat the full descriptor-backed proof.
+        let terminal_recovery_handoff = TerminalRecoveryHandoffRestoreGuard::new(
+            backend,
+            backend
+                .take_terminal_recovery_handoff()
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?,
+        );
         let (
             storage_identity,
             applied,
@@ -3688,8 +6194,12 @@ impl SqliteConsensusCore {
             }
         }
 
+        let terminal_recovery_handoff_restore_slot =
+            backend.terminal_recovery_handoff_restore_slot();
         let core = Self {
             conn: Arc::clone(&backend.conn),
+            terminal_recovery_handoff: Arc::new(Mutex::new(terminal_recovery_handoff.disarm())),
+            terminal_recovery_handoff_restore_slot,
             diagnostics: backend.consensus_diagnostics.clone(),
             database_file,
             proactive_checkpoint_lane,
@@ -3702,6 +6212,7 @@ impl SqliteConsensusCore {
             expected_bindings,
             snapshot_dir: Arc::new(canonical_snapshot_dir),
             snapshot_cleanup_failed: Arc::new(AtomicBool::new(false)),
+            snapshot_publication_indeterminate: Arc::new(AtomicBool::new(false)),
             // The core is shared by state-machine apply, snapshots, and
             // recovery/reopen paths. It must retain the consensus adapter's
             // advertised profile rather than SQLite's standalone ceiling.
@@ -3715,9 +6226,6 @@ impl SqliteConsensusCore {
             #[cfg(test)]
             snapshot_capture_gate: Arc::clone(&backend.consensus_snapshot_capture_gate),
         };
-        if let Some(lane) = &core.consensus_log_prune_lane {
-            lane.signal();
-        }
         Ok(core)
     }
 }
@@ -4141,8 +6649,15 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     {
         return Err(SessionConsensusStorageError::CorruptState);
     }
+    // A writable reopen must audit every row which remains above the durable
+    // purge floor before returning a core that can admit another effect. This
+    // applies to dynamic as well as fixed authority; only fixed authority
+    // adds topology and retained-contiguity constraints below.
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
         validate_fixed_durable_state_sync(&tx, storage_identity, expected_members)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    } else {
+        validate_retained_durable_log_sync(&tx, storage_identity, |_| Ok(()))
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     }
 
@@ -7565,6 +10080,211 @@ pub(crate) fn protected_roster_recovery_trust_root_commitment_sync(
     hasher.update(root.compressed_public_key());
     hasher.update([1]);
     Ok(Some(hasher.finalize().into()))
+}
+
+/// Derive the exact authority predecessor accepted by an operator-recovery
+/// V2 command.  This is intentionally computed by the normal persistence
+/// layer as well as the offline inspector: a plan digest alone cannot prove
+/// that an untouched voter still has the source membership/authority/roster
+/// state when it later applies the epoch command.
+///
+/// The commitment has a bounded canonical raw-SQL projection rather than a
+/// path or snapshot projection.  All participating tables are already
+/// semantically validated by the callers below; this additional binding makes
+/// their exact durable values part of the replicated V2 precondition.
+pub(crate) fn operator_recovery_v2_authority_commitment_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<[u8; 32]> {
+    if expected_members.is_empty()
+        || read_storage_identity_sync(conn).map_err(|_| {
+            invalid_data("session recovery authority predecessor identity is unreadable")
+        })? != identity
+    {
+        return Err(invalid_data(
+            "session recovery authority predecessor identity is invalid",
+        ));
+    }
+    let scope = read_membership_scope_sync(conn, identity)?;
+    if scope.current_identity != identity || scope.current_members != *expected_members {
+        return Err(invalid_data(
+            "session recovery authority predecessor membership differs",
+        ));
+    }
+    let membership = read_membership_sync(conn, identity)?;
+    validate_protected_roster_recovery_state_sync(conn, identity).map_err(|_| {
+        invalid_data("session recovery authority predecessor protected roster is invalid")
+    })?;
+    let profile = read_consensus_authority_profile_sync(conn)
+        .map_err(|_| invalid_data("session recovery authority predecessor profile is invalid"))?;
+    let placement = read_fixed_placement_policy_sync(conn)
+        .map_err(|_| invalid_data("session recovery authority predecessor placement is invalid"))?;
+    match (profile, placement) {
+        (ConsensusAuthorityProfile::Dynamic, None)
+        | (ConsensusAuthorityProfile::FixedImmutable, Some(_)) => {}
+        _ => {
+            return Err(invalid_data(
+                "session recovery authority predecessor descriptor is invalid",
+            ));
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(OPERATOR_RECOVERY_V2_AUTHORITY_COMMITMENT_DOMAIN);
+    hasher.update(identity.cluster_id().as_bytes());
+    hasher.update(identity.configuration_id().as_bytes());
+    hasher.update(identity.configuration_epoch().get().to_be_bytes());
+    hasher.update(fenced_transition_voter_set_digest(
+        identity,
+        expected_members,
+    ));
+    hasher.update(match profile {
+        ConsensusAuthorityProfile::Dynamic => [1],
+        ConsensusAuthorityProfile::FixedImmutable => [2],
+    });
+    hasher.update(match placement {
+        None => [0],
+        Some(PlacementResiliencePolicy::RequireIndependentFailureDomains) => [1],
+        Some(PlacementResiliencePolicy::AllowReducedResilience) => [2],
+    });
+    let encoded_membership = encode_json(&membership)?;
+    hasher.update(
+        u64::try_from(encoded_membership.len())
+            .map_err(|_| invalid_data("session recovery authority membership is too large"))?
+            .to_be_bytes(),
+    );
+    hasher.update(encoded_membership);
+    match protected_roster_recovery_trust_root_commitment_sync(conn)
+        .map_err(|_| invalid_data("session recovery authority verifier root is invalid"))?
+    {
+        None => hasher.update([0]),
+        Some(commitment) => {
+            hasher.update([1]);
+            hasher.update(commitment);
+        }
+    }
+
+    let mut bytes = 0_usize;
+    for (label, query) in [
+        (
+            "consensus_membership_scope",
+            "SELECT * FROM consensus_membership_scope ORDER BY singleton",
+        ),
+        (
+            "consensus_membership_history",
+            "SELECT * FROM consensus_membership_history ORDER BY configuration_epoch",
+        ),
+        (
+            "consensus_membership_terminal_history",
+            "SELECT * FROM consensus_membership_terminal_history ORDER BY transition_start_index, transition_id",
+        ),
+        (
+            "consensus_protected_roster_rows",
+            "SELECT * FROM consensus_protected_roster_rows ORDER BY binding",
+        ),
+        (
+            "consensus_protected_roster_floors",
+            "SELECT * FROM consensus_protected_roster_floors ORDER BY partition",
+        ),
+        (
+            "consensus_protected_roster_retirement_cursors",
+            "SELECT * FROM consensus_protected_roster_retirement_cursors ORDER BY partition",
+        ),
+        (
+            "consensus_protected_roster_witness",
+            "SELECT * FROM consensus_protected_roster_witness ORDER BY singleton",
+        ),
+        (
+            "consensus_protected_roster_business",
+            "SELECT * FROM consensus_protected_roster_business ORDER BY business_key",
+        ),
+        (
+            "consensus_protected_roster_admissions",
+            "SELECT * FROM consensus_protected_roster_admissions ORDER BY binding",
+        ),
+    ] {
+        hash_operator_recovery_v2_authority_table(conn, label, query, &mut hasher, &mut bytes)?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn hash_operator_recovery_v2_authority_table(
+    conn: &Connection,
+    label: &str,
+    query: &str,
+    hasher: &mut Sha256,
+    bytes: &mut usize,
+) -> io::Result<()> {
+    let label_len = u64::try_from(label.len())
+        .map_err(|_| invalid_data("session recovery authority table name is too large"))?;
+    hasher.update(label_len.to_be_bytes());
+    hasher.update(label.as_bytes());
+    if !table_exists(conn, label).map_err(db_error)? {
+        hasher.update([0]);
+        return Ok(());
+    }
+    hasher.update([1]);
+    let mut statement = conn.prepare(query).map_err(db_error)?;
+    let columns = statement.column_count();
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let mut count = 0_usize;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session recovery authority row count overflow"))?;
+        if count > OPERATOR_RECOVERY_V2_AUTHORITY_COMMITMENT_MAX_ROWS {
+            return Err(invalid_data(
+                "session recovery authority row count exceeds bound",
+            ));
+        }
+        hasher.update([0xff]);
+        for column in 0..columns {
+            match row.get_ref(column).map_err(db_error)? {
+                ValueRef::Null => hasher.update([0]),
+                ValueRef::Integer(value) => {
+                    hasher.update([1]);
+                    hasher.update(value.to_be_bytes());
+                }
+                ValueRef::Real(_) => {
+                    return Err(invalid_data(
+                        "session recovery authority contains floating-point state",
+                    ));
+                }
+                ValueRef::Text(value) => {
+                    hash_operator_recovery_v2_authority_value(hasher, 2, value, bytes)?;
+                }
+                ValueRef::Blob(value) => {
+                    hash_operator_recovery_v2_authority_value(hasher, 3, value, bytes)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_operator_recovery_v2_authority_value(
+    hasher: &mut Sha256,
+    tag: u8,
+    value: &[u8],
+    bytes: &mut usize,
+) -> io::Result<()> {
+    *bytes = bytes
+        .checked_add(value.len())
+        .ok_or_else(|| invalid_data("session recovery authority byte count overflow"))?;
+    if *bytes > OPERATOR_RECOVERY_V2_AUTHORITY_COMMITMENT_MAX_BYTES {
+        return Err(invalid_data(
+            "session recovery authority byte count exceeds bound",
+        ));
+    }
+    hasher.update([tag]);
+    hasher.update(
+        u64::try_from(value.len())
+            .map_err(|_| invalid_data("session recovery authority value is too large"))?
+            .to_be_bytes(),
+    );
+    hasher.update(value);
+    Ok(())
 }
 
 /// Validate every persisted roster projection through the canonical decoders
@@ -15084,6 +17804,11 @@ fn validate_existing_schema_with_roster_requirement(
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     validate_fenced_transition_v2_receipts_sync(conn, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    // Snapshot capture validates a read-only source connection. The raw gate
+    // and semantic projection prove the same released schema and recovery
+    // state without attempting the writable migration/singleton insert.
+    read_operator_recovery_after_schema_sync(conn, storage_identity)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     if require_protected_roster {
         protected_roster_layout_in_sync(conn, false)
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -15104,9 +17829,28 @@ CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
         pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
     ),
     watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0),
+    finalize_log_id_json BLOB CHECK (
+        finalize_log_id_json IS NULL
+        OR length(finalize_log_id_json) BETWEEN 1 AND 1024
+    ),
+    finalize_entry_json BLOB CHECK (
+        finalize_entry_json IS NULL
+        OR length(finalize_entry_json) BETWEEN 1 AND 16384
+    ),
+    recovery_v2_activated INTEGER NOT NULL DEFAULT 0 CHECK (
+        recovery_v2_activated IN (0, 1)
+    ),
     CHECK (
         (pending_epoch IS NULL AND pending_plan_digest IS NULL)
         OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    CHECK (
+        (recovery_v2_activated = 0
+            AND finalize_log_id_json IS NULL
+            AND finalize_entry_json IS NULL)
+        OR (recovery_v2_activated = 1
+            AND finalize_log_id_json IS NOT NULL
+            AND finalize_entry_json IS NOT NULL)
     ),
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
 );
@@ -17269,12 +20013,117 @@ CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
 );
 "#;
 
+// The last released V2-certificate table predates the durable activation
+// fence.  Keep its two exact physical products solely to migrate a complete
+// certificate pair to the one-way marker; it is never an accepted post-fence
+// destination layout.
+const PRE_V2_ACTIVATION_CONSENSUS_OPERATOR_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0),
+    finalize_log_id_json BLOB CHECK (
+        finalize_log_id_json IS NULL
+        OR length(finalize_log_id_json) BETWEEN 1 AND 1024
+    ),
+    finalize_entry_json BLOB CHECK (
+        finalize_entry_json IS NULL
+        OR length(finalize_entry_json) BETWEEN 1 AND 16384
+    ),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    CHECK (
+        (finalize_log_id_json IS NULL AND finalize_entry_json IS NULL)
+        OR (finalize_log_id_json IS NOT NULL AND finalize_entry_json IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
+const PRE_V2_ACTIVATION_OPERATOR_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0),
+    finalize_log_id_json BLOB CHECK (
+        finalize_log_id_json IS NULL
+        OR length(finalize_log_id_json) BETWEEN 1 AND 1024
+    ),
+    finalize_entry_json BLOB CHECK (
+        finalize_entry_json IS NULL
+        OR length(finalize_entry_json) BETWEEN 1 AND 16384
+    ),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    CHECK (
+        (finalize_log_id_json IS NULL AND finalize_entry_json IS NULL)
+        OR (finalize_log_id_json IS NOT NULL AND finalize_entry_json IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
 const OPERATOR_RECOVERY_CURSOR_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0);";
+const OPERATOR_RECOVERY_FINALIZE_LOG_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN finalize_log_id_json BLOB CHECK (finalize_log_id_json IS NULL OR length(finalize_log_id_json) BETWEEN 1 AND 1024);";
+const OPERATOR_RECOVERY_FINALIZE_CERTIFICATE_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN finalize_entry_json BLOB CHECK (finalize_entry_json IS NULL OR length(finalize_entry_json) BETWEEN 1 AND 16384);";
+const OPERATOR_RECOVERY_V2_ACTIVATION_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN recovery_v2_activated INTEGER NOT NULL DEFAULT 0 CHECK (recovery_v2_activated IN (0, 1));";
 
 pub(crate) fn ensure_operator_recovery_schema_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<()> {
+    // This helper is reached both during normal open and from a larger state
+    // transaction.  A savepoint is therefore the only safe way to make every
+    // predecessor classification, ALTER, backfill, and singleton creation
+    // all-or-nothing in both contexts.
+    conn.execute_batch("SAVEPOINT operator_recovery_schema_migration")
+        .map_err(db_error)?;
+    let result = ensure_operator_recovery_schema_inner_sync(conn, identity);
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE SAVEPOINT operator_recovery_schema_migration")
+            .map_err(db_error),
+        Err(error) => {
+            conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT operator_recovery_schema_migration; \
+                 RELEASE SAVEPOINT operator_recovery_schema_migration",
+            )
+            .map_err(db_error)?;
+            Err(error)
+        }
+    }
+}
+
+fn ensure_operator_recovery_schema_inner_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    // Classify the untouched predecessor before CREATE IF NOT EXISTS or any
+    // ALTER can make an incomplete L-only/partial pair look migratable.
+    if table_exists(conn, "consensus_operator_recovery").map_err(db_error)? {
+        if !operator_recovery_certificate_table_schema_is_exact_in_sync(conn, false)? {
+            return Err(invalid_data(
+                "session consensus recovery schema is not a released predecessor",
+            ));
+        }
+        validate_raw_operator_recovery_v2_finalize_certificate_sync(conn, identity, false)?;
+    }
     conn.execute_batch(OPERATOR_RECOVERY_SCHEMA)
         .map_err(db_error)?;
     let has_cursor_floor: bool = conn
@@ -17288,11 +20137,129 @@ pub(crate) fn ensure_operator_recovery_schema_sync(
         conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
             .map_err(db_error)?;
     }
+    let has_finalize_log_id: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'finalize_log_id_json')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !has_finalize_log_id {
+        conn.execute_batch(OPERATOR_RECOVERY_FINALIZE_LOG_MIGRATION)
+            .map_err(db_error)?;
+    }
+    let has_finalize_certificate: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'finalize_entry_json')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !has_finalize_certificate {
+        conn.execute_batch(OPERATOR_RECOVERY_FINALIZE_CERTIFICATE_MIGRATION)
+            .map_err(db_error)?;
+    }
+    let has_v2_activation: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'recovery_v2_activated')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !has_v2_activation {
+        // Validate a complete historical V2 pair while its exact predecessor
+        // DDL is still visible.  The savepoint makes adding and backfilling
+        // the fence atomic even when this helper is called from a wider
+        // storage transaction.
+        validate_raw_operator_recovery_v2_finalize_certificate_sync(conn, identity, false)?;
+        conn.execute_batch("SAVEPOINT recovery_v2_activation_migration")
+            .map_err(db_error)?;
+        let migration = (|| {
+            conn.execute_batch(OPERATOR_RECOVERY_V2_ACTIVATION_MIGRATION)
+                .map_err(db_error)?;
+            conn.execute(
+                "UPDATE consensus_operator_recovery SET recovery_v2_activated = 1 \
+                 WHERE finalize_log_id_json IS NOT NULL AND finalize_entry_json IS NOT NULL",
+                [],
+            )
+            .map_err(db_error)?;
+            let partial: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM consensus_operator_recovery \
+                     WHERE (finalize_log_id_json IS NULL) != (finalize_entry_json IS NULL) LIMIT 1)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if partial {
+                return Err(invalid_data(
+                    "session consensus recovery finalization certificate is incomplete",
+                ));
+            }
+            Ok(())
+        })();
+        match migration {
+            Ok(()) => conn
+                .execute_batch("RELEASE SAVEPOINT recovery_v2_activation_migration")
+                .map_err(db_error)?,
+            Err(error) => {
+                conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT recovery_v2_activation_migration; \
+                     RELEASE SAVEPOINT recovery_v2_activation_migration",
+                )
+                .map_err(db_error)?;
+                return Err(error);
+            }
+        }
+    }
     conn.execute(
         "INSERT OR IGNORE INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, NULL, NULL, 0)",
         params![epoch_i64(identity)?, [0_u8; 32].as_slice()],
     )
     .map_err(db_error)?;
+    // Keep the savepoint open until the post-migration image has passed the
+    // same semantic reconstruction used by a normal reader.  In particular,
+    // a syntactically valid predecessor must not leave an ALTER/backfill
+    // behind when its recovery certificate, terminal outcome, applied floor,
+    // machine state, or identity binding is contradictory.
+    let _ = validate_current_operator_recovery_image_sync(conn, identity)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperatorRecoveryState {
+    pub(crate) recovery_epoch: u64,
+    pub(crate) last_plan_digest: [u8; 32],
+    pub(crate) pending_epoch: Option<u64>,
+    pub(crate) pending_plan_digest: Option<[u8; 32]>,
+    pub(crate) watch_cursor_invalidation_floor: u64,
+    /// Exact full LogId of the V2 finalization command.  This survives log
+    /// compaction and binds recovery terminal evidence to the one command
+    /// that produced it.
+    pub(crate) finalize_log_id: Option<LogId<SessionConsensusNodeId>>,
+    /// Canonical V2 finalization certificate.  The exact bytes are carried
+    /// through snapshot monotonicity checks so equal epoch/plan state cannot
+    /// rewrite its compact replay authority.
+    pub(crate) finalize_entry_json: Option<Vec<u8>>,
+    /// One-way durable protocol fence set by a verified V2 finalization.
+    pub(crate) v2_activated: bool,
+}
+
+/// Validate a current recovery image without attempting schema repair.
+///
+/// This is the read-only equivalent of the semantic tail held inside the
+/// migration savepoint. It deliberately retains every cardinality and
+/// cross-table invariant from that tail so a cheap live classifier removes
+/// only migration writes, never durable-state validation.
+pub(crate) fn validate_current_operator_recovery_image_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<OperatorRecoveryState> {
+    // Gate the exact released schema and bounded row projection before even
+    // counting a potentially forged table. The migration path performed this
+    // gate before its post-migration semantic tail; the live read must retain
+    // the same ordering without performing the migration itself.
+    let recovery = read_operator_recovery_after_schema_sync(conn, identity)?;
     let (stored_epoch, rows): (i64, i64) = conn
         .query_row(
             "SELECT configuration_epoch, (SELECT COUNT(*) FROM consensus_operator_recovery) FROM consensus_operator_recovery WHERE singleton = 1",
@@ -17306,21 +20273,83 @@ pub(crate) fn ensure_operator_recovery_schema_sync(
             "session consensus operator recovery state is invalid",
         ));
     }
-    Ok(())
+    if read_storage_identity_sync(conn)
+        .map_err(|_| invalid_data("session consensus recovery storage identity is invalid"))?
+        != identity
+    {
+        return Err(invalid_data(
+            "session consensus recovery storage identity differs",
+        ));
+    }
+    let _ = read_applied_sync(conn, identity)?;
+    let _ = read_machine_sync(conn, identity)?;
+    Ok(recovery)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OperatorRecoveryState {
-    pub(crate) recovery_epoch: u64,
-    pub(crate) last_plan_digest: [u8; 32],
-    pub(crate) pending_epoch: Option<u64>,
-    pub(crate) pending_plan_digest: Option<[u8; 32]>,
-    pub(crate) watch_cursor_invalidation_floor: u64,
-}
+type StoredOperatorRecoveryRow = (
+    i64,
+    i64,
+    Vec<u8>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    i64,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 
-type StoredOperatorRecoveryRow = (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>, i64);
+type OperatorRecoveryCertificateValidationRow = (
+    i64,
+    i64,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    i64,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    i64,
+);
+type OperatorRecoveryFinalizeLogRow = (
+    i64,
+    i64,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    i64,
+    Option<Vec<u8>>,
+);
+type OperatorRecoveryCursorRow = (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>, i64);
+type OperatorRecoveryCertificateRow = (i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+type OperatorRecoveryOutcomeRow = (i64, Option<Vec<u8>>, Option<Vec<u8>>);
 
 pub(crate) fn read_operator_recovery_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<OperatorRecoveryState> {
+    // The migration owns its outer savepoint through the semantic read below.
+    // Keeping that read in a separate helper prevents a normal reader from
+    // recursively reopening/releasing the migration savepoint while still
+    // giving attached validation views their raw, read-only projection.
+    let has_operator_recovery =
+        table_exists(conn, "consensus_operator_recovery").map_err(db_error)?;
+    let attached_validation = attached_snapshot_validation_views_are_active_sync(conn)?;
+    let main_readonly = conn.is_readonly(rusqlite::MAIN_DB).map_err(db_error)?;
+    if has_operator_recovery
+        && !attached_validation
+        // Offline recovery has already admitted the exact schema before it
+        // reaches this reader, and holds a read-only pinned descriptor.  Do
+        // not turn that validation read into a schema migration attempt: the
+        // latter mutates even when no migration is needed and fails closed on
+        // a read-only connection before the durable row can be inspected.
+        && !main_readonly
+    {
+        ensure_operator_recovery_schema_sync(conn, identity)?;
+    }
+    read_operator_recovery_after_schema_sync(conn, identity)
+}
+
+fn read_operator_recovery_after_schema_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<OperatorRecoveryState> {
@@ -17331,15 +20360,147 @@ pub(crate) fn read_operator_recovery_sync(
             pending_epoch: None,
             pending_plan_digest: None,
             watch_cursor_invalidation_floor: 0,
+            finalize_log_id: None,
+            finalize_entry_json: None,
+            v2_activated: false,
         });
     }
-    let row: StoredOperatorRecoveryRow = if operator_recovery_cursor_column_exists(conn)? {
-        conn.query_row(
-            "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    // The caller has installed the durable one-way V2 fence before this
+    // projection. Attached snapshots instead receive their synthetic marker
+    // in the validation view after the raw gate below.
+    if !attached_snapshot_validation_views_are_active_sync(conn)? {
+        // A normal reader is also a snapshot-source reader. Validate a
+        // populated V2 certificate against raw main tables before any
+        // unbounded legacy projection could materialize its row.
+        validate_raw_operator_recovery_v2_finalize_certificate_sync(conn, identity, false)?;
+    }
+    let row: StoredOperatorRecoveryRow = if operator_recovery_finalize_certificate_column_exists(
+        conn,
+    )? {
+        let current: OperatorRecoveryCertificateValidationRow = conn
+            .query_row(
+                "SELECT configuration_epoch, recovery_epoch, \
+             CASE WHEN typeof(last_plan_digest) = 'blob' AND length(last_plan_digest) = 32 \
+                  THEN last_plan_digest ELSE NULL END, \
+             pending_epoch, \
+             CASE WHEN pending_plan_digest IS NULL THEN NULL \
+                  WHEN typeof(pending_plan_digest) = 'blob' AND length(pending_plan_digest) = 32 \
+                  THEN pending_plan_digest ELSE NULL END, \
+             watch_cursor_invalidation_floor, \
+             CASE WHEN finalize_log_id_json IS NULL THEN NULL \
+                  WHEN typeof(finalize_log_id_json) = 'blob' \
+                       AND length(finalize_log_id_json) BETWEEN 1 AND 1024 \
+                  THEN finalize_log_id_json ELSE NULL END, \
+             CASE WHEN finalize_entry_json IS NULL THEN NULL \
+                  WHEN typeof(finalize_entry_json) = 'blob' \
+                       AND length(finalize_entry_json) BETWEEN 1 AND 16384 \
+                  THEN finalize_entry_json ELSE NULL END, \
+             typeof(last_plan_digest) = 'blob' AND length(last_plan_digest) = 32, \
+             pending_plan_digest IS NULL \
+                  OR (typeof(pending_plan_digest) = 'blob' AND length(pending_plan_digest) = 32), \
+             (finalize_log_id_json IS NULL \
+                  OR (typeof(finalize_log_id_json) = 'blob' \
+                      AND length(finalize_log_id_json) BETWEEN 1 AND 1024)) \
+                 AND (finalize_entry_json IS NULL \
+                  OR (typeof(finalize_entry_json) = 'blob' \
+                      AND length(finalize_entry_json) BETWEEN 1 AND 16384)) \
+             FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .map_err(db_error)?;
+        if current.8 != 1 || current.9 != 1 || current.10 != 1 {
+            return Err(invalid_data(
+                "session consensus recovery state contains an unbounded blob",
+            ));
+        }
+        let last_plan_digest = current.2.ok_or_else(|| {
+            invalid_data("session consensus recovery plan digest has invalid length")
+        })?;
+        (
+            current.0,
+            current.1,
+            last_plan_digest,
+            current.3,
+            current.4,
+            current.5,
+            current.6,
+            current.7,
         )
-        .map_err(db_error)?
+    } else if operator_recovery_finalize_log_column_exists(conn)? {
+        // The short-lived L-only migration is permitted only while its new
+        // column remains NULL.  Never materialize an arbitrary L blob just
+        // to discover it is an unreleased partial finalization record.
+        let finalize_log: OperatorRecoveryFinalizeLogRow = conn
+            .query_row(
+                "SELECT configuration_epoch, recovery_epoch, \
+                 CASE WHEN typeof(last_plan_digest) = 'blob' AND length(last_plan_digest) = 32 \
+                      THEN last_plan_digest ELSE NULL END, \
+                 pending_epoch, \
+                 CASE WHEN pending_plan_digest IS NULL THEN NULL \
+                      WHEN typeof(pending_plan_digest) = 'blob' AND length(pending_plan_digest) = 32 \
+                      THEN pending_plan_digest ELSE NULL END, \
+                 watch_cursor_invalidation_floor, \
+                 CASE WHEN typeof(finalize_log_id_json) = 'blob' \
+                           AND length(finalize_log_id_json) BETWEEN 1 AND 1024 \
+                      THEN finalize_log_id_json ELSE NULL END \
+                 FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .map_err(db_error)?;
+        let last_plan_digest = finalize_log.2.ok_or_else(|| {
+            invalid_data("session consensus recovery plan digest has invalid length")
+        })?;
+        if finalize_log.6.is_some() {
+            return Err(invalid_data(
+                "session consensus recovery finalization certificate is incomplete",
+            ));
+        }
+        (
+            finalize_log.0,
+            finalize_log.1,
+            last_plan_digest,
+            finalize_log.3,
+            finalize_log.4,
+            finalize_log.5,
+            finalize_log.6,
+            None,
+        )
+    } else if operator_recovery_cursor_column_exists(conn)? {
+        let cursor: OperatorRecoveryCursorRow = conn
+            .query_row(
+                "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(db_error)?;
+        (
+            cursor.0, cursor.1, cursor.2, cursor.3, cursor.4, cursor.5, None, None,
+        )
     } else {
         let legacy: (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>) = conn
             .query_row(
@@ -17348,10 +20509,20 @@ pub(crate) fn read_operator_recovery_sync(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .map_err(db_error)?;
-        (legacy.0, legacy.1, legacy.2, legacy.3, legacy.4, 0)
+        (
+            legacy.0, legacy.1, legacy.2, legacy.3, legacy.4, 0, None, None,
+        )
     };
-    let (stored_epoch, recovery_epoch, last_digest, pending_epoch, pending_digest, cursor_floor) =
-        row;
+    let (
+        stored_epoch,
+        recovery_epoch,
+        last_digest,
+        pending_epoch,
+        pending_digest,
+        cursor_floor,
+        finalize_log_id,
+        finalize_entry_json,
+    ) = row;
     validate_epoch(stored_epoch, identity)?;
     let recovery_epoch = checked_u64(recovery_epoch)?;
     let last_plan_digest = last_digest
@@ -17372,13 +20543,52 @@ pub(crate) fn read_operator_recovery_sync(
             "session consensus pending recovery state is invalid",
         ));
     }
-    Ok(OperatorRecoveryState {
+    let finalize_log_id = finalize_log_id
+        .map(|encoded| {
+            let decoded = decode_json(&encoded)?;
+            if encode_json(&decoded)? != encoded {
+                return Err(invalid_data(
+                    "session consensus recovery finalize LogId is not canonical",
+                ));
+            }
+            Ok(decoded)
+        })
+        .transpose()?;
+    if let Some(log_id) = finalize_log_id.as_ref() {
+        validate_log_id(log_id)?;
+    }
+    let v2_activated = if operator_recovery_v2_activation_column_exists(conn)? {
+        match conn
+            .query_row(
+                "SELECT recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(db_error)?
+        {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(invalid_data(
+                    "session consensus recovery V2 activation is invalid",
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    let state = OperatorRecoveryState {
         recovery_epoch,
         last_plan_digest,
         pending_epoch,
         pending_plan_digest,
         watch_cursor_invalidation_floor: checked_u64(cursor_floor)?,
-    })
+        finalize_log_id,
+        finalize_entry_json,
+        v2_activated,
+    };
+    validate_operator_recovery_v2_finalize_certificate_for_state_sync(conn, identity, &state)?;
+    Ok(state)
 }
 
 pub(crate) fn read_watch_cursor_invalidation_floor_sync(conn: &Connection) -> io::Result<u64> {
@@ -17404,6 +20614,715 @@ fn operator_recovery_cursor_column_exists(conn: &Connection) -> io::Result<bool>
         |row| row.get(0),
     )
     .map_err(db_error)
+}
+
+fn operator_recovery_finalize_log_column_exists(conn: &Connection) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'finalize_log_id_json')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+fn operator_recovery_finalize_certificate_column_exists(conn: &Connection) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'finalize_entry_json')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+fn operator_recovery_v2_activation_column_exists(conn: &Connection) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'recovery_v2_activated')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+/// The recovery table has two released physical constructions: a direct
+/// current table and the exact historical ALTER sequence.  Once it carries a
+/// V2 finalization certificate, accepting only column names would let a
+/// producer remove the singleton/pair/blob bounds while preserving a
+/// superficially decodable row. Build the two immutable products once and
+/// compare raw DDL before the row is ever projected through a temporary view.
+fn operator_recovery_certificate_schema_forms() -> io::Result<&'static BTreeSet<String>> {
+    if let Some(forms) = OPERATOR_RECOVERY_CERTIFICATE_SCHEMA_FORMS.get() {
+        return Ok(forms);
+    }
+
+    let mut forms = BTreeSet::new();
+
+    // The oldest writable predecessor has neither the cursor nor either
+    // finalization column. It is still a released migration source, but an
+    // intermediate L-only shape was never released and must not be repaired.
+    let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+    canonical
+        .execute_batch(PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    let sql: String = canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    forms.insert(normalize_schema_sql(&sql));
+
+    // Fresh current databases are created from the complete production
+    // schema.  Its recovery table intentionally has no DEFAULT on the watch
+    // floor, whereas the standalone migration schema below does.  Both are
+    // released, exact physical forms.
+    let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+    canonical
+        .execute_batch(CONSENSUS_SCHEMA)
+        .map_err(db_error)?;
+    let sql: String = canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    forms.insert(normalize_schema_sql(&sql));
+
+    let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+    canonical
+        .execute_batch(PRE_V2_ACTIVATION_CONSENSUS_OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    let sql: String = canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    forms.insert(normalize_schema_sql(&sql));
+
+    // A complete certificate in either exact pre-fence release is eligible
+    // only for the transactional marker backfill above.  Retaining these
+    // forms here lets the raw gate distinguish that migration from a forged
+    // same-column table before any certificate BLOB is projected.
+    for migrated in [false, true] {
+        let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+        if migrated {
+            canonical
+                .execute_batch(PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA)
+                .map_err(db_error)?;
+            canonical
+                .execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
+                .map_err(db_error)?;
+            canonical
+                .execute_batch(OPERATOR_RECOVERY_FINALIZE_LOG_MIGRATION)
+                .map_err(db_error)?;
+            canonical
+                .execute_batch(OPERATOR_RECOVERY_FINALIZE_CERTIFICATE_MIGRATION)
+                .map_err(db_error)?;
+        } else {
+            canonical
+                .execute_batch(PRE_V2_ACTIVATION_OPERATOR_RECOVERY_SCHEMA)
+                .map_err(db_error)?;
+        }
+        let sql: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        forms.insert(normalize_schema_sql(&sql));
+    }
+
+    // Applying the fence itself to each direct predecessor preserves that
+    // predecessor's original CREATE text and appends the ALTER text. These
+    // are the only two additional post-fence raw forms accepted on reopen.
+    for schema in [
+        PRE_V2_ACTIVATION_CONSENSUS_OPERATOR_RECOVERY_SCHEMA,
+        PRE_V2_ACTIVATION_OPERATOR_RECOVERY_SCHEMA,
+    ] {
+        let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+        canonical.execute_batch(schema).map_err(db_error)?;
+        canonical
+            .execute_batch(OPERATOR_RECOVERY_V2_ACTIVATION_MIGRATION)
+            .map_err(db_error)?;
+        let sql: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        forms.insert(normalize_schema_sql(&sql));
+    }
+
+    for migrated in [false, true] {
+        let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+        if migrated {
+            install_migrated_operator_recovery_validation_schema_sync(&canonical)?;
+        } else {
+            canonical
+                .execute_batch(OPERATOR_RECOVERY_SCHEMA)
+                .map_err(db_error)?;
+        }
+        let sql: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        forms.insert(normalize_schema_sql(&sql));
+    }
+    let _ = OPERATOR_RECOVERY_CERTIFICATE_SCHEMA_FORMS.set(forms);
+    OPERATOR_RECOVERY_CERTIFICATE_SCHEMA_FORMS
+        .get()
+        .ok_or_else(|| invalid_data("published session consensus schema is unavailable"))
+}
+
+fn operator_recovery_certificate_table_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    let master = if attached {
+        "consensus_incoming.sqlite_master"
+    } else {
+        "main.sqlite_master"
+    };
+    let observed = conn
+        .query_row(
+            &format!(
+                "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) \
+                 FROM {master} WHERE type = 'table' AND name = 'consensus_operator_recovery'"
+            ),
+            [CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((Some(observed), observed_length)) = observed else {
+        return Ok(false);
+    };
+    let observed = normalize_schema_sql(&observed);
+    let forms = operator_recovery_certificate_schema_forms()?;
+    Ok(observed_length <= CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES && forms.contains(&observed))
+}
+
+fn raw_operator_recovery_finalize_columns_exist(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<(bool, bool, bool)> {
+    let pragma = if attached {
+        "pragma_table_info('consensus_operator_recovery', 'consensus_incoming')"
+    } else {
+        "pragma_table_info('consensus_operator_recovery')"
+    };
+    let (finalize_log, certificate, activation): (bool, bool, bool) = conn
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {pragma} WHERE name = 'finalize_log_id_json'), \
+                 EXISTS(SELECT 1 FROM {pragma} WHERE name = 'finalize_entry_json'), \
+                 EXISTS(SELECT 1 FROM {pragma} WHERE name = 'recovery_v2_activated')"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db_error)?;
+    Ok((finalize_log, certificate, activation))
+}
+
+/// Validate the certificate pair through the raw source namespace.  This is
+/// deliberately narrower than the normal state validator: it proves the
+/// exact DDL/index and the bounded raw certificate/outcome binding before a
+/// direct reader or an attached snapshot can materialize attacker-controlled
+/// BLOBs. The normal validator still checks all recovery and machine floors.
+fn validate_raw_operator_recovery_v2_finalize_certificate_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    attached: bool,
+) -> io::Result<()> {
+    let (has_finalize_log, has_certificate, has_activation) =
+        raw_operator_recovery_finalize_columns_exist(conn, attached)?;
+    // The column classifier is intentionally never an authorization by
+    // itself.  In particular, empty predecessor rows and NULL complete rows
+    // still arrive from an attached attacker-controlled database before any
+    // target-table delete; require one released CREATE form before every
+    // early return below.
+    if !operator_recovery_certificate_table_schema_is_exact_in_sync(conn, attached)? {
+        return Err(invalid_data(
+            "session consensus recovery certificate schema is invalid",
+        ));
+    }
+    let source = if attached {
+        "consensus_incoming.consensus_operator_recovery"
+    } else {
+        "main.consensus_operator_recovery"
+    };
+    let activation = if has_activation {
+        conn.query_row(
+            &format!("SELECT recovery_v2_activated FROM {source} WHERE singleton = 1"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(db_error)?
+    } else {
+        None
+    };
+    if matches!(activation, Some(value) if value != 0 && value != 1) {
+        return Err(invalid_data(
+            "session consensus recovery V2 activation is invalid",
+        ));
+    }
+    match (has_finalize_log, has_certificate) {
+        (false, false) => {
+            if activation.is_some() {
+                return Err(invalid_data(
+                    "session consensus recovery V2 activation schema is invalid",
+                ));
+            }
+            return Ok(());
+        }
+        (false, true) => {
+            return Err(invalid_data(
+                "session consensus recovery certificate schema is invalid",
+            ));
+        }
+        (true, false) => {
+            // A source with the finalization identity but no certificate is
+            // not a released predecessor, even if every row is NULL and the
+            // one-way activation marker is absent.  Attached validation runs
+            // before any target delete, so accepting this partial migration
+            // would let a projection hide a raw schema splice.
+            return Err(invalid_data(
+                "session consensus recovery finalization certificate schema is incomplete",
+            ));
+        }
+        (true, true) => {}
+    }
+    let source = if attached {
+        "consensus_incoming.consensus_operator_recovery"
+    } else {
+        "main.consensus_operator_recovery"
+    };
+    // This scalar probe does not materialize any certificate bytes. A single
+    // non-NULL half is enough to require the strict current evidence path;
+    // the bounded row read below then enforces all-or-none exactly.
+    let has_certificate_pair: bool = conn
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {source} \
+                 WHERE finalize_log_id_json IS NOT NULL OR finalize_entry_json IS NOT NULL LIMIT 1)"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !has_certificate_pair {
+        if activation == Some(1) {
+            return Err(invalid_data(
+                "session consensus recovery V2 activation lacks a certificate",
+            ));
+        }
+        return Ok(());
+    }
+    if activation == Some(0) {
+        return Err(invalid_data(
+            "session consensus recovery certificate lacks V2 activation",
+        ));
+    }
+    if !operator_recovery_certificate_table_schema_is_exact_in_sync(conn, attached)? {
+        return Err(invalid_data(
+            "session consensus recovery certificate schema is invalid",
+        ));
+    }
+    validate_generic_request_outcome_point_index_sync(conn, attached)?;
+
+    let (stored_epoch, last_plan_digest, finalize_log_id, encoded_certificate):
+        OperatorRecoveryCertificateRow = conn
+        .query_row(
+            &format!(
+                "SELECT configuration_epoch, \
+                 CASE WHEN typeof(last_plan_digest) = 'blob' AND length(last_plan_digest) = 32 \
+                      THEN last_plan_digest ELSE NULL END, \
+                 CASE WHEN typeof(finalize_log_id_json) = 'blob' \
+                           AND length(finalize_log_id_json) BETWEEN 1 AND 1024 \
+                      THEN finalize_log_id_json ELSE NULL END, \
+                 CASE WHEN typeof(finalize_entry_json) = 'blob' \
+                           AND length(finalize_entry_json) BETWEEN 1 AND 16384 \
+                      THEN finalize_entry_json ELSE NULL END \
+                 FROM {source} WHERE singleton = 1"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| invalid_data("session consensus recovery certificate row is invalid"))?;
+    validate_epoch(stored_epoch, identity)?;
+    let last_plan_digest: [u8; 32] = last_plan_digest
+        .ok_or_else(|| {
+            invalid_data("session consensus recovery certificate plan digest is invalid")
+        })?
+        .try_into()
+        .map_err(|_| {
+            invalid_data("session consensus recovery certificate plan digest is invalid")
+        })?;
+    let finalize_log_id: LogId<SessionConsensusNodeId> =
+        decode_json(&finalize_log_id.ok_or_else(|| {
+            invalid_data("session consensus recovery finalization certificate is incomplete")
+        })?)?;
+    validate_log_id(&finalize_log_id)?;
+    let encoded_certificate = encoded_certificate.ok_or_else(|| {
+        invalid_data("session consensus recovery finalization certificate is incomplete")
+    })?;
+    let certificate: OperatorRecoveryV2FinalizeCertificateV1 = decode_json(&encoded_certificate)?;
+    if encode_json(&certificate)? != encoded_certificate
+        || certificate.certificate_revision != OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_REVISION
+        || certificate.certificate_domain != OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_DOMAIN
+        || certificate.entry.log_id != finalize_log_id
+    {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    }
+    let EntryPayload::Normal(command) = &certificate.entry.payload else {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    };
+    let SessionMutationIntent::FinalizeOperatorRecoveryV2(intent) = &command.intent else {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    };
+    let mut request = [0_u8; 16];
+    request.copy_from_slice(&last_plan_digest[..16]);
+    let expected_request_id = SessionConsensusRequestId::from_bytes(request);
+    if command.request_id != expected_request_id {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    }
+    let sequence = intent
+        .application_sequence_high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus recovery sequence is exhausted"))?;
+    let logical_time = intent
+        .predecessor_logical_time
+        .map_or(command.logical_time, |last| last.max(command.logical_time));
+    let digest = command
+        .calculate_applied_digest(
+            sequence,
+            SessionConsensusEntryDigest::from_bytes(intent.predecessor_last_digest),
+            logical_time,
+        )
+        .map_err(|_| invalid_data("session consensus recovery certificate digest failed"))?;
+    let expected_response = encode_json(&SessionConsensusResponse {
+        result: Ok(SessionMutationOutcome::Unit),
+        sequence,
+        digest: Some(digest),
+        logical_time: Some(logical_time),
+        raft_log_index: finalize_log_id.index,
+    })?;
+    let expected_response_length =
+        checked_i64(u64::try_from(expected_response.len()).map_err(|_| {
+            invalid_data("session consensus recovery terminal response is invalid")
+        })?)?;
+    let payload_digest = operator_recovery_v2_payload_digest_sync(identity, &command.intent)?;
+    let outcome_source = if attached {
+        "consensus_incoming.consensus_request_outcomes"
+    } else {
+        "main.consensus_request_outcomes"
+    };
+    let raw_outcome: Option<OperatorRecoveryOutcomeRow> = conn
+        .query_row(
+            &format!(
+                "SELECT configuration_epoch, \
+                 CASE WHEN typeof(payload_digest) = 'blob' AND length(payload_digest) = 32 \
+                      THEN payload_digest ELSE NULL END, \
+                 CASE WHEN typeof(response_json) = 'blob' AND length(response_json) = ?2 \
+                      THEN response_json ELSE NULL END \
+                 FROM {outcome_source} INDEXED BY sqlite_autoindex_consensus_request_outcomes_1 \
+                 WHERE request_id = ?1"
+            ),
+            params![
+                expected_request_id.as_bytes().as_slice(),
+                expected_response_length,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((outcome_epoch, Some(stored_digest), Some(stored_response))) = raw_outcome else {
+        return Err(invalid_data(
+            "session consensus recovery terminal outcome is missing",
+        ));
+    };
+    validate_epoch(outcome_epoch, identity)?;
+    let stored_digest: [u8; 32] = stored_digest.try_into().map_err(|_| {
+        invalid_data("session consensus recovery terminal outcome digest is invalid")
+    })?;
+    if stored_digest != payload_digest || stored_response != expected_response {
+        return Err(invalid_data(
+            "session consensus recovery terminal outcome differs",
+        ));
+    }
+    Ok(())
+}
+
+/// The certificate is deliberately an exact original V2 entry rather than a
+/// second ad-hoc response record.  Its canonical entry carries every
+/// predecessor field needed to recompute the deterministic effect after log
+/// compaction, while the wrapper closes the durable namespace against a
+/// future JSON shape being accepted as current recovery evidence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorRecoveryV2FinalizeCertificateV1 {
+    certificate_revision: u16,
+    certificate_domain: String,
+    entry: Entry<SessionRaftTypeConfig>,
+}
+
+/// Exact effect reconstructed from a verified durable V2 certificate.  This
+/// is intentionally narrower than a generic outcome reader: its response is
+/// the one canonical successful `Unit` effect that the certificate proves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperatorRecoveryV2FinalizeCertificateBinding {
+    pub(crate) finalize_log_id: LogId<SessionConsensusNodeId>,
+    pub(crate) request_id: SessionConsensusRequestId,
+    pub(crate) payload_digest: [u8; 32],
+    pub(crate) original_command_logical_time: Timestamp,
+    pub(crate) response: SessionConsensusResponse,
+}
+
+fn encode_operator_recovery_v2_finalize_certificate(
+    raft_log_id: &LogId<SessionConsensusNodeId>,
+    command: &SessionConsensusCommand,
+) -> io::Result<Vec<u8>> {
+    validate_log_id(raft_log_id)?;
+    let certificate = OperatorRecoveryV2FinalizeCertificateV1 {
+        certificate_revision: OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_REVISION,
+        certificate_domain: OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_DOMAIN.to_owned(),
+        entry: Entry {
+            log_id: *raft_log_id,
+            payload: EntryPayload::Normal(command.clone()),
+        },
+    };
+    let encoded = encode_json(&certificate)?;
+    if encoded.is_empty() || encoded.len() > OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_MAX_BYTES {
+        return Err(invalid_data(
+            "session consensus recovery finalize certificate exceeds its bound",
+        ));
+    }
+    Ok(encoded)
+}
+
+/// Verify the all-or-none V2 finalization certificate and its immutable
+/// generic-outcome binding.  This reads raw response bytes deliberately: the
+/// generic outcome decoder remains compatible for ordinary historical
+/// requests, but a recovery certificate must never bless an alternate JSON
+/// encoding or a semantically similar response.
+fn validate_operator_recovery_v2_finalize_certificate_for_state_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    recovery: &OperatorRecoveryState,
+) -> io::Result<Option<OperatorRecoveryV2FinalizeCertificateBinding>> {
+    let (finalize_log_id, encoded) = match (
+        recovery.finalize_log_id.as_ref(),
+        recovery.finalize_entry_json.as_ref(),
+    ) {
+        (None, None) if !recovery.v2_activated => return Ok(None),
+        (None, None) => {
+            return Err(invalid_data(
+                "session consensus recovery V2 activation lacks a certificate",
+            ));
+        }
+        (Some(log_id), Some(encoded)) => (log_id, encoded),
+        _ => {
+            return Err(invalid_data(
+                "session consensus recovery finalization certificate is incomplete",
+            ));
+        }
+    };
+    if !recovery.v2_activated {
+        return Err(invalid_data(
+            "session consensus recovery certificate lacks V2 activation",
+        ));
+    }
+    if recovery.recovery_epoch == 0
+        || encoded.is_empty()
+        || encoded.len() > OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_MAX_BYTES
+    {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    }
+    let certificate: OperatorRecoveryV2FinalizeCertificateV1 = decode_json(encoded)?;
+    if encode_json(&certificate)? != encoded.as_slice()
+        || certificate.certificate_revision != OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_REVISION
+        || certificate.certificate_domain != OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_DOMAIN
+        || certificate.entry.log_id != *finalize_log_id
+    {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    }
+    validate_log_id(&certificate.entry.log_id)?;
+    let EntryPayload::Normal(command) = &certificate.entry.payload else {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    };
+    // A certificate is an exact retained command, not merely a decoded
+    // recovery-shaped payload. Keep this shared admission check here too so
+    // a persisted certificate cannot bypass a later command-schema or
+    // semantic fence that a live log entry would have faced.
+    validate_command_for_log(command, identity)?;
+    let SessionMutationIntent::FinalizeOperatorRecoveryV2(intent) = &command.intent else {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    };
+    let mut request = [0_u8; 16];
+    request.copy_from_slice(&recovery.last_plan_digest[..16]);
+    let expected_request_id = SessionConsensusRequestId::from_bytes(request);
+    if command.schema_version != SESSION_CONSENSUS_SCHEMA_VERSION
+        || command.identity != identity
+        || command.request_id != expected_request_id
+        || intent.recovery_epoch != recovery.recovery_epoch
+        || intent.plan_digest != recovery.last_plan_digest
+        || intent.watch_cursor_invalidation_floor != recovery.watch_cursor_invalidation_floor
+    {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    }
+    if observed_fence_high_water_sync(conn)? < intent.fence_high_water
+        || observed_credential_high_water_sync(conn)? < intent.credential_high_water
+    {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate contradicts recovery floors",
+        ));
+    }
+    let payload_digest = operator_recovery_v2_payload_digest_sync(identity, &command.intent)?;
+    let sequence = intent
+        .application_sequence_high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus recovery sequence is exhausted"))?;
+    if sequence == 0 {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate is invalid",
+        ));
+    }
+    let logical_time = intent
+        .predecessor_logical_time
+        .map_or(command.logical_time, |last| last.max(command.logical_time));
+    let digest = command
+        .calculate_applied_digest(
+            sequence,
+            SessionConsensusEntryDigest::from_bytes(intent.predecessor_last_digest),
+            logical_time,
+        )
+        .map_err(|_| invalid_data("session consensus recovery certificate digest failed"))?;
+    let response = SessionConsensusResponse {
+        result: Ok(SessionMutationOutcome::Unit),
+        sequence,
+        digest: Some(digest),
+        logical_time: Some(logical_time),
+        raft_log_index: finalize_log_id.index,
+    };
+    let expected_response = encode_json(&response)?;
+    let expected_response_length =
+        checked_i64(u64::try_from(expected_response.len()).map_err(|_| {
+            invalid_data("session consensus recovery terminal response is invalid")
+        })?)?;
+    // `consensus_request_outcomes` predates a response length CHECK.  Do not
+    // materialize an arbitrary legacy BLOB just to discover that it differs
+    // from this certificate's bounded canonical response. The point query
+    // returns bytes only after SQLite has checked both the storage type and
+    // exact byte length; CASE keeps wrong-type and oversized values inside
+    // SQLite's scalar length/type path.
+    let raw_outcome: Option<OperatorRecoveryOutcomeRow> = conn
+        .query_row(
+            "SELECT configuration_epoch, \
+             CASE WHEN typeof(payload_digest) = 'blob' AND length(payload_digest) = 32 \
+                  THEN payload_digest ELSE NULL END, \
+             CASE WHEN typeof(response_json) = 'blob' AND length(response_json) = ?2 \
+                  THEN response_json ELSE NULL END \
+             FROM consensus_request_outcomes WHERE request_id = ?1",
+            params![
+                expected_request_id.as_bytes().as_slice(),
+                expected_response_length,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((outcome_epoch, Some(stored_digest), Some(stored_response))) = raw_outcome else {
+        return Err(invalid_data(
+            "session consensus recovery terminal outcome is missing",
+        ));
+    };
+    validate_epoch(outcome_epoch, identity)?;
+    let stored_digest: [u8; 32] = stored_digest.try_into().map_err(|_| {
+        invalid_data("session consensus recovery terminal outcome digest is invalid")
+    })?;
+    if stored_digest != payload_digest || stored_response != expected_response {
+        return Err(invalid_data(
+            "session consensus recovery terminal outcome differs",
+        ));
+    }
+    let applied = read_applied_sync(conn, identity)?.ok_or_else(|| {
+        invalid_data("session consensus recovery finalization certificate is not applied")
+    })?;
+    ensure_log_id_not_after(
+        finalize_log_id,
+        &applied,
+        "session consensus recovery finalization certificate is not applied",
+    )?;
+    let (machine_sequence, machine_digest, machine_logical_time, machine_watch_sequence) =
+        read_machine_sync(conn, identity)?;
+    if machine_sequence < sequence
+        || machine_watch_sequence < intent.watch_cursor_invalidation_floor
+        || machine_logical_time.is_none_or(|time| time < logical_time)
+        || (machine_sequence == sequence
+            && (machine_digest != digest
+                || machine_logical_time != Some(logical_time)
+                || machine_watch_sequence != intent.watch_cursor_invalidation_floor))
+    {
+        return Err(invalid_data(
+            "session consensus recovery finalization certificate contradicts machine state",
+        ));
+    }
+    Ok(Some(OperatorRecoveryV2FinalizeCertificateBinding {
+        finalize_log_id: *finalize_log_id,
+        request_id: expected_request_id,
+        payload_digest,
+        original_command_logical_time: command.logical_time,
+        response,
+    }))
+}
+
+/// Expose only fully reconstructed certificate evidence to offline recovery.
+/// `read_operator_recovery_sync` has already enforced the same invariant; the
+/// explicit helper makes proof capture and compact historical validation
+/// compare their HMAC evidence with the durable certificate rather than
+/// merely relying on an earlier read side effect.
+pub(crate) fn operator_recovery_v2_finalize_certificate_binding_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<Option<OperatorRecoveryV2FinalizeCertificateBinding>> {
+    let recovery = read_operator_recovery_sync(conn, identity)?;
+    validate_operator_recovery_v2_finalize_certificate_for_state_sync(conn, identity, &recovery)
 }
 
 pub(crate) fn mark_operator_recovery_pending_sync(
@@ -17464,6 +21383,12 @@ pub(crate) fn finalize_operator_recovery_sync(
 ) -> io::Result<OperatorRecoveryApply> {
     ensure_operator_recovery_schema_sync(conn, identity)?;
     let current = read_operator_recovery_sync(conn, identity)?;
+    // V1 has no durable certificate. Once V2 has been observed, permitting a
+    // later legacy finalizer would advance epochs while retaining stale V2
+    // evidence, so the compatibility path is permanently closed.
+    if current.v2_activated {
+        return Ok(OperatorRecoveryApply::Rejected);
+    }
     if let (Some(pending_epoch), Some(pending_digest)) =
         (current.pending_epoch, current.pending_plan_digest)
     {
@@ -17522,6 +21447,461 @@ pub(crate) fn finalize_operator_recovery_sync(
         ));
     }
     Ok(OperatorRecoveryApply::Applied)
+}
+
+/// Apply the versioned recovery finalization command inside the surrounding
+/// Raft apply transaction.  This intentionally does not use the generic
+/// mutation sequencer: every recovery voter first converges its two global
+/// clocks to the authenticated plan high-waters and only then allocates the
+/// common `H + 1` final application sequence.  It has no replication or
+/// maintenance side effect.
+fn apply_finalize_operator_recovery_v2_in_tx(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    command: &SessionConsensusCommand,
+    raft_log_id: &LogId<SessionConsensusNodeId>,
+    machine: &mut (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+) -> io::Result<SessionConsensusResponse> {
+    let SessionMutationIntent::FinalizeOperatorRecoveryV2(payload) = &command.intent else {
+        return Err(invalid_data(
+            "session consensus recovery V2 command is missing",
+        ));
+    };
+    let FinalizeOperatorRecoveryV2Intent {
+        recovery_epoch,
+        plan_digest,
+        fence_high_water,
+        credential_high_water,
+        application_sequence_high_water,
+        watch_cursor_invalidation_floor,
+        predecessor_recovery_epoch,
+        predecessor_plan_digest,
+        predecessor_watch_cursor_invalidation_floor,
+        predecessor_baseline_log_id,
+        predecessor_application_sequence,
+        predecessor_last_digest,
+        predecessor_logical_time,
+        predecessor_watch_sequence,
+        predecessor_authority_commitment,
+        predecessor_recovery_v2_invariant_state_digest,
+        predecessor_bootstrap_membership_digest,
+    } = payload.as_ref();
+    let payload_digest = payload_digest(identity, command)?;
+    let rejected = || SessionConsensusResponse {
+        result: Err(StoreError::InvalidKey(
+            "operator_recovery_epoch_rejected".into(),
+        )),
+        sequence: machine.0,
+        digest: Some(machine.1),
+        logical_time: machine.2,
+        raft_log_index: raft_log_id.index,
+    };
+    let mut expected_request = [0_u8; 16];
+    expected_request.copy_from_slice(&plan_digest[..16]);
+    if command.request_id != SessionConsensusRequestId::from_bytes(expected_request) {
+        return Ok(rejected());
+    }
+    let current = read_operator_recovery_sync(tx, identity)?;
+
+    if current.recovery_epoch == *recovery_epoch && current.last_plan_digest == *plan_digest {
+        let Some((stored_digest, response)) = read_outcome_sync(tx, identity, command.request_id)?
+        else {
+            return Err(invalid_data(
+                "session consensus recovery terminal outcome is missing",
+            ));
+        };
+        if stored_digest != payload_digest {
+            return Err(invalid_data(
+                "session consensus recovery terminal outcome payload differs",
+            ));
+        }
+        return Ok(response);
+    }
+    let recovery_predecessor_matches = current.recovery_epoch == *predecessor_recovery_epoch
+        && current.last_plan_digest == *predecessor_plan_digest;
+    let target_pending = current.pending_epoch == Some(*recovery_epoch)
+        && current.pending_plan_digest == Some(*plan_digest);
+    let untouched_predecessor = current.pending_epoch.is_none()
+        && current.pending_plan_digest.is_none()
+        && recovery_predecessor_matches
+        && current.watch_cursor_invalidation_floor == *predecessor_watch_cursor_invalidation_floor;
+    let authority_matches = operator_recovery_v2_authority_commitment_sync(
+        tx,
+        identity,
+        &read_membership_scope_sync(tx, identity)
+            .map_err(|_| invalid_data("session recovery V2 membership scope is invalid"))?
+            .current_members,
+    )
+    .is_ok_and(|commitment| commitment == *predecessor_authority_commitment);
+    // This is intentionally evaluated before every recovery mutation.  The
+    // projection is shared verbatim with descriptor-backed inspection and is
+    // bounded by fixed protocol capacities at apply, so no voter can inherit
+    // a post-proof session or immutable-lease change.
+    let invariant_state_matches = crate::recovery::recovery_v2_invariant_state_digest_for_apply(tx)
+        .is_ok_and(|digest| digest == *predecessor_recovery_v2_invariant_state_digest);
+    // A retained Membership predecessor is physical authority regardless of
+    // whether it originated in the legacy bootstrap path.  Its digest is
+    // therefore mandatory for every V2 command. `None` is allowed only for
+    // an exact retained non-Membership row or a baseline covered by the
+    // exact selected snapshot/purge pointer; neither case can silently turn
+    // a retained Membership into an uncommitted predecessor kind.
+    let bootstrap_membership_matches =
+        match operator_recovery_v2_predecessor_kind_sync(tx, identity, predecessor_baseline_log_id)
+        {
+            Ok(OperatorRecoveryV2PredecessorKind::RetainedMembership(actual)) => {
+                *predecessor_bootstrap_membership_digest == Some(actual)
+            }
+            Ok(OperatorRecoveryV2PredecessorKind::RetainedNonMembership) => {
+                predecessor_bootstrap_membership_digest.is_none()
+            }
+            Ok(OperatorRecoveryV2PredecessorKind::NotRetained) => {
+                predecessor_bootstrap_membership_digest.is_none()
+                    && operator_recovery_v2_compacted_predecessor_coverage_sync(
+                        tx,
+                        identity,
+                        predecessor_baseline_log_id,
+                    )
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
+        };
+    let machine_matches = if target_pending {
+        recovery_predecessor_matches
+            && current.watch_cursor_invalidation_floor == *watch_cursor_invalidation_floor
+            && machine.0 == *application_sequence_high_water
+            && *machine.1.as_bytes() == *predecessor_last_digest
+            && machine.2 == *predecessor_logical_time
+            && machine.3 == *watch_cursor_invalidation_floor
+    } else {
+        untouched_predecessor
+            && machine.0 == *predecessor_application_sequence
+            && *machine.1.as_bytes() == *predecessor_last_digest
+            && machine.2 == *predecessor_logical_time
+            && machine.3 == *predecessor_watch_sequence
+    };
+    if *recovery_epoch == 0
+        || *recovery_epoch <= current.recovery_epoch
+        || !(target_pending || untouched_predecessor)
+        || !machine_matches
+        || !authority_matches
+        || !invariant_state_matches
+        || !bootstrap_membership_matches
+        || !operator_recovery_v2_blank_predecessor_suffix_sync(
+            tx,
+            identity,
+            predecessor_baseline_log_id,
+            raft_log_id,
+        )?
+    {
+        return Ok(rejected());
+    }
+    let observed_fence = observed_fence_high_water_sync(tx)?;
+    let observed_credential = observed_credential_high_water_sync(tx)?;
+    if observed_fence > *fence_high_water || observed_credential > *credential_high_water {
+        return Ok(rejected());
+    }
+
+    let sequence = application_sequence_high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus recovery sequence is exhausted"))?;
+    let next_fence = fence_high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus recovery fence is exhausted"))?;
+    let next_credential = credential_high_water
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus recovery credential is exhausted"))?;
+    let logical_time = machine
+        .2
+        .map_or(command.logical_time, |last| last.max(command.logical_time));
+    let command_digest = command
+        .calculate_applied_digest(sequence, machine.1, logical_time)
+        .map_err(|_| invalid_data("session consensus recovery digest failed"))?;
+    let response = SessionConsensusResponse {
+        result: Ok(SessionMutationOutcome::Unit),
+        sequence,
+        digest: Some(command_digest),
+        logical_time: Some(logical_time),
+        raft_log_index: raft_log_id.index,
+    };
+    let finalize_certificate =
+        encode_operator_recovery_v2_finalize_certificate(raft_log_id, command)?;
+
+    tx.execute("UPDATE leases SET active = 0", [])
+        .map_err(db_error)?;
+    // Raising the cursor floor without removing the old journal leaves a
+    // durable self-contradiction: recovery inspection correctly requires the
+    // first retained replication row to start above that floor.  Targets
+    // already reset this journal during prepare; untouched voters must do it
+    // in this same finalization transaction before publishing the new floor.
+    tx.execute("DELETE FROM session_replication_log", [])
+        .map_err(db_error)?;
+    tx.execute(
+        "UPDATE lease_globals SET val = ?1 WHERE key = 'next_fence'",
+        [checked_positive_i64(next_fence)?],
+    )
+    .map_err(db_error)?;
+    tx.execute(
+        "UPDATE lease_globals SET val = ?1 WHERE key = 'next_credential_id'",
+        [checked_positive_i64(next_credential)?],
+    )
+    .map_err(db_error)?;
+    let changed = tx
+        .execute(
+            "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3, watch_sequence = ?4 WHERE singleton = 1 AND configuration_epoch = ?5",
+            params![
+                checked_positive_i64(sequence)?,
+                command_digest.as_bytes().as_slice(),
+                ops::format_rfc3339_normalized(logical_time),
+                checked_i64(*watch_cursor_invalidation_floor)?,
+                epoch_i64(identity)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "session consensus recovery machine state is missing",
+        ));
+    }
+    let changed = tx
+        .execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = ?1, last_plan_digest = ?2, pending_epoch = NULL, pending_plan_digest = NULL, watch_cursor_invalidation_floor = ?3, finalize_log_id_json = ?4, finalize_entry_json = ?5, recovery_v2_activated = 1 WHERE singleton = 1 AND configuration_epoch = ?6",
+            params![
+                checked_positive_i64(*recovery_epoch)?,
+                plan_digest.as_slice(),
+                checked_i64(*watch_cursor_invalidation_floor)?,
+                encode_json(raft_log_id)?,
+                finalize_certificate,
+                epoch_i64(identity)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "session consensus recovery state was not updated",
+        ));
+    }
+    tx.execute(
+        "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            command.request_id.as_bytes().as_slice(),
+            epoch_i64(identity)?,
+            payload_digest.as_slice(),
+            encode_json(&response)?,
+        ],
+    )
+    .map_err(db_error)?;
+    machine.0 = sequence;
+    machine.1 = command_digest;
+    machine.2 = Some(logical_time);
+    machine.3 = *watch_cursor_invalidation_floor;
+    Ok(response)
+}
+
+/// Physical kind of the exact carried V2 predecessor when it is still
+/// retained.  A current-format predecessor can be a Membership entry too;
+/// callers must not use `None` to erase that fact merely because it was not
+/// created by the legacy bootstrap path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperatorRecoveryV2PredecessorKind {
+    RetainedMembership([u8; 32]),
+    RetainedNonMembership,
+    NotRetained,
+}
+
+/// Read and classify the exact retained predecessor log row.  It validates
+/// the full LogId before exposing the row kind, so an equal-index different
+/// term/node substitute cannot select a `None` commitment.
+pub(crate) fn operator_recovery_v2_predecessor_kind_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    baseline: &LogId<SessionConsensusNodeId>,
+) -> io::Result<OperatorRecoveryV2PredecessorKind> {
+    let (baseline_term, baseline_index) = validate_log_id(baseline)?;
+    // Do not route this one-row physical predecessor proof through the
+    // membership projection.  The capsule's purpose is to detect even a
+    // canonical-but-different Membership payload before that payload can be
+    // accepted as the predecessor; later V2 validation separately proves
+    // the admitted membership scope and authority.  This bounded exact-row
+    // read still validates the durable identity, row coordinates, canonical
+    // entry bytes, and carried full LogId.
+    let row = conn
+        .query_row(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE configuration_epoch = ?1 AND log_index = ?2",
+            params![epoch_i64(identity)?, baseline_index],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((stored_epoch, stored_term, stored_index, encoded)) = row else {
+        return Ok(OperatorRecoveryV2PredecessorKind::NotRetained);
+    };
+    validate_epoch(stored_epoch, identity)?;
+    let entry = decode_consensus_log_entry(&encoded)?;
+    validate_log_id(&entry.log_id)?;
+    if stored_term != baseline_term || stored_index != baseline_index || entry.log_id != *baseline {
+        return Err(invalid_data(
+            "session recovery V2 legacy bootstrap Membership LogId differs",
+        ));
+    }
+    let EntryPayload::Membership(payload) = &entry.payload else {
+        return Ok(OperatorRecoveryV2PredecessorKind::RetainedNonMembership);
+    };
+    let encoded = serde_json::to_vec(&(entry.log_id, payload))
+        .map_err(|_| invalid_data("session recovery V2 legacy Membership encoding failed"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(OPERATOR_RECOVERY_V2_LEGACY_BOOTSTRAP_MEMBERSHIP_DOMAIN);
+    hasher.update(encoded);
+    Ok(OperatorRecoveryV2PredecessorKind::RetainedMembership(
+        hasher.finalize().into(),
+    ))
+}
+
+/// Return the canonical digest of the one retained Membership predecessor.
+/// This compatibility-named helper remains used by legacy capsule proof;
+/// callers which admit a `None` commitment must use the full kind classifier
+/// above so a retained Membership cannot bypass its digest.
+pub(crate) fn operator_recovery_v2_bootstrap_membership_digest_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    baseline: &LogId<SessionConsensusNodeId>,
+) -> io::Result<[u8; 32]> {
+    match operator_recovery_v2_predecessor_kind_sync(conn, identity, baseline)? {
+        OperatorRecoveryV2PredecessorKind::RetainedMembership(digest) => Ok(digest),
+        OperatorRecoveryV2PredecessorKind::RetainedNonMembership => Err(invalid_data(
+            "session recovery V2 predecessor is not a legacy bootstrap Membership row",
+        )),
+        OperatorRecoveryV2PredecessorKind::NotRetained => Err(invalid_data(
+            "session recovery V2 legacy bootstrap Membership row is missing",
+        )),
+    }
+}
+
+fn operator_recovery_v2_compacted_predecessor_coverage_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    baseline: &LogId<SessionConsensusNodeId>,
+) -> io::Result<bool> {
+    let purged = read_purged_sync(conn, identity)?;
+    let snapshot = read_current_snapshot_sync(conn, identity)?;
+    let snapshot_log = snapshot
+        .as_ref()
+        .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref());
+    Ok(purged.as_ref() == Some(baseline) || snapshot_log == Some(baseline))
+}
+
+/// Re-prove the exact Raft predecessor carried by an operator-recovery V2
+/// command before its state-machine effect is admitted.  A numeric index is
+/// not a lineage fence: the baseline must be represented by an exact durable
+/// pointer, selected snapshot, or retained entry, and every physically
+/// retained entry from that point up to the V2 command must be a contiguous
+/// inert blank.  This is the non-targeted counterpart to prepare's exact
+/// copied-state proof; it prevents an otherwise valid queued normal or
+/// membership entry from being absorbed below the global recovery ceilings.
+fn operator_recovery_v2_blank_predecessor_suffix_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    baseline: &LogId<SessionConsensusNodeId>,
+    recovery_log_id: &LogId<SessionConsensusNodeId>,
+) -> io::Result<bool> {
+    validate_log_id(baseline)?;
+    validate_log_id(recovery_log_id)?;
+    if baseline.index >= recovery_log_id.index {
+        return Ok(false);
+    }
+    let Some(applied) = read_applied_sync(conn, identity)? else {
+        return Ok(false);
+    };
+    if ensure_log_id_not_after(
+        baseline,
+        &applied,
+        "session recovery V2 predecessor is beyond applied state",
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+
+    let purged = read_purged_sync(conn, identity)?;
+    // Once a later floor has replaced the baseline, the missing entries
+    // cannot be demonstrated to be blanks.  The exact floor itself is a
+    // valid baseline, as is an exact selected snapshot at that same LogId.
+    if purged
+        .as_ref()
+        .is_some_and(|floor| floor.index > baseline.index)
+    {
+        return Ok(false);
+    }
+    let snapshot = read_current_snapshot_sync(conn, identity)?;
+    let snapshot_covers = snapshot
+        .as_ref()
+        .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref())
+        == Some(baseline);
+    let purged_covers = purged.as_ref() == Some(baseline);
+    let retained_covers = if purged_covers {
+        false
+    } else {
+        let end = baseline
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session recovery V2 predecessor index is exhausted"))?;
+        let retained =
+            read_log_range_for_recovery_sync(conn, identity, baseline.index, Some(end), Some(1))?;
+        retained.len() == 1 && retained[0].log_id == *baseline
+    };
+    if !(snapshot_covers || purged_covers || retained_covers) {
+        return Ok(false);
+    }
+
+    let start = baseline
+        .index
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session recovery V2 predecessor index is exhausted"))?;
+    let count = recovery_log_id
+        .index
+        .checked_sub(start)
+        .ok_or_else(|| invalid_data("session recovery V2 predecessor range underflow"))?;
+    let limit = usize::try_from(count)
+        .map_err(|_| invalid_data("session recovery V2 predecessor range exceeds platform"))?;
+    if limit > OPERATOR_RECOVERY_V2_MAX_BLANK_PREDECESSOR_ENTRIES {
+        // A V2 predecessor must be recoverably bounded.  Use the existing
+        // recovery-row ceiling as a conservative row bound rather than
+        // scanning an adversarially large suffix during a single apply.
+        return Ok(false);
+    }
+    let entries = read_log_range_for_recovery_sync(
+        conn,
+        identity,
+        start,
+        Some(recovery_log_id.index),
+        Some(limit),
+    )?;
+    if entries.len() != limit {
+        return Ok(false);
+    }
+    let mut expected_index = start;
+    let mut previous = *baseline;
+    for entry in entries {
+        if entry.log_id.index != expected_index
+            || entry.log_id.leader_id.term < previous.leader_id.term
+            || (entry.log_id.leader_id.term == previous.leader_id.term
+                && entry.log_id.leader_id != previous.leader_id)
+            || !matches!(entry.payload, EntryPayload::Blank)
+        {
+            return Ok(false);
+        }
+        expected_index = expected_index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session recovery V2 predecessor index is exhausted"))?;
+        previous = entry.log_id;
+    }
+    Ok(true)
 }
 
 pub(crate) fn observed_fence_high_water_sync(conn: &Connection) -> io::Result<u64> {
@@ -17740,6 +22120,322 @@ fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
     serde_json::from_slice(bytes).map_err(|_| invalid_data("session consensus decoding failed"))
 }
 
+fn is_fenced_transition_v2_json_discriminant(key: &str) -> bool {
+    matches!(
+        key,
+        "FencedTransitionV2"
+            | "ActivateFencedTransitionV2"
+            | "MaintainFencedTransitionV2History"
+            | "FencedTransitionV2Batch"
+            | "FinalizeOperatorRecoveryV2"
+    )
+}
+
+fn log_json_may_contain_fenced_transition_v2_discriminant(bytes: &[u8]) -> bool {
+    const FENCED_V2_DISCRIMINANT_STEM: &[u8] = b"FencedTransitionV2";
+    const RECOVERY_V2_DISCRIMINANT_STEM: &[u8] = b"FinalizeOperatorRecoveryV2";
+    bytes.contains(&b'\\')
+        || [FENCED_V2_DISCRIMINANT_STEM, RECOVERY_V2_DISCRIMINANT_STEM]
+            .into_iter()
+            .any(|stem| bytes.windows(stem.len()).any(|window| window == stem))
+}
+
+/// Allocation-light scan for a V2 discriminant anywhere in one syntactically
+/// valid JSON value. This deliberately examines ignored outer fields too: a
+/// future/hostile field cannot hide V2 material and select the permissive
+/// legacy decoder path. The actual typed entry remains the authority for
+/// classifying ordinary canonical input.
+struct FencedTransitionV2JsonScan(bool);
+
+impl<'de> serde::Deserialize<'de> for FencedTransitionV2JsonScan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(FencedTransitionV2JsonScanVisitor)
+    }
+}
+
+struct FencedTransitionV2JsonScanVisitor;
+
+impl<'de> serde::de::Visitor<'de> for FencedTransitionV2JsonScanVisitor {
+    type Value = FencedTransitionV2JsonScan;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("one session consensus log JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(FencedTransitionV2JsonScan(false))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut contains_v2 = false;
+        while let Some(value) = sequence.next_element::<FencedTransitionV2JsonScan>()? {
+            contains_v2 |= value.0;
+        }
+        Ok(FencedTransitionV2JsonScan(contains_v2))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut contains_v2 = false;
+        while let Some(key) = map.next_key::<String>()? {
+            contains_v2 |= is_fenced_transition_v2_json_discriminant(&key);
+            contains_v2 |= map.next_value::<FencedTransitionV2JsonScan>()?.0;
+        }
+        Ok(FencedTransitionV2JsonScan(contains_v2))
+    }
+}
+
+/// Duplicate-aware parsed JSON used only to audit V2's exact durable schema.
+/// Structural validation rejects unknown or duplicate keys and a second JSON
+/// value. Durable acceptance additionally requires the original bytes to equal
+/// canonical encoding, so object order, escaping, and whitespace are part of
+/// the persisted byte contract.
+struct ExactFencedTransitionV2Json {
+    value: serde_json::Value,
+    has_duplicate_key: bool,
+    contains_v2_discriminant: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for ExactFencedTransitionV2Json {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ExactFencedTransitionV2JsonVisitor)
+    }
+}
+
+struct ExactFencedTransitionV2JsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
+    type Value = ExactFencedTransitionV2Json;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("one exact session consensus V2 log JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Bool(value),
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Number(value.into()),
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Number(value.into()),
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let value = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("invalid session consensus JSON number"))?;
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Number(value),
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::String(value.to_owned()),
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::String(value),
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Null,
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Null,
+            has_duplicate_key: false,
+            contains_v2_discriminant: false,
+        })
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        let mut has_duplicate_key = false;
+        let mut contains_v2_discriminant = false;
+        while let Some(value) = sequence.next_element::<ExactFencedTransitionV2Json>()? {
+            has_duplicate_key |= value.has_duplicate_key;
+            contains_v2_discriminant |= value.contains_v2_discriminant;
+            values.push(value.value);
+        }
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Array(values),
+            has_duplicate_key,
+            contains_v2_discriminant,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::with_capacity(map.size_hint().unwrap_or(0));
+        let mut has_duplicate_key = false;
+        let mut contains_v2_discriminant = false;
+        while let Some(key) = map.next_key::<String>()? {
+            contains_v2_discriminant |= is_fenced_transition_v2_json_discriminant(&key);
+            let value = map.next_value::<ExactFencedTransitionV2Json>()?;
+            has_duplicate_key |= value.has_duplicate_key;
+            contains_v2_discriminant |= value.contains_v2_discriminant;
+            has_duplicate_key |= values.insert(key, value.value).is_some();
+        }
+        Ok(ExactFencedTransitionV2Json {
+            value: serde_json::Value::Object(values),
+            has_duplicate_key,
+            contains_v2_discriminant,
+        })
+    }
+}
+
+fn mutation_intent_contains_fenced_transition_v2(intent: &SessionMutationIntent) -> bool {
+    matches!(
+        intent,
+        SessionMutationIntent::FencedTransitionV2(_)
+            | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
+            | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+            | SessionMutationIntent::FencedTransitionV2Batch(_)
+            | SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
+    ) || matches!(intent, SessionMutationIntent::Authorized { mutation, .. }
+        if mutation_intent_contains_fenced_transition_v2(mutation))
+}
+
+fn log_entry_contains_fenced_transition_v2(entry: &Entry<SessionRaftTypeConfig>) -> bool {
+    matches!(&entry.payload, EntryPayload::Normal(command)
+        if mutation_intent_contains_fenced_transition_v2(&command.intent))
+}
+
+fn scan_log_json_for_fenced_transition_v2(bytes: &[u8]) -> io::Result<bool> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let scan = <FencedTransitionV2JsonScan as serde::Deserialize>::deserialize(&mut deserializer)
+        .map_err(|_| invalid_data("session consensus log entry decoding failed"))?;
+    deserializer
+        .end()
+        .map_err(|_| invalid_data("session consensus log entry decoding failed"))?;
+    Ok(scan.0)
+}
+
+fn validate_exact_fenced_transition_v2_log_json(
+    bytes: &[u8],
+    entry: &Entry<SessionRaftTypeConfig>,
+) -> io::Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let audited =
+        <ExactFencedTransitionV2Json as serde::Deserialize>::deserialize(&mut deserializer)
+            .map_err(|_| invalid_data("session consensus V2 log entry schema is invalid"))?;
+    deserializer
+        .end()
+        .map_err(|_| invalid_data("session consensus V2 log entry schema is invalid"))?;
+    let canonical = encode_json(entry)
+        .map_err(|_| invalid_data("session consensus V2 log entry encoding failed"))?;
+    // The duplicate-aware visitor deliberately materializes the whole JSON
+    // value while it rejects nested duplicate keys; canonical *bytes*, not
+    // that normalized value, are the durable V2 equality relation.
+    let _ = &audited.value;
+    if audited.has_duplicate_key
+        || !audited.contains_v2_discriminant
+        || bytes != canonical.as_slice()
+    {
+        return Err(invalid_data(
+            "session consensus V2 log entry schema is invalid",
+        ));
+    }
+    Ok(())
+}
+
+/// Decode one persisted Openraft entry under the durable-log profile.
+///
+/// Canonical legacy V1 entries retain their historical serde compatibility.
+/// V2 singleton, activation, maintenance, batch, and authorized forms use an
+/// exact structural schema, including when a V2 discriminant appears only in
+/// data an ordinary derived decoder would ignore.
+fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeConfig>> {
+    if bytes.is_empty() || bytes.len() > SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+        return Err(invalid_data("session consensus log entry size is invalid"));
+    }
+    let entry: Entry<SessionRaftTypeConfig> = decode_json(bytes)?;
+    let typed_v2 = log_entry_contains_fenced_transition_v2(&entry);
+    let raw_v2 = !typed_v2
+        && log_json_may_contain_fenced_transition_v2_discriminant(bytes)
+        && scan_log_json_for_fenced_transition_v2(bytes)?;
+    if typed_v2 || raw_v2 {
+        validate_exact_fenced_transition_v2_log_json(bytes, &entry)?;
+    }
+    Ok(entry)
+}
+
 fn epoch_i64(identity: SessionConsensusIdentity) -> io::Result<i64> {
     checked_positive_i64(identity.configuration_epoch().get())
 }
@@ -17811,22 +22507,71 @@ pub(crate) fn validate_command_for_log(
     if command.identity != identity {
         return Err(invalid_data("session consensus command identity mismatch"));
     }
-    if let SessionMutationIntent::FinalizeOperatorRecovery {
-        recovery_epoch,
-        plan_digest,
-        fence_high_water,
-        credential_high_water,
-    } = &command.intent
-    {
-        if *recovery_epoch == 0
-            || plan_digest.iter().all(|byte| *byte == 0)
-            || *fence_high_water == u64::MAX
-            || *credential_high_water == u64::MAX
-        {
-            return Err(invalid_data(
-                "session consensus operator recovery command is invalid",
-            ));
+    match &command.intent {
+        SessionMutationIntent::FinalizeOperatorRecovery {
+            recovery_epoch,
+            plan_digest,
+            fence_high_water,
+            credential_high_water,
+        } => {
+            if *recovery_epoch == 0
+                || plan_digest.iter().all(|byte| *byte == 0)
+                || *fence_high_water == u64::MAX
+                || *credential_high_water == u64::MAX
+            {
+                return Err(invalid_data(
+                    "session consensus operator recovery command is invalid",
+                ));
+            }
         }
+        SessionMutationIntent::FinalizeOperatorRecoveryV2(payload) => {
+            let FinalizeOperatorRecoveryV2Intent {
+                recovery_epoch,
+                plan_digest,
+                fence_high_water,
+                credential_high_water,
+                application_sequence_high_water,
+                watch_cursor_invalidation_floor,
+                predecessor_recovery_epoch,
+                predecessor_plan_digest,
+                predecessor_watch_cursor_invalidation_floor,
+                predecessor_baseline_log_id,
+                predecessor_application_sequence,
+                predecessor_last_digest,
+                predecessor_logical_time: _,
+                predecessor_watch_sequence,
+                predecessor_authority_commitment,
+                predecessor_recovery_v2_invariant_state_digest,
+                predecessor_bootstrap_membership_digest,
+            } = payload.as_ref();
+            if *recovery_epoch == 0
+                || plan_digest.iter().all(|byte| *byte == 0)
+                || *fence_high_water == u64::MAX
+                || *credential_high_water == u64::MAX
+                || *application_sequence_high_water == u64::MAX
+                || *watch_cursor_invalidation_floor == u64::MAX
+                || *predecessor_watch_cursor_invalidation_floor == u64::MAX
+                || *predecessor_application_sequence == u64::MAX
+                || *predecessor_watch_sequence == u64::MAX
+                || (*predecessor_recovery_epoch > 0
+                    && predecessor_plan_digest.iter().all(|byte| *byte == 0))
+            {
+                return Err(invalid_data(
+                    "session consensus operator recovery V2 command is invalid",
+                ));
+            }
+            validate_log_id(predecessor_baseline_log_id)?;
+            // Both digests may legitimately be all-zero in a genesis
+            // machine state; the apply path recomputes the authority
+            // commitment and compares the machine digest exactly.
+            let _ = (
+                predecessor_last_digest,
+                predecessor_authority_commitment,
+                predecessor_recovery_v2_invariant_state_digest,
+                predecessor_bootstrap_membership_digest,
+            );
+        }
+        _ => {}
     }
     let semantic_intent = match &command.intent {
         SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
@@ -18402,6 +23147,20 @@ impl MembershipLogProjection {
         command: &SessionConsensusCommand,
         storage_identity: SessionConsensusIdentity,
     ) -> io::Result<()> {
+        self.project_fenced_transition_v2_with_durable_probe(conn, command, storage_identity, None)
+    }
+
+    /// Project one V2 item, optionally reusing the exact durable-ledger probe
+    /// already performed by its enclosing physical batch.  A standalone
+    /// command always supplies `None` and retains the full fail-closed schema
+    /// and receipt validation below.
+    fn project_fenced_transition_v2_with_durable_probe(
+        &mut self,
+        conn: &Connection,
+        command: &SessionConsensusCommand,
+        storage_identity: SessionConsensusIdentity,
+        durable_probe: Option<(FencedTransitionV2LedgerLayout, bool)>,
+    ) -> io::Result<()> {
         let request = fenced_transition_v2_request(&command.intent)
             .ok_or_else(|| invalid_data("projected fenced transition V2 request is missing"))?;
         // Do not advance the projection's logical clock for a command whose
@@ -18513,12 +23272,23 @@ impl MembershipLogProjection {
         // follower append admission runs.  Do not query its receipt table
         // until a prior committed entry has published the V3 layout; doing so
         // would reject the very activation/bind entry that creates it.
-        let durable_receipt_exists = if fenced_transition_v2_ledger_layout_sync(conn)?
-            == FencedTransitionV2LedgerLayout::Activated
-        {
-            read_fenced_transition_v2_receipt_sync(conn, storage_identity, request)?.is_some()
-        } else {
-            false
+        let durable_receipt_exists = match durable_probe {
+            Some((FencedTransitionV2LedgerLayout::Absent, true)) => {
+                return Err(invalid_data(
+                    "projected fenced transition V2 durable receipt probe is invalid",
+                ));
+            }
+            Some((_, exists)) => exists,
+            None => {
+                if fenced_transition_v2_ledger_layout_sync(conn)?
+                    == FencedTransitionV2LedgerLayout::Activated
+                {
+                    read_fenced_transition_v2_receipt_sync(conn, storage_identity, request)?
+                        .is_some()
+                } else {
+                    false
+                }
+            }
         };
         if self.projected_v2_bound_requests.contains(&full_id) || durable_receipt_exists {
             self.advance_projected_logical_time(command.logical_time);
@@ -18623,17 +23393,39 @@ impl MembershipLogProjection {
             .ok_or_else(|| invalid_data("projected fenced transition V2 count is invalid"))?;
         let before_sequence = self.projected_application_sequence;
         let mut admitted_fresh = 0usize;
+        // A physical batch has one immutable SQLite schema for the duration
+        // of admission.  Audit it at most once, lazily at the same precedence
+        // point where a standalone item would first need durable state.
+        let mut durable_layout = None;
         for request in requests {
-            let is_fresh = matches!(request.validate(), Ok(()))
-                && history.active_epoch == Some(request.request_id().epoch())
-                && request.request_id().epoch().get() > history.retired_through
-                && !self
-                    .projected_v2_bound_requests
-                    .contains(&request.request_id().to_bytes())
-                && (fenced_transition_v2_ledger_layout_sync(conn)?
-                    == FencedTransitionV2LedgerLayout::Activated
+            let already_projected = self
+                .projected_v2_bound_requests
+                .contains(&request.request_id().to_bytes());
+            let epoch = request.request_id().epoch();
+            let may_need_durable_probe =
+                matches!(request.validate(), Ok(())) && epoch.get() > history.retired_through;
+            let durable_probe = if may_need_durable_probe {
+                let layout = match durable_layout {
+                    Some(layout) => layout,
+                    None => {
+                        let layout = fenced_transition_v2_ledger_layout_sync(conn)?;
+                        durable_layout = Some(layout);
+                        layout
+                    }
+                };
+                let exists = layout == FencedTransitionV2LedgerLayout::Activated
                     && read_fenced_transition_v2_receipt_sync(conn, storage_identity, request)?
-                        .is_none());
+                        .is_some();
+                Some((layout, exists))
+            } else {
+                None
+            };
+            let is_fresh = !already_projected
+                && history.active_epoch == Some(epoch)
+                && matches!(
+                    durable_probe,
+                    Some((FencedTransitionV2LedgerLayout::Activated, false))
+                );
             if is_fresh {
                 if admitted_fresh >= available {
                     continue;
@@ -18650,8 +23442,19 @@ impl MembershipLogProjection {
                 logical_time: command.logical_time,
                 intent,
             };
-            self.project_fenced_transition_v2(conn, &singleton, storage_identity)?;
+            self.project_fenced_transition_v2_with_durable_probe(
+                conn,
+                &singleton,
+                storage_identity,
+                durable_probe,
+            )?;
         }
+        // Even when every fresh item is beyond the remaining capacity and
+        // therefore skips singleton projection, apply commits the physical
+        // batch as a no-effect HistoryFull response and advances its logical
+        // clock. A following lower-timestamp maintenance entry in the same
+        // append must observe that identical clock.
+        self.advance_projected_logical_time(command.logical_time);
         if self.projected_application_sequence > before_sequence {
             self.projected_application_sequence =
                 before_sequence.checked_add(1).ok_or_else(|| {
@@ -19474,6 +24277,7 @@ impl MembershipLogProjection {
             | SessionMutationIntent::RenewLease { .. }
             | SessionMutationIntent::ReleaseLease(_)
             | SessionMutationIntent::FinalizeOperatorRecovery { .. }
+            | SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
             | SessionMutationIntent::RosterAdmission(_)
             | SessionMutationIntent::RosterTerminal(_)
             | SessionMutationIntent::RosterAdmissionV2(_)
@@ -19489,7 +24293,8 @@ fn replay_unapplied_log_prefix_sync(
     before: u64,
     projection: &mut MembershipLogProjection,
 ) -> io::Result<Option<u64>> {
-    let applied = read_applied_sync(conn, storage_identity)?.map(|log_id| log_id.index);
+    let applied_log_id = read_applied_sync(conn, storage_identity)?;
+    let applied = applied_log_id.as_ref().map(|log_id| log_id.index);
     let first = applied
         .map(|index| {
             index
@@ -19521,13 +24326,14 @@ fn replay_unapplied_log_prefix_sync(
         .query(params![checked_i64(first)?, checked_i64(target)?])
         .map_err(db_error)?;
     let mut expected = first;
+    let mut previous_log = applied_log_id;
     while let Some(row) = rows.next().map_err(db_error)? {
         let epoch: i64 = row.get(0).map_err(db_error)?;
         let term: i64 = row.get(1).map_err(db_error)?;
         let index: i64 = row.get(2).map_err(db_error)?;
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, storage_identity)?;
-        let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
+        let entry = decode_consensus_log_entry(&encoded)?;
         if entry.log_id.index != expected
             || checked_u64(index)? != expected
             || checked_u64(term)? != entry.log_id.leader_id.term
@@ -19536,10 +24342,18 @@ fn replay_unapplied_log_prefix_sync(
                 "persisted session consensus unapplied log projection is not contiguous",
             ));
         }
+        if let Some(previous) = previous_log.as_ref() {
+            ensure_log_id_not_after(
+                previous,
+                &entry.log_id,
+                "persisted session consensus unapplied log leader ordering regressed",
+            )?;
+        }
         projection.project(conn, &entry, storage_identity)?;
         expected = expected
             .checked_add(1)
             .ok_or_else(|| invalid_data("session consensus log index exhausted"))?;
+        previous_log = Some(entry.log_id);
     }
     if expected != target {
         return Err(invalid_data(
@@ -19693,6 +24507,974 @@ fn save_log_pointer(
     Ok(())
 }
 
+/// Read one retained log identity without treating its numeric primary key as
+/// proof of lineage.  Every pointer-changing path uses this before changing a
+/// durable frontier or deleting a prefix/suffix.
+fn retained_log_id_at_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    index: u64,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    let row = conn
+        .query_row(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index = ?1",
+            [checked_i64(index)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((epoch, term, stored_index, encoded)) = row else {
+        return Ok(None);
+    };
+    validate_epoch(epoch, identity)?;
+    let log_id: LogId<SessionConsensusNodeId> = decode_consensus_log_entry(&encoded)?.log_id;
+    validate_log_id(&log_id)?;
+    if checked_u64(term)? != log_id.leader_id.term
+        || checked_u64(stored_index)? != log_id.index
+        || log_id.index != index
+    {
+        return Err(invalid_data("persisted session consensus log row mismatch"));
+    }
+    Ok(Some(log_id))
+}
+
+/// Read the exact retained Membership payload at one durable membership
+/// pointer. A matching numeric row or LogId is not enough to authorize
+/// replacement: the row must still carry the same membership value which the
+/// state machine persisted.
+fn retained_membership_at_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<Option<StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>>>
+{
+    let row = conn
+        .query_row(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index = ?1",
+            [checked_i64(target.index)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((epoch, term, stored_index, encoded)) = row else {
+        return Ok(None);
+    };
+    validate_epoch(epoch, identity)?;
+    let entry = decode_consensus_log_entry(&encoded)?;
+    validate_log_id(&entry.log_id)?;
+    if checked_u64(term)? != entry.log_id.leader_id.term
+        || checked_u64(stored_index)? != entry.log_id.index
+        || entry.log_id != *target
+    {
+        return Err(invalid_data(
+            "session consensus membership conflicts with retained log",
+        ));
+    }
+    let EntryPayload::Membership(payload) = entry.payload else {
+        return Err(invalid_data(
+            "session consensus membership lacks exact retained payload",
+        ));
+    };
+    Ok(Some(StoredMembership::new(Some(entry.log_id), payload)))
+}
+
+fn selected_snapshot_log_id_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    Ok(read_current_snapshot_sync(conn, identity)?.and_then(|(meta, _, _, _)| meta.last_log_id))
+}
+
+fn require_exact_log_id_coverage_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    validate_log_id(target)?;
+    if let Some(retained) = retained_log_id_at_sync(conn, identity, target.index)? {
+        if retained != *target {
+            return Err(invalid_data(
+                "session consensus durable pointer conflicts with retained log",
+            ));
+        }
+        return Ok(());
+    }
+    let purged = read_purged_sync(conn, identity)?;
+    let snapshot = selected_snapshot_log_id_sync(conn, identity)?;
+    if purged.as_ref() == Some(target) || snapshot.as_ref() == Some(target) {
+        return Ok(());
+    }
+    if purged.is_some_and(|pointer| pointer.index == target.index)
+        || snapshot.is_some_and(|pointer| pointer.index == target.index)
+    {
+        return Err(invalid_data(
+            "session consensus durable pointer conflicts with compacted boundary",
+        ));
+    }
+    Err(invalid_data(
+        "session consensus durable pointer lacks exact log coverage",
+    ))
+}
+
+/// Read the compaction markers as one durable lineage.  A marker does not
+/// supersede an older marker merely because it has a higher numeric index:
+/// their full `LogId`s must describe the same monotonic Raft history.  If a
+/// physical row remains at a marker index it is an additional exact witness,
+/// not an alternate history that may be ignored after a partial prune.
+fn validated_log_markers_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    let purged = read_purged_sync(conn, identity)?;
+    let snapshot = selected_snapshot_log_id_sync(conn, identity)?;
+    let mut markers = [purged, snapshot].into_iter().flatten().collect::<Vec<_>>();
+    for marker in &markers {
+        validate_log_id(marker)?;
+        if let Some(retained) = retained_log_id_at_sync(conn, identity, marker.index)? {
+            if retained != *marker {
+                return Err(invalid_data(
+                    "session consensus compacted marker conflicts with retained log",
+                ));
+            }
+        }
+    }
+    markers.sort_by_key(|marker| marker.index);
+    for pair in markers.windows(2) {
+        let earlier = &pair[0];
+        let later = &pair[1];
+        if earlier.index == later.index {
+            if earlier != later {
+                return Err(invalid_data(
+                    "session consensus compacted markers conflict at one index",
+                ));
+            }
+        } else {
+            ensure_log_id_not_after(
+                earlier,
+                later,
+                "session consensus compacted marker lineage is invalid",
+            )?;
+        }
+    }
+    Ok(markers)
+}
+
+// This is deliberately local to the committed-log validation tests. It counts
+// decoded rows from the shared range reader, so the regression asserts the
+// actual selected SQL interval rather than a host-contended wall-clock time.
+#[cfg(test)]
+thread_local! {
+    static COMMITTED_LOG_VALIDATION_DECODED_ROWS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static DURABLE_LOG_AUDIT_FAULTS_FOR_TEST: std::cell::Cell<DurableLogAuditFaultsForTest> =
+        const { std::cell::Cell::new(DurableLogAuditFaultsForTest::NONE) };
+}
+
+#[cfg(test)]
+fn reset_committed_log_validation_decoded_rows_for_test() {
+    COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn committed_log_validation_decoded_rows_for_test() -> usize {
+    COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(std::cell::Cell::get)
+}
+
+const DURABLE_LOG_AUDIT_WORKERS: usize = 8;
+const DURABLE_LOG_AUDIT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const DURABLE_LOG_AUDIT_BATCH_ROWS: usize = 4_096;
+const DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS: usize = 64;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct DurableLogAuditFaultsForTest {
+    spawn_failure_worker: Option<usize>,
+    panic_worker: Option<usize>,
+}
+
+#[cfg(test)]
+impl DurableLogAuditFaultsForTest {
+    const NONE: Self = Self {
+        spawn_failure_worker: None,
+        panic_worker: None,
+    };
+}
+
+#[cfg(test)]
+fn with_durable_log_audit_faults_for_test<T>(
+    faults: DurableLogAuditFaultsForTest,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(DurableLogAuditFaultsForTest);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DURABLE_LOG_AUDIT_FAULTS_FOR_TEST.with(|configured| configured.set(self.0));
+        }
+    }
+
+    let previous = DURABLE_LOG_AUDIT_FAULTS_FOR_TEST.with(|configured| configured.replace(faults));
+    let _reset = Reset(previous);
+    run()
+}
+
+#[cfg(test)]
+fn reset_durable_log_audit_max_batch_rows_for_test() {
+    DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST.with(|maximum| maximum.set(0));
+}
+
+#[cfg(test)]
+fn durable_log_audit_max_batch_rows_for_test() -> usize {
+    DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+struct EncodedDurableLogAuditRow {
+    epoch: i64,
+    term: i64,
+    index: i64,
+    encoded: Vec<u8>,
+}
+
+fn decode_durable_log_audit_row(
+    row: &EncodedDurableLogAuditRow,
+    identity: SessionConsensusIdentity,
+) -> io::Result<LogId<SessionConsensusNodeId>> {
+    validate_epoch(row.epoch, identity)?;
+    let log_id = decode_consensus_log_entry(&row.encoded)?.log_id;
+    validate_log_id(&log_id)?;
+    if checked_u64(row.term)? != log_id.leader_id.term || checked_u64(row.index)? != log_id.index {
+        return Err(invalid_data("persisted session consensus log row mismatch"));
+    }
+    Ok(log_id)
+}
+
+fn durable_log_audit_worker_count(rows: usize, available: usize) -> usize {
+    if rows < DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS {
+        return 1;
+    }
+    DURABLE_LOG_AUDIT_WORKERS.min(available.max(1)).min(rows)
+}
+
+fn reserve_exact_durable_log_audit_capacity<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+) -> io::Result<()> {
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| io::Error::other("session consensus durable log audit allocation failed"))
+}
+
+fn decode_durable_log_audit_rows(
+    rows: &[EncodedDurableLogAuditRow],
+    identity: SessionConsensusIdentity,
+) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    let mut decoded = Vec::new();
+    reserve_exact_durable_log_audit_capacity(&mut decoded, rows.len())?;
+    for row in rows {
+        decoded.push(decode_durable_log_audit_row(row, identity)?);
+    }
+    Ok(decoded)
+}
+
+fn decode_durable_log_audit_batch_with_available_parallelism(
+    rows: &[EncodedDurableLogAuditRow],
+    identity: SessionConsensusIdentity,
+    available_parallelism: usize,
+) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = durable_log_audit_worker_count(rows.len(), available_parallelism);
+    // Ordinary committed-frontier advances normally contain one row. Keep
+    // that hot path thread-free; parallelism is reserved for the large exact
+    // audits performed at snapshot and recovery boundaries.
+    if workers == 1 {
+        return decode_durable_log_audit_rows(rows, identity);
+    }
+    let rows_per_worker = rows.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        reserve_exact_durable_log_audit_capacity(&mut handles, workers)?;
+        let mut decoded = Vec::new();
+        reserve_exact_durable_log_audit_capacity(&mut decoded, rows.len())?;
+        let mut spawn_error = None;
+        for (worker_index, chunk) in rows.chunks(rows_per_worker).enumerate() {
+            #[cfg(not(test))]
+            let _ = worker_index;
+            #[cfg(test)]
+            if DURABLE_LOG_AUDIT_FAULTS_FOR_TEST
+                .with(|faults| faults.get().spawn_failure_worker == Some(worker_index))
+            {
+                spawn_error = Some(invalid_data(
+                    "session consensus durable log audit worker spawn failed",
+                ));
+                break;
+            }
+            #[cfg(test)]
+            let panic_worker = DURABLE_LOG_AUDIT_FAULTS_FOR_TEST
+                .with(|faults| faults.get().panic_worker == Some(worker_index));
+            let handle = std::thread::Builder::new()
+                .spawn_scoped(scope, move || {
+                    #[cfg(test)]
+                    if panic_worker {
+                        panic!("injected durable log audit worker failure");
+                    }
+                    decode_durable_log_audit_rows(chunk, identity)
+                })
+                .map_err(|_| {
+                    invalid_data("session consensus durable log audit worker spawn failed")
+                });
+            match handle {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
+        // Join in source order so witness insertion and error precedence stay
+        // deterministic even though exact row decoding runs concurrently.
+        let mut first_error = None;
+        for handle in handles {
+            let result = handle
+                .join()
+                .map_err(|_| invalid_data("session consensus durable log audit worker failed"));
+            match result {
+                Ok(Ok(mut chunk)) if first_error.is_none() => decoded.append(&mut chunk),
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) | Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else if let Some(error) = spawn_error {
+            Err(error)
+        } else {
+            Ok(decoded)
+        }
+    })
+}
+
+fn decode_durable_log_audit_batch(
+    rows: &[EncodedDurableLogAuditRow],
+    identity: SessionConsensusIdentity,
+) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    decode_durable_log_audit_batch_with_available_parallelism(
+        rows,
+        identity,
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
+}
+
+fn insert_validated_log_rows_in_range_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    end: u64,
+    witnesses: &mut BTreeMap<u64, LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    if start > end {
+        return Ok(());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT configuration_epoch, term, log_index, \
+             CASE WHEN length(entry_json) BETWEEN 1 AND ?3 THEN entry_json END \
+             FROM consensus_log \
+             WHERE log_index >= ?1 AND log_index <= ?2 ORDER BY log_index ASC",
+        )
+        .map_err(db_error)?;
+    let mut rows = statement
+        .query(params![
+            checked_i64(start)?,
+            checked_i64(end)?,
+            i64::try_from(SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES)
+                .expect("durable log entry bound fits SQLite integer")
+        ])
+        .map_err(db_error)?;
+    loop {
+        let mut encoded_rows = Vec::new();
+        let mut encoded_bytes = 0_usize;
+        // The last row can cross the byte target by at most one already-
+        // bounded log entry. The independent row ceiling also bounds tiny-row
+        // descriptor and allocator overhead without buffering an unread
+        // SQLite row between batches.
+        let mut exhausted = false;
+        let mut read_error = None;
+        while encoded_rows.len() < DURABLE_LOG_AUDIT_BATCH_ROWS
+            && encoded_bytes < DURABLE_LOG_AUDIT_BATCH_BYTES
+        {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    exhausted = true;
+                    break;
+                }
+                Err(error) => {
+                    read_error = Some(db_error(error));
+                    break;
+                }
+            };
+            let encoded_row = (|| {
+                let epoch = row.get(0).map_err(db_error)?;
+                let term = row.get(1).map_err(db_error)?;
+                let index = row.get(2).map_err(db_error)?;
+                let encoded: Option<Vec<u8>> = row.get(3).map_err(db_error)?;
+                let encoded = encoded
+                    .ok_or_else(|| invalid_data("session consensus log entry size is invalid"))?;
+                Ok(EncodedDurableLogAuditRow {
+                    epoch,
+                    term,
+                    index,
+                    encoded,
+                })
+            })();
+            let encoded_row = match encoded_row {
+                Ok(encoded_row) => encoded_row,
+                Err(error) => {
+                    read_error = Some(error);
+                    break;
+                }
+            };
+            encoded_bytes = encoded_bytes
+                .checked_add(encoded_row.encoded.len())
+                .ok_or_else(|| invalid_data("session consensus durable log audit size overflow"))?;
+            if encoded_rows.len() == encoded_rows.capacity() {
+                let remaining = DURABLE_LOG_AUDIT_BATCH_ROWS - encoded_rows.len();
+                let growth = if encoded_rows.capacity() == 0 {
+                    8.min(remaining)
+                } else {
+                    encoded_rows.capacity().min(remaining)
+                };
+                reserve_exact_durable_log_audit_capacity(&mut encoded_rows, growth)?;
+            }
+            encoded_rows.push(encoded_row);
+        }
+        #[cfg(test)]
+        DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST.with(|maximum| {
+            maximum.set(maximum.get().max(encoded_rows.len()));
+        });
+        if encoded_rows.is_empty() {
+            if let Some(error) = read_error {
+                return Err(error);
+            }
+            break;
+        }
+        for log_id in decode_durable_log_audit_batch(&encoded_rows, identity)? {
+            #[cfg(test)]
+            COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(|count| count.set(count.get() + 1));
+            if let Some(previous) = witnesses.insert(log_id.index, log_id) {
+                if previous != log_id {
+                    return Err(invalid_data(
+                        "session consensus compacted marker conflicts with retained log",
+                    ));
+                }
+            }
+        }
+        // A row-fetch/type/size error follows every successfully buffered row
+        // in source order. Decode those earlier rows first so parallel batching
+        // preserves the former row-by-row error precedence.
+        if let Some(error) = read_error {
+            return Err(error);
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Merge compaction markers and physical rows into ordered exact witnesses.
+/// Markers are inline evidence, rather than scan boundaries: they can attest
+/// their own index but cannot hide a missing index between two witnesses.
+fn validated_log_witnesses_through_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<BTreeMap<u64, LogId<SessionConsensusNodeId>>> {
+    validate_log_id(target)?;
+    let markers = validated_log_markers_sync(conn, identity)?;
+    // A selected snapshot can be ahead of a pointer currently being saved or
+    // used as a physical-purge boundary. It is still an inline witness for
+    // that same durable history: omitting it would allow a higher-term target
+    // to splice in immediately before a later lower-term snapshot. Scan any
+    // physically retained rows through the highest such witness as well, so a
+    // retained row cannot bridge the marker boundary with another history.
+    let highest_witness_index = markers
+        .iter()
+        .map(|marker| marker.index)
+        .chain(std::iter::once(target.index))
+        .max()
+        .expect("target is always an inline witness bound");
+    let mut witnesses = BTreeMap::new();
+    for marker in markers {
+        if let Some(previous) = witnesses.insert(marker.index, marker) {
+            if previous != marker {
+                return Err(invalid_data(
+                    "session consensus compacted markers conflict at one index",
+                ));
+            }
+        }
+    }
+    insert_validated_log_rows_in_range_sync(
+        conn,
+        identity,
+        0,
+        highest_witness_index,
+        &mut witnesses,
+    )?;
+    for pair in witnesses.values().collect::<Vec<_>>().windows(2) {
+        ensure_log_id_not_after(
+            pair[0],
+            pair[1],
+            "session consensus durable log leader ordering regressed",
+        )?;
+    }
+    Ok(witnesses)
+}
+
+fn exact_log_prefix_start_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<u64> {
+    if let Some(known) = read_purged_sync(conn, identity)? {
+        return known
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"));
+    }
+    Ok(selected_snapshot_log_id_sync(conn, identity)?
+        .filter(|snapshot| snapshot.index <= target.index)
+        // A selected snapshot is exact evidence for its own compacted
+        // boundary when no logical purge row predates it. Once a purge row
+        // exists, however, a later snapshot stays inline and cannot erase
+        // the required witnesses between the two markers.
+        .map(|snapshot| snapshot.index)
+        .unwrap_or(0))
+}
+
+/// Prove a monotonic committed-pointer advance from the immediately prior
+/// durable committed frontier. The prior pointer was published only after a
+/// complete prefix audit. Append-only log writes preserve that audited prefix,
+/// while destructive and recovery boundaries retain their complete audits.
+/// Consequently an ordinary advance need only prove the new interval, its
+/// exact endpoints, and every compaction witness it crosses (or which follows
+/// it and can otherwise splice the lineage).
+fn validate_exact_committed_log_advance_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    previous: &LogId<SessionConsensusNodeId>,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    require_exact_log_id_coverage_sync(conn, identity, previous)?;
+    ensure_log_id_not_after(
+        previous,
+        target,
+        "session consensus committed index regressed",
+    )?;
+    if previous == target {
+        return Ok(());
+    }
+
+    validate_log_id(target)?;
+    let markers = validated_log_markers_sync(conn, identity)?;
+    let highest_witness_index = markers
+        .iter()
+        .map(|marker| marker.index)
+        .chain(std::iter::once(target.index))
+        .max()
+        .expect("target is always an inline witness bound");
+    let mut witnesses = BTreeMap::new();
+    witnesses.insert(previous.index, *previous);
+    for marker in markers {
+        if let Some(existing) = witnesses.insert(marker.index, marker) {
+            if existing != marker {
+                return Err(invalid_data(
+                    "session consensus compacted marker conflicts with committed frontier",
+                ));
+            }
+        }
+    }
+    let extension_start = previous
+        .index
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+    insert_validated_log_rows_in_range_sync(
+        conn,
+        identity,
+        extension_start,
+        highest_witness_index,
+        &mut witnesses,
+    )?;
+    for pair in witnesses.values().collect::<Vec<_>>().windows(2) {
+        ensure_log_id_not_after(
+            pair[0],
+            pair[1],
+            "session consensus durable log leader ordering regressed",
+        )?;
+    }
+    match witnesses.get(&target.index) {
+        Some(witness) if witness == target => {}
+        Some(_) => {
+            return Err(invalid_data(
+                "session consensus durable pointer conflicts with retained log",
+            ));
+        }
+        None => {
+            return Err(invalid_data(
+                "session consensus durable pointer lacks exact log coverage",
+            ));
+        }
+    }
+
+    let start = exact_log_prefix_start_sync(conn, identity, target)?.max(extension_start);
+    for index in start..=target.index {
+        if !witnesses.contains_key(&index) {
+            return Err(invalid_data(
+                "session consensus durable log prefix contains a hole",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Prove that the target is an exact durable identity and every index above
+/// the logical purge floor has an inline exact witness.
+fn validate_exact_log_prefix_through_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+    require_retained_target: bool,
+) -> io::Result<()> {
+    validate_log_id(target)?;
+    let witnesses = validated_log_witnesses_through_sync(conn, identity, target)?;
+    validate_exact_log_prefix_from_witnesses_sync(
+        conn,
+        identity,
+        target,
+        require_retained_target,
+        &witnesses,
+    )
+}
+
+/// Apply one target's exact identity and no-hole proof to a witness map that
+/// was already validated through this target or a strict superset frontier.
+fn validate_exact_log_prefix_from_witnesses_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+    require_retained_target: bool,
+    witnesses: &BTreeMap<u64, LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    validate_log_id(target)?;
+    if require_retained_target
+        && retained_log_id_at_sync(conn, identity, target.index)?.as_ref() != Some(target)
+    {
+        return Err(invalid_data(
+            "session consensus truncate boundary lacks exact retained log coverage",
+        ));
+    }
+    match witnesses.get(&target.index) {
+        Some(retained) if retained != target => {
+            return Err(invalid_data(
+                "session consensus durable pointer conflicts with retained log",
+            ));
+        }
+        None => {
+            return Err(invalid_data(
+                "session consensus durable pointer lacks exact log coverage",
+            ));
+        }
+        _ => {}
+    }
+
+    let start = exact_log_prefix_start_sync(conn, identity, target)?;
+    for index in start..=target.index {
+        if !witnesses.contains_key(&index) {
+            return Err(invalid_data(
+                "session consensus durable log prefix contains a hole",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the one compacted interval which a portable snapshot install is
+/// allowed to replace without recreating its source log rows. The snapshot
+/// builder deliberately removes the source Raft rows and markers, while a
+/// follower may already retain an older logical floor after physically
+/// pruning that floor without ever receiving the later source rows. Once the
+/// incoming, attached image has been fully authenticated and its selected
+/// snapshot is published in this same transaction, that exact selected cut
+/// covers an entirely absent interval. If the local A<=C frontier retains the
+/// exact physical P+1..C prefix and C+1..S is entirely absent, that same
+/// selected cut covers only the absent tail; this is valid for both authority
+/// profiles after their respective pre-install audits. Any other retained row
+/// shape keeps the ordinary complete-prefix proof, so a corrupt, spliced, or
+/// gapped retained interval is never hidden by the incoming snapshot.
+fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    _authority_profile: ConsensusAuthorityProfile,
+    preinstall_committed: Option<LogId<SessionConsensusNodeId>>,
+    preinstall_applied: Option<LogId<SessionConsensusNodeId>>,
+    target: &LogId<SessionConsensusNodeId>,
+    require_retained_target: bool,
+) -> io::Result<()> {
+    validate_log_id(target)?;
+    let selected_snapshot = selected_snapshot_log_id_sync(conn, identity)?;
+    let purged = read_purged_sync(conn, identity)?;
+    let (Some(snapshot), Some(floor)) = (selected_snapshot, purged) else {
+        return validate_exact_log_prefix_through_sync(
+            conn,
+            identity,
+            target,
+            require_retained_target,
+        );
+    };
+    if snapshot != *target || floor.index >= target.index {
+        return validate_exact_log_prefix_through_sync(
+            conn,
+            identity,
+            target,
+            require_retained_target,
+        );
+    }
+
+    let witnesses = validated_log_witnesses_through_sync(conn, identity, target)?;
+    if require_retained_target
+        && retained_log_id_at_sync(conn, identity, target.index)?.as_ref() != Some(target)
+    {
+        return Err(invalid_data(
+            "session consensus truncate boundary lacks exact retained log coverage",
+        ));
+    }
+    match witnesses.get(&target.index) {
+        Some(witness) if witness == target => {}
+        Some(_) => {
+            return Err(invalid_data(
+                "session consensus durable pointer conflicts with retained log",
+            ));
+        }
+        None => {
+            return Err(invalid_data(
+                "session consensus durable pointer lacks exact log coverage",
+            ));
+        }
+    }
+
+    let start = floor
+        .index
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+    let has_retained_rows: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index >= ?1 AND log_index <= ?2 LIMIT 1)",
+            params![checked_i64(start)?, checked_i64(target.index)?],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if has_retained_rows {
+        // A complete physical P+1..S prefix remains the ordinary proof,
+        // including when the old local C=A=P and a later retained suffix is
+        // present.  Decide this from the exact row shape before considering
+        // the compacted-tail exception; once this shape is present, propagate
+        // every
+        // strict-prefix validation error instead of treating corruption as an
+        // absent snapshot-covered interval.
+        let target_end = target
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+        let retained_through_target =
+            read_log_range_sync(conn, identity, start, Some(target_end), None)?;
+        if retained_through_target.last().map(|entry| entry.log_id) == Some(*target) {
+            return validate_exact_log_prefix_through_sync(
+                conn,
+                identity,
+                target,
+                require_retained_target,
+            );
+        }
+        // The exact P+1..C retained prefix followed by an entirely absent
+        // tail is also safe for FixedImmutable. Its pre-install audit has already
+        // bound the immutable identity, roster, bindings, membership payload,
+        // and every retained entry; the selected authenticated snapshot is
+        // then the exact witness for the absent suffix.  Keep this after the
+        // full-prefix shape above so a retained row through S, or any corrupt
+        // / gapped retained suffix, still takes the strict proof path.
+        let (Some(committed), Some(applied)) = (preinstall_committed, preinstall_applied) else {
+            return Err(invalid_data(
+                "session consensus portable snapshot retained tail lacks local pointers",
+            ));
+        };
+        ensure_log_id_not_after(
+            &floor,
+            &applied,
+            "session consensus portable snapshot retained tail regresses purge floor",
+        )?;
+        ensure_log_id_not_after(
+            &applied,
+            &committed,
+            "session consensus portable snapshot retained tail applied pointer exceeds committed frontier",
+        )?;
+        ensure_log_id_not_after(
+            &committed,
+            target,
+            "session consensus portable snapshot retained tail exceeds selected cut",
+        )?;
+        let retained_end = committed
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus retained tail index is exhausted"))?;
+        let retained = read_log_range_sync(conn, identity, start, Some(retained_end), None)?;
+        if retained.first().map(|entry| entry.log_id.index) != Some(start)
+            || retained.last().map(|entry| entry.log_id) != Some(committed)
+        {
+            return Err(invalid_data(
+                "session consensus portable snapshot retained tail lacks exact boundaries",
+            ));
+        }
+        ensure_log_id_not_after(
+            &floor,
+            &retained
+                .first()
+                .expect("retained tail exact boundaries require a first row")
+                .log_id,
+            "session consensus portable snapshot retained tail regresses purge floor",
+        )?;
+        let has_retained_suffix: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index > ?1 AND log_index <= ?2 LIMIT 1)",
+                params![checked_i64(committed.index)?, checked_i64(target.index)?],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if has_retained_suffix {
+            return Err(invalid_data(
+                "session consensus portable snapshot retained tail extends into absent suffix",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The file-backed fixed-profile prune lane may observe a partly removed
+/// physical prefix.  Prove the logical floor and the remaining physical
+/// suffix together before authorizing another bounded delete.  In particular,
+/// a gap among still-retained rows cannot be hidden behind the logical floor.
+fn validate_exact_log_prune_lineage_in_tx(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    floor: &LogId<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    validate_log_id(floor)?;
+    if read_purged_sync(tx, identity)?.as_ref() != Some(floor) {
+        return Err(invalid_data(
+            "session consensus prune floor lacks exact durable identity",
+        ));
+    }
+    let markers = validated_log_markers_sync(tx, identity)?;
+
+    let mut statement = tx
+        .prepare(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log \
+             WHERE log_index <= ?1 ORDER BY log_index ASC",
+        )
+        .map_err(db_error)?;
+    let mut rows = statement
+        .query([checked_i64(floor.index)?])
+        .map_err(db_error)?;
+    let mut retained = Vec::new();
+    while let Some(row) = rows.next().map_err(db_error)? {
+        let epoch: i64 = row.get(0).map_err(db_error)?;
+        let term: i64 = row.get(1).map_err(db_error)?;
+        let index: i64 = row.get(2).map_err(db_error)?;
+        let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
+        validate_epoch(epoch, identity)?;
+        let log_id = decode_consensus_log_entry(&encoded)?.log_id;
+        validate_log_id(&log_id)?;
+        if checked_u64(term)? != log_id.leader_id.term || checked_u64(index)? != log_id.index {
+            return Err(invalid_data("persisted session consensus log row mismatch"));
+        }
+        retained.push(log_id);
+    }
+    if retained.is_empty() {
+        // A previous bounded turn may have removed the complete physical
+        // prefix. The exact logical floor remains enough to authorize this
+        // no-op turn.
+        return Ok(());
+    }
+    if retained.last() != Some(floor) {
+        return Err(invalid_data(
+            "session consensus retained prune suffix does not end at floor",
+        ));
+    }
+    for pair in retained.windows(2) {
+        if pair[1].index
+            != pair[0]
+                .index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?
+        {
+            return Err(invalid_data(
+                "session consensus retained prune suffix contains a hole",
+            ));
+        }
+    }
+    let mut witnesses = BTreeMap::new();
+    for marker in markers {
+        if marker.index <= floor.index {
+            witnesses.insert(marker.index, marker);
+        }
+    }
+    for retained_log in &retained {
+        if let Some(marker) = witnesses.insert(retained_log.index, *retained_log) {
+            if marker != *retained_log {
+                return Err(invalid_data(
+                    "session consensus prune marker conflicts with retained suffix",
+                ));
+            }
+        }
+    }
+    for pair in witnesses.values().collect::<Vec<_>>().windows(2) {
+        ensure_log_id_not_after(
+            pair[0],
+            pair[1],
+            "session consensus retained prune lineage is invalid",
+        )?;
+    }
+    if witnesses.get(&floor.index) != Some(floor) {
+        return Err(invalid_data(
+            "session consensus prune floor conflicts with retained lineage",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn read_committed_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -19750,11 +25532,12 @@ fn save_committed_in_tx(
         return Ok(());
     };
     if let Some(current) = read_committed_sync(tx, identity)? {
-        if committed.index < current.index
-            || (committed.index == current.index && committed != current)
-        {
-            return Err(invalid_data("session consensus committed index regressed"));
-        }
+        validate_exact_committed_log_advance_sync(tx, identity, &current, &committed)?;
+    } else {
+        // No committed frontier has yet been durably audited. Establish the
+        // inheritance base with the complete prefix proof before publishing
+        // the first committed pointer.
+        validate_exact_log_prefix_through_sync(tx, identity, &committed, false)?;
     }
     save_log_pointer(tx, "consensus_committed", identity, &committed)?;
     Ok(())
@@ -19784,11 +25567,15 @@ pub(crate) fn last_log_sync(
         return Ok(floor);
     };
     validate_epoch(epoch, identity)?;
-    let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
+    let entry = decode_consensus_log_entry(&encoded)?;
+    validate_log_id(&entry.log_id)?;
     if checked_u64(term)? != entry.log_id.leader_id.term
         || checked_u64(index)? != entry.log_id.index
     {
         return Err(invalid_data("persisted session consensus log row mismatch"));
+    }
+    if let EntryPayload::Normal(command) = &entry.payload {
+        validate_command_for_log(command, identity)?;
     }
     Ok(Some(entry.log_id))
 }
@@ -19807,7 +25594,7 @@ pub(crate) fn read_log_range_sync(
         end,
         limit,
         false,
-        false,
+        LogRangeRecoveryProfile::Strict,
     )
 }
 
@@ -19828,7 +25615,30 @@ pub(crate) fn read_log_range_for_recovery_sync(
         end,
         limit,
         false,
-        true,
+        LogRangeRecoveryProfile::Published684,
+    )
+}
+
+/// Read the physical retained suffix during offline recovery. When no purge
+/// marker exists, the first row establishes only the physical cursor; the
+/// recovery layer must authenticate any omitted prefix against the selected
+/// snapshot. Every subsequent row remains strictly contiguous. A durable
+/// purge marker keeps the ordinary exact `purged + 1` start requirement.
+pub(crate) fn read_physical_log_range_for_recovery_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    read_log_range_with_batch_sync(
+        conn,
+        identity,
+        logical_log_start(conn, identity, start)?,
+        end,
+        limit,
+        false,
+        LogRangeRecoveryProfile::PhysicalRetained,
     )
 }
 
@@ -19840,8 +25650,15 @@ pub(crate) fn read_limited_log_range_sync(
     limit: usize,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let start = logical_log_start(conn, identity, start)?;
-    let entries =
-        read_log_range_with_batch_sync(conn, identity, start, Some(end), Some(limit), true, false)?;
+    let entries = read_log_range_with_batch_sync(
+        conn,
+        identity,
+        start,
+        Some(end),
+        Some(limit),
+        true,
+        LogRangeRecoveryProfile::Strict,
+    )?;
     let purged = read_purged_sync(conn, identity)?;
     let expected_start = match purged {
         Some(purged) if start <= purged.index => purged.index.checked_add(1),
@@ -19891,6 +25708,23 @@ fn logical_log_start(
     }
 }
 
+#[derive(Clone, Copy)]
+enum LogRangeRecoveryProfile {
+    Strict,
+    Published684,
+    PhysicalRetained,
+}
+
+impl LogRangeRecoveryProfile {
+    const fn allows_published_684(self) -> bool {
+        !matches!(self, Self::Strict)
+    }
+
+    const fn scans_physical_retained_suffix(self) -> bool {
+        matches!(self, Self::PhysicalRetained)
+    }
+}
+
 fn read_log_range_with_batch_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -19898,7 +25732,7 @@ fn read_log_range_with_batch_sync(
     end: Option<u64>,
     limit: Option<usize>,
     append_entries_batch: bool,
-    allow_published_684_recovery_layout: bool,
+    recovery_profile: LogRangeRecoveryProfile,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let start_u64 = start;
     let start = checked_i64(start)?;
@@ -19910,7 +25744,30 @@ fn read_log_range_with_batch_sync(
         })
         .transpose()?;
     let mut projection =
-        MembershipLogProjection::load(conn, identity, allow_published_684_recovery_layout)?;
+        MembershipLogProjection::load(conn, identity, recovery_profile.allows_published_684())?;
+    // The durable purge floor is the only predecessor which may have been
+    // removed.  Seed ordering validation from it so a retained first row
+    // cannot regress the OpenRaft leader term across compaction.  Later rows
+    // are compared directly as they are decoded; this covers recovery's full
+    // retained scan as well as normal bounded reads.
+    let mut previous_log = read_purged_sync(conn, identity)?;
+    // SQLite returns a sparse ordered subset when a row is missing. A normal
+    // range read may stop at its requested upper bound or payload limit, but
+    // it must never skip a retained index within the portion it returns. The
+    // recovery-only physical scan may establish its first cursor from the
+    // first row when no purge marker exists; its caller separately proves the
+    // omitted prefix from an exact selected snapshot.
+    let mut expected_log_index = previous_log
+        .as_ref()
+        .map(|log_id| {
+            log_id
+                .index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session consensus log index is exhausted"))
+        })
+        .transpose()?
+        .unwrap_or(0)
+        .max(start_u64);
     let applied_index =
         replay_unapplied_log_prefix_sync(conn, identity, start_u64, &mut projection)?;
     let mut entries = Vec::new();
@@ -19922,7 +25779,7 @@ fn read_log_range_with_batch_sync(
             "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC"
         }
         (None, Some(_)) => {
-            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC LIMIT ?3"
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC LIMIT ?2"
         }
         (None, None) => {
             "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC"
@@ -19943,12 +25800,35 @@ fn read_log_range_with_batch_sync(
         let index: i64 = row.get(2).map_err(db_error)?;
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, identity)?;
-        let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
+        let entry = decode_consensus_log_entry(&encoded)?;
+        validate_log_id(&entry.log_id)?;
         if checked_u64(term)? != entry.log_id.leader_id.term
             || checked_u64(index)? != entry.log_id.index
         {
             return Err(invalid_data("persisted session consensus log row mismatch"));
         }
+        if recovery_profile.scans_physical_retained_suffix()
+            && previous_log.is_none()
+            && entries.is_empty()
+        {
+            expected_log_index = entry.log_id.index;
+        }
+        if entry.log_id.index != expected_log_index {
+            return Err(invalid_data(
+                "persisted session consensus log range contains a hole",
+            ));
+        }
+        if let Some(previous) = previous_log.as_ref() {
+            if entry.log_id.leader_id.term < previous.leader_id.term
+                || (entry.log_id.leader_id.term == previous.leader_id.term
+                    && entry.log_id.leader_id != previous.leader_id)
+            {
+                return Err(invalid_data(
+                    "persisted session consensus log leader ordering regressed",
+                ));
+            }
+        }
+        let log_id = entry.log_id;
         match applied_index {
             Some(applied_through) if entry.log_id.index <= applied_through => {
                 validate_applied_entry_for_membership_scope(
@@ -19976,13 +25856,11 @@ fn read_log_range_with_batch_sync(
             }
             Some(AppendEntriesBatchDecision::StopBefore) => break,
         }
-    }
-    for pair in entries.windows(2) {
-        if pair[1].log_id.index != pair[0].log_id.index.saturating_add(1) {
-            return Err(invalid_data(
-                "persisted session consensus log contains a hole",
-            ));
-        }
+        previous_log = Some(log_id);
+        expected_log_index = log_id
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
     }
     Ok(entries)
 }
@@ -20100,7 +25978,9 @@ fn append_logs_in_tx(
     entries: &[Entry<SessionRaftTypeConfig>],
 ) -> io::Result<()> {
     let mut projection = MembershipLogProjection::load(tx, identity, false)?;
-    let expected = last_log_sync(tx, identity)?
+    let mut previous_log = last_log_sync(tx, identity)?;
+    let expected = previous_log
+        .as_ref()
         .map(|log| {
             log.index
                 .checked_add(1)
@@ -20126,7 +26006,15 @@ fn append_logs_in_tx(
                 "session consensus log batch is not contiguous",
             ));
         }
+        if let Some(previous) = previous_log.as_ref() {
+            ensure_log_id_not_after(
+                previous,
+                &entry.log_id,
+                "session consensus log append leader ordering regressed",
+            )?;
+        }
         projection.project(tx, entry, identity)?;
+        previous_log = Some(entry.log_id);
     }
 
     for entry in entries {
@@ -20191,26 +26079,44 @@ fn truncate_logs_in_tx(
     index: i64,
 ) -> io::Result<()> {
     if let Some(committed) = read_committed_sync(tx, identity)? {
-        if since.index <= committed.index {
+        validate_exact_log_prefix_through_sync(tx, identity, &committed, false)?;
+        ensure_log_id_not_after(
+            &committed,
+            since,
+            "session consensus truncate crosses committed log",
+        )?;
+        if since.index == committed.index {
             return Err(invalid_data(
                 "session consensus truncate crosses committed log",
             ));
         }
     }
     if let Some(applied) = read_applied_sync(tx, identity)? {
-        if since.index <= applied.index {
+        validate_exact_log_prefix_through_sync(tx, identity, &applied, false)?;
+        ensure_log_id_not_after(
+            &applied,
+            since,
+            "session consensus truncate crosses applied log",
+        )?;
+        if since.index == applied.index {
             return Err(invalid_data(
                 "session consensus truncate crosses applied log",
             ));
         }
     }
     if let Some(purged) = read_purged_sync(tx, identity)? {
-        if since.index <= purged.index {
+        ensure_log_id_not_after(
+            &purged,
+            since,
+            "session consensus truncate crosses purged log",
+        )?;
+        if since.index == purged.index {
             return Err(invalid_data(
                 "session consensus truncate crosses purged log",
             ));
         }
     }
+    validate_exact_log_prefix_through_sync(tx, identity, since, true)?;
     tx.execute("DELETE FROM consensus_log WHERE log_index >= ?1", [index])
         .map_err(db_error)?;
     Ok(())
@@ -20234,22 +26140,154 @@ fn logical_purge_logs_in_tx(
     _index: i64,
 ) -> io::Result<()> {
     if let Some(current) = read_purged_sync(tx, identity)? {
-        if through.index < current.index || (through.index == current.index && through != &current)
-        {
+        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        if through.index < current.index {
+            // A delayed engine notification may describe a prefix which the
+            // snapshot replacement transaction already made durable. It is
+            // an idempotent no-op, but must never move the full-LogId floor
+            // backwards.
+            ensure_log_id_not_after(
+                through,
+                &current,
+                "session consensus delayed purge lineage is invalid",
+            )?;
+            return Ok(());
+        }
+        if through.index == current.index && through != &current {
             return Err(invalid_data("session consensus purged index regressed"));
         }
         if through == &current {
             return Ok(());
         }
+        ensure_log_id_not_after(
+            &current,
+            through,
+            "session consensus purged index regressed",
+        )?;
     }
     let applied = read_applied_sync(tx, identity)?
         .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
-    if through.index > applied.index {
+    let witnesses = validated_log_witnesses_through_sync(tx, identity, &applied)?;
+    validate_exact_log_prefix_from_witnesses_sync(tx, identity, &applied, false, &witnesses)?;
+    ensure_log_id_not_after(
+        through,
+        &applied,
+        "session consensus cannot purge unapplied logs",
+    )?;
+    validate_exact_log_prefix_from_witnesses_sync(tx, identity, through, false, &witnesses)?;
+    save_log_pointer(tx, "consensus_purged", identity, through)
+}
+
+/// Publish the exact logical floor for an already-validated portable snapshot.
+/// This remains install-only: ordinary Raft purges must always prove every
+/// index above their existing logical floor from retained local evidence.
+fn logical_purge_logs_after_portable_snapshot_install_in_tx(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    preinstall_committed: Option<LogId<SessionConsensusNodeId>>,
+    preinstall_applied: Option<LogId<SessionConsensusNodeId>>,
+    through: &LogId<SessionConsensusNodeId>,
+    _index: i64,
+) -> io::Result<()> {
+    if selected_snapshot_log_id_sync(tx, identity)? != Some(*through) {
         return Err(invalid_data(
-            "session consensus cannot purge unapplied logs",
+            "session consensus portable snapshot purge lacks exact selected cut",
         ));
     }
+    if let Some(current) = read_purged_sync(tx, identity)? {
+        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        if through.index < current.index {
+            ensure_log_id_not_after(
+                through,
+                &current,
+                "session consensus delayed purge lineage is invalid",
+            )?;
+            return Ok(());
+        }
+        if through.index == current.index && through != &current {
+            return Err(invalid_data("session consensus purged index regressed"));
+        }
+        if through == &current {
+            return Ok(());
+        }
+        ensure_log_id_not_after(
+            &current,
+            through,
+            "session consensus purged index regressed",
+        )?;
+    }
+    let applied = read_applied_sync(tx, identity)?
+        .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
+    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+        tx,
+        identity,
+        authority_profile,
+        preinstall_committed,
+        preinstall_applied,
+        &applied,
+        false,
+    )?;
+    ensure_log_id_not_after(
+        through,
+        &applied,
+        "session consensus cannot purge unapplied logs",
+    )?;
+    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+        tx,
+        identity,
+        authority_profile,
+        preinstall_committed,
+        preinstall_applied,
+        through,
+        false,
+    )?;
     save_log_pointer(tx, "consensus_purged", identity, through)
+}
+
+/// Advance the committed frontier to the authenticated portable snapshot cut
+/// while the follower's older purge marker still witnesses its prior
+/// committed frontier. The ordinary committed advance requires every
+/// intervening physical row, which a lagging follower legitimately never
+/// received. This install-only path accepts a wholly absent interval, or an
+/// exact local P+1..C prefix with A<=C followed by an absent tail, covered by
+/// the
+/// selected snapshot and preserves the exact proof of any previous committed
+/// pointer before replacing it.
+fn save_committed_after_portable_snapshot_install_in_tx(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    preinstall_committed: Option<LogId<SessionConsensusNodeId>>,
+    preinstall_applied: Option<LogId<SessionConsensusNodeId>>,
+    committed: &LogId<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if selected_snapshot_log_id_sync(tx, identity)? != Some(*committed) {
+        return Err(invalid_data(
+            "session consensus portable snapshot commit lacks exact selected cut",
+        ));
+    }
+    if let Some(current) = read_committed_sync(tx, identity)? {
+        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        ensure_log_id_not_after(
+            &current,
+            committed,
+            "session consensus committed index regressed",
+        )?;
+        if current.index == committed.index && current != *committed {
+            return Err(invalid_data("session consensus committed index regressed"));
+        }
+    }
+    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+        tx,
+        identity,
+        authority_profile,
+        preinstall_committed,
+        preinstall_applied,
+        committed,
+        false,
+    )?;
+    save_log_pointer(tx, "consensus_committed", identity, committed)
 }
 
 pub(crate) fn purge_logs_with_authority_sync(
@@ -20317,18 +26355,54 @@ fn purge_logs_in_tx(
     index: i64,
 ) -> io::Result<()> {
     if let Some(current) = read_purged_sync(tx, identity)? {
-        if through.index < current.index || (through.index == current.index && through != &current)
-        {
+        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        if through.index < current.index {
+            // The logical floor is already stronger. A late physical purge
+            // must not make snapshot installation fail or regress its exact
+            // term/node/index identity.
+            ensure_log_id_not_after(
+                through,
+                &current,
+                "session consensus delayed purge lineage is invalid",
+            )?;
+            return Ok(());
+        }
+        if through.index == current.index && through != &current {
             return Err(invalid_data("session consensus purged index regressed"));
         }
+        if through == &current {
+            if selected_snapshot_log_id_sync(tx, identity)? != Some(current) {
+                // An ordinary physical purge must retain its exact terminal
+                // row until this transaction removes the verified contiguous
+                // prefix. A selected snapshot at this exact full LogId is
+                // the narrow exception: snapshot installation records the
+                // logical floor atomically even though its portable image
+                // deliberately carries no Raft rows. In that case retained
+                // local rows below the cut are stale covered debris, not a
+                // required suffix; the preceding exact-marker validation
+                // already rejects an inconsistent selected cut or any
+                // conflicting retained marker.
+                validate_exact_log_prune_lineage_in_tx(tx, identity, &current)?;
+            }
+            tx.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [index])
+                .map_err(db_error)?;
+            return Ok(());
+        }
+        ensure_log_id_not_after(
+            &current,
+            through,
+            "session consensus purged index regressed",
+        )?;
     }
     let applied = read_applied_sync(tx, identity)?
         .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
-    if through.index > applied.index {
-        return Err(invalid_data(
-            "session consensus cannot purge unapplied logs",
-        ));
-    }
+    validate_exact_log_prefix_through_sync(tx, identity, &applied, false)?;
+    ensure_log_id_not_after(
+        through,
+        &applied,
+        "session consensus cannot purge unapplied logs",
+    )?;
+    validate_exact_log_prefix_through_sync(tx, identity, through, false)?;
     tx.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [index])
         .map_err(db_error)?;
     save_log_pointer(tx, "consensus_purged", identity, through)?;
@@ -20738,6 +26812,56 @@ fn payload_digest(
     hasher.update(OUTCOME_DIGEST_DOMAIN);
     hasher.update(encoded);
     Ok(hasher.finalize().into())
+}
+
+/// Recompute the idempotency payload binding for one operator-recovery V2
+/// intent without inventing leader-owned request timing.  Offline recovery
+/// uses this to bind a compacted finalization marker to the exact durable
+/// request outcome; it deliberately accepts no other intent family.
+pub(crate) fn operator_recovery_v2_payload_digest_sync(
+    identity: SessionConsensusIdentity,
+    intent: &SessionMutationIntent,
+) -> io::Result<[u8; 32]> {
+    if !matches!(intent, SessionMutationIntent::FinalizeOperatorRecoveryV2(_)) {
+        return Err(invalid_data(
+            "session recovery V2 payload digest received another intent",
+        ));
+    }
+    let encoded = encode_json(&(SESSION_CONSENSUS_SCHEMA_VERSION, identity, intent))?;
+    let mut hasher = Sha256::new();
+    hasher.update(OUTCOME_DIGEST_DOMAIN);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+/// Return an exact, successful V2 recovery outcome only when it is bound to
+/// the caller's expected command digest, full Raft identity, and first
+/// recovery application sequence.  `None` is a semantic mismatch rather
+/// than an absent/corrupt row so offline recovery can fail closed uniformly.
+#[allow(clippy::too_many_arguments)] // Exact operator-recovery outcome binding fields.
+pub(crate) fn exact_operator_recovery_v2_outcome_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+    expected_payload_digest: [u8; 32],
+    expected_log_id: &LogId<SessionConsensusNodeId>,
+    expected_sequence: u64,
+    expected_digest: SessionConsensusEntryDigest,
+    expected_logical_time: Timestamp,
+) -> io::Result<Option<SessionConsensusResponse>> {
+    let Some((stored_digest, response)) = read_outcome_sync(conn, identity, request_id)? else {
+        return Ok(None);
+    };
+    if stored_digest != expected_payload_digest
+        || !matches!(response.result, Ok(SessionMutationOutcome::Unit))
+        || response.sequence != expected_sequence
+        || response.digest != Some(expected_digest)
+        || response.logical_time != Some(expected_logical_time)
+        || response.raft_log_index != expected_log_id.index
+    {
+        return Ok(None);
+    }
+    Ok(Some(response))
 }
 
 /// Calculate the durable payload digest for the authenticated application
@@ -21797,24 +27921,25 @@ fn read_fenced_transition_v2_receipt_sync(
     request: &FencedTransitionV2Request,
 ) -> io::Result<Option<FencedTransitionV2Receipt>> {
     let request_id = request.request_id().to_bytes();
-    let row = conn
-        .query_row(
+    let mut statement = conn
+        .prepare_cached(
             "SELECT request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_v2_receipts WHERE request_id = ?1",
-            [request_id.as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, Option<Vec<u8>>>(7)?,
-                    row.get::<_, Option<Vec<u8>>>(8)?,
-                ))
-            },
         )
+        .map_err(db_error)?;
+    let row = statement
+        .query_row([request_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+                row.get::<_, Option<Vec<u8>>>(8)?,
+            ))
+        })
         .optional()
         .map_err(db_error)?;
     let Some((
@@ -21922,7 +28047,7 @@ fn read_fenced_transition_v2_receipt_sync(
     }))
 }
 
-fn store_fenced_transition_v2_receipt_sync(
+fn store_fenced_transition_v2_receipt_row_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     request: &FencedTransitionV2Request,
@@ -21948,20 +28073,13 @@ fn store_fenced_transition_v2_receipt_sync(
     )?;
     let response_digest = fenced_transition_v2_receipt_response_digest(binding_digest, &encoded)?;
     let history_epoch = request.request_id().epoch().get();
-    let changed = conn
-        .execute(
-            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = current_bound_count + 1 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2",
-            params![checked_positive_i64(history_epoch)?, checked_i64(ordinal.checked_sub(1).ok_or_else(|| invalid_data("fenced transition V2 ordinal is invalid"))?)?],
+    let mut statement = conn
+        .prepare_cached(
+            "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .map_err(db_error)?;
-    if changed != 1 {
-        return Err(invalid_data(
-            "fenced transition V2 history bind state is invalid",
-        ));
-    }
-    conn.execute(
-        "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
+    statement
+        .execute(params![
             request.request_id().to_bytes().as_slice(),
             checked_positive_i64(history_epoch)?,
             checked_positive_i64(ordinal)?,
@@ -21971,10 +28089,73 @@ fn store_fenced_transition_v2_receipt_sync(
             binding_digest.as_slice(),
             encoded,
             response_digest.as_slice(),
-        ],
-    )
-    .map_err(db_error)?;
+        ])
+        .map_err(db_error)?;
     Ok(())
+}
+
+fn advance_fenced_transition_v2_history_count_sync(
+    conn: &Connection,
+    history_epoch: u64,
+    previous_count: u64,
+    next_count: u64,
+) -> io::Result<()> {
+    if next_count <= previous_count
+        || next_count
+            > u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .map_err(|_| invalid_data("fenced transition V2 history bound is invalid"))?
+    {
+        return Err(invalid_data(
+            "fenced transition V2 history bind range is invalid",
+        ));
+    }
+    let mut statement = conn
+        .prepare_cached(
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?3 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2",
+        )
+        .map_err(db_error)?;
+    let changed = statement
+        .execute(params![
+            checked_positive_i64(history_epoch)?,
+            checked_i64(previous_count)?,
+            checked_i64(next_count)?,
+        ])
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "fenced transition V2 history bind state is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn store_fenced_transition_v2_receipt_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request: &FencedTransitionV2Request,
+    ordinal: u64,
+    payload_digest: [u8; 32],
+    retained_until: Timestamp,
+    response: &SessionConsensusResponse,
+) -> io::Result<()> {
+    let previous_count = ordinal
+        .checked_sub(1)
+        .ok_or_else(|| invalid_data("fenced transition V2 ordinal is invalid"))?;
+    advance_fenced_transition_v2_history_count_sync(
+        conn,
+        request.request_id().epoch().get(),
+        previous_count,
+        ordinal,
+    )?;
+    store_fenced_transition_v2_receipt_row_sync(
+        conn,
+        identity,
+        request,
+        ordinal,
+        payload_digest,
+        retained_until,
+        response,
+    )
 }
 
 fn compact_fenced_transition_v2_receipt_sync(
@@ -24025,8 +30206,9 @@ fn apply_fenced_transition_v2_batch_command_sync(
     } else {
         (machine.0, machine.1)
     };
-    let mut ordinal = u64::try_from(history.current_bound_count)
+    let initial_bound_count = u64::try_from(history.current_bound_count)
         .map_err(|_| invalid_data("fenced transition V2 ordinal is invalid"))?;
+    let mut ordinal = initial_bound_count;
     for (slot, payload_digest) in fresh {
         if outcomes[slot].is_some() {
             continue;
@@ -24088,7 +30270,7 @@ fn apply_fenced_transition_v2_batch_command_sync(
             logical_time: Some(logical_time),
             raft_log_index,
         };
-        store_fenced_transition_v2_receipt_sync(
+        store_fenced_transition_v2_receipt_row_sync(
             tx,
             storage_identity,
             request,
@@ -24098,6 +30280,14 @@ fn apply_fenced_transition_v2_batch_command_sync(
             &response,
         )?;
         outcomes[slot] = Some(result);
+    }
+    if ordinal != initial_bound_count {
+        advance_fenced_transition_v2_history_count_sync(
+            tx,
+            requests[0].request_id().epoch().get(),
+            initial_bound_count,
+            ordinal,
+        )?;
     }
     let outcomes = outcomes
         .into_iter()
@@ -25043,6 +31233,86 @@ fn read_outcome_sync(
     Ok(Some((digest, response)))
 }
 
+/// Test-only exact classification of one generic consensus padding receipt.
+#[cfg(feature = "test-control")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsensusPaddingReceiptStatus {
+    /// This voter has not durably applied the exact request ID.
+    NotFound,
+    /// The exact authenticated command was durably applied at this index.
+    Recorded {
+        /// Original nonzero Openraft log index retained in the receipt.
+        raft_log_index: u64,
+    },
+    /// The request ID is durably bound to another authenticated payload.
+    Conflict,
+}
+
+/// Read one exact `AdvanceLogicalTime` receipt without proposing or replaying
+/// the command. Every successful answer is bound to the current authenticated
+/// authority and checked against this voter's applied state-machine frontier.
+#[cfg(feature = "test-control")]
+pub(crate) fn consensus_padding_receipt_status_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+) -> io::Result<ConsensusPaddingReceiptStatus> {
+    let expected_digest = authorized_mutation_payload_digest(
+        storage_identity,
+        authority_identity,
+        &SessionMutationIntent::AdvanceLogicalTime,
+    )?;
+    let Some((stored_digest, response)) = read_outcome_sync(conn, storage_identity, request_id)?
+    else {
+        return Ok(ConsensusPaddingReceiptStatus::NotFound);
+    };
+    if stored_digest != expected_digest {
+        return Ok(ConsensusPaddingReceiptStatus::Conflict);
+    }
+
+    let response_digest = match (&response.result, response.digest, response.logical_time) {
+        (Ok(SessionMutationOutcome::Unit), Some(response_digest), Some(response_logical_time))
+            if response.sequence != 0 && response.raft_log_index != 0 =>
+        {
+            (response_digest, response_logical_time)
+        }
+        _ => {
+            return Err(invalid_data(
+                "persisted consensus padding receipt has invalid response shape",
+            ));
+        }
+    };
+    let applied = read_applied_sync(conn, storage_identity)?.ok_or_else(|| {
+        invalid_data("persisted consensus padding receipt has no applied frontier")
+    })?;
+    if response.raft_log_index > applied.index {
+        return Err(invalid_data(
+            "persisted consensus padding receipt is beyond the applied frontier",
+        ));
+    }
+    let (machine_sequence, machine_digest, machine_logical_time, _) =
+        read_machine_sync(conn, storage_identity)?;
+    let machine_logical_time = machine_logical_time.ok_or_else(|| {
+        invalid_data("persisted consensus padding receipt has no machine logical time")
+    })?;
+    if response.sequence > machine_sequence || response_digest.1 > machine_logical_time {
+        return Err(invalid_data(
+            "persisted consensus padding receipt is beyond the machine frontier",
+        ));
+    }
+    if response.sequence == machine_sequence
+        && (response_digest.0 != machine_digest || response_digest.1 != machine_logical_time)
+    {
+        return Err(invalid_data(
+            "persisted consensus padding receipt does not match the machine frontier",
+        ));
+    }
+    Ok(ConsensusPaddingReceiptStatus::Recorded {
+        raft_log_index: response.raft_log_index,
+    })
+}
+
 fn validate_membership_ids(
     membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
 ) -> io::Result<()> {
@@ -25287,6 +31557,7 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::FencedTransitionV2Batch(_)
         | SessionMutationIntent::RosterAdmission(_)
         | SessionMutationIntent::RosterTerminal(_)
+        | SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
         | SessionMutationIntent::RosterAdmissionV2(_)
         | SessionMutationIntent::RosterTerminalV2(_)
         | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
@@ -25467,6 +31738,7 @@ fn execute_intent_sync(
                     | SessionMutationIntent::AbortTopologyTransition { .. }
                     | SessionMutationIntent::FinalizeTopologyTransition { .. }
                     | SessionMutationIntent::FinalizeOperatorRecovery { .. }
+                    | SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
                     | SessionMutationIntent::Authorized { .. }
             ) || !application_authority_matches(&scope, *origin, *authority_identity)
             {
@@ -25474,7 +31746,8 @@ fn execute_intent_sync(
             }
             execute_application_intent_sync(conn, mutation, caps, logical_time)
         }
-        SessionMutationIntent::FinalizeOperatorRecovery { .. } => {
+        SessionMutationIntent::FinalizeOperatorRecovery { .. }
+        | SessionMutationIntent::FinalizeOperatorRecoveryV2(_) => {
             execute_application_intent_sync(conn, intent, caps, logical_time)
         }
         legacy_application => {
@@ -25978,6 +32251,13 @@ pub(crate) fn apply_entries_with_authority_and_diagnostics_sync(
         if entry.log_id.index != expected_index {
             return Err(invalid_data("session consensus apply is not contiguous"));
         }
+        if let Some(previous) = last_applied.as_ref() {
+            ensure_log_id_not_after(
+                previous,
+                &entry.log_id,
+                "session consensus apply leader ordering regressed",
+            )?;
+        }
 
         // Roster application is a self-contained two-command namespace. It
         // intentionally bypasses `consensus_request_outcomes`: that absorbing
@@ -26036,6 +32316,22 @@ pub(crate) fn apply_entries_with_authority_and_diagnostics_sync(
                 }
             }
             EntryPayload::Normal(command) => {
+                if matches!(
+                    &command.intent,
+                    SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
+                ) {
+                    let response = apply_finalize_operator_recovery_v2_in_tx(
+                        &tx,
+                        identity,
+                        &command,
+                        &entry.log_id,
+                        &mut machine,
+                    )?;
+                    save_log_pointer(&tx, "consensus_applied", identity, &entry.log_id)?;
+                    last_applied = Some(entry.log_id);
+                    responses.push(response);
+                    continue;
+                }
                 let digest = payload_digest(identity, &command)?;
                 if let Some((
                     expected_generation,
@@ -26849,11 +33145,436 @@ fn ensure_log_id_not_after(
     later: &LogId<SessionConsensusNodeId>,
     message: &'static str,
 ) -> io::Result<()> {
-    if earlier.index > later.index {
+    if earlier.index > later.index
+        || (earlier.index == later.index && earlier != later)
+        // Raft may advance an index only under the same leader term or a
+        // later term. A different leader in one term is equally a distinct
+        // history: there is one elected leader per term. This is the same
+        // lineage rule used by retained/snapshot marker reconciliation, kept
+        // central so snapshot-floor, recovery-certificate, and durable-log
+        // callers cannot silently diverge.
+        || (earlier.index < later.index
+            && (later.leader_id.term < earlier.leader_id.term
+                || (later.leader_id.term == earlier.leader_id.term
+                    && later.leader_id != earlier.leader_id)))
+    {
         return Err(invalid_data(message));
     }
-    if earlier.index == later.index && earlier != later {
-        return Err(invalid_data(message));
+    Ok(())
+}
+
+/// Bind every durable Raft pointer to one exact retained, purged, or snapshot
+/// LogId.  Numeric indices alone are not lineage: equal indices with a
+/// different term or leader identify different histories.  Both normal
+/// writable reopen and offline recovery call this shared check.
+///
+/// Membership has a second authority dimension beyond its `LogId`: a
+/// retained membership entry or the selected snapshot must attest to the
+/// exact stored membership payload.  A purge marker cannot do that, because
+/// it preserves only an index/term/leader triple.
+pub(crate) struct DurableMembershipLineage<'a> {
+    pub(crate) persisted:
+        &'a StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    pub(crate) snapshot:
+        Option<&'a StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>>,
+    pub(crate) retained:
+        &'a [StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>],
+}
+
+/// Prove the compacted applied-membership case after its retained row is gone.
+/// The caller has already read the persisted membership through the semantic
+/// membership-scope validator. A selected snapshot whose cut reaches that
+/// membership must still carry the exact payload. Only when the selected cut
+/// is older may the later full-LogId purge floor witness the applied
+/// membership's monotonic position; that floor alone is never payload proof.
+fn validate_compacted_persisted_membership_coverage(
+    membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    membership_log: &LogId<SessionConsensusNodeId>,
+    purged: Option<&LogId<SessionConsensusNodeId>>,
+    snapshot: Option<&LogId<SessionConsensusNodeId>>,
+    snapshot_membership: Option<
+        &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    >,
+) -> io::Result<()> {
+    if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.index >= membership_log.index) {
+        ensure_log_id_not_after(
+            membership_log,
+            snapshot,
+            "session consensus snapshot and membership conflict",
+        )?;
+        if snapshot_membership != Some(membership) {
+            return Err(invalid_data(
+                "session consensus compacted membership lacks exact snapshot coverage",
+            ));
+        }
+        return Ok(());
+    }
+
+    let purged = purged.ok_or_else(|| {
+        invalid_data("session consensus compacted membership lacks purge coverage")
+    })?;
+    ensure_log_id_not_after(
+        membership_log,
+        purged,
+        "session consensus purged pointer is before persisted membership",
+    )
+}
+
+pub(crate) fn validate_durable_log_pointer_lineage(
+    committed: Option<&LogId<SessionConsensusNodeId>>,
+    applied: Option<&LogId<SessionConsensusNodeId>>,
+    purged: Option<&LogId<SessionConsensusNodeId>>,
+    snapshot: Option<&LogId<SessionConsensusNodeId>>,
+    membership: DurableMembershipLineage<'_>,
+    retained: &[LogId<SessionConsensusNodeId>],
+    last_logical: Option<&LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    let membership_log = membership.persisted.log_id().as_ref();
+    let snapshot_membership_log = membership
+        .snapshot
+        .and_then(|stored_membership| stored_membership.log_id().as_ref());
+    let same_index_requires_exact = |left: Option<&LogId<SessionConsensusNodeId>>,
+                                     right: Option<&LogId<SessionConsensusNodeId>>,
+                                     message: &'static str| {
+        if let (Some(left), Some(right)) = (left, right) {
+            if left.index == right.index && left != right {
+                return Err(invalid_data(message));
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(applied) = applied {
+        let committed = committed.ok_or_else(|| {
+            invalid_data("session consensus applied pointer lacks committed state")
+        })?;
+        ensure_log_id_not_after(
+            applied,
+            committed,
+            "session consensus applied pointer is beyond committed state",
+        )?;
+    }
+    if let Some(purged) = purged {
+        let applied = applied
+            .ok_or_else(|| invalid_data("session consensus purged pointer lacks applied state"))?;
+        ensure_log_id_not_after(
+            purged,
+            applied,
+            "session consensus purged pointer is beyond applied state",
+        )?;
+    }
+    if let Some(snapshot) = snapshot {
+        let applied = applied
+            .ok_or_else(|| invalid_data("session consensus snapshot is beyond applied state"))?;
+        ensure_log_id_not_after(
+            snapshot,
+            applied,
+            "session consensus snapshot is beyond applied state",
+        )?;
+    }
+    if let Some(membership) = membership_log {
+        let applied = applied
+            .ok_or_else(|| invalid_data("session consensus membership is beyond applied state"))?;
+        ensure_log_id_not_after(
+            membership,
+            applied,
+            "session consensus membership is beyond applied state",
+        )?;
+    } else if !is_pristine_membership(membership.persisted) {
+        return Err(invalid_data(
+            "session consensus membership log identity is missing",
+        ));
+    }
+    if let Some(snapshot_membership) = membership.snapshot {
+        match (snapshot_membership.log_id().as_ref(), snapshot) {
+            (Some(snapshot_membership_log), Some(snapshot)) => ensure_log_id_not_after(
+                snapshot_membership_log,
+                snapshot,
+                "session consensus snapshot membership is beyond its last log",
+            )?,
+            (Some(_), None) => {
+                return Err(invalid_data(
+                    "session consensus snapshot membership lacks snapshot state",
+                ));
+            }
+            (None, _) if !is_pristine_membership(snapshot_membership) => {
+                return Err(invalid_data(
+                    "session consensus snapshot membership log identity is missing",
+                ));
+            }
+            (None, _) => {}
+        }
+    }
+
+    for (left, right, message) in [
+        (
+            committed,
+            applied,
+            "session consensus committed and applied pointers conflict",
+        ),
+        (
+            applied,
+            purged,
+            "session consensus applied and purged pointers conflict",
+        ),
+        (
+            applied,
+            snapshot,
+            "session consensus applied pointer and snapshot conflict",
+        ),
+        (
+            committed,
+            purged,
+            "session consensus committed and purged pointers conflict",
+        ),
+        (
+            committed,
+            snapshot,
+            "session consensus committed pointer and snapshot conflict",
+        ),
+        (
+            purged,
+            snapshot,
+            "session consensus purged pointer and snapshot conflict",
+        ),
+        (
+            committed,
+            membership_log,
+            "session consensus committed pointer and membership conflict",
+        ),
+        (
+            applied,
+            membership_log,
+            "session consensus applied pointer and membership conflict",
+        ),
+        (
+            purged,
+            membership_log,
+            "session consensus purged pointer and membership conflict",
+        ),
+        (
+            snapshot,
+            membership_log,
+            "session consensus snapshot and membership conflict",
+        ),
+        (
+            committed,
+            snapshot_membership_log,
+            "session consensus committed pointer and snapshot membership conflict",
+        ),
+        (
+            applied,
+            snapshot_membership_log,
+            "session consensus applied pointer and snapshot membership conflict",
+        ),
+        (
+            purged,
+            snapshot_membership_log,
+            "session consensus purged pointer and snapshot membership conflict",
+        ),
+        (
+            snapshot,
+            snapshot_membership_log,
+            "session consensus snapshot and snapshot membership conflict",
+        ),
+        (
+            membership_log,
+            snapshot_membership_log,
+            "session consensus persisted and snapshot membership conflict",
+        ),
+    ] {
+        same_index_requires_exact(left, right, message)?;
+    }
+
+    if let Some(committed) = committed {
+        let last_logical = last_logical.ok_or_else(|| {
+            invalid_data("session consensus committed pointer lacks a logical log")
+        })?;
+        ensure_log_id_not_after(
+            committed,
+            last_logical,
+            "session consensus committed pointer is beyond the logical log",
+        )?;
+    }
+
+    let covers = |pointer: &LogId<SessionConsensusNodeId>| {
+        retained.iter().any(|entry| entry == pointer)
+            || purged == Some(pointer)
+            || snapshot == Some(pointer)
+    };
+    for pointer in [
+        committed,
+        applied,
+        purged,
+        snapshot,
+        membership_log,
+        snapshot_membership_log,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if retained
+            .iter()
+            .find(|entry| entry.index == pointer.index)
+            .is_some_and(|entry| entry != pointer)
+        {
+            return Err(invalid_data(
+                "session consensus durable pointer conflicts with retained log",
+            ));
+        }
+    }
+    for pointer in [applied, committed].into_iter().flatten() {
+        if !covers(pointer) {
+            return Err(invalid_data(
+                "session consensus durable pointer lacks exact log coverage",
+            ));
+        }
+    }
+
+    if let Some(persisted_log) = membership_log {
+        let retained_at_membership_index = retained
+            .iter()
+            .any(|entry| entry.index == persisted_log.index);
+        if retained_at_membership_index {
+            if !membership
+                .retained
+                .iter()
+                .any(|entry| entry == membership.persisted)
+            {
+                return Err(invalid_data(
+                    "session consensus retained membership payload conflicts with persisted membership",
+                ));
+            }
+        } else {
+            validate_compacted_persisted_membership_coverage(
+                membership.persisted,
+                persisted_log,
+                purged,
+                snapshot,
+                membership.snapshot,
+            )?;
+        }
+    }
+
+    if let (Some(snapshot_membership_log), Some(snapshot_membership)) =
+        (snapshot_membership_log, membership.snapshot)
+    {
+        if retained
+            .iter()
+            .any(|entry| entry.index == snapshot_membership_log.index)
+            && !membership
+                .retained
+                .iter()
+                .any(|entry| entry == snapshot_membership)
+        {
+            return Err(invalid_data(
+                "session consensus retained membership payload conflicts with snapshot membership",
+            ));
+        }
+    }
+
+    // `consensus_membership` is not merely any historically valid
+    // membership. It is the applied state-machine authority, so it must
+    // equal the newest membership transition which the durable applied
+    // frontier can prove. A retained row or selected snapshot provides exact
+    // payload evidence; the narrowly allowed, scope-validated purge-attested
+    // successor remains a candidate so an older selected snapshot cannot
+    // roll the applied authority back.
+    let latest_retained_membership_at_or_before = |limit: &LogId<SessionConsensusNodeId>| {
+        membership
+            .retained
+            .iter()
+            .filter_map(|stored| {
+                stored
+                    .log_id()
+                    .and_then(|log_id| (log_id.index <= limit.index).then_some((log_id, stored)))
+            })
+            .max_by_key(|(log_id, _)| log_id.index)
+            .map(|(_, stored)| stored)
+    };
+
+    if let Some(applied) = applied {
+        let retained_latest = latest_retained_membership_at_or_before(applied);
+        let snapshot_latest = membership.snapshot.filter(|stored| {
+            stored
+                .log_id()
+                .is_some_and(|log_id| log_id.index <= applied.index)
+        });
+        let latest = [Some(membership.persisted), retained_latest, snapshot_latest]
+            .into_iter()
+            .flatten()
+            .max_by_key(|stored| stored.log_id().map_or(0, |log_id| log_id.index))
+            .expect("persisted membership is always a latest-membership candidate");
+        if latest != membership.persisted {
+            return Err(invalid_data(
+                "session consensus persisted membership is not the latest applied membership",
+            ));
+        }
+    }
+
+    if let (Some(snapshot_log), Some(snapshot_membership)) = (snapshot, membership.snapshot) {
+        if let Some(retained_latest) = latest_retained_membership_at_or_before(snapshot_log) {
+            match snapshot_membership.log_id() {
+                Some(snapshot_membership_log)
+                    if retained_latest.log_id().is_some_and(|retained_log_id| {
+                        retained_log_id.index > snapshot_membership_log.index
+                    }) =>
+                {
+                    return Err(invalid_data(
+                        "session consensus snapshot membership is stale relative to retained log",
+                    ));
+                }
+                None => {
+                    return Err(invalid_data(
+                        "session consensus snapshot membership is stale relative to retained log",
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    // A marker-only lineage has no physically retained edge from which the
+    // row scanner can derive Raft leader ordering.  Fold every durable marker
+    // into that ordering proof so a forged high-term purge followed by a
+    // lower-term snapshot/applied/committed state cannot survive compaction.
+    let mut lineage = retained.to_vec();
+    for pointer in [
+        purged,
+        snapshot,
+        snapshot_membership_log,
+        membership_log,
+        applied,
+        committed,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !lineage.iter().any(|known| known.index == pointer.index) {
+            lineage.push(*pointer);
+        }
+    }
+    lineage.sort_by_key(|log_id| log_id.index);
+    for pair in lineage.windows(2) {
+        let [previous, current] = pair else {
+            unreachable!("a two-element lineage window has exactly two values");
+        };
+        if current.index == previous.index {
+            if current != previous {
+                return Err(invalid_data(
+                    "session consensus durable markers conflict at one log index",
+                ));
+            }
+            continue;
+        }
+        if current.leader_id.term < previous.leader_id.term
+            || (current.leader_id.term == previous.leader_id.term
+                && current.leader_id != previous.leader_id)
+        {
+            return Err(invalid_data(
+                "session consensus durable marker leader ordering regressed",
+            ));
+        }
     }
     Ok(())
 }
@@ -26971,52 +33692,468 @@ fn validate_fixed_durable_state_sync(
     expected_members: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<()> {
     validate_fixed_live_durable_state_sync(conn, identity, expected_members)?;
-    let floor = read_purged_sync(conn, identity)?
+    // Dynamic scope validation permits its narrow purge-attested successor
+    // membership case. Fixed authority deliberately retains the historical
+    // exact-payload rule: once M is compacted, only selected snapshot M may
+    // attest it, even if a later purge marker is otherwise monotonic.
+    let membership = read_membership_sync(conn, identity)?;
+    if let Some(membership_log) = membership.log_id().as_ref() {
+        match retained_membership_at_sync(conn, identity, membership_log)? {
+            Some(retained) if retained != membership => {
+                return Err(invalid_data(
+                    "session consensus retained membership payload conflicts with persisted membership",
+                ));
+            }
+            Some(_) => {}
+            None if read_current_snapshot_sync(conn, identity)?
+                .as_ref()
+                .map(|(meta, _, _, _)| &meta.last_membership)
+                != Some(&membership) =>
+            {
+                return Err(invalid_data(
+                    "session consensus compacted membership lacks exact snapshot coverage",
+                ));
+            }
+            None => {}
+        }
+    }
+    validate_retained_durable_log_sync(conn, identity, |entry| {
+        validate_fixed_log_id(&entry.log_id)?;
+        if fixed_profile_entry_changes_topology(entry, expected_members) {
+            return Err(invalid_data("session consensus fixed log entry is invalid"));
+        }
+        Ok(())
+    })
+}
+
+/// Prove the local log-store pointers which the portable image will replace.
+/// This intentionally does not require compacted membership-payload evidence:
+/// ordinary Raft purge may leave C=A=P at one exact marker after removing its
+/// physical membership row, and the incoming authenticated snapshot supplies
+/// that payload witness. Every replaced pointer must nevertheless have exact
+/// retained/marker coverage and preserve Raft ordering before any table copy.
+fn validate_snapshot_install_replaced_pointers_sync(
+    conn: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    incoming: Option<&LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    let committed = read_committed_sync(conn, identity)?;
+    let applied = read_applied_sync(conn, identity)?;
+    let purged = read_purged_sync(conn, identity)?;
+    let current_snapshot = read_current_snapshot_sync(conn, identity)?;
+    let snapshot = current_snapshot
+        .as_ref()
+        .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref());
+    let snapshot_membership = current_snapshot
+        .as_ref()
+        .map(|(meta, _, _, _)| &meta.last_membership);
+    let snapshot_membership_log =
+        snapshot_membership.and_then(|membership| membership.log_id().as_ref());
+    let membership = read_membership_sync(conn, identity)?;
+    let membership_log = membership.log_id().as_ref();
+    if let Some(floor) = purged.as_ref() {
+        // An exact selected snapshot covers interrupted physical cleanup at
+        // and below its own cut. Without that exact coverage, any remaining
+        // old-prefix debris must still be the contiguous suffix produced by
+        // the bounded prune lane; installation may not hide a partial gap.
+        if snapshot != Some(floor) {
+            validate_exact_log_prune_lineage_in_tx(conn, identity, floor)?;
+        }
+    }
+    if let Some(applied) = applied.as_ref() {
+        let committed = committed.as_ref().ok_or_else(|| {
+            invalid_data("session consensus applied pointer lacks committed state")
+        })?;
+        ensure_log_id_not_after(
+            applied,
+            committed,
+            "session consensus applied pointer is beyond committed state",
+        )?;
+    }
+    if let Some(purged) = purged.as_ref() {
+        let applied = applied
+            .as_ref()
+            .ok_or_else(|| invalid_data("session consensus purged pointer lacks applied state"))?;
+        ensure_log_id_not_after(
+            purged,
+            applied,
+            "session consensus purged pointer is beyond applied state",
+        )?;
+    }
+    if let Some(snapshot) = snapshot {
+        let applied = applied
+            .as_ref()
+            .ok_or_else(|| invalid_data("session consensus snapshot is beyond applied state"))?;
+        ensure_log_id_not_after(
+            snapshot,
+            applied,
+            "session consensus snapshot is beyond applied state",
+        )?;
+        let incoming = incoming.ok_or_else(|| {
+            invalid_data("session consensus snapshot regresses selected snapshot state")
+        })?;
+        ensure_log_id_not_after(
+            snapshot,
+            incoming,
+            "session consensus snapshot regresses selected snapshot state",
+        )?;
+    }
+    if let Some(snapshot_membership_log) = snapshot_membership_log {
+        let snapshot = snapshot.ok_or_else(|| {
+            invalid_data("session consensus snapshot membership lacks snapshot state")
+        })?;
+        ensure_log_id_not_after(
+            snapshot_membership_log,
+            snapshot,
+            "session consensus snapshot membership is beyond its last log",
+        )?;
+    } else if snapshot_membership.is_some_and(|membership| !is_pristine_membership(membership)) {
+        return Err(invalid_data(
+            "session consensus snapshot membership log identity is missing",
+        ));
+    }
+    if let Some(membership_log) = membership_log {
+        let applied = applied
+            .as_ref()
+            .ok_or_else(|| invalid_data("session consensus membership is beyond applied state"))?;
+        ensure_log_id_not_after(
+            membership_log,
+            applied,
+            "session consensus membership is beyond applied state",
+        )?;
+    } else if !is_pristine_membership(&membership) {
+        return Err(invalid_data(
+            "session consensus membership log identity is missing",
+        ));
+    }
+    let same_index_requires_exact = |left: Option<&LogId<SessionConsensusNodeId>>,
+                                     right: Option<&LogId<SessionConsensusNodeId>>,
+                                     message: &'static str| {
+        if let (Some(left), Some(right)) = (left, right) {
+            if left.index == right.index && left != right {
+                return Err(invalid_data(message));
+            }
+        }
+        Ok(())
+    };
+    for (left, right, message) in [
+        (
+            membership_log,
+            purged.as_ref(),
+            "session consensus purged pointer and membership conflict",
+        ),
+        (
+            membership_log,
+            snapshot,
+            "session consensus snapshot and membership conflict",
+        ),
+        (
+            membership_log,
+            snapshot_membership_log,
+            "session consensus persisted and snapshot membership conflict",
+        ),
+        (
+            snapshot_membership_log,
+            purged.as_ref(),
+            "session consensus purged pointer and snapshot membership conflict",
+        ),
+        (
+            snapshot_membership_log,
+            applied.as_ref(),
+            "session consensus applied pointer and snapshot membership conflict",
+        ),
+        (
+            snapshot_membership_log,
+            committed.as_ref(),
+            "session consensus committed pointer and snapshot membership conflict",
+        ),
+    ] {
+        same_index_requires_exact(left, right, message)?;
+    }
+    if let Some(membership_log) = membership_log {
+        if let Some(retained) = retained_membership_at_sync(conn, identity, membership_log)? {
+            if retained != membership {
+                return Err(invalid_data(
+                    "session consensus retained membership payload conflicts with persisted membership",
+                ));
+            }
+        } else if authority_profile == ConsensusAuthorityProfile::Dynamic {
+            validate_compacted_persisted_membership_coverage(
+                &membership,
+                membership_log,
+                purged.as_ref(),
+                snapshot,
+                snapshot_membership,
+            )?;
+        } else if snapshot_membership != Some(&membership) {
+            return Err(invalid_data(
+                "session consensus compacted membership lacks exact snapshot coverage",
+            ));
+        }
+    }
+    if let (Some(snapshot_membership_log), Some(snapshot_membership)) =
+        (snapshot_membership_log, snapshot_membership)
+    {
+        if let Some(retained) =
+            retained_membership_at_sync(conn, identity, snapshot_membership_log)?
+        {
+            if retained != *snapshot_membership {
+                return Err(invalid_data(
+                    "session consensus retained membership payload conflicts with snapshot membership",
+                ));
+            }
+        }
+    }
+    for pointer in [
+        purged.as_ref(),
+        applied.as_ref(),
+        committed.as_ref(),
+        snapshot,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_exact_log_prefix_through_sync(conn, identity, pointer, false)?;
+    }
+    if purged.is_none() && snapshot.is_none() {
+        for pointer in [applied.as_ref(), committed.as_ref()].into_iter().flatten() {
+            if retained_log_id_at_sync(conn, identity, pointer.index)?.as_ref() != Some(pointer) {
+                return Err(invalid_data(
+                    "session consensus uncompacted pointer lacks exact retained log coverage",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the complete physical suffix which will survive or be covered by
+/// an incoming portable snapshot. Existing rows may end before the incoming
+/// cut (the authenticated snapshot covers that missing tail), but they may
+/// never contain an internal gap, malformed entry, leader regression, or a
+/// different full LogId at the incoming cut. A selected local snapshot may be
+/// the predecessor only when the first retained row is exactly its successor.
+fn validate_snapshot_install_retained_rows_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    fixed_expected_members: &BTreeSet<SessionConsensusNodeId>,
+    incoming: Option<&LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    let purged = read_purged_sync(conn, identity)?;
+    let current_snapshot = read_current_snapshot_sync(conn, identity)?;
+    let snapshot = current_snapshot
+        .as_ref()
+        .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref());
+    let first_index: Option<i64> = conn
+        .query_row("SELECT MIN(log_index) FROM consensus_log", [], |row| {
+            row.get(0)
+        })
+        .map_err(db_error)?;
+    let first_index = first_index.map(checked_u64).transpose()?;
+    let snapshot_successor = snapshot
+        .map(|snapshot| {
+            snapshot
+                .index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session consensus snapshot index is exhausted"))
+        })
+        .transpose()?;
+    let start = if purged.is_none()
+        && snapshot_successor.is_some_and(|successor| first_index == Some(successor))
+    {
+        snapshot_successor.expect("selected snapshot successor was matched")
+    } else {
+        0
+    };
+    let entries = read_log_range_sync(conn, identity, start, None, None)?;
+    if start != 0 {
+        if let (Some(snapshot), Some(first)) = (snapshot, entries.first()) {
+            ensure_log_id_not_after(
+                snapshot,
+                &first.log_id,
+                "session consensus retained log regresses selected snapshot",
+            )?;
+        }
+    }
+    if incoming.is_none() && !entries.is_empty() {
+        return Err(invalid_data(
+            "session consensus pristine snapshot cannot replace retained logs",
+        ));
+    }
+    for entry in &entries {
+        if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+            validate_fixed_log_id(&entry.log_id)?;
+            if fixed_profile_entry_changes_topology(entry, fixed_expected_members) {
+                return Err(invalid_data("session consensus fixed log entry is invalid"));
+            }
+        }
+        if incoming.is_some_and(|incoming| {
+            entry.log_id.index == incoming.index && entry.log_id != *incoming
+        }) {
+            return Err(invalid_data(
+                "session consensus incoming snapshot conflicts with retained log",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Audit every local pointer and retained row after a portable snapshot
+/// replacement. Dynamic authority applies the ordinary durable-log decoder
+/// and lineage proof; fixed authority additionally rejects any entry outside
+/// its immutable topology. The published snapshot now supplies compacted
+/// membership evidence, so this binds every surviving physical suffix to the
+/// new selected snapshot and purge cut.
+fn validate_snapshot_install_retained_log_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    fixed_expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        validate_fixed_durable_state_sync(conn, identity, fixed_expected_members)
+    } else {
+        validate_retained_durable_log_sync(conn, identity, |_| Ok(()))
+    }
+}
+
+/// Decode and bind every physically retained durable-log row above the
+/// logical purge floor. Legacy V1 entries retain their historical decoder
+/// compatibility, but [`decode_consensus_log_entry`] switches to exact V2
+/// validation whenever V2 material is present, including hidden fields.
+fn validate_retained_durable_log_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    mut validate_entry: impl FnMut(&Entry<SessionRaftTypeConfig>) -> io::Result<()>,
+) -> io::Result<()> {
+    let committed = read_committed_sync(conn, identity)?;
+    let applied = read_applied_sync(conn, identity)?;
+    let purged = read_purged_sync(conn, identity)?;
+    let membership = read_membership_sync(conn, identity)?;
+    let floor = purged
+        .as_ref()
         .map(|log| checked_i64(log.index))
         .transpose()?
         .unwrap_or(-1);
+    let current_snapshot = read_current_snapshot_sync(conn, identity)?;
+    let snapshot_floor = current_snapshot
+        .as_ref()
+        .and_then(|(meta, _, _, _)| meta.last_log_id);
+    let snapshot_membership = current_snapshot
+        .as_ref()
+        .map(|(meta, _, _, _)| &meta.last_membership);
     let mut statement = conn
         .prepare(
             "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index > ?1 ORDER BY log_index ASC",
         )
         .map_err(db_error)?;
     let mut rows = statement.query([floor]).map_err(db_error)?;
-    let mut expected = if floor < 0 {
-        0
-    } else {
-        u64::try_from(floor)
-            .map_err(|_| invalid_data("session consensus fixed retained log index is invalid"))?
-            .checked_add(1)
-            .ok_or_else(|| {
-                invalid_data("session consensus fixed retained log index is exhausted")
-            })?
-    };
+    let mut first = true;
+    let mut expected_index = None;
+    let mut previous_log = None;
+    let mut retained_log_ids = Vec::new();
+    let mut retained_memberships = Vec::new();
     while let Some(row) = rows.next().map_err(db_error)? {
         let epoch: i64 = row.get(0).map_err(db_error)?;
         let term: i64 = row.get(1).map_err(db_error)?;
         let index: i64 = row.get(2).map_err(db_error)?;
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, identity)?;
-        let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
-        validate_fixed_log_id(&entry.log_id)?;
+        let entry = decode_consensus_log_entry(&encoded)?;
+        validate_log_id(&entry.log_id)?;
         if let EntryPayload::Normal(command) = &entry.payload {
             validate_command_for_log(command, identity)?;
         }
         if checked_u64(term)? != entry.log_id.leader_id.term
             || checked_u64(index)? != entry.log_id.index
-            || fixed_profile_entry_changes_topology(&entry, expected_members)
         {
-            return Err(invalid_data("session consensus fixed log entry is invalid"));
+            return Err(invalid_data("persisted session consensus log row mismatch"));
         }
-        if entry.log_id.index != expected {
+        // A snapshot describes one exact LogId, not merely its index.  If the
+        // covered row remains physically retained, startup must reject a
+        // term/leader splice at that index instead of treating the snapshot
+        // and log as two independently plausible histories.
+        if snapshot_floor.as_ref().is_some_and(|snapshot| {
+            entry.log_id.index == snapshot.index && entry.log_id != *snapshot
+        }) {
             return Err(invalid_data(
-                "session consensus fixed retained log contains a hole",
+                "persisted session consensus snapshot does not match retained log",
             ));
         }
-        expected = expected.checked_add(1).ok_or_else(|| {
-            invalid_data("session consensus fixed retained log index is exhausted")
-        })?;
+        if first {
+            match (purged.as_ref(), snapshot_floor.as_ref()) {
+                (Some(purged), _) => {
+                    expected_index = Some(purged.index.checked_add(1).ok_or_else(|| {
+                        invalid_data("session consensus retained log index is exhausted")
+                    })?);
+                    previous_log = Some(*purged);
+                }
+                (None, Some(snapshot))
+                    if entry.log_id.index
+                        == snapshot.index.checked_add(1).ok_or_else(|| {
+                            invalid_data("session consensus retained log index is exhausted")
+                        })? =>
+                {
+                    // A snapshot may authorize a missing physical prefix only
+                    // when no durable purge says that the prefix must remain.
+                    expected_index = Some(entry.log_id.index);
+                    previous_log = Some(*snapshot);
+                }
+                (None, _) => expected_index = Some(0),
+            }
+            first = false;
+        }
+        let expected = expected_index
+            .ok_or_else(|| invalid_data("session consensus retained log index is unavailable"))?;
+        if entry.log_id.index != expected {
+            return Err(invalid_data(
+                "persisted session consensus retained log contains a hole",
+            ));
+        }
+        if let Some(previous) = previous_log.as_ref() {
+            if entry.log_id.leader_id.term < previous.leader_id.term
+                || (entry.log_id.leader_id.term == previous.leader_id.term
+                    && entry.log_id.leader_id != previous.leader_id)
+            {
+                return Err(invalid_data(
+                    "persisted session consensus log leader ordering regressed",
+                ));
+            }
+        }
+        validate_entry(&entry)?;
+        if let EntryPayload::Membership(payload) = &entry.payload {
+            retained_memberships.push(StoredMembership::new(Some(entry.log_id), payload.clone()));
+        }
+        retained_log_ids.push(entry.log_id);
+        expected_index =
+            Some(entry.log_id.index.checked_add(1).ok_or_else(|| {
+                invalid_data("session consensus retained log index is exhausted")
+            })?);
+        previous_log = Some(entry.log_id);
     }
+    // The logical head may be supplied by an exact snapshot even when a
+    // compacted physical suffix remains below it. Never let a lower retained
+    // row hide that snapshot from the committed-pointer bound.
+    let last_logical = retained_log_ids
+        .iter()
+        .chain(purged.iter())
+        .chain(snapshot_floor.iter())
+        .max_by_key(|log_id| log_id.index);
+    validate_durable_log_pointer_lineage(
+        committed.as_ref(),
+        applied.as_ref(),
+        purged.as_ref(),
+        snapshot_floor.as_ref(),
+        DurableMembershipLineage {
+            persisted: &membership,
+            snapshot: snapshot_membership,
+            retained: &retained_memberships,
+        },
+        &retained_log_ids,
+        last_logical,
+    )?;
     Ok(())
 }
 
@@ -27505,7 +34642,7 @@ pub(crate) fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn build_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -27514,6 +34651,7 @@ pub(crate) fn build_snapshot_database_sync(
     build_snapshot_database_with_capture_hook_sync(conn, identity, path, || {})
 }
 
+#[cfg(test)]
 pub(crate) fn build_snapshot_database_with_capture_hook_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -27524,10 +34662,12 @@ pub(crate) fn build_snapshot_database_with_capture_hook_sync(
     validate_sealed_state_sync(&tx)?;
     validate_fenced_transition_receipts_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
+    let intermediate = create_pinned_snapshot_database_intermediate(&destination)?;
     let (snapshot, mut destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
         &tx,
         identity,
         destination,
+        intermediate,
         capture_hook,
     )?;
     tx.commit().map_err(db_error)?;
@@ -27544,6 +34684,7 @@ pub(crate) struct SnapshotBuildAuthority<'a> {
     pub(crate) fixed_placement_policy: Option<PlacementResiliencePolicy>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     conn: &Connection,
     authority: SnapshotBuildAuthority<'_>,
@@ -27560,6 +34701,7 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
     conn: &Connection,
     authority: SnapshotBuildAuthority<'_>,
@@ -27583,17 +34725,84 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_syn
     // Do not create even an empty snapshot artifact until the durable fixed
     // authority check has succeeded under the source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
+    let intermediate = create_pinned_snapshot_database_intermediate(&destination)?;
     let (snapshot, destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
         &tx,
         authority.identity,
         destination,
+        intermediate,
         capture_hook,
     )?;
     tx.commit().map_err(db_error)?;
     Ok((snapshot, destination))
 }
 
-#[allow(dead_code)]
+/// Build a fallback snapshot into two caller-created descriptor-pinned
+/// namespace children.  Storage creates both files with `O_EXCL` and arms
+/// their emergency cleanup before it acquires the source connection, so no
+/// fallible SQLite setup can leave an unowned logical pathname behind.
+///
+/// `destination` is the final compacted SQLite image and `intermediate` is
+/// the raw `vacuum-raw-*` backup.  Both remain exact-inode authority for the
+/// whole operation; this function never reopens either parent/name to create
+/// a replacement file.
+pub(crate) fn build_snapshot_database_pinned_with_authority_into_sync(
+    conn: &Connection,
+    authority: SnapshotBuildAuthority<'_>,
+    destination: crate::consensus::snapshot::PinnedSqliteFile,
+    intermediate: crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
+    build_snapshot_database_pinned_with_authority_and_capture_hook_into_sync(
+        conn,
+        authority,
+        destination,
+        intermediate,
+        || {},
+    )
+}
+
+/// Capture-hook counterpart to
+/// [`build_snapshot_database_pinned_with_authority_into_sync`].  This is
+/// kept separate from the pathname API so production namespace callers never
+/// downgrade a precreated file to path-based creation.
+pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_into_sync(
+    conn: &Connection,
+    authority: SnapshotBuildAuthority<'_>,
+    destination: crate::consensus::snapshot::PinnedSqliteFile,
+    intermediate: crate::consensus::snapshot::PinnedSqliteFile,
+    capture_hook: impl FnOnce(),
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
+    destination.verify_linked_identity()?;
+    intermediate.verify_linked_identity()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
+    validate_durable_authority_for_raw_access(
+        &tx,
+        authority.identity,
+        authority.profile,
+        authority.expected_members,
+        authority.expected_bindings,
+        authority.fixed_placement_policy,
+    )?;
+    validate_sealed_state_sync(&tx)?;
+    validate_fenced_transition_receipts_sync(&tx, authority.identity)?;
+    let (snapshot, destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
+        &tx,
+        authority.identity,
+        destination,
+        intermediate,
+        capture_hook,
+    )?;
+    tx.commit().map_err(db_error)?;
+    Ok((snapshot, destination))
+}
+
+#[cfg(test)]
 pub(crate) fn build_snapshot_database_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -27624,15 +34833,22 @@ fn build_snapshot_database_from_pinned_with_capture_hook_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     destination: crate::consensus::snapshot::PinnedSqliteFile,
+    intermediate: crate::consensus::snapshot::PinnedSqliteFile,
     capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
-    capture_and_finalize_snapshot_database_sync(conn, identity, destination, capture_hook)
+    capture_and_finalize_snapshot_database_sync(
+        conn,
+        identity,
+        destination,
+        intermediate,
+        capture_hook,
+    )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn create_pinned_snapshot_database(
     path: &std::path::Path,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
@@ -27670,9 +34886,23 @@ fn create_pinned_snapshot_database(
 // `-shm` sidecars. `create_new` remains the authority check; the bounded
 // counter only avoids collision with an interrupted sibling from this or
 // another process.
+#[cfg(test)]
 const SNAPSHOT_INTERMEDIATE_CREATE_ATTEMPTS: usize = 32;
 static SNAPSHOT_INTERMEDIATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Produce one canonical `vacuum-raw-*` basename for a caller-created
+/// snapshot intermediate.  Namespace owners must still create it with
+/// `O_EXCL` and retry a bounded number of collisions; this helper merely
+/// keeps every producer on the restart scavenger's grammar.
+pub(crate) fn next_snapshot_database_intermediate_name() -> std::ffi::OsString {
+    let sequence = SNAPSHOT_INTERMEDIATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut name = std::ffi::OsString::from("vacuum-raw-");
+    name.push(format!("{}-{sequence}", std::process::id()));
+    name.push(".sqlite");
+    name
+}
+
+#[cfg(test)]
 fn create_pinned_snapshot_database_intermediate(
     final_destination: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
@@ -27686,10 +34916,7 @@ fn create_pinned_snapshot_database_intermediate(
         ));
     }
     for _ in 0..SNAPSHOT_INTERMEDIATE_CREATE_ATTEMPTS {
-        let sequence = SNAPSHOT_INTERMEDIATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut name = std::ffi::OsString::from("vacuum-raw-");
-        name.push(format!("{}-{sequence}", std::process::id()));
-        name.push(".sqlite");
+        let name = next_snapshot_database_intermediate_name();
         match create_pinned_snapshot_database(&parent.join(name)) {
             Ok(intermediate) => return Ok(intermediate),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -27967,6 +35194,8 @@ const SNAPSHOT_BACKUP_STEP_PAGES: i32 = 128;
 const SNAPSHOT_BACKUP_BUSY_RETRY_LIMIT: usize = 8;
 const SNAPSHOT_BACKUP_STEP_LIMIT: usize =
     (SNAPSHOT_DATABASE_MAX_BYTES / 512 / SNAPSHOT_BACKUP_STEP_PAGES as u64 + 1) as usize;
+const SNAPSHOT_FOREGROUND_PACING_PAUSE: Duration = Duration::from_millis(32);
+const SNAPSHOT_COMPACTION_FOREGROUND_PROGRESS_OPS: i32 = 4_096;
 
 /// One VFS-verified, independently pinned SQLite snapshot reader.
 ///
@@ -28186,6 +35415,7 @@ fn backup_snapshot_reader_bounded(
     reader: &SnapshotReadConnection,
     destination: &mut Connection,
     wal_maximum: u64,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
 ) -> io::Result<u64> {
     backup_snapshot_reader_bounded_with_hook_and_step(
         reader,
@@ -28193,6 +35423,7 @@ fn backup_snapshot_reader_bounded(
         wal_maximum,
         || {},
         |backup| backup.step(SNAPSHOT_BACKUP_STEP_PAGES),
+        || foreground_pacer.pace(),
     )
 }
 
@@ -28215,24 +35446,27 @@ where
         wal_maximum,
         after_step,
         |backup| backup.step(SNAPSHOT_BACKUP_STEP_PAGES),
+        || {},
     )
 }
 
 /// Keep step result injection confined to this private test seam: production
 /// supplies the exact `Backup::step` call above, while the test can prove a
 /// post-step WAL overflow wins over a SQLite step error.
-fn backup_snapshot_reader_bounded_with_hook_and_step<F, S>(
+fn backup_snapshot_reader_bounded_with_hook_and_step<F, S, P>(
     reader: &SnapshotReadConnection,
     destination: &mut Connection,
     wal_maximum: u64,
     mut after_step: F,
     mut step: S,
+    mut pace: P,
 ) -> io::Result<u64>
 where
     F: FnMut(),
     S: for<'a, 'b> FnMut(
         &rusqlite::backup::Backup<'a, 'b>,
     ) -> rusqlite::Result<rusqlite::backup::StepResult>,
+    P: FnMut(),
 {
     let mut wal_peak = validate_snapshot_reader_wal_bound(reader, wal_maximum)?;
     let backup =
@@ -28252,7 +35486,7 @@ where
         let result = result.map_err(db_error)?;
         match result {
             rusqlite::backup::StepResult::Done => return Ok(wal_peak),
-            rusqlite::backup::StepResult::More => {}
+            rusqlite::backup::StepResult::More => pace(),
             rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
                 return Err(invalid_data(
                     "session consensus bounded snapshot backup lost its SQLite read lock",
@@ -28539,6 +35773,32 @@ fn validate_snapshot_compaction_foreign_keys_sync(conn: &Connection) -> io::Resu
     Ok(())
 }
 
+struct SnapshotCompactionProgressGuard<'a>(&'a Connection);
+
+impl Drop for SnapshotCompactionProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+fn install_snapshot_compaction_foreground_pacer(
+    conn: &Connection,
+    foreground_pacer: ConsensusSnapshotForegroundPacer,
+) -> SnapshotCompactionProgressGuard<'_> {
+    install_snapshot_compaction_progress_handler(conn, move || {
+        foreground_pacer.pace();
+        false
+    })
+}
+
+fn install_snapshot_compaction_progress_handler(
+    conn: &Connection,
+    progress: impl FnMut() -> bool + Send + 'static,
+) -> SnapshotCompactionProgressGuard<'_> {
+    conn.progress_handler(SNAPSHOT_COMPACTION_FOREGROUND_PROGRESS_OPS, Some(progress));
+    SnapshotCompactionProgressGuard(conn)
+}
+
 /// Copy the already-validated raw image into a fresh descriptor-pinned image.
 /// Unlike `VACUUM INTO`, every page of the output belongs to this connection's
 /// `main` database, whose page-size-derived cap was installed while it was
@@ -28548,6 +35808,18 @@ fn compact_pinned_snapshot_database_sync(
     source: &crate::consensus::snapshot::PinnedSqliteFile,
     compacted: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<()> {
+    compact_pinned_snapshot_database_with_pacer_sync(
+        source,
+        compacted,
+        &ConsensusSnapshotForegroundPacer::default(),
+    )
+}
+
+fn compact_pinned_snapshot_database_with_pacer_sync(
+    source: &crate::consensus::snapshot::PinnedSqliteFile,
+    compacted: &crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
+) -> io::Result<()> {
     let settings = snapshot_compaction_source_settings_sync(source)?;
     let destination = open_empty_pinned_snapshot_compaction_database(
         compacted,
@@ -28555,6 +35827,8 @@ fn compact_pinned_snapshot_database_sync(
         settings.auto_vacuum,
     )?;
     disable_snapshot_database_journal_sync(&destination)?;
+    let _progress =
+        install_snapshot_compaction_foreground_pacer(&destination, foreground_pacer.clone());
     destination
         .execute_batch("PRAGMA foreign_keys = OFF;")
         .map_err(db_error)?;
@@ -28648,28 +35922,14 @@ fn checked_snapshot_capture_workspace_bytes(component_bytes: &[u64]) -> io::Resu
 fn pinned_snapshot_database_sidecar_bytes_sync(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<u64> {
-    ["-journal", "-wal", "-shm"]
-        .iter()
-        .try_fold(0_u64, |total, suffix| {
-            let mut sidecar = pinned.path().as_os_str().to_os_string();
-            sidecar.push(suffix);
-            match std::fs::symlink_metadata(PathBuf::from(sidecar)) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(total),
-                Err(error) => Err(error),
-                Ok(metadata) if !metadata.is_file() => Err(invalid_data(
-                    "session consensus snapshot sidecar is not a regular file",
-                )),
-                Ok(metadata) => total.checked_add(metadata.len()).ok_or_else(|| {
-                    invalid_data("session consensus snapshot sidecar accounting overflowed")
-                }),
-            }
-        })
+    pinned.sidecar_bytes()
 }
 
 /// Copy one already-fixed source reader image into a descriptor-pinned raw
 /// snapshot. This never performs destination cleanup or validation while the
 /// source reader remains open.
 #[allow(clippy::too_many_arguments)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn capture_snapshot_database_from_reader_sync(
     reader: &SnapshotReadConnection,
     identity: SessionConsensusIdentity,
@@ -28684,6 +35944,42 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
     crate::consensus::snapshot::PinnedSqliteFile,
     u64,
 )> {
+    let pinned = create_pinned_snapshot_database(path)?;
+    capture_snapshot_database_from_reader_into_sync(
+        reader,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        expected_cut,
+        pinned,
+        &ConsensusSnapshotForegroundPacer::default(),
+    )
+}
+
+/// Descriptor-pinned counterpart to
+/// [`capture_snapshot_database_from_reader_sync`].  The caller has already
+/// created `pinned` with namespace-relative `O_EXCL` and armed cleanup before
+/// the first fallible source validation.  No destination pathname is opened
+/// or created by this path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_snapshot_database_from_reader_into_sync(
+    reader: &SnapshotReadConnection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    expected_cut: &ConsensusAppliedMembership,
+    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+    u64,
+)> {
+    pinned.verify_linked_identity()?;
     verify_snapshot_read_connection(reader)?;
     snapshot_database_extent_sync(&reader.connection)?;
     let source_bytes = reader.source.file().metadata()?.len();
@@ -28705,11 +36001,14 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
             "session consensus snapshot source cut differs from the live cut",
         ));
     }
-    let mut pinned = create_pinned_snapshot_database(path)?;
     let mut destination = open_pinned_snapshot_database(&pinned)?;
     disable_snapshot_database_journal_sync(&destination)?;
-    let wal_bytes =
-        backup_snapshot_reader_bounded(reader, &mut destination, SNAPSHOT_SOURCE_WAL_MAX_BYTES)?;
+    let wal_bytes = backup_snapshot_reader_bounded(
+        reader,
+        &mut destination,
+        SNAPSHOT_SOURCE_WAL_MAX_BYTES,
+        foreground_pacer,
+    )?;
     snapshot_database_extent_sync(&destination)?;
     drop(destination);
     pinned.capture_created_sidecars();
@@ -28724,6 +36023,7 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
 
 /// Finish a raw snapshot only after its reader has been released.
 #[allow(clippy::too_many_arguments)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn finalize_captured_snapshot_database_sync(
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,
@@ -28731,14 +36031,44 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     expected_cut: &ConsensusAppliedMembership,
-    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    pinned: crate::consensus::snapshot::PinnedSqliteFile,
     vacuum_path: &Path,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    let compacted = create_pinned_snapshot_database(vacuum_path)?;
+    finalize_captured_snapshot_database_into_sync(
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        expected_cut,
+        pinned,
+        compacted,
+        &ConsensusSnapshotForegroundPacer::default(),
+    )
+}
+
+/// Finalize a reader-captured raw image into a caller-created compacted
+/// namespace child.  Both inputs retain the original `O_EXCL` descriptors
+/// and cleanup guards; this never recreates the raw or vacuum pathname.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_captured_snapshot_database_into_sync(
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    expected_cut: &ConsensusAppliedMembership,
+    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    mut compacted: crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
     // Create and retain the fresh compacted descriptor before SQLite sees it:
-    // a bare pathname would leave a replacement window and does not guarantee
-    // O_EXCL/O_NOFOLLOW. The logical copier installs its actual-page-size
-    // extent guard on this empty descriptor before it creates any schema page.
-    let mut compacted = create_pinned_snapshot_database(vacuum_path)?;
+    // the caller supplied an already-created `O_EXCL` descriptor, so a bare
+    // pathname cannot replace it between creation and the first SQLite page.
+    // The logical copier installs its actual-page-size extent guard on this
+    // empty descriptor before it creates any schema page.
+    pinned.verify_linked_identity()?;
     compacted.verify_linked_identity()?;
     let destination = open_pinned_snapshot_database(&pinned)?;
     disable_snapshot_database_journal_sync(&destination)?;
@@ -28767,7 +36097,7 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
     verify_pinned_snapshot_descriptor(&pinned, &destination)?;
     drop(destination);
     pinned.capture_created_sidecars();
-    compact_pinned_snapshot_database_sync(&pinned, &compacted)?;
+    compact_pinned_snapshot_database_with_pacer_sync(&pinned, &compacted, foreground_pacer)?;
 
     compacted.verify_linked_identity()?;
     compacted.file().sync_all()?;
@@ -28778,7 +36108,7 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
         compacted.file().metadata()?.len(),
         pinned_snapshot_database_sidecar_bytes_sync(&compacted)?,
     ])?;
-    sync_snapshot_parent_directory(vacuum_path)?;
+    compacted.sync_parent_directory()?;
     let compacted_connection = open_pinned_snapshot_database(&compacted)?;
     validate_durable_authority_for_raw_access(
         &compacted_connection,
@@ -28801,21 +36131,10 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
     }
     compacted = refresh_pinned_snapshot_database(compacted)?;
     verify_pinned_snapshot_descriptor(&compacted, &compacted_connection)?;
-    if !compacted.path_matches_identity(vacuum_path)? {
-        return Err(invalid_data(
-            "session consensus compacted snapshot path was replaced",
-        ));
-    }
+    compacted.verify_linked_identity()?;
     drop(compacted_connection);
     compacted.capture_created_sidecars();
     Ok(compacted)
-}
-
-fn sync_snapshot_parent_directory(path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_data("session consensus vacuum snapshot has no parent"))?;
-    File::open(parent)?.sync_all()
 }
 
 /// Capture the source image while the caller holds the SQLite transaction that
@@ -28825,6 +36144,7 @@ fn capture_and_finalize_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    mut raw: crate::consensus::snapshot::PinnedSqliteFile,
     capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
@@ -28837,11 +36157,12 @@ fn capture_and_finalize_snapshot_database_sync(
     capture_hook();
     let (expected_pages, page_size) = snapshot_database_extent_sync(conn)?;
 
-    // Keep the caller-provided descriptor empty until the raw source has been
-    // validated. The intermediate has exact cleanup ownership; the final
-    // descriptor is populated only by `compact_pinned_snapshot_database_sync`,
-    // whose page-size-derived cap is installed before its first schema page.
-    let mut raw = create_pinned_snapshot_database_intermediate(&pinned)?;
+    // Both caller-provided descriptors were created and cleanup-armed before
+    // any fallible SQLite setup.  Keep the final image empty until the raw
+    // source has been validated; the intermediate remains exact cleanup
+    // authority while SQLite fills it.
+    pinned.verify_linked_identity()?;
+    raw.verify_linked_identity()?;
     let mut raw_destination = open_pinned_snapshot_database(&raw)?;
     disable_snapshot_database_journal_sync(&raw_destination)?;
     {
@@ -29423,6 +36744,39 @@ fn attached_snapshot_table_exists(conn: &Connection, table: &str) -> io::Result<
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM consensus_incoming.sqlite_master WHERE type = 'table' AND name = ?1)",
         [table],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+fn attached_snapshot_operator_recovery_finalize_log_column_exists(
+    conn: &Connection,
+) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery', 'consensus_incoming') WHERE name = 'finalize_log_id_json')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+fn attached_snapshot_operator_recovery_finalize_certificate_column_exists(
+    conn: &Connection,
+) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery', 'consensus_incoming') WHERE name = 'finalize_entry_json')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+fn attached_snapshot_operator_recovery_v2_activation_column_exists(
+    conn: &Connection,
+) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery', 'consensus_incoming') WHERE name = 'recovery_v2_activated')",
+        [],
         |row| row.get(0),
     )
     .map_err(db_error)
@@ -30940,6 +38294,9 @@ fn create_attached_snapshot_validation_views(
     conn: &Connection,
     lease_schema: AttachedSnapshotLeaseSchema,
     incoming_has_protected_roster: bool,
+    incoming_has_recovery_finalize_log: bool,
+    incoming_has_recovery_finalize_certificate: bool,
+    incoming_has_recovery_v2_activation: bool,
     incoming_has_protected_roster_v2: bool,
 ) -> io::Result<()> {
     for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
@@ -30970,6 +38327,38 @@ fn create_attached_snapshot_validation_views(
             "CREATE TEMP VIEW consensus_fenced_transition_v2_activation AS SELECT CAST(NULL AS INTEGER) AS singleton, CAST(NULL AS INTEGER) AS storage_configuration_epoch, CAST(NULL AS BLOB) AS scope_configuration_id, CAST(NULL AS INTEGER) AS scope_configuration_epoch, CAST(NULL AS BLOB) AS voter_set_digest, CAST(NULL AS BLOB) AS profile_digest WHERE 0".to_owned()
         } else if *table == "consensus_fenced_transition_v2_history" && !source_exists {
             "CREATE TEMP VIEW consensus_fenced_transition_v2_history AS SELECT CAST(NULL AS INTEGER) AS singleton, CAST(NULL AS INTEGER) AS storage_configuration_epoch, CAST(NULL AS BLOB) AS profile_digest, CAST(NULL AS INTEGER) AS active_epoch, CAST(NULL AS INTEGER) AS retired_through_epoch, CAST(NULL AS INTEGER) AS generation, CAST(NULL AS INTEGER) AS current_bound_count, CAST(NULL AS INTEGER) AS reclaim_epoch, CAST(NULL AS INTEGER) AS reclaim_cursor_ordinal, CAST(NULL AS INTEGER) AS reclaim_remaining, CAST(NULL AS INTEGER) AS reclaimed_entries WHERE 0".to_owned()
+        } else if *table == "consensus_operator_recovery" {
+            match (
+                incoming_has_recovery_finalize_log,
+                incoming_has_recovery_finalize_certificate,
+            ) {
+                (true, true) if incoming_has_recovery_v2_activation => {
+                    "CREATE TEMP VIEW consensus_operator_recovery AS SELECT * FROM consensus_incoming.consensus_operator_recovery".to_owned()
+                }
+                (true, true) => {
+                    // An exact complete pre-fence V2 image has just passed
+                    // the raw certificate gate. Backfill its one-way marker
+                    // in the validation projection before any reader or copy
+                    // can compare it with local state.
+                    "CREATE TEMP VIEW consensus_operator_recovery AS SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, CAST(1 AS INTEGER) AS recovery_v2_activated FROM consensus_incoming.consensus_operator_recovery".to_owned()
+                }
+                (true, false) => {
+                    return Err(invalid_data(
+                        "session consensus snapshot recovery certificate schema is incomplete",
+                    ));
+                }
+                (false, false) => {
+                    // The historical shape has no V2 finalization identity;
+                    // both current columns are canonically NULL for attached
+                    // validation and are materialized that way on copy.
+                    "CREATE TEMP VIEW consensus_operator_recovery AS SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, CAST(NULL AS BLOB) AS finalize_log_id_json, CAST(NULL AS BLOB) AS finalize_entry_json, CAST(0 AS INTEGER) AS recovery_v2_activated FROM consensus_incoming.consensus_operator_recovery".to_owned()
+                }
+                (false, true) => {
+                    return Err(invalid_data(
+                        "session consensus snapshot recovery certificate schema is invalid",
+                    ));
+                }
+            }
         } else if !incoming_has_protected_roster_v2
             && *table == "consensus_protected_roster_v2_activation"
         {
@@ -31272,6 +38661,16 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
         checksum,
         byte_length,
     )
+    .map(|_| ())
+}
+
+/// Whether the replacement transaction committed with the incoming namespace
+/// cleanly detached. A committed-but-attached connection is not reusable for a
+/// later snapshot install until its owner resolves that cleanup boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotInstallPublicationOutcome {
+    Clean,
+    CommittedDetachPending,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -31291,7 +38690,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     final_file_name: &str,
     checksum: [u8; 32],
     byte_length: u64,
-) -> io::Result<()> {
+) -> io::Result<SnapshotInstallPublicationOutcome> {
     if pinned.has_immutable_generation() {
         pinned.verify_immutable_generation()?;
     }
@@ -31312,23 +38711,24 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     let snapshot_uri = pinned_snapshot_uri(&pinned, true);
     conn.execute("ATTACH DATABASE ?1 AS consensus_incoming", [snapshot_uri])
         .map_err(db_error)?;
-    conn.query_row(
-        "SELECT 1 FROM consensus_incoming.sqlite_schema LIMIT 1",
-        [],
-        |_| Ok(()),
-    )
-    .map_err(db_error)?;
+    if let Err(error) = conn
+        .query_row(
+            "SELECT 1 FROM consensus_incoming.sqlite_schema LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .map_err(db_error)
+    {
+        let _ = detach_attached_snapshot_database_sync(conn);
+        return Err(error);
+    }
     if let Err(error) = verify_attached_snapshot_descriptor(&pinned, conn, "consensus_incoming") {
-        return match conn.execute("DETACH DATABASE consensus_incoming", []) {
-            Ok(_) => Err(error),
-            Err(detach_error) => Err(db_error(detach_error)),
-        };
+        let _ = detach_attached_snapshot_database_sync(conn);
+        return Err(error);
     }
     if let Err(error) = attached_snapshot_database_extent_sync(conn) {
-        return match conn.execute("DETACH DATABASE consensus_incoming", []) {
-            Ok(_) => Err(error),
-            Err(detach_error) => Err(db_error(detach_error)),
-        };
+        let _ = detach_attached_snapshot_database_sync(conn);
+        return Err(error);
     }
 
     let result = (|| {
@@ -31339,6 +38739,21 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         // validation and replacement even though deployment admission already
         // requires one writer per backing store.
         validate_snapshot_floor(&tx, identity, incoming_last_log_id)?;
+        validate_snapshot_install_replaced_pointers_sync(
+            &tx,
+            identity,
+            authority_profile,
+            incoming_last_log_id,
+        )?;
+        validate_snapshot_install_retained_rows_sync(
+            &tx,
+            identity,
+            authority_profile,
+            expected_members.unwrap_or(&expected_scope.current_members),
+            incoming_last_log_id,
+        )?;
+        let preinstall_committed = read_committed_sync(&tx, identity)?;
+        let preinstall_applied = read_applied_sync(&tx, identity)?;
         let local_monotonic_state = snapshot_monotonic_state_sync(&tx, identity)?;
         validate_protected_roster_state_sync(&tx, identity)
             .map_err(|_| invalid_data("session consensus protected roster state is invalid"))?;
@@ -31437,10 +38852,24 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             validate_attached_snapshot_fenced_receipt_schema_sync(&tx)?;
         }
         let incoming_lease_schema = attached_snapshot_lease_schema(&tx)?;
+        let incoming_has_recovery_finalize_log =
+            attached_snapshot_operator_recovery_finalize_log_column_exists(&tx)?;
+        let incoming_has_recovery_finalize_certificate =
+            attached_snapshot_operator_recovery_finalize_certificate_column_exists(&tx)?;
+        let incoming_has_recovery_v2_activation =
+            attached_snapshot_operator_recovery_v2_activation_column_exists(&tx)?;
+        // The attached recovery table has not been shadowed yet. Prove a
+        // populated V2 certificate and its generic-outcome point namespace
+        // against this exact raw image before a compatibility view can hide a
+        // weakened DDL or materialize an oversized BLOB.
+        validate_raw_operator_recovery_v2_finalize_certificate_sync(&tx, identity, true)?;
         create_attached_snapshot_validation_views(
             &tx,
             incoming_lease_schema,
             incoming_has_protected_roster,
+            incoming_has_recovery_finalize_log,
+            incoming_has_recovery_finalize_certificate,
+            incoming_has_recovery_v2_activation,
             incoming_has_protected_roster_v2,
         )?;
         let validation: io::Result<()> = (|| {
@@ -31458,6 +38887,13 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             )?;
             let incoming_monotonic_state = snapshot_monotonic_state_sync(&tx, identity)?;
             validate_snapshot_monotonic_state(&local_monotonic_state, &incoming_monotonic_state)?;
+            validate_snapshot_finalized_recovery_log_id(
+                &tx,
+                identity,
+                incoming_last_log_id,
+                &local_monotonic_state,
+                &incoming_monotonic_state,
+            )?;
             let incoming_roster_attestation_root = if incoming_has_roster_attestation_root_columns {
                 read_roster_attestation_trust_root_sync(&tx).map_err(|_| {
                     invalid_data("session consensus snapshot roster trust root is invalid")
@@ -31690,7 +39126,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             ),
             (
                 "consensus_operator_recovery",
-                "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor",
+                "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated",
             ),
             (
                 "restore_scan_state",
@@ -31727,6 +39163,30 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                 && incoming_lease_schema == AttachedSnapshotLeaseSchema::PreAcquisitionTimestamp
             {
                 "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, NULL, expires_at_unix_ms, guard_expires_at"
+            } else if table == "consensus_operator_recovery" {
+                match (
+                    incoming_has_recovery_finalize_log,
+                    incoming_has_recovery_finalize_certificate,
+                ) {
+                    (true, true) if incoming_has_recovery_v2_activation => columns,
+                    (true, true) => {
+                        "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, 1"
+                    }
+                    (true, false) => {
+                        // Validation above rejects any non-NULL finalize L
+                        // paired with this synthetic NULL certificate before
+                        // the replacement transaction reaches this copy.
+                        "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, NULL, 0"
+                    }
+                    (false, false) => {
+                        "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, NULL, NULL, 0"
+                    }
+                    (false, true) => {
+                        return Err(invalid_data(
+                            "session consensus snapshot recovery certificate schema is invalid",
+                        ));
+                    }
+                }
             } else {
                 columns
             };
@@ -31738,16 +39198,10 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             )
             .map_err(db_error)?;
         }
-        validate_existing_schema(&tx, identity)
-            .map_err(|_| invalid_data("installed session consensus schema is invalid"))?;
-        validate_fenced_transition_receipts_sync(&tx, identity)?;
-        validate_fenced_transition_v2_receipts_sync(&tx, identity)?;
-        // Restore cursors are local evidence, not replicated state-machine
-        // authority. Every snapshot destination gets a fresh incarnation so
-        // two nodes installing the same coherent snapshot cannot consume one
-        // another's continuation token.
-        ops::rotate_restore_scan_incarnation_sync(&tx)
-            .map_err(|_| invalid_data("installed session snapshot restore metadata failed"))?;
+        // Publish the selected snapshot metadata inside this still-uncommitted
+        // replacement transaction before deriving its exact logical purge
+        // boundary.  The portable image deliberately omits its Raft rows, so
+        // this is the only durable coverage contract for that cut.
         tx.execute(
             "INSERT OR REPLACE INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![
@@ -31759,6 +39213,69 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             ],
         )
         .map_err(db_error)?;
+        if let Some(snapshot_log_id) = incoming_last_log_id {
+            // The producer deliberately omits its Raft log and purge row
+            // from a portable snapshot image. Before publishing this selected
+            // image, retain the exact snapshot cut as the local logical purge
+            // floor. This leaves physical deletion to the queued Raft purge,
+            // yet makes historical recovery see coherent snapshot+purge
+            // evidence immediately after this transaction commits.
+            if let Some(current_purged) = read_purged_sync(&tx, identity)? {
+                ensure_log_id_not_after(
+                    &current_purged,
+                    snapshot_log_id,
+                    "session consensus snapshot regresses purge floor",
+                )?;
+            }
+            let (_, snapshot_index) = validate_log_id(snapshot_log_id)?;
+            // Advance committed while the follower's older purge marker still
+            // witnesses its prior frontier. Advancing purge first would erase
+            // that exact old-marker proof before the committed pointer moves.
+            save_committed_after_portable_snapshot_install_in_tx(
+                &tx,
+                identity,
+                authority_profile,
+                preinstall_committed,
+                preinstall_applied,
+                snapshot_log_id,
+            )?;
+            logical_purge_logs_after_portable_snapshot_install_in_tx(
+                &tx,
+                identity,
+                authority_profile,
+                preinstall_committed,
+                preinstall_applied,
+                snapshot_log_id,
+                snapshot_index,
+            )?;
+            if read_purged_sync(&tx, identity)? != Some(*snapshot_log_id) {
+                return Err(invalid_data(
+                    "session consensus snapshot purge floor is not exact",
+                ));
+            }
+            // Openraft advances its in-memory committed frontier when it
+            // accepts a full snapshot, but does not issue a separate
+            // `save_committed` command for that cut. The install-only advance
+            // above persists the same exact full LogId before publishing the
+            // new purge floor, so process loss cannot leave installed applied
+            // state ahead of the durable committed frontier.
+        }
+        validate_snapshot_install_retained_log_sync(
+            &tx,
+            identity,
+            authority_profile,
+            expected_members.unwrap_or(&expected_scope.current_members),
+        )?;
+        validate_existing_schema(&tx, identity)
+            .map_err(|_| invalid_data("installed session consensus schema is invalid"))?;
+        validate_fenced_transition_receipts_sync(&tx, identity)?;
+        validate_fenced_transition_v2_receipts_sync(&tx, identity)?;
+        // Restore cursors are local evidence, not replicated state-machine
+        // authority. Every snapshot destination gets a fresh incarnation so
+        // two nodes installing the same coherent snapshot cannot consume one
+        // another's continuation token.
+        ops::rotate_restore_scan_incarnation_sync(&tx)
+            .map_err(|_| invalid_data("installed session snapshot restore metadata failed"))?;
         verify_attached_snapshot_descriptor(&pinned, &tx, "consensus_incoming")?;
         if pinned.has_immutable_generation() {
             pinned.verify_immutable_generation()?;
@@ -31774,10 +39291,46 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         tx.commit().map_err(db_error)
     })();
 
-    let detach = conn
-        .execute("DETACH DATABASE consensus_incoming", [])
-        .map_err(db_error);
-    result.and(detach.map(|_| ()))
+    match result {
+        Ok(()) => {
+            // The durable replacement is already committed. Report the
+            // cleanup boundary to the publication owner rather than swallowing
+            // it: that owner must read back the exact singleton and either
+            // detach successfully or fail-stop/reopen before reuse.
+            match detach_attached_snapshot_database_sync(conn) {
+                Ok(()) => Ok(SnapshotInstallPublicationOutcome::Clean),
+                Err(_) => Ok(SnapshotInstallPublicationOutcome::CommittedDetachPending),
+            }
+        }
+        Err(error) => {
+            let _ = detach_attached_snapshot_database_sync(conn);
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn detach_attached_snapshot_database_sync(conn: &Connection) -> io::Result<()> {
+    let mut last = None;
+    for _ in 0..2 {
+        match conn.execute("DETACH DATABASE consensus_incoming", []) {
+            Ok(_) => return Ok(()),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(db_error(last.expect("detach attempts record an error")))
+}
+
+/// Whether the per-connection snapshot-install alias remains attached after a
+/// reported publish error.  Normal metadata publication has no such alias,
+/// so callers must not turn an exact durable readback into a detach attempt
+/// (and a spurious reusable-connection failure).
+pub(crate) fn attached_snapshot_database_is_attached_sync(conn: &Connection) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name = 'consensus_incoming')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
 }
 
 fn validate_snapshot_floor(
@@ -31788,6 +39341,11 @@ fn validate_snapshot_floor(
     for floor in [
         read_committed_sync(conn, identity)?,
         read_applied_sync(conn, identity)?,
+        // A portable snapshot intentionally omits producer log-store rows.
+        // Its selected cut must nevertheless extend the local logical purge
+        // lineage before any replacement delete begins; index-only ordering
+        // would let a lower-term higher index erase a higher-term marker.
+        read_purged_sync(conn, identity)?,
     ] {
         let Some(floor) = floor else {
             continue;
@@ -31797,16 +39355,16 @@ fn validate_snapshot_floor(
                 "session consensus snapshot regresses durable state",
             ));
         };
-        if incoming.index < floor.index || (incoming.index == floor.index && incoming != &floor) {
-            return Err(invalid_data(
-                "session consensus snapshot regresses durable state",
-            ));
-        }
+        ensure_log_id_not_after(
+            &floor,
+            incoming,
+            "session consensus snapshot regresses durable state",
+        )?;
     }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SnapshotMonotonicState {
     logical_time: Option<Timestamp>,
     application_sequence: u64,
@@ -31817,6 +39375,9 @@ struct SnapshotMonotonicState {
     pending_epoch: Option<u64>,
     pending_plan_digest: Option<[u8; 32]>,
     watch_cursor_invalidation_floor: u64,
+    finalize_log_id: Option<LogId<SessionConsensusNodeId>>,
+    finalize_entry_json: Option<Vec<u8>>,
+    recovery_v2_activated: bool,
 }
 
 fn snapshot_monotonic_state_sync(
@@ -31836,6 +39397,9 @@ fn snapshot_monotonic_state_sync(
         pending_epoch: recovery.pending_epoch,
         pending_plan_digest: recovery.pending_plan_digest,
         watch_cursor_invalidation_floor: recovery.watch_cursor_invalidation_floor,
+        finalize_log_id: recovery.finalize_log_id,
+        finalize_entry_json: recovery.finalize_entry_json,
+        recovery_v2_activated: recovery.v2_activated,
     })
 }
 
@@ -31858,8 +39422,17 @@ fn validate_snapshot_monotonic_state(
             && incoming.last_digest != local.last_digest)
         || incoming.watch_sequence < local.watch_sequence
         || incoming.recovery_epoch < local.recovery_epoch
+        || (local.recovery_v2_activated && !incoming.recovery_v2_activated)
         || (incoming.recovery_epoch == local.recovery_epoch
             && incoming.last_plan_digest != local.last_plan_digest)
+        // A current V2 recovery has one finalization identity for an exact
+        // epoch/plan pair.  Comparing the complete LogId prevents a same
+        // index different-term/node source from silently replacing the
+        // retained compaction anchor.
+        || (incoming.recovery_epoch == local.recovery_epoch
+            && incoming.last_plan_digest == local.last_plan_digest
+            && (incoming.finalize_log_id != local.finalize_log_id
+                || incoming.finalize_entry_json != local.finalize_entry_json))
         || incoming.watch_cursor_invalidation_floor < local.watch_cursor_invalidation_floor
     {
         return Err(invalid_data(
@@ -31874,7 +39447,9 @@ fn validate_snapshot_monotonic_state(
             let exact_finalized = incoming.pending_epoch.is_none()
                 && incoming.pending_plan_digest.is_none()
                 && incoming.recovery_epoch == pending_epoch
-                && incoming.last_plan_digest == pending_plan_digest;
+                && incoming.last_plan_digest == pending_plan_digest
+                && incoming.finalize_log_id.is_some()
+                && incoming.finalize_entry_json.is_some();
             if !preserves_pending && !exact_finalized {
                 return Err(invalid_data(
                     "session consensus snapshot regresses durable recovery state",
@@ -31889,6 +39464,55 @@ fn validate_snapshot_monotonic_state(
         }
     }
     Ok(())
+}
+
+/// A snapshot that completes the local pending V2 epoch must retain the exact
+/// command LogId and prove that the incoming applied pointer and snapshot cut
+/// cover that same full identity.  An index alone is not enough: a same-index
+/// term/node splice is a distinct recovery history.
+fn validate_snapshot_finalized_recovery_log_id(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    incoming_snapshot_log_id: Option<&LogId<SessionConsensusNodeId>>,
+    local: &SnapshotMonotonicState,
+    incoming: &SnapshotMonotonicState,
+) -> io::Result<()> {
+    let (Some(pending_epoch), Some(pending_plan_digest)) =
+        (local.pending_epoch, local.pending_plan_digest)
+    else {
+        return Ok(());
+    };
+    if incoming.pending_epoch.is_some()
+        || incoming.pending_plan_digest.is_some()
+        || incoming.recovery_epoch != pending_epoch
+        || incoming.last_plan_digest != pending_plan_digest
+    {
+        return Ok(());
+    }
+    let finalize_log_id = incoming.finalize_log_id.as_ref().ok_or_else(|| {
+        invalid_data("session consensus finalized recovery snapshot omits full LogId")
+    })?;
+    if incoming.finalize_entry_json.is_none() {
+        return Err(invalid_data(
+            "session consensus finalized recovery snapshot omits certificate",
+        ));
+    }
+    let incoming_applied = read_applied_sync(conn, identity)?.ok_or_else(|| {
+        invalid_data("session consensus finalized recovery snapshot omits applied LogId")
+    })?;
+    let snapshot_log_id = incoming_snapshot_log_id.ok_or_else(|| {
+        invalid_data("session consensus finalized recovery snapshot omits snapshot LogId")
+    })?;
+    ensure_log_id_not_after(
+        finalize_log_id,
+        &incoming_applied,
+        "session consensus finalized recovery snapshot LogId is not applied",
+    )?;
+    ensure_log_id_not_after(
+        finalize_log_id,
+        snapshot_log_id,
+        "session consensus finalized recovery snapshot LogId is beyond snapshot",
+    )
 }
 
 pub(crate) fn save_current_snapshot_sync(
@@ -31960,6 +39584,15 @@ fn save_current_snapshot_in_tx(
     byte_length: u64,
 ) -> io::Result<()> {
     validate_published_snapshot_file_name(file_name)?;
+    if let Some(snapshot_log_id) = meta.last_log_id.as_ref() {
+        let applied = read_applied_sync(conn, identity)?
+            .ok_or_else(|| invalid_data("session consensus snapshot is beyond applied state"))?;
+        ensure_log_id_not_after(
+            snapshot_log_id,
+            &applied,
+            "session consensus snapshot is beyond applied state",
+        )?;
+    }
     let scope = read_membership_scope_sync(conn, identity)?;
     if let Some(log_id) = meta.last_membership.log_id() {
         validate_membership_for_log(&meta.last_membership, &scope, log_id.index)?;
@@ -32069,7 +39702,7 @@ pub(crate) use tests::{
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -32083,6 +39716,1796 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn durable_log_audit_parallelism_is_fixed_and_skips_small_frontier_advances() {
+        assert_eq!(1, durable_log_audit_worker_count(1, 128));
+        assert_eq!(1, durable_log_audit_worker_count(63, 128));
+        assert_eq!(1, durable_log_audit_worker_count(4_096, 1));
+        assert_eq!(4, durable_log_audit_worker_count(4_096, 4));
+        assert_eq!(
+            DURABLE_LOG_AUDIT_WORKERS,
+            durable_log_audit_worker_count(4_096, 128)
+        );
+    }
+
+    fn encoded_blank_durable_log_audit_rows(count: usize) -> Vec<EncodedDurableLogAuditRow> {
+        (0..count)
+            .map(|index| {
+                let index = u64::try_from(index).expect("audit fixture index fits u64");
+                let entry = blank_entry(index);
+                EncodedDurableLogAuditRow {
+                    epoch: epoch_i64(identity()).expect("audit fixture epoch"),
+                    term: i64::try_from(entry.log_id.leader_id.term)
+                        .expect("audit fixture term fits SQLite"),
+                    index: i64::try_from(index).expect("audit fixture index fits SQLite"),
+                    encoded: encode_json(&entry).expect("encode audit fixture row"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_log_audit_allocation_spawn_and_worker_failures_are_fail_closed() {
+        let mut impossible = Vec::<u8>::new();
+        assert_eq!(
+            reserve_exact_durable_log_audit_capacity(&mut impossible, usize::MAX)
+                .expect_err("impossible audit allocation rejects")
+                .kind(),
+            io::ErrorKind::Other,
+        );
+
+        let rows = encoded_blank_durable_log_audit_rows(128);
+        let spawn_error = with_durable_log_audit_faults_for_test(
+            DurableLogAuditFaultsForTest {
+                spawn_failure_worker: Some(1),
+                panic_worker: None,
+            },
+            || decode_durable_log_audit_batch_with_available_parallelism(&rows, identity(), 4),
+        )
+        .expect_err("worker spawn failure rejects the complete audit");
+        assert_eq!(spawn_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            spawn_error.to_string(),
+            "session consensus durable log audit worker spawn failed",
+        );
+
+        let panic_error = with_durable_log_audit_faults_for_test(
+            DurableLogAuditFaultsForTest {
+                spawn_failure_worker: None,
+                panic_worker: Some(1),
+            },
+            || decode_durable_log_audit_batch_with_available_parallelism(&rows, identity(), 4),
+        )
+        .expect_err("worker panic rejects the complete audit");
+        assert_eq!(panic_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            panic_error.to_string(),
+            "session consensus durable log audit worker failed",
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_log_audit_tiny_corrupt_rows_obey_fixed_batch_cardinality() {
+        let last_index =
+            u64::try_from(DURABLE_LOG_AUDIT_BATCH_ROWS).expect("audit row cap fits u64");
+        let backend = backend_with_blank_logs(last_index).await;
+        let conn = backend.conn.lock().await;
+        conn.execute("UPDATE consensus_log SET entry_json = ?1", [vec![b'x']])
+            .expect("install tiny corrupt audit rows");
+
+        reset_durable_log_audit_max_batch_rows_for_test();
+        let mut witnesses = BTreeMap::new();
+        assert_eq!(
+            insert_validated_log_rows_in_range_sync(
+                &conn,
+                identity(),
+                0,
+                last_index,
+                &mut witnesses,
+            )
+            .expect_err("tiny corrupt rows fail closed")
+            .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(witnesses.is_empty());
+        assert_eq!(
+            durable_log_audit_max_batch_rows_for_test(),
+            DURABLE_LOG_AUDIT_BATCH_ROWS,
+            "one-byte rows cannot grow the coordinator batch beyond its fixed row cap",
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_log_audit_preserves_decode_before_later_row_read_error() {
+        let backend = backend_with_blank_logs(1).await;
+        let conn = backend.conn.lock().await;
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 0",
+            [vec![b'x']],
+        )
+        .expect("install earlier decode error");
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+            .expect("allow later empty-row fixture");
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+            [Vec::<u8>::new()],
+        )
+        .expect("install later row-size error");
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .expect("restore row constraints");
+
+        let expected = decode_consensus_log_entry(b"x")
+            .expect_err("earlier fixture is invalid JSON")
+            .to_string();
+        let mut witnesses = BTreeMap::new();
+        let error =
+            insert_validated_log_rows_in_range_sync(&conn, identity(), 0, 1, &mut witnesses)
+                .expect_err("earlier decode error wins over later row error");
+        assert_eq!(error.to_string(), expected);
+        assert!(witnesses.is_empty());
+    }
+
+    #[test]
+    fn snapshot_foreground_pacer_observes_generation_once_and_active_pressure_repeatedly() {
+        let primary_writers = Arc::new(AtomicUsize::new(0));
+        let writer_generation = Arc::new(AtomicU64::new(0));
+        let pacer = ConsensusSnapshotForegroundPacer::new(
+            Arc::clone(&primary_writers),
+            Arc::clone(&writer_generation),
+        );
+        let mut pauses = Vec::new();
+
+        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        writer_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+
+        primary_writers.store(1, Ordering::Release);
+        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        primary_writers.store(0, Ordering::Release);
+        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+
+        assert_eq!(pauses, vec![SNAPSHOT_FOREGROUND_PACING_PAUSE; 3]);
+    }
+
+    #[test]
+    fn snapshot_compaction_progress_guard_never_interrupts_and_removes_its_callback() {
+        let connection = Connection::open_in_memory().expect("open progress-handler fixture");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let query = "WITH RECURSIVE sequence(value) AS (\
+                     SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 256\
+                     ) SELECT sum(abs(left.value - right.value)) \
+                     FROM sequence AS left CROSS JOIN sequence AS right";
+
+        {
+            let _guard = install_snapshot_compaction_progress_handler(&connection, move || {
+                handler_calls.fetch_add(1, Ordering::Relaxed);
+                false
+            });
+            let _: i64 = connection
+                .query_row(query, [], |row| row.get(0))
+                .expect("noninterrupting compaction progress callback");
+        }
+        let calls_with_guard = calls.load(Ordering::Relaxed);
+        assert_ne!(0, calls_with_guard, "the progress seam must be exercised");
+
+        let _: i64 = connection
+            .query_row(query, [], |row| row.get(0))
+            .expect("query remains usable after progress guard removal");
+        assert_eq!(
+            calls_with_guard,
+            calls.load(Ordering::Relaxed),
+            "dropping the guard removes the snapshot progress callback",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PendingTerminalLatchFixture {
+        _directory: tempfile::TempDir,
+        database: PathBuf,
+        snapshot_dir: PathBuf,
+        identity: SessionConsensusIdentity,
+        members: BTreeSet<SessionConsensusNodeId>,
+        bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+        latch: OperatorRecoveryLatch,
+        connection: Connection,
+    }
+
+    /// Produce the exact process-restart shape consumed by terminal-latch
+    /// classification.  Unsupported persistent-handle filesystems cannot
+    /// construct a sound terminal latch and are intentionally skipped here;
+    /// production rejects them before recovery mutation.
+    #[cfg(target_os = "linux")]
+    async fn pending_terminal_latch_fixture() -> Option<PendingTerminalLatchFixture> {
+        let directory = tempfile::tempdir().expect("terminal handoff directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let identity = identity();
+        let members = expected_members();
+        let bindings = test_member_bindings(&members);
+
+        let backend = SqliteSessionBackend::open(&database).expect("open initial backend");
+        let initial = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir.clone(),
+            identity,
+            members.clone(),
+            bindings.clone(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize initial core");
+        drop(initial);
+        drop(backend);
+
+        let plan_digest = [0xB3; 32];
+        let connection = Connection::open(&database).expect("open recovery fixture connection");
+        let database_file = File::open(&database).expect("open recovery fixture database");
+        if operator_recovery_file_incarnation(&database_file).is_err() {
+            return None;
+        }
+        mark_operator_recovery_pending_sync(&connection, identity, 1, plan_digest)
+            .expect("mark recovery pending");
+        let outcome = finalize_operator_recovery_sync(
+            &connection,
+            identity,
+            1,
+            plan_digest,
+            observed_fence_high_water_sync(&connection).expect("read fence high-water"),
+            observed_credential_high_water_sync(&connection).expect("read credential high-water"),
+        )
+        .expect("finalize recovery state");
+        assert_eq!(OperatorRecoveryApply::Applied, outcome);
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint terminal fixture");
+        let latch = OperatorRecoveryLatch {
+            identity,
+            recovery_epoch: 1,
+            plan_digest,
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch)
+            .expect("write active terminal fixture latch");
+        terminalize_operator_recovery_latch_sync(&database, latch, &database_file, None)
+            .expect("write pending terminal fixture latch");
+        drop(database_file);
+
+        Some(PendingTerminalLatchFixture {
+            _directory: directory,
+            database,
+            snapshot_dir,
+            identity,
+            members,
+            bindings,
+            latch,
+            connection,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replace_database_path_with_byte_identical_copy(database: &Path, suffix: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let replacement = database.with_extension(suffix);
+        std::fs::copy(database, &replacement)
+            .expect("copy byte-identical terminal database replacement");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict terminal database replacement");
+        std::fs::rename(&replacement, database)
+            .expect("replace terminal database at the public path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn latch_replacement_rechecks_the_promoted_sidecar_after_directory_sync() {
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        // Persistent handles are a required runtime capability for terminal
+        // latches. Hosts lacking the kernel/filesystem support fail closed in
+        // production; this causal replacement test is meaningful only when
+        // the local qualification filesystem exports one.
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xA9; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch).expect("write active recovery latch");
+        install_latch_replace_after_directory_sync_hook(move |path| {
+            let replacement = path.with_extension("attacker-replacement");
+            std::fs::write(
+                &replacement,
+                std::fs::read(path).expect("read byte-identical sidecar replacement"),
+            )
+            .expect("write byte-identical sidecar replacement");
+            std::fs::rename(&replacement, path).expect("replace sidecar after directory sync");
+        });
+
+        let error = set_operator_recovery_latch_audit_pending_sync(&database, latch, true)
+            .expect_err("post-sync same-byte sidecar replacement must be rejected");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            ensure_operator_recovery_latch_sync(&database, latch).is_err(),
+            "a copied same-byte public sidecar must remain invalid on retry",
+        );
+        assert!(
+            read_operator_recovery_latch_record(&database).is_err(),
+            "a copied same-byte public sidecar must remain fail-closed after restart",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transition_rejects_a_temporary_sidecar_substitution_across_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xA8; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch).expect("write active latch");
+        install_latch_transition_after_temporary_validation_hook(move |temporary| {
+            let replacement = temporary.with_extension("substituted-after-validation");
+            std::fs::copy(temporary, &replacement)
+                .expect("copy exact temporary sidecar substitution");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict temporary sidecar substitution");
+            std::fs::rename(&replacement, temporary)
+                .expect("replace temporary sidecar after validation");
+        });
+
+        let error = set_operator_recovery_latch_audit_pending_sync(&database, latch, true)
+            .expect_err("post-validation temporary substitution must be rejected");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            ensure_operator_recovery_latch_sync(&database, latch).is_err(),
+            "the substituted sidecar cannot become authority on retry",
+        );
+        assert!(
+            read_operator_recovery_latch_record(&database).is_err(),
+            "the promoted substituted sidecar remains fail-closed after restart",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_latch_creation_rejects_byte_identical_inode_replacement() {
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xAA; 32],
+            audit_pending: false,
+        };
+        install_latch_create_after_directory_sync_hook(move |path| {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let replacement = path.with_extension("initial-byte-identical");
+            std::fs::copy(path, &replacement).expect("copy initial latch");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict copied initial latch");
+            std::fs::rename(&replacement, path).expect("replace initial latch");
+        });
+
+        let error = ensure_operator_recovery_latch_sync(&database, latch)
+            .expect_err("initial same-byte latch substitution must fail");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            ensure_operator_recovery_latch_sync(&database, latch).is_err(),
+            "the copied initial sidecar must remain invalid on retry",
+        );
+        assert!(
+            read_operator_recovery_latch_record(&database).is_err(),
+            "the copied initial sidecar must remain invalid after restart",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_latch_creation_rejects_a_different_valid_latch() {
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xAB; 32],
+            audit_pending: false,
+        };
+        let replacement_latch = OperatorRecoveryLatch {
+            plan_digest: [0xAC; 32],
+            ..latch
+        };
+        install_latch_create_after_directory_sync_hook(move |path| {
+            let replacement = path.with_extension("initial-different-valid");
+            drop(
+                write_latch_file(
+                    &replacement,
+                    OperatorRecoveryLatchRecord::Active(replacement_latch),
+                    true,
+                )
+                .expect("write valid replacement latch"),
+            );
+            std::fs::rename(&replacement, path).expect("replace initial latch");
+        });
+
+        let error = ensure_operator_recovery_latch_sync(&database, latch)
+            .expect_err("initial different valid latch substitution must fail");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_latch_creation_succeeds_and_publishes_the_exact_active_record() {
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xAD; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch)
+            .expect("fresh active recovery latch must publish");
+        assert_eq!(
+            read_operator_recovery_latch_record(&database).expect("read published active latch"),
+            Some(OperatorRecoveryLatchRecord::Active(latch)),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_latch_creation_crash_boundaries_retry_without_partial_public_state() {
+        for boundary in [
+            LatchCreateFailureBoundary::AfterTemporarySync,
+            LatchCreateFailureBoundary::AfterPublish,
+        ] {
+            let directory = tempfile::tempdir().expect("recovery latch directory");
+            let database = directory.path().join("sessions.sqlite");
+            File::create(&database).expect("create database anchor");
+            if operator_recovery_file_incarnation(
+                &File::open(&database).expect("open database anchor"),
+            )
+            .is_err()
+            {
+                return;
+            }
+            let latch = OperatorRecoveryLatch {
+                identity: identity(),
+                recovery_epoch: 1,
+                plan_digest: [0xBE; 32],
+                audit_pending: false,
+            };
+            let sidecar = operator_recovery_latch_path(&database).expect("latch path");
+            fail_next_latch_create_at_boundary(boundary);
+            let error = ensure_operator_recovery_latch_sync(&database, latch)
+                .expect_err("injected first-publication interruption");
+            assert_eq!(io::ErrorKind::Other, error.kind());
+            if boundary == LatchCreateFailureBoundary::AfterTemporarySync {
+                assert!(
+                    !sidecar.exists(),
+                    "a crash before public publication must leave no public partial latch",
+                );
+            } else {
+                assert_eq!(
+                    read_operator_recovery_latch_record(&database)
+                        .expect("published post-link latch remains readable"),
+                    Some(OperatorRecoveryLatchRecord::Active(latch)),
+                    "a crash after link publishes complete creator bytes",
+                );
+            }
+            ensure_operator_recovery_latch_sync(&database, latch)
+                .expect("retry must publish or resync the exact active latch");
+            assert_eq!(
+                read_operator_recovery_latch_record(&database).expect("read retried active latch"),
+                Some(OperatorRecoveryLatchRecord::Active(latch)),
+                "retry must not require deleting a partial public sidecar",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_latch_creation_retries_keep_one_private_artifact_and_clean_it() {
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xBF; 32],
+            audit_pending: false,
+        };
+        let sidecar = operator_recovery_latch_path(&database).expect("latch path");
+        let private = latch_creation_temporary_path(
+            sidecar.parent().expect("latch parent"),
+            sidecar
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("UTF-8 latch name"),
+        );
+
+        for _ in 0..3 {
+            fail_next_latch_create_at_boundary(LatchCreateFailureBoundary::AfterTemporarySync);
+            let error = ensure_operator_recovery_latch_sync(&database, latch)
+                .expect_err("injected pre-publication interruption");
+            assert_eq!(io::ErrorKind::Other, error.kind());
+            assert!(
+                !sidecar.exists(),
+                "pre-publication crash leaves latch absent"
+            );
+            assert!(
+                private.exists(),
+                "one private creator remains for retry cleanup"
+            );
+            let private_count = std::fs::read_dir(directory.path())
+                .expect("read latch directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path() == private)
+                .count();
+            assert_eq!(private_count, 1, "retries must not accumulate creators");
+        }
+
+        ensure_operator_recovery_latch_sync(&database, latch)
+            .expect("retry publishes the exact active latch");
+        assert!(
+            !private.exists(),
+            "successful publication cleans the private creator"
+        );
+        ensure_operator_recovery_latch_sync(&database, latch)
+            .expect("valid-public retry remains idempotent after cleanup");
+        assert!(
+            !private.exists(),
+            "valid-public retry leaves no private creator"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_public_latch_remains_fail_closed_and_untouched_on_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xC0; 32],
+            audit_pending: false,
+        };
+        let sidecar = operator_recovery_latch_path(&database).expect("latch path");
+        let malformed = b"not an operator recovery latch";
+        std::fs::write(&sidecar, malformed).expect("write malformed public latch");
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict malformed public latch");
+        let incarnation = operator_recovery_file_incarnation(
+            &File::open(&sidecar).expect("open malformed public latch"),
+        )
+        .expect("bind malformed public latch");
+        let private = latch_creation_temporary_path(
+            sidecar.parent().expect("latch parent"),
+            sidecar
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("UTF-8 latch name"),
+        );
+
+        let error = ensure_operator_recovery_latch_sync(&database, latch)
+            .expect_err("malformed public latch must remain fail-closed");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(
+            std::fs::read(&sidecar).expect("read malformed latch"),
+            malformed
+        );
+        assert_eq!(
+            operator_recovery_file_incarnation(
+                &File::open(&sidecar).expect("reopen malformed latch")
+            )
+            .expect("bind malformed public latch after retry"),
+            incarnation,
+            "retry must not replace a malformed public inode",
+        );
+        assert!(
+            !private.exists(),
+            "fail-closed malformed public state must not create or clean a private retry artifact",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn audit_transition_rejects_and_preserves_a_pre_rename_sidecar_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xAE; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch).expect("write active latch");
+        let replacement = OperatorRecoveryLatch {
+            plan_digest: [0xAF; 32],
+            ..latch
+        };
+        install_latch_transition_before_replace_hook(move |path| {
+            let substitute = path.with_extension("pre-rename-different-active");
+            drop(
+                write_latch_file(
+                    &substitute,
+                    OperatorRecoveryLatchRecord::Active(replacement),
+                    true,
+                )
+                .expect("write replacement active latch"),
+            );
+            std::fs::set_permissions(&substitute, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict replacement active latch");
+            std::fs::rename(&substitute, path).expect("replace latch before transition rename");
+        });
+        let error = set_operator_recovery_latch_audit_pending_sync(&database, latch, true)
+            .expect_err("pre-rename replacement must not be overwritten");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_operator_recovery_latch_record(&database).expect("read replacement latch"),
+            Some(OperatorRecoveryLatchRecord::Active(replacement)),
+            "the foreign active latch remains at the public name"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_to_active_rejects_and_preserves_a_byte_identical_pre_rename_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        let database_file = File::create(&database).expect("create database anchor");
+        let incarnation = match operator_recovery_file_incarnation(&database_file) {
+            Ok(incarnation) => incarnation,
+            Err(_) => return,
+        };
+        let terminal_latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xB0; 32],
+            audit_pending: false,
+        };
+        let sidecar = operator_recovery_latch_path(&database).expect("sidecar path");
+        drop(
+            write_latch_file(
+                &sidecar,
+                OperatorRecoveryLatchRecord::terminal(
+                    terminal_latch,
+                    incarnation,
+                    OperatorRecoveryTerminalPhase::Consumed,
+                    None,
+                ),
+                true,
+            )
+            .expect("write consumed terminal latch"),
+        );
+        let terminal_bytes = std::fs::read(&sidecar).expect("read terminal latch bytes");
+        let replacement = OperatorRecoveryLatch {
+            recovery_epoch: 2,
+            plan_digest: [0xB1; 32],
+            ..terminal_latch
+        };
+        install_latch_transition_before_replace_hook(move |path| {
+            let substitute = path.with_extension("pre-rename-byte-identical");
+            std::fs::copy(path, &substitute).expect("copy terminal latch");
+            std::fs::set_permissions(&substitute, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict copied terminal latch");
+            std::fs::rename(&substitute, path).expect("replace terminal latch before rename");
+        });
+        let error = ensure_operator_recovery_latch_sync(&database, replacement)
+            .expect_err("byte-identical terminal replacement must not be overwritten");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            read_operator_recovery_latch_record(&database).is_err(),
+            "a copied sidecar is not a valid replacement for its bound inode"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).expect("read substituted terminal bytes"),
+            terminal_bytes,
+            "the substituted terminal remains byte-identical at the public name"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_active_latch_retry_resyncs_and_rechecks_the_existing_sidecar() {
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xB1; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch).expect("write active recovery latch");
+        install_latch_resync_after_directory_sync_hook(move |path| {
+            let replacement = path.with_extension("attacker-resync-active");
+            std::fs::write(
+                &replacement,
+                std::fs::read(path).expect("read byte-identical active sidecar"),
+            )
+            .expect("write byte-identical active sidecar");
+            std::fs::rename(&replacement, path)
+                .expect("replace active sidecar after retry directory sync");
+        });
+
+        let error = ensure_operator_recovery_latch_sync(&database, latch)
+            .expect_err("retry must reject a sidecar replaced after its durability sync");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_active_latch_retry_rejects_a_pre_resync_byte_identical_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xB3; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch).expect("write active recovery latch");
+        let active_bytes =
+            std::fs::read(operator_recovery_latch_path(&database).expect("active latch path"))
+                .expect("read active latch bytes");
+        install_latch_transition_before_replace_hook(move |path| {
+            let replacement = path.with_extension("attacker-pre-resync-active");
+            std::fs::copy(path, &replacement).expect("copy active latch");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict copied active latch");
+            std::fs::rename(&replacement, path).expect("replace active latch before resync");
+        });
+        let error = ensure_operator_recovery_latch_sync(&database, latch)
+            .expect_err("retry must retain its original sidecar through resync");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            read_operator_recovery_latch_record(&database).is_err(),
+            "a copied sidecar is not treated as the retry's old descriptor"
+        );
+        assert_eq!(
+            std::fs::read(operator_recovery_latch_path(&database).expect("active latch path"))
+                .expect("read substituted active bytes"),
+            active_bytes,
+            "the replacement remains byte-identical at the public name"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_pending_terminal_retry_resyncs_and_rechecks_the_existing_sidecar() {
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        File::create(&database).expect("create database anchor");
+        let database_file = File::open(&database).expect("open database anchor");
+        if operator_recovery_file_incarnation(&database_file).is_err() {
+            return;
+        }
+
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xB2; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch).expect("write active recovery latch");
+        terminalize_operator_recovery_latch_sync(&database, latch, &database_file, None)
+            .expect("write pending terminal recovery latch");
+        install_latch_resync_after_directory_sync_hook(move |path| {
+            let replacement = path.with_extension("attacker-resync-pending");
+            std::fs::write(
+                &replacement,
+                std::fs::read(path).expect("read byte-identical terminal sidecar"),
+            )
+            .expect("write byte-identical terminal sidecar");
+            std::fs::rename(&replacement, path)
+                .expect("replace terminal sidecar after retry directory sync");
+        });
+
+        let error =
+            terminalize_operator_recovery_latch_sync(&database, latch, &database_file, None)
+                .expect_err("retry must reject a terminal sidecar replaced after durability sync");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_pending_terminal_retry_rejects_a_pre_resync_byte_identical_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("recovery latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        let database_file = File::create(&database).expect("create database anchor");
+        if operator_recovery_file_incarnation(&database_file).is_err() {
+            return;
+        }
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xB4; 32],
+            audit_pending: false,
+        };
+        ensure_operator_recovery_latch_sync(&database, latch).expect("write active recovery latch");
+        terminalize_operator_recovery_latch_sync(&database, latch, &database_file, None)
+            .expect("write pending terminal recovery latch");
+        install_latch_transition_before_replace_hook(move |path| {
+            let replacement = path.with_extension("attacker-pre-resync-terminal");
+            std::fs::copy(path, &replacement).expect("copy terminal latch");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict copied terminal latch");
+            std::fs::rename(&replacement, path).expect("replace terminal latch before resync");
+        });
+        let error =
+            terminalize_operator_recovery_latch_sync(&database, latch, &database_file, None)
+                .expect_err("terminal retry must retain its original sidecar through resync");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_terminal_snapshot_handoff_validation_keeps_the_handoff_pending() {
+        let Some(fixture) = pending_terminal_latch_fixture().await else {
+            return;
+        };
+        let PendingTerminalLatchFixture {
+            _directory,
+            database,
+            snapshot_dir,
+            identity,
+            members,
+            bindings,
+            latch: _,
+            connection,
+        } = fixture;
+        drop(connection);
+
+        let reopened_backend =
+            SqliteSessionBackend::open(&database).expect("reopen terminal backend");
+        let core = SqliteConsensusCore::initialize(
+            &reopened_backend,
+            snapshot_dir,
+            identity,
+            members,
+            bindings,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize terminal handoff core");
+        assert!(core.terminal_recovery_handoff_pending_for_test());
+
+        assert!(matches!(
+            core.terminal_recovery_snapshot_handoff_file(Some("unexpected.opc"), None),
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+        assert!(core.terminal_recovery_handoff_pending_for_test());
+
+        assert!(matches!(
+            core.consume_terminal_recovery_handoff_after_snapshot_validation(
+                Some("unexpected.opc",),
+                None
+            )
+            .await,
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+        assert!(
+            core.terminal_recovery_handoff_pending_for_test(),
+            "failed terminal selection validation must not consume its retryable handoff"
+        );
+
+        install_latch_consume_before_final_revalidation_hook(move |path| {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let replacement = path.with_extension("terminal-handoff-byte-identical");
+            std::fs::copy(path, &replacement).expect("copy terminal sidecar replacement");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict terminal sidecar replacement");
+            std::fs::rename(&replacement, path).expect("replace terminal sidecar before consume");
+        });
+        assert!(matches!(
+            core.consume_terminal_recovery_handoff_after_snapshot_validation(None, None)
+                .await,
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+        assert!(
+            core.terminal_recovery_handoff_pending_for_test(),
+            "same-byte pending-sidecar substitution must leave the handoff retryable"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_handoff_consume_rejects_database_path_replaced_during_sidecar_transition() {
+        let Some(fixture) = pending_terminal_latch_fixture().await else {
+            return;
+        };
+        let classification = classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        )
+        .expect("classify pending terminal fixture");
+        let handoff = classification
+            .into_terminal_handoff()
+            .expect("pending terminal supplies handoff");
+
+        let database = fixture.database.clone();
+        install_latch_replace_after_directory_sync_hook(move |_| {
+            replace_database_path_with_byte_identical_copy(
+                &database,
+                "terminal-database-replacement",
+            );
+        });
+
+        let error = consume_operator_recovery_terminal_handoff_sync(
+            &fixture.database,
+            &fixture.connection,
+            &handoff,
+            None,
+        )
+        .expect_err("database replacement during terminal transition must fail closed");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_handoff_consume_rejects_database_path_replaced_before_sidecar_transition() {
+        let Some(fixture) = pending_terminal_latch_fixture().await else {
+            return;
+        };
+        let classification = classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        )
+        .expect("classify pending terminal fixture");
+        let handoff = classification
+            .into_terminal_handoff()
+            .expect("pending terminal supplies handoff");
+
+        let database = fixture.database.clone();
+        install_latch_consume_before_final_revalidation_hook(move |_| {
+            replace_database_path_with_byte_identical_copy(
+                &database,
+                "terminal-database-pretransition",
+            );
+        });
+
+        let error = consume_operator_recovery_terminal_handoff_sync(
+            &fixture.database,
+            &fixture.connection,
+            &handoff,
+            None,
+        )
+        .expect_err("database replacement before terminal transition must fail closed");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn classifier_rejects_consumed_terminal_replaced_by_active_sidecar() {
+        let Some(fixture) = pending_terminal_latch_fixture().await else {
+            return;
+        };
+
+        let classification = classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        )
+        .expect("classify pending terminal fixture");
+        let handoff = classification
+            .into_terminal_handoff()
+            .expect("pending terminal supplies handoff");
+        consume_operator_recovery_terminal_handoff_sync(
+            &fixture.database,
+            &fixture.connection,
+            &handoff,
+            None,
+        )
+        .expect("consume fixture terminal");
+
+        let database = fixture.database.clone();
+        let latch = fixture.latch;
+        install_latch_classify_before_final_revalidation_hook(move |_| {
+            ensure_operator_recovery_latch_sync(&database, latch)
+                .expect("replace consumed terminal with active latch");
+        });
+        let error = match classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        ) {
+            Ok(_) => panic!("consumed-to-active substitution during classification must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn classifier_rejects_byte_identical_consumed_terminal_inode_replacement() {
+        let Some(fixture) = pending_terminal_latch_fixture().await else {
+            return;
+        };
+
+        let classification = classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        )
+        .expect("classify pending terminal fixture");
+        let handoff = classification
+            .into_terminal_handoff()
+            .expect("pending terminal supplies handoff");
+        consume_operator_recovery_terminal_handoff_sync(
+            &fixture.database,
+            &fixture.connection,
+            &handoff,
+            None,
+        )
+        .expect("consume fixture terminal");
+
+        install_latch_classify_before_final_revalidation_hook(move |path| {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let replacement = path.with_extension("consumed-terminal-byte-identical");
+            std::fs::copy(path, &replacement).expect("copy consumed terminal sidecar");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict consumed terminal replacement");
+            std::fs::rename(&replacement, path)
+                .expect("replace consumed terminal with byte-identical inode");
+        });
+        let error = match classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        ) {
+            Ok(_) => panic!("byte-identical consumed terminal substitution must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn classifier_rejects_database_path_replaced_after_consumed_sidecar_preflight() {
+        let Some(fixture) = pending_terminal_latch_fixture().await else {
+            return;
+        };
+
+        let classification = classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        )
+        .expect("classify pending terminal fixture");
+        let handoff = classification
+            .into_terminal_handoff()
+            .expect("pending terminal supplies handoff");
+        consume_operator_recovery_terminal_handoff_sync(
+            &fixture.database,
+            &fixture.connection,
+            &handoff,
+            None,
+        )
+        .expect("consume fixture terminal");
+
+        let database = fixture.database.clone();
+        install_latch_classify_before_final_revalidation_hook(move |_| {
+            replace_database_path_with_byte_identical_copy(&database, "consumed-database-copy");
+        });
+        let error = match classify_operator_recovery_latch_with_connection_sync(
+            &fixture.database,
+            &fixture.connection,
+        ) {
+            Ok(_) => panic!("consumed terminal database replacement must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn classifier_rejects_active_latch_created_after_an_absent_preflight() {
+        let directory = tempfile::tempdir().expect("absent latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open pristine backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize pristine core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xB4; 32],
+            audit_pending: false,
+        };
+        let database_for_hook = database.clone();
+        install_latch_classify_before_final_revalidation_hook(move |_| {
+            ensure_operator_recovery_latch_sync(&database_for_hook, latch)
+                .expect("create active latch after absent preflight");
+        });
+        let connection = Connection::open(&database).expect("open classifier connection");
+        let error =
+            match classify_operator_recovery_latch_with_connection_sync(&database, &connection) {
+                Ok(_) => panic!("active latch created after absent preflight must fail"),
+                Err(error) => error,
+            };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_remains_read_only_while_primary_writer_is_active() {
+        let directory = tempfile::tempdir().expect("live clear probe directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open live clear backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize live clear core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let writer = Connection::open(&database).expect("open independent primary writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold primary writer transaction");
+        let connection = Connection::open(&database).expect("open live probe connection");
+
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("clear live probe is a read-only authority projection"),
+        );
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release primary writer transaction");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_active_probe_remains_read_only_while_primary_writer_is_active() {
+        let directory = tempfile::tempdir().expect("live active probe directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let identity = identity();
+        let backend = SqliteSessionBackend::open(&database).expect("open live active backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity,
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize live active core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        let latch = OperatorRecoveryLatch {
+            identity,
+            recovery_epoch: 1,
+            plan_digest: [0xC6; 32],
+            audit_pending: false,
+        };
+        mark_operator_recovery_pending_sync(
+            &connection,
+            identity,
+            latch.recovery_epoch,
+            latch.plan_digest,
+        )
+        .expect("mark active recovery pending");
+        ensure_operator_recovery_latch_sync(&database, latch)
+            .expect("publish matching active recovery sidecar");
+
+        let writer = Connection::open(&database).expect("open independent primary writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold primary writer transaction");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Active,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("active live probe is a read-only authority projection"),
+        );
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release primary writer transaction");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_rejects_and_does_not_repair_a_missing_recovery_singleton() {
+        let directory = tempfile::tempdir().expect("missing recovery singleton directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open missing-row backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize missing-row core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("baseline missing-row fixture is clear"),
+        );
+        connection
+            .execute("DELETE FROM consensus_operator_recovery", [])
+            .expect("remove recovery singleton");
+
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "a missing durable recovery singleton must fail closed",
+        );
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_operator_recovery",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count recovery rows after failed probe");
+        assert_eq!(
+            0, rows,
+            "a read-only recovery probe must not self-heal corrupt durable state",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_retains_post_migration_integrity_checks() {
+        let directory = tempfile::tempdir().expect("live clear integrity directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open integrity backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize integrity core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("baseline integrity fixture is clear"),
+        );
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow extra recovery row fixture");
+        connection
+            .execute(
+                "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated) SELECT 2, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+            )
+            .expect("inject extra recovery row");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore recovery constraints");
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "an extra durable recovery row must fail closed",
+        );
+        connection
+            .execute(
+                "DELETE FROM consensus_operator_recovery WHERE singleton = 2",
+                [],
+            )
+            .expect("remove extra recovery row");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("removing the extra row restores a clear projection"),
+        );
+
+        let machine_digest: Vec<u8> = connection
+            .query_row(
+                "SELECT last_digest FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read original machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corrupt machine fixture");
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = zeroblob(31) WHERE singleton = 1",
+                [],
+            )
+            .expect("inject corrupt machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore machine constraints");
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "a corrupt durable machine projection must fail closed",
+        );
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = ?1 WHERE singleton = 1",
+                [machine_digest.as_slice()],
+            )
+            .expect("restore machine digest");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("restoring the machine projection restores Clear"),
+        );
+
+        connection
+            .execute(
+                "INSERT INTO consensus_applied (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, 0, 0, X'00') ON CONFLICT(singleton) DO UPDATE SET log_id_json = excluded.log_id_json",
+                [epoch_i64(identity()).expect("encode identity epoch")],
+            )
+            .expect("inject malformed applied pointer");
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "a corrupt durable applied projection must fail closed",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_rejects_a_missing_sidecar_for_pending_recovery() {
+        let directory = tempfile::tempdir().expect("missing recovery sidecar directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open missing-sidecar backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize missing-sidecar core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("baseline missing-sidecar fixture is clear"),
+        );
+        mark_operator_recovery_pending_sync(&connection, identity(), 1, [0xC7; 32])
+            .expect("mark durable recovery pending without a sidecar");
+        assert!(
+            read_operator_recovery_latch_record(&database)
+                .expect("read absent recovery sidecar")
+                .is_none(),
+            "the fixture must retain a missing recovery sidecar",
+        );
+
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "durable pending recovery without its sidecar must fail closed",
+        );
+        let recovery = read_operator_recovery_after_schema_sync(&connection, identity())
+            .expect("read durable pending recovery after failed probe");
+        assert_eq!(Some(1), recovery.pending_epoch);
+        assert_eq!(Some([0xC7; 32]), recovery.pending_plan_digest);
+    }
+
+    #[test]
+    fn read_only_current_recovery_validator_rejects_corruption_without_repair() {
+        let backend = SqliteSessionBackend::in_memory().expect("read-only validator backend");
+        let connection = backend.conn.blocking_lock();
+        let identity = identity();
+        initialize_schema(&connection, identity, &expected_members())
+            .expect("initialize read-only validator schema");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("baseline current recovery image");
+
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow extra recovery row fixture");
+        connection
+            .execute(
+                "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated) SELECT 2, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+            )
+            .expect("inject extra recovery row");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore recovery constraints");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            2_i64,
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_operator_recovery",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count unrepaired recovery rows"),
+        );
+        connection
+            .execute(
+                "DELETE FROM consensus_operator_recovery WHERE singleton = 2",
+                [],
+            )
+            .expect("remove extra recovery row");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("recovery cardinality repair restores baseline");
+
+        let machine_digest: Vec<u8> = connection
+            .query_row(
+                "SELECT last_digest FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read original machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corrupt machine fixture");
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = zeroblob(31) WHERE singleton = 1",
+                [],
+            )
+            .expect("inject corrupt machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore machine constraints");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            31_i64,
+            connection
+                .query_row(
+                    "SELECT length(last_digest) FROM consensus_machine WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read unrepaired machine digest length"),
+        );
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = ?1 WHERE singleton = 1",
+                [machine_digest.as_slice()],
+            )
+            .expect("restore machine digest");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("machine repair restores baseline");
+
+        connection
+            .execute(
+                "INSERT INTO consensus_applied (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, 0, 0, X'00') ON CONFLICT(singleton) DO UPDATE SET log_id_json = excluded.log_id_json",
+                [epoch_i64(identity).expect("encode identity epoch")],
+            )
+            .expect("inject malformed applied pointer");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            vec![0_u8],
+            connection
+                .query_row(
+                    "SELECT log_id_json FROM consensus_applied WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .expect("read unrepaired applied pointer"),
+        );
+        connection
+            .execute("DELETE FROM consensus_applied", [])
+            .expect("remove malformed applied pointer");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("applied repair restores baseline");
+
+        connection
+            .execute("DELETE FROM consensus_operator_recovery", [])
+            .expect("remove recovery singleton");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            0_i64,
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_operator_recovery",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count unrepaired missing singleton"),
+        );
+    }
+
+    #[test]
+    fn admitted_active_classifier_rejects_schema_absence_but_pre_admission_retains_legacy_gate() {
+        let connection = Connection::open_in_memory().expect("empty active classifier database");
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xC8; 32],
+            audit_pending: false,
+        };
+        active_latch_is_coherent_with_connection(&connection, latch)
+            .expect("pre-admission Active sidecar remains a closed legacy gate");
+        assert!(
+            active_latch_is_coherent_with_admitted_connection(&connection, latch).is_err(),
+            "an admitted live core cannot treat missing current schema as coherent",
+        );
+    }
+
+    #[test]
+    fn active_classifier_split_preserves_exact_pre_fence_v2_migration() {
+        let backend = SqliteSessionBackend::in_memory().expect("active migration backend");
+        let connection = backend.conn.blocking_lock();
+        apply_valid_recovery_v2_finalization_fixture(&connection, &backend.caps);
+        replace_recovery_with_exact_pre_fence_fixture(&connection);
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xA1; 32],
+            audit_pending: false,
+        };
+
+        assert!(
+            active_latch_is_coherent_with_admitted_connection(&connection, latch).is_err(),
+            "a live admitted projection cannot silently migrate a pre-fence image",
+        );
+        assert!(
+            !operator_recovery_v2_activation_column_exists(&connection)
+                .expect("inspect untouched pre-fence schema"),
+            "the admitted read must leave the released predecessor untouched",
+        );
+
+        active_latch_is_coherent_with_connection(&connection, latch)
+            .expect("pre-admission classifier migrates the exact released predecessor");
+        assert_eq!(
+            1_i64,
+            connection
+                .query_row(
+                    "SELECT recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read migrated V2 activation marker"),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn classifier_rejects_database_path_replaced_after_an_absent_preflight() {
+        let directory = tempfile::tempdir().expect("absent latch directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open pristine backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize pristine core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let database_for_hook = database.clone();
+        install_latch_classify_before_final_revalidation_hook(move |_| {
+            replace_database_path_with_byte_identical_copy(
+                &database_for_hook,
+                "absent-database-copy",
+            );
+        });
+        let connection = Connection::open(&database).expect("open classifier connection");
+        let error =
+            match classify_operator_recovery_latch_with_connection_sync(&database, &connection) {
+                Ok(_) => panic!("absent terminal database replacement must fail"),
+                Err(error) => error,
+            };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn terminal_snapshot_digest_bound_accepts_the_complete_exact_envelope() {
+        validate_terminal_snapshot_envelope_bytes(SNAPSHOT_ENVELOPE_MAX_BYTES)
+            .expect("the exact complete snapshot envelope remains admissible");
+        let error = validate_terminal_snapshot_envelope_bytes(
+            SNAPSHOT_ENVELOPE_MAX_BYTES
+                .checked_add(1)
+                .expect("snapshot envelope ceiling leaves an oversize value"),
+        )
+        .expect_err("one byte beyond the complete envelope must fail");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_snapshot_constructor_binds_the_raw_envelope_not_a_workflow_digest() {
+        let directory = tempfile::tempdir().expect("terminal snapshot directory");
+        let path = directory.path().join("snapshot-terminal-envelope.opc");
+        let bytes = b"terminal snapshot envelope bytes";
+        std::fs::write(&path, bytes).expect("write terminal snapshot envelope");
+        let file = File::open(&path).expect("open terminal snapshot envelope");
+        if operator_recovery_file_incarnation(&file).is_err() {
+            // Persistent file handles are an explicit recovery capability.
+            // Hosts without them fail closed in production; this exact-FD
+            // constructor test is meaningful only on a qualifying filesystem.
+            return;
+        }
+
+        let terminal = operator_recovery_terminal_snapshot(&path, &file, false)
+            .expect("construct terminal snapshot evidence");
+        let raw: [u8; 32] = Sha256::digest(bytes).into();
+        let mut workflow = Sha256::new();
+        workflow.update(b"workflow-digest-domain\\0");
+        workflow.update(bytes);
+        let workflow: [u8; 32] = workflow.finalize().into();
+
+        assert_eq!(terminal.digest, raw);
+        assert_ne!(
+            terminal.digest, workflow,
+            "terminal evidence must bind the raw envelope normal startup consumes"
+        );
+    }
 
     #[test]
     fn proactive_checkpoint_cadence_expires_at_its_exact_fixed_threshold() {
@@ -33002,14 +42425,15 @@ mod tests {
 
         // The VFS registry is process-global.  Re-exec exactly this test so
         // no parallel unit test can observe its deliberate fault injection.
+        // Use the live Linux descriptor link rather than Cargo's replaceable
+        // target path: a concurrent linker may unlink that path while this
+        // long-running test binary remains executable through /proc.
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(
-                std::env::current_exe().expect("current unit-test executable"),
-            )
-            .args(["--exact", TEST_NAME])
-            .env(CHILD, "1")
-            .status()
-            .expect("run isolated temporary-path failure regression");
+            let status = std::process::Command::new("/proc/self/exe")
+                .args(["--exact", TEST_NAME])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated temporary-path failure regression");
             assert!(status.success(), "isolated regression succeeds");
             return;
         }
@@ -33525,6 +42949,9 @@ mod tests {
             pending_epoch: None,
             pending_plan_digest: None,
             watch_cursor_invalidation_floor: 9,
+            finalize_log_id: Some(log_id(9)),
+            finalize_entry_json: Some(vec![0xC9]),
+            recovery_v2_activated: true,
         };
 
         for rollback in [
@@ -33534,11 +42961,13 @@ mod tests {
             "watch-sequence",
             "recovery-epoch",
             "recovery-plan",
+            "recovery-finalize-log-id",
+            "recovery-finalize-certificate",
             "watch-cursor-floor",
             "pending-erasure",
         ] {
-            let mut incoming = local;
-            let mut local = local;
+            let mut incoming = local.clone();
+            let mut local = local.clone();
             match rollback {
                 "logical-time" => incoming.logical_time = None,
                 "application-sequence" => incoming.application_sequence -= 1,
@@ -33546,6 +42975,11 @@ mod tests {
                 "watch-sequence" => incoming.watch_sequence -= 1,
                 "recovery-epoch" => incoming.recovery_epoch -= 1,
                 "recovery-plan" => incoming.last_plan_digest = [0x94; 32],
+                "recovery-finalize-log-id" => {
+                    incoming.finalize_log_id =
+                        Some(LogId::new(CommittedLeaderId::new(2, node_id()), 9));
+                }
+                "recovery-finalize-certificate" => incoming.finalize_entry_json = Some(vec![0xCA]),
                 "watch-cursor-floor" => incoming.watch_cursor_invalidation_floor -= 1,
                 "pending-erasure" => {
                     local.pending_epoch = Some(10);
@@ -33562,14 +42996,86 @@ mod tests {
         let finalized = SnapshotMonotonicState {
             recovery_epoch: 10,
             last_plan_digest: [0x95; 32],
-            ..local
+            ..local.clone()
         };
         let pending_local = SnapshotMonotonicState {
             pending_epoch: Some(10),
             pending_plan_digest: Some([0x95; 32]),
-            ..local
+            ..local.clone()
         };
         assert!(validate_snapshot_monotonic_state(&pending_local, &finalized).is_ok());
+    }
+
+    #[test]
+    fn pending_recovery_snapshot_finalization_requires_a_covered_full_log_id() {
+        let local = SnapshotMonotonicState {
+            recovery_epoch: 4,
+            last_plan_digest: [0xA4; 32],
+            pending_epoch: Some(5),
+            pending_plan_digest: Some([0xA5; 32]),
+            finalize_log_id: Some(log_id(1)),
+            finalize_entry_json: Some(vec![0xC1]),
+            ..snapshot_monotonic_state(0)
+        };
+        let finalized = SnapshotMonotonicState {
+            recovery_epoch: 5,
+            last_plan_digest: [0xA5; 32],
+            pending_epoch: None,
+            pending_plan_digest: None,
+            finalize_log_id: Some(log_id(2)),
+            finalize_entry_json: Some(vec![0xC2]),
+            ..snapshot_monotonic_state(0)
+        };
+        assert!(validate_snapshot_monotonic_state(&local, &finalized).is_ok());
+        let missing_finalize = SnapshotMonotonicState {
+            finalize_log_id: None,
+            finalize_entry_json: None,
+            ..finalized.clone()
+        };
+        assert!(validate_snapshot_monotonic_state(&local, &missing_finalize).is_err());
+        let missing_certificate = SnapshotMonotonicState {
+            finalize_entry_json: None,
+            ..finalized.clone()
+        };
+        assert!(validate_snapshot_monotonic_state(&local, &missing_certificate).is_err());
+
+        let backend = SqliteSessionBackend::in_memory().expect("snapshot recovery backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("snapshot schema");
+        set_applied_index_for_test(&conn, identity(), 2);
+        validate_snapshot_finalized_recovery_log_id(
+            &conn,
+            identity(),
+            Some(&log_id(2)),
+            &local,
+            &finalized,
+        )
+        .expect("exact finalized recovery LogId is covered");
+
+        let same_index_different_term = SnapshotMonotonicState {
+            finalize_log_id: Some(LogId::new(CommittedLeaderId::new(2, node_id()), 2)),
+            ..finalized.clone()
+        };
+        assert!(validate_snapshot_finalized_recovery_log_id(
+            &conn,
+            identity(),
+            Some(&log_id(2)),
+            &local,
+            &same_index_different_term,
+        )
+        .is_err());
+        let beyond_cut = SnapshotMonotonicState {
+            finalize_log_id: Some(log_id(3)),
+            ..finalized.clone()
+        };
+        assert!(validate_snapshot_finalized_recovery_log_id(
+            &conn,
+            identity(),
+            Some(&log_id(2)),
+            &local,
+            &beyond_cut,
+        )
+        .is_err());
     }
 
     #[test]
@@ -33711,6 +43217,7 @@ mod tests {
                 }
             },
             |_| Err(rusqlite::Error::QueryReturnedNoRows),
+            || {},
         )
         .expect_err("post-step WAL overflow must win over the forced step error");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
@@ -33718,6 +43225,54 @@ mod tests {
         writer
             .execute("INSERT INTO payload(value) VALUES (zeroblob(8))", [])
             .expect("writer remains usable after reader release");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stepped_backup_paces_only_between_more_and_the_next_step() {
+        let directory = tempfile::tempdir().expect("snapshot pacing directory");
+        let source_path = directory.path().join("source.sqlite");
+        let destination_path = directory.path().join("destination.sqlite");
+        let source = Connection::open(&source_path).expect("open source SQLite");
+        source
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE payload(value BLOB);")
+            .expect("enable source WAL");
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source)
+                .expect("duplicate source descriptor"),
+            source_path,
+        )
+        .expect("pin source descriptor");
+        let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
+        reader
+            .connection
+            .execute_batch("BEGIN DEFERRED TRANSACTION; SELECT count(*) FROM payload;")
+            .expect("begin reader transaction");
+        pin_snapshot_reader_wal(&reader).expect("pin reader WAL descriptor");
+        let mut destination = Connection::open(destination_path).expect("open destination");
+        let mut steps = 0_usize;
+        let mut pauses = 0_usize;
+
+        backup_snapshot_reader_bounded_with_hook_and_step(
+            &reader,
+            &mut destination,
+            SNAPSHOT_SOURCE_WAL_MAX_BYTES,
+            || {},
+            |_| {
+                steps += 1;
+                if steps == 1 {
+                    Ok(rusqlite::backup::StepResult::More)
+                } else {
+                    Ok(rusqlite::backup::StepResult::Done)
+                }
+            },
+            || pauses += 1,
+        )
+        .expect("synthetic bounded backup completes");
+
+        assert_eq!(2, steps, "Done follows one More continuation");
+        assert_eq!(1, pauses, "Done never receives a trailing pacing pause");
+        release_snapshot_read_sync(&reader).expect("release reader after pacing proof");
     }
 
     #[cfg(target_os = "linux")]
@@ -34277,6 +43832,9 @@ mod tests {
             pending_epoch: None,
             pending_plan_digest: None,
             watch_cursor_invalidation_floor: 0,
+            finalize_log_id: None,
+            finalize_entry_json: None,
+            recovery_v2_activated: false,
         }
     }
 
@@ -34520,6 +44078,9 @@ mod tests {
         create_attached_snapshot_validation_views(
             &conn,
             AttachedSnapshotLeaseSchema::Current,
+            true,
+            true,
+            true,
             true,
             false,
         )
@@ -36330,9 +45891,311 @@ mod tests {
         tx.commit().expect("commit purge-floor fixture");
     }
 
+    fn set_test_log_pointer(
+        conn: &Connection,
+        table: &'static str,
+        pointer: &LogId<SessionConsensusNodeId>,
+    ) {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .expect("begin raw log-pointer fixture transaction");
+        save_log_pointer(&tx, table, identity(), pointer).expect("save raw log-pointer fixture");
+        tx.commit().expect("commit raw log-pointer fixture");
+    }
+
+    fn replace_test_blank_log(conn: &Connection, log_id: &LogId<SessionConsensusNodeId>) {
+        let entry: Entry<SessionRaftTypeConfig> = Entry {
+            log_id: *log_id,
+            payload: EntryPayload::Blank,
+        };
+        conn.execute(
+            "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = ?3",
+            params![
+                i64::try_from(log_id.leader_id.term).expect("test term fits SQLite"),
+                encode_json(&entry).expect("encode test blank log"),
+                i64::try_from(log_id.index).expect("test index fits SQLite"),
+            ],
+        )
+        .expect("replace test blank log");
+    }
+
+    fn save_test_snapshot_marker(
+        conn: &Connection,
+        marker: LogId<SessionConsensusNodeId>,
+        snapshot_id: &str,
+    ) {
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(marker),
+            last_membership: read_membership_sync(conn, identity())
+                .expect("read fixture membership for snapshot marker"),
+            snapshot_id: snapshot_id.to_owned(),
+        };
+        conn.execute(
+            "INSERT INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, 1)",
+            params![
+                epoch_i64(identity()).expect("epoch fits SQLite"),
+                encode_json(&meta).expect("encode raw snapshot marker"),
+                "snapshot-00000000-0000-4000-8000-0000000000f1.opc",
+                [0_u8; 32].as_slice(),
+            ],
+        )
+        .expect("seed raw snapshot marker");
+    }
+
+    #[test]
+    fn aggregate_roster_schema_validation_is_select_only() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed_writes = Arc::clone(&writes);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                rusqlite::hooks::AuthAction::Insert { .. }
+                    | rusqlite::hooks::AuthAction::Update { .. }
+                    | rusqlite::hooks::AuthAction::Delete { .. }
+            ) {
+                observed_writes.fetch_add(1, Ordering::Relaxed);
+                rusqlite::hooks::Authorization::Deny
+            } else {
+                rusqlite::hooks::Authorization::Allow
+            }
+        }));
+
+        validate_existing_schema(&conn, identity())
+            .expect("aggregate roster validation is a read-only schema projection");
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            0,
+            "aggregate roster validation must not attempt any main-database write"
+        );
+    }
+
     #[cfg(target_os = "linux")]
-    async fn assert_consensus_log_prune_primary_preemption_at_production_window(
+    #[test]
+    fn snapshot_install_rejects_orphan_target_roster_side_rows_before_views_or_writes() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let directory = tempfile::tempdir().expect("orphan-roster snapshot directory");
+        let snapshot_path = directory.path().join("valid-forward-roster.sqlite");
+        let target_path = directory.path().join("corrupt-target-roster.sqlite");
+
+        let source = SqliteSessionBackend::in_memory().expect("valid forward roster source");
+        let (meta, byte_length) = {
+            let conn = source.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("source schema");
+            apply_entries_sync(
+                &conn,
+                identity(),
+                &source.caps,
+                vec![membership_entry(), blank_entry(1)],
+            )
+            .expect("apply valid forward source state");
+            activate_protected_roster_schema_sync(&conn)
+                .expect("activate valid forward source roster");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&conn, identity(), &snapshot_path)
+                    .expect("build valid forward activated-roster snapshot");
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "valid-forward-roster-orphan-target".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("valid forward snapshot metadata")
+                    .len(),
+            )
+        };
+        drop(source);
+
+        let target = SqliteSessionBackend::open(&target_path).expect("corrupt target backend");
+        {
+            let conn = target.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("target schema");
+            // Snapshot installation validates the current recovery singleton
+            // before it validates the protected roster.  Materialize that
+            // released schema up front: the authorizer below must observe
+            // only writes attempted by the install, not this target's first
+            // lazy recovery-schema initialization.
+            ensure_operator_recovery_schema_sync(&conn, identity())
+                .expect("materialize target recovery singleton before install");
+            apply_entries_sync(&conn, identity(), &target.caps, vec![membership_entry()])
+                .expect("apply target predecessor membership");
+            activate_protected_roster_schema_sync(&conn).expect("activate target roster");
+            conn.execute_batch("PRAGMA foreign_keys = OFF")
+                .expect("permit explicit orphan corruption fixture");
+            conn.execute(
+                "INSERT INTO consensus_protected_roster_admissions \
+                 (binding, stable_slot, admission_request_id, terminal_request_id, configuration_epoch, \
+                  original_owner, original_fence, original_credential_id, original_generation, \
+                  original_acquired_at, original_expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, 1, 'orphan-owner', 1, 1, 1, \
+                         '2026-01-01T00:00:00.000000000Z', '2026-01-01T00:01:00.000000000Z')",
+                params![
+                    [0x91_u8; 120].as_slice(),
+                    [0x92_u8; 32].as_slice(),
+                    [0x93_u8; 16].as_slice(),
+                    [0x94_u8; 16].as_slice(),
+                ],
+            )
+            .expect("inject orphan target roster admission side row");
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("checkpoint corrupt target fixture");
+        }
+        drop(target);
+
+        let target_bytes_before = std::fs::read(&target_path).expect("read target before install");
+        let source_bytes_before =
+            std::fs::read(&snapshot_path).expect("read source before install");
+        let conn = Connection::open(&target_path).expect("reopen corrupt target for install");
+        apply_pragma_profile(&conn, false, true).expect("configure target install connection");
+        let target_schema_before = conn
+            .prepare(
+                "SELECT type, name, tbl_name, COALESCE(sql, '') \
+                 FROM sqlite_master ORDER BY type, name, tbl_name, sql",
+            )
+            .expect("prepare target schema image")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .expect("read target schema image")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect target schema image");
+        let target_orphan_before: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT binding, stable_slot, admission_request_id, terminal_request_id \
+                 FROM consensus_protected_roster_admissions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read exact orphan target side row");
+        assert!(
+            table_exists(&conn, "consensus_operator_recovery")
+                .expect("target recovery table remains materialized"),
+            "the target baseline must pre-materialize recovery schema before authorizing install"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("target recovery singleton remains materialized"),
+            1
+        );
+        let target_writes = Arc::new(AtomicUsize::new(0));
+        let observed_target_writes = Arc::clone(&target_writes);
+        let validation_views = Arc::new(AtomicUsize::new(0));
+        let observed_validation_views = Arc::clone(&validation_views);
+        conn.authorizer(Some(move |context: AuthContext<'_>| {
+            // SQLite reports the idempotent `CREATE TABLE IF NOT EXISTS` and
+            // `INSERT OR IGNORE` used by the normal recovery *reader* as
+            // authorizer writes even when neither changes a page or row.
+            // Count every target replacement-table mutation; the exact main
+            // database image assertion below covers those no-op probes too.
+            let is_target_replacement_write = match context.action {
+                AuthAction::Insert { table_name }
+                    if table_name != "sqlite_master"
+                        && table_name != "consensus_operator_recovery" =>
+                {
+                    true
+                }
+                AuthAction::Update { table_name, .. } | AuthAction::Delete { table_name }
+                    if table_name != "sqlite_master" =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if context.database_name == Some("main") && is_target_replacement_write {
+                observed_target_writes.fetch_add(1, Ordering::SeqCst);
+            }
+            if matches!(context.action, AuthAction::CreateTempView { .. }) {
+                observed_validation_views.fetch_add(1, Ordering::SeqCst);
+            }
+            Authorization::Allow
+        }));
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            open_nofollow_read(&snapshot_path).expect("pin valid forward source"),
+            snapshot_path.clone(),
+        )
+        .expect("bind valid forward source identity");
+        let error = install_snapshot_database_from_pinned_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+            None,
+            None,
+            pinned,
+            None,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-0000000007f1.opc",
+            [0x95; 32],
+            byte_length,
+        )
+        .expect_err("corrupt activated target roster must reject a valid forward snapshot");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(
+            target_writes.load(Ordering::SeqCst),
+            0,
+            "target roster validation rejects before any main-database replacement write"
+        );
+        assert_eq!(
+            validation_views.load(Ordering::SeqCst),
+            0,
+            "target roster validation rejects before creating attached-source validation views"
+        );
+        let target_schema_after = conn
+            .prepare(
+                "SELECT type, name, tbl_name, COALESCE(sql, '') \
+                 FROM sqlite_master ORDER BY type, name, tbl_name, sql",
+            )
+            .expect("prepare retained target schema image")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .expect("read retained target schema image")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect retained target schema image");
+        let target_orphan_after: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT binding, stable_slot, admission_request_id, terminal_request_id \
+                 FROM consensus_protected_roster_admissions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read retained orphan target side row");
+        assert_eq!(target_schema_after, target_schema_before);
+        assert_eq!(target_orphan_after, target_orphan_before);
+        drop(conn);
+        assert_eq!(
+            std::fs::read(&target_path).expect("read target after rejected install"),
+            target_bytes_before,
+            "rejection keeps the target database byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(&snapshot_path).expect("read source after rejected install"),
+            source_bytes_before,
+            "rejection keeps the valid incoming artifact byte-identical"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_consensus_log_prune_turn_interruption_at_controlled_window(
         point: ConsensusLogPruneTurnGatePoint,
+        cancel_primary_before_handoff: bool,
     ) {
         let directory = tempfile::tempdir().expect("prune preemption directory");
         let source_path = directory.path().join("prune-preemption.sqlite");
@@ -36405,8 +46268,18 @@ mod tests {
         );
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
         let gate = match point {
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead
+                if cancel_primary_before_handoff =>
+            {
+                ConsensusLogPruneTurnGateForTest::
+                    install_before_authority_read_with_progress_handoff(directory.path())
+            }
             ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead => {
                 ConsensusLogPruneTurnGateForTest::install_before_authority_read(directory.path())
+            }
+            ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt => {
+                ConsensusLogPruneTurnGateForTest::
+                    install_after_begin_success_before_synthetic_interrupt(directory.path())
             }
             ConsensusLogPruneTurnGatePoint::BeforeReadPurged => {
                 ConsensusLogPruneTurnGateForTest::install_before_read_purged(directory.path())
@@ -36440,8 +46313,57 @@ mod tests {
             })
             .await
             .expect("join production-window gate observer"),
-            "the real lane is parked after its final explicit check with no VDBE active"
+            "the real prune lane reached the controlled interruption window"
         );
+
+        if point == ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt {
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let snapshot = diagnostics.snapshot();
+                    if snapshot.consensus_log_prune_drained_turns == 1
+                        || snapshot.consensus_log_prune_degraded
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("interrupted BEGIN cleanup either drains or reports its terminal state");
+            let snapshot = diagnostics.snapshot();
+            assert!(
+                !snapshot.consensus_log_prune_degraded && !lane.is_degraded(),
+                "an interrupted BEGIN that opened a transaction must roll back before retrying; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_attempts,
+                2,
+                "the interrupted BEGIN and its successful retry are the only turns; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_busy_retries, 1,
+                "the interrupted BEGIN schedules exactly one retry; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_permanent_failures, 0,
+                "the interrupted BEGIN cleanup must not degrade the lane; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_drained_turns, 1,
+                "the successful retry drains the backlog once; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                primary
+                    .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("count drained rows after interrupted BEGIN cleanup"),
+                0,
+                "the retry drains the intact physical backlog after interrupted BEGIN cleanup"
+            );
+            lane.shutdown().await;
+            return;
+        }
 
         let primary_lane = Arc::clone(&lane);
         let primary_guard =
@@ -36453,6 +46375,66 @@ mod tests {
         })
         .await
         .expect("primary priority interrupts the gated prune turn before handoff");
+        if cancel_primary_before_handoff {
+            // Enter a real authority-read VDBE while the primary claim is
+            // retained. Its interval-one progress callback records the exact
+            // turn-local preemption and parks before returning SQLITE_INTERRUPT.
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !gate.progress_preempted() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("authority-read VDBE observes the waiting primary");
+            primary_guard.abort();
+            let primary_cancelled = match primary_guard.await {
+                Err(error) => error.is_cancelled(),
+                Ok(_) => false,
+            };
+            assert!(
+                primary_cancelled,
+                "the primary handoff task is cancelled before the prune turn returns"
+            );
+            assert_eq!(
+                lane.primary_writers_for_test(),
+                0,
+                "cancelling the waiting primary releases its priority claim"
+            );
+            gate.gate.release_progress_preemption();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let snapshot = diagnostics.snapshot();
+                    if snapshot.consensus_log_prune_drained_turns == 1
+                        || snapshot.consensus_log_prune_degraded
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled primary preemption retries and drains the intact prune backlog");
+            let snapshot = diagnostics.snapshot();
+            assert_eq!(
+                snapshot.consensus_log_prune_busy_retries, 1,
+                "one cancelled primary causes exactly one rolled-back prune retry; diagnostics={snapshot:?}"
+            );
+            assert!(
+                !snapshot.consensus_log_prune_degraded && !lane.is_degraded(),
+                "a cancelled primary cannot turn its exact interrupt into permanent degradation; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                primary
+                    .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("count drained rows after cancelled primary preemption"),
+                0,
+                "the retry drains the rolled-back physical backlog"
+            );
+            lane.shutdown().await;
+            return;
+        }
         gate.release();
         let primary_guard = primary_guard.await.expect("join primary prune handoff");
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -36532,8 +46514,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_preemption_closes_the_window_before_delete() {
-        assert_consensus_log_prune_primary_preemption_at_production_window(
+        assert_consensus_log_prune_turn_interruption_at_controlled_window(
             ConsensusLogPruneTurnGatePoint::BeforeDelete,
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_synthetic_interrupted_begin_rolls_back_before_retrying() {
+        assert_consensus_log_prune_turn_interruption_at_controlled_window(
+            ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt,
+            false,
         )
         .await;
     }
@@ -36541,8 +46534,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_preemption_rolls_back_a_mid_delete_interrupt() {
-        assert_consensus_log_prune_primary_preemption_at_production_window(
+        assert_consensus_log_prune_turn_interruption_at_controlled_window(
             ConsensusLogPruneTurnGatePoint::MidDelete,
+            false,
         )
         .await;
     }
@@ -36550,8 +46544,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_preemption_closes_the_window_before_purged_read() {
-        assert_consensus_log_prune_primary_preemption_at_production_window(
+        assert_consensus_log_prune_turn_interruption_at_controlled_window(
             ConsensusLogPruneTurnGatePoint::BeforeReadPurged,
+            false,
         )
         .await;
     }
@@ -36559,8 +46554,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_preemption_closes_the_window_before_authority_read() {
-        assert_consensus_log_prune_primary_preemption_at_production_window(
+        assert_consensus_log_prune_turn_interruption_at_controlled_window(
             ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+            false,
         )
         .await;
     }
@@ -36568,8 +46564,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_preemption_closes_the_window_before_commit() {
-        assert_consensus_log_prune_primary_preemption_at_production_window(
+        assert_consensus_log_prune_turn_interruption_at_controlled_window(
             ConsensusLogPruneTurnGatePoint::BeforeCommit,
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_cancelled_primary_preemption_retries_without_degradation() {
+        assert_consensus_log_prune_turn_interruption_at_controlled_window(
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+            true,
         )
         .await;
     }
@@ -36581,6 +46588,8 @@ mod tests {
         set_test_purge_floor(&conn, &log_id(129));
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin row-limit turn");
+        validate_exact_log_prune_lineage_in_tx(&tx, identity(), &log_id(129))
+            .expect("valid fixed prune proof accepts a complete retained prefix");
         let completion = prune_consensus_log_rows_in_tx(
             &tx,
             &log_id(129),
@@ -36701,7 +46710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_purge_masks_all_log_reads_and_rejects_floor_regression() {
+    async fn logical_purge_masks_all_log_reads_and_keeps_a_stronger_floor() {
         let backend = backend_with_blank_logs(3).await;
         let conn = backend.conn.lock().await;
         apply_entries_sync(
@@ -36761,11 +46770,11 @@ mod tests {
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin idempotent floor transaction");
         logical_purge_logs_in_tx(&tx, identity(), &log_id(1), 1).expect("same floor is idempotent");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(0), 0)
+            .expect("older delayed floor is an idempotent no-op");
         assert_eq!(
-            logical_purge_logs_in_tx(&tx, identity(), &log_id(0), 0)
-                .expect_err("floor regression rejects")
-                .kind(),
-            io::ErrorKind::InvalidData
+            read_purged_sync(&tx, identity()).expect("stronger purge floor remains"),
+            Some(log_id(1))
         );
         let different_id = LogId::new(CommittedLeaderId::new(2, node_id()), 1);
         assert_eq!(
@@ -36785,6 +46794,505 @@ mod tests {
                 .expect_err("unapplied floor rejects")
                 .kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_purge_shares_one_exact_superset_payload_scan() {
+        const SNAPSHOT_INDEX: u64 = 4_095;
+        const PURGE_INDEX: u64 = 3_071;
+
+        let backend = backend_with_blank_logs(SNAPSHOT_INDEX).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership before snapshot marker");
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(SNAPSHOT_INDEX));
+        save_test_snapshot_marker(
+            &conn,
+            log_id(SNAPSHOT_INDEX),
+            "logical-purge-one-superset-scan",
+        );
+
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin exact logical purge");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+            .expect("one superset payload audit proves applied and purge targets");
+        tx.commit().expect("commit exact logical purge");
+
+        assert_eq!(
+            committed_log_validation_decoded_rows_for_test(),
+            usize::try_from(SNAPSHOT_INDEX + 1).expect("snapshot row count fits usize"),
+            "the applied and purge proofs must share exactly one complete payload audit",
+        );
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("read one-scan purge floor"),
+            Some(log_id(PURGE_INDEX)),
+        );
+    }
+
+    #[tokio::test]
+    async fn large_exact_purge_audit_rejects_noncanonical_interior_v2_before_pointer_mutation() {
+        const APPLIED_INDEX: u64 = 127;
+        const CORRUPT_INDEX: u64 = 96;
+        const PURGE_INDEX: u64 = 63;
+
+        let backend = backend_with_blank_logs(APPLIED_INDEX).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership before strict audit");
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(APPLIED_INDEX));
+        save_test_snapshot_marker(
+            &conn,
+            log_id(APPLIED_INDEX),
+            "logical-purge-strict-parallel-audit",
+        );
+        let entry = fenced_transition_v2_entry(
+            CORRUPT_INDEX,
+            fenced_transition_v2_request(0x96, 1, "parallel-audit-owner"),
+            timestamp(2),
+        );
+        let encoded = noncanonical_v2_log_json(&entry);
+        assert!(
+            decode_consensus_log_entry(&encoded).is_err(),
+            "fixture must be strict-V2 noncanonical",
+        );
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+            params![
+                encoded,
+                i64::try_from(CORRUPT_INDEX).expect("index fits SQLite")
+            ],
+        )
+        .expect("install interior strict-V2 corruption");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin strict exact purge");
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+                .expect_err("interior strict-V2 corruption rejects before purge publication")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_purged_sync(&tx, identity()).expect("read unmodified purge pointer"),
+            None,
+        );
+        drop(tx);
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("read durable unmodified purge pointer"),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn full_log_id_pointer_guards_reject_lower_term_advances_before_purge_delete() {
+        let backend = backend_with_blank_logs(2).await;
+        let conn = backend.conn.lock().await;
+        let current = log_id(1);
+        let lower_term_next = LogId::new(CommittedLeaderId::new(0, node_id()), 2);
+        let equal_index_other_history = LogId::new(CommittedLeaderId::new(2, node_id()), 1);
+
+        save_committed_sync(&conn, identity(), Some(current)).expect("save committed full pointer");
+        for invalid in [&lower_term_next, &equal_index_other_history] {
+            assert_eq!(
+                save_committed_sync(&conn, identity(), Some(*invalid))
+                    .expect_err("invalid committed lineage rejects")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                read_committed_sync(&conn, identity()).expect("committed pointer remains exact"),
+                Some(current)
+            );
+        }
+
+        let applied = log_id(2);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("seed full purge pointers");
+        save_log_pointer(&tx, "consensus_purged", identity(), &current)
+            .expect("seed purge pointer");
+        save_log_pointer(&tx, "consensus_applied", identity(), &applied)
+            .expect("seed applied pointer");
+        tx.commit().expect("commit full purge pointers");
+        let retained_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+            .expect("count log rows before rejected purge");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin invalid physical purge");
+        assert_eq!(
+            purge_logs_in_tx(&tx, identity(), &lower_term_next, 2)
+                .expect_err("higher index lower term purge rejects before delete")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(tx);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                .get::<_, i64>(0))
+                .expect("rejected purge retains log rows"),
+            retained_rows
+        );
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("rejected purge retains full floor"),
+            Some(current)
+        );
+    }
+
+    #[tokio::test]
+    async fn compacted_marker_lineage_rejects_order_and_identity_splices_without_mutation() {
+        fn alternate(term: u64, index: u64) -> LogId<SessionConsensusNodeId> {
+            LogId::new(CommittedLeaderId::new(term, node_id()), index)
+        }
+        fn save_raw_snapshot_marker(
+            conn: &Connection,
+            marker: LogId<SessionConsensusNodeId>,
+            snapshot_id: &str,
+        ) {
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id: Some(marker),
+                last_membership: read_membership_sync(conn, identity())
+                    .expect("read pristine membership"),
+                snapshot_id: snapshot_id.to_owned(),
+            };
+            conn.execute(
+                "INSERT INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, 1)",
+                params![
+                    epoch_i64(identity()).expect("epoch fits SQLite"),
+                    encode_json(&meta).expect("encode raw snapshot marker"),
+                    "snapshot-00000000-0000-4000-8000-0000000000f1.opc",
+                    [0_u8; 32].as_slice(),
+                ],
+            )
+            .expect("seed raw snapshot marker");
+        }
+
+        // With the marker rows physically gone, selecting only the newer
+        // snapshot would accept this splice.  The ordered proof must reject
+        // purge(term=5,index=0) -> snapshot(term=4,index=1) first.
+        let ordered = backend_with_blank_logs(2).await;
+        let ordered_conn = ordered.conn.lock().await;
+        ordered_conn
+            .execute("DELETE FROM consensus_log WHERE log_index <= 1", [])
+            .expect("remove physically pruned marker rows");
+        set_test_purge_floor(&ordered_conn, &alternate(5, 0));
+        save_raw_snapshot_marker(&ordered_conn, alternate(4, 1), "ordered-marker-splice");
+        assert_eq!(
+            validate_exact_log_prefix_through_sync(
+                &ordered_conn,
+                identity(),
+                &alternate(5, 2),
+                false,
+            )
+            .expect_err("lower-term newer marker rejects")
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            ordered_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count retained rows"),
+            1,
+            "marker validation cannot delete retained rows"
+        );
+
+        let same_index = backend_with_blank_logs(1).await;
+        let same_index_conn = same_index.conn.lock().await;
+        same_index_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("remove same-index marker row");
+        set_test_purge_floor(&same_index_conn, &alternate(5, 0));
+        save_raw_snapshot_marker(&same_index_conn, alternate(4, 0), "same-index-splice");
+        assert!(
+            validated_log_markers_sync(&same_index_conn, identity()).is_err(),
+            "same numeric marker index requires exact full LogId equality"
+        );
+
+        let retained = backend_with_blank_logs(1).await;
+        let retained_conn = retained.conn.lock().await;
+        set_test_purge_floor(&retained_conn, &alternate(5, 0));
+        assert!(
+            validated_log_markers_sync(&retained_conn, identity()).is_err(),
+            "a retained marker row is an exact identity witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_snapshot_witness_rejects_target_term_splice_before_pointer_or_log_mutation() {
+        enum Operation {
+            Commit,
+            Truncate,
+            Purge,
+        }
+
+        for operation in [Operation::Commit, Operation::Truncate, Operation::Purge] {
+            let backend = backend_with_blank_logs(2).await;
+            let conn = backend.conn.lock().await;
+            let target = LogId::new(CommittedLeaderId::new(3, node_id()), 1);
+            let later_snapshot = LogId::new(CommittedLeaderId::new(2, node_id()), 2);
+            replace_test_blank_log(&conn, &target);
+            replace_test_blank_log(&conn, &later_snapshot);
+            set_test_purge_floor(&conn, &log_id(0));
+            save_test_snapshot_marker(&conn, later_snapshot, "later-snapshot-term-splice");
+            set_test_log_pointer(&conn, "consensus_applied", &target);
+            let rows_before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+                .expect("count retained rows before rejected operation");
+
+            match operation {
+                Operation::Commit => {
+                    assert_eq!(
+                        save_committed_sync(&conn, identity(), Some(target))
+                            .expect_err("later lower-term snapshot rejects committed splice")
+                            .kind(),
+                        io::ErrorKind::InvalidData
+                    );
+                    assert_eq!(
+                        read_committed_sync(&conn, identity())
+                            .expect("read committed pointer after rejection"),
+                        None,
+                        "rejected committed splice does not publish a pointer"
+                    );
+                }
+                Operation::Truncate => {
+                    assert_eq!(
+                        truncate_logs_sync(&conn, identity(), &later_snapshot)
+                            .expect_err("later lower-term snapshot rejects truncate splice")
+                            .kind(),
+                        io::ErrorKind::InvalidData
+                    );
+                }
+                Operation::Purge => {
+                    assert_eq!(
+                        purge_logs_sync(&conn, identity(), &target)
+                            .expect_err("later lower-term snapshot rejects purge splice")
+                            .kind(),
+                        io::ErrorKind::InvalidData
+                    );
+                    assert_eq!(
+                        read_purged_sync(&conn, identity())
+                            .expect("read purge floor after rejection"),
+                        Some(log_id(0)),
+                        "rejected purge splice does not advance its logical floor"
+                    );
+                }
+            }
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count retained rows after rejected operation"),
+                rows_before,
+                "later snapshot splice rejects before any DELETE"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn later_snapshot_witness_accepts_valid_ahead_intermarker_and_compacted_prefix() {
+        let ahead = backend_with_blank_logs(2).await;
+        let ahead_conn = ahead.conn.lock().await;
+        let intermarker = LogId::new(CommittedLeaderId::new(2, node_id()), 1);
+        let snapshot = LogId::new(CommittedLeaderId::new(2, node_id()), 2);
+        replace_test_blank_log(&ahead_conn, &intermarker);
+        replace_test_blank_log(&ahead_conn, &snapshot);
+        set_test_purge_floor(&ahead_conn, &log_id(0));
+        save_test_snapshot_marker(&ahead_conn, snapshot, "valid-ahead-intermarker");
+        validate_exact_log_prefix_through_sync(&ahead_conn, identity(), &intermarker, false)
+            .expect("a monotonic snapshot ahead of an inline retained target is valid");
+        set_test_log_pointer(&ahead_conn, "consensus_applied", &snapshot);
+        purge_logs_sync(&ahead_conn, identity(), &intermarker)
+            .expect("valid snapshot-ahead purge advances the exact logical floor");
+        assert_eq!(
+            read_purged_sync(&ahead_conn, identity()).expect("read advanced floor"),
+            Some(intermarker),
+            "valid inter-marker purge preserves its exact full LogId"
+        );
+
+        let compacted = backend_with_blank_logs(2).await;
+        let compacted_conn = compacted.conn.lock().await;
+        set_test_purge_floor(&compacted_conn, &log_id(1));
+        compacted_conn
+            .execute("DELETE FROM consensus_log WHERE log_index < 2", [])
+            .expect("remove only rows below authoritative compaction floor");
+        save_test_snapshot_marker(&compacted_conn, log_id(2), "valid-compacted-prefix");
+        validate_exact_log_prefix_through_sync(&compacted_conn, identity(), &log_id(2), false)
+            .expect("missing rows below the exact logical floor remain legitimate compaction");
+    }
+
+    #[tokio::test]
+    async fn exact_log_coverage_rejects_missing_gap_and_alternate_truncate_without_mutation() {
+        let missing = backend_with_blank_logs(2).await;
+        let missing_conn = missing.conn.lock().await;
+        assert_eq!(
+            save_committed_sync(&missing_conn, identity(), Some(log_id(3)))
+                .expect_err("missing committed target rejects")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_committed_sync(&missing_conn, identity()).expect("missing target writes nothing"),
+            None
+        );
+
+        let gap = backend_with_blank_logs(2).await;
+        let gap_conn = gap.conn.lock().await;
+        gap_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+            .expect("create retained gap fixture");
+        assert_eq!(
+            save_committed_sync(&gap_conn, identity(), Some(log_id(2)))
+                .expect_err("gapped committed target rejects")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_committed_sync(&gap_conn, identity()).expect("gap writes nothing"),
+            None
+        );
+
+        let truncate = backend_with_blank_logs(2).await;
+        let truncate_conn = truncate.conn.lock().await;
+        let count_before: i64 = truncate_conn
+            .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+            .expect("count before alternate truncate");
+        let alternate = LogId::new(CommittedLeaderId::new(2, node_id()), 2);
+        assert_eq!(
+            truncate_logs_sync(&truncate_conn, identity(), &alternate)
+                .expect_err("alternate truncate boundary rejects")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            truncate_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("alternate truncate deletes nothing"),
+            count_before
+        );
+        truncate_logs_sync(&truncate_conn, identity(), &log_id(2))
+            .expect("exact uncommitted tail truncates inclusively");
+        assert_eq!(
+            truncate_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("valid truncate count"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_log_validation_decodes_only_successive_extensions() {
+        const LAST_INDEX: u64 = 4_096;
+
+        let backend = backend_with_blank_logs(LAST_INDEX).await;
+        let conn = backend.conn.lock().await;
+        save_committed_sync(&conn, identity(), Some(log_id(0)))
+            .expect("first committed pointer establishes the complete-audit base");
+
+        reset_committed_log_validation_decoded_rows_for_test();
+        for index in 1..=LAST_INDEX {
+            save_committed_sync(&conn, identity(), Some(log_id(index)))
+                .expect("monotonic committed pointer advance");
+        }
+
+        assert_eq!(
+            committed_log_validation_decoded_rows_for_test(),
+            usize::try_from(LAST_INDEX).expect("test index fits usize"),
+            "each ordinary advance decodes its one newly crossed durable-log row; \
+             a repeated complete-prefix scan would grow quadratically",
+        );
+        assert_eq!(
+            read_committed_sync(&conn, identity()).expect("read final committed pointer"),
+            Some(log_id(LAST_INDEX)),
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_log_incremental_validation_fails_closed_for_frontier_gap_and_corruption() {
+        let frontier = backend_with_blank_logs(2).await;
+        let frontier_conn = frontier.conn.lock().await;
+        save_committed_sync(&frontier_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier");
+        let alternate_target = LogId::new(CommittedLeaderId::new(2, node_id()), 2);
+        replace_test_blank_log(&frontier_conn, &alternate_target);
+        assert_eq!(
+            save_committed_sync(&frontier_conn, identity(), Some(log_id(2)))
+                .expect_err("new committed frontier must exactly match its retained row")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&frontier_conn, identity())
+                .expect("read committed pointer after rejected frontier"),
+            Some(log_id(1)),
+        );
+
+        let gap = backend_with_blank_logs(3).await;
+        let gap_conn = gap.conn.lock().await;
+        save_committed_sync(&gap_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier before retained gap");
+        gap_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 2", [])
+            .expect("create newly crossed retained gap");
+        assert_eq!(
+            save_committed_sync(&gap_conn, identity(), Some(log_id(3)))
+                .expect_err("newly crossed retained gap rejects")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&gap_conn, identity())
+                .expect("read committed pointer after rejected gap"),
+            Some(log_id(1)),
+        );
+
+        let corrupt = backend_with_blank_logs(2).await;
+        let corrupt_conn = corrupt.conn.lock().await;
+        save_committed_sync(&corrupt_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier before corrupt extension");
+        corrupt_conn
+            .execute(
+                "UPDATE consensus_log SET entry_json = X'00' WHERE log_index = 2",
+                [],
+            )
+            .expect("inject corrupt newly crossed log row");
+        assert_eq!(
+            save_committed_sync(&corrupt_conn, identity(), Some(log_id(2)))
+                .expect_err("corrupt newly crossed log row rejects")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&corrupt_conn, identity())
+                .expect("read committed pointer after rejected corruption"),
+            Some(log_id(1)),
+        );
+
+        let later_marker = backend_with_blank_logs(3).await;
+        let later_marker_conn = later_marker.conn.lock().await;
+        save_committed_sync(&later_marker_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier before later marker splice");
+        later_marker_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 3", [])
+            .expect("remove physical row represented by later marker");
+        save_test_snapshot_marker(
+            &later_marker_conn,
+            LogId::new(CommittedLeaderId::new(0, node_id()), 3),
+            "incremental-later-marker-splice",
+        );
+        assert_eq!(
+            save_committed_sync(&later_marker_conn, identity(), Some(log_id(2)))
+                .expect_err("later lower-term snapshot marker rejects incremental splice")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&later_marker_conn, identity())
+                .expect("read committed pointer after rejected marker splice"),
+            Some(log_id(1)),
         );
     }
 
@@ -36865,6 +47373,134 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fixed_synchronous_purge_reclaims_snapshot_covered_stale_prefix_without_a_lane() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory backend");
+        let conn = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &conn,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed in-memory authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        let command = blank_entry(1);
+        append_logs_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &[membership.clone(), command.clone()],
+        )
+        .expect("append fixed snapshot cut");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership, command],
+        )
+        .expect("apply fixed snapshot cut");
+        save_test_snapshot_marker(&conn, log_id(1), "snapshot-covered-stale-prefix");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin durable snapshot floor");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(1), 1)
+            .expect("publish exact snapshot purge floor");
+        tx.commit().expect("commit durable snapshot floor");
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+            .expect("portable snapshot leaves only the stale predecessor row");
+
+        // A snapshot has atomically established applied/snapshot/purged L1,
+        // so L0 is covered debris even though it cannot form a physical
+        // suffix ending at L1. This is the no-lane path used when OpenRaft
+        // immediately purges after snapshot install.
+        purge_logs_without_prune_lane_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &log_id(1),
+        )
+        .expect("snapshot-covered stale prefix is physically reclaimable");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index <= 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count reclaimed stale rows"),
+            0
+        );
+        assert_eq!(
+            Some(log_id(1)),
+            read_purged_sync(&conn, identity()).expect("exact snapshot floor survives reclaim")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_lane_startup_recovery_signals_and_attempts_once_when_quiescent() {
+        let directory = tempfile::tempdir().expect("prune startup directory");
+        let source_path = directory.path().join("prune-startup.sqlite");
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let backend = SqliteSessionBackend::open(&source_path)
+            .expect("open prune backend")
+            .with_consensus_diagnostics(Arc::clone(&diagnostics));
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(),
+            members,
+            bindings,
+            ConsensusAuthorityProfile::FixedImmutable,
+            FIXED_TEST_PLACEMENT_POLICY,
+        )
+        .await
+        .expect("initialize pristine fixed prune core");
+        let lane = core
+            .consensus_log_prune_lane()
+            .expect("fixed durable core owns a startup prune lane");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = diagnostics.snapshot();
+                if snapshot.consensus_log_prune_attempts >= 1
+                    && diagnostics.consensus_log_prune_gauges_for_test().0 == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup recovery reaches a quiescent empty turn");
+        // Let every ready coalesced signal run before sampling the final
+        // counters, rather than accepting the first completed turn while a
+        // duplicate startup signal is still queued behind it.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.consensus_log_prune_signals, 1);
+        assert_eq!(snapshot.consensus_log_prune_attempts, 1);
+        assert_eq!(snapshot.consensus_log_prune_completed_turns, 1);
+        assert_eq!(diagnostics.consensus_log_prune_gauges_for_test(), (0, 1));
+        lane.shutdown().await;
+        assert_eq!(diagnostics.consensus_log_prune_gauges_for_test(), (0, 0));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_lane_signals_and_drains_with_one_worker() {
@@ -36939,6 +47575,14 @@ mod tests {
             .expect("pin prune primary descriptor"),
         );
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        primary
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(
+                    PlacementResiliencePolicy::AllowReducedResilience,
+                )],
+            )
+            .expect("tamper fixed prune authority before the startup signal");
         let lane = ConsensusLogPruneLane::start(
             Arc::clone(&pinned),
             None,
@@ -36949,21 +47593,17 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("start prune lane");
-        primary
-            .execute(
-                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
-                [placement_policy_i64(
-                    PlacementResiliencePolicy::AllowReducedResilience,
-                )],
-            )
-            .expect("tamper fixed prune authority");
-        lane.signal();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let snapshot = diagnostics.snapshot();
-                if snapshot.consensus_log_prune_permanent_failures == 1 {
+                if snapshot.consensus_log_prune_permanent_failures == 1
+                    && diagnostics.consensus_log_prune_gauges_for_test() == (0, 0)
+                {
                     assert_eq!(snapshot.consensus_log_prune_completed_turns, 0);
                     assert_eq!(snapshot.consensus_log_prune_rows_deleted, 0);
+                    assert_eq!(snapshot.consensus_log_prune_attempts, 1);
+                    assert!(snapshot.consensus_log_prune_degraded);
+                    assert!(lane.is_degraded());
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -36979,7 +47619,15 @@ mod tests {
                 )],
             )
             .expect("restore fixed prune authority");
+        let stopped = diagnostics.snapshot();
         lane.signal();
+        lane.signal();
+        lane.signal();
+        assert_eq!(
+            diagnostics.snapshot(),
+            stopped,
+            "a degraded lane rejects repeated signals without retrying or restarting"
+        );
         lane.shutdown().await;
         let reopened = ConsensusLogPruneLane::start(
             pinned,
@@ -36991,7 +47639,6 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("reopen prune lane after permanent failure");
-        reopened.signal();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let snapshot = diagnostics.snapshot();
@@ -37000,6 +47647,8 @@ mod tests {
                     assert_eq!(snapshot.consensus_log_prune_completed_turns, 2);
                     assert_eq!(snapshot.consensus_log_prune_more_turns, 1);
                     assert_eq!(snapshot.consensus_log_prune_rows_deleted, 130);
+                    assert!(!snapshot.consensus_log_prune_degraded);
+                    assert!(!reopened.is_degraded());
                     assert_eq!(snapshot.consensus_log_prune_queue_high_water, 1);
                     assert_eq!(snapshot.consensus_log_prune_active_high_water, 1);
                     assert_eq!(snapshot.consensus_log_prune_worker_high_water, 1);
@@ -37011,6 +47660,292 @@ mod tests {
         .await
         .expect("reopen startup signal drains retained logical-purge backlog");
         reopened.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_prune_missing_exact_floor_row_stops_permanently_before_delete() {
+        let directory = tempfile::tempdir().expect("corrupt prune lane directory");
+        let source_path = directory.path().join("corrupt-prune.sqlite");
+        let backend = SqliteSessionBackend::open(&source_path).expect("open corrupt prune backend");
+        let primary = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &primary,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed corrupt prune authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        let entry = blank_entry(1);
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&membership),
+        )
+        .expect("append corrupt-prune membership");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership],
+        )
+        .expect("apply corrupt-prune membership");
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&entry),
+        )
+        .expect("append corrupt-prune floor");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![entry],
+        )
+        .expect("apply corrupt-prune floor");
+        let tx = Transaction::new_unchecked(&primary, TransactionBehavior::Immediate)
+            .expect("begin corrupt-prune floor");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(1), 1)
+            .expect("save corrupt-prune logical floor");
+        tx.commit().expect("commit corrupt-prune logical floor");
+        // Retain the lower physical suffix but remove the one exact row that
+        // authorizes the floor. The live worker must fail before it reaches
+        // the DELETE gate, then ignore all later signals.
+        primary
+            .execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+            .expect("delete exact retained floor row");
+        let pinned = Arc::new(
+            crate::consensus::snapshot::PinnedSqliteFile::from_file(
+                opc_sqlite_file_control_sys::main_file_descriptor(&primary)
+                    .expect("duplicate corrupt-prune descriptor"),
+                source_path,
+            )
+            .expect("pin corrupt-prune descriptor"),
+        );
+        let gate = ConsensusLogPruneTurnGateForTest::install_before_delete(directory.path());
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let lane = ConsensusLogPruneLane::start(
+            pinned,
+            None,
+            identity(),
+            members,
+            bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .expect("start corrupt-prune lane");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = diagnostics.snapshot();
+                if snapshot.consensus_log_prune_permanent_failures == 1 {
+                    assert!(lane.is_degraded());
+                    assert_eq!(snapshot.consensus_log_prune_rows_deleted, 0);
+                    assert_eq!(snapshot.consensus_log_prune_completed_turns, 0);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("missing exact floor permanently stops worker");
+        assert!(
+            !gate.wait_until_entered(Duration::from_millis(25)),
+            "failed lineage proof never authorizes a physical DELETE"
+        );
+        assert_eq!(
+            primary
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count retained lower suffix"),
+            1,
+            "the lower suffix remains untouched after corrupt floor rejection"
+        );
+        let stopped = diagnostics.snapshot();
+        lane.signal();
+        lane.signal();
+        assert_eq!(
+            diagnostics.snapshot(),
+            stopped,
+            "a permanently degraded lane ignores later prune signals"
+        );
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_prune_internal_retained_hole_stops_permanently_before_delete() {
+        let directory = tempfile::tempdir().expect("internal-hole prune lane directory");
+        let source_path = directory.path().join("internal-hole-prune.sqlite");
+        let backend =
+            SqliteSessionBackend::open(&source_path).expect("open internal-hole prune backend");
+        let primary = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &primary,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed internal-hole authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        let entries = (1..=3).map(blank_entry).collect::<Vec<_>>();
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&membership),
+        )
+        .expect("append internal-hole membership");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership],
+        )
+        .expect("apply internal-hole membership");
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &entries,
+        )
+        .expect("append internal-hole retained suffix");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            entries,
+        )
+        .expect("apply internal-hole retained suffix");
+        let tx = Transaction::new_unchecked(&primary, TransactionBehavior::Immediate)
+            .expect("begin internal-hole logical floor");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(3), 3)
+            .expect("save internal-hole logical floor");
+        tx.commit().expect("commit internal-hole logical floor");
+        // Leave the exact floor and its upper retained suffix intact, but
+        // remove the internal index. No physical prune may treat this as an
+        // authoritative compacted prefix.
+        primary
+            .execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+            .expect("remove internal retained row");
+        let retained_before = {
+            let mut statement = primary
+                .prepare("SELECT log_index, entry_json FROM consensus_log ORDER BY log_index")
+                .expect("prepare retained-row snapshot");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .expect("query retained-row snapshot")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect retained-row snapshot")
+        };
+        assert_eq!(
+            retained_before
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3],
+            "fixture retains the exact floor and upper suffix around one internal hole"
+        );
+        let pinned = Arc::new(
+            crate::consensus::snapshot::PinnedSqliteFile::from_file(
+                opc_sqlite_file_control_sys::main_file_descriptor(&primary)
+                    .expect("duplicate internal-hole descriptor"),
+                source_path,
+            )
+            .expect("pin internal-hole descriptor"),
+        );
+        let gate = ConsensusLogPruneTurnGateForTest::install_before_delete(directory.path());
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let lane = ConsensusLogPruneLane::start(
+            pinned,
+            None,
+            identity(),
+            members,
+            bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .expect("start internal-hole prune lane");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = diagnostics.snapshot();
+                if snapshot.consensus_log_prune_permanent_failures == 1 {
+                    assert!(lane.is_degraded());
+                    assert_eq!(snapshot.consensus_log_prune_rows_deleted, 0);
+                    assert_eq!(snapshot.consensus_log_prune_completed_turns, 0);
+                    assert_eq!(snapshot.consensus_log_prune_attempts, 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("internal retained hole permanently stops worker");
+        assert!(
+            !gate.wait_until_entered(Duration::from_millis(25)),
+            "the corrupt retained suffix never reaches the physical DELETE gate"
+        );
+        let retained_after = {
+            let mut statement = primary
+                .prepare("SELECT log_index, entry_json FROM consensus_log ORDER BY log_index")
+                .expect("prepare retained-row verification");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .expect("query retained-row verification")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect retained-row verification")
+        };
+        assert_eq!(
+            retained_after, retained_before,
+            "permanent corruption rejection preserves every retained row byte-for-byte"
+        );
+        let stopped = diagnostics.snapshot();
+        lane.signal();
+        lane.signal();
+        assert_eq!(
+            diagnostics.snapshot(),
+            stopped,
+            "a permanently degraded internal-hole lane ignores later signals"
+        );
+        lane.shutdown().await;
     }
 
     #[cfg(target_os = "linux")]
@@ -37088,7 +48023,8 @@ mod tests {
             .expect("pin prune shutdown primary descriptor"),
         );
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
-        let gate = ConsensusLogPruneTurnGateForTest::install(directory.path());
+        let gate =
+            ConsensusLogPruneTurnGateForTest::install_before_authority_read(directory.path());
         let lane = ConsensusLogPruneLane::start(
             Arc::clone(&pinned),
             None,
@@ -37130,7 +48066,37 @@ mod tests {
         })
         .await
         .expect("shutdown publishes stop before joining the active worker");
+
+        let primary_lane = Arc::clone(&lane);
+        let primary_preemption =
+            tokio::spawn(async move { primary_lane.request_primary_preemption().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !primary_preemption.is_finished(),
+            "a stopping primary still waits for the prune writer transaction to roll back",
+        );
         gate.release();
+        let primary_guard = tokio::time::timeout(Duration::from_secs(1), primary_preemption)
+            .await
+            .expect("primary preemption waits for the interrupted prune rollback")
+            .expect("join primary preemption after shutdown");
+        let primary_writer =
+            Connection::open(pinned.path()).expect("open primary writer after shutdown preemption");
+        apply_pragma_profile(&primary_writer, false, true)
+            .expect("configure primary writer after shutdown preemption");
+        let primary_write =
+            Transaction::new_unchecked(&primary_writer, TransactionBehavior::Immediate)
+                .expect("primary BEGIN IMMEDIATE waits for prune rollback/autocommit");
+        primary_write
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = fixed_placement_policy WHERE singleton = 1",
+                [],
+            )
+            .expect("primary writes after prune rollback/autocommit");
+        primary_write
+            .commit()
+            .expect("commit primary write after prune rollback/autocommit");
+        drop(primary_guard);
         tokio::time::timeout(Duration::from_secs(1), shutdown)
             .await
             .expect("shutdown joins the interrupted real worker within the bounded budget")
@@ -37390,13 +48356,15 @@ mod tests {
         let source_conn = source.conn.blocking_lock();
         initialize_schema(&source_conn, identity(), &expected_members())
             .expect("initialize source schema");
-        apply_entries_sync(
-            &source_conn,
-            identity(),
-            &source.caps,
-            vec![membership_entry()],
-        )
-        .expect("apply source membership");
+        let source_prefix = std::iter::once(membership_entry())
+            .chain((1..=8).map(blank_entry))
+            .collect::<Vec<_>>();
+        append_logs_sync(&source_conn, identity(), &source_prefix)
+            .expect("append source protected-roster prefix");
+        save_committed_sync(&source_conn, identity(), Some(log_id(8)))
+            .expect("commit source protected-roster prefix");
+        apply_entries_sync(&source_conn, identity(), &source.caps, source_prefix)
+            .expect("apply source protected-roster prefix");
         activate_protected_roster_schema_sync(&source_conn).expect("activate source roster");
         write_retirement_fixture_record(&source_conn, &retained, retained_at);
         write_retirement_fixture_floor(&source_conn, retained.binding());
@@ -37407,7 +48375,6 @@ mod tests {
                 [],
             )
             .expect("advance source roster sequence horizon");
-        set_applied_index_for_test(&source_conn, identity(), 8);
         let (last_log_id, last_membership) =
             build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
                 .expect("build protected-roster snapshot");
@@ -37417,13 +48384,15 @@ mod tests {
         let target_conn = target.conn.blocking_lock();
         initialize_schema(&target_conn, identity(), &expected_members())
             .expect("initialize target schema");
-        apply_entries_sync(
-            &target_conn,
-            identity(),
-            &target.caps,
-            vec![membership_entry()],
-        )
-        .expect("apply target membership");
+        let target_prefix = std::iter::once(membership_entry())
+            .chain((1..=8).map(blank_entry))
+            .collect::<Vec<_>>();
+        append_logs_sync(&target_conn, identity(), &target_prefix)
+            .expect("append target protected-roster prefix");
+        save_committed_sync(&target_conn, identity(), Some(log_id(8)))
+            .expect("commit target protected-roster prefix");
+        apply_entries_sync(&target_conn, identity(), &target.caps, target_prefix)
+            .expect("apply target protected-roster prefix");
         activate_protected_roster_schema_sync(&target_conn).expect("activate target roster");
         write_retirement_fixture_record(&target_conn, &retained, retained_at);
         write_retirement_fixture_floor(&target_conn, retained.binding());
@@ -37434,7 +48403,6 @@ mod tests {
                 [],
             )
             .expect("advance target roster sequence horizon");
-        set_applied_index_for_test(&target_conn, identity(), 8);
         target_conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .expect("enable foreign keys");
@@ -37514,6 +48482,8 @@ mod tests {
             );
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append predecessor membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit predecessor membership");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![initial])
                 .expect("apply predecessor membership");
             stage_membership_scope_sync(
@@ -37540,6 +48510,8 @@ mod tests {
             );
             append_logs_sync(&conn, storage_identity, &[learners.clone(), ready.clone()])
                 .expect("append successor readiness");
+            save_committed_sync(&conn, storage_identity, Some(ready.log_id))
+                .expect("commit successor readiness");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![learners, ready])
                 .expect("apply successor readiness");
             fence_application_authority_sync(
@@ -37573,6 +48545,8 @@ mod tests {
                 &[joint.clone(), uniform.clone(), finalize.clone()],
             )
             .expect("append successor cutover");
+            save_committed_sync(&conn, storage_identity, Some(finalize.log_id))
+                .expect("commit successor cutover");
             apply_entries_sync(
                 &conn,
                 storage_identity,
@@ -37580,6 +48554,12 @@ mod tests {
                 vec![joint, uniform, finalize],
             )
             .expect("apply successor cutover");
+
+            let retained_horizon = [blank_entry(6), blank_entry(7), blank_entry(8)];
+            append_logs_sync(&conn, storage_identity, &retained_horizon)
+                .expect("append retained roster horizon");
+            save_committed_sync(&conn, storage_identity, Some(retained_horizon[2].log_id))
+                .expect("commit retained roster horizon");
 
             let retained =
                 retirement_fixture_retained_with_terminal_sequence(0x76, 1, 1, retained_at, 8);
@@ -37631,6 +48611,14 @@ mod tests {
             vec![predecessor_members.clone()],
             predecessor_members.clone(),
         );
+        append_logs_sync(
+            &target_conn,
+            storage_identity,
+            std::slice::from_ref(&target_initial),
+        )
+        .expect("append target predecessor membership");
+        save_committed_sync(&target_conn, storage_identity, Some(target_initial.log_id))
+            .expect("commit target predecessor membership");
         apply_entries_sync(
             &target_conn,
             storage_identity,
@@ -40120,6 +51108,21 @@ mod tests {
                 intent: SessionMutationIntent::FencedTransitionV2Batch(requests),
             }),
         }
+    }
+
+    fn maximum_fenced_transition_v2_batch_requests() -> Vec<FencedTransitionV2Request> {
+        (0..crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS)
+            .map(|index| {
+                let request_byte = u8::try_from((index % usize::from(u8::MAX)) + 1)
+                    .expect("the nonzero fixture byte is bounded");
+                let fixture_owner = if index < usize::from(u8::MAX) {
+                    "v2-max-batch-item-a"
+                } else {
+                    "v2-max-batch-item-b"
+                };
+                fenced_transition_v2_request(request_byte, 1, fixture_owner)
+            })
+            .collect()
     }
 
     fn fenced_transition_v2_authorized_entry(
@@ -44471,6 +55474,193 @@ LIMIT 20000;
     }
 
     #[test]
+    fn fenced_transition_v2_projection_batch_reuses_one_schema_audit_and_one_receipt_probe() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let activation = fenced_transition_v2_request(0xA7, 1, "v2-projection-batch-activation");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, activation, timestamp(1)),
+            ],
+        )
+        .expect("activate durable V2 ledger");
+        let batch = fenced_transition_v2_batch_entry(
+            2,
+            maximum_fenced_transition_v2_batch_requests(),
+            timestamp(2),
+        );
+        let mut projection =
+            MembershipLogProjection::load(&conn, identity(), false).expect("load V2 projection");
+
+        // Disable statement caching only for this causal execution counter:
+        // one authorization of the selected `ordinal` column corresponds to
+        // one actual receipt lookup. Production keeps the fixed statement
+        // cache enabled.
+        conn.set_prepared_statement_cache_capacity(0);
+        let schema_definition_reads = Arc::new(AtomicUsize::new(0));
+        let observed_schema_definition_reads = Arc::clone(&schema_definition_reads);
+        let receipt_ordinal_reads = Arc::new(AtomicUsize::new(0));
+        let observed_receipt_ordinal_reads = Arc::clone(&receipt_ordinal_reads);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            match context.action {
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "sqlite_master" | "sqlite_schema",
+                    column_name: "sql",
+                } => {
+                    observed_schema_definition_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "consensus_fenced_transition_v2_receipts",
+                    column_name: "ordinal",
+                } => {
+                    observed_receipt_ordinal_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).expect("direct V2 schema audit"),
+            FencedTransitionV2LedgerLayout::Activated,
+            "the causal schema-audit baseline must exercise the activated layout",
+        );
+        let schema_reads_per_audit = schema_definition_reads.load(Ordering::Relaxed);
+        assert!(
+            schema_reads_per_audit > 0,
+            "the direct activated-layout audit must read its exact schema definitions",
+        );
+
+        projection
+            .project(&conn, &batch, identity())
+            .expect("project maximum V2 batch");
+        let projected_once = (
+            projection.projected_v2_history,
+            projection.projected_v2_bound_requests.clone(),
+            projection.projected_application_sequence,
+            projection.projected_logical_time,
+        );
+        projection
+            .project(&conn, &batch, identity())
+            .expect("project exact still-unapplied replay");
+        assert_eq!(
+            (
+                projection.projected_v2_history,
+                projection.projected_v2_bound_requests.clone(),
+                projection.projected_application_sequence,
+                projection.projected_logical_time,
+            ),
+            projected_once,
+            "an exact projected replay must not reserve or advance a second time",
+        );
+        let logical_items =
+            crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS;
+        assert_eq!(
+            receipt_ordinal_reads.load(Ordering::Relaxed),
+            logical_items * 2,
+            "the original projection and exact replay each probe every receipt exactly once",
+        );
+        assert_eq!(
+            schema_definition_reads.load(Ordering::Relaxed),
+            schema_reads_per_audit * 3,
+            "the direct audit plus two physical batches perform exactly one activated-layout audit each",
+        );
+    }
+
+    #[test]
+    fn fenced_transition_v2_projection_full_batch_preserves_clock_for_following_maintenance() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let activation = fenced_transition_v2_request(0xA8, 1, "v2-full-clock-activation");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, activation, timestamp(1)),
+            ],
+        )
+        .expect("activate V2 ledger");
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?1 WHERE singleton = 1",
+            [i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .expect("V2 capacity fits SQLite")],
+        )
+        .expect("seed exact full active epoch");
+
+        let candidate = fenced_transition_v2_request(0xA9, 1, "v2-full-clock-candidate");
+        let full_batch = fenced_transition_v2_batch_entry(2, vec![candidate], timestamp(10));
+        let initial_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+        let maintenance = Entry {
+            log_id: log_id(3),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([0xAA; 16]),
+                logical_time: timestamp(9),
+                intent: SessionMutationIntent::MaintainFencedTransitionV2History {
+                    expected_generation: 0,
+                    expected_active_epoch: Some(initial_epoch),
+                    expected_retired_through: 0,
+                    expected_bound_entries: u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                        .expect("V2 capacity fits u64"),
+                },
+            }),
+        };
+
+        let mut projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load full-epoch projection");
+        projection
+            .project(&conn, &full_batch, identity())
+            .expect("project all-HistoryFull batch");
+        assert_eq!(
+            projection.projected_logical_time,
+            Some(timestamp(10)),
+            "a committed no-effect physical batch still advances projected logical time",
+        );
+        projection
+            .project(&conn, &maintenance, identity())
+            .expect("project lower-timestamp successor maintenance");
+
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![full_batch, maintenance],
+        )
+        .expect("apply full batch and successor maintenance");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [
+                SessionConsensusResponse {
+                    result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                    ..
+                },
+                SessionConsensusResponse {
+                    result: Ok(SessionMutationOutcome::Unit),
+                    ..
+                },
+            ] if matches!(outcomes.as_slice(), [Err(StoreError::FencedTransitionHistoryFull)])
+        ));
+        let durable_history =
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after successor maintenance");
+        let durable_machine =
+            read_machine_sync(&conn, identity()).expect("machine after successor maintenance");
+        assert_eq!(projection.projected_v2_history, Some(durable_history));
+        assert_eq!(projection.projected_application_sequence, durable_machine.0,);
+        assert_eq!(projection.projected_logical_time, durable_machine.2);
+        assert_eq!(durable_machine.2, Some(timestamp(10)));
+    }
+
+    #[test]
     fn fenced_transition_v2_batch_projection_replays_retained_closed_epoch_per_item() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
@@ -44630,6 +55820,114 @@ LIMIT 20000;
                 )
                 .is_err(),
             "closed-epoch follower projection must consult and validate the retained receipt before its active-epoch gate",
+        );
+    }
+
+    #[test]
+    fn fenced_transition_v2_projection_maximum_closed_epoch_batch_audits_once_and_probes_each_item()
+    {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        let retained = fenced_transition_v2_request(0xE3, 1, "v2-maximum-closed-retained-owner");
+        let activation = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![activating_fenced_transition_v2_entry(
+                1,
+                retained.clone(),
+                timestamp(1),
+            )],
+        )
+        .expect("bind retained closed-epoch receipt");
+        let retained_outcome = match &activation.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.clone(),
+            other => panic!("unexpected retained activation outcome: {other:?}"),
+        };
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history \
+             SET active_epoch = 2, generation = 1, current_bound_count = 0 \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("form retained closed predecessor epoch");
+
+        let mut requests = maximum_fenced_transition_v2_batch_requests();
+        requests[0] = retained.clone();
+        let logical_items = requests.len();
+        let batch = fenced_transition_v2_batch_entry(2, requests, timestamp(2));
+        let mut projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load closed-epoch follower projection");
+
+        conn.set_prepared_statement_cache_capacity(0);
+        let schema_definition_reads = Arc::new(AtomicUsize::new(0));
+        let observed_schema_definition_reads = Arc::clone(&schema_definition_reads);
+        let receipt_ordinal_reads = Arc::new(AtomicUsize::new(0));
+        let observed_receipt_ordinal_reads = Arc::clone(&receipt_ordinal_reads);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            match context.action {
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "sqlite_master" | "sqlite_schema",
+                    column_name: "sql",
+                } => {
+                    observed_schema_definition_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "consensus_fenced_transition_v2_receipts",
+                    column_name: "ordinal",
+                } => {
+                    observed_receipt_ordinal_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).expect("direct V2 schema audit"),
+            FencedTransitionV2LedgerLayout::Activated,
+        );
+        let schema_reads_per_audit = schema_definition_reads.load(Ordering::Relaxed);
+        assert!(
+            schema_reads_per_audit > 0,
+            "direct schema audit is observable"
+        );
+
+        projection
+            .project(&conn, &batch, identity())
+            .expect("project maximum closed-epoch batch");
+        assert_eq!(
+            schema_definition_reads.load(Ordering::Relaxed),
+            schema_reads_per_audit * 2,
+            "one direct audit and one physical closed-epoch batch audit are permitted",
+        );
+        assert_eq!(
+            receipt_ordinal_reads.load(Ordering::Relaxed),
+            logical_items,
+            "every valid non-retired closed-epoch member receives exactly one receipt lookup",
+        );
+
+        let applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![batch])
+            .expect("apply maximum retained/unknown closed-epoch batch");
+        let outcomes = match applied.responses.as_slice() {
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                ..
+            }] => outcomes,
+            other => panic!("unexpected maximum closed-epoch batch outcome: {other:?}"),
+        };
+        assert_eq!(outcomes.first(), Some(&Ok(retained_outcome)));
+        assert!(
+            outcomes[1..]
+                .iter()
+                .all(|outcome| *outcome == Err(StoreError::FencedTransitionHistoryEpochNotActive)),
+            "unknown non-retired closed-epoch IDs remain EpochNotActive",
+        );
+        assert!(
+            applied.notifications.is_empty(),
+            "a retained replay beside unknown closed IDs cannot repeat business effects",
         );
     }
 
@@ -45992,24 +57290,28 @@ LIMIT 20000;
         let source_conn = source.conn.blocking_lock();
         initialize_schema(&source_conn, storage_identity, &current)
             .expect("initialize activated source");
-        apply_entries_sync(
+        let source_initial = vec![
+            membership_entry_at(0, vec![current.clone()], current.clone()),
+            activating_fenced_transition_authorized_entry(
+                1,
+                request.clone(),
+                timestamp(1),
+                member(7),
+                storage_identity,
+                storage_identity,
+                &current,
+            ),
+        ];
+        append_logs_sync(&source_conn, storage_identity, &source_initial)
+            .expect("append source activation");
+        save_committed_sync(
             &source_conn,
             storage_identity,
-            &source.caps,
-            vec![
-                membership_entry_at(0, vec![current.clone()], current.clone()),
-                activating_fenced_transition_authorized_entry(
-                    1,
-                    request.clone(),
-                    timestamp(1),
-                    member(7),
-                    storage_identity,
-                    storage_identity,
-                    &current,
-                ),
-            ],
+            Some(source_initial[1].log_id),
         )
-        .expect("activate source scope");
+        .expect("commit source activation");
+        apply_entries_sync(&source_conn, storage_identity, &source.caps, source_initial)
+            .expect("activate source scope");
         assert!(fenced_transition_activation_matches_scope_sync(
             &source_conn,
             storage_identity,
@@ -46022,24 +57324,28 @@ LIMIT 20000;
         let target_conn = target.conn.blocking_lock();
         initialize_schema(&target_conn, storage_identity, &current)
             .expect("initialize activated target");
-        apply_entries_sync(
+        let target_initial = vec![
+            membership_entry_at(0, vec![current.clone()], current.clone()),
+            activating_fenced_transition_authorized_entry(
+                1,
+                request.clone(),
+                timestamp(1),
+                member(7),
+                storage_identity,
+                storage_identity,
+                &current,
+            ),
+        ];
+        append_logs_sync(&target_conn, storage_identity, &target_initial)
+            .expect("append target activation");
+        save_committed_sync(
             &target_conn,
             storage_identity,
-            &target.caps,
-            vec![
-                membership_entry_at(0, vec![current.clone()], current.clone()),
-                activating_fenced_transition_authorized_entry(
-                    1,
-                    request.clone(),
-                    timestamp(1),
-                    member(7),
-                    storage_identity,
-                    storage_identity,
-                    &current,
-                ),
-            ],
+            Some(target_initial[1].log_id),
         )
-        .expect("activate target scope");
+        .expect("commit target activation");
+        apply_entries_sync(&target_conn, storage_identity, &target.caps, target_initial)
+            .expect("activate target scope");
         assert!(fenced_transition_activation_matches_scope_sync(
             &target_conn,
             storage_identity,
@@ -46193,11 +57499,19 @@ LIMIT 20000;
                 request_digest: transition_digest,
             },
         );
+        append_logs_sync(
+            &source_conn,
+            storage_identity,
+            &[learners.clone(), ready.clone()],
+        )
+        .expect("append successor eligibility");
+        save_committed_sync(&source_conn, storage_identity, Some(ready.log_id))
+            .expect("commit successor eligibility");
         apply_entries_sync(
             &source_conn,
             storage_identity,
             &source.caps,
-            vec![learners, ready],
+            vec![learners.clone(), ready.clone()],
         )
         .expect("make successor eligible");
         fence_application_authority_sync(
@@ -46217,13 +57531,65 @@ LIMIT 20000;
             vec![successor_members.clone()],
             successor_members.clone(),
         );
+        append_logs_sync(
+            &source_conn,
+            storage_identity,
+            &[joint.clone(), uniform.clone()],
+        )
+        .expect("append successor promotion");
+        save_committed_sync(&source_conn, storage_identity, Some(uniform.log_id))
+            .expect("commit successor promotion");
         apply_entries_sync(
             &source_conn,
             storage_identity,
             &source.caps,
-            vec![joint, uniform],
+            vec![joint.clone(), uniform.clone()],
         )
         .expect("promote successor scope");
+        // The destination received the committed follower suffix but has not
+        // applied it; the later snapshot supplies that state.  Its prior
+        // snapshot established a logical purge at index one, so retaining the
+        // exact suffix is required evidence rather than an optional fixture
+        // convenience.
+        stage_membership_scope_sync(
+            &target_conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("stage destination successor scope");
+        append_logs_sync(
+            &target_conn,
+            storage_identity,
+            &[learners.clone(), ready.clone()],
+        )
+        .expect("retain successor learner suffix");
+        save_committed_sync(&target_conn, storage_identity, Some(ready.log_id))
+            .expect("commit successor learner suffix");
+        apply_entries_sync(
+            &target_conn,
+            storage_identity,
+            &target.caps,
+            vec![learners.clone(), ready.clone()],
+        )
+        .expect("apply successor learner suffix");
+        fence_application_authority_sync(
+            &target_conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+        )
+        .expect("fence destination predecessor authority");
+        append_logs_sync(
+            &target_conn,
+            storage_identity,
+            &[joint.clone(), uniform.clone()],
+        )
+        .expect("retain successor promotion suffix");
+        save_committed_sync(&target_conn, storage_identity, Some(uniform.log_id))
+            .expect("commit successor promotion suffix");
         assert!(!fenced_transition_activation_matches_scope_sync(
             &source_conn,
             storage_identity,
@@ -46420,11 +57786,20 @@ LIMIT 20000;
             let source_conn = source.conn.blocking_lock();
             initialize_schema(&source_conn, identity(), &expected_members())
                 .expect("source consensus schema");
+            let initial_membership = membership_entry();
+            append_logs_sync(
+                &source_conn,
+                identity(),
+                std::slice::from_ref(&initial_membership),
+            )
+            .expect("append source membership");
+            save_committed_sync(&source_conn, identity(), Some(initial_membership.log_id))
+                .expect("commit source membership");
             apply_entries_sync(
                 &source_conn,
                 identity(),
                 &source.caps,
-                vec![membership_entry()],
+                vec![initial_membership],
             )
             .expect("source membership");
             if state != "empty" {
@@ -46457,6 +57832,19 @@ LIMIT 20000;
             let target_conn = target.conn.blocking_lock();
             initialize_schema(&target_conn, identity(), &expected_members())
                 .expect("target consensus schema");
+            let target_initial_membership = membership_entry();
+            append_logs_sync(
+                &target_conn,
+                identity(),
+                std::slice::from_ref(&target_initial_membership),
+            )
+            .expect("append target membership");
+            save_committed_sync(
+                &target_conn,
+                identity(),
+                Some(target_initial_membership.log_id),
+            )
+            .expect("commit target membership");
             let meta = opc_consensus::engine::SnapshotMeta {
                 last_log_id,
                 last_membership,
@@ -47992,6 +59380,2181 @@ BEGIN IMMEDIATE;
     }
 
     #[tokio::test]
+    async fn snapshot_install_preserves_v2_finalize_log_id_and_exact_outcome() {
+        let directory = tempfile::tempdir().expect("recovery snapshot directory");
+        let snapshot_path = directory.path().join("recovery.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("recovery source");
+        let (meta, byte_length, expected_finalize_log_id, expected_certificate, expected_outcome) =
+            {
+                let conn = source.conn.lock().await;
+                initialize_schema(&conn, identity(), &expected_members()).expect("source schema");
+                let membership = membership_entry();
+                append_logs_sync(&conn, identity(), std::slice::from_ref(&membership))
+                    .expect("append bootstrap Membership");
+                apply_entries_sync(&conn, identity(), &source.caps, vec![membership])
+                    .expect("apply bootstrap Membership");
+                seed_v2_certificate_monotonic_floors(&conn);
+                let membership_digest = operator_recovery_v2_bootstrap_membership_digest_sync(
+                    &conn,
+                    identity(),
+                    &log_id(0),
+                )
+                .expect("bootstrap Membership digest");
+                mark_operator_recovery_pending_sync(&conn, identity(), 1, [0xA1; 32])
+                    .expect("mark recovery pending");
+                let finalize = recovery_v2_entry_for_current_predecessor(
+                    &conn,
+                    1,
+                    0xD8,
+                    log_id(0),
+                    Some(membership_digest),
+                );
+                append_logs_sync(&conn, identity(), std::slice::from_ref(&finalize))
+                    .expect("append V2 finalization");
+                apply_entries_sync(&conn, identity(), &source.caps, vec![finalize.clone()])
+                    .expect("apply V2 finalization");
+                let recovery = read_operator_recovery_sync(&conn, identity())
+                    .expect("source recovery finalization");
+                let outcome: Vec<u8> = conn
+                .query_row(
+                    "SELECT response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+                    [SessionConsensusRequestId::from_bytes([0xA1; 16]).as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("source V2 outcome");
+                let certificate = recovery
+                    .finalize_entry_json
+                    .clone()
+                    .expect("source V2 finalize certificate");
+                let (last_log_id, last_membership) =
+                    build_snapshot_database_sync(&conn, identity(), &snapshot_path)
+                        .expect("build V2 snapshot");
+                let byte_length = std::fs::metadata(&snapshot_path)
+                    .expect("snapshot metadata")
+                    .len();
+                (
+                    opc_consensus::engine::SnapshotMeta {
+                        last_log_id,
+                        last_membership,
+                        snapshot_id: "recovery-finalize-log-id".into(),
+                    },
+                    byte_length,
+                    recovery.finalize_log_id.expect("source full V2 LogId"),
+                    certificate,
+                    outcome,
+                )
+            };
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            open_nofollow_read(&snapshot_path).expect("pin V2 snapshot"),
+            snapshot_path.clone(),
+        )
+        .expect("pinned V2 snapshot");
+        let target = SqliteSessionBackend::in_memory().expect("recovery target");
+        let conn = target.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("target schema");
+        install_snapshot_database_from_pinned_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+            None,
+            None,
+            pinned,
+            None,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-0000000000d8.opc",
+            [0xD8; 32],
+            byte_length,
+        )
+        .expect("install V2 snapshot");
+        assert_eq!(
+            read_operator_recovery_sync(&conn, identity())
+                .expect("target recovery finalization")
+                .finalize_log_id,
+            Some(expected_finalize_log_id)
+        );
+        assert_eq!(
+            read_operator_recovery_sync(&conn, identity())
+                .expect("target recovery certificate")
+                .finalize_entry_json,
+            Some(expected_certificate.clone())
+        );
+        let installed_outcome: Vec<u8> = conn
+            .query_row(
+                "SELECT response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+                [SessionConsensusRequestId::from_bytes([0xA1; 16])
+                    .as_bytes()
+                    .as_slice()],
+                |row| row.get(0),
+            )
+            .expect("installed V2 outcome");
+        assert_eq!(installed_outcome, expected_outcome);
+        let recovery_before = read_operator_recovery_sync(&conn, identity())
+            .expect("target certificate before rejected installs");
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("snapshot install purge floor"),
+            Some(expected_finalize_log_id),
+            "the snapshot replacement transaction records the exact full cut before publication"
+        );
+        assert_eq!(
+            read_committed_sync(&conn, identity()).expect("snapshot install committed frontier"),
+            Some(expected_finalize_log_id),
+            "the installed snapshot cut is the exact durable committed frontier"
+        );
+        purge_logs_sync(&conn, identity(), &expected_finalize_log_id)
+            .expect("same exact queued Raft purge remains idempotent");
+        purge_logs_sync(&conn, identity(), &log_id(0))
+            .expect("older queued Raft purge remains an idempotent no-op");
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("purge floor after queued purges"),
+            Some(expected_finalize_log_id)
+        );
+        assert!(
+            operator_recovery_v2_finalize_certificate_binding_sync(&conn, identity())
+                .expect("certificate remains valid after snapshot purge floor")
+                .is_some(),
+            "snapshot floor and delayed purge retain the exact certificate/outcome binding"
+        );
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&conn)
+                .expect("count zero-receipt certificate fixture"),
+            0,
+            "the raw certificate gate must not rely on a V1 receipt to validate the outcome schema"
+        );
+
+        // A structurally valid snapshot with only the deterministic V2
+        // outcome removed used to pass attached-source validation, delete
+        // this target row, and leave a same-E/P retry without its replay
+        // authority.  Install it over an already valid target and prove the
+        // rejection occurs before that target image is replaced.
+        let tampered_path = directory.path().join("recovery-missing-outcome.sqlite");
+        std::fs::copy(&snapshot_path, &tampered_path).expect("copy snapshot for outcome tamper");
+        let tampered = Connection::open(&tampered_path).expect("open tampered snapshot");
+        tampered
+            .execute(
+                "DELETE FROM consensus_request_outcomes WHERE request_id = ?1",
+                [SessionConsensusRequestId::from_bytes([0xA1; 16])
+                    .as_bytes()
+                    .as_slice()],
+            )
+            .expect("remove only certified recovery outcome");
+        drop(tampered);
+        let pinned_tampered = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            open_nofollow_read(&tampered_path).expect("pin missing-outcome snapshot"),
+            tampered_path,
+        )
+        .expect("pinned missing-outcome snapshot");
+        assert!(install_snapshot_database_from_pinned_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+            None,
+            None,
+            pinned_tampered,
+            None,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-0000000000d9.opc",
+            [0xD9; 32],
+            byte_length,
+        )
+        .is_err());
+        assert_eq!(
+            read_operator_recovery_sync(&conn, identity())
+                .expect("target survives missing-outcome install"),
+            recovery_before
+        );
+        let retained_outcome: Vec<u8> = conn
+            .query_row(
+                "SELECT response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+                [SessionConsensusRequestId::from_bytes([0xA1; 16])
+                    .as_bytes()
+                    .as_slice()],
+                |row| row.get(0),
+            )
+            .expect("target outcome survives rejected install");
+        assert_eq!(retained_outcome, expected_outcome);
+
+        // The attached reader must apply the same bounded raw-outcome and
+        // certificate-effect checks before the replacement transaction
+        // deletes a target row. These source mutations are each locally
+        // shaped enough to reach the exact V2 reader rather than a generic
+        // snapshot decode path.
+        let target_delete_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_target_delete_attempts = Arc::clone(&target_delete_attempts);
+        let target_schema = |connection: &Connection| {
+            connection
+                .prepare(
+                    "SELECT type, name, tbl_name, COALESCE(sql, '') \
+                     FROM sqlite_master ORDER BY type, name, tbl_name, sql",
+                )
+                .expect("prepare target schema snapshot")
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .expect("read target schema snapshot")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect target schema snapshot")
+        };
+        let target_schema_before = target_schema(&conn);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if context.database_name == Some("main")
+                && matches!(
+                    context.action,
+                    rusqlite::hooks::AuthAction::Delete {
+                        table_name: "consensus_operator_recovery" | "consensus_request_outcomes"
+                    }
+                )
+            {
+                observed_target_delete_attempts.fetch_add(1, Ordering::Relaxed);
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+        for case in [
+            "outcome-one-over",
+            "outcome-materially-oversized",
+            "outcome-wrong-type",
+            "outcome-payload-digest-materially-oversized",
+            "certificate-materially-oversized",
+            "activation-cleared",
+            "finalize-log-without-certificate-null",
+            "finalize-log-without-certificate-populated",
+            "complete-columns-null-weak-ddl",
+            "released-predecessor-columns-absent-weak-ddl",
+            "operator-schema-without-singleton-primary-key",
+            "outcome-schema-with-duplicate-request",
+            "fence-floor-lowered",
+            "credential-floor-lowered",
+            "watch-floor-coherent-drift",
+            "applied-same-index-different-term",
+            "applied-before-finalize",
+        ] {
+            let invalid_path = directory.path().join(format!("recovery-{case}.sqlite"));
+            std::fs::copy(&snapshot_path, &invalid_path)
+                .unwrap_or_else(|error| panic!("copy {case} snapshot: {error}"));
+            let invalid = Connection::open(&invalid_path)
+                .unwrap_or_else(|error| panic!("open {case} snapshot: {error}"));
+            let request_id = SessionConsensusRequestId::from_bytes([0xA1; 16]);
+            match case {
+                "outcome-one-over" => {
+                    invalid
+                        .execute(
+                            "UPDATE consensus_request_outcomes SET response_json = zeroblob(?1) WHERE request_id = ?2",
+                            params![
+                                i64::try_from(expected_outcome.len() + 1)
+                                    .expect("outcome length fits SQLite"),
+                                request_id.as_bytes().as_slice(),
+                            ],
+                        )
+                        .expect(case);
+                }
+                "outcome-materially-oversized" => {
+                    invalid
+                        .execute(
+                            "UPDATE consensus_request_outcomes SET response_json = zeroblob(1048576) WHERE request_id = ?1",
+                            [request_id.as_bytes().as_slice()],
+                        )
+                        .expect(case);
+                }
+                "outcome-wrong-type" => {
+                    invalid
+                        .execute(
+                            "UPDATE consensus_request_outcomes SET response_json = 'not-a-blob' WHERE request_id = ?1",
+                            [request_id.as_bytes().as_slice()],
+                        )
+                        .expect(case);
+                }
+                "outcome-payload-digest-materially-oversized" => {
+                    invalid
+                        .execute_batch("PRAGMA ignore_check_constraints = ON")
+                        .expect("permit oversized incoming digest");
+                    invalid
+                        .execute(
+                            "UPDATE consensus_request_outcomes SET payload_digest = zeroblob(1048576) WHERE request_id = ?1",
+                            [request_id.as_bytes().as_slice()],
+                        )
+                        .expect(case);
+                    invalid
+                        .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                        .expect("restore incoming CHECK enforcement");
+                }
+                "certificate-materially-oversized" => {
+                    invalid
+                        .execute_batch("PRAGMA ignore_check_constraints = ON")
+                        .expect("permit oversized incoming certificate");
+                    invalid
+                        .execute(
+                            "UPDATE consensus_operator_recovery SET finalize_entry_json = zeroblob(65536) WHERE singleton = 1",
+                            [],
+                        )
+                        .expect(case);
+                    invalid
+                        .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                        .expect("restore incoming CHECK enforcement");
+                }
+                "activation-cleared" => {
+                    invalid
+                        .execute_batch("PRAGMA ignore_check_constraints = ON")
+                        .expect("permit corrupt incoming activation fixture");
+                    invalid
+                        .execute(
+                            "UPDATE consensus_operator_recovery SET recovery_v2_activated = 0 WHERE singleton = 1",
+                            [],
+                        )
+                        .expect(case);
+                    invalid
+                        .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                        .expect("restore incoming CHECK enforcement");
+                }
+                "finalize-log-without-certificate-null"
+                | "finalize-log-without-certificate-populated" => {
+                    invalid
+                        .execute_batch(
+                            "PRAGMA foreign_keys = OFF;
+                             CREATE TEMP TABLE certificate_recovery_copy AS
+                                 SELECT * FROM consensus_operator_recovery;
+                             DROP TABLE consensus_operator_recovery;
+                             CREATE TABLE consensus_operator_recovery (
+                                 singleton INTEGER PRIMARY KEY,
+                                 configuration_epoch INTEGER NOT NULL,
+                                 recovery_epoch INTEGER NOT NULL,
+                                 last_plan_digest BLOB NOT NULL,
+                                 pending_epoch INTEGER,
+                                 pending_plan_digest BLOB,
+                                 watch_cursor_invalidation_floor INTEGER NOT NULL,
+                                 finalize_log_id_json BLOB,
+                                 recovery_v2_activated INTEGER NOT NULL
+                             );
+                             PRAGMA foreign_keys = ON;",
+                        )
+                        .expect(case);
+                    let finalize_log_id = if case == "finalize-log-without-certificate-null" {
+                        None
+                    } else {
+                        Some(vec![0x42])
+                    };
+                    invalid
+                        .execute(
+                            "INSERT INTO consensus_operator_recovery \
+                             (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, recovery_v2_activated) \
+                             SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, ?1, 0 \
+                             FROM certificate_recovery_copy",
+                            [finalize_log_id],
+                        )
+                        .expect(case);
+                    invalid
+                        .execute_batch("DROP TABLE certificate_recovery_copy")
+                        .expect(case);
+                }
+                "complete-columns-null-weak-ddl" => {
+                    // Keep both V2 columns present but NULL.  A raw column
+                    // probe alone would classify this as an inert complete
+                    // form; only the exact released CREATE text makes that
+                    // safe before an attached install can delete target rows.
+                    invalid
+                        .execute_batch(
+                            "PRAGMA foreign_keys = OFF;
+                             CREATE TEMP TABLE certificate_recovery_copy AS
+                                 SELECT * FROM consensus_operator_recovery;
+                             DROP TABLE consensus_operator_recovery;
+                             CREATE TABLE consensus_operator_recovery (
+                                 singleton INTEGER PRIMARY KEY,
+                                 configuration_epoch INTEGER NOT NULL,
+                                 recovery_epoch INTEGER NOT NULL,
+                                 last_plan_digest BLOB NOT NULL,
+                                 pending_epoch INTEGER,
+                                 pending_plan_digest BLOB,
+                                 watch_cursor_invalidation_floor INTEGER NOT NULL,
+                                 finalize_log_id_json BLOB,
+                                 finalize_entry_json BLOB,
+                                 recovery_v2_activated INTEGER NOT NULL
+                             );
+                             PRAGMA foreign_keys = ON;",
+                        )
+                        .expect(case);
+                    invalid
+                        .execute_batch(
+                            "INSERT INTO consensus_operator_recovery \
+                             (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated) \
+                             SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, NULL, NULL, 0 \
+                             FROM certificate_recovery_copy;
+                             DROP TABLE certificate_recovery_copy;",
+                        )
+                        .expect(case);
+                }
+                "released-predecessor-columns-absent-weak-ddl" => {
+                    // This looks like the oldest released predecessor to a
+                    // column-name classifier, but intentionally weakens its
+                    // singleton constraint. It must fail before replacement
+                    // deletes even though no certificate values exist.
+                    invalid
+                        .execute_batch(
+                            "PRAGMA foreign_keys = OFF;
+                             CREATE TEMP TABLE certificate_recovery_copy AS
+                                 SELECT * FROM consensus_operator_recovery;
+                             DROP TABLE consensus_operator_recovery;
+                             CREATE TABLE consensus_operator_recovery (
+                                 singleton INTEGER NOT NULL,
+                                 configuration_epoch INTEGER NOT NULL,
+                                 recovery_epoch INTEGER NOT NULL,
+                                 last_plan_digest BLOB NOT NULL,
+                                 pending_epoch INTEGER,
+                                 pending_plan_digest BLOB
+                             );
+                             INSERT INTO consensus_operator_recovery \
+                             (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest) \
+                             SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest \
+                             FROM certificate_recovery_copy;
+                             DROP TABLE certificate_recovery_copy;
+                             PRAGMA foreign_keys = ON;",
+                        )
+                        .expect(case);
+                }
+                "operator-schema-without-singleton-primary-key" => {
+                    invalid
+                        .execute_batch(
+                            "PRAGMA foreign_keys = OFF;
+                             CREATE TEMP TABLE certificate_recovery_copy AS
+                                 SELECT * FROM consensus_operator_recovery;
+                             DROP TABLE consensus_operator_recovery;
+                             CREATE TABLE consensus_operator_recovery (
+                                 singleton INTEGER NOT NULL CHECK (singleton = 1),
+                                 configuration_epoch INTEGER NOT NULL,
+                                 recovery_epoch INTEGER NOT NULL,
+                                 last_plan_digest BLOB NOT NULL,
+                                 pending_epoch INTEGER,
+                                 pending_plan_digest BLOB,
+                                 watch_cursor_invalidation_floor INTEGER NOT NULL,
+                                 finalize_log_id_json BLOB,
+                                 finalize_entry_json BLOB
+                             );
+                             INSERT INTO consensus_operator_recovery
+                                 SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json FROM certificate_recovery_copy;
+                             DROP TABLE certificate_recovery_copy;
+                             PRAGMA foreign_keys = ON;",
+                        )
+                        .expect(case);
+                }
+                "outcome-schema-with-duplicate-request" => {
+                    invalid
+                        .execute_batch(
+                            "PRAGMA foreign_keys = OFF;
+                             CREATE TEMP TABLE certificate_outcome_copy AS
+                                 SELECT * FROM consensus_request_outcomes;
+                             DROP TABLE consensus_request_outcomes;
+                             CREATE TABLE consensus_request_outcomes (
+                                 request_id BLOB NOT NULL,
+                                 configuration_epoch INTEGER NOT NULL,
+                                 payload_digest BLOB NOT NULL,
+                                 response_json BLOB NOT NULL
+                             );
+                             INSERT INTO consensus_request_outcomes
+                                 SELECT * FROM certificate_outcome_copy;
+                             INSERT INTO consensus_request_outcomes
+                                 SELECT * FROM certificate_outcome_copy
+                                 WHERE request_id = X'A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1';
+                             DROP TABLE certificate_outcome_copy;
+                             PRAGMA foreign_keys = ON;",
+                        )
+                        .expect(case);
+                }
+                "fence-floor-lowered" => {
+                    invalid
+                        .execute(
+                            "UPDATE lease_globals SET val = 1 WHERE key = 'next_fence'",
+                            [],
+                        )
+                        .expect(case);
+                    validate_sealed_state_sync(&invalid)
+                        .expect("lowered fence allocator remains lease-valid");
+                }
+                "credential-floor-lowered" => {
+                    invalid
+                        .execute(
+                            "UPDATE lease_globals SET val = 1 WHERE key = 'next_credential_id'",
+                            [],
+                        )
+                        .expect(case);
+                    validate_sealed_state_sync(&invalid)
+                        .expect("lowered credential allocator remains lease-valid");
+                }
+                "watch-floor-coherent-drift" => invalid
+                    .execute_batch(
+                        "UPDATE consensus_machine SET watch_sequence = 6 WHERE singleton = 1; \
+                         UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = 6 WHERE singleton = 1",
+                    )
+                    .expect(case),
+                "applied-same-index-different-term" => {
+                    let tx = Transaction::new_unchecked(&invalid, TransactionBehavior::Immediate)
+                        .expect("begin incoming applied splice");
+                    save_log_pointer(
+                        &tx,
+                        "consensus_applied",
+                        identity(),
+                        &LogId::new(CommittedLeaderId::new(2, node_id()), 1),
+                    )
+                    .expect(case);
+                    tx.commit().expect("commit incoming applied splice");
+                }
+                "applied-before-finalize" => {
+                    let tx = Transaction::new_unchecked(&invalid, TransactionBehavior::Immediate)
+                        .expect("begin incoming stale applied fixture");
+                    save_log_pointer(&tx, "consensus_applied", identity(), &log_id(0))
+                        .expect(case);
+                    tx.commit().expect("commit incoming stale applied fixture");
+                }
+                _ => unreachable!("fixed incoming certificate mutation"),
+            }
+            drop(invalid);
+            let pinned_invalid = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+                open_nofollow_read(&invalid_path)
+                    .unwrap_or_else(|error| panic!("pin {case} snapshot: {error}")),
+                invalid_path,
+            )
+            .unwrap_or_else(|error| panic!("pinned {case} snapshot: {error}"));
+            assert!(
+                install_snapshot_database_from_pinned_with_authority_sync(
+                    &conn,
+                    identity(),
+                    ConsensusAuthorityProfile::Dynamic,
+                    None,
+                    None,
+                    None,
+                    pinned_invalid,
+                    None,
+                    &meta,
+                    "snapshot-00000000-0000-4000-8000-0000000000e1.opc",
+                    [0xE1; 32],
+                    byte_length,
+                )
+                .is_err(),
+                "{case} incoming certificate must reject"
+            );
+            assert_eq!(
+                read_operator_recovery_sync(&conn, identity())
+                    .expect("target certificate survives rejected incoming install"),
+                recovery_before,
+                "{case} must not replace the target certificate"
+            );
+            let retained_outcome: Vec<u8> = conn
+                .query_row(
+                    "SELECT response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+                    [request_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("target outcome survives rejected incoming install");
+            assert_eq!(retained_outcome, expected_outcome, "{case}");
+        }
+        assert_eq!(
+            target_delete_attempts.load(Ordering::Relaxed),
+            0,
+            "raw attached certificate rejection must happen before target recovery/outcome deletion"
+        );
+        assert_eq!(
+            target_schema(&conn),
+            target_schema_before,
+            "every rejected attached DDL fixture leaves target sqlite_master exact"
+        );
+
+        // An incoming same-E/P snapshot is equally unable to replace the
+        // retained certificate with another canonical V2 entry.  This is an
+        // attached-source install, not merely a monotonic-state unit check.
+        let mismatched_path = directory
+            .path()
+            .join("recovery-mismatched-certificate.sqlite");
+        std::fs::copy(&snapshot_path, &mismatched_path)
+            .expect("copy snapshot for certificate mismatch");
+        let mismatched = Connection::open(&mismatched_path).expect("open mismatched snapshot");
+        let mut mismatched_certificate: OperatorRecoveryV2FinalizeCertificateV1 =
+            decode_json(&expected_certificate).expect("decode source certificate");
+        let EntryPayload::Normal(command) = &mut mismatched_certificate.entry.payload else {
+            panic!("source certificate has a normal finalization command");
+        };
+        command.request_id = SessionConsensusRequestId::from_bytes([0xD8; 16]);
+        mismatched
+            .execute(
+                "UPDATE consensus_operator_recovery SET finalize_entry_json = ?1 WHERE singleton = 1",
+                [encode_json(&mismatched_certificate).expect("encode mismatched certificate")],
+            )
+            .expect("replace only incoming certificate");
+        drop(mismatched);
+        let pinned_mismatched = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            open_nofollow_read(&mismatched_path).expect("pin mismatched-certificate snapshot"),
+            mismatched_path,
+        )
+        .expect("pinned mismatched-certificate snapshot");
+        assert!(install_snapshot_database_from_pinned_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+            None,
+            None,
+            pinned_mismatched,
+            None,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-0000000000da.opc",
+            [0xDA; 32],
+            byte_length,
+        )
+        .is_err());
+        assert_eq!(
+            read_operator_recovery_sync(&conn, identity())
+                .expect("target survives mismatched-certificate install"),
+            recovery_before
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_install_advances_an_old_purge_floor_without_intervening_rows() {
+        // This is a normal follower catch-up state: the source snapshot is a
+        // portable compacted image (and therefore contains no consensus_log
+        // or consensus_purged rows), while the target physically pruned its
+        // older durable floor and never received the following rows. The
+        // incoming selected snapshot is the authenticated exact witness for
+        // that wholly absent interval.
+        let directory = tempfile::tempdir().expect("portable snapshot directory");
+        let snapshot_path = directory.path().join("forward.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("portable snapshot source");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+        ];
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize source schema");
+            append_logs_sync(&source_conn, identity(), &entries).expect("append source logs");
+            save_committed_sync(&source_conn, identity(), Some(log_id(3)))
+                .expect("commit source snapshot cut");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply source logs");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build portable source snapshot");
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "old-floor-no-intervening-rows".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("portable snapshot metadata")
+                    .len(),
+            )
+        };
+        let portable = Connection::open(&snapshot_path).expect("open portable snapshot");
+        assert_eq!(
+            portable
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count portable log rows"),
+            0,
+            "portable snapshots intentionally omit physical consensus logs"
+        );
+        assert_eq!(
+            portable
+                .query_row("SELECT COUNT(*) FROM consensus_purged", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count portable purge rows"),
+            0,
+            "portable snapshots intentionally omit the producer purge marker"
+        );
+        drop(portable);
+
+        let target = SqliteSessionBackend::in_memory().expect("old-floor target");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize target schema");
+        let target_floor = vec![membership_entry()];
+        append_logs_sync(&target_conn, identity(), &target_floor).expect("append target floor");
+        save_committed_sync(&target_conn, identity(), Some(log_id(0)))
+            .expect("commit target floor");
+        apply_entries_sync(&target_conn, identity(), &target.caps, target_floor)
+            .expect("apply target floor");
+        set_test_purge_floor(&target_conn, &log_id(0));
+        target_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("physically prune the old target floor");
+
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000702.opc",
+            [0x70; 32],
+            byte_length,
+        )
+        .expect("forward portable snapshot installs over an old empty physical interval");
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("installed purge floor"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("installed applied frontier"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("installed committed frontier"),
+            Some(log_id(3))
+        );
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000709.opc",
+            [0x79; 32],
+            byte_length,
+        )
+        .expect("reinstalling the same compacted snapshot is idempotent");
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("reinstalled purge floor"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("reinstalled applied frontier"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("reinstalled committed frontier"),
+            Some(log_id(3))
+        );
+
+        // The exception allows only a wholly absent interval or an exact
+        // P+1..C retained prefix followed by an absent tail. A retained row
+        // behind a hole remains a rejected local corruption, even though the
+        // selected snapshot has the same valid cut.
+        let gapped = SqliteSessionBackend::in_memory().expect("gapped target");
+        let gapped_conn = gapped.conn.lock().await;
+        initialize_schema(&gapped_conn, identity(), &expected_members())
+            .expect("initialize gapped target schema");
+        append_logs_sync(&gapped_conn, identity(), &entries).expect("append gapped target logs");
+        save_committed_sync(&gapped_conn, identity(), Some(log_id(0)))
+            .expect("commit gapped target floor");
+        apply_entries_sync(
+            &gapped_conn,
+            identity(),
+            &gapped.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply gapped target floor");
+        set_test_purge_floor(&gapped_conn, &log_id(0));
+        gapped_conn
+            .execute("DELETE FROM consensus_log WHERE log_index != 2", [])
+            .expect("leave one gapped retained row");
+        let error = install_snapshot_database_sync(
+            &gapped_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000703.opc",
+            [0x71; 32],
+            byte_length,
+        )
+        .expect_err("a retained physical gap must still reject the snapshot install");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&gapped_conn, identity()).expect("rejected floor remains exact"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&gapped_conn, identity()).expect("rejected applied remains exact"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&gapped_conn, identity())
+                .expect("rejected committed remains exact"),
+            Some(log_id(0))
+        );
+        assert!(read_current_snapshot_sync(&gapped_conn, identity())
+            .expect("rejected selected snapshot")
+            .is_none());
+
+        // Replacement must not erase a locally corrupt applied pointer before
+        // auditing it. The incoming cut is newer, but the old applied L2 has
+        // no exact retained or compacted coverage above committed/purged L0.
+        let uncovered_applied =
+            SqliteSessionBackend::in_memory().expect("uncovered-applied target");
+        let uncovered_applied_conn = uncovered_applied.conn.lock().await;
+        initialize_schema(&uncovered_applied_conn, identity(), &expected_members())
+            .expect("initialize uncovered-applied target");
+        append_logs_sync(&uncovered_applied_conn, identity(), &entries[..3])
+            .expect("append uncovered-applied target logs");
+        save_committed_sync(&uncovered_applied_conn, identity(), Some(log_id(0)))
+            .expect("commit uncovered-applied target floor");
+        apply_entries_sync(
+            &uncovered_applied_conn,
+            identity(),
+            &uncovered_applied.caps,
+            entries[..3].to_vec(),
+        )
+        .expect("advance uncovered local applied pointer");
+        set_test_purge_floor(&uncovered_applied_conn, &log_id(0));
+        uncovered_applied_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("remove coverage for corrupt applied pointer");
+        let error = install_snapshot_database_sync(
+            &uncovered_applied_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000704.opc",
+            [0x72; 32],
+            byte_length,
+        )
+        .expect_err("incoming replacement must not erase an uncovered applied pointer");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied purge rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied committed rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied pointer rollback"),
+            Some(log_id(2))
+        );
+        assert!(
+            read_current_snapshot_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied snapshot rollback")
+                .is_none()
+        );
+
+        // A corrupt selected-snapshot marker must not be silently erased by
+        // an otherwise forward install. Normal publication rejects a snapshot
+        // beyond applied state, so form the crash/corruption fixture directly:
+        // C=A=P=L0 while the selected marker claims L5. The incoming L3 cut
+        // extends all ordinary floor pointers, but it still regresses that
+        // replaced marker and must leave the entire target transaction exact.
+        let selected_ahead = SqliteSessionBackend::in_memory().expect("selected-ahead target");
+        let selected_ahead_conn = selected_ahead.conn.lock().await;
+        initialize_schema(&selected_ahead_conn, identity(), &expected_members())
+            .expect("initialize selected-ahead target");
+        let selected_ahead_floor = vec![membership_entry()];
+        append_logs_sync(&selected_ahead_conn, identity(), &selected_ahead_floor)
+            .expect("append selected-ahead floor");
+        save_committed_sync(&selected_ahead_conn, identity(), Some(log_id(0)))
+            .expect("commit selected-ahead floor");
+        apply_entries_sync(
+            &selected_ahead_conn,
+            identity(),
+            &selected_ahead.caps,
+            selected_ahead_floor,
+        )
+        .expect("apply selected-ahead floor");
+        set_test_purge_floor(&selected_ahead_conn, &log_id(0));
+        selected_ahead_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("prune selected-ahead floor");
+        let corrupt_selected_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(5)),
+            last_membership: meta.last_membership.clone(),
+            snapshot_id: "selected-ahead-of-applied".into(),
+        };
+        selected_ahead_conn
+            .execute(
+                "INSERT INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    epoch_i64(identity()).expect("selected-ahead epoch"),
+                    encode_json(&corrupt_selected_meta).expect("encode selected-ahead marker"),
+                    "snapshot-00000000-0000-4000-8000-000000000705.opc",
+                    [0x75_u8; 32].as_slice(),
+                    1_i64,
+                ],
+            )
+            .expect("inject selected marker beyond applied state");
+        let error = install_snapshot_database_sync(
+            &selected_ahead_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000706.opc",
+            [0x76; 32],
+            byte_length,
+        )
+        .expect_err("incoming snapshot must not regress the replaced selected marker");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead purge rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead committed rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead applied rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_current_snapshot_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead snapshot rollback")
+                .expect("selected-ahead marker remains selected")
+                .0,
+            corrupt_selected_meta
+        );
+
+        let suffix_entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+
+        // A compatible contiguous suffix beyond the incoming cut remains
+        // usable. Rows covered by the selected snapshot are ignored only
+        // after proving their exact lineage; L4 and L5 remain above new P=L3.
+        let compatible_suffix =
+            SqliteSessionBackend::in_memory().expect("compatible-suffix target");
+        let compatible_suffix_conn = compatible_suffix.conn.lock().await;
+        initialize_schema(&compatible_suffix_conn, identity(), &expected_members())
+            .expect("initialize compatible-suffix target");
+        append_logs_sync(&compatible_suffix_conn, identity(), &suffix_entries)
+            .expect("append compatible retained suffix");
+        save_committed_sync(&compatible_suffix_conn, identity(), Some(log_id(0)))
+            .expect("commit compatible-suffix target floor");
+        apply_entries_sync(
+            &compatible_suffix_conn,
+            identity(),
+            &compatible_suffix.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply compatible-suffix target floor");
+        set_test_purge_floor(&compatible_suffix_conn, &log_id(0));
+        compatible_suffix_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("physically prune compatible target floor");
+        install_snapshot_database_sync(
+            &compatible_suffix_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000705.opc",
+            [0x73; 32],
+            byte_length,
+        )
+        .expect("compatible retained suffix survives forward snapshot install");
+        assert_eq!(
+            read_purged_sync(&compatible_suffix_conn, identity())
+                .expect("compatible-suffix installed purge"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            last_log_sync(&compatible_suffix_conn, identity())
+                .expect("compatible-suffix retained head"),
+            Some(log_id(5))
+        );
+
+        // A row above the incoming cut cannot hide behind the install-only
+        // absent-interval exception. The pre-replacement audit sees that L5
+        // lacks L1..L4 and rejects before any selected snapshot is published.
+        let gapped_suffix = SqliteSessionBackend::in_memory().expect("gapped-suffix target");
+        let gapped_suffix_conn = gapped_suffix.conn.lock().await;
+        initialize_schema(&gapped_suffix_conn, identity(), &expected_members())
+            .expect("initialize gapped-suffix target");
+        append_logs_sync(&gapped_suffix_conn, identity(), &suffix_entries)
+            .expect("append gapped-suffix target logs");
+        save_committed_sync(&gapped_suffix_conn, identity(), Some(log_id(0)))
+            .expect("commit gapped-suffix target floor");
+        apply_entries_sync(
+            &gapped_suffix_conn,
+            identity(),
+            &gapped_suffix.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply gapped-suffix target floor");
+        set_test_purge_floor(&gapped_suffix_conn, &log_id(0));
+        gapped_suffix_conn
+            .execute("DELETE FROM consensus_log WHERE log_index != 5", [])
+            .expect("leave lone retained row above incoming cut");
+        let error = install_snapshot_database_sync(
+            &gapped_suffix_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000706.opc",
+            [0x74; 32],
+            byte_length,
+        )
+        .expect_err("gapped retained suffix must reject before snapshot replacement");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&gapped_suffix_conn, identity())
+                .expect("gapped-suffix purge rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&gapped_suffix_conn, identity())
+                .expect("gapped-suffix committed rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&gapped_suffix_conn, identity())
+                .expect("gapped-suffix applied rollback"),
+            Some(log_id(0))
+        );
+        assert!(read_current_snapshot_sync(&gapped_suffix_conn, identity())
+            .expect("gapped-suffix snapshot rollback")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_portable_snapshot_install_accepts_purged_successor_membership_after_historical_snapshot(
+    ) {
+        // S0/M0 remains a truthful historical selected snapshot. The later
+        // M2 is applied before ordinary Raft purge P3 removes every physical
+        // row, so it is scope-validated applied authority rather than payload
+        // invented by the marker. An authenticated S5/M2 may replace this
+        // normal fully-pruned dynamic follower.
+        let directory = tempfile::tempdir().expect("successor-membership snapshot directory");
+        let snapshot_path = directory.path().join("successor-membership.sqlite");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            membership_entry_at(2, vec![expected_members()], expected_members()),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let source = SqliteSessionBackend::in_memory().expect("successor-membership source");
+        let (meta, byte_length, source_membership, source_scope) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize successor-membership source");
+            append_logs_sync(&source_conn, identity(), &entries)
+                .expect("append successor-membership source logs");
+            save_committed_sync(&source_conn, identity(), Some(log_id(5)))
+                .expect("commit successor-membership source cut");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply successor-membership source logs");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build authenticated S5/M2 portable snapshot");
+            assert_eq!(last_log_id, Some(log_id(5)));
+            assert_eq!(last_membership.log_id(), &Some(log_id(2)));
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "dynamic-purged-successor-membership".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("successor-membership snapshot metadata")
+                    .len(),
+                read_membership_sync(&source_conn, identity())
+                    .expect("read source successor membership"),
+                read_membership_scope_sync(&source_conn, identity())
+                    .expect("read source membership scope"),
+            )
+        };
+
+        let target = SqliteSessionBackend::in_memory().expect("historical-snapshot target");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize historical-snapshot target");
+        append_logs_sync(&target_conn, identity(), &entries[..4])
+            .expect("append target through P3");
+        save_committed_sync(&target_conn, identity(), Some(log_id(0)))
+            .expect("commit historical S0/M0 cut");
+        apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            vec![entries[0].clone()],
+        )
+        .expect("apply historical M0");
+        let historical_membership =
+            read_membership_sync(&target_conn, identity()).expect("read historical M0");
+        let historical_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: historical_membership.clone(),
+            snapshot_id: "historical-s0-m0".into(),
+        };
+        save_current_snapshot_sync(
+            &target_conn,
+            identity(),
+            &historical_meta,
+            "snapshot-00000000-0000-4000-8000-000000000702.opc",
+            [0x70; 32],
+            1,
+        )
+        .expect("persist historical S0/M0");
+        save_committed_sync(&target_conn, identity(), Some(log_id(3)))
+            .expect("advance target committed frontier to L3");
+        apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            entries[1..4].to_vec(),
+        )
+        .expect("apply target M2 and L3");
+        let successor_membership =
+            read_membership_sync(&target_conn, identity()).expect("read target M2");
+        assert_eq!(successor_membership.log_id(), &Some(log_id(2)));
+        assert_ne!(successor_membership, historical_membership);
+        purge_logs_sync(&target_conn, identity(), &log_id(3))
+            .expect("ordinary P3 removes the applied physical prefix");
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count fully purged target logs"),
+            0
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("target C"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("target A"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("target P"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_current_snapshot_sync(&target_conn, identity())
+                .expect("target historical snapshot")
+                .expect("target selected snapshot")
+                .0,
+            historical_meta
+        );
+        validate_retained_durable_log_sync(&target_conn, identity(), |_| Ok(()))
+            .expect("shared deep validation accepts purge-attested successor M2");
+
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000703.opc",
+            [0x71; 32],
+            byte_length,
+        )
+        .expect("authenticated S5/M2 installs over historical S0/M0 and P3");
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("installed C"),
+            Some(log_id(5))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("installed A"),
+            Some(log_id(5))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("installed P"),
+            Some(log_id(5))
+        );
+        let installed_snapshot = read_current_snapshot_sync(&target_conn, identity())
+            .expect("installed selected snapshot")
+            .expect("installed S5/M2");
+        assert_eq!(installed_snapshot.0, meta);
+        assert_eq!(
+            read_membership_sync(&target_conn, identity()).expect("installed M2"),
+            source_membership
+        );
+        assert_eq!(
+            read_membership_scope_sync(&target_conn, identity())
+                .expect("installed membership scope"),
+            source_scope
+        );
+        validate_retained_durable_log_sync(&target_conn, identity(), |_| Ok(()))
+            .expect("post-install deep audit accepts exact C/A/P/S and M2");
+    }
+
+    #[tokio::test]
+    async fn dynamic_portable_snapshot_install_rejects_unattested_or_snapshot_mismatched_purged_membership(
+    ) {
+        let directory = tempfile::tempdir().expect("membership coverage controls directory");
+        let snapshot_path = directory.path().join("membership-coverage.sqlite");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            membership_entry_at(2, vec![expected_members()], expected_members()),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let source = SqliteSessionBackend::in_memory().expect("membership coverage source");
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize membership coverage source");
+            append_logs_sync(&source_conn, identity(), &entries)
+                .expect("append membership coverage source logs");
+            save_committed_sync(&source_conn, identity(), Some(log_id(5)))
+                .expect("commit membership coverage source");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply membership coverage source");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build membership coverage source snapshot");
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "dynamic-membership-coverage-controls".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("membership coverage source metadata")
+                    .len(),
+            )
+        };
+
+        // P1 is before M2. Removing the rows anyway is corrupt local state,
+        // and neither deep validation nor incoming S5 may repair it by
+        // treating a too-old marker as membership payload evidence.
+        let insufficient = SqliteSessionBackend::in_memory().expect("insufficient-purge target");
+        let insufficient_conn = insufficient.conn.lock().await;
+        initialize_schema(&insufficient_conn, identity(), &expected_members())
+            .expect("initialize insufficient-purge target");
+        append_logs_sync(&insufficient_conn, identity(), &entries[..4])
+            .expect("append insufficient-purge target logs");
+        save_committed_sync(&insufficient_conn, identity(), Some(log_id(0)))
+            .expect("commit insufficient-purge M0");
+        apply_entries_sync(
+            &insufficient_conn,
+            identity(),
+            &insufficient.caps,
+            vec![entries[0].clone()],
+        )
+        .expect("apply insufficient-purge M0");
+        let historical_membership = read_membership_sync(&insufficient_conn, identity())
+            .expect("read insufficient-purge M0");
+        let historical_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: historical_membership,
+            snapshot_id: "insufficient-purge-historical-s0-m0".into(),
+        };
+        save_current_snapshot_sync(
+            &insufficient_conn,
+            identity(),
+            &historical_meta,
+            "snapshot-00000000-0000-4000-8000-000000000704.opc",
+            [0x72; 32],
+            1,
+        )
+        .expect("persist insufficient-purge S0/M0");
+        save_committed_sync(&insufficient_conn, identity(), Some(log_id(3)))
+            .expect("advance insufficient-purge committed frontier");
+        apply_entries_sync(
+            &insufficient_conn,
+            identity(),
+            &insufficient.caps,
+            entries[1..4].to_vec(),
+        )
+        .expect("apply insufficient-purge M2 and L3");
+        set_test_purge_floor(&insufficient_conn, &log_id(1));
+        insufficient_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("inject absent M2 without a covering purge");
+        assert!(
+            validate_retained_durable_log_sync(&insufficient_conn, identity(), |_| Ok(())).is_err()
+        );
+        let insufficient_before = (
+            read_committed_sync(&insufficient_conn, identity()).expect("insufficient C before"),
+            read_applied_sync(&insufficient_conn, identity()).expect("insufficient A before"),
+            read_purged_sync(&insufficient_conn, identity()).expect("insufficient P before"),
+            read_current_snapshot_sync(&insufficient_conn, identity())
+                .expect("insufficient S before"),
+            read_membership_sync(&insufficient_conn, identity()).expect("insufficient M before"),
+        );
+        assert!(install_snapshot_database_sync(
+            &insufficient_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000705.opc",
+            [0x73; 32],
+            byte_length,
+        )
+        .is_err());
+        assert_eq!(
+            (
+                read_committed_sync(&insufficient_conn, identity())
+                    .expect("insufficient C rollback"),
+                read_applied_sync(&insufficient_conn, identity()).expect("insufficient A rollback"),
+                read_purged_sync(&insufficient_conn, identity()).expect("insufficient P rollback"),
+                read_current_snapshot_sync(&insufficient_conn, identity())
+                    .expect("insufficient S rollback"),
+                read_membership_sync(&insufficient_conn, identity())
+                    .expect("insufficient M rollback"),
+            ),
+            insufficient_before
+        );
+
+        // S3 claims to cover M2 but carries M0. P3 is otherwise a valid
+        // full-LogId floor, yet cannot substitute for the selected snapshot's
+        // exact membership payload when that selected cut reaches M2.
+        let mismatched = SqliteSessionBackend::in_memory().expect("mismatched-snapshot target");
+        let mismatched_conn = mismatched.conn.lock().await;
+        initialize_schema(&mismatched_conn, identity(), &expected_members())
+            .expect("initialize mismatched-snapshot target");
+        append_logs_sync(&mismatched_conn, identity(), &entries[..4])
+            .expect("append mismatched-snapshot target logs");
+        save_committed_sync(&mismatched_conn, identity(), Some(log_id(0)))
+            .expect("commit mismatched-snapshot M0");
+        apply_entries_sync(
+            &mismatched_conn,
+            identity(),
+            &mismatched.caps,
+            vec![entries[0].clone()],
+        )
+        .expect("apply mismatched-snapshot M0");
+        let historical_membership = read_membership_sync(&mismatched_conn, identity())
+            .expect("read mismatched-snapshot M0");
+        save_committed_sync(&mismatched_conn, identity(), Some(log_id(3)))
+            .expect("advance mismatched-snapshot committed frontier");
+        apply_entries_sync(
+            &mismatched_conn,
+            identity(),
+            &mismatched.caps,
+            entries[1..4].to_vec(),
+        )
+        .expect("apply mismatched-snapshot M2 and L3");
+        let mismatched_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(3)),
+            last_membership: historical_membership,
+            snapshot_id: "mismatched-covering-s3-m0".into(),
+        };
+        save_current_snapshot_sync(
+            &mismatched_conn,
+            identity(),
+            &mismatched_meta,
+            "snapshot-00000000-0000-4000-8000-000000000706.opc",
+            [0x74; 32],
+            1,
+        )
+        .expect("persist selected S3 with mismatched M0 payload");
+        purge_logs_sync(&mismatched_conn, identity(), &log_id(3))
+            .expect("ordinary P3 removes mismatched-snapshot physical rows");
+        assert!(
+            validate_retained_durable_log_sync(&mismatched_conn, identity(), |_| Ok(())).is_err()
+        );
+        let mismatched_before = (
+            read_committed_sync(&mismatched_conn, identity()).expect("mismatched C before"),
+            read_applied_sync(&mismatched_conn, identity()).expect("mismatched A before"),
+            read_purged_sync(&mismatched_conn, identity()).expect("mismatched P before"),
+            read_current_snapshot_sync(&mismatched_conn, identity()).expect("mismatched S before"),
+            read_membership_sync(&mismatched_conn, identity()).expect("mismatched M before"),
+        );
+        assert!(install_snapshot_database_sync(
+            &mismatched_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000707.opc",
+            [0x75; 32],
+            byte_length,
+        )
+        .is_err());
+        assert_eq!(
+            (
+                read_committed_sync(&mismatched_conn, identity()).expect("mismatched C rollback"),
+                read_applied_sync(&mismatched_conn, identity()).expect("mismatched A rollback"),
+                read_purged_sync(&mismatched_conn, identity()).expect("mismatched P rollback"),
+                read_current_snapshot_sync(&mismatched_conn, identity())
+                    .expect("mismatched S rollback"),
+                read_membership_sync(&mismatched_conn, identity()).expect("mismatched M rollback"),
+            ),
+            mismatched_before
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_portable_snapshot_catches_up_with_applied_behind_committed_prefix() {
+        let directory = tempfile::tempdir().expect("dynamic catch-up snapshot directory");
+        let snapshot_path = directory.path().join("dynamic-catch-up.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("dynamic catch-up source");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize dynamic catch-up source");
+            append_logs_sync(&source_conn, identity(), &entries)
+                .expect("append dynamic source through S=L5");
+            save_committed_sync(&source_conn, identity(), Some(log_id(5)))
+                .expect("commit dynamic source S=L5");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply dynamic source S=L5");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build dynamic portable S=L5");
+            assert_eq!(last_log_id, Some(log_id(5)));
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "dynamic-applied-behind-committed-catch-up".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("dynamic portable snapshot metadata")
+                    .len(),
+            )
+        };
+
+        // OpenRaft can install a newer snapshot after C advances beyond the
+        // state-machine A frontier. L1..L2 remain an exact local P+1..C
+        // prefix, while the authenticated selected cut covers L3..L5.
+        let target_path = directory.path().join("dynamic-compacted-follower.sqlite");
+        let target = SqliteSessionBackend::open(&target_path).expect("dynamic compacted follower");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize dynamic compacted follower");
+        append_logs_sync(&target_conn, identity(), &entries[..3])
+            .expect("append dynamic local P+1..C prefix");
+        save_committed_sync(&target_conn, identity(), Some(log_id(2)))
+            .expect("commit dynamic local C=L2");
+        apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            entries[..2].to_vec(),
+        )
+        .expect("apply dynamic local A=L1");
+        let predecessor_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: stored_membership_at(0, vec![expected_members()], expected_members()),
+            snapshot_id: "dynamic-compacted-predecessor".into(),
+        };
+        save_current_snapshot_sync(
+            &target_conn,
+            identity(),
+            &predecessor_meta,
+            "snapshot-00000000-0000-4000-8000-00000000070b.opc",
+            [0x7b; 32],
+            1,
+        )
+        .expect("publish dynamic predecessor snapshot");
+        purge_logs_sync(&target_conn, identity(), &log_id(0))
+            .expect("purge dynamic predecessor floor");
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("dynamic A"),
+            Some(log_id(1))
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("dynamic C"),
+            Some(log_id(2))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("dynamic P"),
+            Some(log_id(0))
+        );
+
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-00000000070c.opc",
+            [0x7c; 32],
+            byte_length,
+        )
+        .expect("dynamic S=L5 installs over A=L1, C=L2 prefix");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&target_conn, identity()).expect("installed C"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&target_conn, identity()).expect("installed A"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&target_conn, identity()).expect("installed P"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "installed dynamic {name} cut");
+        }
+        purge_logs_sync(&target_conn, identity(), &log_id(5))
+            .expect("queued dynamic successor purge");
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count queued dynamic purge rows"),
+            0
+        );
+        drop(target_conn);
+        drop(target);
+
+        let reopened = SqliteSessionBackend::open(&target_path).expect("reopen dynamic follower");
+        let reopened_conn = reopened.conn.lock().await;
+        initialize_schema(&reopened_conn, identity(), &expected_members())
+            .expect("reopen dynamic follower after queued purge");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&reopened_conn, identity()).expect("reopened C"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&reopened_conn, identity()).expect("reopened A"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&reopened_conn, identity()).expect("reopened P"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "reopened dynamic {name} cut");
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_portable_snapshot_catches_up_a_previously_compacted_follower() {
+        let profile = ConsensusAuthorityProfile::FixedImmutable;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let directory = tempfile::tempdir().expect("fixed catch-up snapshot directory");
+        let snapshot_path = directory.path().join("fixed-catch-up.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("fixed catch-up source");
+        let source_entries = vec![
+            membership_entry_at(0, vec![members.clone()], members.clone()),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema_with_profile(&source_conn, identity(), &members, profile)
+                .expect("initialize fixed catch-up source");
+            append_logs_with_authority_sync(
+                &source_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &source_entries,
+            )
+            .expect("append fixed source through later snapshot cut");
+            save_committed_with_authority_sync(
+                &source_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                Some(log_id(5)),
+            )
+            .expect("commit fixed source snapshot cut");
+            apply_entries_with_authority_sync(
+                &source_conn,
+                identity(),
+                &source.caps,
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                source_entries.clone(),
+            )
+            .expect("apply fixed source snapshot cut");
+            let (last_log_id, last_membership) = build_snapshot_database_with_authority_sync(
+                &source_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &snapshot_path,
+            )
+            .expect("build fixed portable catch-up snapshot");
+            assert_eq!(last_log_id, Some(log_id(5)));
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "fixed-predecessor-to-successor-catch-up".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("fixed portable snapshot metadata")
+                    .len(),
+            )
+        };
+        let portable = Connection::open(&snapshot_path).expect("open fixed portable snapshot");
+        for table in [
+            "consensus_vote",
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_log",
+            "consensus_snapshot",
+        ] {
+            assert_eq!(
+                portable
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap_or_else(|error| panic!("count portable {table}: {error}")),
+                0,
+                "portable fixed snapshot must omit producer {table} rows"
+            );
+        }
+        drop(portable);
+
+        // This follower was healthy at P=S_old=L0, A=L1, and C=L2, retaining
+        // exact L1..L2. It then misses L3..L5 before receiving authenticated
+        // S=L5. Membership M=L0 is compacted below P and is attested by the
+        // old selected snapshot rather than by a retained physical row.
+        let target_path = directory.path().join("fixed-compacted-follower.sqlite");
+        let target = SqliteSessionBackend::open(&target_path).expect("fixed compacted follower");
+        let target_conn = target.conn.lock().await;
+        initialize_schema_with_profile(&target_conn, identity(), &members, profile)
+            .expect("initialize fixed compacted follower");
+        let predecessor = source_entries[..3].to_vec();
+        append_logs_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &predecessor,
+        )
+        .expect("append fixed predecessor cut");
+        save_committed_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(log_id(2)),
+        )
+        .expect("commit fixed predecessor cut");
+        apply_entries_with_authority_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            predecessor[..2].to_vec(),
+        )
+        .expect("apply fixed predecessor cut");
+        let predecessor_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: stored_membership_at(0, vec![members.clone()], members.clone()),
+            snapshot_id: "fixed-compacted-predecessor".into(),
+        };
+        save_current_snapshot_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &predecessor_meta,
+            "snapshot-00000000-0000-4000-8000-000000000707.opc",
+            [0x77; 32],
+            1,
+        )
+        .expect("publish fixed predecessor snapshot marker");
+        purge_logs_without_prune_lane_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &log_id(0),
+        )
+        .expect("complete predecessor physical purge");
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("predecessor committed"),
+            Some(log_id(2))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("predecessor applied"),
+            Some(log_id(1))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("predecessor purged"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_current_snapshot_sync(&target_conn, identity())
+                .expect("predecessor selected snapshot")
+                .expect("predecessor snapshot remains selected")
+                .0
+                .last_log_id,
+            Some(log_id(0))
+        );
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count exact retained predecessor suffix"),
+            2
+        );
+        validate_fixed_durable_state_sync(&target_conn, identity(), &members)
+            .expect("predecessor fixed state is healthy");
+
+        install_snapshot_database_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            Some(&members),
+            Some(&bindings),
+            FIXED_TEST_PLACEMENT_POLICY,
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000708.opc",
+            [0x78; 32],
+            byte_length,
+        )
+        .expect("fixed follower catches up from retained L1..L2 to snapshot S=L5");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&target_conn, identity()).expect("installed committed"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&target_conn, identity()).expect("installed applied"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&target_conn, identity()).expect("installed purged"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "installed {name} cut");
+        }
+        assert_eq!(
+            read_current_snapshot_sync(&target_conn, identity())
+                .expect("installed selected snapshot")
+                .expect("successor snapshot remains selected")
+                .0
+                .last_log_id,
+            Some(log_id(5))
+        );
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count installed covered predecessor suffix"),
+            2
+        );
+        assert!(fixed_quorum_authority_is_exact_sync(
+            &target_conn,
+            identity(),
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy"),
+            false,
+        )
+        .expect("installed fixed authority"));
+        validate_fixed_durable_state_sync(&target_conn, identity(), &members)
+            .expect("installed fixed state is deep-valid");
+
+        // OpenRaft queues this same-floor purge after state-machine install.
+        // It must remain idempotent and reclaim no authority evidence needed
+        // for a subsequent restart.
+        purge_logs_without_prune_lane_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &log_id(5),
+        )
+        .expect("queued successor purge is idempotent");
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("queued purge reclaims covered predecessor suffix"),
+            0
+        );
+        validate_fixed_durable_state_sync(&target_conn, identity(), &members)
+            .expect("fixed state remains deep-valid after queued purge");
+        drop(target_conn);
+        drop(target);
+
+        let reopened = SqliteSessionBackend::open(&target_path).expect("reopen fixed follower");
+        let reopened_conn = reopened.conn.lock().await;
+        initialize_schema_with_profile(&reopened_conn, identity(), &members, profile)
+            .expect("fixed follower reopens after queued purge");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&reopened_conn, identity()).expect("reopened committed"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&reopened_conn, identity()).expect("reopened applied"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&reopened_conn, identity()).expect("reopened purged"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "reopened {name} cut");
+        }
+        drop(reopened_conn);
+        drop(reopened);
+
+        // Neither the portable selected cut nor the Fixed pre-install audit
+        // may turn a corrupt retained suffix into the exact P+1..C prefix
+        // used above. Check an internal gap and a row above C; each must fail
+        // before the replacement transaction changes durable state.
+        for (case, delete_sql) in [
+            (
+                "gapped-l1-l3",
+                "DELETE FROM consensus_log WHERE log_index = 2",
+            ),
+            (
+                "suffix-above-c",
+                "DELETE FROM consensus_log WHERE log_index > 3",
+            ),
+        ] {
+            let corrupt_path = directory.path().join(format!("fixed-{case}.sqlite"));
+            let corrupt = SqliteSessionBackend::open(&corrupt_path)
+                .unwrap_or_else(|error| panic!("open {case} target: {error}"));
+            let corrupt_conn = corrupt.conn.lock().await;
+            initialize_schema_with_profile(&corrupt_conn, identity(), &members, profile)
+                .unwrap_or_else(|error| panic!("initialize {case} target: {error}"));
+            append_logs_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &source_entries[..4],
+            )
+            .unwrap_or_else(|error| panic!("append {case} target: {error}"));
+            save_committed_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                Some(log_id(2)),
+            )
+            .unwrap_or_else(|error| panic!("commit {case} target: {error}"));
+            apply_entries_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                &corrupt.caps,
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                source_entries[..2].to_vec(),
+            )
+            .unwrap_or_else(|error| panic!("apply {case} target: {error}"));
+            save_current_snapshot_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &predecessor_meta,
+                "snapshot-00000000-0000-4000-8000-000000000709.opc",
+                [0x79; 32],
+                1,
+            )
+            .unwrap_or_else(|error| panic!("publish {case} predecessor snapshot: {error}"));
+            purge_logs_without_prune_lane_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &log_id(0),
+            )
+            .unwrap_or_else(|error| panic!("purge {case} predecessor floor: {error}"));
+            corrupt_conn
+                .execute(delete_sql, [])
+                .unwrap_or_else(|error| panic!("inject {case} retained corruption: {error}"));
+            let before = (
+                read_committed_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} committed: {error}")),
+                read_applied_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} applied: {error}")),
+                read_purged_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} purged: {error}")),
+                read_current_snapshot_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} snapshot: {error}")),
+                read_membership_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} membership: {error}")),
+            );
+            let error = install_snapshot_database_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                Some(&members),
+                Some(&bindings),
+                FIXED_TEST_PLACEMENT_POLICY,
+                &snapshot_path,
+                &meta,
+                "snapshot-00000000-0000-4000-8000-00000000070a.opc",
+                [0x7a; 32],
+                byte_length,
+            )
+            .expect_err("corrupt fixed retained suffix must reject before replacement");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}");
+            assert_eq!(
+                (
+                    read_committed_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} committed rollback: {error}")),
+                    read_applied_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} applied rollback: {error}")),
+                    read_purged_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} purged rollback: {error}")),
+                    read_current_snapshot_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} snapshot rollback: {error}")),
+                    read_membership_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} membership rollback: {error}")),
+                ),
+                before,
+                "{case} snapshot install rolls back exact durable state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_rejects_purged_lineage_regression_before_replacement_for_dynamic_and_fixed(
+    ) {
+        // The snapshot cut is an authority boundary, not merely an index
+        // watermark.  In particular, an incoming later index from an older
+        // term must not erase either an earlier high-term local purge floor
+        // or a locally stronger retained floor. Exercise the real attached
+        // install path under both supported authority profiles; the source
+        // has a strictly higher state-machine sequence than the target.
+        for (profile, members) in [
+            (ConsensusAuthorityProfile::Dynamic, expected_members()),
+            (
+                ConsensusAuthorityProfile::FixedImmutable,
+                members(&[7, 8, 9]),
+            ),
+        ] {
+            let bindings = test_member_bindings(&members);
+            let fixed_policy = (profile == ConsensusAuthorityProfile::FixedImmutable)
+                .then_some(PlacementResiliencePolicy::RequireIndependentFailureDomains);
+            let directory = tempfile::tempdir().expect("snapshot floor directory");
+            let snapshot_path = directory.path().join(match profile {
+                ConsensusAuthorityProfile::Dynamic => "dynamic-lineage.sqlite",
+                ConsensusAuthorityProfile::FixedImmutable => "fixed-lineage.sqlite",
+            });
+            let source = SqliteSessionBackend::in_memory().expect("snapshot floor source");
+            let source_conn = source.conn.lock().await;
+            initialize_schema_with_profile(&source_conn, identity(), &members, profile)
+                .expect("initialize source authority");
+            let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+            let advance = Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Normal(SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes([0xB7; 16]),
+                    logical_time: timestamp(1),
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                }),
+            };
+            append_logs_with_authority_sync(
+                &source_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                fixed_policy,
+                &[membership.clone(), advance.clone()],
+            )
+            .expect("append source membership and advance");
+            apply_entries_with_authority_sync(
+                &source_conn,
+                identity(),
+                &source.caps,
+                profile,
+                &members,
+                &bindings,
+                fixed_policy,
+                vec![membership.clone(), advance],
+            )
+            .expect("apply source membership and advance");
+            assert!(
+                read_machine_sync(&source_conn, identity())
+                    .expect("source machine")
+                    .0
+                    > 0,
+                "the incoming image must have a newer application sequence"
+            );
+            let (last_log_id, last_membership) = if profile == ConsensusAuthorityProfile::Dynamic {
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build dynamic source snapshot")
+            } else {
+                build_snapshot_database_with_authority_sync(
+                    &source_conn,
+                    identity(),
+                    profile,
+                    &members,
+                    &bindings,
+                    fixed_policy,
+                    &snapshot_path,
+                )
+                .expect("build fixed source snapshot")
+            };
+            drop(source_conn);
+            let byte_length = std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len();
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: match profile {
+                    ConsensusAuthorityProfile::Dynamic => "dynamic-purge-lineage".into(),
+                    ConsensusAuthorityProfile::FixedImmutable => "fixed-purge-lineage".into(),
+                },
+            };
+
+            for (case, floor) in [
+                // The audited regression: the old index-only check accepted
+                // a low-term later snapshot cut over this floor.
+                (
+                    "higher-term-lower-index",
+                    LogId::new(CommittedLeaderId::new(10, node_id()), 0),
+                ),
+                // The adjacent purge-floor case must also reject before any
+                // source copy can replace target state.
+                (
+                    "stronger-local-index",
+                    LogId::new(CommittedLeaderId::new(1, node_id()), 2),
+                ),
+            ] {
+                let target = SqliteSessionBackend::in_memory().expect("snapshot floor target");
+                let target_conn = target.conn.lock().await;
+                initialize_schema_with_profile(&target_conn, identity(), &members, profile)
+                    .expect("initialize target authority");
+                append_logs_with_authority_sync(
+                    &target_conn,
+                    identity(),
+                    profile,
+                    &members,
+                    &bindings,
+                    fixed_policy,
+                    std::slice::from_ref(&membership),
+                )
+                .expect("append target membership");
+                apply_entries_with_authority_sync(
+                    &target_conn,
+                    identity(),
+                    &target.caps,
+                    profile,
+                    &members,
+                    &bindings,
+                    fixed_policy,
+                    vec![membership.clone()],
+                )
+                .expect("apply target membership");
+                let tx = Transaction::new_unchecked(&target_conn, TransactionBehavior::Immediate)
+                    .expect("begin target purge fixture");
+                save_log_pointer(&tx, "consensus_purged", identity(), &floor)
+                    .expect("persist target purge floor");
+                tx.commit().expect("commit target purge floor");
+                let machine_before = read_machine_sync(&target_conn, identity())
+                    .expect("target machine before install");
+                let applied_before = read_applied_sync(&target_conn, identity())
+                    .expect("target applied before install");
+                let log_count_before: i64 = target_conn
+                    .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+                    .expect("target log count before install");
+
+                let error = install_snapshot_database_with_authority_sync(
+                    &target_conn,
+                    identity(),
+                    profile,
+                    (profile == ConsensusAuthorityProfile::FixedImmutable).then_some(&members),
+                    (profile == ConsensusAuthorityProfile::FixedImmutable).then_some(&bindings),
+                    fixed_policy,
+                    &snapshot_path,
+                    &meta,
+                    "snapshot-00000000-0000-4000-8000-0000000000f1.opc",
+                    [0xF1; 32],
+                    byte_length,
+                )
+                .expect_err("purge lineage regression must reject before replacement");
+                assert_eq!(
+                    io::ErrorKind::InvalidData,
+                    error.kind(),
+                    "{profile:?} {case}"
+                );
+                assert_eq!(
+                    machine_before,
+                    read_machine_sync(&target_conn, identity()).expect("unchanged target machine"),
+                    "{profile:?} {case}"
+                );
+                assert_eq!(
+                    applied_before,
+                    read_applied_sync(&target_conn, identity()).expect("unchanged target applied"),
+                    "{profile:?} {case}"
+                );
+                assert_eq!(
+                    Some(floor),
+                    read_purged_sync(&target_conn, identity())
+                        .expect("unchanged target purge floor"),
+                    "{profile:?} {case}"
+                );
+                assert_eq!(
+                    log_count_before,
+                    target_conn
+                        .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .expect("unchanged target log count"),
+                    "{profile:?} {case}"
+                );
+                assert!(
+                    read_current_snapshot_sync(&target_conn, identity())
+                        .expect("target snapshot metadata")
+                        .is_none(),
+                    "{profile:?} {case} must fail before snapshot publication"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn live_consensus_restore_scan_revalidates_persisted_payload_authority() {
         let exact = SqliteSessionBackend::in_memory().expect("exact-cap backend");
         {
@@ -48487,6 +62050,18 @@ BEGIN IMMEDIATE;
         conn: &Connection,
         entry: &Entry<SessionRaftTypeConfig>,
     ) {
+        persist_unvalidated_log_json_fixture(
+            conn,
+            entry,
+            encode_json(entry).expect("fixture log encoding"),
+        );
+    }
+
+    fn persist_unvalidated_log_json_fixture(
+        conn: &Connection,
+        entry: &Entry<SessionRaftTypeConfig>,
+        encoded: Vec<u8>,
+    ) {
         let (term, index) = validate_log_id(&entry.log_id).expect("fixture log ID");
         conn.execute(
             "INSERT INTO consensus_log (configuration_epoch, term, log_index, entry_json) VALUES (?1, ?2, ?3, ?4)",
@@ -48494,10 +62069,1534 @@ BEGIN IMMEDIATE;
                 epoch_i64(identity()).expect("fixture epoch"),
                 term,
                 index,
-                encode_json(entry).expect("fixture log encoding"),
+                encoded,
             ],
         )
         .expect("persist unvalidated log fixture");
+    }
+
+    fn normal_command_json_mut(
+        value: &mut serde_json::Value,
+    ) -> &mut serde_json::Map<String, serde_json::Value> {
+        value
+            .get_mut("payload")
+            .and_then(|payload| payload.get_mut("Normal"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("normal command JSON")
+    }
+
+    fn v2_intent_variant_json_mut<'a>(
+        value: &'a mut serde_json::Value,
+        variant: &str,
+    ) -> &'a mut serde_json::Value {
+        normal_command_json_mut(value)
+            .get_mut("intent")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|intent| intent.get_mut(variant))
+            .expect("V2 intent variant JSON")
+    }
+
+    fn noncanonical_v2_log_json(entry: &Entry<SessionRaftTypeConfig>) -> Vec<u8> {
+        let mut value = serde_json::to_value(entry).expect("V2 log value");
+        normal_command_json_mut(&mut value).insert(
+            "ignored_future_command_field".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        serde_json::to_vec(&value).expect("noncanonical V2 log JSON")
+    }
+
+    fn recovery_v2_log_entry(index: u64) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([0xD7; 16]),
+                logical_time: timestamp(u8::try_from(index).expect("recovery V2 test index")),
+                intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(Box::new(
+                    FinalizeOperatorRecoveryV2Intent {
+                        recovery_epoch: 1,
+                        plan_digest: [0xA1; 32],
+                        fence_high_water: 1,
+                        credential_high_water: 1,
+                        application_sequence_high_water: 1,
+                        watch_cursor_invalidation_floor: 1,
+                        predecessor_recovery_epoch: 0,
+                        predecessor_plan_digest: [0; 32],
+                        predecessor_watch_cursor_invalidation_floor: 0,
+                        predecessor_baseline_log_id: log_id(0),
+                        predecessor_application_sequence: 0,
+                        predecessor_last_digest: [0; 32],
+                        predecessor_logical_time: None,
+                        predecessor_watch_sequence: 0,
+                        predecessor_authority_commitment: [0; 32],
+                        predecessor_recovery_v2_invariant_state_digest: [0; 32],
+                        predecessor_bootstrap_membership_digest: None,
+                    },
+                )),
+            }),
+        }
+    }
+
+    fn recovery_v2_entry_for_current_predecessor(
+        conn: &Connection,
+        index: u64,
+        _request_byte: u8,
+        predecessor_baseline_log_id: LogId<SessionConsensusNodeId>,
+        predecessor_bootstrap_membership_digest: Option<[u8; 32]>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let machine = read_machine_sync(conn, identity()).expect("read V2 predecessor machine");
+        let recovery =
+            read_operator_recovery_sync(conn, identity()).expect("read V2 predecessor recovery");
+        let scope =
+            read_membership_scope_sync(conn, identity()).expect("read V2 predecessor membership");
+        let predecessor_authority_commitment = operator_recovery_v2_authority_commitment_sync(
+            conn,
+            identity(),
+            &scope.current_members,
+        )
+        .expect("derive V2 predecessor authority commitment");
+        let predecessor_recovery_v2_invariant_state_digest =
+            crate::recovery::recovery_v2_invariant_state_digest_for_apply(conn)
+                .expect("derive V2 predecessor invariant commitment");
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                // V2's durable replay key is the first 16 bytes of the full
+                // plan digest. Test builders must not invent a second request
+                // namespace merely to vary a fixture label.
+                request_id: SessionConsensusRequestId::from_bytes([0xA1; 16]),
+                logical_time: timestamp(u8::try_from(index).expect("V2 test log index")),
+                intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(Box::new(
+                    FinalizeOperatorRecoveryV2Intent {
+                        recovery_epoch: recovery
+                            .recovery_epoch
+                            .checked_add(1)
+                            .expect("V2 recovery epoch successor"),
+                        plan_digest: [0xA1; 32],
+                        fence_high_water: observed_fence_high_water_sync(conn)
+                            .expect("V2 predecessor fence high-water"),
+                        credential_high_water: observed_credential_high_water_sync(conn)
+                            .expect("V2 predecessor credential high-water"),
+                        application_sequence_high_water: machine.0,
+                        watch_cursor_invalidation_floor: machine.3,
+                        predecessor_recovery_epoch: recovery.recovery_epoch,
+                        predecessor_plan_digest: recovery.last_plan_digest,
+                        predecessor_watch_cursor_invalidation_floor: recovery
+                            .watch_cursor_invalidation_floor,
+                        predecessor_baseline_log_id,
+                        predecessor_application_sequence: machine.0,
+                        predecessor_last_digest: *machine.1.as_bytes(),
+                        predecessor_logical_time: machine.2,
+                        predecessor_watch_sequence: machine.3,
+                        predecessor_authority_commitment,
+                        predecessor_recovery_v2_invariant_state_digest,
+                        predecessor_bootstrap_membership_digest,
+                    },
+                )),
+            }),
+        }
+    }
+
+    /// Seed nonzero V2 floors without introducing a lease or recovery effect.
+    /// The durable allocator and cursor rows remain individually valid, which
+    /// lets certificate tests prove that a later lowering is rejected by the
+    /// certified plan rather than by unrelated lease validation.
+    fn seed_v2_certificate_monotonic_floors(conn: &Connection) {
+        conn.execute(
+            "UPDATE lease_globals SET val = 8 WHERE key = 'next_fence'",
+            [],
+        )
+        .expect("seed V2 fence floor");
+        conn.execute(
+            "UPDATE lease_globals SET val = 10 WHERE key = 'next_credential_id'",
+            [],
+        )
+        .expect("seed V2 credential floor");
+        conn.execute(
+            "UPDATE consensus_machine SET watch_sequence = 5 WHERE singleton = 1",
+            [],
+        )
+        .expect("seed V2 machine watch floor");
+        conn.execute(
+            "UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = 5 WHERE singleton = 1",
+            [],
+        )
+        .expect("seed V2 recovery watch floor");
+    }
+
+    /// Build a complete current-format V2 finalization with its original
+    /// retained membership entry and deterministic generic outcome.  Tests
+    /// deliberately alter one post-commit evidence byte at a time below.
+    fn apply_valid_recovery_v2_finalization_fixture(conn: &Connection, caps: &BackendCapabilities) {
+        initialize_schema(conn, identity(), &expected_members())
+            .expect("certificate fixture schema");
+        let membership = membership_entry();
+        append_logs_sync(conn, identity(), std::slice::from_ref(&membership))
+            .expect("certificate fixture Membership log");
+        apply_entries_sync(conn, identity(), caps, vec![membership])
+            .expect("certificate fixture Membership apply");
+        seed_v2_certificate_monotonic_floors(conn);
+        let membership_digest =
+            operator_recovery_v2_bootstrap_membership_digest_sync(conn, identity(), &log_id(0))
+                .expect("certificate fixture Membership digest");
+        mark_operator_recovery_pending_sync(conn, identity(), 1, [0xA1; 32])
+            .expect("certificate fixture pending state");
+        let finalization = recovery_v2_entry_for_current_predecessor(
+            conn,
+            1,
+            0xD8,
+            log_id(0),
+            Some(membership_digest),
+        );
+        append_logs_sync(conn, identity(), std::slice::from_ref(&finalization))
+            .expect("certificate fixture finalization log");
+        apply_entries_sync(conn, identity(), caps, vec![finalization])
+            .expect("certificate fixture finalization apply");
+        read_operator_recovery_sync(conn, identity()).expect("certificate fixture finalization");
+    }
+
+    type RawRecoveryMigrationImage = (
+        Vec<(String, String, Option<String>)>,
+        Vec<String>,
+        Vec<String>,
+    );
+
+    fn raw_recovery_migration_image(conn: &Connection) -> RawRecoveryMigrationImage {
+        let schema = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master \
+                 WHERE tbl_name IN ('consensus_operator_recovery', 'consensus_request_outcomes') \
+                    OR name IN ('consensus_operator_recovery', 'consensus_request_outcomes') \
+                 ORDER BY type, name",
+            )
+            .expect("prepare raw recovery schema image")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("read raw recovery schema image")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect raw recovery schema image");
+        let recovery_rows = conn
+            .prepare(
+                "SELECT quote(singleton) || '|' || quote(configuration_epoch) || '|' || \
+                        quote(recovery_epoch) || '|' || quote(last_plan_digest) || '|' || \
+                        quote(pending_epoch) || '|' || quote(pending_plan_digest) || '|' || \
+                        quote(watch_cursor_invalidation_floor) || '|' || \
+                        quote(finalize_log_id_json) || '|' || quote(finalize_entry_json) \
+                 FROM consensus_operator_recovery ORDER BY singleton",
+            )
+            .expect("prepare raw recovery rows")
+            .query_map([], |row| row.get(0))
+            .expect("read raw recovery rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect raw recovery rows");
+        let outcome_rows = conn
+            .prepare(
+                "SELECT quote(request_id) || '|' || quote(configuration_epoch) || '|' || \
+                        quote(payload_digest) || '|' || quote(response_json) \
+                 FROM consensus_request_outcomes ORDER BY request_id",
+            )
+            .expect("prepare raw recovery outcomes")
+            .query_map([], |row| row.get(0))
+            .expect("read raw recovery outcomes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect raw recovery outcomes");
+        (schema, recovery_rows, outcome_rows)
+    }
+
+    fn replace_recovery_with_exact_pre_fence_fixture(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TEMP TABLE recovery_pre_fence_copy AS \
+                 SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                        pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, \
+                        finalize_log_id_json, finalize_entry_json \
+                 FROM consensus_operator_recovery; \
+             DROP TABLE consensus_operator_recovery;",
+        )
+        .expect("extract pre-fence recovery state");
+        conn.execute_batch(PRE_V2_ACTIVATION_CONSENSUS_OPERATOR_RECOVERY_SCHEMA)
+            .expect("restore exact pre-fence recovery table");
+        conn.execute_batch(
+            "INSERT INTO consensus_operator_recovery \
+                 SELECT * FROM recovery_pre_fence_copy; \
+             DROP TABLE recovery_pre_fence_copy;",
+        )
+        .expect("restore pre-fence recovery row");
+    }
+
+    #[test]
+    fn recovery_v2_activation_backfills_exact_pre_fence_state_and_blocks_legacy_finalize() {
+        let backend = SqliteSessionBackend::in_memory().expect("activation fence backend");
+        let conn = backend.conn.blocking_lock();
+        apply_valid_recovery_v2_finalization_fixture(&conn, &backend.caps);
+
+        // Reproduce the exact released pre-fence table around a complete V2
+        // pair.  Reopen must atomically add the marker before the first
+        // recovery read, rather than treating absent optional columns as a
+        // new legacy campaign.
+        replace_recovery_with_exact_pre_fence_fixture(&conn);
+
+        assert!(
+            operator_recovery_certificate_table_schema_is_exact_in_sync(&conn, false)
+                .expect("classify pre-fence recovery schema"),
+            "pre-fence recovery DDL must be recognized"
+        );
+
+        let migrated = read_operator_recovery_sync(&conn, identity())
+            .expect("exact pre-fence V2 state migrates");
+        assert!(migrated.v2_activated);
+        assert_eq!(
+            conn.query_row(
+                "SELECT recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read durable activation marker"),
+            1
+        );
+
+        mark_operator_recovery_pending_sync(&conn, identity(), 2, [0xB2; 32])
+            .expect("new campaign preserves V2 activation");
+        let before_legacy = read_operator_recovery_sync(&conn, identity())
+            .expect("read activated pending campaign");
+        assert!(before_legacy.v2_activated);
+        assert_eq!(
+            finalize_operator_recovery_sync(
+                &conn,
+                identity(),
+                2,
+                [0xB2; 32],
+                observed_fence_high_water_sync(&conn).expect("current fence floor"),
+                observed_credential_high_water_sync(&conn).expect("current credential floor"),
+            )
+            .expect("legacy finalizer decision"),
+            OperatorRecoveryApply::Rejected
+        );
+        assert_eq!(
+            read_operator_recovery_sync(&conn, identity())
+                .expect("legacy rejection preserves state"),
+            before_legacy
+        );
+    }
+
+    #[test]
+    fn recovery_schema_migration_rejects_invalid_predecessors_without_any_ddl_or_row_effect() {
+        for case in [
+            "partial-pair",
+            "wrong-type",
+            "oversized-certificate",
+            "weakened-ddl",
+            "missing-outcome-autoindex",
+            "recovery-epoch-vs-certificate",
+            "watch-floor-vs-certificate",
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("migration rollback backend");
+            let conn = backend.conn.blocking_lock();
+            apply_valid_recovery_v2_finalization_fixture(&conn, &backend.caps);
+            replace_recovery_with_exact_pre_fence_fixture(&conn);
+            match case {
+                "partial-pair" => conn
+                    .execute_batch(
+                        "PRAGMA ignore_check_constraints = ON; \
+                         UPDATE consensus_operator_recovery \
+                         SET finalize_entry_json = NULL WHERE singleton = 1; \
+                         PRAGMA ignore_check_constraints = OFF;",
+                    )
+                    .expect(case),
+                "wrong-type" => conn
+                    .execute_batch(
+                        "PRAGMA ignore_check_constraints = ON; \
+                         UPDATE consensus_operator_recovery \
+                         SET last_plan_digest = 'not-a-blob' WHERE singleton = 1; \
+                         PRAGMA ignore_check_constraints = OFF;",
+                    )
+                    .expect(case),
+                "oversized-certificate" => conn
+                    .execute_batch(
+                        "PRAGMA ignore_check_constraints = ON; \
+                         UPDATE consensus_operator_recovery \
+                         SET finalize_entry_json = zeroblob(65536) WHERE singleton = 1; \
+                         PRAGMA ignore_check_constraints = OFF;",
+                    )
+                    .expect(case),
+                "weakened-ddl" => conn
+                    .execute_batch(
+                        "PRAGMA foreign_keys = OFF; \
+                         CREATE TEMP TABLE weak_recovery_copy AS \
+                             SELECT * FROM consensus_operator_recovery; \
+                         DROP TABLE consensus_operator_recovery; \
+                         CREATE TABLE consensus_operator_recovery ( \
+                             singleton INTEGER, configuration_epoch INTEGER, recovery_epoch INTEGER, \
+                             last_plan_digest BLOB, pending_epoch INTEGER, pending_plan_digest BLOB, \
+                             watch_cursor_invalidation_floor INTEGER, finalize_log_id_json BLOB, \
+                             finalize_entry_json BLOB \
+                         ); \
+                         INSERT INTO consensus_operator_recovery SELECT * FROM weak_recovery_copy; \
+                         DROP TABLE weak_recovery_copy; \
+                         PRAGMA foreign_keys = ON;",
+                    )
+                    .expect(case),
+                "missing-outcome-autoindex" => conn
+                    .execute_batch(
+                        "PRAGMA foreign_keys = OFF; \
+                         CREATE TEMP TABLE weak_outcome_copy AS \
+                             SELECT * FROM consensus_request_outcomes; \
+                         DROP TABLE consensus_request_outcomes; \
+                         CREATE TABLE consensus_request_outcomes ( \
+                             request_id BLOB NOT NULL, configuration_epoch INTEGER NOT NULL, \
+                             payload_digest BLOB NOT NULL, response_json BLOB NOT NULL \
+                         ); \
+                         INSERT INTO consensus_request_outcomes SELECT * FROM weak_outcome_copy; \
+                         DROP TABLE weak_outcome_copy; \
+                         PRAGMA foreign_keys = ON;",
+                    )
+                    .expect(case),
+                "recovery-epoch-vs-certificate" => {
+                    conn.execute(
+                        "UPDATE consensus_operator_recovery SET recovery_epoch = 2 WHERE singleton = 1",
+                        [],
+                    )
+                    .expect(case);
+                }
+                "watch-floor-vs-certificate" => {
+                    conn.execute(
+                        "UPDATE consensus_operator_recovery \
+                         SET watch_cursor_invalidation_floor = 2 WHERE singleton = 1",
+                        [],
+                    )
+                    .expect(case);
+                }
+                _ => unreachable!("migration invalid predecessor fixture"),
+            };
+            let before = raw_recovery_migration_image(&conn);
+            let error = read_operator_recovery_sync(&conn, identity())
+                .expect_err("invalid migration predecessor must reject");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}");
+            assert_eq!(
+                raw_recovery_migration_image(&conn),
+                before,
+                "{case} must leave exact schema and raw recovery/outcome rows unchanged"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // Complete durable before-state assertion fixture.
+    fn assert_recovery_v2_rejection_has_no_effects(
+        conn: &Connection,
+        caps: &BackendCapabilities,
+        entry: Entry<SessionRaftTypeConfig>,
+        machine_before: (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+        recovery_before: OperatorRecoveryState,
+        outcomes_before: i64,
+        replication_before: i64,
+        leases_before: Vec<(i64, i64)>,
+    ) {
+        let applied = apply_entries_sync(conn, identity(), caps, vec![entry])
+            .expect("apply V2 predecessor mismatch as a deterministic rejection");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::InvalidKey(reason)),
+                ..
+            }] if reason == "operator_recovery_epoch_rejected"
+        ));
+        assert_eq!(
+            read_machine_sync(conn, identity()).expect("machine after V2 rejection"),
+            machine_before,
+            "V2 predecessor mismatch must not advance the application machine"
+        );
+        assert_eq!(
+            read_operator_recovery_sync(conn, identity()).expect("recovery after V2 rejection"),
+            recovery_before,
+            "V2 predecessor mismatch must not mutate recovery state"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("outcomes after V2 rejection"),
+            outcomes_before,
+            "V2 predecessor mismatch must not publish an outcome"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_replication_log", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("replication log after V2 rejection"),
+            replication_before,
+            "V2 predecessor mismatch must not mutate replication state"
+        );
+        assert_eq!(
+            conn.prepare("SELECT active, expires_at_unix_ms FROM leases ORDER BY tenant, nf_kind, key_type, stable_id")
+                .expect("lease state query")
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .expect("lease state rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("lease state values"),
+            leases_before,
+            "V2 predecessor mismatch must not deactivate or otherwise mutate leases"
+        );
+    }
+
+    #[test]
+    fn recovery_v2_retained_membership_requires_exact_digest_before_effects() {
+        // Current-format V2 is not limited to legacy plans: a retained
+        // Membership baseline is physical predecessor authority in either
+        // format, so `None` must not bypass its exact digest.
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        append_logs_sync(&conn, identity(), &[membership_entry()])
+            .expect("append bootstrap Membership");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply bootstrap Membership");
+        mark_operator_recovery_pending_sync(&conn, identity(), 1, [0xA1; 32])
+            .expect("mark recovery pending");
+        let missing_digest =
+            recovery_v2_entry_for_current_predecessor(&conn, 1, 0xB3, log_id(0), None);
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&missing_digest))
+            .expect("append V2 missing Membership digest");
+        let machine_before = read_machine_sync(&conn, identity()).expect("machine before reject");
+        let recovery_before =
+            read_operator_recovery_sync(&conn, identity()).expect("recovery before reject");
+        let outcomes_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outcomes before reject");
+        let replication_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_replication_log", [], |row| {
+                row.get(0)
+            })
+            .expect("replication before reject");
+        let leases_before = conn
+            .prepare("SELECT active, expires_at_unix_ms FROM leases ORDER BY tenant, nf_kind, key_type, stable_id")
+            .expect("lease state query")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .expect("lease state rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lease state values");
+        assert_recovery_v2_rejection_has_no_effects(
+            &conn,
+            &backend.caps,
+            missing_digest,
+            machine_before,
+            recovery_before,
+            outcomes_before,
+            replication_before,
+            leases_before,
+        );
+
+        // The same retained Membership succeeds when the builder carries its
+        // current-format predecessor digest.
+        let backend = SqliteSessionBackend::in_memory().expect("success backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("success schema");
+        append_logs_sync(&conn, identity(), &[membership_entry()])
+            .expect("append success Membership");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply success Membership");
+        let digest =
+            operator_recovery_v2_bootstrap_membership_digest_sync(&conn, identity(), &log_id(0))
+                .expect("capture current-format Membership digest");
+        mark_operator_recovery_pending_sync(&conn, identity(), 1, [0xA1; 32])
+            .expect("mark success recovery pending");
+        let entry =
+            recovery_v2_entry_for_current_predecessor(&conn, 1, 0xB4, log_id(0), Some(digest));
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+            .expect("append V2 current-format Membership digest");
+        let applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![entry])
+            .expect("apply V2 current-format Membership digest");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse { result: Ok(_), .. }]
+        ));
+        assert_eq!(
+            read_operator_recovery_sync(&conn, identity())
+                .expect("read successful current-format recovery")
+                .recovery_epoch,
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_v2_retained_nonmembership_predecessor_permits_none_digest() {
+        // A Blank baseline is an explicitly retained non-Membership row.  It
+        // proves that `None` remains usable where it cannot erase a retained
+        // Membership commitment.
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        append_logs_sync(&conn, identity(), &[membership_entry(), blank_entry(1)])
+            .expect("append Membership and retained Blank baseline");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![membership_entry(), blank_entry(1)],
+        )
+        .expect("apply retained Blank baseline");
+        mark_operator_recovery_pending_sync(&conn, identity(), 1, [0xA1; 32])
+            .expect("mark recovery pending");
+        let entry = recovery_v2_entry_for_current_predecessor(&conn, 2, 0xB5, log_id(1), None);
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+            .expect("append V2 retained non-Membership baseline");
+        let applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![entry])
+            .expect("apply V2 retained non-Membership baseline");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse { result: Ok(_), .. }]
+        ));
+    }
+
+    #[test]
+    fn recovery_v2_rejects_session_or_immutable_lease_drift_before_effects() {
+        for (case, mutation) in [
+            (
+                "session-row",
+                "UPDATE session_records SET owner = 'different-valid-owner'",
+            ),
+            (
+                "immutable-lease-row",
+                "UPDATE leases SET expires_at_unix_ms = expires_at_unix_ms + 1",
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            append_logs_sync(&conn, identity(), &[membership_entry()])
+                .expect("append bootstrap Membership");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("apply bootstrap Membership");
+            persist_valid_lease_backed_record_fixture(&conn);
+            // V2 intentionally flips only `active`; retain an otherwise valid
+            // inactive lease so its immutable fields belong to the predecessor
+            // commitment and are not a finalization side effect.
+            conn.execute(
+                "UPDATE leases SET active = 0, expires_at_unix_ms = expires_at_unix_ms + 1",
+                [],
+            )
+            .expect("make fixture lease inactive");
+            mark_operator_recovery_pending_sync(&conn, identity(), 1, [0xA1; 32])
+                .expect("mark recovery pending");
+            let entry = recovery_v2_entry_for_current_predecessor(&conn, 1, 0xB1, log_id(0), None);
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                .expect("append recovery V2 entry");
+            let expected_invariant = match &entry.payload {
+                EntryPayload::Normal(SessionConsensusCommand {
+                    intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(payload),
+                    ..
+                }) => payload.predecessor_recovery_v2_invariant_state_digest,
+                _ => panic!("recovery V2 fixture intent"),
+            };
+            let machine_before =
+                read_machine_sync(&conn, identity()).expect("machine before drift");
+            let recovery_before =
+                read_operator_recovery_sync(&conn, identity()).expect("recovery before drift");
+            let authority_before = operator_recovery_v2_authority_commitment_sync(
+                &conn,
+                identity(),
+                &expected_members(),
+            )
+            .expect("authority before drift");
+            let outcomes_before: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_request_outcomes",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("outcomes before drift");
+            let replication_before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_replication_log", [], |row| {
+                    row.get(0)
+                })
+                .expect("replication log before drift");
+            conn.execute(mutation, [])
+                .unwrap_or_else(|error| panic!("{case} drift mutation: {error}"));
+            assert_ne!(
+                crate::recovery::recovery_v2_invariant_state_digest_for_apply(&conn)
+                    .expect("invariant after drift"),
+                expected_invariant,
+                "{case} must perturb the exact V2 invariant projection"
+            );
+            assert_eq!(
+                operator_recovery_v2_authority_commitment_sync(
+                    &conn,
+                    identity(),
+                    &expected_members(),
+                )
+                .expect("authority after drift"),
+                authority_before,
+                "{case} retains the authenticated authority predecessor"
+            );
+            let leases_before = conn
+                .prepare("SELECT active, expires_at_unix_ms FROM leases ORDER BY tenant, nf_kind, key_type, stable_id")
+                .expect("lease state query")
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .expect("lease state rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("lease state values");
+
+            assert_recovery_v2_rejection_has_no_effects(
+                &conn,
+                &backend.caps,
+                entry,
+                machine_before,
+                recovery_before,
+                outcomes_before,
+                replication_before,
+                leases_before,
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_v2_rejects_legacy_bootstrap_payload_rewrite_before_effects() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        append_logs_sync(&conn, identity(), &[membership_entry()])
+            .expect("append bootstrap Membership");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply bootstrap Membership");
+        let bootstrap_digest =
+            operator_recovery_v2_bootstrap_membership_digest_sync(&conn, identity(), &log_id(0))
+                .expect("capture exact bootstrap Membership payload");
+        mark_operator_recovery_pending_sync(&conn, identity(), 1, [0xA1; 32])
+            .expect("mark recovery pending");
+        let entry = recovery_v2_entry_for_current_predecessor(
+            &conn,
+            1,
+            0xB2,
+            log_id(0),
+            Some(bootstrap_digest),
+        );
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+            .expect("append legacy recovery V2 entry");
+        let machine_before = read_machine_sync(&conn, identity()).expect("machine before rewrite");
+        let recovery_before =
+            read_operator_recovery_sync(&conn, identity()).expect("recovery before rewrite");
+        let authority_before =
+            operator_recovery_v2_authority_commitment_sync(&conn, identity(), &expected_members())
+                .expect("authority before rewrite");
+        let outcomes_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outcomes before rewrite");
+        let replication_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_replication_log", [], |row| {
+                row.get(0)
+            })
+            .expect("replication log before rewrite");
+        let leases_before = conn
+            .prepare("SELECT active, expires_at_unix_ms FROM leases ORDER BY tenant, nf_kind, key_type, stable_id")
+            .expect("lease state query")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .expect("lease state rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lease state values");
+
+        // The duplicated uniform configuration still represents the same
+        // voting set and leaves the already-applied scope/authority valid,
+        // but it is a distinct canonical bootstrap Membership payload.
+        let rewritten = membership_entry_at(
+            0,
+            vec![expected_members(), expected_members()],
+            expected_members(),
+        );
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE configuration_epoch = ?2 AND term = ?3 AND log_index = 0",
+            params![
+                encode_json(&rewritten).expect("canonical rewritten Membership"),
+                epoch_i64(identity()).expect("fixture epoch"),
+                1_i64,
+            ],
+        )
+        .expect("rewrite exact bootstrap Membership payload");
+        assert_eq!(
+            read_membership_scope_sync(&conn, identity())
+                .expect("scope after bootstrap rewrite")
+                .current_members,
+            expected_members(),
+            "rewrite retains the structurally valid voter set"
+        );
+        assert_eq!(
+            operator_recovery_v2_authority_commitment_sync(&conn, identity(), &expected_members())
+                .expect("authority after bootstrap rewrite"),
+            authority_before,
+            "rewrite retains the authenticated authority state"
+        );
+        assert_ne!(
+            operator_recovery_v2_bootstrap_membership_digest_sync(&conn, identity(), &log_id(0))
+                .expect("re-read rewritten bootstrap Membership payload"),
+            bootstrap_digest,
+            "legacy V2 requires the exact captured bootstrap payload, not its resulting voter set"
+        );
+
+        assert_recovery_v2_rejection_has_no_effects(
+            &conn,
+            &backend.caps,
+            entry,
+            machine_before,
+            recovery_before,
+            outcomes_before,
+            replication_before,
+            leases_before,
+        );
+    }
+
+    #[test]
+    fn recovery_v2_finalize_certificate_rejects_exact_entry_and_outcome_tampering() {
+        for case in [
+            "outcome-payload-digest",
+            "outcome-result",
+            "outcome-effect",
+            "outcome-sequence",
+            "outcome-digest",
+            "outcome-logical-time",
+            "outcome-raft-index",
+            "outcome-response-one-over",
+            "outcome-response-materially-oversized",
+            "outcome-response-wrong-type",
+            "outcome-payload-digest-materially-oversized",
+            "recovery-fence-floor",
+            "recovery-credential-floor",
+            "recovery-watch-floor-coherent-drift",
+            "applied-same-index-different-term",
+            "applied-before-finalize",
+            "certificate-request-id",
+            "certificate-plan-digest",
+            "certificate-command-logical-time",
+            "certificate-full-log-id",
+            "certificate-unknown-field",
+            "certificate-noncanonical",
+            "certificate-trailing-json",
+            "certificate-oversized",
+            "certificate-materially-oversized",
+            "operator-schema-without-singleton-primary-key",
+            "outcome-schema-with-duplicate-request",
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("certificate tamper backend");
+            let conn = backend.conn.blocking_lock();
+            apply_valid_recovery_v2_finalization_fixture(&conn, &backend.caps);
+
+            let request_id = SessionConsensusRequestId::from_bytes([0xA1; 16]);
+            let certificate: Vec<u8> = conn
+                .query_row(
+                    "SELECT finalize_entry_json FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read current certificate");
+            let outcome: Vec<u8> = conn
+                .query_row(
+                    "SELECT response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+                    [request_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("read current outcome");
+
+            match case {
+                "outcome-payload-digest" => {
+                    conn.execute(
+                        "UPDATE consensus_request_outcomes SET payload_digest = ?1 WHERE request_id = ?2",
+                        params![[0xB1_u8; 32].as_slice(), request_id.as_bytes().as_slice()],
+                    )
+                    .expect(case);
+                }
+                "outcome-result"
+                | "outcome-effect"
+                | "outcome-sequence"
+                | "outcome-digest"
+                | "outcome-logical-time"
+                | "outcome-raft-index" => {
+                    let mut response: SessionConsensusResponse =
+                        decode_json(&outcome).expect("decode current outcome");
+                    match case {
+                        "outcome-result" => response.result = Err(StoreError::NotFound),
+                        "outcome-effect" => {
+                            response.result = Ok(SessionMutationOutcome::ConsumerRecord(None));
+                        }
+                        "outcome-sequence" => response.sequence += 1,
+                        "outcome-digest" => {
+                            response.digest =
+                                Some(SessionConsensusEntryDigest::from_bytes([0xB2; 32]));
+                        }
+                        "outcome-logical-time" => response.logical_time = Some(timestamp(2)),
+                        "outcome-raft-index" => response.raft_log_index += 1,
+                        _ => unreachable!("fixed outcome tamper case"),
+                    }
+                    conn.execute(
+                        "UPDATE consensus_request_outcomes SET response_json = ?1 WHERE request_id = ?2",
+                        params![
+                            encode_json(&response).expect("encode tampered outcome"),
+                            request_id.as_bytes().as_slice()
+                        ],
+                    )
+                    .expect(case);
+                }
+                "outcome-response-one-over" => {
+                    let one_over = i64::try_from(outcome.len() + 1)
+                        .expect("canonical outcome length fits SQLite");
+                    conn.execute(
+                        "UPDATE consensus_request_outcomes SET response_json = zeroblob(?1) WHERE request_id = ?2",
+                        params![one_over, request_id.as_bytes().as_slice()],
+                    )
+                    .expect(case);
+                }
+                "outcome-response-materially-oversized" => {
+                    // SQLite can retain a zero-blob without constructing a
+                    // large Rust fixture. The certificate reader must reject
+                    // it through `length()` before `row.get::<Vec<_>>()`.
+                    conn.execute(
+                        "UPDATE consensus_request_outcomes SET response_json = zeroblob(1048576) WHERE request_id = ?1",
+                        [request_id.as_bytes().as_slice()],
+                    )
+                    .expect(case);
+                }
+                "outcome-response-wrong-type" => {
+                    conn.execute(
+                        "UPDATE consensus_request_outcomes SET response_json = 'not-a-blob' WHERE request_id = ?1",
+                        [request_id.as_bytes().as_slice()],
+                    )
+                    .expect(case);
+                }
+                "outcome-payload-digest-materially-oversized" => {
+                    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                        .expect("permit oversized corrupt fixture");
+                    conn.execute(
+                        "UPDATE consensus_request_outcomes SET payload_digest = zeroblob(1048576) WHERE request_id = ?1",
+                        [request_id.as_bytes().as_slice()],
+                    )
+                    .expect(case);
+                    conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+                        .expect("restore SQLite CHECK enforcement");
+                }
+                "recovery-fence-floor" => {
+                    conn.execute(
+                        "UPDATE lease_globals SET val = 1 WHERE key = 'next_fence'",
+                        [],
+                    )
+                    .expect(case);
+                    validate_sealed_state_sync(&conn)
+                        .expect("lowered allocator remains a valid lease state");
+                }
+                "recovery-credential-floor" => {
+                    conn.execute(
+                        "UPDATE lease_globals SET val = 1 WHERE key = 'next_credential_id'",
+                        [],
+                    )
+                    .expect(case);
+                    validate_sealed_state_sync(&conn)
+                        .expect("lowered allocator remains a valid lease state");
+                }
+                "recovery-watch-floor-coherent-drift" => {
+                    conn.execute_batch(
+                        "UPDATE consensus_machine SET watch_sequence = 6 WHERE singleton = 1; \
+                         UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = 6 WHERE singleton = 1",
+                    )
+                    .expect(case);
+                }
+                "applied-same-index-different-term" => {
+                    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                        .expect("begin applied splice fixture");
+                    save_log_pointer(
+                        &tx,
+                        "consensus_applied",
+                        identity(),
+                        &LogId::new(CommittedLeaderId::new(2, node_id()), 1),
+                    )
+                    .expect(case);
+                    tx.commit().expect("commit applied splice fixture");
+                }
+                "applied-before-finalize" => {
+                    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                        .expect("begin stale applied fixture");
+                    save_log_pointer(&tx, "consensus_applied", identity(), &log_id(0)).expect(case);
+                    tx.commit().expect("commit stale applied fixture");
+                }
+                "certificate-request-id"
+                | "certificate-plan-digest"
+                | "certificate-command-logical-time"
+                | "certificate-full-log-id"
+                | "certificate-unknown-field"
+                | "certificate-noncanonical"
+                | "certificate-trailing-json"
+                | "certificate-oversized"
+                | "certificate-materially-oversized" => {
+                    let mut decoded: OperatorRecoveryV2FinalizeCertificateV1 =
+                        decode_json(&certificate).expect("decode current certificate");
+                    let encoded = match case {
+                        "certificate-request-id"
+                        | "certificate-plan-digest"
+                        | "certificate-command-logical-time" => {
+                            let EntryPayload::Normal(command) = &mut decoded.entry.payload else {
+                                panic!("certificate must retain a normal command");
+                            };
+                            match case {
+                                "certificate-request-id" => {
+                                    command.request_id =
+                                        SessionConsensusRequestId::from_bytes([0xD8; 16]);
+                                }
+                                "certificate-plan-digest" => {
+                                    let SessionMutationIntent::FinalizeOperatorRecoveryV2(intent) =
+                                        &mut command.intent
+                                    else {
+                                        panic!("certificate must retain a V2 finalization");
+                                    };
+                                    intent.plan_digest = [0xB3; 32];
+                                }
+                                "certificate-command-logical-time" => {
+                                    command.logical_time = timestamp(2);
+                                }
+                                _ => unreachable!("fixed certificate tamper case"),
+                            }
+                            encode_json(&decoded).expect("encode tampered certificate")
+                        }
+                        "certificate-full-log-id" => {
+                            decoded.entry.log_id = log_id(2);
+                            encode_json(&decoded).expect("encode tampered certificate")
+                        }
+                        "certificate-unknown-field" => {
+                            let mut value =
+                                serde_json::to_value(&decoded).expect("certificate JSON value");
+                            value
+                                .as_object_mut()
+                                .expect("certificate JSON object")
+                                .insert(
+                                    "unknown_certificate_field".to_owned(),
+                                    serde_json::Value::Null,
+                                );
+                            serde_json::to_vec(&value).expect("encode unknown certificate field")
+                        }
+                        "certificate-noncanonical" => {
+                            let mut bytes = b" \n".to_vec();
+                            bytes.extend_from_slice(&certificate);
+                            bytes
+                        }
+                        "certificate-trailing-json" => {
+                            let mut bytes = certificate.clone();
+                            bytes.extend_from_slice(b"\n{} ");
+                            bytes
+                        }
+                        "certificate-oversized" => {
+                            vec![b' '; OPERATOR_RECOVERY_V2_FINALIZE_CERTIFICATE_MAX_BYTES + 1]
+                        }
+                        "certificate-materially-oversized" => vec![0_u8; 65_536],
+                        _ => unreachable!("fixed certificate tamper case"),
+                    };
+                    if matches!(
+                        case,
+                        "certificate-oversized" | "certificate-materially-oversized"
+                    ) {
+                        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                            .expect("permit oversized corrupt fixture");
+                    }
+                    conn.execute(
+                        "UPDATE consensus_operator_recovery SET finalize_entry_json = ?1 WHERE singleton = 1",
+                        [encoded],
+                    )
+                    .expect(case);
+                    if matches!(
+                        case,
+                        "certificate-oversized" | "certificate-materially-oversized"
+                    ) {
+                        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+                            .expect("restore SQLite CHECK enforcement");
+                    }
+                }
+                "operator-schema-without-singleton-primary-key" => {
+                    conn.execute_batch(
+                        "PRAGMA foreign_keys = OFF;
+                         CREATE TEMP TABLE certificate_recovery_copy AS
+                             SELECT * FROM consensus_operator_recovery;
+                         DROP TABLE consensus_operator_recovery;
+                         CREATE TABLE consensus_operator_recovery (
+                             singleton INTEGER NOT NULL CHECK (singleton = 1),
+                             configuration_epoch INTEGER NOT NULL,
+                             recovery_epoch INTEGER NOT NULL,
+                             last_plan_digest BLOB NOT NULL,
+                             pending_epoch INTEGER,
+                             pending_plan_digest BLOB,
+                             watch_cursor_invalidation_floor INTEGER NOT NULL,
+                             finalize_log_id_json BLOB,
+                             finalize_entry_json BLOB
+                         );
+                         INSERT INTO consensus_operator_recovery
+                             SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json FROM certificate_recovery_copy;
+                         DROP TABLE certificate_recovery_copy;
+                         PRAGMA foreign_keys = ON;",
+                    )
+                    .expect(case);
+                }
+                "outcome-schema-with-duplicate-request" => {
+                    conn.execute_batch(
+                        "PRAGMA foreign_keys = OFF;
+                         CREATE TEMP TABLE certificate_outcome_copy AS
+                             SELECT * FROM consensus_request_outcomes;
+                         DROP TABLE consensus_request_outcomes;
+                         CREATE TABLE consensus_request_outcomes (
+                             request_id BLOB NOT NULL,
+                             configuration_epoch INTEGER NOT NULL,
+                             payload_digest BLOB NOT NULL,
+                             response_json BLOB NOT NULL
+                         );
+                         INSERT INTO consensus_request_outcomes
+                             SELECT * FROM certificate_outcome_copy;
+                         INSERT INTO consensus_request_outcomes
+                             SELECT * FROM certificate_outcome_copy
+                             WHERE request_id = X'A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1';
+                         DROP TABLE certificate_outcome_copy;
+                         PRAGMA foreign_keys = ON;",
+                    )
+                    .expect(case);
+                }
+                _ => unreachable!("fixed certificate tamper case"),
+            }
+
+            assert_eq!(
+                read_operator_recovery_sync(&conn, identity())
+                    .expect_err(case)
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_recovery_v2_log_decoder_requires_exact_canonical_bytes() {
+        let entry = recovery_v2_log_entry(1);
+        let canonical = encode_json(&entry).expect("canonical recovery V2 JSON");
+        assert_eq!(
+            decode_consensus_log_entry(&canonical).expect("canonical recovery V2 decodes"),
+            entry,
+        );
+
+        let reordered =
+            serde_json::to_vec(&serde_json::to_value(&entry).expect("reordered recovery V2 value"))
+                .expect("reordered recovery V2 JSON");
+        assert_ne!(
+            canonical, reordered,
+            "fixture must change recovery V2 key order"
+        );
+        let mut whitespace = b" \n\t".to_vec();
+        whitespace.extend_from_slice(&canonical);
+        whitespace.extend_from_slice(b"\r\n ");
+
+        let mut unknown = serde_json::to_value(&entry).expect("recovery V2 value");
+        v2_intent_variant_json_mut(&mut unknown, "FinalizeOperatorRecoveryV2")
+            .as_object_mut()
+            .expect("recovery V2 variant object")
+            .insert("unknown_recovery_field".to_owned(), serde_json::Value::Null);
+        let unknown = serde_json::to_vec(&unknown).expect("unknown recovery V2 JSON");
+
+        let canonical_text = String::from_utf8(canonical.clone()).expect("recovery V2 JSON UTF-8");
+        let duplicate = canonical_text.replacen(
+            "\"schema_version\":",
+            "\"schema_version\":1,\"schema_version\":",
+            1,
+        );
+        for (case, encoded) in [
+            ("reordered", reordered),
+            ("whitespace", whitespace),
+            ("unknown", unknown),
+            ("duplicate", duplicate.into_bytes()),
+        ] {
+            assert_eq!(
+                decode_consensus_log_entry(&encoded).expect_err(case).kind(),
+                io::ErrorKind::InvalidData,
+                "{case}",
+            );
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let hostile = noncanonical_v2_log_json(&entry);
+        persist_unvalidated_log_json_fixture(&conn, &entry, hostile);
+        for (case, result) in [
+            ("last", last_log_sync(&conn, identity()).map(|_| ())),
+            (
+                "range",
+                read_log_range_sync(&conn, identity(), 0, None, None).map(|_| ()),
+            ),
+            (
+                "recovery-range",
+                read_log_range_for_recovery_sync(&conn, identity(), 0, None, None).map(|_| ()),
+            ),
+        ] {
+            assert_eq!(
+                result.expect_err(case).kind(),
+                io::ErrorKind::InvalidData,
+                "{case}",
+            );
+        }
+    }
+
+    #[test]
+    fn durable_v2_log_decoder_requires_canonical_bytes_for_every_exact_intent_shape() {
+        let request = fenced_transition_v2_request(0x91, 1, "v2-json-owner");
+        let initial_epoch =
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch");
+        let entries = vec![
+            fenced_transition_v2_entry(1, request.clone(), timestamp(1)),
+            activating_fenced_transition_v2_entry(1, request.clone(), timestamp(1)),
+            fenced_transition_v2_batch_entry(
+                1,
+                vec![
+                    request.clone(),
+                    fenced_transition_v2_request(0x92, 1, "v2-json-batch-owner"),
+                ],
+                timestamp(1),
+            ),
+            fenced_transition_v2_authorized_entry(1, request, timestamp(1), node_id(), identity()),
+            Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Normal(SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes([0x93; 16]),
+                    logical_time: timestamp(1),
+                    intent: SessionMutationIntent::MaintainFencedTransitionV2History {
+                        expected_generation: 0,
+                        expected_active_epoch: Some(initial_epoch),
+                        expected_retired_through: 0,
+                        expected_bound_entries: 0,
+                    },
+                }),
+            },
+        ];
+
+        for entry in entries {
+            let canonical = encode_json(&entry).expect("canonical V2 log JSON");
+            assert_eq!(
+                decode_consensus_log_entry(&canonical).expect("canonical V2 log JSON"),
+                entry,
+            );
+
+            // `to_value` deliberately loses declaration order before the
+            // second serialization.  V2 persists an exact byte contract, so
+            // semantically equivalent order and whitespace variants fail
+            // before their payload can be admitted as durable history.
+            let reordered =
+                serde_json::to_vec(&serde_json::to_value(&entry).expect("reordered V2 log value"))
+                    .expect("reordered V2 log JSON");
+            assert_ne!(canonical, reordered, "fixture must change V2 key order");
+            let mut padded = b" \n\t".to_vec();
+            padded.extend_from_slice(&canonical);
+            padded.extend_from_slice(b"\r\n  ");
+            assert!(decode_consensus_log_entry(&reordered).is_err());
+            assert!(decode_consensus_log_entry(&padded).is_err());
+        }
+    }
+
+    #[test]
+    fn durable_v2_log_decoder_rejects_unknown_outer_variant_and_nested_fields() {
+        let request = fenced_transition_v2_request(0x94, 1, "v2-hostile-json-owner");
+        let activation = activating_fenced_transition_v2_entry(1, request.clone(), timestamp(1));
+        let baseline = serde_json::to_value(&activation).expect("activation JSON");
+        let mut cases = Vec::new();
+
+        let mut root = baseline.clone();
+        root.as_object_mut()
+            .expect("entry object")
+            .insert("future_entry".to_owned(), serde_json::Value::Null);
+        cases.push(("entry", root));
+
+        let mut log_id_field = baseline.clone();
+        log_id_field
+            .get_mut("log_id")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("log ID object")
+            .insert("future_log_id".to_owned(), serde_json::Value::Null);
+        cases.push(("log-id", log_id_field));
+
+        let mut payload = baseline.clone();
+        payload
+            .get_mut("payload")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("payload object")
+            .insert("FuturePayload".to_owned(), serde_json::Value::Null);
+        cases.push(("payload", payload));
+
+        let mut command = baseline.clone();
+        normal_command_json_mut(&mut command)
+            .insert("future_command".to_owned(), serde_json::Value::Null);
+        cases.push(("command", command));
+
+        let mut activation_variant = baseline.clone();
+        v2_intent_variant_json_mut(&mut activation_variant, "ActivateFencedTransitionV2")
+            .as_object_mut()
+            .expect("activation object")
+            .insert("future_activation".to_owned(), serde_json::Value::Null);
+        cases.push(("activation-variant", activation_variant));
+
+        let initial_epoch =
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch");
+        let maintenance: Entry<SessionRaftTypeConfig> = Entry {
+            log_id: log_id(1),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([0x99; 16]),
+                logical_time: timestamp(1),
+                intent: SessionMutationIntent::MaintainFencedTransitionV2History {
+                    expected_generation: 0,
+                    expected_active_epoch: Some(initial_epoch),
+                    expected_retired_through: 0,
+                    expected_bound_entries: 0,
+                },
+            }),
+        };
+        let mut maintenance_variant =
+            serde_json::to_value(maintenance).expect("maintenance V2 JSON");
+        v2_intent_variant_json_mut(
+            &mut maintenance_variant,
+            "MaintainFencedTransitionV2History",
+        )
+        .as_object_mut()
+        .expect("maintenance object")
+        .insert("future_maintenance".to_owned(), serde_json::Value::Null);
+        cases.push(("maintenance-variant", maintenance_variant));
+
+        let mut request_field = baseline.clone();
+        v2_intent_variant_json_mut(&mut request_field, "ActivateFencedTransitionV2")
+            .get_mut("request")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("request object")
+            .insert("future_request".to_owned(), serde_json::Value::Null);
+        cases.push(("request", request_field));
+
+        let mut request_id = baseline.clone();
+        v2_intent_variant_json_mut(&mut request_id, "ActivateFencedTransitionV2")
+            .get_mut("request")
+            .and_then(|request| request.get_mut("request_id"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("request ID object")
+            .insert("future_request_id".to_owned(), serde_json::Value::Null);
+        cases.push(("request-id", request_id));
+
+        let mut lease_variant = baseline.clone();
+        v2_intent_variant_json_mut(&mut lease_variant, "ActivateFencedTransitionV2")
+            .get_mut("request")
+            .and_then(|request| request.get_mut("lease"))
+            .and_then(|lease| lease.get_mut("acquire"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("lease variant object")
+            .insert("future_lease".to_owned(), serde_json::Value::Null);
+        cases.push(("lease-variant", lease_variant));
+
+        let mut mutation_variant = baseline.clone();
+        v2_intent_variant_json_mut(&mut mutation_variant, "ActivateFencedTransitionV2")
+            .get_mut("request")
+            .and_then(|request| request.get_mut("mutation"))
+            .and_then(|mutation| mutation.get_mut("create"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("mutation variant object")
+            .insert("future_mutation".to_owned(), serde_json::Value::Null);
+        cases.push(("mutation-variant", mutation_variant));
+
+        let authorized = fenced_transition_v2_authorized_entry(
+            1,
+            request.clone(),
+            timestamp(1),
+            node_id(),
+            identity(),
+        );
+        let mut authorized_wrapper = serde_json::to_value(authorized).expect("authorized V2 JSON");
+        v2_intent_variant_json_mut(&mut authorized_wrapper, "Authorized")
+            .as_object_mut()
+            .expect("authorized object")
+            .insert("future_authorized".to_owned(), serde_json::Value::Null);
+        cases.push(("authorized-wrapper", authorized_wrapper));
+
+        let batch = fenced_transition_v2_batch_entry(1, vec![request], timestamp(1));
+        let mut batch_request = serde_json::to_value(batch).expect("batch V2 JSON");
+        v2_intent_variant_json_mut(&mut batch_request, "FencedTransitionV2Batch")
+            .as_array_mut()
+            .and_then(|requests| requests.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("batch request object")
+            .insert("future_batch_request".to_owned(), serde_json::Value::Null);
+        cases.push(("batch-request", batch_request));
+
+        for (location, value) in cases {
+            let error = decode_consensus_log_entry(
+                &serde_json::to_vec(&value).expect("hostile V2 log JSON"),
+            )
+            .expect_err(location);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{location}");
+        }
+
+        let mut unknown_variant = baseline;
+        let intent = normal_command_json_mut(&mut unknown_variant)
+            .get_mut("intent")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("intent object");
+        let body = intent
+            .remove("ActivateFencedTransitionV2")
+            .expect("activation body");
+        intent.insert("ActivateFencedTransitionV3".to_owned(), body);
+        assert_eq!(
+            decode_consensus_log_entry(
+                &serde_json::to_vec(&unknown_variant).expect("unknown V2 variant JSON")
+            )
+            .expect_err("unknown V2 enum variant")
+            .kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn durable_v2_log_decoder_rejects_duplicates_second_values_trailing_data_and_over_cap() {
+        let entry = fenced_transition_v2_entry(
+            1,
+            fenced_transition_v2_request(0x95, 1, "v2-json-boundary-owner"),
+            timestamp(1),
+        );
+        let encoded = encode_json(&entry).expect("canonical V2 JSON");
+        let canonical = String::from_utf8(encoded.clone()).expect("UTF-8 V2 JSON");
+        let duplicate = canonical.replacen(
+            "\"schema_version\":",
+            "\"schema_version\":1,\"schema_version\":",
+            1,
+        );
+        assert_ne!(duplicate, canonical, "duplicate fixture must splice a key");
+
+        let mut second_value = encoded.clone();
+        second_value.extend_from_slice(b"{}");
+        let mut trailing_data = encoded;
+        trailing_data.extend_from_slice(b"x");
+        for (case, hostile) in [
+            ("duplicate", duplicate.into_bytes()),
+            ("second-value", second_value),
+            ("trailing-data", trailing_data),
+            (
+                "over-cap",
+                vec![b' '; SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES + 1],
+            ),
+        ] {
+            assert_eq!(
+                decode_consensus_log_entry(&hostile).expect_err(case).kind(),
+                io::ErrorKind::InvalidData,
+                "{case}",
+            );
+        }
+    }
+
+    #[test]
+    fn durable_log_decoder_preserves_legacy_unknown_field_compatibility_but_not_hidden_v2() {
+        let entry = acquire_entry(1, [0x96; 16], "legacy-json-owner");
+        let canonical = String::from_utf8(encode_json(&entry).expect("canonical legacy JSON"))
+            .expect("UTF-8 legacy JSON");
+        let mut compatible = serde_json::to_value(&entry).expect("legacy log JSON");
+        normal_command_json_mut(&mut compatible).insert(
+            "legacy_ignored_extension".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        assert_eq!(
+            decode_consensus_log_entry(
+                &serde_json::to_vec(&compatible).expect("extended legacy JSON")
+            )
+            .expect("legacy ignored field remains compatible"),
+            entry,
+        );
+
+        normal_command_json_mut(&mut compatible).insert(
+            "legacy_ignored_v2_extension".to_owned(),
+            serde_json::json!({"FencedTransitionV2": null}),
+        );
+        assert_eq!(
+            decode_consensus_log_entry(&serde_json::to_vec(&compatible).expect("hidden V2 JSON"))
+                .expect_err("ignored outer field cannot hide V2")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        // The first duplicate value contains V2 material and the last value
+        // hides it from a normal last-key-wins JSON tree. The streaming scan
+        // and duplicate-aware exact pass must still fail closed.
+        let hidden_duplicate = canonical.replacen(
+            "\"schema_version\":",
+            "\"ignored_future\":{\"FencedTransitionV2\":null},\"ignored_future\":null,\"schema_version\":",
+            1,
+        );
+        assert_ne!(hidden_duplicate, canonical, "duplicate fixture must splice");
+        assert_eq!(
+            decode_consensus_log_entry(hidden_duplicate.as_bytes())
+                .expect_err("a duplicate outer key cannot erase hidden V2")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let escaped_hidden = canonical.replacen(
+            "\"schema_version\":",
+            "\"ignored_future\":{\"\\u0046encedTransitionV2\":null},\"schema_version\":",
+            1,
+        );
+        assert_eq!(
+            decode_consensus_log_entry(escaped_hidden.as_bytes())
+                .expect_err("JSON escaping cannot hide a V2 discriminant")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn noncanonical_v2_persisted_log_fails_last_range_and_recovery_reads_before_effects() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let entry = fenced_transition_v2_entry(
+            0,
+            fenced_transition_v2_request(0x97, 1, "v2-corrupt-log-owner"),
+            timestamp(0),
+        );
+        persist_unvalidated_log_json_fixture(&conn, &entry, noncanonical_v2_log_json(&entry));
+        let machine_before = read_machine_sync(&conn, identity()).expect("machine before reads");
+        let records_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+            .expect("records before reads");
+
+        assert_eq!(
+            last_log_sync(&conn, identity())
+                .expect_err("last-log read rejects noncanonical V2")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_log_range_sync(&conn, identity(), 0, None, None)
+                .expect_err("ordinary range rejects noncanonical V2")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_log_range_for_recovery_sync(&conn, identity(), 0, None, None)
+                .expect_err("offline recovery range rejects noncanonical V2")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_machine_sync(&conn, identity()).expect("machine after rejected reads"),
+            machine_before,
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| row
+                .get::<_, i64>(0))
+                .expect("records after rejected reads"),
+            records_before,
+        );
     }
 
     #[tokio::test]
@@ -48754,6 +63853,1164 @@ BEGIN IMMEDIATE;
             Err(error) => error,
         };
         assert_eq!(error, SessionConsensusStorageError::CorruptState);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_reopen_rejects_noncanonical_v2_durable_log_json() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let snapshots = tempfile::tempdir().expect("snapshot directory");
+        let members = BTreeSet::from([member(7), member(8), member(9)]);
+        let bindings = test_member_bindings(&members);
+        let snapshot_dir = snapshots.path().join("snapshots");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir.clone(),
+            identity(),
+            members.clone(),
+            bindings.clone(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            FIXED_TEST_PLACEMENT_POLICY,
+        )
+        .await
+        .expect("initialize fixed durable core");
+        drop(core);
+        {
+            let conn = backend.conn.lock().await;
+            let entry = fenced_transition_v2_entry(
+                0,
+                fenced_transition_v2_request(0x98, 1, "v2-fixed-reopen-owner"),
+                timestamp(0),
+            );
+            let encoded = noncanonical_v2_log_json(&entry);
+            assert_eq!(
+                decode_consensus_log_entry(&encoded)
+                    .expect_err("fixture is causally noncanonical")
+                    .kind(),
+                io::ErrorKind::InvalidData,
+            );
+            persist_unvalidated_log_json_fixture(&conn, &entry, encoded);
+        }
+
+        let error = match SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members,
+            bindings,
+            ConsensusAuthorityProfile::FixedImmutable,
+            FIXED_TEST_PLACEMENT_POLICY,
+        )
+        .await
+        {
+            Ok(_) => panic!("fixed reopen must reject noncanonical V2 durable log JSON"),
+            Err(error) => error,
+        };
+        assert_eq!(error, SessionConsensusStorageError::CorruptState);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_reopen_rejects_applied_interior_noncanonical_v2_durable_log_json() {
+        for corruption in ["unknown", "hidden", "duplicate"] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let snapshots = tempfile::tempdir().expect("snapshot directory");
+            let members = expected_members();
+            let bindings = test_member_bindings(&members);
+            let snapshot_dir = snapshots.path().join("snapshots");
+            let core = SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir.clone(),
+                identity(),
+                members.clone(),
+                bindings.clone(),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            .expect("initialize dynamic durable core");
+            drop(core);
+
+            let request = fenced_transition_v2_request(0x99, 1, "v2-dynamic-reopen-owner");
+            let entries = vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, request.clone(), timestamp(1)),
+                fenced_transition_v2_entry(2, request, timestamp(2)),
+                blank_entry(3),
+            ];
+            let (applied_before, records_before, outcomes_before) = {
+                let conn = backend.conn.lock().await;
+                append_logs_sync(&conn, identity(), &entries).expect("append retained V2 log");
+                apply_entries_sync(&conn, identity(), &backend.caps, entries)
+                    .expect("apply retained V2 log");
+                let encoded = match corruption {
+                    "unknown" => noncanonical_v2_log_json(&fenced_transition_v2_entry(
+                        2,
+                        fenced_transition_v2_request(0x99, 1, "v2-dynamic-reopen-owner"),
+                        timestamp(2),
+                    )),
+                    "hidden" => {
+                        let entry = fenced_transition_v2_entry(
+                            2,
+                            fenced_transition_v2_request(0x99, 1, "v2-dynamic-reopen-owner"),
+                            timestamp(2),
+                        );
+                        let mut value = serde_json::to_value(&entry).expect("V2 log JSON");
+                        normal_command_json_mut(&mut value).insert(
+                            "ignored_future".to_owned(),
+                            serde_json::json!({"FencedTransitionV2": null}),
+                        );
+                        serde_json::to_vec(&value).expect("hidden V2 log JSON")
+                    }
+                    "duplicate" => {
+                        let entry = fenced_transition_v2_entry(
+                            2,
+                            fenced_transition_v2_request(0x99, 1, "v2-dynamic-reopen-owner"),
+                            timestamp(2),
+                        );
+                        let canonical =
+                            String::from_utf8(encode_json(&entry).expect("canonical V2 log JSON"))
+                                .expect("V2 log JSON is UTF-8");
+                        canonical
+                            .replacen(
+                                "\"schema_version\":",
+                                "\"ignored_future\":{\"FencedTransitionV2\":null},\"ignored_future\":null,\"schema_version\":",
+                                1,
+                            )
+                            .into_bytes()
+                    }
+                    _ => unreachable!("fixed corruption cases"),
+                };
+                assert_eq!(
+                    decode_consensus_log_entry(&encoded)
+                        .expect_err("fixture is structurally noncanonical V2 JSON")
+                        .kind(),
+                    io::ErrorKind::InvalidData,
+                );
+                conn.execute(
+                    "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 2",
+                    [encoded],
+                )
+                .expect("corrupt already-applied interior V2 row");
+                let records_before: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+                    .expect("record count before reopen");
+                let outcomes_before: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM consensus_request_outcomes",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("outcome count before reopen");
+                (
+                    read_applied_sync(&conn, identity()).expect("applied before reopen"),
+                    records_before,
+                    outcomes_before,
+                )
+            };
+
+            let error = match SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir,
+                identity(),
+                members,
+                bindings,
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("dynamic reopen must reject every corrupt applied V2 row"),
+            };
+            assert_eq!(
+                error,
+                SessionConsensusStorageError::CorruptState,
+                "{corruption}"
+            );
+
+            let conn = backend.conn.lock().await;
+            assert_eq!(
+                read_applied_sync(&conn, identity()).expect("applied after rejected reopen"),
+                applied_before,
+                "{corruption}: rejected reopen must not apply another effect",
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("record count after rejected reopen"),
+                records_before,
+                "{corruption}: rejected reopen must not write records",
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM consensus_request_outcomes",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("outcome count after rejected reopen"),
+                outcomes_before,
+                "{corruption}: rejected reopen must not publish another outcome",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_reopen_rejects_retained_gaps_and_leader_term_regression() {
+        for corruption in ["gap", "term-regression"] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let snapshots = tempfile::tempdir().expect("snapshot directory");
+            let members = expected_members();
+            let bindings = test_member_bindings(&members);
+            let snapshot_dir = snapshots.path().join("snapshots");
+            let core = SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir.clone(),
+                identity(),
+                members.clone(),
+                bindings.clone(),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            .expect("initialize dynamic durable core");
+            drop(core);
+
+            {
+                let conn = backend.conn.lock().await;
+                let mut membership = membership_entry();
+                membership.log_id = LogId::new(CommittedLeaderId::new(2, node_id()), 0);
+                let entries = vec![
+                    membership,
+                    Entry {
+                        log_id: LogId::new(CommittedLeaderId::new(2, node_id()), 1),
+                        payload: EntryPayload::Blank,
+                    },
+                    Entry {
+                        log_id: LogId::new(CommittedLeaderId::new(2, node_id()), 2),
+                        payload: EntryPayload::Blank,
+                    },
+                    Entry {
+                        log_id: LogId::new(CommittedLeaderId::new(2, node_id()), 3),
+                        payload: EntryPayload::Blank,
+                    },
+                ];
+                append_logs_sync(&conn, identity(), &entries).expect("append retained log");
+                apply_entries_sync(&conn, identity(), &backend.caps, entries)
+                    .expect("apply retained log");
+                match corruption {
+                    "gap" => {
+                        conn.execute("DELETE FROM consensus_log WHERE log_index = 2", [])
+                            .expect("delete interior retained row");
+                    }
+                    "term-regression" => {
+                        let regressed: Entry<SessionRaftTypeConfig> = Entry {
+                            log_id: LogId::new(CommittedLeaderId::new(1, node_id()), 3),
+                            payload: EntryPayload::Blank,
+                        };
+                        conn.execute(
+                            "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = 3",
+                            params![
+                                i64::try_from(regressed.log_id.leader_id.term)
+                                    .expect("test term fits SQLite"),
+                                encode_json(&regressed).expect("canonical regressed entry"),
+                            ],
+                        )
+                        .expect("regress retained leader term");
+                    }
+                    _ => unreachable!("known corruption case"),
+                }
+            }
+
+            let error = match SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir,
+                identity(),
+                members,
+                bindings,
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("dynamic reopen must reject {corruption}"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                SessionConsensusStorageError::CorruptState,
+                "{corruption}"
+            );
+        }
+    }
+
+    #[test]
+    fn append_and_apply_reject_log_id_leader_ordering_regressions() {
+        let regressed_leader = CommittedLeaderId::new(1, node_id());
+        {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+
+            let mut membership = membership_entry();
+            membership.log_id = LogId::new(CommittedLeaderId::new(2, node_id()), 0);
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&membership))
+                .expect("append initial membership");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership.clone()])
+                .expect("apply initial membership");
+
+            let regressed = Entry {
+                log_id: LogId::new(regressed_leader, 1),
+                payload: EntryPayload::Blank,
+            };
+            let append = append_logs_sync(&conn, identity(), std::slice::from_ref(&regressed))
+                .expect_err("append must reject a regressed LogId lineage");
+            assert_eq!(append.kind(), io::ErrorKind::InvalidData);
+            let log_rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+                .expect("count retained log rows");
+            assert_eq!(log_rows, 1, "rejected append must not write a log row");
+
+            let apply = apply_entries_sync(&conn, identity(), &backend.caps, vec![regressed])
+                .expect_err("apply must reject a regressed LogId lineage");
+            assert_eq!(apply.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                read_applied_sync(&conn, identity()).expect("read applied pointer"),
+                Some(membership.log_id),
+                "rejected apply must not advance the durable pointer"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_reopen_rejects_uncovered_or_spliced_membership_log_id() {
+        for corruption in [
+            "term-leader-splice",
+            "beyond-applied",
+            "retained-payload-splice",
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let snapshots = tempfile::tempdir().expect("snapshot directory");
+            let members = expected_members();
+            let bindings = test_member_bindings(&members);
+            let snapshot_dir = snapshots.path().join("snapshots");
+            let core = SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir.clone(),
+                identity(),
+                members.clone(),
+                bindings.clone(),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            .expect("initialize dynamic durable core");
+            drop(core);
+
+            {
+                let conn = backend.conn.lock().await;
+                let entry = membership_entry();
+                append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                    .expect("append dynamic membership");
+                save_committed_sync(&conn, identity(), Some(entry.log_id))
+                    .expect("commit dynamic membership");
+                apply_entries_sync(&conn, identity(), &backend.caps, vec![entry.clone()])
+                    .expect("apply dynamic membership");
+                let membership =
+                    read_membership_sync(&conn, identity()).expect("read persisted membership");
+                let forged_log_id = match corruption {
+                    "term-leader-splice" => LogId::new(
+                        CommittedLeaderId::new(entry.log_id.leader_id.term + 1, node_id()),
+                        entry.log_id.index,
+                    ),
+                    "beyond-applied" => LogId::new(
+                        entry.log_id.leader_id,
+                        entry.log_id.index.checked_add(1).expect("test log index"),
+                    ),
+                    "retained-payload-splice" => entry.log_id,
+                    _ => unreachable!("known membership lineage corruption"),
+                };
+                let forged_membership = if corruption == "retained-payload-splice" {
+                    // Keep the voter universe intact so the ordinary scope
+                    // validator cannot hide the payload-lineage rejection.
+                    Membership::new(vec![members.clone(), members.clone()], members.clone())
+                } else {
+                    membership.membership().clone()
+                };
+                let forged = StoredMembership::new(Some(forged_log_id), forged_membership);
+                conn.execute(
+                    "UPDATE consensus_membership SET membership_json = ?1 WHERE singleton = 1",
+                    [encode_json(&forged).expect("encode forged membership")],
+                )
+                .expect("persist forged membership LogId");
+                assert!(
+                    validate_retained_durable_log_sync(&conn, identity(), |_| Ok(())).is_err(),
+                    "the shared retained-lineage validator must reject {corruption}",
+                );
+            }
+
+            match SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir,
+                identity(),
+                members,
+                bindings,
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            {
+                Err(SessionConsensusStorageError::CorruptState) => {}
+                Err(error) => panic!("dynamic normal reopen returned {error:?}"),
+                Ok(_) => panic!("dynamic normal reopen accepted {corruption}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_reopen_accepts_compacted_membership_attested_by_snapshot() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let snapshots = tempfile::tempdir().expect("snapshot directory");
+        let members = expected_members();
+        let bindings = test_member_bindings(&members);
+        let snapshot_dir = snapshots.path().join("snapshots");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir.clone(),
+            identity(),
+            members.clone(),
+            bindings.clone(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize dynamic durable core");
+        drop(core);
+
+        {
+            let conn = backend.conn.lock().await;
+            let membership_entry = membership_entry();
+            let applied_entry = Entry {
+                log_id: LogId::new(
+                    membership_entry.log_id.leader_id,
+                    membership_entry
+                        .log_id
+                        .index
+                        .checked_add(1)
+                        .expect("test applied log index"),
+                ),
+                payload: EntryPayload::Blank,
+            };
+            append_logs_sync(
+                &conn,
+                identity(),
+                &[membership_entry.clone(), applied_entry.clone()],
+            )
+            .expect("append membership and later applied log");
+            save_committed_sync(&conn, identity(), Some(applied_entry.log_id))
+                .expect("commit applied log");
+            apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![membership_entry.clone(), applied_entry.clone()],
+            )
+            .expect("apply membership and later log");
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id: Some(applied_entry.log_id),
+                last_membership: read_membership_sync(&conn, identity())
+                    .expect("read persisted membership"),
+                snapshot_id: "compacted-membership-attestation".to_owned(),
+            };
+            save_current_snapshot_sync(
+                &conn,
+                identity(),
+                &meta,
+                "snapshot-00000000-0000-4000-8000-0000000000d3.opc",
+                [0; 32],
+                1,
+            )
+            .expect("persist snapshot membership attestation");
+            purge_logs_sync(&conn, identity(), &applied_entry.log_id)
+                .expect("compact membership and applied log");
+            validate_retained_durable_log_sync(&conn, identity(), |_| Ok(()))
+                .expect("snapshot last_membership covers compacted membership");
+        }
+
+        let reopened = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members,
+            bindings,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("normal dynamic reopen accepts compacted membership evidence");
+        drop(reopened);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_reopen_rejects_stale_latest_persisted_and_snapshot_membership() {
+        for corruption in ["persisted", "snapshot"] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let snapshots = tempfile::tempdir().expect("snapshot directory");
+            let members = expected_members();
+            let bindings = test_member_bindings(&members);
+            let snapshot_dir = snapshots.path().join("snapshots");
+            let core = SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir.clone(),
+                identity(),
+                members.clone(),
+                bindings.clone(),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            .expect("initialize dynamic durable core");
+            drop(core);
+
+            {
+                let conn = backend.conn.lock().await;
+                // Both memberships are individually valid under the same
+                // scope. The attack is only that the persisted/snapshot
+                // authority is rolled back from the newest M1 to M0.
+                let historical = membership_entry_at(0, vec![members.clone()], members.clone());
+                let bridge = blank_entry(1);
+                let latest = membership_entry_at(2, vec![members.clone()], members.clone());
+                append_logs_sync(
+                    &conn,
+                    identity(),
+                    &[historical.clone(), bridge, latest.clone()],
+                )
+                .expect("append sequential membership history");
+                save_committed_sync(&conn, identity(), Some(latest.log_id))
+                    .expect("commit newest membership");
+                apply_entries_sync(
+                    &conn,
+                    identity(),
+                    &backend.caps,
+                    vec![historical.clone(), blank_entry(1), latest.clone()],
+                )
+                .expect("apply sequential membership history");
+
+                let historical_membership = StoredMembership::new(
+                    Some(historical.log_id),
+                    match &historical.payload {
+                        EntryPayload::Membership(membership) => membership.clone(),
+                        _ => unreachable!("historical entry is a membership"),
+                    },
+                );
+                let applied_membership = read_membership_sync(&conn, identity())
+                    .expect("read newest persisted membership");
+                assert_ne!(historical_membership, applied_membership);
+
+                match corruption {
+                    "persisted" => {
+                        conn.execute(
+                            "UPDATE consensus_membership SET membership_json = ?1 WHERE singleton = 1",
+                            [encode_json(&historical_membership)
+                                .expect("encode stale persisted membership")],
+                        )
+                        .expect("roll persisted authority back to historical membership");
+                    }
+                    "snapshot" => {
+                        let meta = opc_consensus::engine::SnapshotMeta {
+                            last_log_id: Some(latest.log_id),
+                            last_membership: historical_membership,
+                            snapshot_id: "stale-snapshot-membership".to_owned(),
+                        };
+                        save_current_snapshot_sync(
+                            &conn,
+                            identity(),
+                            &meta,
+                            "snapshot-00000000-0000-4000-8000-0000000000d8.opc",
+                            [0; 32],
+                            1,
+                        )
+                        .expect("persist stale snapshot membership fixture");
+                    }
+                    _ => unreachable!("known stale membership corruption"),
+                }
+                assert!(
+                    validate_retained_durable_log_sync(&conn, identity(), |_| Ok(())).is_err(),
+                    "the shared lineage validator rejects stale {corruption} membership authority",
+                );
+            }
+
+            match SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir,
+                identity(),
+                members,
+                bindings,
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            {
+                Err(SessionConsensusStorageError::CorruptState) => {}
+                Err(error) => panic!("dynamic normal reopen returned {error:?}"),
+                Ok(_) => panic!("dynamic normal reopen accepted stale {corruption} membership"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_and_fixed_reopen_reject_snapshot_log_id_splices() {
+        let dynamic_backend = SqliteSessionBackend::in_memory().expect("dynamic backend");
+        let dynamic_snapshots = tempfile::tempdir().expect("dynamic snapshot directory");
+        let dynamic_members = expected_members();
+        let dynamic_bindings = test_member_bindings(&dynamic_members);
+        let dynamic_snapshot_dir = dynamic_snapshots.path().join("snapshots");
+        let dynamic_core = SqliteConsensusCore::initialize(
+            &dynamic_backend,
+            dynamic_snapshot_dir.clone(),
+            identity(),
+            dynamic_members.clone(),
+            dynamic_bindings.clone(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize dynamic core");
+        drop(dynamic_core);
+        {
+            let conn = dynamic_backend.conn.lock().await;
+            let entry = membership_entry();
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                .expect("append dynamic membership");
+            save_committed_sync(&conn, identity(), Some(entry.log_id))
+                .expect("commit dynamic membership");
+            apply_entries_sync(
+                &conn,
+                identity(),
+                &dynamic_backend.caps,
+                vec![entry.clone()],
+            )
+            .expect("apply dynamic membership");
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id: Some(entry.log_id),
+                last_membership: read_membership_sync(&conn, identity())
+                    .expect("read dynamic membership"),
+                snapshot_id: "dynamic-retained-splice".to_owned(),
+            };
+            save_current_snapshot_sync(
+                &conn,
+                identity(),
+                &meta,
+                "snapshot-00000000-0000-4000-8000-0000000000d1.opc",
+                [0; 32],
+                1,
+            )
+            .expect("persist dynamic snapshot metadata");
+            let spliced = Entry {
+                log_id: LogId::new(CommittedLeaderId::new(2, node_id()), entry.log_id.index),
+                payload: entry.payload,
+            };
+            conn.execute(
+                "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = ?3",
+                params![
+                    i64::try_from(spliced.log_id.leader_id.term).expect("test term"),
+                    encode_json(&spliced).expect("encode dynamic splice"),
+                    i64::try_from(spliced.log_id.index).expect("test index"),
+                ],
+            )
+            .expect("splice dynamic retained row");
+            let error = validate_retained_durable_log_sync(&conn, identity(), |_| Ok(()))
+                .expect_err("dynamic retained snapshot splice must be rejected");
+            assert_eq!(
+                "persisted session consensus snapshot does not match retained log",
+                error.to_string()
+            );
+        }
+        match SqliteConsensusCore::initialize(
+            &dynamic_backend,
+            dynamic_snapshot_dir,
+            identity(),
+            dynamic_members,
+            dynamic_bindings,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        {
+            Err(SessionConsensusStorageError::CorruptState) => {}
+            Err(error) => panic!("dynamic normal reopen returned {error:?}"),
+            Ok(_) => panic!("dynamic normal reopen accepted a snapshot log splice"),
+        }
+
+        let fixed_backend = SqliteSessionBackend::in_memory().expect("fixed backend");
+        let fixed_snapshots = tempfile::tempdir().expect("fixed snapshot directory");
+        let fixed_members = BTreeSet::from([member(7), member(8), member(9)]);
+        let fixed_bindings = test_member_bindings(&fixed_members);
+        let fixed_snapshot_dir = fixed_snapshots.path().join("snapshots");
+        let fixed_core = SqliteConsensusCore::initialize(
+            &fixed_backend,
+            fixed_snapshot_dir.clone(),
+            identity(),
+            fixed_members.clone(),
+            fixed_bindings.clone(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            FIXED_TEST_PLACEMENT_POLICY,
+        )
+        .await
+        .expect("initialize fixed core");
+        drop(fixed_core);
+        {
+            let conn = fixed_backend.conn.lock().await;
+            let entry = membership_entry_at(0, vec![fixed_members.clone()], fixed_members.clone());
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                .expect("append fixed membership");
+            save_committed_with_authority_sync(
+                &conn,
+                identity(),
+                ConsensusAuthorityProfile::FixedImmutable,
+                &fixed_members,
+                &fixed_bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                Some(entry.log_id),
+            )
+            .expect("commit fixed membership");
+            apply_entries_with_authority_sync(
+                &conn,
+                identity(),
+                &fixed_backend.caps,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &fixed_members,
+                &fixed_bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                vec![entry.clone()],
+            )
+            .expect("apply fixed membership");
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id: Some(entry.log_id),
+                last_membership: read_membership_sync(&conn, identity())
+                    .expect("read fixed membership"),
+                snapshot_id: "fixed-retained-splice".to_owned(),
+            };
+            save_current_snapshot_sync(
+                &conn,
+                identity(),
+                &meta,
+                "snapshot-00000000-0000-4000-8000-0000000000d2.opc",
+                [0; 32],
+                1,
+            )
+            .expect("persist fixed snapshot metadata");
+            let spliced = Entry {
+                log_id: LogId::new(CommittedLeaderId::new(2, node_id()), entry.log_id.index),
+                payload: entry.payload,
+            };
+            conn.execute(
+                "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = ?3",
+                params![
+                    i64::try_from(spliced.log_id.leader_id.term).expect("test term"),
+                    encode_json(&spliced).expect("encode fixed splice"),
+                    i64::try_from(spliced.log_id.index).expect("test index"),
+                ],
+            )
+            .expect("splice fixed retained row");
+            let error = validate_retained_durable_log_sync(&conn, identity(), |_| Ok(()))
+                .expect_err("fixed retained snapshot splice must be rejected");
+            assert_eq!(
+                "persisted session consensus snapshot does not match retained log",
+                error.to_string()
+            );
+        }
+        match SqliteConsensusCore::initialize(
+            &fixed_backend,
+            fixed_snapshot_dir,
+            identity(),
+            fixed_members,
+            fixed_bindings,
+            ConsensusAuthorityProfile::FixedImmutable,
+            FIXED_TEST_PLACEMENT_POLICY,
+        )
+        .await
+        {
+            Err(SessionConsensusStorageError::CorruptState) => {}
+            Err(error) => panic!("fixed normal reopen returned {error:?}"),
+            Ok(_) => panic!("fixed normal reopen accepted a snapshot log splice"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_and_fixed_reopen_reject_uncovered_applied_and_committed_pointers() {
+        for (profile, members) in [
+            (ConsensusAuthorityProfile::Dynamic, expected_members()),
+            (
+                ConsensusAuthorityProfile::FixedImmutable,
+                BTreeSet::from([member(7), member(8), member(9)]),
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let snapshots = tempfile::tempdir().expect("snapshot directory");
+            let bindings = test_member_bindings(&members);
+            let snapshot_dir = snapshots.path().join("snapshots");
+            let core = SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir.clone(),
+                identity(),
+                members.clone(),
+                bindings.clone(),
+                profile,
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => None,
+                    ConsensusAuthorityProfile::FixedImmutable => FIXED_TEST_PLACEMENT_POLICY,
+                },
+            )
+            .await
+            .expect("initialize durable core");
+            drop(core);
+
+            {
+                let conn = backend.conn.lock().await;
+                let entry = match profile {
+                    ConsensusAuthorityProfile::Dynamic => membership_entry(),
+                    ConsensusAuthorityProfile::FixedImmutable => {
+                        membership_entry_at(0, vec![members.clone()], members.clone())
+                    }
+                };
+                append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                    .expect("append committed membership");
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => {
+                        save_committed_sync(&conn, identity(), Some(entry.log_id))
+                            .expect("commit dynamic membership");
+                        apply_entries_sync(&conn, identity(), &backend.caps, vec![entry])
+                            .expect("apply dynamic membership");
+                    }
+                    ConsensusAuthorityProfile::FixedImmutable => {
+                        save_committed_with_authority_sync(
+                            &conn,
+                            identity(),
+                            profile,
+                            &members,
+                            &bindings,
+                            FIXED_TEST_PLACEMENT_POLICY,
+                            Some(entry.log_id),
+                        )
+                        .expect("commit fixed membership");
+                        apply_entries_with_authority_sync(
+                            &conn,
+                            identity(),
+                            &backend.caps,
+                            profile,
+                            &members,
+                            &bindings,
+                            FIXED_TEST_PLACEMENT_POLICY,
+                            vec![entry],
+                        )
+                        .expect("apply fixed membership");
+                    }
+                }
+                conn.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+                    .expect("remove exact committed/applied coverage");
+                assert!(
+                    validate_retained_durable_log_sync(&conn, identity(), |_| Ok(())).is_err(),
+                    "the low-level retained scan must reject uncovered {profile:?} pointers",
+                );
+            }
+
+            match SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir,
+                identity(),
+                members,
+                bindings,
+                profile,
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => None,
+                    ConsensusAuthorityProfile::FixedImmutable => FIXED_TEST_PLACEMENT_POLICY,
+                },
+            )
+            .await
+            {
+                Err(SessionConsensusStorageError::CorruptState) => {}
+                Err(error) => panic!("{profile:?} normal reopen returned {error:?}"),
+                Ok(_) => panic!("{profile:?} normal reopen accepted uncovered pointers"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_and_fixed_reopen_reject_snapshot_purge_same_index_splices() {
+        for (profile, members) in [
+            (ConsensusAuthorityProfile::Dynamic, expected_members()),
+            (
+                ConsensusAuthorityProfile::FixedImmutable,
+                BTreeSet::from([member(7), member(8), member(9)]),
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let snapshots = tempfile::tempdir().expect("snapshot directory");
+            let bindings = test_member_bindings(&members);
+            let snapshot_dir = snapshots.path().join("snapshots");
+            let core = SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir.clone(),
+                identity(),
+                members.clone(),
+                bindings.clone(),
+                profile,
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => None,
+                    ConsensusAuthorityProfile::FixedImmutable => FIXED_TEST_PLACEMENT_POLICY,
+                },
+            )
+            .await
+            .expect("initialize durable core");
+            drop(core);
+
+            {
+                let conn = backend.conn.lock().await;
+                let entry = match profile {
+                    ConsensusAuthorityProfile::Dynamic => membership_entry(),
+                    ConsensusAuthorityProfile::FixedImmutable => {
+                        membership_entry_at(0, vec![members.clone()], members.clone())
+                    }
+                };
+                append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                    .expect("append committed membership");
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => {
+                        save_committed_sync(&conn, identity(), Some(entry.log_id))
+                            .expect("commit dynamic membership");
+                        apply_entries_sync(&conn, identity(), &backend.caps, vec![entry.clone()])
+                            .expect("apply dynamic membership");
+                    }
+                    ConsensusAuthorityProfile::FixedImmutable => {
+                        save_committed_with_authority_sync(
+                            &conn,
+                            identity(),
+                            profile,
+                            &members,
+                            &bindings,
+                            FIXED_TEST_PLACEMENT_POLICY,
+                            Some(entry.log_id),
+                        )
+                        .expect("commit fixed membership");
+                        apply_entries_with_authority_sync(
+                            &conn,
+                            identity(),
+                            &backend.caps,
+                            profile,
+                            &members,
+                            &bindings,
+                            FIXED_TEST_PLACEMENT_POLICY,
+                            vec![entry.clone()],
+                        )
+                        .expect("apply fixed membership");
+                    }
+                }
+                let meta = opc_consensus::engine::SnapshotMeta {
+                    last_log_id: Some(entry.log_id),
+                    last_membership: read_membership_sync(&conn, identity())
+                        .expect("read applied membership"),
+                    snapshot_id: format!("{profile:?}-purge-snapshot-splice"),
+                };
+                save_current_snapshot_sync(
+                    &conn,
+                    identity(),
+                    &meta,
+                    "snapshot-00000000-0000-4000-8000-0000000000d3.opc",
+                    [0; 32],
+                    1,
+                )
+                .expect("persist snapshot metadata");
+                let forged = LogId::new(
+                    CommittedLeaderId::new(entry.log_id.leader_id.term + 1, node_id()),
+                    entry.log_id.index,
+                );
+                conn.execute(
+                    "INSERT OR REPLACE INTO consensus_purged (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, ?2, ?3, ?4)",
+                    params![
+                        i64::try_from(identity().configuration_epoch().get()).expect("epoch"),
+                        i64::try_from(forged.leader_id.term).expect("term"),
+                        i64::try_from(forged.index).expect("index"),
+                        encode_json(&forged).expect("encode forged purge pointer"),
+                    ],
+                )
+                .expect("splice purge pointer at snapshot index");
+                let error = validate_retained_durable_log_sync(&conn, identity(), |_| Ok(()))
+                    .expect_err("same-index purge and snapshot histories must conflict");
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData,
+                    "shared validator rejects {profile:?} purge/snapshot splice",
+                );
+            }
+
+            match SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir,
+                identity(),
+                members,
+                bindings,
+                profile,
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => None,
+                    ConsensusAuthorityProfile::FixedImmutable => FIXED_TEST_PLACEMENT_POLICY,
+                },
+            )
+            .await
+            {
+                Err(SessionConsensusStorageError::CorruptState) => {}
+                Err(error) => panic!("{profile:?} normal reopen returned {error:?}"),
+                Ok(_) => panic!("{profile:?} normal reopen accepted snapshot/purge splice"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_and_fixed_reopen_reject_marker_only_term_regressions_after_purge() {
+        for (profile, members) in [
+            (ConsensusAuthorityProfile::Dynamic, expected_members()),
+            (
+                ConsensusAuthorityProfile::FixedImmutable,
+                BTreeSet::from([member(7), member(8), member(9)]),
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let snapshots = tempfile::tempdir().expect("snapshot directory");
+            let bindings = test_member_bindings(&members);
+            let snapshot_dir = snapshots.path().join("snapshots");
+            let core = SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir.clone(),
+                identity(),
+                members.clone(),
+                bindings.clone(),
+                profile,
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => None,
+                    ConsensusAuthorityProfile::FixedImmutable => FIXED_TEST_PLACEMENT_POLICY,
+                },
+            )
+            .await
+            .expect("initialize durable core");
+            drop(core);
+
+            {
+                let conn = backend.conn.lock().await;
+                let entry = match profile {
+                    ConsensusAuthorityProfile::Dynamic => membership_entry(),
+                    ConsensusAuthorityProfile::FixedImmutable => {
+                        membership_entry_at(0, vec![members.clone()], members.clone())
+                    }
+                };
+                append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                    .expect("append committed membership");
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => {
+                        save_committed_sync(&conn, identity(), Some(entry.log_id))
+                            .expect("commit dynamic membership");
+                        apply_entries_sync(&conn, identity(), &backend.caps, vec![entry])
+                            .expect("apply dynamic membership");
+                    }
+                    ConsensusAuthorityProfile::FixedImmutable => {
+                        save_committed_with_authority_sync(
+                            &conn,
+                            identity(),
+                            profile,
+                            &members,
+                            &bindings,
+                            FIXED_TEST_PLACEMENT_POLICY,
+                            Some(entry.log_id),
+                        )
+                        .expect("commit fixed membership");
+                        apply_entries_with_authority_sync(
+                            &conn,
+                            identity(),
+                            &backend.caps,
+                            profile,
+                            &members,
+                            &bindings,
+                            FIXED_TEST_PLACEMENT_POLICY,
+                            vec![entry],
+                        )
+                        .expect("apply fixed membership");
+                    }
+                }
+                let high_term_purge = LogId::new(CommittedLeaderId::new(3, node_id()), 0);
+                let lower_term_marker = LogId::new(CommittedLeaderId::new(2, node_id()), 1);
+                let meta = opc_consensus::engine::SnapshotMeta {
+                    last_log_id: Some(lower_term_marker),
+                    last_membership: read_membership_sync(&conn, identity())
+                        .expect("read applied membership"),
+                    snapshot_id: format!("{profile:?}-marker-only-term-regression"),
+                };
+                conn.execute(
+                    "INSERT OR REPLACE INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        epoch_i64(identity()).expect("epoch"),
+                        encode_json(&meta).expect("encode marker-only snapshot"),
+                        "snapshot-00000000-0000-4000-8000-0000000000d4.opc",
+                        vec![0_u8; 32],
+                        1_i64,
+                    ],
+                )
+                .expect("install marker-only snapshot metadata");
+                for table in ["consensus_committed", "consensus_applied"] {
+                    conn.execute(
+                        &format!(
+                            "UPDATE {table} SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1"
+                        ),
+                        params![
+                            i64::try_from(lower_term_marker.leader_id.term).expect("term"),
+                            i64::try_from(lower_term_marker.index).expect("index"),
+                            encode_json(&lower_term_marker).expect("encode marker pointer"),
+                        ],
+                    )
+                    .expect("replace durable marker pointer");
+                }
+                conn.execute(
+                    "INSERT OR REPLACE INTO consensus_purged (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, ?2, ?3, ?4)",
+                    params![
+                        epoch_i64(identity()).expect("epoch"),
+                        i64::try_from(high_term_purge.leader_id.term).expect("purge term"),
+                        i64::try_from(high_term_purge.index).expect("purge index"),
+                        encode_json(&high_term_purge).expect("encode purge pointer"),
+                    ],
+                )
+                .expect("install high-term purge marker");
+                conn.execute("DELETE FROM consensus_log", [])
+                    .expect("remove all retained rows between markers");
+                let error = validate_retained_durable_log_sync(&conn, identity(), |_| Ok(()))
+                    .expect_err("marker-only lineage must retain Raft leader ordering");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{profile:?}");
+            }
+
+            match SqliteConsensusCore::initialize(
+                &backend,
+                snapshot_dir,
+                identity(),
+                members,
+                bindings,
+                profile,
+                match profile {
+                    ConsensusAuthorityProfile::Dynamic => None,
+                    ConsensusAuthorityProfile::FixedImmutable => FIXED_TEST_PLACEMENT_POLICY,
+                },
+            )
+            .await
+            {
+                Err(SessionConsensusStorageError::CorruptState) => {}
+                Err(error) => panic!("{profile:?} normal reopen returned {error:?}"),
+                Ok(_) => panic!("{profile:?} normal reopen accepted marker-only term regression"),
+            }
+        }
     }
 
     fn authorized_acquire_entry(
@@ -49094,6 +65351,11 @@ BEGIN IMMEDIATE;
         .expect("append first finalization");
         apply_entries_sync(&conn, storage_identity, &backend.caps, vec![finalize_first])
             .expect("apply first finalization");
+        // A normal durable reopen may not observe an applied entry beyond the
+        // committed frontier.  The fixture applies the finalization directly,
+        // so persist its commit pointer before exercising restart lineage.
+        save_committed_sync(&conn, storage_identity, Some(log_id(5)))
+            .expect("commit first finalization");
         assert_eq!(
             MembershipScopeMutation::Applied,
             stage_membership_scope_sync(
@@ -49628,6 +65890,8 @@ BEGIN IMMEDIATE;
             let initial = membership_entry_at(0, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append initial membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit initial membership");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
                 .expect("apply initial membership");
 
@@ -49661,6 +65925,8 @@ BEGIN IMMEDIATE;
                 ],
             )
             .expect("append first abort");
+            save_committed_sync(&conn, storage_identity, Some(first_cleanup.log_id))
+                .expect("commit first abort");
             apply_entries_sync(
                 &conn,
                 storage_identity,
@@ -49704,6 +65970,8 @@ BEGIN IMMEDIATE;
                 ],
             )
             .expect("append second abort");
+            save_committed_sync(&conn, storage_identity, Some(second_cleanup.log_id))
+                .expect("commit second abort");
             apply_entries_sync(
                 &conn,
                 storage_identity,
@@ -50004,6 +66272,8 @@ BEGIN IMMEDIATE;
             let initial = membership_entry_at(0, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append current membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit current membership");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
                 .expect("apply current membership");
             stage_membership_scope_sync(
@@ -50018,6 +66288,8 @@ BEGIN IMMEDIATE;
             let learners = membership_entry_at(1, vec![current.clone()], desired.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&learners))
                 .expect("append learners");
+            save_committed_sync(&conn, storage_identity, Some(learners.log_id))
+                .expect("commit learners");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![learners])
                 .expect("apply learners");
             let abort = topology_entry_at(
@@ -50030,11 +66302,14 @@ BEGIN IMMEDIATE;
             );
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&abort))
                 .expect("append abort");
+            save_committed_sync(&conn, storage_identity, Some(abort.log_id)).expect("commit abort");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![abort])
                 .expect("apply abort");
             let cleanup = membership_entry_at(3, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&cleanup))
                 .expect("append exact abort cleanup");
+            save_committed_sync(&conn, storage_identity, Some(cleanup.log_id))
+                .expect("commit exact abort cleanup");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![cleanup])
                 .expect("apply exact abort cleanup");
         }
@@ -50144,6 +66419,8 @@ BEGIN IMMEDIATE;
             let initial = membership_entry_at(0, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append source membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit source membership");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![initial])
                 .expect("apply source membership");
             stage_membership_scope_sync(
@@ -50158,6 +66435,8 @@ BEGIN IMMEDIATE;
             let learners = membership_entry_at(1, vec![current.clone()], desired.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&learners))
                 .expect("append source learners");
+            save_committed_sync(&conn, storage_identity, Some(learners.log_id))
+                .expect("commit source learners");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![learners])
                 .expect("apply source learners");
             let ready = topology_entry_at(
@@ -50170,6 +66449,8 @@ BEGIN IMMEDIATE;
             );
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&ready))
                 .expect("append source readiness");
+            save_committed_sync(&conn, storage_identity, Some(ready.log_id))
+                .expect("commit source readiness");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![ready])
                 .expect("apply source readiness");
             fence_application_authority_sync(
@@ -50183,6 +66464,8 @@ BEGIN IMMEDIATE;
                 membership_entry_at(3, vec![current.clone(), desired.clone()], desired.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&joint))
                 .expect("append source joint membership");
+            save_committed_sync(&conn, storage_identity, Some(joint.log_id))
+                .expect("commit source joint membership");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![joint])
                 .expect("apply source joint membership");
         }
@@ -50598,6 +66881,35 @@ BEGIN IMMEDIATE;
             })
             .expect("snapshot count");
         assert_eq!(0, count);
+    }
+
+    #[tokio::test]
+    async fn dynamic_snapshot_metadata_cannot_advance_beyond_applied_state() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let identity = identity();
+        let expected = expected_members();
+        initialize_schema(&conn, identity, &expected).expect("consensus schema");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: read_membership_sync(&conn, identity)
+                .expect("read pristine dynamic membership"),
+            snapshot_id: "dynamic-ahead-of-applied".into(),
+        };
+
+        let error = save_current_snapshot_sync(
+            &conn,
+            identity,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000017.opc",
+            [0; 32],
+            1,
+        )
+        .expect_err("dynamic snapshot must not get ahead of applied state");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(read_current_snapshot_sync(&conn, identity)
+            .expect("read rejected snapshot state")
+            .is_none());
     }
 
     #[tokio::test]
@@ -51522,6 +67834,27 @@ BEGIN IMMEDIATE;
                 ConsensusAuthorityProfile::FixedImmutable,
             )
             .expect("initialize fixed authority");
+            let initial_formation = membership_entry_at(0, vec![members.clone()], members.clone());
+            append_logs_with_authority_sync(
+                &conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                std::slice::from_ref(&initial_formation),
+            )
+            .expect("append fixed quorum");
+            save_committed_with_authority_sync(
+                &conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                Some(initial_formation.log_id),
+            )
+            .expect("commit fixed quorum");
             apply_entries_with_authority_sync(
                 &conn,
                 identity,
@@ -51530,11 +67863,7 @@ BEGIN IMMEDIATE;
                 &members,
                 &bindings,
                 FIXED_TEST_PLACEMENT_POLICY,
-                vec![membership_entry_at(
-                    0,
-                    vec![members.clone()],
-                    members.clone(),
-                )],
+                vec![initial_formation],
             )
             .expect("form fixed quorum");
             drop(conn);
@@ -51561,6 +67890,259 @@ BEGIN IMMEDIATE;
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fixed_status_reader_isolates_the_primary_writer_and_fails_closed_freshly() {
+        let directory = tempfile::tempdir().expect("fixed authority reader directory");
+        let database = directory.path().join("sessions.sqlite");
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let placement_policy = FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy");
+        let backend = SqliteSessionBackend::open(&database).expect("fixed backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        let initial_formation = membership_entry_at(0, vec![members.clone()], members.clone());
+        append_logs_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            std::slice::from_ref(&initial_formation),
+        )
+        .expect("append fixed quorum");
+        save_committed_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            Some(initial_formation.log_id),
+        )
+        .expect("commit fixed quorum");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            vec![initial_formation],
+        )
+        .expect("form fixed quorum");
+        activate_fenced_transition_v2_scope_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            fenced_transition_v2_profile_digest(),
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch"),
+        )
+        .expect("activate V2 fixture");
+        drop(conn);
+
+        let v2_request = fenced_transition_v2_request(0x74, 1, "writer-contention");
+
+        // Snapshot publication legitimately owns the primary connection for
+        // its atomic metadata transaction. Synchronous status/scope reads
+        // must remain independent rather than reporting a false revocation.
+        let held_primary = backend.conn.lock().await;
+        assert!(backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+        drop(held_primary);
+
+        // A live WAL prune/checkpoint writer may overlap an ordinary
+        // pre-transmission authority probe. That probe is a strict read, not
+        // a schema-repair boundary, and must not turn the writer reservation
+        // into a false BackendUnavailable result.
+        let independent_writer = Connection::open(&database).expect("independent WAL writer");
+        apply_pragma_profile(&independent_writer, false, false)
+            .expect("configure independent WAL writer");
+        independent_writer
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("reserve independent WAL writer");
+        let application_traffic_authority = tokio::time::timeout(
+            Duration::from_millis(250),
+            backend.fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(application_traffic_authority, Ok(Ok(true))),
+            "pre-transmission authority cannot attempt a write behind an independent WAL writer: {application_traffic_authority:?}",
+        );
+        let activated_snapshot = tokio::time::timeout(
+            Duration::from_millis(250),
+            backend.fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                activated_snapshot,
+                Ok(Ok(
+                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshot::Activated { .. }
+                ))
+            ),
+            "raw V2 mutation acceptance cannot attempt a recovery-schema write behind an independent WAL writer: {activated_snapshot:?}",
+        );
+        let activated_status = tokio::time::timeout(
+            Duration::from_millis(250),
+            backend.fixed_quorum_fenced_transition_v2_status_at_scope(
+                crate::sqlite::FixedQuorumFencedTransitionV2StatusReadRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                    require_activation: true,
+                },
+                &v2_request,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                activated_status,
+                Ok(Ok(
+                    crate::sqlite::FixedQuorumFencedTransitionV2StatusRead::Activated(
+                        FencedTransitionV2Status::NotFound
+                    )
+                ))
+            ),
+            "raw V2 status acceptance cannot attempt a recovery-schema write behind an independent WAL writer: {activated_status:?}",
+        );
+        independent_writer
+            .execute_batch("ROLLBACK;")
+            .expect("release independent WAL writer");
+
+        // A committed authority mismatch must be visible on the very next
+        // checkout. No previously observed true result may be cached.
+        let mismatched_policy = PlacementResiliencePolicy::AllowReducedResilience;
+        backend
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(mismatched_policy)],
+            )
+            .expect("commit fixed placement-policy mismatch");
+        assert!(!backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+        assert!(
+            !backend
+                .fixed_quorum_authority_record_is_exact(
+                    identity,
+                    &members,
+                    &bindings,
+                    placement_policy,
+                    false,
+                )
+                .await
+        );
+        assert!(!backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .expect("mismatched application authority read"));
+        backend
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(placement_policy)],
+            )
+            .expect("restore fixed placement policy");
+        assert!(
+            backend
+                .fixed_quorum_application_traffic_authority_is_exact(
+                    identity,
+                    members.clone(),
+                    bindings.clone(),
+                    placement_policy,
+                )
+                .await
+                .expect("restored application authority read"),
+            "restoring the committed placement policy cannot retain a cached false result",
+        );
+
+        // Synchronous status/scope accessors cannot await a reader lane. When
+        // all bounded lanes are in use they must fail closed, then recover on
+        // the first fresh checkout after capacity returns.
+        let pool = Arc::clone(
+            backend
+                .consensus_acceptance_reader_pool
+                .as_ref()
+                .expect("file-backed stores have acceptance readers"),
+        );
+        let held_readers = {
+            let mut receiver = pool.receiver.lock().await;
+            let mut readers =
+                Vec::with_capacity(crate::sqlite::SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS);
+            for _ in 0..crate::sqlite::SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS {
+                readers.push(receiver.try_recv().expect("bounded reader lane"));
+            }
+            readers
+        };
+        assert!(!backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+        for reader in held_readers {
+            pool.sender
+                .send(reader)
+                .await
+                .expect("return bounded reader lane");
+        }
+        assert!(backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+    }
+
     #[tokio::test]
     async fn fixed_application_traffic_snapshot_fails_closed_for_recovery_sidecars() {
         let directory = tempfile::tempdir().expect("fixed authority snapshot directory");
@@ -51578,6 +68160,27 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::FixedImmutable,
         )
         .expect("initialize fixed authority");
+        let initial_formation = membership_entry_at(0, vec![members.clone()], members.clone());
+        append_logs_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            std::slice::from_ref(&initial_formation),
+        )
+        .expect("append fixed quorum");
+        save_committed_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            Some(initial_formation.log_id),
+        )
+        .expect("commit fixed quorum");
         apply_entries_with_authority_sync(
             &conn,
             identity,
@@ -51586,11 +68189,7 @@ BEGIN IMMEDIATE;
             &members,
             &bindings,
             Some(placement_policy),
-            vec![membership_entry_at(
-                0,
-                vec![members.clone()],
-                members.clone(),
-            )],
+            vec![initial_formation],
         )
         .expect("form fixed quorum");
         drop(conn);
@@ -51604,21 +68203,21 @@ BEGIN IMMEDIATE;
             )
             .await
             .expect("exact fixed authority snapshot"));
-
         let conn = backend.conn.lock().await;
         mark_operator_recovery_pending_sync(&conn, identity, 1, [0x71; 32])
             .expect("mark recovery pending");
         drop(conn);
-        assert!(!backend
-            .fixed_quorum_application_traffic_authority_is_exact(
-                identity,
-                members.clone(),
-                bindings.clone(),
-                placement_policy,
-            )
-            .await
-            .expect("pending recovery snapshot"));
-
+        assert!(matches!(
+            backend
+                .fixed_quorum_application_traffic_authority_is_exact(
+                    identity,
+                    members.clone(),
+                    bindings.clone(),
+                    placement_policy,
+                )
+                .await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
         ensure_operator_recovery_latch_sync(
             &database,
             OperatorRecoveryLatch {
@@ -51638,7 +68237,6 @@ BEGIN IMMEDIATE;
             )
             .await
             .is_err());
-
         std::fs::write(
             operator_recovery_latch_path(&database).expect("recovery latch path"),
             b"corrupt",
@@ -51653,13 +68251,12 @@ BEGIN IMMEDIATE;
             )
             .await
             .is_err());
-
         backend.inject_consensus_operator_recovery_failure(true);
         assert!(backend
             .fixed_quorum_application_traffic_authority_is_exact(
                 identity,
-                members,
-                bindings,
+                members.clone(),
+                bindings.clone(),
                 placement_policy,
             )
             .await
@@ -53939,6 +70536,63 @@ BEGIN IMMEDIATE;
             }]
         ));
         assert!(rejected.notifications.is_empty());
+    }
+
+    #[test]
+    fn fenced_transition_v2_max_batch_advances_history_with_one_row_update() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let activation = fenced_transition_v2_request(0xA7, 1, "v2-max-batch-cas-activation");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, activation, timestamp(1)),
+            ],
+        )
+        .expect("activate V2");
+
+        let history_updates = Arc::new(AtomicUsize::new(0));
+        let observed_history_updates = Arc::clone(&history_updates);
+        conn.update_hook(Some(move |action, database: &str, table: &str, _row_id| {
+            if action == rusqlite::hooks::Action::SQLITE_UPDATE
+                && database == "main"
+                && table == "consensus_fenced_transition_v2_history"
+            {
+                observed_history_updates.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+        let requests = maximum_fenced_transition_v2_batch_requests();
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(2, requests, timestamp(2))],
+        )
+        .expect("apply maximum V2 batch");
+        let outcomes = match &applied.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) => outcomes,
+            other => panic!("unexpected maximum V2 batch result: {other:?}"),
+        };
+        assert_eq!(
+            outcomes.len(),
+            crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+        );
+        assert_eq!(
+            history_updates.load(Ordering::Relaxed),
+            1,
+            "one already-atomic batch must compare-and-set its shared history count once",
+        );
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after maximum batch")
+                .current_bound_count,
+            crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS + 1,
+            "activation and every independently bound batch item consume one exact slot",
+        );
     }
 
     #[test]

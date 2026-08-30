@@ -23,8 +23,8 @@ use opc_session_net::{
     MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
     MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS, MIN_SESSION_CONSENSUS_FRAME_SIZE,
     PERSISTENT_SESSION_CONSUMER_MAINTENANCE_TASKS_PER_POOL,
-    RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_CONSENSUS_ALPN,
-    SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
+    RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_ROSTER_ALPN, SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
@@ -40,15 +40,20 @@ use opc_session_store::{
 };
 use opc_session_testkit::qualification::{
     session_mtls_candidate_evidence_v2_schema_sha256, session_mtls_candidate_schedule_sha256,
-    SessionHaPersistentConsumerEvidenceV7, SessionHaQualificationProfile,
-    SessionHaQualificationProfileV7, SessionMtlsCandidateCampaign,
+    QualificationPersistentConsumerAuthorityV9, QualificationPersistentConsumerBindingsV9,
+    QualificationPersistentConsumerInvocationV9, QualificationPersistentConsumerLaneV9,
+    QualificationPersistentConsumerProcessLedgerV9, QualificationPersistentConsumerProvenanceV9,
+    QualificationPersistentConsumerReleaseGateV9, SessionHaPersistentConsumerEvidenceV7,
+    SessionHaPersistentConsumerHeadEvidenceV9, SessionHaPersistentConsumerHeadEvidenceV9Error,
+    SessionHaQualificationProfile, SessionHaQualificationProfileV7, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceError, SessionMtlsCandidateEvidenceV2,
     QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P999_MICROS_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P99_MICROS_V7, SESSION_HA_EVIDENCE_V6_SCHEMA_JSON,
     SESSION_HA_EVIDENCE_V7_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON,
-    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON,
+    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON,
+    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON,
     SESSION_HA_PROFILE_V6_SCHEMA_JSON, SESSION_HA_PROFILE_V7_JSON,
     SESSION_HA_PROFILE_V7_SCHEMA_JSON, SESSION_HA_SCHEDULE_SCHEMA_JSON,
     SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES,
@@ -152,31 +157,8 @@ fn assert_canonical_invalid_input(output: &Output) {
     );
 }
 
-fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
-    match &mut schema {
-        Value::Object(object) => {
-            for unsupported in ["maxItems", "maxLength", "pattern", "uniqueItems"] {
-                object.remove(unsupported);
-            }
-            for value in object.values_mut() {
-                *value = structural_schema_for_lightweight_validator(value.take());
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                *value = structural_schema_for_lightweight_validator(value.take());
-            }
-        }
-        _ => {}
-    }
-    schema
-}
-
 fn validate_structural_schema(schema: &Value, instance: &Value) -> Result<(), String> {
-    opc_schema_validate::validate(
-        &structural_schema_for_lightweight_validator(schema.clone()),
-        instance,
-    )
+    opc_schema_validate::validate(schema, instance)
 }
 
 fn validate_mtls_candidate_evidence(schema: &Value, evidence: &Value) -> Result<(), String> {
@@ -210,7 +192,9 @@ fn validate_mtls_candidate_evidence_v2(
     evidence: &Value,
 ) -> Result<SessionMtlsCandidateEvidenceV2, String> {
     validate_structural_schema(schema, evidence)?;
-    let encoded = serde_json::to_vec(evidence).map_err(|_| "invalid typed v2 evidence")?;
+    let typed: SessionMtlsCandidateEvidenceV2 =
+        serde_json::from_value(evidence.clone()).map_err(|_| "invalid typed v2 evidence")?;
+    let encoded = serde_json::to_vec(&typed).map_err(|_| "invalid typed v2 evidence")?;
     SessionMtlsCandidateEvidenceV2::from_json(&encoded)
         .map_err(|_| "invalid v2 evidence binding".to_owned())
 }
@@ -569,22 +553,9 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
     assert!(profile.topology.stable_identity_independent_of_route);
 
     let contract = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
-    assert_eq!(
-        profile.protocol.consensus_alpn.as_bytes(),
-        SESSION_CONSENSUS_ALPN
-    );
-    assert_eq!(
-        profile.protocol.transport_revision,
-        SESSION_CONSENSUS_TRANSPORT_REVISION
-    );
-    assert_eq!(
-        profile.protocol.wire_schema_revision,
-        contract.wire_schema_revision
-    );
-    assert_eq!(
-        profile.protocol.application_revision, contract.application_revision,
-        "the qualification golden records the exact outcome-digest application gate"
-    );
+    assert_eq!(profile.protocol.consensus_alpn, "opc-session-consensus/2");
+    assert_eq!(profile.protocol.transport_revision, 4);
+    assert_eq!(profile.protocol.wire_schema_revision, 4);
     assert_eq!(
         profile.protocol.error_set_revision,
         contract.error_set_revision
@@ -604,12 +575,24 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
     );
     assert!(!profile.protocol.legacy_direct_backend_enabled);
 
+    let mut retroactive_application_revision: Value =
+        serde_json::from_str(SESSION_HA_PROFILE_V6_JSON).expect("frozen v6 profile JSON");
+    retroactive_application_revision["protocol"]["application_revision"] =
+        contract.application_revision.into();
+    assert!(
+        validate_structural_schema(&profile_schema, &retroactive_application_revision).is_err()
+    );
+    assert!(serde_json::from_value::<SessionHaQualificationProfile>(
+        retroactive_application_revision
+    )
+    .is_err());
+
     let consumer = profile
         .protocol
         .stateless_consumer
         .as_ref()
         .expect("frozen v6 profile has the stateless consumer contract");
-    assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
+    assert_eq!(consumer.alpn, "opc-session-consumer/1");
     assert_eq!(consumer.transport_revision, 1);
     assert!(!consumer.fallback_or_dual_mode_enabled);
     assert_eq!(consumer.max_requests_per_connection, 1);
@@ -935,14 +918,14 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
             "{:x}",
             Sha256::digest(SESSION_HA_PROFILE_V6_JSON.as_bytes())
         ),
-        "7d5c877f90f08c2155d57a37b1023db5e4d3827c23fe4a808addedaf2dcc5f0c"
+        "4ba6d641d3ed7f03badf2759efa8d1135a4e64f126496423493fbe613ad8d107"
     );
     assert_eq!(
         format!(
             "{:x}",
             Sha256::digest(SESSION_HA_PROFILE_V6_SCHEMA_JSON.as_bytes())
         ),
-        "317c5a0d3961ed498ad178be3804033c2fdbf4f531d416233eba49d2fc369172"
+        "3e4429f2f2abc8ac535a8bed2c0b99ac5913d009694e42812bdbdb282a1ce794"
     );
     assert_eq!(
         format!(
@@ -956,7 +939,32 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
             "{:x}",
             Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
         ),
-        "df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87"
+        "875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V7_SCHEMA_JSON.as_bytes())
+        ),
+        "3ce5f0e622508ba89820742514eddfd2c0575265754c0bdd1a726e5b3335ecca"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON.as_bytes())
+        ),
+        "0b02633f0118283f425c4b60d8540de4503023d3759b7c6939ebaf2d16365772"
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(V7_EVIDENCE_FIXTURE.as_bytes())),
+        "44da16640ac29a8e1bec77fadf784a86015bb8a64af8ecacc768888117642d7c"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON.as_bytes())
+        ),
+        "5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd"
     );
 
     let schema: Value =
@@ -968,19 +976,18 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
 
     assert_eq!(profile.schema_version, "opc-session-ha-profile/v7");
     assert_eq!(profile.profile_id, "opc-session-openraft-ha/v7");
-    let contract = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
-    assert_eq!(
-        profile.protocol.transport_revision,
-        SESSION_CONSENSUS_TRANSPORT_REVISION
-    );
-    assert_eq!(
-        profile.protocol.wire_schema_revision,
-        contract.wire_schema_revision
-    );
-    assert_eq!(
-        profile.protocol.application_revision, contract.application_revision,
-        "the v7 golden cannot relabel a prior outcome-digest state machine as current"
-    );
+    assert_eq!(profile.protocol.transport_revision, 4);
+    assert_eq!(profile.protocol.wire_schema_revision, 4);
+    let mut retroactive_application_revision = value.clone();
+    retroactive_application_revision["protocol"]["application_revision"] =
+        CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+            .application_revision
+            .into();
+    assert!(validate_structural_schema(&schema, &retroactive_application_revision).is_err());
+    assert!(serde_json::from_value::<SessionHaQualificationProfileV7>(
+        retroactive_application_revision
+    )
+    .is_err());
     assert_eq!(
         profile
             .persistent_consumer_thresholds
@@ -1010,7 +1017,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         "qualification/v7/session-ha-evidence.schema.json"
     );
     let consumer = &profile.protocol.persistent_consumer;
-    assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
+    assert_eq!(consumer.alpn, "opc-session-consumer/1");
     assert_eq!(consumer.transport_revision, 2);
     assert_eq!(
         consumer.max_requests_per_connection,
@@ -1109,7 +1116,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     assert!(validate_structural_schema(&v6_evidence_schema, &v7_evidence).is_err());
     assert_eq!(
         v7_evidence["execution"]["profile_sha256"],
-        "sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87"
+        "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7"
     );
     assert_eq!(
         v7_evidence["execution"]["client_type"],
@@ -1118,7 +1125,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     let typed_v7: SessionHaPersistentConsumerEvidenceV7 =
         serde_json::from_value(v7_evidence.clone()).expect("strict typed v7 evidence");
     typed_v7
-        .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .expect("fixture satisfies computed v7 evidence relationships");
     let rendered_v7 = format!("{typed_v7:?}\n{:?}", typed_v7.execution);
     for sensitive in [
@@ -1153,7 +1160,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         }
         assert!(
             changed
-                .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+                .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
                 .is_err(),
             "{label} mutation with the retained transcript digest must reject"
         );
@@ -1165,7 +1172,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         .canonical_transcript_sha256()
         .expect("mutated transcript remains encodable");
     assert!(wrong_topology_claim
-        .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     assert!(validate_structural_schema(
         &v7_evidence_schema,
@@ -1179,7 +1186,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         .canonical_transcript_sha256()
         .expect("reordered transcript remains encodable");
     assert!(reordered_coverage
-        .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     assert!(validate_structural_schema(
         &v7_evidence_schema,
@@ -1210,7 +1217,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         .canonical_transcript_sha256()
         .expect("oversized transcript remains encodable");
     assert!(oversized_sample
-        .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     assert!(validate_structural_schema(
         &v7_evidence_schema,
@@ -1228,17 +1235,17 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     let mut sentinel_revision = typed_v7.clone();
     sentinel_revision.source_revision = "0000000000000000000000000000000000000000".into();
     assert!(sentinel_revision
-        .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     let mut sentinel_tree = typed_v7.clone();
     sentinel_tree.source_tree = "0000000000000000000000000000000000000000".into();
     assert!(sentinel_tree
-        .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     let mut forged_percentile = typed_v7.clone();
     forged_percentile.warm_latency.p99_micros += 1;
     assert!(forged_percentile
-        .validate("sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
 
     let mut augmented_v6 = v6_evidence;
@@ -1292,16 +1299,308 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
 
 #[test]
 fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
-    let schema: Value =
+    let frozen_v8_schema: Value =
         serde_json::from_str(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON)
-            .expect("v8 current-head evidence schema JSON");
+            .expect("frozen v8 evidence schema JSON");
+    let schema: Value =
+        serde_json::from_str(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON)
+            .expect("v9 current-head evidence schema JSON");
+    let authority = QualificationPersistentConsumerAuthorityV9 {
+        positive_observations: 1,
+        negative_boundary_rejections: 1,
+    };
+    let protected_tenant_authority = QualificationPersistentConsumerAuthorityV9 {
+        positive_observations: 1,
+        negative_boundary_rejections: 3,
+    };
+    let cargo_target_directory = "/var/lib/opc-testkit/target";
+    let evidence_root_directory = "/var/lib/opc-testkit/v9-evidence";
+    let fs_verity_snapshot_root_directory = "/var/lib/opc-testkit/fs-verity-snapshots";
+    let pair_directory = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory(evidence_root_directory)
+        .expect("derive fixed V9 pair directory");
+    let cargo_executable_alias = "/usr/bin/cargo";
+    let cargo_executable = "/usr/bin/rustup";
+    let evidence = SessionHaPersistentConsumerHeadEvidenceV9 {
+        schema_version: "opc-session-ha-persistent-consumer-head-evidence/v9".into(),
+        evidence_kind: "persistent-consumer-executed-lanes".into(),
+        experimental: true,
+        qualification_complete: true,
+        provenance: QualificationPersistentConsumerProvenanceV9 {
+            source_revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            source_tree: "89abcdef0123456789abcdef0123456789abcdef".into(),
+            source_tree_status: "clean".into(),
+            source_worktree_sha256: format!("sha256:{}", "a".repeat(64)),
+        },
+        invocation: QualificationPersistentConsumerInvocationV9 {
+            test_id: "three_process_projected_mtls_persistent_v2_batch_release_gate".into(),
+            argv_sha256: format!("sha256:{}", "b".repeat(64)),
+            run_id_sha256: format!("sha256:{}", "c".repeat(64)),
+            cargo_executable_alias: cargo_executable_alias.into(),
+            cargo_executable: cargo_executable.into(),
+            cargo_executable_sha256: format!("sha256:{}", "d".repeat(64)),
+            cargo_executable_mode: 0o755,
+            canonical_cargo_argv: opc_session_testkit::qualification::
+                SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_CARGO_ARGV
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            reproduction_command: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+                    cargo_target_directory,
+                    evidence_root_directory,
+                    fs_verity_snapshot_root_directory,
+                    cargo_executable_alias,
+                )
+                .expect("render V9 reproduction command"),
+        },
+        bindings: QualificationPersistentConsumerBindingsV9 {
+            v9_schema_sha256: opc_session_testkit::qualification::session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            harness_sha256: format!("sha256:{}", "e".repeat(64)),
+            child_sha256: format!("sha256:{}", "f".repeat(64)),
+            executable_sha256: format!("sha256:{}", "1".repeat(64)),
+            v1_canonical_sha256: format!("sha256:{}", "2".repeat(64)),
+            cargo_target_directory: cargo_target_directory.into(),
+            cargo_target_directory_sha256: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_cargo_target_directory_sha256(
+                    cargo_target_directory,
+                )
+                .expect("commit canonical target directory"),
+            evidence_root_directory: evidence_root_directory.into(),
+            evidence_root_directory_sha256: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_evidence_root_directory_sha256(
+                    evidence_root_directory,
+                )
+                .expect("commit canonical V9 evidence root"),
+            fs_verity_snapshot_root_directory: fs_verity_snapshot_root_directory.into(),
+            fs_verity_snapshot_root_directory_sha256: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+                    fs_verity_snapshot_root_directory,
+                )
+                .expect("commit canonical V9 fs-verity snapshot root"),
+            fs_verity_snapshot_root_device: 17,
+            fs_verity_snapshot_root_inode: 19,
+            pair_directory: pair_directory.clone(),
+            pair_directory_sha256: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(
+                    &pair_directory,
+                )
+                .expect("commit derived V9 pair root"),
+        },
+        process_ledger: QualificationPersistentConsumerProcessLedgerV9 {
+            initial_processes: 3,
+            unclean_process_losses: 2,
+            restarted_processes: 1,
+            observed_process_generations: 4,
+            release_gate_process_generations: 4,
+        },
+        release_gate: QualificationPersistentConsumerReleaseGateV9 {
+            credential_rotation_executed: true,
+            old_credential_rejected: true,
+            new_credential_rejected: true,
+            fixed_capacity_reclaimed: true,
+            durable_status_cardinality: 12,
+            post_outcome_unknown_mutation_dispatches: 0,
+        },
+        lanes: [
+            QualificationPersistentConsumerLaneV9 {
+                lane: "general".into(),
+                transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                application_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                    .application_revision,
+                sdk_protocol_revision: 5,
+                consumer_alpn: String::from_utf8(SESSION_QUORUM_CONSUMER_ALPN.to_vec())
+                    .expect("ASCII ALPN"),
+                executed: true,
+                admission_operations: 1,
+                status_operations: 1,
+                before_leader_loss_operations: 1,
+                after_leader_loss_operations: 1,
+                after_restart_operations: 1,
+                after_voter_loss_operations: 1,
+                tenant_authority: authority.clone(),
+                scope_authority: authority.clone(),
+                fence_authority: authority.clone(),
+            },
+            QualificationPersistentConsumerLaneV9 {
+                lane: "protected_roster".into(),
+                transport_revision: SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+                application_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                    .application_revision,
+                sdk_protocol_revision: 5,
+                consumer_alpn: String::from_utf8(SESSION_QUORUM_CONSUMER_ROSTER_ALPN.to_vec())
+                    .expect("ASCII ALPN"),
+                executed: true,
+                admission_operations: 1,
+                status_operations: 1,
+                before_leader_loss_operations: 1,
+                after_leader_loss_operations: 1,
+                after_restart_operations: 1,
+                after_voter_loss_operations: 1,
+                tenant_authority: protected_tenant_authority,
+                scope_authority: authority.clone(),
+                fence_authority: authority.clone(),
+            },
+        ],
+        members: 3,
+        authenticated_setup_successes: 48,
+        warm_reused_calls: 1_000,
+        fixed_labels_only: true,
+        identifying_values_recorded: false,
+    };
+    let canonical = evidence.to_canonical_json().expect("canonical v9 evidence");
+    assert!(SessionHaPersistentConsumerHeadEvidenceV9::from_json(&canonical).is_ok());
+    let value: Value = serde_json::from_slice(&canonical).expect("canonical v9 JSON");
+    validate_structural_schema(&schema, &value).expect("shared schema accepts typed v9 evidence");
+    assert!(validate_structural_schema(&frozen_v8_schema, &value).is_err());
+    let mut incomplete = value.clone();
+    incomplete["qualification_complete"] = serde_json::json!(false);
     assert_eq!(
-        schema["properties"]["execution"]["properties"]["transport_revision"]["const"],
-        serde_json::json!(SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION),
-        "the current-head schema must be changed with the compiled wire revision"
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(
+            &serde_json::to_vec(&incomplete).expect("incomplete V9 JSON"),
+        ),
+        Err(SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument),
+        "only a completed full release-gate artifact is a valid V9 envelope"
     );
 
-    let attestation = serde_json::json!({
+    for (path, replacement) in [
+        ("transport_revision", serde_json::json!(7)),
+        ("application_revision", serde_json::json!(2)),
+        ("sdk_protocol_revision", serde_json::json!(4)),
+        ("consumer_alpn", serde_json::json!("opc-session-consumer/2")),
+    ] {
+        let mut wrong = value.clone();
+        wrong["lanes"][0][path] = replacement;
+        assert_eq!(
+            SessionHaPersistentConsumerHeadEvidenceV9::from_json(
+                &serde_json::to_vec(&wrong).expect("wrong lane JSON")
+            ),
+            Err(SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument)
+        );
+    }
+    let mut no_negative = value.clone();
+    no_negative["lanes"][1]["tenant_authority"]["negative_boundary_rejections"] =
+        serde_json::json!(1);
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(
+            &serde_json::to_vec(&no_negative).expect("authority JSON")
+        ),
+        Err(SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument)
+    );
+    let mut borrowed_general_lifecycle = value.clone();
+    borrowed_general_lifecycle["lanes"][1]["after_leader_loss_operations"] =
+        borrowed_general_lifecycle["lanes"][0]["after_leader_loss_operations"].clone();
+    borrowed_general_lifecycle["lanes"][0]["after_leader_loss_operations"] = serde_json::json!(0);
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(
+            &serde_json::to_vec(&borrowed_general_lifecycle).expect("lane-separated JSON")
+        ),
+        Err(SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument),
+        "a protected-lane lifecycle observation cannot be borrowed by the general lane"
+    );
+    for (path, replacement, expected) in [
+        (
+            "invocation.test_id",
+            serde_json::json!("five_process_projected_mtls_persistent_quorum_consumers"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument,
+        ),
+        (
+            "process_ledger.unclean_process_losses",
+            serde_json::json!(1),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument,
+        ),
+        (
+            "release_gate.post_outcome_unknown_mutation_dispatches",
+            serde_json::json!(1),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument,
+        ),
+        (
+            "bindings.v1_canonical_sha256",
+            serde_json::json!("sha256:bad"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument,
+        ),
+        (
+            "bindings.cargo_target_directory",
+            serde_json::json!("relative-target"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument,
+        ),
+        (
+            "bindings.cargo_target_directory",
+            serde_json::json!("/var/lib/opc-testkit/target\u{0}replacement"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Binding,
+        ),
+        (
+            "invocation.cargo_executable_alias",
+            serde_json::json!("/usr/bin/../bin/cargo"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Invocation,
+        ),
+        (
+            "invocation.cargo_executable",
+            serde_json::json!("/usr/bin/../bin/cargo"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Invocation,
+        ),
+        (
+            "invocation.cargo_executable_sha256",
+            serde_json::json!("sha256:bad"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument,
+        ),
+        (
+            "invocation.cargo_executable_mode",
+            serde_json::json!(0o644),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Invocation,
+        ),
+        (
+            "bindings.evidence_root_directory",
+            serde_json::json!("/var/lib/opc-testkit/replaced-v9-evidence"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Binding,
+        ),
+        (
+            "bindings.pair_directory",
+            serde_json::json!("/var/lib/opc-testkit/v9-evidence/borrowed-pair"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Binding,
+        ),
+        (
+            "invocation.reproduction_command",
+            serde_json::json!("CARGO_TARGET_DIR=/fake cargo test"),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Binding,
+        ),
+        (
+            "bindings.v9_schema_sha256",
+            serde_json::json!(format!("sha256:{}", "d".repeat(64))),
+            SessionHaPersistentConsumerHeadEvidenceV9Error::Binding,
+        ),
+    ] {
+        let mut wrong = value.clone();
+        let mut segments = path.split('.');
+        let first = segments.next().expect("fixed nested field");
+        let second = segments.next().expect("fixed nested field");
+        wrong[first][second] = replacement;
+        assert_eq!(
+            SessionHaPersistentConsumerHeadEvidenceV9::from_json(
+                &serde_json::to_vec(&wrong).expect("wrong V9 envelope JSON"),
+            ),
+            Err(expected),
+            "closed V9 envelope rejects {path} mutation",
+        );
+    }
+    let mut duplicate = String::from_utf8(canonical.clone())
+        .expect("UTF-8")
+        .replacen("\"members\":3", "\"members\":3,\"members\":3", 1)
+        .into_bytes();
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(&duplicate),
+        Err(SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument)
+    );
+    duplicate = String::from_utf8(canonical)
+        .expect("UTF-8")
+        .replacen("{", "{\n", 1)
+        .into_bytes();
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(&duplicate),
+        Err(SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument)
+    );
+
+    let v8_attestation = serde_json::json!({
         "schema_version": "opc-session-ha-persistent-consumer-head-evidence/v8",
         "evidence_kind": "persistent-consumer-wire-binding",
         "experimental": true,
@@ -1312,7 +1611,7 @@ fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
         "execution": {
             "client_type": "PersistentSessionConsumerClient",
             "consumer_profile_path": "protocol.persistent_consumer",
-            "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            "transport_revision": 5,
             "authenticated_route": "authenticated-mtls-persistent"
         },
         "measurements": {
@@ -1325,15 +1624,11 @@ fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
             "identifying_values_recorded": false
         }
     });
-    validate_structural_schema(&schema, &attestation)
-        .expect("current-head attestation matches the compiled wire revision");
-
-    let mut mismatched = attestation;
-    mismatched["execution"]["transport_revision"] =
-        serde_json::json!(SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION.wrapping_add(1));
+    validate_structural_schema(&frozen_v8_schema, &v8_attestation)
+        .expect("frozen v8 attestation remains independently valid");
     assert!(
-        validate_structural_schema(&schema, &mismatched).is_err(),
-        "a current-head wire revision mismatch must fail closed"
+        validate_structural_schema(&schema, &v8_attestation).is_err(),
+        "a fully valid frozen-v8 document cannot be widened into the v9 contract"
     );
 }
 
@@ -1811,14 +2106,27 @@ fn mtls_candidate_v2_fixture_is_typed_and_exactly_digest_bound() {
 #[test]
 fn mtls_candidate_v2_public_decoder_is_bounded_closed_and_validating() {
     let fixture = MTLS_CANDIDATE_V2_FIXTURE.as_bytes();
+    let canonical = serde_json::to_vec(
+        &serde_json::from_slice::<SessionMtlsCandidateEvidenceV2>(fixture)
+            .expect("typed v2 fixture"),
+    )
+    .expect("canonical v2 fixture");
     assert!(fixture.len() < SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES);
-    SessionMtlsCandidateEvidenceV2::from_json(fixture)
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(fixture),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument),
+        "immutable pretty fixture is schema input, not a canonical durable record"
+    );
+    SessionMtlsCandidateEvidenceV2::from_json(&canonical)
         .expect("bounded decoder accepts the canonical fixture");
 
-    let mut exact_limit = fixture.to_vec();
+    let mut exact_limit = canonical;
     exact_limit.resize(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES, b' ');
-    SessionMtlsCandidateEvidenceV2::from_json(&exact_limit)
-        .expect("bounded decoder accepts valid JSON at the exact limit");
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&exact_limit),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument),
+        "whitespace padding is not canonical durable evidence"
+    );
 
     let mut oversized = exact_limit;
     oversized.push(b' ');
@@ -1853,7 +2161,7 @@ fn mtls_candidate_v2_public_decoder_is_bounded_closed_and_validating() {
     let encoded = serde_json::to_vec(&invalid_claim).expect("encode invalid claim mutation");
     assert_eq!(
         SessionMtlsCandidateEvidenceV2::from_json(&encoded),
-        Err(SessionMtlsCandidateEvidenceError::Claim)
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
     );
 }
 

@@ -112,9 +112,8 @@
   },
   "protocol": {
     "consensus_alpn": "opc-session-consensus/2",
-    "transport_revision": 5,
-    "wire_schema_revision": 5,
-    "application_revision": 2,
+    "transport_revision": 4,
+    "wire_schema_revision": 4,
     "error_set_revision": 6,
     "consensus_schema_version": 1,
     "min_frame_bytes": 9437184,
