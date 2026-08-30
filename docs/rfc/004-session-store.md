@@ -2048,6 +2048,41 @@ provider/key rotation can therefore use the same durable journal path, key,
 and volume. This does not claim host failover, host/volume-loss recovery,
 journal replication, or a second consensus transition.
 
+`SessionConsumerPreparedCheckpointBackend` is the public protected V1
+prepared fenced-transition router for that wrapper. It composes one protected
+backend allocation with the exact complete roster of persistent authenticated
+consumer voters for one scope. Construction rejects an incomplete, duplicate,
+or differently authenticated/bound roster and then canonicalizes the admitted
+voters by node ordinal; caller input order is not authority. For every
+caller-stable `FencedTransitionRequestId`, the router derives the same origin
+from the authenticated scope, canonical roster, and ID. It uses the existing
+V1 `fenced_transition` operation only. It is not #702's V2 receipt-history
+protocol or `FencedTransitionV2PreparedJournal`, and grants neither activation
+or readiness-probe authority nor a new quorum, replication, membership, or
+consensus authority.
+
+Preparation retains the exact outer protected journal token privately in a
+move-only affine handle. The router reprojects and revalidates that exact outer
+token before every physical mutation and receipt-status attempt; it MUST NOT
+reconstruct the request or replace the retained token with current
+provider/key state. Mutation starts at the deterministic origin and visits the
+canonical voter roster. It MAY advance to another voter only after a proven
+pre-dispatch `NotTransmitted` result. Cancellation during the pre-dispatch
+setup is safe and retryable because no application bytes can cross the
+transport boundary. After dispatch begins, a possible send, including
+`OutcomeUnknown`, or cancellation is ambiguous and MUST permanently make the
+handle receipt-only; it MUST NOT regain mutation authority.
+
+Receipt status is read-only. A single status call uses the next deterministic
+canonical successor voter. A status-until-terminal call makes at most one such
+successor pass under the single immutable caller absolute deadline, with every
+physical attempt additionally capped by the prepared physical-attempt budget.
+It can end with `NotFound`, unavailable, or deadline, none of which is a
+terminal receipt or proof that a delayed mutation cannot commit. A terminal
+receipt is cached locally. Restart recovery returns only the status-only
+`SessionConsumerRecoveredFencedTransitionStatus` handle; it deliberately has
+no execute authority, even if the recovered token is otherwise valid.
+
 Journal provisioning and reopening are distinct. A deployment MUST call
 `PreparedFencedTransitionJournal::create_new` exactly once for a missing path
 and `open_existing` on every restart. Reopening never creates or initializes a

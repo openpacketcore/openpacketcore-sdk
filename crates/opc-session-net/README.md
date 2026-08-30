@@ -295,6 +295,39 @@ separately scoped `FencedTransitionV2PreparedJournal` described in the
 session-store documentation; V2 transport does not create, substitute for, or
 fall back to that durable recovery boundary.
 
+`SessionConsumerPreparedCheckpointBackend` separately exposes the public
+protected V1 prepared fenced-transition router. It composes one protected
+backend allocation with the *complete*, exact same-authenticated-scope roster
+of persistent consumer voters. Construction rejects an incomplete, duplicate,
+or differently bound roster, and canonicalizes accepted voters by node ordinal;
+the caller's input order is not authority. For each request, the router derives
+one deterministic origin from the authenticated scope, canonical roster, and
+caller-stable `FencedTransitionRequestId`. This is a router over the existing
+V1 `fenced_transition` operation, not V2 receipt-history authority, a V2
+journal, a quorum API, or an activation/readiness probe.
+
+`prepare_fenced_transition` keeps the exact outer protected journal token
+private in a move-only `SessionConsumerPreparedFencedTransition` handle. Before
+each physical mutation or status attempt it reprojects and revalidates that
+exact outer token; it never reconstructs a request or substitutes current
+provider/key state. Mutation visits canonical voters from its origin and may
+advance only after a proven pre-dispatch `NotTransmitted` result. While setup is
+still pre-dispatch, cancellation is safe and retryable because no application
+bytes can cross the transport boundary. Once dispatch starts, any possible send
+(`OutcomeUnknown`) or cancellation makes the affine handle permanently
+receipt-only; it can never dispatch the mutation again.
+
+Receipt-only status is read-only. `status_once` uses the next deterministic
+successor voter, while `status_until_terminal` makes at most one pass over the
+canonical successors under the one immutable caller absolute deadline, with
+each physical attempt capped by the prepared physical-attempt budget. It may
+finish with `NotFound`, unavailable, or deadline rather than a terminal receipt;
+none of those outcomes proves that a delayed mutation cannot commit. A terminal
+receipt is cached locally. After restart,
+`recover_fenced_transition_status` returns only
+`SessionConsumerRecoveredFencedTransitionStatus`, which has receipt/status
+authority and deliberately no execution method.
+
 For a fenced transition, the public consumer request ID is byte-identical to
 the nested transition ID. The internal receipt ID is domain-separated by
 authenticated consumer identity, stable cluster identity, and that public ID;
