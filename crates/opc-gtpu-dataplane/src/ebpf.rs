@@ -38242,10 +38242,11 @@ mod aya_runtime {
 
         #[test]
         fn current_recovery_record_round_trips_and_rejects_tampering() {
+            let map_ids = std::array::from_fn(|index| u32::try_from(index + 1).unwrap());
             let record = CurrentRecoveryRecord::unbound(
                 [0x11; 32],
                 true,
-                [73; CURRENT_MAP_NAMES.len()],
+                map_ids,
                 41,
                 42,
                 super::super::test_current_ebpf_graph_recovery_authority_binding(),
@@ -38269,7 +38270,7 @@ mod aya_runtime {
                     &CurrentRecoveryRecord::unbound(
                         [0x11; 32],
                         false,
-                        [73; CURRENT_MAP_NAMES.len()],
+                        map_ids,
                         41,
                         42,
                         super::super::test_current_ebpf_graph_recovery_authority_binding(),
@@ -38278,6 +38279,33 @@ mod aya_runtime {
                 ),
                 None
             );
+        }
+
+        #[test]
+        fn current_recovery_record_rejects_duplicate_and_proof_overlapping_map_ids() {
+            let unique = std::array::from_fn(|index| u32::try_from(index + 1).unwrap());
+            for case in ["duplicate", "proof-overlap"] {
+                let mut map_ids = unique;
+                if case == "duplicate" {
+                    map_ids[1] = map_ids[0];
+                }
+                let proof_map_id = if case == "proof-overlap" { map_ids[0] } else { 99 };
+                let record = CurrentRecoveryRecord::unbound(
+                    [0x11; 32],
+                    false,
+                    map_ids,
+                    41,
+                    42,
+                    super::super::test_current_ebpf_graph_recovery_authority_binding(),
+                )
+                .bind_to_proof_map(proof_map_id)
+                .unwrap();
+                assert_eq!(
+                    CurrentRecoveryRecord::decode(&record.encode()),
+                    None,
+                    "{case} current map identity must not decode as canonical"
+                );
+            }
         }
 
         #[test]
@@ -56591,6 +56619,68 @@ mod tests {
                 .count(),
             1,
             "an idempotent retry does not publish a second terminal WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_25_current_terminal_refuses_a_different_r5_terminal_receipt() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode =
+            FakeHistorical25ControlRootMode::Predecessor0755;
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .expect("retire the first exact R5 graph"),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph_with_authority(
+                    current_recovery_authorized_request("s2bu-historical"),
+                )
+                .await
+                .expect("publish the first exact R5-source current WAL"),
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+
+        // Model a later, otherwise legitimate R5 terminal adoption. Its
+        // graph commitment and compatibility digest are deliberately
+        // unchanged, while the exact terminal receipt authority is not H1.
+        let replacement_authority = historical_25_authority_with_values(
+            0x31,
+            0x32,
+            8,
+            0x33,
+            0x14,
+            0x15,
+            0x16,
+            Box::new(AlwaysCurrentHistoricalRecoveryGuard),
+        )
+        .binding();
+        runtime
+            .state()
+            .historical_25_authorities
+            .insert(pin_dir.clone(), replacement_authority);
+        let terminal_before = runtime.state().current_recovery_terminal_leaves[&pin_dir];
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph_with_authority(
+                    current_recovery_authorized_request("s2bu-historical"),
+                )
+                .await
+                .expect("a changed exact R5 source receipt is a typed refusal"),
+            CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::IndeterminateState
+            )
+        );
+        assert_eq!(
+            runtime.state().current_recovery_terminal_leaves[&pin_dir],
+            terminal_before,
+            "source-receipt mismatch must leave the current WAL byte-equivalent"
         );
     }
 
