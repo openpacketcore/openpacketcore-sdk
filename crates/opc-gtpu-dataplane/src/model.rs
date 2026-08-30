@@ -3909,6 +3909,14 @@ pub enum HistoricalEbpfGraphRecoveryProgress {
     /// At least one recorded historical map pin was removed; retry the exact
     /// request to continue the durable cleanup.
     PinCleanupStarted,
+    /// Durable recovery state may have committed before the live external
+    /// authority reported that it no longer matched this exact operation.
+    /// Only a retry carrying the matching durable authority may resume it.
+    AuthorityMismatch,
+    /// Durable recovery state may have committed before the live external
+    /// authority changed or became unavailable. The retained proof remains
+    /// the mandatory fence for an exact authorized retry.
+    AuthorityChanged,
     /// A committed cleanup could not establish its exact final state.
     Indeterminate,
 }

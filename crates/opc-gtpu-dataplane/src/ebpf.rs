@@ -741,6 +741,20 @@ const fn historical_recovery_currentness_refusal(
     }
 }
 
+const fn historical_recovery_currentness_progress(
+    currentness: crate::HistoricalEbpfGraphRecoveryAuthorityCurrentness,
+) -> crate::HistoricalEbpfGraphRecoveryProgress {
+    match currentness {
+        crate::HistoricalEbpfGraphRecoveryAuthorityCurrentness::Mismatch => {
+            crate::HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch
+        }
+        crate::HistoricalEbpfGraphRecoveryAuthorityCurrentness::Changed
+        | crate::HistoricalEbpfGraphRecoveryAuthorityCurrentness::Unavailable => {
+            crate::HistoricalEbpfGraphRecoveryProgress::AuthorityChanged
+        }
+    }
+}
+
 /// One indivisible terminal readback from the runtime. A persisted R5
 /// handoff carries its authenticated graph commitment; pristine absence is a
 /// separately classified, read-only point-in-time observation and can never
@@ -9481,6 +9495,15 @@ impl EbpfGtpuDataplaneBackend {
                 HistoricalEbpfGraphTerminalAbsenceProof::NotProven,
             )
         };
+        let authority_interrupted = |currentness| {
+            receipt(
+                HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    historical_recovery_currentness_progress(currentness),
+                ),
+                None,
+                HistoricalEbpfGraphTerminalAbsenceProof::NotProven,
+            )
+        };
         // These attestations are deliberately checked at the public
         // maintenance boundary, before runtime authority acquisition can
         // create or touch any compatibility-control object.
@@ -9574,7 +9597,11 @@ impl EbpfGtpuDataplaneBackend {
             Ok(outcome) => outcome,
             Err(error) => {
                 return if let Some(currentness) = currentness.first_failure() {
-                    Ok(authority_refused(currentness))
+                    // Once the runtime attempt has begun, an adapter error
+                    // cannot prove that no durable proof or unlink committed.
+                    // Preserve the sticky authority subtype as retry-required
+                    // progress instead of promising a pre-effect refusal.
+                    Ok(authority_interrupted(currentness))
                 } else {
                     Err(error)
                 };
@@ -9585,7 +9612,13 @@ impl EbpfGtpuDataplaneBackend {
         // runtime must never turn a fail-then-success external observation
         // into `Partial` or `IndeterminateState`.
         if let Some(currentness) = currentness.first_failure() {
-            return Ok(authority_refused(currentness));
+            return Ok(
+                if matches!(outcome, HistoricalEbpfGraphRecoveryOutcome::Refused(_)) {
+                    authority_refused(currentness)
+                } else {
+                    authority_interrupted(currentness)
+                },
+            );
         }
         let terminal = matches!(
             outcome,
@@ -9594,18 +9627,18 @@ impl EbpfGtpuDataplaneBackend {
         );
         if terminal {
             if let Some(currentness) = currentness.first_failure() {
-                return Ok(authority_refused(currentness));
+                return Ok(authority_interrupted(currentness));
             }
             if let Err(currentness) = currentness.verify_current() {
-                return Ok(authority_refused(currentness));
+                return Ok(authority_interrupted(currentness));
             }
         }
         let terminal_snapshot = if terminal {
             if let Some(currentness) = currentness.first_failure() {
-                return Ok(authority_refused(currentness));
+                return Ok(authority_interrupted(currentness));
             }
             if let Err(currentness) = currentness.verify_current() {
-                return Ok(authority_refused(currentness));
+                return Ok(authority_interrupted(currentness));
             }
             match self.inner.runtime.historical_recovery_terminal_snapshot(
                 replacement,
@@ -9620,7 +9653,7 @@ impl EbpfGtpuDataplaneBackend {
                     // probe retains that first failure, so classify it before
                     // exposing a generic adapter error to the caller.
                     return if let Some(currentness) = currentness.first_failure() {
-                        Ok(authority_refused(currentness))
+                        Ok(authority_interrupted(currentness))
                     } else {
                         Err(error)
                     };
@@ -9628,7 +9661,7 @@ impl EbpfGtpuDataplaneBackend {
                 Ok(Some(snapshot)) => snapshot,
                 Ok(None) => {
                     if let Some(currentness) = currentness.first_failure() {
-                        return Ok(authority_refused(currentness));
+                        return Ok(authority_interrupted(currentness));
                     }
                     return Ok(receipt(
                         HistoricalEbpfGraphRecoveryOutcome::Partial(
@@ -9644,10 +9677,10 @@ impl EbpfGtpuDataplaneBackend {
         };
         if terminal {
             if let Some(currentness) = currentness.first_failure() {
-                return Ok(authority_refused(currentness));
+                return Ok(authority_interrupted(currentness));
             }
             if let Err(currentness) = currentness.verify_current() {
-                return Ok(authority_refused(currentness));
+                return Ok(authority_interrupted(currentness));
             }
         }
         // Runtime authentication plus the terminal R5 readback is the first
@@ -16135,6 +16168,10 @@ mod aya_runtime {
             const { std::cell::Cell::new(false) };
         static HISTORICAL_25_TEST_CRASH_AFTER_INSTALLED_STAGING: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        static HISTORICAL_25_TEST_CRASH_AFTER_ORDINARY_EXCLUSION_MKDIR: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static HISTORICAL_25_TEST_CRASH_BEFORE_ORDINARY_EXCLUSION_RENAME: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
     }
 
     #[cfg(test)]
@@ -16145,6 +16182,11 @@ mod aya_runtime {
 
     #[cfg(test)]
     static HISTORICAL_25_TEST_ORDINARY_MUTATION_PAUSE: OnceLock<
+        Mutex<Option<Historical25OrdinaryMutationPause>>,
+    > = OnceLock::new();
+
+    #[cfg(test)]
+    static HISTORICAL_25_TEST_ORDINARY_EXCLUSION_RENAME_PAUSE: OnceLock<
         Mutex<Option<Historical25OrdinaryMutationPause>>,
     > = OnceLock::new();
 
@@ -16166,6 +16208,24 @@ mod aya_runtime {
     fn historical_25_test_crash_after_exclusion_retirement() {
         if HISTORICAL_25_TEST_CRASH_AFTER_EXCLUSION_RETIREMENT.with(|armed| armed.replace(false)) {
             panic!("test crash after durable ordinary-exclusion retirement");
+        }
+    }
+
+    #[cfg(test)]
+    fn historical_25_test_crash_after_ordinary_exclusion_mkdir() {
+        if HISTORICAL_25_TEST_CRASH_AFTER_ORDINARY_EXCLUSION_MKDIR
+            .with(|armed| armed.replace(false))
+        {
+            panic!("test crash after ordinary exclusion staging mkdir");
+        }
+    }
+
+    #[cfg(test)]
+    fn historical_25_test_crash_before_ordinary_exclusion_rename() {
+        if HISTORICAL_25_TEST_CRASH_BEFORE_ORDINARY_EXCLUSION_RENAME
+            .with(|armed| armed.replace(false))
+        {
+            panic!("test crash after durable ordinary exclusion staging");
         }
     }
 
@@ -16202,6 +16262,43 @@ mod aya_runtime {
             release
                 .recv()
                 .expect("ordinary mutation test releases the loader");
+        }
+    }
+
+    #[cfg(test)]
+    fn historical_25_arm_ordinary_exclusion_rename_pause() -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let pause =
+            HISTORICAL_25_TEST_ORDINARY_EXCLUSION_RENAME_PAUSE.get_or_init(|| Mutex::new(None));
+        let mut pause = pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            pause.is_none(),
+            "only one ordinary exclusion rename pause may be armed"
+        );
+        *pause = Some((entered_sender, release_receiver));
+        (entered_receiver, release_sender)
+    }
+
+    #[cfg(test)]
+    fn historical_25_pause_before_ordinary_exclusion_rename() {
+        let pause = HISTORICAL_25_TEST_ORDINARY_EXCLUSION_RENAME_PAUSE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((entered, release)) = pause {
+            entered
+                .send(())
+                .expect("ordinary exclusion rename test receiver remains live");
+            release
+                .recv()
+                .expect("ordinary exclusion rename test releases the publisher");
         }
     }
 
@@ -17390,7 +17487,8 @@ mod aya_runtime {
     /// Checksum-covered current recovery WAL phase.  Only a proof that was
     /// explicitly promoted to `Terminal` before it received the external
     /// authority-leaf pin can authorize an empty graph directory or a
-    /// graph-absent retry.  V2 had no terminal phase and is intentionally not
+    /// pin-graph-drained retry. The exact empty canonical namespace inode is
+    /// retained through terminal handoff. V2 had no terminal phase and is intentionally not
     /// decoded by this unreleased contract.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(u8)]
@@ -17523,6 +17621,11 @@ mod aya_runtime {
         /// The main proof was unlinked, leaving only the authority pin and the
         /// exact recorded graph directory with an empty inventory.
         AuthorityPinnedEmptyGraph,
+        /// A shipped-R5 terminal authority pin names an exact retained-empty
+        /// historical graph inode. The current terminal has no in-graph proof
+        /// pin to retire, and this inode must remain available for the admitted
+        /// successor to adopt.
+        AuthorityPinnedRetainedHistoricalGraph,
     }
 
     struct HeldCurrentPin {
@@ -19916,13 +20019,13 @@ mod aya_runtime {
 
         fn acquire_reconciler_ownership(
             pin_dir: &Path,
-            allow_admitted_successor: bool,
+            terminal_admission: Option<&CurrentTerminalAdmissionExecution<'_>>,
         ) -> Result<Arc<ReconcilerOwnership>, GtpuError> {
             let historical_25_ordinary_exclusion =
-                Self::acquire_historical_25_ordinary_exclusion(pin_dir, allow_admitted_successor)?;
+                Self::acquire_historical_25_ordinary_exclusion(pin_dir, terminal_admission)?;
             Self::acquire_reconciler_ownership_inner(
                 pin_dir,
-                None,
+                terminal_admission.map(|admission| admission.currentness),
                 true,
                 Some(historical_25_ordinary_exclusion),
             )
@@ -19996,9 +20099,13 @@ mod aya_runtime {
             drop(devices);
             exact_successor.map_or_else(
                 || {
-                    Self::acquire_existing_reconciler_ownership_with_currentness(
+                    let historical_25_ordinary_exclusion =
+                        Self::acquire_existing_historical_25_ordinary_exclusion(pin_dir, true)?;
+                    Self::acquire_reconciler_ownership_inner(
                         pin_dir,
-                        currentness,
+                        Some(currentness),
+                        false,
+                        Some(historical_25_ordinary_exclusion),
                     )
                 },
                 Ok,
@@ -20252,21 +20359,10 @@ mod aya_runtime {
                 "ebpf_reconciler_historical_handoff",
             )?;
             let historical_25_handoff = if let Some(proof) = receipt {
-                let historical_graph_is_absent = match fs::symlink_metadata(pin_dir) {
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-                    Ok(metadata)
-                        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
-                    {
-                        (metadata.dev(), metadata.ino())
-                            != (proof.record.graph_device, proof.record.graph_inode)
-                    }
-                    Ok(_) | Err(_) => false,
-                };
                 if !proof.record.is_terminal()
                     || proof.record.namespace_hash != namespace_hash
                     || proof.record.current_control_device != control_dir_metadata.dev()
                     || proof.record.current_control_inode != control_dir_metadata.ino()
-                    || !historical_graph_is_absent
                 {
                     return Err(state_indeterminate("ebpf_reconciler_historical_handoff"));
                 }
@@ -20397,7 +20493,7 @@ mod aya_runtime {
                 None,
                 "ebpf_reconciler_operation_lock",
             )?;
-            Ok(Arc::new(ReconcilerOwnership {
+            let ownership = Arc::new(ReconcilerOwnership {
                 _lease: control_dir,
                 _historical_25_ordinary_exclusion: historical_25_ordinary_exclusion,
                 bpffs_root_path: configured_root.to_path_buf(),
@@ -20415,7 +20511,17 @@ mod aya_runtime {
                 historical_25_handoff,
                 canonical_pin_dir: pin_dir.to_path_buf(),
                 namespace_hash,
-            }))
+            });
+            if let Some(handoff) = ownership.historical_25_handoff.as_ref() {
+                if !Self::historical_25_handoff_graph_layout_is_exact(
+                    &ownership,
+                    handoff,
+                    "ebpf_reconciler_historical_handoff",
+                )? {
+                    return Err(state_indeterminate("ebpf_reconciler_historical_handoff"));
+                }
+            }
+            Ok(ownership)
         }
 
         fn verify_historical_25_ordinary_exclusion_directory(
@@ -20555,9 +20661,59 @@ mod aya_runtime {
 
         fn acquire_historical_25_ordinary_exclusion(
             pin_dir: &Path,
+            terminal_admission: Option<&CurrentTerminalAdmissionExecution<'_>>,
+        ) -> Result<Historical25OrdinaryExclusion, GtpuError> {
+            // A historical-source successor deliberately retires its
+            // transient current WAL after broker admission. A fresh process
+            // can therefore have no affine admission object to consume, but
+            // may re-register the already-materialised exact current graph.
+            // This narrow durable discriminator is never enough to create a
+            // missing predecessor exclusion: the inner path requires that
+            // canonical inode to pre-exist before accepting a populated graph
+            // and reauthenticates the complete handoff/map graph under both
+            // flocks before any hook effect.
+            let exact_finalized_successor =
+                Self::historical_25_exact_finalized_successor_layout(pin_dir)?;
+            Self::acquire_historical_25_ordinary_exclusion_inner(
+                pin_dir,
+                terminal_admission,
+                terminal_admission.is_some() || exact_finalized_successor,
+                true,
+                None,
+            )
+        }
+
+        /// Reacquire only a previously published exact predecessor exclusion.
+        /// Successor inspection after process loss is an authority reader: it
+        /// may take the existing flock but must never manufacture a root,
+        /// staging leaf, or marker while reconstructing ownership.
+        fn acquire_existing_historical_25_ordinary_exclusion(
+            pin_dir: &Path,
             allow_admitted_successor: bool,
         ) -> Result<Historical25OrdinaryExclusion, GtpuError> {
+            Self::acquire_historical_25_ordinary_exclusion_inner(
+                pin_dir,
+                None,
+                allow_admitted_successor,
+                false,
+                None,
+            )
+        }
+
+        fn acquire_historical_25_ordinary_exclusion_inner(
+            pin_dir: &Path,
+            terminal_admission: Option<&CurrentTerminalAdmissionExecution<'_>>,
+            allow_admitted_successor: bool,
+            allow_create: bool,
+            staging_nonce: Option<[u8; 16]>,
+        ) -> Result<Historical25OrdinaryExclusion, GtpuError> {
             const OPERATION: &str = "ebpf_historical_25_ordinary_exclusion";
+            let require_admission_current = || {
+                terminal_admission.map_or(Ok(()), |admission| {
+                    Self::require_current_terminal_admission_current(admission, OPERATION)
+                })
+            };
+            require_admission_current()?;
             // Preserve the observation-only path discriminator ahead of any
             // authority-root creation. In particular, a foreign file,
             // symlink, or the complete shipped-25 graph must refuse with the
@@ -20574,25 +20730,33 @@ mod aya_runtime {
                     "pin namespace must have one final component",
                 )
             })?;
-            let (root, root_metadata, predecessor_root) =
-                match Self::open_or_create_bpffs_namespace_root(configured_root) {
-                    Ok((root, metadata)) => (root, metadata, false),
-                    Err(current_error) => {
-                        match Self::open_historical_25_bpffs_namespace_root(
-                            configured_root,
-                            OPERATION,
-                        ) {
-                            Ok((root, metadata)) => (root, metadata, true),
-                            Err(_) => return Err(current_error),
-                        }
+            let current_root = if allow_create {
+                require_admission_current()?;
+                let root = Self::open_or_create_bpffs_namespace_root(configured_root);
+                require_admission_current()?;
+                root
+            } else {
+                Self::open_bpffs_namespace_root(configured_root, false, OPERATION)
+            };
+            let (root, root_metadata, predecessor_root) = match current_root {
+                Ok((root, metadata)) => (root, metadata, false),
+                Err(current_error) => {
+                    match Self::open_historical_25_bpffs_namespace_root(configured_root, OPERATION)
+                    {
+                        Ok((root, metadata)) => (root, metadata, true),
+                        Err(_) => return Err(current_error),
                     }
-                };
-            if !predecessor_root {
-                match rustix::fs::mkdirat(
+                }
+            };
+            if !predecessor_root && allow_create {
+                require_admission_current()?;
+                let control_create = rustix::fs::mkdirat(
                     &root,
                     RECONCILER_CONTROL_DIRECTORY,
                     rustix::fs::Mode::from_bits_truncate(0o700),
-                ) {
+                );
+                require_admission_current()?;
+                match control_create {
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
                 }
@@ -20613,9 +20777,17 @@ mod aya_runtime {
             } else {
                 Self::verify_control_root(&control_root, None, OPERATION)?
             };
+            if allow_create {
+                match rustix::fs::flock(
+                    &control_root,
+                    rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                ) {
+                    Ok(()) => {}
+                    Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                    Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+                }
+            }
             let legacy_name = Self::historical_25_legacy_leaf_name(leaf)?;
-            let staging_name =
-                format!("{legacy_name}{HISTORICAL_25_ORDINARY_EXCLUSION_STAGING_SUFFIX}");
 
             let acquire_named = |descriptor: File| {
                 let (metadata, marker) = Self::verify_historical_25_ordinary_exclusion_directory(
@@ -20648,7 +20820,9 @@ mod aya_runtime {
                 Ok(descriptor) => {
                     let descriptor = File::from(descriptor);
                     match acquire_named(descriptor) {
-                        Ok(acquired) => acquired,
+                        Ok((descriptor, directory_metadata, marker_metadata)) => {
+                            (descriptor, directory_metadata, marker_metadata)
+                        }
                         Err(GtpuError::StateIndeterminate { .. }) => {
                             let predecessor = rustix::fs::openat(
                                 &control_root,
@@ -20682,19 +20856,48 @@ mod aya_runtime {
                     }
                 }
                 Err(rustix::io::Errno::NOENT) => {
+                    if !allow_create {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                    let graph_materialized = Self::historical_25_ordinary_graph_preflight(
+                        pin_dir,
+                        allow_admitted_successor,
+                    )?
+                    .is_some()
+                        && !Self::current_directory_entries(pin_dir)?.is_empty();
+                    if graph_materialized {
+                        // A materialised admitted successor must already be
+                        // paired with the canonical predecessor exclusion
+                        // established before its first graph effect. Never
+                        // manufacture that authority after the fact from a
+                        // merely current-shaped or partially published graph.
+                        return Err(state_indeterminate(OPERATION));
+                    }
                     Self::historical_25_ordinary_preflight(
                         pin_dir,
                         allow_admitted_successor,
                         None,
                     )?;
-                    match rustix::fs::mkdirat(
+                    let staging_nonce = match staging_nonce {
+                        Some(staging_nonce) if staging_nonce != [0; 16] => staging_nonce,
+                        Some(_) => return Err(state_indeterminate(OPERATION)),
+                        None => historical_25_handoff_nonce()?,
+                    };
+                    let staging_name = Self::historical_25_ordinary_exclusion_staging_name(
+                        &legacy_name,
+                        &staging_nonce,
+                    );
+                    require_admission_current()?;
+                    let staging_create = rustix::fs::mkdirat(
                         &control_root,
                         staging_name.as_str(),
                         rustix::fs::Mode::from_bits_truncate(0o700),
-                    ) {
+                    );
+                    require_admission_current()?;
+                    match staging_create {
                         Ok(()) => {}
-                        // A deterministic staging name that predates this
-                        // attempt has no creation provenance. Ordinary startup
+                        // A per-attempt staging name that predates this
+                        // attempt has no live creation provenance. Ordinary startup
                         // must neither adopt nor mutate it, even if it happens
                         // to be empty or marker-shaped.
                         Err(rustix::io::Errno::EXIST) => {
@@ -20702,6 +20905,8 @@ mod aya_runtime {
                         }
                         Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
                     }
+                    #[cfg(test)]
+                    historical_25_test_crash_after_ordinary_exclusion_mkdir();
                     let staging = rustix::fs::openat(
                         &control_root,
                         staging_name.as_str(),
@@ -20737,12 +20942,14 @@ mod aya_runtime {
                     if !entries.is_empty() {
                         return Err(state_indeterminate(OPERATION));
                     }
-                    rustix::fs::mkdirat(
+                    require_admission_current()?;
+                    let marker_create = rustix::fs::mkdirat(
                         &staging,
                         HISTORICAL_25_ORDINARY_EXCLUSION_MARKER,
                         rustix::fs::Mode::from_bits_truncate(0o700),
-                    )
-                    .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                    );
+                    require_admission_current()?;
+                    marker_create.map_err(|error| GtpuError::io(OPERATION, error.into()))?;
                     let (_, marker_metadata) =
                         Self::verify_historical_25_ordinary_exclusion_directory(
                             &staging,
@@ -20752,13 +20959,38 @@ mod aya_runtime {
                         )?;
                     Self::sync_control_directory(&staging, OPERATION)?;
                     Self::sync_control_directory(&control_root, OPERATION)?;
-                    match rustix::fs::renameat_with(
+                    #[cfg(test)]
+                    historical_25_test_crash_before_ordinary_exclusion_rename();
+                    #[cfg(test)]
+                    historical_25_pause_before_ordinary_exclusion_rename();
+                    require_admission_current()?;
+                    let named_staging = rustix::fs::openat(
+                        &control_root,
+                        staging_name.as_str(),
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map(File::from)
+                    .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                    Self::verify_historical_25_ordinary_exclusion_directory(
+                        &named_staging,
+                        Some((staging_metadata.dev(), staging_metadata.ino())),
+                        Some((marker_metadata.dev(), marker_metadata.ino())),
+                        OPERATION,
+                    )?;
+                    require_admission_current()?;
+                    let publication = rustix::fs::renameat_with(
                         &control_root,
                         staging_name.as_str(),
                         &control_root,
                         legacy_name.as_str(),
                         rustix::fs::RenameFlags::NOREPLACE,
-                    ) {
+                    );
+                    require_admission_current()?;
+                    match publication {
                         Ok(()) => {}
                         // Do not remove by pathname after a collision: the
                         // retained descriptor identifies our staging inode,
@@ -20790,12 +21022,58 @@ mod aya_runtime {
             Self::revalidate_historical_25_ordinary_exclusion(
                 pin_dir, &exclusion, None, OPERATION,
             )?;
-            Self::historical_25_ordinary_preflight(
-                pin_dir,
-                allow_admitted_successor,
-                Some(&exclusion),
-            )?;
+            require_admission_current()?;
+            if allow_create {
+                Self::historical_25_ordinary_preflight(
+                    pin_dir,
+                    allow_admitted_successor,
+                    Some(&exclusion),
+                )?;
+            }
+            // Existing-only acquisition grants no graph authority.  Its
+            // caller next locks the current leaf and validates the complete
+            // historical receipt/current WAL/map-inode relationship through
+            // `historical_25_handoff_graph_layout_is_exact`.  Running the
+            // ordinary preflight here would incorrectly require that same
+            // proven successor inode to remain empty before the current leaf
+            // can be locked.
             Ok(exclusion)
+        }
+
+        fn historical_25_ordinary_exclusion_staging_name(
+            legacy_name: &str,
+            nonce: &[u8; 16],
+        ) -> String {
+            format!(
+                "{legacy_name}{HISTORICAL_25_ORDINARY_EXCLUSION_STAGING_SUFFIX}-{}",
+                Self::lower_hex(nonce)
+            )
+        }
+
+        /// Recognize only the syntactically reserved, non-authoritative
+        /// ordinary-exclusion staging grammar. A crashed stage is never
+        /// opened, adopted, removed, or allowed to stand in for either the
+        /// predecessor leaf or the canonical exclusion. Preserving and
+        /// ignoring it lets a fresh random attempt recover liveness without
+        /// laundering same-shaped unknown state into authority.
+        fn historical_25_ordinary_exclusion_staging_name_is_reserved(
+            entry: &str,
+            legacy_name: &str,
+        ) -> bool {
+            entry.starts_with(legacy_name)
+                && Self::historical_25_ordinary_exclusion_staging_name_is_globally_reserved(entry)
+        }
+
+        fn historical_25_ordinary_exclusion_staging_name_is_globally_reserved(entry: &str) -> bool {
+            let Some((legacy_name, suffix)) = entry.split_at_checked(64) else {
+                return false;
+            };
+            Self::historical_25_decode_lower_hex::<32>(legacy_name).is_some()
+                && suffix
+                    .strip_prefix(HISTORICAL_25_ORDINARY_EXCLUSION_STAGING_SUFFIX)
+                    .and_then(|suffix| suffix.strip_prefix('-'))
+                    .and_then(Self::historical_25_decode_lower_hex::<16>)
+                    .is_some_and(|nonce| nonce != [0; 16])
         }
 
         fn historical_25_legacy_leaf_name(leaf: &std::ffi::OsStr) -> Result<String, GtpuError> {
@@ -21092,15 +21370,25 @@ mod aya_runtime {
         /// A shared predecessor control root can contain another namespace's
         /// independently authenticated native selector namespace, R5 terminal
         /// handoff, or exact installed staging leaf. Clean-target observation
-        /// preserves those disjoint, SDK-authored entries, but a name alone is
-        /// never enough: every component, marker, proof map, and record
-        /// binding is checked. Unknown, partial, and orphaned operation-lock
-        /// entries remain ambiguous and fail closed.
+        /// preserves those disjoint, SDK-authored entries. The sole name-only
+        /// exception is an exact nonzero-nonce ordinary-exclusion staging
+        /// name: it is classified only as inert, non-authoritative residue and
+        /// is never opened, adopted, or deleted. Same-target callers reject it
+        /// separately. Every authority-bearing component, marker, proof map,
+        /// and record binding is checked; unknown, partial, and orphaned
+        /// operation-lock entries remain ambiguous and fail closed.
         fn historical_25_other_namespace_entry_is_conclusive(
             control_root: &File,
             entry: &str,
             operation: &'static str,
         ) -> Result<bool, GtpuError> {
+            if Self::historical_25_ordinary_exclusion_staging_name_is_globally_reserved(entry) {
+                // Reserved ordinary staging names carry no authority. Never
+                // open, adopt, or delete one; merely exclude it from another
+                // tenant's root grammar so a crashed publisher cannot fence a
+                // disjoint namespace.
+                return Ok(true);
+            }
             let terminal_namespace = Self::historical_25_decode_lower_hex::<32>(entry);
             if let Some(namespace_hash) = terminal_namespace {
                 let descriptor = match rustix::fs::openat(
@@ -21313,15 +21601,28 @@ mod aya_runtime {
             descriptor: &File,
             operation: &'static str,
         ) -> Result<bool, GtpuError> {
+            let entries = match Self::historical_25_control_root_entries(descriptor, operation) {
+                Ok(entries) => entries,
+                Err(_) => return Ok(false),
+            };
+            if entries.as_slice() == [HISTORICAL_25_ORDINARY_EXCLUSION_MARKER] {
+                // Ordinary current ownership publishes this exact bounded
+                // predecessor-exclusion leaf before it creates the native
+                // current leaf.  The caller has already excluded the target's
+                // own deterministic legacy name, so a fully authenticated
+                // sibling exclusion is disjoint state to preserve, not target
+                // ambiguity.  A name, mode, or marker alone is insufficient:
+                // revalidate the complete one-child inode shape here.
+                return Ok(Self::verify_historical_25_ordinary_exclusion_directory(
+                    descriptor, None, None, operation,
+                )
+                .is_ok());
+            }
             let legacy_metadata =
                 match Self::historical_25_verify_legacy_directory(descriptor, None, operation) {
                     Ok(metadata) => metadata,
                     Err(_) => return Ok(false),
                 };
-            let entries = match Self::historical_25_legacy_entries(descriptor, operation) {
-                Ok(entries) => entries,
-                Err(_) => return Ok(false),
-            };
             if entries.is_empty() {
                 return Ok(true);
             }
@@ -21500,6 +21801,22 @@ mod aya_runtime {
             Ok(graph_metadata)
         }
 
+        /// Recognize only a fully materialised current map namespace. This is
+        /// not standalone graph authority: callers additionally require the
+        /// exact retained historical inode, canonical predecessor exclusion,
+        /// current handoff, selector schema, detached hooks, and both live
+        /// ownership flocks before registration can have an effect.
+        fn historical_25_exact_finalized_successor_layout(
+            pin_dir: &Path,
+        ) -> Result<bool, GtpuError> {
+            if Self::historical_25_ordinary_graph_preflight(pin_dir, false)?.is_none() {
+                return Ok(false);
+            }
+            let entries = Self::current_directory_entries(pin_dir)?;
+            Ok(entries.len() == CURRENT_MAP_NAMES.len()
+                && CURRENT_MAP_NAMES.iter().all(|name| entries.contains(*name)))
+        }
+
         /// Ordinary startup never manufactures a current authority object
         /// while a predecessor namespace might still own the same graph.
         /// This is deliberately an observation-only discriminator: dedicated
@@ -21511,7 +21828,7 @@ mod aya_runtime {
             exclusion: Option<&Historical25OrdinaryExclusion>,
         ) -> Result<(), GtpuError> {
             const OPERATION: &str = "ebpf_historical_25_ordinary_preflight";
-            let graph_metadata =
+            let _ =
                 Self::historical_25_ordinary_graph_preflight(pin_dir, allow_admitted_successor)?;
 
             let configured_root = pin_dir.parent().ok_or_else(|| {
@@ -21648,15 +21965,16 @@ mod aya_runtime {
                 OPERATION,
             )?;
             if let Some(receipt) = receipt {
-                let historical_graph_is_absent = graph_metadata.as_ref().is_none_or(|metadata| {
-                    (metadata.dev(), metadata.ino())
-                        != (receipt.record.graph_device, receipt.record.graph_inode)
-                });
                 if !receipt.record.is_terminal()
                     || receipt.record.namespace_hash != namespace_hash
                     || receipt.record.current_control_device != current_metadata.dev()
                     || receipt.record.current_control_inode != current_metadata.ino()
-                    || !historical_graph_is_absent
+                    || (!allow_admitted_successor
+                        && !Self::historical_25_retained_empty_graph_is_exact(
+                            pin_dir,
+                            receipt.record,
+                            OPERATION,
+                        )?)
                 {
                     return Err(state_indeterminate(OPERATION));
                 }
@@ -21777,6 +22095,10 @@ mod aya_runtime {
                 }
                 for entry in entries {
                     if entry == legacy_leaf
+                        || Self::historical_25_ordinary_exclusion_staging_name_is_reserved(
+                            &entry,
+                            &legacy_leaf,
+                        )
                         || entry == current_leaf
                         || entry.starts_with(&staging_prefix)
                         || !Self::historical_25_other_namespace_entry_is_conclusive(
@@ -21815,10 +22137,9 @@ mod aya_runtime {
         }
 
         /// Resume the sole legal state after the predecessor authority leaf has
-        /// been retired.  Absence alone is never success: the retained current
-        /// receipt, its exact leaf flock, the detached replacement, and every
-        /// hierarchy identity remain mandatory.  This closes the crash window
-        /// between legacy `rmdir` and terminal receipt publication.
+        /// been retired. Retained emptiness alone is never success: the
+        /// current receipt, exact leaf flock, detached replacement, graph
+        /// inode, and every hierarchy identity remain mandatory.
         fn historical_25_resume_without_legacy(
             pin_dir: &Path,
             replacement: (&str, u32),
@@ -21827,12 +22148,6 @@ mod aya_runtime {
             currentness: &dyn HistoricalEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
             const OPERATION: &str = "ebpf_historical_25_post_legacy_resume";
-            if !matches!(
-                fs::symlink_metadata(pin_dir),
-                Err(error) if error.kind() == io::ErrorKind::NotFound
-            ) {
-                return Err(state_indeterminate(OPERATION));
-            }
             let configured_root = pin_dir.parent().ok_or_else(|| {
                 GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
             })?;
@@ -21911,29 +22226,75 @@ mod aya_runtime {
             .map(File::from)
             .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
             let current_metadata = Self::verify_control_directory(&current, None, OPERATION)?;
+            let proof_path = configured_root
+                .join(RECONCILER_CONTROL_DIRECTORY)
+                .join(&current_leaf)
+                .join(HISTORICAL_25_ROOT_HANDOFF_MARKER);
+            let proof_presence = || match Self::historical_25_optional_pin_leaf_identity(
+                &current,
+                HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                "ebpf_historical_25_current_proof_presence",
+            ) {
+                Ok(None) => Some(false),
+                Ok(Some(_)) => Some(true),
+                Err(_) => None,
+            };
+            let proof_presence_before = proof_presence();
+            let proof_observation = Self::historical_25_read_proof_at(
+                &proof_path,
+                Historical25ProofLeaf::CurrentHandoff,
+                OPERATION,
+            );
+            let mut proof = match proof_observation {
+                Ok(Some(proof)) => proof,
+                Ok(None) | Err(_) => {
+                    let proof_presence_after = proof_presence();
+                    if proof_presence_before == Some(false) && proof_presence_after == Some(false) {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            };
+            // Reading an exact durable current proof establishes that legacy
+            // retirement may already have committed. From this point onward,
+            // every inability to authenticate or finish the same operation is
+            // committed partial progress, never a pre-effect refusal. This is
+            // deliberately local: a stably absent proof above still has no
+            // authenticated recovery effect to resume, while present,
+            // malformed, or observation-raced residue remains typed Partial.
+            macro_rules! committed_try {
+                ($result:expr) => {
+                    match $result {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                            ))
+                        }
+                    }
+                };
+            }
             match rustix::fs::flock(
                 &current,
                 rustix::fs::FlockOperation::NonBlockingLockExclusive,
             ) {
                 Ok(()) => {}
-                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
-                Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+                Err(_) => {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ))
+                }
             }
+            let authority_interrupted = |currentness| {
+                Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    super::historical_recovery_currentness_progress(currentness),
+                ))
+            };
             if let Err(currentness) = currentness.verify_current() {
-                return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
-                    super::historical_recovery_currentness_refusal(currentness),
-                ));
+                return authority_interrupted(currentness);
             }
-            let proof_path = configured_root
-                .join(RECONCILER_CONTROL_DIRECTORY)
-                .join(&current_leaf)
-                .join(HISTORICAL_25_ROOT_HANDOFF_MARKER);
-            let mut proof = Self::historical_25_read_proof_at(
-                &proof_path,
-                Historical25ProofLeaf::CurrentHandoff,
-                OPERATION,
-            )?
-            .ok_or_else(|| state_indeterminate(OPERATION))?;
             // An in-progress R5 record is an exact effect fence: a changed
             // scope/epoch/operation must never resume it. A fully terminal
             // handoff is different. With graph and predecessor absence
@@ -21947,8 +22308,8 @@ mod aya_runtime {
                 && (!proof.record.is_terminal()
                     || !proof.record.matches_authority_target(authority))
             {
-                return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
-                    HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch,
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch,
                 ));
             }
             let recheck = |expected: Historical25RecoveryProof,
@@ -21961,10 +22322,11 @@ mod aya_runtime {
                         .record
                         .matches_replacement(replacement, tc_priority)
                     || !expected.record.is_detached()
-                    || !matches!(
-                        fs::symlink_metadata(pin_dir),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound
-                    )
+                    || !Self::historical_25_retained_empty_graph_is_exact(
+                        pin_dir,
+                        expected.record,
+                        OPERATION,
+                    )?
                 {
                     return Err(state_indeterminate(OPERATION));
                 }
@@ -22074,38 +22436,34 @@ mod aya_runtime {
 
             match proof.record.phase {
                 Historical25RecoveryPhase::Terminal => {
-                    recheck(proof, true)?;
+                    committed_try!(recheck(proof, true));
                     if let Err(currentness) = currentness.verify_current() {
-                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
-                            super::historical_recovery_currentness_refusal(currentness),
-                        ));
+                        return authority_interrupted(currentness);
                     }
                     if terminal_adoption {
-                        let rebound = proof
+                        let rebound = committed_try!(proof
                             .record
                             .rebind_terminal_authority(authority)
-                            .ok_or_else(|| state_indeterminate(OPERATION))?;
-                        proof = Self::historical_25_write_proof_at(
+                            .ok_or_else(|| state_indeterminate(OPERATION)));
+                        proof = committed_try!(Self::historical_25_write_proof_at(
                             &proof_path,
                             Historical25ProofLeaf::CurrentHandoff,
                             proof,
                             rebound,
                             OPERATION,
                             currentness,
-                        )?;
+                        ));
                         if let Err(currentness) = currentness.verify_current() {
-                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
-                                super::historical_recovery_currentness_refusal(currentness),
-                            ));
+                            return authority_interrupted(currentness);
                         }
                         if !proof.record.matches_authority(authority) {
-                            return Err(state_indeterminate(OPERATION));
-                        }
-                        recheck(proof, true)?;
-                        if let Err(currentness) = currentness.verify_current() {
-                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
-                                super::historical_recovery_currentness_refusal(currentness),
+                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch,
                             ));
+                        }
+                        committed_try!(recheck(proof, true));
+                        if let Err(currentness) = currentness.verify_current() {
+                            return authority_interrupted(currentness);
                         }
                     }
                     return Ok(HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent);
@@ -22114,12 +22472,16 @@ mod aya_runtime {
                 // Our protocol retires that leaf strictly after publishing
                 // the exact operation marker, so proof-only state here is
                 // foreign/ambiguous removal rather than a resumable cut.
-                Historical25RecoveryPhase::GraphAbsent => recheck(proof, true)?,
+                Historical25RecoveryPhase::GraphAbsent => {
+                    committed_try!(recheck(proof, true));
+                }
                 Historical25RecoveryPhase::Qualified | Historical25RecoveryPhase::Installed => {
-                    return Err(state_indeterminate(OPERATION));
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
                 }
             }
-            let marker = rustix::fs::openat(
+            let marker = committed_try!(rustix::fs::openat(
                 &current,
                 HISTORICAL_25_OPERATION_LOCK_MARKER,
                 rustix::fs::OFlags::RDONLY
@@ -22129,35 +22491,33 @@ mod aya_runtime {
                 rustix::fs::Mode::empty(),
             )
             .map(File::from)
-            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
-            Self::verify_empty_marker_directory(&marker, None, OPERATION)?;
-            Self::sync_control_directory(&marker, OPERATION)?;
-            Self::sync_control_directory(&current, OPERATION)?;
-            recheck(proof, true)?;
-            let terminal = proof
+            .map_err(|error| GtpuError::io(OPERATION, error.into())));
+            committed_try!(Self::verify_empty_marker_directory(
+                &marker, None, OPERATION
+            ));
+            committed_try!(Self::sync_control_directory(&marker, OPERATION));
+            committed_try!(Self::sync_control_directory(&current, OPERATION));
+            committed_try!(recheck(proof, true));
+            let terminal = committed_try!(proof
                 .record
                 .advance_phase(Historical25RecoveryPhase::Terminal)
-                .ok_or_else(|| state_indeterminate(OPERATION))?;
+                .ok_or_else(|| state_indeterminate(OPERATION)));
             if let Err(currentness) = currentness.verify_current() {
-                return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
-                    super::historical_recovery_currentness_refusal(currentness),
-                ));
+                return authority_interrupted(currentness);
             }
-            proof = Self::historical_25_write_proof_at(
+            proof = committed_try!(Self::historical_25_write_proof_at(
                 &proof_path,
                 Historical25ProofLeaf::CurrentHandoff,
                 proof,
                 terminal,
                 OPERATION,
                 currentness,
-            )?;
+            ));
             if let Err(currentness) = currentness.verify_current() {
-                return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
-                    super::historical_recovery_currentness_refusal(currentness),
-                ));
+                return authority_interrupted(currentness);
             }
-            Self::sync_control_directory(&current, OPERATION)?;
-            recheck(proof, true)?;
+            committed_try!(Self::sync_control_directory(&current, OPERATION));
+            committed_try!(recheck(proof, true));
             Ok(HistoricalEbpfGraphRecoveryOutcome::Removed)
         }
 
@@ -22174,12 +22534,6 @@ mod aya_runtime {
             const OPERATION: &str = "ebpf_historical_25_terminal_receipt_read";
             Self::validate_replacement_identity(replacement.0, replacement.1)
                 .map_err(|_| state_indeterminate(OPERATION))?;
-            if !matches!(
-                fs::symlink_metadata(pin_dir),
-                Err(error) if error.kind() == io::ErrorKind::NotFound
-            ) {
-                return Err(state_indeterminate(OPERATION));
-            }
             let configured_root = pin_dir.parent().ok_or_else(|| {
                 GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
             })?;
@@ -22337,6 +22691,11 @@ mod aya_runtime {
                 || proof.record.current_control_inode != current_metadata.ino()
                 || !proof.record.matches_replacement(replacement, tc_priority)
                 || !proof.record.matches_authority(authority)
+                || !Self::historical_25_retained_empty_graph_is_exact(
+                    pin_dir,
+                    proof.record,
+                    OPERATION,
+                )?
             {
                 return Err(state_indeterminate(OPERATION));
             }
@@ -23147,6 +23506,111 @@ mod aya_runtime {
             }
         }
 
+        /// Re-prove the exact canonical graph inode retained by the shipped
+        /// R5 handoff.  Before successor admission it is empty.  During the
+        /// current-domain successor transaction it may contain only the
+        /// checksum-bound proof and the complete map inventory recorded by
+        /// that proof.  Once both transient proof pins are retired, the same
+        /// inode may contain only a complete current map graph.
+        ///
+        /// This is deliberately an inventory/identity gate, not permission
+        /// to mutate the graph.  Callers still need the operation flock and
+        /// their operation-specific live authority, hook, schema, target, and
+        /// graph checks before any effect.  A partial map publication, an
+        /// unbound map inventory, a mismatched proof, or any foreign entry is
+        /// indeterminate.
+        fn historical_25_handoff_graph_layout_is_exact(
+            ownership: &ReconcilerOwnership,
+            handoff: &Historical25RootHandoff,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            let historical = handoff.receipt.proof.record;
+            let historical_identity = (historical.graph_device, historical.graph_inode);
+            let graph = Self::historical_25_open_graph_path(
+                &ownership.canonical_pin_dir,
+                Some(historical_identity),
+                operation,
+            )?;
+            let entries = Self::historical_25_control_root_entries(&graph, operation)?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            if entries.is_empty() {
+                Self::historical_25_verify_graph_directory(
+                    &graph,
+                    Some(historical_identity),
+                    operation,
+                )?;
+                return Ok(true);
+            }
+
+            // Any materialised current successor has already crossed the
+            // admission-fenced mode transition in `prepare_*`; do not accept
+            // an umask-derived predecessor directory after it contains pins.
+            let metadata = Self::verify_private_bpffs_directory(&graph, operation)?;
+            if (metadata.dev(), metadata.ino()) != historical_identity
+                || !Self::current_terminal_successor_entries_are_bounded(&entries)
+            {
+                return Ok(false);
+            }
+            let proof_present = entries.contains(LEGACY_V2_TEARDOWN_PROOF_MAP);
+            let current_count = CURRENT_MAP_NAMES
+                .iter()
+                .filter(|name| entries.contains(**name))
+                .count();
+            let proof = Self::read_current_terminal_proof(ownership)?;
+            let main = Self::read_current_recovery_proof(ownership)?;
+
+            if current_count == 0 && entries.len() == usize::from(proof_present) {
+                let Some(proof) = proof else {
+                    return Ok(false);
+                };
+                return Ok(proof_present
+                    && main == Some(proof)
+                    && proof.record.phase == CurrentRecoveryPhase::SuccessorInProgress
+                    && Self::historical_handoff_matches_current_terminal(ownership, proof.record)
+                    && (
+                        proof.record.successor_graph_device,
+                        proof.record.successor_graph_inode,
+                    ) == historical_identity
+                    && proof.record.successor_map_ids == [0; CURRENT_MAP_NAMES.len()]);
+            }
+
+            if current_count != CURRENT_MAP_NAMES.len()
+                || entries.len() != CURRENT_MAP_NAMES.len() + usize::from(proof_present)
+            {
+                return Ok(false);
+            }
+            let map_ids = Self::pinned_map_ids(
+                &Self::pinned_map_identity(&ownership.canonical_pin_dir)
+                    .map_err(|_| state_indeterminate(operation))?,
+            );
+            if let Some(proof) = proof {
+                let graph_is_bound =
+                    Self::historical_handoff_matches_current_terminal(ownership, proof.record)
+                        && (
+                            proof.record.successor_graph_device,
+                            proof.record.successor_graph_inode,
+                        ) == historical_identity
+                        && proof.record.successor_map_ids == map_ids;
+                let proof_inventory_is_exact = if proof_present {
+                    main == Some(proof)
+                } else {
+                    main.is_none() && proof.record.phase == CurrentRecoveryPhase::SuccessorSealed
+                };
+                return Ok(graph_is_bound && proof_inventory_is_exact);
+            }
+
+            // After broker admission both transient pins are intentionally
+            // absent.  The persistent historical handoff still binds this
+            // exact inode and the ordinary current-graph gates validate its
+            // ABI, hooks, target and selector authority before use.  A stray
+            // current-source response-loss witness is not part of this
+            // historical provenance and must not be ignored.
+            Ok(!proof_present
+                && main.is_none()
+                && Self::read_current_finalized_successor_record(ownership, operation)?.is_none())
+        }
+
         /// The receipt makes a non-private predecessor root usable for exactly
         /// one root-bound current namespace.  It is not an inventory waiver:
         /// the marker inode is bound, the legacy leaf name must now be absent,
@@ -23206,27 +23670,15 @@ mod aya_runtime {
                 .join(ownership.control_root_name)
                 .join(&ownership.control_dir_name)
                 .join(HISTORICAL_25_ROOT_HANDOFF_MARKER);
-            let historical_graph_is_absent =
-                match fs::symlink_metadata(&ownership.canonical_pin_dir) {
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-                    Ok(metadata)
-                        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
-                    {
-                        (metadata.dev(), metadata.ino())
-                            != (
-                                handoff.receipt.proof.record.graph_device,
-                                handoff.receipt.proof.record.graph_inode,
-                            )
-                    }
-                    Ok(_) | Err(_) => false,
-                };
             if Self::historical_25_read_proof_at(
                 &proof_path,
                 Historical25ProofLeaf::CurrentHandoff,
                 operation,
             )? != Some(handoff.receipt.proof)
                 || !handoff.receipt.proof.record.is_terminal()
-                || !historical_graph_is_absent
+                || !Self::historical_25_handoff_graph_layout_is_exact(
+                    ownership, handoff, operation,
+                )?
             {
                 return Err(state_indeterminate(operation));
             }
@@ -26454,6 +26906,33 @@ mod aya_runtime {
             Ok(present)
         }
 
+        /// Prove the terminal substrate without deleting its pathname.  The
+        /// directory must be the exact inode sealed into the historical WAL
+        /// and must contain no surviving pin or foreign entry.  Retaining
+        /// this inode removes the non-conditional final `rmdir` race and lets
+        /// a separately broker-admitted current successor adopt the same
+        /// authenticated namespace.
+        fn historical_25_retained_empty_graph_is_exact(
+            pin_dir: &Path,
+            record: Historical25RecoveryRecord,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            let graph = Self::historical_25_open_graph_path(
+                pin_dir,
+                Some((record.graph_device, record.graph_inode)),
+                operation,
+            )?;
+            if !Self::historical_25_control_root_entries(&graph, operation)?.is_empty() {
+                return Ok(false);
+            }
+            Self::historical_25_verify_graph_directory(
+                &graph,
+                Some((record.graph_device, record.graph_inode)),
+                operation,
+            )?;
+            Ok(true)
+        }
+
         /// Check the checksum-sealed ordered removal WAL against the exact
         /// graph inventory.  A retry can observe only a committed absent
         /// prefix plus an optional prepared current pin; every hole, early
@@ -26462,19 +26941,11 @@ mod aya_runtime {
             pin_dir: &Path,
             record: Historical25RecoveryRecord,
         ) -> Result<bool, LegacyV2IdentityError> {
-            // A crash after the final `rmdir` but before publishing
-            // GraphAbsent is the sole legal whole-directory cut. The sealed
-            // Installed cursor proves all 25 individual unlinks completed;
-            // the caller re-proves every other fenced fact before phase
-            // advancement. An earlier or prepared cursor remains ambiguous.
             if matches!(
                 fs::symlink_metadata(pin_dir),
                 Err(error) if error.kind() == io::ErrorKind::NotFound
             ) {
-                return Ok(record.phase == Historical25RecoveryPhase::Installed
-                    && usize::from(record.removal_cursor)
-                        == PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()
-                    && record.prepared_removal == HISTORICAL_25_NO_PREPARED_REMOVAL);
+                return Ok(false);
             }
             let _ = Self::historical_25_recorded_pin_count(pin_dir, record)?;
             let cursor = usize::from(record.removal_cursor);
@@ -26737,76 +27208,6 @@ mod aya_runtime {
             Ok(Historical25PinUnlinkOutcome::Removed)
         }
 
-        fn historical_25_remove_graph_dir(
-            legacy: &Historical25LegacyOwnership,
-            current: &Historical25CurrentOwnership,
-            pin_dir: &Path,
-            proof: Historical25RecoveryProof,
-            replacement: (&str, u32),
-            tc_priority: u16,
-            currentness: &dyn super::HistoricalEbpfGraphRecoveryCurrentnessProbe,
-        ) -> Result<(), GtpuError> {
-            let record = proof.record;
-            if Self::historical_25_cleanup_effect_fence(
-                Historical25EffectFence::new(
-                    legacy,
-                    current,
-                    pin_dir,
-                    proof,
-                    replacement,
-                    tc_priority,
-                ),
-                true,
-                "ebpf_historical_25_graph_remove",
-            )? != 0
-            {
-                return Err(state_indeterminate("ebpf_historical_25_graph_remove"));
-            }
-            let (root, graph) = Self::historical_25_open_graph(
-                legacy,
-                pin_dir,
-                (record.graph_device, record.graph_inode),
-                "ebpf_historical_25_graph_remove",
-            )?;
-            let leaf = pin_dir
-                .file_name()
-                .ok_or_else(|| state_indeterminate("ebpf_historical_25_graph_remove"))?;
-            // Keep `graph` open through rmdir: it captures the exact directory
-            // whose empty inventory was just proven, while `root` is the
-            // re-opened authoritative parent used for the removal itself.
-            let metadata = graph
-                .metadata()
-                .map_err(|error| GtpuError::io("ebpf_historical_25_graph_remove", error))?;
-            if metadata.dev() != record.graph_device || metadata.ino() != record.graph_inode {
-                return Err(state_indeterminate("ebpf_historical_25_graph_remove"));
-            }
-            if Self::historical_25_cleanup_effect_fence(
-                Historical25EffectFence::new(
-                    legacy,
-                    current,
-                    pin_dir,
-                    proof,
-                    replacement,
-                    tc_priority,
-                ),
-                true,
-                "ebpf_historical_25_graph_remove",
-            )? != 0
-            {
-                return Err(state_indeterminate("ebpf_historical_25_graph_remove"));
-            }
-            Self::historical_25_require_effect_currentness(
-                currentness,
-                "ebpf_historical_25_graph_remove",
-            )?;
-            rustix::fs::unlinkat(&root, leaf, rustix::fs::AtFlags::REMOVEDIR)
-                .map_err(|error| GtpuError::io("ebpf_historical_25_graph_remove", error.into()))?;
-            Self::historical_25_require_effect_currentness(
-                currentness,
-                "ebpf_historical_25_graph_remove",
-            )
-        }
-
         fn historical_25_remove_proof(
             legacy: &Historical25LegacyOwnership,
             current: &Historical25CurrentOwnership,
@@ -26911,7 +27312,7 @@ mod aya_runtime {
             }
             Self::validate_replacement_identity(replacement.0, replacement.1)
                 .map_err(|_| state_indeterminate(operation))?;
-            if !matches!(fs::symlink_metadata(pin_dir), Err(error) if error.kind() == io::ErrorKind::NotFound)
+            if !Self::historical_25_retained_empty_graph_is_exact(pin_dir, proof.record, operation)?
                 || Self::historical_25_recorded_hook_states(
                     replacement.1,
                     tc_priority,
@@ -27178,7 +27579,11 @@ mod aya_runtime {
             if proof.record.phase != Historical25RecoveryPhase::GraphAbsent && !terminal
                 || !proof.record.matches_replacement(replacement, tc_priority)
                 || !proof.record.is_detached()
-                || !matches!(fs::symlink_metadata(pin_dir), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                || !Self::historical_25_retained_empty_graph_is_exact(
+                    pin_dir,
+                    proof.record,
+                    operation,
+                )?
             {
                 return Err(state_indeterminate(operation));
             }
@@ -27679,8 +28084,12 @@ mod aya_runtime {
                             tc_priority,
                             &identity,
                         )? != Historical25AttachmentIdentity::Detached
-                        || !Self::historical_25_maps_are_drained(pin_dir)
-                            .map_err(|_| state_indeterminate(OPERATION))?
+                        || !Self::historical_25_maps_are_drained(
+                            pin_dir,
+                            (proof.record.graph_device, proof.record.graph_inode),
+                            proof.record.map_ids,
+                        )
+                        .map_err(|_| state_indeterminate(OPERATION))?
                         || !Self::historical_25_program_references_absent(&proof.record.map_ids)?
                     {
                         return Err(state_indeterminate(OPERATION));
@@ -28057,7 +28466,8 @@ mod aya_runtime {
         /// Resume H/R/T after the legacy proof path was durably unpinned but
         /// before its now-empty leaf could be retired. The retained current
         /// GraphAbsent receipt is the only authority for this narrow state;
-        /// a missing graph and a missing legacy proof alone are never enough.
+        /// the exact retained-empty graph and missing legacy proof alone are
+        /// never enough without that receipt.
         fn historical_25_read_post_legacy_graph_absent_proof(
             pin_dir: &Path,
             legacy: &Historical25LegacyOwnership,
@@ -28143,19 +28553,22 @@ mod aya_runtime {
         }
 
         /// M: one exact, effect-local fence for every pin unlink, graph
-        /// rmdir, and dual-receipt phase transition after detachment.  The
+        /// pin unlink and dual-receipt phase transition after detachment. The
         /// proof is not merely a historical hint: it binds both authority
         /// leaves, the replacement identity, hooks, global program references
         /// and the exact surviving pin subset at the instant of the effect.
+        /// `recorded_pins_present` describes materialized graph pins, not the
+        /// retained canonical directory. GraphAbsent and Terminal keep that
+        /// exact empty inode as the successor handoff substrate.
         const fn historical_25_phase_is_consistent_with_graph_presence(
             phase: Historical25RecoveryPhase,
-            graph_present: bool,
+            recorded_pins_present: bool,
         ) -> bool {
             match phase {
-                Historical25RecoveryPhase::Qualified => graph_present,
+                Historical25RecoveryPhase::Qualified => recorded_pins_present,
                 Historical25RecoveryPhase::Installed => true,
-                Historical25RecoveryPhase::GraphAbsent => !graph_present,
-                Historical25RecoveryPhase::Terminal => !graph_present,
+                Historical25RecoveryPhase::GraphAbsent => !recorded_pins_present,
+                Historical25RecoveryPhase::Terminal => !recorded_pins_present,
             }
         }
 
@@ -28191,16 +28604,8 @@ mod aya_runtime {
             }
             match fs::symlink_metadata(pin_dir) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    if graph_required
-                        || !Self::historical_25_phase_is_consistent_with_graph_presence(
-                            proof.record.phase,
-                            false,
-                        )
-                    {
-                        Err(state_indeterminate(operation))
-                    } else {
-                        Ok(0)
-                    }
+                    let _ = graph_required;
+                    Err(state_indeterminate(operation))
                 }
                 Ok(metadata)
                     if metadata.file_type().is_dir()
@@ -28208,12 +28613,6 @@ mod aya_runtime {
                         && metadata.dev() == proof.record.graph_device
                         && metadata.ino() == proof.record.graph_inode =>
                 {
-                    if !Self::historical_25_phase_is_consistent_with_graph_presence(
-                        proof.record.phase,
-                        true,
-                    ) {
-                        return Err(state_indeterminate(operation));
-                    }
                     let _ = Self::historical_25_open_graph(
                         legacy,
                         pin_dir,
@@ -28222,7 +28621,16 @@ mod aya_runtime {
                     )?;
                     let remaining = Self::historical_25_recorded_pin_count(pin_dir, proof.record)
                         .map_err(|_| state_indeterminate(operation))?;
-                    if !Self::historical_25_surviving_maps_are_drained(pin_dir)
+                    let recorded_pins_present = remaining != 0;
+                    if graph_required != recorded_pins_present
+                        || !Self::historical_25_phase_is_consistent_with_graph_presence(
+                            proof.record.phase,
+                            recorded_pins_present,
+                        )
+                    {
+                        return Err(state_indeterminate(operation));
+                    }
+                    if !Self::historical_25_surviving_maps_are_drained(pin_dir, proof.record)
                         .map_err(|_| state_indeterminate(operation))?
                     {
                         return Err(state_indeterminate(operation));
@@ -28896,25 +29304,37 @@ mod aya_runtime {
         /// maps are actually empty. The caller's drain proof is necessary but
         /// not sufficient: a retained entry is contradictory kernel evidence
         /// and is never deleted by this operation.
-        fn historical_25_maps_are_drained(pin_dir: &Path) -> Result<bool, LegacyV2IdentityError> {
+        fn historical_25_maps_are_drained(
+            pin_dir: &Path,
+            graph_identity: (u64, u64),
+            expected_map_ids: [u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
+        ) -> Result<bool, LegacyV2IdentityError> {
             let graph = Self::historical_25_open_graph_path(
                 pin_dir,
-                None,
+                Some(graph_identity),
                 "ebpf_historical_25_drain_readback",
             )
             .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
             let open = |name: &str| {
-                Self::historical_25_open_pinned_map(
+                let (data, _) = Self::historical_25_open_pinned_map(
                     &graph,
                     name,
                     "ebpf_historical_25_drain_readback",
                 )
-                .map(|(data, _)| data)
-                .and_then(|data| {
-                    Map::from_map_data(data)
-                        .map_err(|_| state_indeterminate("ebpf_historical_25_drain_readback"))
-                })
-                .map_err(|_| LegacyV2IdentityError::Indeterminate)
+                .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                let expected_index = PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
+                    .iter()
+                    .position(|expected| *expected == name)
+                    .ok_or(LegacyV2IdentityError::Mismatch)?;
+                if data
+                    .info()
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                    .id()
+                    != expected_map_ids[expected_index]
+                {
+                    return Err(LegacyV2IdentityError::Indeterminate);
+                }
+                Map::from_map_data(data).map_err(|_| LegacyV2IdentityError::Indeterminate)
             };
             let far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(open(
                 MAP_UPLINK_FAR,
@@ -29025,7 +29445,7 @@ mod aya_runtime {
             Self::historical_25_fixed_arrays_are_canonical(&open)?;
             Self::historical_25_verify_graph_directory(
                 &graph,
-                None,
+                Some(graph_identity),
                 "ebpf_historical_25_drain_readback",
             )
             .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
@@ -29038,10 +29458,11 @@ mod aya_runtime {
         /// canonical-value invariant before the next unlink is authorized.
         fn historical_25_surviving_maps_are_drained(
             pin_dir: &Path,
+            record: Historical25RecoveryRecord,
         ) -> Result<bool, LegacyV2IdentityError> {
             let graph = Self::historical_25_open_graph_path(
                 pin_dir,
-                None,
+                Some((record.graph_device, record.graph_inode)),
                 "ebpf_historical_25_surviving_drain_readback",
             )
             .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
@@ -29062,6 +29483,18 @@ mod aya_runtime {
                 )
                 .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
                 if identity != opened_identity {
+                    return Err(LegacyV2IdentityError::Indeterminate);
+                }
+                let expected_index = PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
+                    .iter()
+                    .position(|expected| *expected == name)
+                    .ok_or(LegacyV2IdentityError::Mismatch)?;
+                if data
+                    .info()
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                    .id()
+                    != record.map_ids[expected_index]
+                {
                     return Err(LegacyV2IdentityError::Indeterminate);
                 }
                 Map::from_map_data(data)
@@ -29236,7 +29669,7 @@ mod aya_runtime {
             }
             Self::historical_25_verify_graph_directory(
                 &graph,
-                None,
+                Some((record.graph_device, record.graph_inode)),
                 "ebpf_historical_25_surviving_drain_readback",
             )
             .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
@@ -31358,10 +31791,11 @@ mod aya_runtime {
                         terminal.record,
                     ) && Self::historical_25_program_references_absent(
                         &handoff.receipt.proof.record.map_ids,
-                    )? && matches!(
-                        fs::symlink_metadata(&ownership.canonical_pin_dir),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound
-                    ))
+                    )? && Self::historical_25_retained_empty_graph_is_exact(
+                        &ownership.canonical_pin_dir,
+                        handoff.receipt.proof.record,
+                        "ebpf_current_terminal_historical_source",
+                    )?)
                 }
             }
         }
@@ -31405,6 +31839,19 @@ mod aya_runtime {
                 if entry == ownership.control_dir_name {
                     target_leaf_present = true;
                     continue;
+                }
+                if Self::historical_25_ordinary_exclusion_staging_name_is_reserved(
+                    &entry,
+                    &legacy_leaf,
+                ) {
+                    if Self::revalidate_owned_historical_25_ordinary_exclusion(
+                        ownership,
+                        &legacy_leaf,
+                        operation,
+                    )? {
+                        continue;
+                    }
+                    return Ok(false);
                 }
                 if entry == legacy_leaf {
                     if Self::revalidate_owned_historical_25_ordinary_exclusion(
@@ -31475,7 +31922,12 @@ mod aya_runtime {
                     target_leaf_present = true;
                 } else if native_operation_lock == Some(entry.as_str()) {
                     native_operation_lock_present = true;
-                } else if entry == legacy_leaf {
+                } else if entry == legacy_leaf
+                    || Self::historical_25_ordinary_exclusion_staging_name_is_reserved(
+                        &entry,
+                        &legacy_leaf,
+                    )
+                {
                     if !Self::revalidate_owned_historical_25_ordinary_exclusion(
                         ownership,
                         &legacy_leaf,
@@ -31528,6 +31980,16 @@ mod aya_runtime {
                         .then_some(CurrentTerminalPublicationCut::AuthorityOnly))
                 }
                 Err(_) => Err(state_indeterminate(operation)),
+                Ok(metadata)
+                    if metadata.file_type().is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && expected.record.terminal_source
+                            == CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff =>
+                {
+                    Ok((authority == Some(expected) && main.is_none()).then_some(
+                        CurrentTerminalPublicationCut::AuthorityPinnedRetainedHistoricalGraph,
+                    ))
+                }
                 Ok(metadata)
                     if metadata.file_type().is_dir()
                         && !metadata.file_type().is_symlink()
@@ -31603,7 +32065,10 @@ mod aya_runtime {
                     tc_priority,
                     operation,
                 )?,
-                Some(CurrentTerminalPublicationCut::AuthorityOnly)
+                Some(
+                    CurrentTerminalPublicationCut::AuthorityOnly
+                        | CurrentTerminalPublicationCut::AuthorityPinnedRetainedHistoricalGraph
+                )
             ))
         }
 
@@ -31980,44 +32445,61 @@ mod aya_runtime {
                     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
                 {
                     let entries = Self::current_directory_entries(&ownership.canonical_pin_dir)?;
-                    if !proof.record.is_successor()
-                        || configuration.is_some_and(|configuration| {
-                            !proof.record.successor_target_matches(
-                                receipt_commitment,
+                    if proof.record.is_terminal() {
+                        if main.is_some()
+                            || !entries.is_empty()
+                            || !Self::current_terminal_target_is_exact(
+                                ownership,
+                                operation_lock,
+                                proof,
                                 replacement,
                                 tc_priority,
-                                configuration,
-                            )
-                        })
-                    {
-                        return Err(state_indeterminate(OPERATION));
-                    }
-                    let graph_unbound_cut = proof.record.successor_graph_device == 0
-                        && proof.record.successor_graph_inode == 0
-                        && main.is_none()
-                        && entries.is_empty();
-                    let graph_bound_pre_pin_cut = proof.record.successor_graph_device != 0
-                        && (metadata.dev(), metadata.ino())
-                            == (
-                                proof.record.successor_graph_device,
-                                proof.record.successor_graph_inode,
-                            )
-                        && main.is_none()
-                        && entries.is_empty();
-                    let graph_bound_pinned_cut = proof.record.successor_graph_device != 0
-                        && (metadata.dev(), metadata.ino())
-                            == (
-                                proof.record.successor_graph_device,
-                                proof.record.successor_graph_inode,
-                            )
-                        && main == Some(proof)
-                        && entries.contains(LEGACY_V2_TEARDOWN_PROOF_MAP)
-                        && entries.iter().all(|entry| {
-                            entry == LEGACY_V2_TEARDOWN_PROOF_MAP
-                                || CURRENT_MAP_NAMES.contains(&entry.as_str())
-                        });
-                    if !graph_unbound_cut && !graph_bound_pre_pin_cut && !graph_bound_pinned_cut {
-                        return Err(state_indeterminate(OPERATION));
+                                OPERATION,
+                            )?
+                        {
+                            return Err(state_indeterminate(OPERATION));
+                        }
+                    } else {
+                        if !proof.record.is_successor()
+                            || configuration.is_some_and(|configuration| {
+                                !proof.record.successor_target_matches(
+                                    receipt_commitment,
+                                    replacement,
+                                    tc_priority,
+                                    configuration,
+                                )
+                            })
+                        {
+                            return Err(state_indeterminate(OPERATION));
+                        }
+                        let graph_unbound_cut = proof.record.successor_graph_device == 0
+                            && proof.record.successor_graph_inode == 0
+                            && main.is_none()
+                            && entries.is_empty();
+                        let graph_bound_pre_pin_cut = proof.record.successor_graph_device != 0
+                            && (metadata.dev(), metadata.ino())
+                                == (
+                                    proof.record.successor_graph_device,
+                                    proof.record.successor_graph_inode,
+                                )
+                            && main.is_none()
+                            && entries.is_empty();
+                        let graph_bound_pinned_cut = proof.record.successor_graph_device != 0
+                            && (metadata.dev(), metadata.ino())
+                                == (
+                                    proof.record.successor_graph_device,
+                                    proof.record.successor_graph_inode,
+                                )
+                            && main == Some(proof)
+                            && entries.contains(LEGACY_V2_TEARDOWN_PROOF_MAP)
+                            && entries.iter().all(|entry| {
+                                entry == LEGACY_V2_TEARDOWN_PROOF_MAP
+                                    || CURRENT_MAP_NAMES.contains(&entry.as_str())
+                            });
+                        if !graph_unbound_cut && !graph_bound_pre_pin_cut && !graph_bound_pinned_cut
+                        {
+                            return Err(state_indeterminate(OPERATION));
+                        }
                     }
                 }
                 Ok(_) => return Err(state_indeterminate(OPERATION)),
@@ -32214,13 +32696,17 @@ mod aya_runtime {
                 || !proof.record.matches_authority(admission.authority)
                 || !Self::current_terminal_root_layout_is_exact(ownership, OPERATION)?
             {
-                return Err(state_indeterminate(OPERATION));
+                return Err(state_indeterminate(
+                    "ebpf_current_successor_prepare_terminal_authority",
+                ));
             }
             Self::revalidate_current_control_path(ownership, operation_lock, OPERATION)?;
             let (surviving_authority, surviving_decommission) =
                 Self::marker_inventory(&ownership._lease)?;
             if !surviving_authority.is_empty() || !surviving_decommission.is_empty() {
-                return Err(state_indeterminate(OPERATION));
+                return Err(state_indeterminate(
+                    "ebpf_current_successor_prepare_surviving_authority",
+                ));
             }
 
             if proof.record.is_terminal() {
@@ -32230,7 +32716,9 @@ mod aya_runtime {
                         Ok(true)
                     )
                 {
-                    return Err(state_indeterminate(OPERATION));
+                    return Err(state_indeterminate(
+                        "ebpf_current_successor_prepare_terminal_source",
+                    ));
                 }
                 let prepared = proof
                     .record
@@ -32243,7 +32731,7 @@ mod aya_runtime {
                     proof,
                     prepared,
                     admission,
-                    OPERATION,
+                    "ebpf_current_successor_prepare_intent_publish",
                 )?;
                 Self::sync_control_directory(&ownership._lease, OPERATION)?;
                 Self::require_current_terminal_admission_current(admission, OPERATION)?;
@@ -32262,107 +32750,248 @@ mod aya_runtime {
             let staging_metadata = fs::symlink_metadata(&staging_path);
 
             if proof.record.successor_graph_device == 0 {
-                if proof.record.successor_graph_inode != 0
-                    || !matches!(
+                if proof.record.successor_graph_inode != 0 {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                let retained_historical_identity = if proof.record.terminal_source
+                    == CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff
+                {
+                    let handoff = ownership
+                        .historical_25_handoff
+                        .as_ref()
+                        .ok_or_else(|| state_indeterminate(OPERATION))?;
+                    if !Self::historical_handoff_matches_current_terminal(ownership, proof.record)
+                        || !Self::historical_25_retained_empty_graph_is_exact(
+                            &ownership.canonical_pin_dir,
+                            handoff.receipt.proof.record,
+                            OPERATION,
+                        )?
+                    {
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_retained_source",
+                        ));
+                    }
+                    Some((
+                        handoff.receipt.proof.record.graph_device,
+                        handoff.receipt.proof.record.graph_inode,
+                    ))
+                } else {
+                    None
+                };
+
+                if let Some(identity) = retained_historical_identity {
+                    if !matches!(
                         canonical_metadata,
+                        Ok(ref metadata)
+                            if metadata.file_type().is_dir()
+                                && !metadata.file_type().is_symlink()
+                                && (metadata.dev(), metadata.ino()) == identity
+                    ) || !matches!(
+                        staging_metadata,
                         Err(ref error) if error.kind() == io::ErrorKind::NotFound
-                    )
-                    || !matches!(
+                    ) || !matches!(
                         Self::replacement_cleanup_absence_proven(replacement, tc_priority),
                         Ok(true)
-                    )
-                {
-                    return Err(state_indeterminate(OPERATION));
-                }
-                match staging_metadata {
-                    Ok(metadata) => {
-                        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                            return Err(state_indeterminate(OPERATION));
-                        }
-                        let (root, staging, _) = Self::open_current_terminal_successor_directory(
+                    ) {
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_retained_layout",
+                        ));
+                    }
+                    // The shipped writer created this product-owned leaf with
+                    // an umask-governed mode (normally 0755). Once the exact
+                    // terminal handoff and broker admission are both live,
+                    // tighten that same inode to the current private 0700 ABI
+                    // before binding it as the successor graph. Historical
+                    // verification also accepts 0700, so a crash at either
+                    // side of this idempotent transition remains resumable.
+                    let retained = Self::historical_25_open_graph_path(
+                        &ownership.canonical_pin_dir,
+                        Some(identity),
+                        "ebpf_current_successor_prepare_retained_mode",
+                    )?;
+                    if !Self::historical_25_control_root_entries(
+                        &retained,
+                        "ebpf_current_successor_prepare_retained_mode",
+                    )?
+                    .is_empty()
+                    {
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_retained_mode",
+                        ));
+                    }
+                    Self::require_current_terminal_admission_current(
+                        admission,
+                        "ebpf_current_successor_prepare_retained_mode",
+                    )?;
+                    rustix::fs::fchmod(&retained, rustix::fs::Mode::from_bits_truncate(0o700))
+                        .map_err(|error| {
+                            GtpuError::io(
+                                "ebpf_current_successor_prepare_retained_mode",
+                                error.into(),
+                            )
+                        })?;
+                    Self::sync_control_directory(
+                        &retained,
+                        "ebpf_current_successor_prepare_retained_mode",
+                    )?;
+                    Self::require_current_terminal_admission_current(
+                        admission,
+                        "ebpf_current_successor_prepare_retained_mode",
+                    )?;
+                    let retained_metadata = Self::verify_private_bpffs_directory(
+                        &retained,
+                        "ebpf_current_successor_prepare_retained_mode",
+                    )?;
+                    if (retained_metadata.dev(), retained_metadata.ino()) != identity {
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_retained_mode",
+                        ));
+                    }
+                    let bound = proof
+                        .record
+                        .bind_successor_graph(
+                            receipt,
+                            replacement,
+                            tc_priority,
+                            configuration,
+                            identity,
+                        )
+                        .ok_or_else(|| {
+                            state_indeterminate("ebpf_current_successor_prepare_retained_bind")
+                        })?;
+                    Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                    proof = Self::rewrite_current_recovery_record_at(
+                        ownership,
+                        Self::current_recovery_terminal_proof_path(ownership)?,
+                        proof,
+                        bound,
+                        admission,
+                        "ebpf_current_successor_prepare_retained_bind_publish",
+                    )?;
+                    Self::sync_control_directory(&ownership._lease, OPERATION)?;
+                    let (_, retained) = Self::open_current_pin_cleanup_descriptors(
+                        ownership,
+                        Some(identity),
+                        OPERATION,
+                    )?;
+                    if !Self::current_directory_entries_at(&retained, OPERATION)?.is_empty()
+                        || !Self::historical_handoff_matches_current_terminal(
                             ownership,
                             proof.record,
-                            None,
-                            OPERATION,
-                        )?;
-                        let held = Self::verify_private_bpffs_directory(&staging, OPERATION)?;
-                        let identity = (held.dev(), held.ino());
-                        if identity != (metadata.dev(), metadata.ino())
-                            || !Self::current_directory_entries_at(&staging, OPERATION)?.is_empty()
-                        {
-                            return Err(state_indeterminate(OPERATION));
-                        }
-                        let leaf = Self::current_terminal_successor_staging_leaf(proof.record)?;
-                        Self::require_named_private_directory_identity(
-                            &root,
-                            std::ffi::OsStr::new(&leaf),
-                            identity,
-                            OPERATION,
-                        )?;
-                        Self::require_current_terminal_admission_current(admission, OPERATION)?;
-                        Self::require_named_private_directory_identity(
-                            &root,
-                            std::ffi::OsStr::new(&leaf),
-                            identity,
-                            OPERATION,
-                        )?;
-                        rustix::fs::unlinkat(&root, leaf.as_str(), rustix::fs::AtFlags::REMOVEDIR)
-                            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
-                        drop(staging);
-                        Self::sync_control_directory(&root, OPERATION)?;
-                        Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                        )
+                    {
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_retained_recheck",
+                        ));
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(_) => return Err(state_indeterminate(OPERATION)),
-                }
-                let root = Self::open_current_bpffs_root(ownership, OPERATION)?;
-                let leaf = Self::current_terminal_successor_staging_leaf(proof.record)?;
-                Self::require_current_terminal_admission_current(admission, OPERATION)?;
-                rustix::fs::mkdirat(
-                    &root,
-                    leaf.as_str(),
-                    rustix::fs::Mode::from_bits_truncate(0o700),
-                )
-                .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
-                Self::require_current_terminal_admission_current(admission, OPERATION)?;
-                let (_, staging, _) = Self::open_current_terminal_successor_directory(
-                    ownership,
-                    proof.record,
-                    None,
-                    OPERATION,
-                )?;
-                let metadata = Self::verify_private_bpffs_directory(&staging, OPERATION)?;
-                let identity = (metadata.dev(), metadata.ino());
-                Self::require_named_private_directory_identity(
-                    &root,
-                    std::ffi::OsStr::new(&leaf),
-                    identity,
-                    OPERATION,
-                )?;
-                if !Self::current_directory_entries_at(&staging, OPERATION)?.is_empty() {
-                    return Err(state_indeterminate(OPERATION));
-                }
-                let bound = proof
-                    .record
-                    .bind_successor_graph(
-                        receipt,
-                        replacement,
-                        tc_priority,
-                        configuration,
-                        identity,
+                    Self::sync_control_directory(&retained, OPERATION)?;
+                    Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                } else {
+                    if !matches!(
+                        canonical_metadata,
+                        Err(ref error) if error.kind() == io::ErrorKind::NotFound
+                    ) || !matches!(
+                        Self::replacement_cleanup_absence_proven(replacement, tc_priority),
+                        Ok(true)
+                    ) {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                    match staging_metadata {
+                        Ok(metadata) => {
+                            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                                return Err(state_indeterminate(OPERATION));
+                            }
+                            let (root, staging, _) =
+                                Self::open_current_terminal_successor_directory(
+                                    ownership,
+                                    proof.record,
+                                    None,
+                                    OPERATION,
+                                )?;
+                            let held = Self::verify_private_bpffs_directory(&staging, OPERATION)?;
+                            let identity = (held.dev(), held.ino());
+                            if identity != (metadata.dev(), metadata.ino())
+                                || !Self::current_directory_entries_at(&staging, OPERATION)?
+                                    .is_empty()
+                            {
+                                return Err(state_indeterminate(OPERATION));
+                            }
+                            let leaf = Self::current_terminal_successor_staging_leaf(proof.record)?;
+                            Self::require_named_private_directory_identity(
+                                &root,
+                                std::ffi::OsStr::new(&leaf),
+                                identity,
+                                OPERATION,
+                            )?;
+                            Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                            Self::require_named_private_directory_identity(
+                                &root,
+                                std::ffi::OsStr::new(&leaf),
+                                identity,
+                                OPERATION,
+                            )?;
+                            rustix::fs::unlinkat(
+                                &root,
+                                leaf.as_str(),
+                                rustix::fs::AtFlags::REMOVEDIR,
+                            )
+                            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                            drop(staging);
+                            Self::sync_control_directory(&root, OPERATION)?;
+                            Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(_) => return Err(state_indeterminate(OPERATION)),
+                    }
+                    let root = Self::open_current_bpffs_root(ownership, OPERATION)?;
+                    let leaf = Self::current_terminal_successor_staging_leaf(proof.record)?;
+                    Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                    rustix::fs::mkdirat(
+                        &root,
+                        leaf.as_str(),
+                        rustix::fs::Mode::from_bits_truncate(0o700),
                     )
-                    .ok_or_else(|| state_indeterminate(OPERATION))?;
-                proof = Self::rewrite_current_recovery_record_at(
-                    ownership,
-                    Self::current_recovery_terminal_proof_path(ownership)?,
-                    proof,
-                    bound,
-                    admission,
-                    OPERATION,
-                )?;
-                Self::sync_control_directory(&ownership._lease, OPERATION)?;
-                Self::sync_control_directory(&root, OPERATION)?;
-                Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                    .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                    Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                    let (_, staging, _) = Self::open_current_terminal_successor_directory(
+                        ownership,
+                        proof.record,
+                        None,
+                        OPERATION,
+                    )?;
+                    let metadata = Self::verify_private_bpffs_directory(&staging, OPERATION)?;
+                    let identity = (metadata.dev(), metadata.ino());
+                    Self::require_named_private_directory_identity(
+                        &root,
+                        std::ffi::OsStr::new(&leaf),
+                        identity,
+                        OPERATION,
+                    )?;
+                    if !Self::current_directory_entries_at(&staging, OPERATION)?.is_empty() {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                    let bound = proof
+                        .record
+                        .bind_successor_graph(
+                            receipt,
+                            replacement,
+                            tc_priority,
+                            configuration,
+                            identity,
+                        )
+                        .ok_or_else(|| state_indeterminate(OPERATION))?;
+                    proof = Self::rewrite_current_recovery_record_at(
+                        ownership,
+                        Self::current_recovery_terminal_proof_path(ownership)?,
+                        proof,
+                        bound,
+                        admission,
+                        OPERATION,
+                    )?;
+                    Self::sync_control_directory(&ownership._lease, OPERATION)?;
+                    Self::sync_control_directory(&root, OPERATION)?;
+                    Self::require_current_terminal_admission_current(admission, OPERATION)?;
+                }
             }
 
             let graph_identity = (
@@ -32400,11 +33029,17 @@ mod aya_runtime {
                     )?;
                     (path, pin, false)
                 }
-                _ => return Err(state_indeterminate(OPERATION)),
+                _ => {
+                    return Err(state_indeterminate(
+                        "ebpf_current_successor_prepare_graph_identity",
+                    ))
+                }
             };
             let entries = Self::current_directory_entries_at(&pin, OPERATION)?;
             if !Self::current_terminal_successor_entries_are_exact(proof.record, &entries) {
-                return Err(state_indeterminate(OPERATION));
+                return Err(state_indeterminate(
+                    "ebpf_current_successor_prepare_graph_inventory",
+                ));
             }
             let proof_path = Self::historical_25_descriptor_relative_pin_path(
                 &pin,
@@ -32419,37 +33054,56 @@ mod aya_runtime {
                     && canonical_published => {}
                 None => {
                     if !entries.is_empty() {
-                        return Err(state_indeterminate(OPERATION));
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_proof_inventory",
+                        ));
                     }
                     let source_path = Self::current_recovery_terminal_proof_path(ownership)?;
-                    let data = MapData::from_pin(&source_path)
-                        .map_err(|_| state_indeterminate(OPERATION))?;
+                    let data = MapData::from_pin(&source_path).map_err(|_| {
+                        state_indeterminate("ebpf_current_successor_prepare_proof_source")
+                    })?;
                     if data
                         .info()
-                        .map_err(|_| state_indeterminate(OPERATION))?
+                        .map_err(|_| {
+                            state_indeterminate("ebpf_current_successor_prepare_proof_source")
+                        })?
                         .id()
                         != proof.map_id
                     {
-                        return Err(state_indeterminate(OPERATION));
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_proof_source",
+                        ));
                     }
                     let map = Array::<_, [u8; CURRENT_RECOVERY_PROOF_LEN]>::try_from(
-                        Map::from_map_data(data).map_err(|_| state_indeterminate(OPERATION))?,
+                        Map::from_map_data(data).map_err(|_| {
+                            state_indeterminate("ebpf_current_successor_prepare_proof_source")
+                        })?,
                     )
-                    .map_err(|_| state_indeterminate(OPERATION))?;
+                    .map_err(|_| {
+                        state_indeterminate("ebpf_current_successor_prepare_proof_source")
+                    })?;
                     Self::require_current_terminal_admission_current(admission, OPERATION)?;
                     if map.pin(&proof_path).is_err()
                         || Self::read_current_recovery_proof_at(proof_path, ownership, OPERATION)?
                             != Some(proof)
                     {
-                        return Err(state_indeterminate(OPERATION));
+                        return Err(state_indeterminate(
+                            "ebpf_current_successor_prepare_proof_publish",
+                        ));
                     }
                     Self::sync_control_directory(&pin, OPERATION)?;
                     Self::require_current_terminal_admission_current(admission, OPERATION)?;
                 }
-                Some(_) => return Err(state_indeterminate(OPERATION)),
+                Some(_) => {
+                    return Err(state_indeterminate(
+                        "ebpf_current_successor_prepare_proof_mismatch",
+                    ))
+                }
             }
             if Self::read_current_terminal_proof(ownership)? != Some(proof) {
-                return Err(state_indeterminate(OPERATION));
+                return Err(state_indeterminate(
+                    "ebpf_current_successor_prepare_terminal_readback",
+                ));
             }
             Self::require_current_terminal_admission_current(admission, OPERATION)?;
             Ok(Some(CurrentTerminalSuccessorPreparation {
@@ -32894,10 +33548,11 @@ mod aya_runtime {
             let exact_preflight = || {
                 Self::revalidate_current_control_path(ownership, operation_lock, OPERATION)?;
                 if !matches!(Self::read_current_recovery_proof(ownership), Ok(None))
-                    || !matches!(
-                        fs::symlink_metadata(&ownership.canonical_pin_dir),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound
-                    )
+                    || !Self::historical_25_retained_empty_graph_is_exact(
+                        &ownership.canonical_pin_dir,
+                        handoff.receipt.proof.record,
+                        OPERATION,
+                    )?
                     || !matches!(
                         Self::replacement_cleanup_absence_proven(replacement, tc_priority),
                         Ok(true)
@@ -33022,7 +33677,8 @@ mod aya_runtime {
                 }
                 CurrentTerminalPublicationCut::AuthorityOnly
                 | CurrentTerminalPublicationCut::DualPinned
-                | CurrentTerminalPublicationCut::AuthorityPinnedEmptyGraph => {
+                | CurrentTerminalPublicationCut::AuthorityPinnedEmptyGraph
+                | CurrentTerminalPublicationCut::AuthorityPinnedRetainedHistoricalGraph => {
                     Self::current_recovery_terminal_proof_path(ownership)?
                 }
             };
@@ -33195,7 +33851,11 @@ mod aya_runtime {
             )?
             .ok_or_else(|| state_indeterminate(OPERATION))?;
             Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
-            if cut == CurrentTerminalPublicationCut::AuthorityOnly {
+            if matches!(
+                cut,
+                CurrentTerminalPublicationCut::AuthorityOnly
+                    | CurrentTerminalPublicationCut::AuthorityPinnedRetainedHistoricalGraph
+            ) {
                 return Ok(());
             }
             if cut == CurrentTerminalPublicationCut::MainOnly {
@@ -33827,6 +34487,30 @@ mod aya_runtime {
                         ));
                     }
                     if Self::read_current_terminal_proof(ownership)? == Some(terminal) {
+                        Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent)
+                    } else {
+                        Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                            CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                        ))
+                    }
+                }
+                Ok(metadata)
+                    if terminal.record.terminal_source
+                        == CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff
+                        && metadata.file_type().is_dir()
+                        && !metadata.file_type().is_symlink() =>
+                {
+                    if let Err(currentness) = currentness.verify_current() {
+                        return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                            super::current_recovery_currentness_refusal(currentness),
+                        ));
+                    }
+                    if Self::read_current_terminal_proof(ownership)? == Some(terminal)
+                        && matches!(
+                            Self::current_terminal_source_absence_is_proven(ownership, terminal),
+                            Ok(true)
+                        )
+                    {
                         Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent)
                     } else {
                         Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
@@ -37108,7 +37792,7 @@ mod aya_runtime {
             terminal_admission: Option<CurrentTerminalAdmissionExecution<'_>>,
         ) -> Result<EbpfAttachmentDisposition, GtpuError> {
             let reconciler_ownership =
-                Self::acquire_reconciler_ownership(pin_dir, terminal_admission.is_some())?;
+                Self::acquire_reconciler_ownership(pin_dir, terminal_admission.as_ref())?;
             let _graph_lock =
                 Self::acquire_operation_control_lock(&reconciler_ownership, "ebpf_attach")?;
             let pins_preexisted =
@@ -37498,7 +38182,7 @@ mod aya_runtime {
             )?;
 
             let reconciler_ownership =
-                Self::acquire_reconciler_ownership(pin_dir, terminal_admission.is_some())?;
+                Self::acquire_reconciler_ownership(pin_dir, terminal_admission.as_ref())?;
             let _graph_lock =
                 Self::acquire_operation_control_lock(&reconciler_ownership, "ebpf_attach_grouped")?;
             let pins_preexisted =
@@ -37903,11 +38587,23 @@ mod aya_runtime {
                 }
                 Arc::clone(&device._reconciler_ownership)
             };
-            let graph_lock = Self::acquire_operation_control_lock(&ownership, OPERATION)?;
+            let graph_lock = Self::acquire_operation_control_lock(
+                &ownership,
+                "ebpf_current_terminal_successor_finalize_lock",
+            )?;
             Self::require_current_terminal_admission_current(&terminal_admission, OPERATION)?;
-            Self::revalidate_current_control_path(&ownership, &graph_lock, OPERATION)?;
-            if !Self::current_terminal_root_layout_is_exact(&ownership, OPERATION)? {
-                return Err(state_indeterminate(OPERATION));
+            Self::revalidate_current_control_path(
+                &ownership,
+                &graph_lock,
+                "ebpf_current_terminal_successor_finalize_control",
+            )?;
+            if !Self::current_terminal_root_layout_is_exact(
+                &ownership,
+                "ebpf_current_terminal_successor_finalize_root",
+            )? {
+                return Err(state_indeterminate(
+                    "ebpf_current_terminal_successor_finalize_root",
+                ));
             }
             let (surviving_authority, surviving_decommission) =
                 Self::marker_inventory(&ownership._lease)?;
@@ -38068,7 +38764,7 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<[u8; 4], GtpuError> {
-            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir, false)?;
+            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir, None)?;
             let _graph_lock =
                 Self::acquire_operation_control_lock(&reconciler_ownership, "ebpf_adopt")?;
             let canonical_pin_dir =
@@ -38263,7 +38959,7 @@ mod aya_runtime {
             tc_priority: u16,
             expected_local_ip: [u8; 4],
         ) -> Result<EbpfCleanupOnlyAdoption, GtpuError> {
-            let reconciler_ownership = match Self::acquire_reconciler_ownership(pin_dir, false) {
+            let reconciler_ownership = match Self::acquire_reconciler_ownership(pin_dir, None) {
                 Ok(ownership) => ownership,
                 Err(GtpuError::AlreadyExists) => {
                     return Ok(EbpfCleanupOnlyAdoption::Refused(
@@ -38537,7 +39233,7 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
-            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir, false)?;
+            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir, None)?;
             let _graph_lock = Self::acquire_operation_control_lock(
                 &reconciler_ownership,
                 "ebpf_legacy_v2_teardown",
@@ -39276,17 +39972,26 @@ mod aya_runtime {
             currentness: &dyn HistoricalEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
             let refused = |reason| Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(reason));
+            let mut committed_effect = false;
             macro_rules! require_current_authority {
                 () => {
                     if let Some(currentness) = currentness.first_failure() {
-                        return refused(super::historical_recovery_currentness_refusal(
-                            currentness,
-                        ));
+                        return if committed_effect {
+                            Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                super::historical_recovery_currentness_progress(currentness),
+                            ))
+                        } else {
+                            refused(super::historical_recovery_currentness_refusal(currentness))
+                        };
                     }
                     if let Err(currentness) = currentness.verify_current() {
-                        return refused(super::historical_recovery_currentness_refusal(
-                            currentness,
-                        ));
+                        return if committed_effect {
+                            Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                super::historical_recovery_currentness_progress(currentness),
+                            ))
+                        } else {
+                            refused(super::historical_recovery_currentness_refusal(currentness))
+                        };
                     }
                 };
             }
@@ -39365,6 +40070,30 @@ mod aya_runtime {
                                 }
                             }
                         }
+                        Ok(metadata)
+                            if metadata.file_type().is_dir()
+                                && !metadata.file_type().is_symlink() =>
+                        {
+                            require_current_authority!();
+                            match Self::historical_25_resume_without_legacy(
+                                pin_dir,
+                                (interface, ifindex),
+                                tc_priority,
+                                authority,
+                                currentness,
+                            ) {
+                                Ok(outcome) => Ok(outcome),
+                                Err(GtpuError::NotFound) => refused(
+                                    HistoricalEbpfGraphRecoveryRefusal::HistoricalGenerationMismatch,
+                                ),
+                                Err(GtpuError::AlreadyExists) => {
+                                    refused(HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner)
+                                }
+                                Err(_) => {
+                                    refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState)
+                                }
+                            }
+                        }
                         Ok(_) => refused(
                             HistoricalEbpfGraphRecoveryRefusal::HistoricalGenerationMismatch,
                         ),
@@ -39418,6 +40147,30 @@ mod aya_runtime {
                                 }
                             }
                         }
+                        Ok(metadata)
+                            if metadata.file_type().is_dir()
+                                && !metadata.file_type().is_symlink() =>
+                        {
+                            require_current_authority!();
+                            match Self::historical_25_resume_without_legacy(
+                                pin_dir,
+                                (interface, ifindex),
+                                tc_priority,
+                                authority,
+                                currentness,
+                            ) {
+                                Ok(outcome) => Ok(outcome),
+                                Err(GtpuError::NotFound) => refused(
+                                    HistoricalEbpfGraphRecoveryRefusal::HistoricalGenerationMismatch,
+                                ),
+                                Err(GtpuError::AlreadyExists) => {
+                                    refused(HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner)
+                                }
+                                Err(_) => {
+                                    refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState)
+                                }
+                            }
+                        }
                         Ok(_) => refused(
                             HistoricalEbpfGraphRecoveryRefusal::HistoricalGenerationMismatch,
                         ),
@@ -39445,6 +40198,16 @@ mod aya_runtime {
             {
                 return refused(HistoricalEbpfGraphRecoveryRefusal::ArtifactProvenanceMismatch);
             }
+            let proof_presence = || match Self::historical_25_optional_pin_leaf_identity(
+                &legacy._lease,
+                HISTORICAL_25_RECOVERY_PROOF_MAP,
+                "ebpf_historical_25_proof_presence",
+            ) {
+                Ok(None) => Some(false),
+                Ok(Some(_)) => Some(true),
+                Err(_) => None,
+            };
+            let proof_presence_before = proof_presence();
             let existing_proof = match Self::historical_25_read_proof_observation(&legacy) {
                 Ok(Some(Historical25RecoveryProofObservation::Detached(proof))) => Some(proof),
                 Ok(Some(Historical25RecoveryProofObservation::AttachedCommitted(_))) => {
@@ -39461,12 +40224,23 @@ mod aya_runtime {
                     return refused(HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch);
                 }
                 Ok(None) => None,
-                Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
+                Err(_) => {
+                    let proof_presence_after = proof_presence();
+                    if proof_presence_before == Some(false) && proof_presence_after == Some(false) {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
             };
             let (current, mut proof, legacy_proof_retired) = if let Some(proof) = existing_proof {
                 if !proof.record.matches_authority(authority) {
-                    return refused(HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch);
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch,
+                    ));
                 }
+                committed_effect = true;
                 if !proof
                     .record
                     .matches_replacement((interface, ifindex), tc_priority)
@@ -39475,9 +40249,26 @@ mod aya_runtime {
                         HistoricalEbpfGraphRecoveryProgress::Indeterminate,
                     ));
                 }
+                let recorded_pins_present = match graph_metadata.as_ref() {
+                    Some(_) => {
+                        match Self::historical_25_recorded_pin_count(pin_dir, proof.record) {
+                            Ok(count) => count != 0,
+                            Err(_) => {
+                                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                                ))
+                            }
+                        }
+                    }
+                    None => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        ))
+                    }
+                };
                 if !Self::historical_25_phase_is_consistent_with_graph_presence(
                     proof.record.phase,
-                    graph_metadata.is_some(),
+                    recorded_pins_present,
                 ) {
                     return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
                         HistoricalEbpfGraphRecoveryProgress::Indeterminate,
@@ -39518,9 +40309,9 @@ mod aya_runtime {
                         ) {
                             Ok(current) => current,
                             Err(GtpuError::AlreadyExists) => {
-                                return refused(
-                                    HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner,
-                                )
+                                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                                ))
                             }
                             Err(_) => {
                                 return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
@@ -39534,9 +40325,9 @@ mod aya_runtime {
                         match Self::acquire_historical_25_current_ownership(pin_dir, &legacy) {
                             Ok(current) => current,
                             Err(GtpuError::AlreadyExists) => {
-                                return refused(
-                                    HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner,
-                                )
+                                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                                ))
                             }
                             Err(_) => {
                                 return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
@@ -39593,16 +40384,19 @@ mod aya_runtime {
                         ));
                     }
                     if !proof.record.matches_authority(authority) {
-                        return refused(HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch);
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch,
+                        ));
                     }
+                    committed_effect = true;
                     require_current_authority!();
                     let current =
                         match Self::acquire_historical_25_current_ownership(pin_dir, &legacy) {
                             Ok(current) => current,
                             Err(GtpuError::AlreadyExists) => {
-                                return refused(
-                                    HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner,
-                                )
+                                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                                ))
                             }
                             Err(_) => {
                                 return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
@@ -39686,7 +40480,11 @@ mod aya_runtime {
                             HistoricalEbpfGraphRecoveryRefusal::ActiveHistoricalAttachment,
                         );
                     }
-                    match Self::historical_25_maps_are_drained(pin_dir) {
+                    match Self::historical_25_maps_are_drained(
+                        pin_dir,
+                        (graph_metadata.dev(), graph_metadata.ino()),
+                        identity.map_ids,
+                    ) {
                         Ok(true) => {}
                         Ok(false) => {
                             return refused(HistoricalEbpfGraphRecoveryRefusal::PopulatedState);
@@ -39798,12 +40596,17 @@ mod aya_runtime {
                             return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
                         }
                         Err(Historical25ProofCommitError::PublicationIndeterminate) => {
+                            // Publication may have reached bpffs even when its
+                            // readback is indeterminate. Conservatively retain
+                            // the post-effect outcome class.
+                            committed_effect = true;
                             require_current_authority!();
                             return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
                                 HistoricalEbpfGraphRecoveryProgress::Indeterminate,
                             ));
                         }
                     };
+                    committed_effect = true;
                     #[cfg(test)]
                     historical_25_test_crash_after_qualified_proof();
                     if legacy.ordinary_exclusion_marker.is_some() {
@@ -39834,7 +40637,9 @@ mod aya_runtime {
                     ) {
                         Ok(current) => current,
                         Err(GtpuError::AlreadyExists) => {
-                            return refused(HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner)
+                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                HistoricalEbpfGraphRecoveryProgress::ProofCommitted,
+                            ))
                         }
                         Err(_) => {
                             require_current_authority!();
@@ -39865,7 +40670,9 @@ mod aya_runtime {
             // structural refusal that could tempt a caller to bypass the
             // recovery fence.
             if !proof.record.matches_authority(authority) {
-                return refused(HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch);
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch,
+                ));
             }
             require_current_authority!();
             if proof.record.phase != Historical25RecoveryPhase::Installed
@@ -39931,7 +40738,11 @@ mod aya_runtime {
                 && proof.record.prepared_removal == HISTORICAL_25_NO_PREPARED_REMOVAL
                 && present_pin_count == PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()
             {
-                match Self::historical_25_maps_are_drained(pin_dir) {
+                match Self::historical_25_maps_are_drained(
+                    pin_dir,
+                    (proof.record.graph_device, proof.record.graph_inode),
+                    proof.record.map_ids,
+                ) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
@@ -40076,57 +40887,25 @@ mod aya_runtime {
                 };
                 require_current_authority!();
             }
-            match fs::symlink_metadata(pin_dir) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Ok(_) => {
-                    match Self::historical_25_recorded_pin_count(pin_dir, proof.record) {
-                        Ok(0) => {}
-                        _ => {
-                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                                HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                            ));
-                        }
-                    }
-                    require_current_authority!();
-                    if Self::historical_25_remove_graph_dir(
-                        &legacy,
-                        &current,
-                        pin_dir,
-                        proof,
-                        (interface, ifindex),
-                        tc_priority,
-                        currentness,
-                    )
-                    .is_err()
-                    {
-                        require_current_authority!();
-                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                            HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted,
-                        ));
-                    }
-                    require_current_authority!();
-                }
-                Err(_) => {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                    ));
-                }
+            require_current_authority!();
+            if !matches!(
+                Self::historical_25_retained_empty_graph_is_exact(
+                    pin_dir,
+                    proof.record,
+                    "ebpf_historical_25_retained_empty_graph",
+                ),
+                Ok(true)
+            ) {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                ));
             }
-            match fs::symlink_metadata(pin_dir) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Ok(_) | Err(_) => {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                    ));
-                }
-            }
+            require_current_authority!();
             if proof.record.phase == Historical25RecoveryPhase::Installed {
-                // This also covers the durable retry cut after the exact
-                // final graph `rmdir`: the checksum-sealed cursor was
-                // accepted above only for Installed/25/no-prepared, and this
-                // fence re-proves both receipts, target identity, detached
-                // hooks/program references, and replacement immediately
-                // before publishing GraphAbsent.
+                // The checksum-sealed cursor proves every one of the exact
+                // 25 pins was removed. Re-prove the retained canonical inode,
+                // both receipts, detached hooks/program references, and the
+                // replacement before publishing the drained phase.
                 require_current_authority!();
                 if Self::historical_25_cleanup_effect_fence(
                     Historical25EffectFence::new(
@@ -40769,6 +41548,10 @@ mod aya_runtime {
             // authority rather than an interrupted staging sibling.
             let target_residue_absent = !entries.iter().any(|entry| {
                 entry == &legacy_leaf
+                    || Self::historical_25_ordinary_exclusion_staging_name_is_reserved(
+                        entry,
+                        &legacy_leaf,
+                    )
                     || (entry != &operation_lock && entry.starts_with(&staging_prefix))
             });
             let terminal_candidate = target_leaf_present
@@ -40785,6 +41568,10 @@ mod aya_runtime {
                 if entry == &current_leaf
                     || entry == &legacy_leaf
                     || entry == &operation_lock
+                    || Self::historical_25_ordinary_exclusion_staging_name_is_reserved(
+                        entry,
+                        &legacy_leaf,
+                    )
                     || entry.starts_with(&staging_prefix)
                     || !Self::historical_25_other_namespace_entry_is_conclusive(
                         &control_root,
@@ -40901,18 +41688,26 @@ mod aya_runtime {
                 None => {}
             }
 
-            // The only graph-free non-pristine state allowed into the
-            // mutation-lock reader is the paired target leaf + operation
-            // lock terminal candidate classified by the pristine observer.
-            // A present or empty graph directory remains a nonterminal
-            // result; its terminal cut is completed by recovery itself.
-            if !matches!(
-                fs::symlink_metadata(pin_dir),
-                Err(error) if error.kind() == io::ErrorKind::NotFound
-            ) || !matches!(
-                self.current_recovery_pristine_observation(replacement, pin_dir, tc_priority),
-                CurrentRecoveryPristineObservation::GraphPresent
-            ) {
+            // The only non-pristine states allowed into the mutation-lock
+            // reader are a graph-absent current terminal or the exact retained
+            // empty historical inode. The latter is authenticated again
+            // against the source handoff below; an arbitrary empty directory
+            // never becomes a terminal receipt.
+            let terminal_graph_path_is_admissible = match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    true
+                }
+                Ok(_) | Err(_) => false,
+            };
+            if !terminal_graph_path_is_admissible
+                || !matches!(
+                    self.current_recovery_pristine_observation(replacement, pin_dir, tc_priority),
+                    CurrentRecoveryPristineObservation::GraphPresent
+                )
+            {
                 return Ok(None);
             }
 
@@ -42438,11 +43233,89 @@ mod aya_runtime {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
                 return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
             }
+            if terminal_proof.is_none() {
+                if let Some(handoff) = ownership.historical_25_handoff.as_ref() {
+                    if !Self::historical_25_retained_empty_graph_is_exact(
+                        &ownership.canonical_pin_dir,
+                        handoff.receipt.proof.record,
+                        "ebpf_current_historical_handoff_retained_empty",
+                    )? {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                    match managed_state {
+                        CurrentRecoveryManagedState::Clear => {}
+                        CurrentRecoveryManagedState::Conflict => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::ManagedAttachment);
+                        }
+                        CurrentRecoveryManagedState::Indeterminate => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                        }
+                    }
+                    let Some(replacement) = replacement else {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                    };
+                    match Self::replacement_cleanup_absence_proven(replacement, tc_priority) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch)
+                        }
+                        Err(ReplacementHookObservationError::IdentityChanged) => return refused(
+                            CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                        ),
+                        Err(ReplacementHookObservationError::Indeterminate) => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState)
+                        }
+                    }
+                    return match Self::publish_historical_handoff_current_terminal_proof(
+                        &ownership,
+                        &graph_lock,
+                        replacement,
+                        tc_priority,
+                        authority,
+                        currentness,
+                    ) {
+                        Ok(terminal)
+                            if terminal.record.matches_authority(authority)
+                                && matches!(
+                                    Self::current_terminal_source_absence_is_proven(
+                                        &ownership, terminal,
+                                    ),
+                                    Ok(true)
+                                ) =>
+                        {
+                            Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent)
+                        }
+                        Ok(_) => Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                            CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                        )),
+                        Err(_) => match currentness.first_failure() {
+                            Some(currentness) => authority_refused(currentness),
+                            None => Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                                CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                            )),
+                        },
+                    };
+                }
+            }
             if let Some(terminal) = terminal_proof {
                 if terminal.record.terminal_source
                     == CurrentRecoveryTerminalSourceKind::CurrentGraph
                     && (terminal.record.graph_device, terminal.record.graph_inode)
                         == (metadata.dev(), metadata.ino())
+                {
+                    return Self::complete_current_terminal_recovery(
+                        &ownership,
+                        terminal,
+                        replacement,
+                        tc_priority,
+                        managed_state,
+                        authority,
+                        currentness,
+                    );
+                }
+                if terminal.record.terminal_source
+                    == CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff
+                    && Self::current_terminal_source_absence_is_proven(&ownership, terminal)?
                 {
                     return Self::complete_current_terminal_recovery(
                         &ownership,
@@ -46017,9 +46890,13 @@ mod aya_runtime {
                     pin_dir.file_name().expect("canonical test leaf"),
                 )
                 .expect("derive the exact predecessor authority leaf");
-                let staging = control_root.join(format!(
-                    "{legacy_name}{HISTORICAL_25_ORDINARY_EXCLUSION_STAGING_SUFFIX}"
-                ));
+                let collision_nonce = [0x5a; 16];
+                let staging = control_root.join(
+                    AyaGtpuRuntime::historical_25_ordinary_exclusion_staging_name(
+                        &legacy_name,
+                        &collision_nonce,
+                    ),
+                );
                 for collision_child in [
                     None,
                     Some(HISTORICAL_25_ORDINARY_EXCLUSION_MARKER),
@@ -46042,7 +46919,13 @@ mod aya_runtime {
                         .collect::<Vec<_>>();
                     before_entries.sort_unstable();
                     assert!(matches!(
-                        AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(&pin_dir, false,),
+                        AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion_inner(
+                            &pin_dir,
+                            None,
+                            false,
+                            true,
+                            Some(collision_nonce),
+                        ),
                         Err(GtpuError::StateIndeterminate {
                             operation: "ebpf_historical_25_ordinary_exclusion"
                         })
@@ -46066,6 +46949,275 @@ mod aya_runtime {
                     fs::remove_dir_all(&staging)
                         .expect("remove only the test-created staging collision");
                 }
+
+                let canonical_exclusion = control_root.join(&legacy_name);
+                let staging_prefix =
+                    format!("{legacy_name}{HISTORICAL_25_ORDINARY_EXCLUSION_STAGING_SUFFIX}-");
+                let ordinary_stages = || {
+                    let mut stages = fs::read_dir(&control_root)
+                        .expect("inventory ordinary exclusion stages")
+                        .map(|entry| entry.expect("read ordinary stage entry").path())
+                        .filter(|path| {
+                            path.file_name()
+                                .and_then(std::ffi::OsStr::to_str)
+                                .is_some_and(|name| name.starts_with(&staging_prefix))
+                        })
+                        .collect::<Vec<_>>();
+                    stages.sort_unstable();
+                    stages
+                };
+                let stage_snapshot = |stage: &Path| {
+                    let metadata = fs::metadata(stage).expect("capture ordinary stage identity");
+                    let mut entries = fs::read_dir(stage)
+                        .expect("inventory ordinary stage")
+                        .map(|entry| entry.expect("read ordinary stage child").file_name())
+                        .collect::<Vec<_>>();
+                    entries.sort_unstable();
+                    ((metadata.dev(), metadata.ino()), entries)
+                };
+                let remove_canonical_exclusion = || {
+                    fs::remove_dir_all(&canonical_exclusion)
+                        .expect("remove only the test-created canonical exclusion");
+                };
+
+                HISTORICAL_25_TEST_CRASH_AFTER_ORDINARY_EXCLUSION_MKDIR
+                    .with(|armed| armed.set(true));
+                let crashed = std::panic::catch_unwind(|| {
+                    let _ =
+                        AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(&pin_dir, None);
+                });
+                assert!(crashed.is_err(), "the mkdir crash cut must be exercised");
+                let mkdir_stages = ordinary_stages();
+                assert_eq!(mkdir_stages.len(), 1);
+                let mkdir_stage = mkdir_stages[0].clone();
+                let mkdir_snapshot = stage_snapshot(&mkdir_stage);
+                assert!(mkdir_snapshot.1.is_empty());
+                let exclusion =
+                    AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(&pin_dir, None)
+                        .expect("a fresh nonce bypasses an inert mkdir crash residue");
+                assert!(
+                    !pin_dir.exists(),
+                    "exclusion acquisition never creates a graph"
+                );
+                drop(exclusion);
+                assert_eq!(stage_snapshot(&mkdir_stage), mkdir_snapshot);
+                remove_canonical_exclusion();
+
+                HISTORICAL_25_TEST_CRASH_BEFORE_ORDINARY_EXCLUSION_RENAME
+                    .with(|armed| armed.set(true));
+                let crashed = std::panic::catch_unwind(|| {
+                    let _ =
+                        AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(&pin_dir, None);
+                });
+                assert!(
+                    crashed.is_err(),
+                    "the durable pre-rename crash cut must be exercised"
+                );
+                let synced_stage = ordinary_stages()
+                    .into_iter()
+                    .find(|stage| *stage != mkdir_stage)
+                    .expect("the durable crash leaves a distinct nonce stage");
+                let synced_snapshot = stage_snapshot(&synced_stage);
+                assert_eq!(
+                    synced_snapshot.1,
+                    [std::ffi::OsString::from(
+                        HISTORICAL_25_ORDINARY_EXCLUSION_MARKER
+                    )]
+                );
+                let exclusion =
+                    AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(&pin_dir, None)
+                        .expect("a fresh nonce bypasses an inert durable stage");
+                assert!(
+                    !pin_dir.exists(),
+                    "exclusion acquisition never creates a graph"
+                );
+                drop(exclusion);
+                assert_eq!(stage_snapshot(&synced_stage), synced_snapshot);
+                remove_canonical_exclusion();
+
+                let stages_before_collision = ordinary_stages();
+                let (entered, release) = historical_25_arm_ordinary_exclusion_rename_pause();
+                let collision_pin_dir = pin_dir.clone();
+                let publisher = std::thread::spawn(move || {
+                    AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(
+                        &collision_pin_dir,
+                        None,
+                    )
+                });
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .expect("publisher reaches the canonical rename boundary");
+                let collision_stage = ordinary_stages()
+                    .into_iter()
+                    .find(|stage| !stages_before_collision.contains(stage))
+                    .expect("collision attempt owns one fresh nonce stage");
+                let collision_snapshot = stage_snapshot(&collision_stage);
+                let active_stage_pristine_observation =
+                    AyaGtpuRuntime::historical_25_initialize_clean_absence(
+                        &pin_dir,
+                        ("lo", ifindex),
+                        tc_priority,
+                        super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                        &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
+                    );
+                let active_stage_current_observation = AyaGtpuRuntime::new()
+                    .current_recovery_pristine_absence(
+                        Some(("lo", ifindex)),
+                        &pin_dir,
+                        tc_priority,
+                        &super::super::TestCurrentEbpfGraphRecoveryCurrentness,
+                    );
+                let active_stage_after_observation = stage_snapshot(&collision_stage);
+                fs::create_dir(&canonical_exclusion)
+                    .expect("publish a competing exact canonical exclusion");
+                fs::set_permissions(&canonical_exclusion, fs::Permissions::from_mode(0o700))
+                    .expect("make competing canonical exclusion private");
+                let competing_marker =
+                    canonical_exclusion.join(HISTORICAL_25_ORDINARY_EXCLUSION_MARKER);
+                fs::create_dir(&competing_marker).expect("publish exact competing marker");
+                fs::set_permissions(&competing_marker, fs::Permissions::from_mode(0o700))
+                    .expect("make competing marker private");
+                release.send(()).expect("release collision publisher");
+                assert!(matches!(
+                    publisher
+                        .join()
+                        .expect("collision publisher must not panic"),
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_ordinary_exclusion"
+                    })
+                ));
+                assert!(matches!(
+                    active_stage_pristine_observation,
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_pristine_absence"
+                    })
+                ));
+                assert!(matches!(
+                    active_stage_current_observation,
+                    Ok(Some(crate::CurrentEbpfGraphRecoveryOutcome::Refused(
+                        crate::CurrentEbpfGraphRecoveryRefusal::IndeterminateState
+                    )))
+                ), "current pristine recovery must refuse an active same-target stage: {active_stage_current_observation:?}");
+                assert_eq!(
+                    active_stage_after_observation, collision_snapshot,
+                    "same-target pristine inspection must refuse an active stage without mutation"
+                );
+                assert_eq!(stage_snapshot(&collision_stage), collision_snapshot);
+                let exclusion =
+                    AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(&pin_dir, None)
+                        .expect("the exact competing canonical exclusion is reusable");
+                drop(exclusion);
+                assert_eq!(stage_snapshot(&collision_stage), collision_snapshot);
+                remove_canonical_exclusion();
+
+                let stale_stage_ownership = AyaGtpuRuntime::acquire_reconciler_ownership(
+                    &pin_dir, None,
+                )
+                .expect("an owned canonical exclusion makes same-target stale stages inert");
+                assert!(AyaGtpuRuntime::current_terminal_root_layout_is_exact(
+                    &stale_stage_ownership,
+                    "ebpf_historical_25_stale_stage_terminal_layout",
+                )
+                .expect("classify the owned terminal root with stale stages"));
+                assert!(AyaGtpuRuntime::ordinary_current_root_layout_is_exact(
+                    &stale_stage_ownership,
+                    "ebpf_historical_25_stale_stage_ordinary_layout",
+                )
+                .expect("classify the owned ordinary root with stale stages"));
+                remove_canonical_exclusion();
+                let (entered, release) = historical_25_arm_ordinary_exclusion_rename_pause();
+                let active_stage_pin_dir = pin_dir.clone();
+                let publisher = std::thread::spawn(move || {
+                    AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(
+                        &active_stage_pin_dir,
+                        None,
+                    )
+                });
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .expect("publisher reaches the target-stage classification boundary");
+                let terminal_during_publication =
+                    AyaGtpuRuntime::current_terminal_root_layout_is_exact(
+                        &stale_stage_ownership,
+                        "ebpf_historical_25_active_stage_terminal_layout",
+                    );
+                let ordinary_during_publication =
+                    AyaGtpuRuntime::ordinary_current_root_layout_is_exact(
+                        &stale_stage_ownership,
+                        "ebpf_historical_25_active_stage_ordinary_layout",
+                    );
+                release.send(()).expect("release active-stage publisher");
+                let published_exclusion = publisher
+                    .join()
+                    .expect("active-stage publisher must not panic")
+                    .expect("active-stage publisher establishes canonical exclusion");
+                assert!(
+                    !matches!(terminal_during_publication, Ok(true)),
+                    "an active target stage cannot authenticate terminal root absence: {terminal_during_publication:?}"
+                );
+                assert!(
+                    !matches!(ordinary_during_publication, Ok(true)),
+                    "an active target stage cannot authenticate ordinary root absence: {ordinary_during_publication:?}"
+                );
+                drop(published_exclusion);
+                drop(stale_stage_ownership);
+                let reacquired = AyaGtpuRuntime::acquire_reconciler_ownership(&pin_dir, None)
+                    .expect("the published canonical exclusion converges after the race");
+                assert!(AyaGtpuRuntime::ordinary_current_root_layout_is_exact(
+                    &reacquired,
+                    "ebpf_historical_25_active_stage_converged_layout",
+                )
+                .expect("classify the converged ordinary root"));
+                drop(reacquired);
+                remove_canonical_exclusion();
+
+                let stages_before_swap = ordinary_stages();
+                let (entered, release) = historical_25_arm_ordinary_exclusion_rename_pause();
+                let swap_pin_dir = pin_dir.clone();
+                let publisher = std::thread::spawn(move || {
+                    AyaGtpuRuntime::acquire_historical_25_ordinary_exclusion(&swap_pin_dir, None)
+                });
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .expect("publisher reaches the source revalidation boundary");
+                let swapped_stage = ordinary_stages()
+                    .into_iter()
+                    .find(|stage| !stages_before_swap.contains(stage))
+                    .expect("swap attempt owns one fresh nonce stage");
+                let displaced_stage =
+                    control_root.join(format!("displaced-ordinary-stage-{ordinal}"));
+                fs::rename(&swapped_stage, &displaced_stage)
+                    .expect("displace the publisher-owned stage by pathname");
+                fs::create_dir(&swapped_stage).expect("replace stage pathname with unknown state");
+                fs::set_permissions(&swapped_stage, fs::Permissions::from_mode(0o700))
+                    .expect("make unknown replacement private");
+                let unknown_child = swapped_stage.join("UNKNOWN_LAYOUT_V1");
+                fs::create_dir(&unknown_child).expect("seed unknown replacement contents");
+                fs::set_permissions(&unknown_child, fs::Permissions::from_mode(0o700))
+                    .expect("make unknown replacement child private");
+                let unknown_snapshot = stage_snapshot(&swapped_stage);
+                release.send(()).expect("release source-swap publisher");
+                assert!(matches!(
+                    publisher
+                        .join()
+                        .expect("source-swap publisher must not panic"),
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_ordinary_exclusion"
+                    })
+                ));
+                assert_eq!(
+                    stage_snapshot(&swapped_stage),
+                    unknown_snapshot,
+                    "source replacement must remain at its original path and inode"
+                );
+                assert!(
+                    !canonical_exclusion.exists(),
+                    "a replaced source must never move into canonical authority"
+                );
+                assert!(
+                    displaced_stage.exists(),
+                    "the publisher-owned staged inode remains preserved"
+                );
 
                 let runtime = Arc::new(AyaGtpuRuntime::new());
                 let (entered, release) = historical_25_arm_ordinary_mutation_pause();
@@ -46181,6 +47333,120 @@ mod aya_runtime {
                 );
             }
             println!("OPC_GTPU_HISTORICAL_25_ORDINARY_EXCLUSION_PROVEN");
+        }
+
+        #[test]
+        #[ignore = "requires writable bpffs in an isolated mount namespace"]
+        fn ordinary_exclusion_stages_are_inert_across_tenants() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let sequence = CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let pin_root = PathBuf::from(format!(
+                "/sys/fs/bpf/opc-gtpu-historical-25-multitenant-stage-{}-{sequence}",
+                std::process::id()
+            ));
+            struct ExactRootCleanup(PathBuf);
+            impl Drop for ExactRootCleanup {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = ExactRootCleanup(pin_root.clone());
+            fs::create_dir(&pin_root).expect("create shared exact namespace root");
+            fs::set_permissions(&pin_root, fs::Permissions::from_mode(0o700))
+                .expect("make shared namespace root private");
+            let control_root = pin_root.join(RECONCILER_CONTROL_DIRECTORY);
+            fs::create_dir(&control_root).expect("create shared control root");
+            fs::set_permissions(&control_root, fs::Permissions::from_mode(0o700))
+                .expect("make shared control root private");
+
+            let tenant_a = pin_root.join("tenant-a");
+            let tenant_b = pin_root.join("tenant-b");
+            let legacy_a = AyaGtpuRuntime::historical_25_legacy_leaf_name(
+                tenant_a.file_name().expect("tenant A leaf"),
+            )
+            .expect("derive tenant A legacy name");
+            let empty_stage = control_root.join(
+                AyaGtpuRuntime::historical_25_ordinary_exclusion_staging_name(
+                    &legacy_a,
+                    &[0x31; 16],
+                ),
+            );
+            let marked_stage = control_root.join(
+                AyaGtpuRuntime::historical_25_ordinary_exclusion_staging_name(
+                    &legacy_a,
+                    &[0x32; 16],
+                ),
+            );
+            for stage in [&empty_stage, &marked_stage] {
+                fs::create_dir(stage).expect("create tenant A inert stage");
+                fs::set_permissions(stage, fs::Permissions::from_mode(0o700))
+                    .expect("make tenant A stage private");
+            }
+            let marker = marked_stage.join(HISTORICAL_25_ORDINARY_EXCLUSION_MARKER);
+            fs::create_dir(&marker).expect("create tenant A staged marker");
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o700))
+                .expect("make tenant A staged marker private");
+            let snapshot = |path: &Path| {
+                let metadata = fs::metadata(path).expect("capture inert stage identity");
+                let mut entries = fs::read_dir(path)
+                    .expect("inventory inert stage")
+                    .map(|entry| entry.expect("read inert stage entry").file_name())
+                    .collect::<Vec<_>>();
+                entries.sort_unstable();
+                ((metadata.dev(), metadata.ino()), entries)
+            };
+            let empty_before = snapshot(&empty_stage);
+            let marked_before = snapshot(&marked_stage);
+
+            let ownership = AyaGtpuRuntime::acquire_reconciler_ownership(&tenant_b, None)
+                .expect("tenant A inert stages do not fence tenant B ownership");
+            let operation = AyaGtpuRuntime::acquire_operation_control_lock(
+                &ownership,
+                "ebpf_historical_25_multitenant_stage_test",
+            )
+            .expect("lock tenant B operation boundary");
+            assert!(
+                AyaGtpuRuntime::ordinary_pristine_graph_absence_is_exact(
+                    &ownership,
+                    &operation,
+                    "ebpf_historical_25_multitenant_stage_test",
+                )
+                .expect("classify tenant B pristine graph"),
+                "inert tenant A stages cannot become tenant B authority"
+            );
+            assert!(
+                AyaGtpuRuntime::current_terminal_root_layout_is_exact(
+                    &ownership,
+                    "ebpf_historical_25_multitenant_stage_test",
+                )
+                .expect("classify tenant B terminal root"),
+                "terminal root grammar must preserve disjoint inert stages"
+            );
+            assert_eq!(snapshot(&empty_stage), empty_before);
+            assert_eq!(snapshot(&marked_stage), marked_before);
+
+            let zero_nonce_stage = control_root.join(format!(
+                "{legacy_a}{HISTORICAL_25_ORDINARY_EXCLUSION_STAGING_SUFFIX}-{}",
+                "00".repeat(16)
+            ));
+            fs::create_dir(&zero_nonce_stage).expect("create malformed zero-nonce stage");
+            fs::set_permissions(&zero_nonce_stage, fs::Permissions::from_mode(0o700))
+                .expect("make malformed stage private");
+            let malformed_before = snapshot(&zero_nonce_stage);
+            assert!(
+                !AyaGtpuRuntime::current_terminal_root_layout_is_exact(
+                    &ownership,
+                    "ebpf_historical_25_multitenant_stage_test",
+                )
+                .expect("malformed stage classification is conclusive"),
+                "a malformed reserved-looking name remains fail-closed"
+            );
+            assert_eq!(snapshot(&zero_nonce_stage), malformed_before);
+            println!("OPC_GTPU_HISTORICAL_25_MULTITENANT_STAGE_PROVEN");
         }
 
         #[test]
@@ -46924,13 +48190,11 @@ mod aya_runtime {
                 .expect("seed the shipped schema marker");
             drop(ebpf);
             let graph_metadata = fs::metadata(&pin_dir).expect("historical graph metadata");
+            let historical_graph_identity = (graph_metadata.dev(), graph_metadata.ino());
             assert_eq!(
-                AyaGtpuRuntime::historical_25_named_map_ids(
-                    &pin_dir,
-                    (graph_metadata.dev(), graph_metadata.ino()),
-                )
-                .expect("exact frozen 25-map graph")
-                .len(),
+                AyaGtpuRuntime::historical_25_named_map_ids(&pin_dir, historical_graph_identity,)
+                    .expect("exact frozen 25-map graph")
+                    .len(),
                 25
             );
 
@@ -47405,9 +48669,9 @@ mod aya_runtime {
                         crate::model::HistoricalEbpfGraphRecoveryAuthorityKind::ExactDetached,
                         &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
                     )
-                    .expect("malformed marker-bound proof must remain a typed refusal"),
-                HistoricalEbpfGraphRecoveryOutcome::Refused(
-                    HistoricalEbpfGraphRecoveryRefusal::IndeterminateState
+                    .expect("malformed marker-bound proof must remain typed committed progress"),
+                HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate
                 )
             );
             assert!(ordinary_exclusion.exists());
@@ -47537,16 +48801,12 @@ mod aya_runtime {
                         &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
                     )
                     .expect("wrong-mode receipt must remain a typed fail-closed outcome");
-                assert!(
-                    matches!(
-                        outcome,
-                        HistoricalEbpfGraphRecoveryOutcome::Refused(
-                            HistoricalEbpfGraphRecoveryRefusal::IndeterminateState
-                        ) | HistoricalEbpfGraphRecoveryOutcome::Partial(
-                            HistoricalEbpfGraphRecoveryProgress::Indeterminate
-                        )
+                assert_eq!(
+                    outcome,
+                    HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate
                     ),
-                    "wrong-mode Installed receipt must not authorize a graph effect"
+                    "a committed Installed receipt must never collapse to a pre-effect refusal"
                 );
                 assert!(pin_dir.exists(), "receipt refusal must retain the graph");
                 assert_eq!(
@@ -47578,11 +48838,71 @@ mod aya_runtime {
                 .await
                 .expect("recover exact detached historical graph through the public API");
             assert_eq!(final_outcome, HistoricalEbpfGraphRecoveryOutcome::Removed);
+            let retained_empty_metadata = fs::metadata(&pin_dir)
+                .expect("the authenticated historical namespace inode remains for adoption");
             assert!(
-                !pin_dir.exists(),
-                "all exact historical pins must be absent"
+                fs::read_dir(&pin_dir)
+                    .expect("inventory authenticated retained-empty namespace")
+                    .next()
+                    .is_none(),
+                "all exact historical pins must be absent while the canonical inode remains"
+            );
+            assert_eq!(
+                (retained_empty_metadata.dev(), retained_empty_metadata.ino()),
+                historical_graph_identity,
+                "recovery must retain the exact qualified namespace inode"
             );
             assert!(!legacy_leaf.exists(), "legacy authority must be retired");
+            let control_metadata = fs::metadata(&control_root)
+                .expect("capture the retained current authority-root identity");
+            let current_leaf_name = AyaGtpuRuntime::lower_hex(
+                &AyaGtpuRuntime::selector_namespace_pin_commitment(
+                    control_metadata.dev(),
+                    control_metadata.ino(),
+                    pin_dir.file_name().expect("canonical historical leaf"),
+                )
+                .expect("derive the exact current handoff namespace"),
+            );
+            let current_handoff_proof = control_root
+                .join(current_leaf_name)
+                .join(HISTORICAL_25_ROOT_HANDOFF_MARKER);
+            let current_handoff_metadata = fs::symlink_metadata(&current_handoff_proof)
+                .expect("capture the committed current handoff proof identity");
+            let committed_inventory = control_inventory();
+            fs::set_permissions(&current_handoff_proof, fs::Permissions::from_mode(0o640))
+                .expect("make the surviving committed handoff proof noncanonical");
+            assert_eq!(
+                backend
+                    .recover_orphaned_historical_ebpf_graph(historical_request())
+                    .await
+                    .expect("malformed surviving handoff remains typed committed progress"),
+                HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate
+                )
+            );
+            let current_handoff_after = fs::symlink_metadata(&current_handoff_proof)
+                .expect("the malformed committed handoff proof must survive");
+            assert_eq!(
+                (
+                    current_handoff_after.dev(),
+                    current_handoff_after.ino(),
+                    current_handoff_after.mode(),
+                ),
+                (
+                    current_handoff_metadata.dev(),
+                    current_handoff_metadata.ino(),
+                    0o100640,
+                ),
+                "post-effect refusal must not replace or repair the surviving proof"
+            );
+            assert_eq!(control_inventory(), committed_inventory);
+            assert!(fs::read_dir(&pin_dir)
+                .expect("malformed handoff cannot recreate the removed graph")
+                .next()
+                .is_none());
+            assert!(!legacy_leaf.exists());
+            fs::set_permissions(&current_handoff_proof, fs::Permissions::from_mode(0o600))
+                .expect("restore the exact committed handoff proof mode");
             assert_eq!(
                 backend
                     .recover_orphaned_historical_ebpf_graph(historical_request())
@@ -47696,10 +49016,20 @@ mod aya_runtime {
                 terminal.outcome(),
                 CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
             );
-            assert!(matches!(
-                terminal.terminal_source(),
-                Some(crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff { .. })
-            ));
+            let bridged_empty_metadata = fs::metadata(&pin_dir)
+                .expect("current terminal bridge retains the authenticated empty namespace");
+            assert_eq!(
+                (bridged_empty_metadata.dev(), bridged_empty_metadata.ino()),
+                historical_graph_identity,
+                "current terminal publication must stay bound to the historical namespace inode"
+            );
+            assert!(
+                matches!(
+                    terminal.terminal_source(),
+                    Some(crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff { .. })
+                ),
+                "bridged terminal receipt must retain its source: {terminal:?}"
+            );
             let terminal = crate::CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(
                 terminal
                     .encode_authenticated_terminal()
@@ -47893,6 +49223,151 @@ mod aya_runtime {
                         .expect("transferred terminal remains broker-persistable"),
                 )
                 .expect("the broker decodes the transferred terminal receipt");
+            let mut create = CreateGtpDeviceRequest::new("up0");
+            create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            let grouped_config = GtpuSessionDeviceConfig::new(
+                opc_gtpu_ebpf_common::GtpuSessionDeviceId::new([0x25; GTPU_SESSION_GROUP_ID_LEN])
+                    .expect("nonzero graph-free terminal group identity"),
+                replacement_ifindex,
+                Some([192, 0, 2, 1]),
+                None,
+            )
+            .expect("canonical graph-free terminal grouped configuration")
+            .encode();
+            let graph_free_inventory = AyaGtpuRuntime::historical_25_control_root_entries(
+                &File::open(&pin_dir).expect("open the graph-free terminal namespace"),
+                "ebpf_historical_25_graph_free_terminal_inventory",
+            )
+            .expect("inventory the graph-free terminal namespace");
+            assert!(graph_free_inventory.is_empty());
+            let graph_free_control_inventory = control_inventory();
+            let graph_free_authority_snapshot = {
+                let ownership =
+                    AyaGtpuRuntime::acquire_existing_reconciler_ownership_with_currentness(
+                        &pin_dir,
+                        &super::super::TestCurrentEbpfGraphRecoveryCurrentness,
+                    )
+                    .expect("open the graph-free terminal authority without mutation");
+                let current_leaf = control_root.join(&ownership.control_dir_name);
+                let operation_lock = if ownership.historical_25_handoff.is_some() {
+                    current_leaf.join(&ownership.operation_lock_name)
+                } else {
+                    control_root.join(&ownership.operation_lock_name)
+                };
+                let terminal_path = current_leaf.join(CURRENT_RECOVERY_TERMINAL_PROOF_MAP);
+                let identity = |path: &Path| {
+                    let metadata = fs::symlink_metadata(path)
+                        .expect("capture graph-free terminal authority identity");
+                    (metadata.dev(), metadata.ino())
+                };
+                (
+                    identity(&current_leaf),
+                    identity(&operation_lock),
+                    identity(&terminal_path),
+                    AyaGtpuRuntime::read_current_terminal_proof(&ownership)
+                        .expect("read graph-free terminal authority")
+                        .expect("graph-free terminal authority must remain durable"),
+                )
+            };
+            let assert_graph_free_terminal_unchanged = || {
+                assert!(
+                    !legacy_leaf.exists(),
+                    "ordinary attachment must not recreate historical authority beside an unadmitted terminal"
+                );
+                assert_eq!(
+                    AyaGtpuRuntime::historical_25_control_root_entries(
+                        &File::open(&pin_dir).expect("reopen the graph-free terminal namespace"),
+                        "ebpf_historical_25_graph_free_terminal_inventory",
+                    )
+                    .expect("reinventory the graph-free terminal namespace"),
+                    graph_free_inventory,
+                    "ordinary attachment must not materialize any graph pin"
+                );
+                assert_eq!(
+                    control_inventory(),
+                    graph_free_control_inventory,
+                    "ordinary attachment must not mutate the shared authority root"
+                );
+                let ownership =
+                    AyaGtpuRuntime::acquire_existing_reconciler_ownership_with_currentness(
+                        &pin_dir,
+                        &super::super::TestCurrentEbpfGraphRecoveryCurrentness,
+                    )
+                    .expect("reopen unchanged graph-free terminal authority");
+                let current_leaf = control_root.join(&ownership.control_dir_name);
+                let operation_lock = if ownership.historical_25_handoff.is_some() {
+                    current_leaf.join(&ownership.operation_lock_name)
+                } else {
+                    control_root.join(&ownership.operation_lock_name)
+                };
+                let terminal_path = current_leaf.join(CURRENT_RECOVERY_TERMINAL_PROOF_MAP);
+                let identity = |path: &Path| {
+                    let metadata = fs::symlink_metadata(path)
+                        .expect("recheck graph-free terminal authority identity");
+                    (metadata.dev(), metadata.ino())
+                };
+                assert_eq!(
+                    (
+                        identity(&current_leaf),
+                        identity(&operation_lock),
+                        identity(&terminal_path),
+                        AyaGtpuRuntime::read_current_terminal_proof(&ownership)
+                            .expect("re-read graph-free terminal authority")
+                            .expect("graph-free terminal authority must survive refusal"),
+                    ),
+                    graph_free_authority_snapshot,
+                    "ordinary attachment must preserve terminal authority byte-for-byte and inode-for-inode"
+                );
+            };
+            let unadmitted_create = backend.create_device(create.clone()).await;
+            assert!(
+                matches!(
+                    unadmitted_create,
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_ordinary_preflight"
+                    })
+                ),
+                "legacy create without the exact terminal admission must fail closed: {unadmitted_create:?}"
+            );
+            assert_graph_free_terminal_unchanged();
+            let unadmitted_legacy_attach = runtime.attach(
+                "up0",
+                replacement_ifindex,
+                &pin_dir,
+                50,
+                [192, 0, 2, 1],
+                None,
+                None,
+            );
+            assert!(
+                matches!(
+                    unadmitted_legacy_attach,
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_ordinary_preflight"
+                    })
+                ),
+                "Aya legacy attach without the exact terminal admission must fail closed: {unadmitted_legacy_attach:?}"
+            );
+            assert_graph_free_terminal_unchanged();
+            let unadmitted_grouped_attach = runtime.attach_grouped(
+                "up0",
+                replacement_ifindex,
+                &pin_dir,
+                50,
+                grouped_config,
+                None,
+                None,
+            );
+            assert!(
+                matches!(
+                    unadmitted_grouped_attach,
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_ordinary_preflight"
+                    })
+                ),
+                "Aya grouped attach without the exact terminal admission must fail closed: {unadmitted_grouped_attach:?}"
+            );
+            assert_graph_free_terminal_unchanged();
             assert_eq!(
                 backend
                     .admit_current_ebpf_graph_terminal(
@@ -47905,8 +49380,6 @@ mod aya_runtime {
                     .expect("admit only the exact broker-durable terminal"),
                 crate::CurrentEbpfGraphRecoveryTerminalAdmissionOutcome::Admitted
             );
-            let mut create = CreateGtpDeviceRequest::new("up0");
-            create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
             assert_eq!(
                 backend
                     .create_device(create.clone())
@@ -47915,8 +49388,226 @@ mod aya_runtime {
                     .ifindex,
                 replacement_ifindex
             );
+            let successor_graph_metadata = fs::metadata(&pin_dir)
+                .expect("the admitted successor occupies the retained canonical namespace");
+            assert_eq!(
+                (
+                    successor_graph_metadata.dev(),
+                    successor_graph_metadata.ino()
+                ),
+                historical_graph_identity,
+                "the admitted successor must adopt, not replace, the authenticated empty inode"
+            );
+            drop(backend);
+            let backend = super::super::EbpfGtpuDataplaneBackend::with_config(
+                super::super::EbpfGtpuDataplaneBackendConfig {
+                    bpffs_pin_root: pin_root.clone(),
+                    tc_priority: 50,
+                },
+            );
             let successor_target =
                 || crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(create.clone());
+            let expected_successor_map_ids = AyaGtpuRuntime::pinned_map_ids(
+                &AyaGtpuRuntime::pinned_map_identity(&pin_dir)
+                    .expect("capture the exact admitted successor map identities"),
+            );
+            let current_graph_inventory = || {
+                AyaGtpuRuntime::historical_25_control_root_entries(
+                    &File::open(&pin_dir).expect("open retained successor graph"),
+                    "ebpf_historical_25_fresh_process_graph_inventory",
+                )
+                .expect("inventory retained successor graph")
+            };
+            let current_authority_inventory = || {
+                AyaGtpuRuntime::historical_25_control_root_entries(
+                    &File::open(&control_root).expect("open retained successor authority root"),
+                    "ebpf_historical_25_fresh_process_authority_inventory",
+                )
+                .expect("inventory retained successor authority root")
+            };
+            let admitted_graph_inventory = current_graph_inventory();
+            let admitted_authority_inventory = current_authority_inventory();
+
+            {
+                use std::io::{BufRead as _, Write as _};
+                use std::process::Stdio;
+
+                // Linux coalesces flock ownership within one process. Model
+                // the authentic competing writer with a child process and a
+                // pipe handshake so the assertion never races lock uptake.
+                let mut live_owner = std::process::Command::new("flock")
+                    .arg("--exclusive")
+                    .arg("--nonblock")
+                    .arg(&legacy_leaf)
+                    .arg("sh")
+                    .arg("-c")
+                    .arg("printf 'locked\\n'; read _")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("spawn a distinct live predecessor owner");
+                let mut ready = String::new();
+                std::io::BufReader::new(
+                    live_owner
+                        .stdout
+                        .take()
+                        .expect("capture live-owner readiness"),
+                )
+                .read_line(&mut ready)
+                .expect("wait for live-owner lock readiness");
+                assert_eq!(ready, "locked\n");
+                let held_owner_outcome = backend
+                    .inspect_current_ebpf_graph_successor(
+                        current_intent().into_successor_inspection_request(
+                            successor_target(),
+                            admitted_authority(),
+                        ),
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        held_owner_outcome,
+                        Ok(crate::CurrentEbpfGraphRecoverySuccessorInspectionOutcome::Refused(
+                            CurrentEbpfGraphRecoveryRefusal::ActiveOwner
+                        ))
+                    ),
+                    "a held predecessor exclusion must remain a typed live-owner refusal: {held_owner_outcome:?}"
+                );
+                assert_eq!(current_graph_inventory(), admitted_graph_inventory);
+                assert_eq!(current_authority_inventory(), admitted_authority_inventory);
+                live_owner
+                    .stdin
+                    .as_mut()
+                    .expect("retain live-owner release pipe")
+                    .write_all(b"release\n")
+                    .expect("release the live predecessor owner");
+                assert!(
+                    live_owner
+                        .wait()
+                        .expect("reap the live predecessor owner")
+                        .success(),
+                    "live predecessor owner must exit cleanly"
+                );
+            }
+
+            let partial_map = pin_dir.join(MAP_CONFIG);
+            let displaced_partial_map = pin_dir.join("P0_PARTIAL_CURRENT_CONFIG");
+            fs::rename(&partial_map, &displaced_partial_map)
+                .expect("model an incomplete admitted successor inventory without unlinking a pin");
+            let partial_create = backend.create_device(create.clone()).await;
+            assert!(
+                matches!(
+                    partial_create,
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_ordinary_preflight"
+                    })
+                ),
+                "partial admitted successor must fail closed without mutation: {partial_create:?}"
+            );
+            assert!(displaced_partial_map.exists());
+            assert!(!partial_map.exists());
+            assert_eq!(current_authority_inventory(), admitted_authority_inventory);
+            fs::rename(&displaced_partial_map, &partial_map)
+                .expect("restore the exact admitted successor inventory");
+            assert_eq!(current_graph_inventory(), admitted_graph_inventory);
+            assert_eq!(
+                AyaGtpuRuntime::pinned_map_ids(
+                    &AyaGtpuRuntime::pinned_map_identity(&pin_dir)
+                        .expect("re-read restored admitted successor map identities"),
+                ),
+                expected_successor_map_ids
+            );
+
+            // These two current maps intentionally share the same kernel ABI.
+            // Swapping only their pin names therefore preserves a complete,
+            // schema-valid inventory while breaking the exact map-ID vector
+            // sealed by the current recovery WAL.
+            let first_map = pin_dir.join(MAP_CONFIG);
+            let second_map = pin_dir.join(GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME);
+            let displaced_first_map = pin_dir.join("P0_SWAPPED_CURRENT_MAP");
+            fs::rename(&first_map, &displaced_first_map)
+                .expect("stage the first admitted successor map for an ID swap");
+            fs::rename(&second_map, &first_map)
+                .expect("place the second map under the first canonical name");
+            fs::rename(&displaced_first_map, &second_map)
+                .expect("complete the canonical-name map-ID swap");
+            let swapped_map_ids = AyaGtpuRuntime::pinned_map_ids(
+                &AyaGtpuRuntime::pinned_map_identity(&pin_dir)
+                    .expect("the swapped graph retains the complete current ABI"),
+            );
+            assert_ne!(swapped_map_ids, expected_successor_map_ids);
+            assert_eq!(current_graph_inventory(), admitted_graph_inventory);
+            let swapped_create = backend.create_device(create.clone()).await;
+            assert!(
+                matches!(
+                    swapped_create,
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_historical_25_ordinary_preflight"
+                    })
+                ),
+                "map-ID-swapped successor must fail closed without mutation: {swapped_create:?}"
+            );
+            assert_eq!(
+                AyaGtpuRuntime::pinned_map_ids(
+                    &AyaGtpuRuntime::pinned_map_identity(&pin_dir)
+                        .expect("refusal preserves the complete swapped map inventory"),
+                ),
+                swapped_map_ids
+            );
+            assert_eq!(current_authority_inventory(), admitted_authority_inventory);
+            fs::rename(&second_map, &displaced_first_map)
+                .expect("stage the swapped first map for restoration");
+            fs::rename(&first_map, &second_map).expect("restore the second map's canonical name");
+            fs::rename(&displaced_first_map, &first_map)
+                .expect("restore the first map's canonical name");
+            assert_eq!(
+                AyaGtpuRuntime::pinned_map_ids(
+                    &AyaGtpuRuntime::pinned_map_identity(&pin_dir)
+                        .expect("re-read the restored admitted successor graph"),
+                ),
+                expected_successor_map_ids
+            );
+            assert_eq!(current_graph_inventory(), admitted_graph_inventory);
+            assert_eq!(current_authority_inventory(), admitted_authority_inventory);
+            {
+                let exclusion = AyaGtpuRuntime::acquire_existing_historical_25_ordinary_exclusion(
+                    &pin_dir, true,
+                )
+                .expect("fresh process reacquires the exact predecessor exclusion");
+                let ownership = AyaGtpuRuntime::acquire_reconciler_ownership_inner(
+                    &pin_dir,
+                    Some(&super::super::TestCurrentEbpfGraphRecoveryCurrentness),
+                    false,
+                    Some(exclusion),
+                )
+                .expect("fresh process reopens the populated retained handoff");
+                let graph_lock = AyaGtpuRuntime::acquire_operation_control_lock(
+                    &ownership,
+                    "ebpf_historical_25_fresh_process_successor",
+                )
+                .expect("fresh process reacquires the retained operation fence");
+                assert!(AyaGtpuRuntime::current_terminal_root_layout_is_exact(
+                    &ownership,
+                    "ebpf_historical_25_fresh_process_successor",
+                )
+                .expect("fresh process validates the retained authority root"));
+                let terminal = AyaGtpuRuntime::read_current_terminal_proof(&ownership)
+                    .expect("fresh process reads the successor WAL")
+                    .expect("the sealed successor WAL remains present");
+                AyaGtpuRuntime::retained_successor_graph_identity(
+                    &ownership,
+                    &graph_lock,
+                    terminal,
+                    ("up0", replacement_ifindex),
+                    50,
+                    super::super::CurrentTerminalSuccessorConfiguration::Legacy {
+                        local_ip: [192, 0, 2, 1],
+                        pmtu_policy: None,
+                    },
+                    "ebpf_historical_25_fresh_process_successor",
+                )
+                .expect("fresh process reauthenticates the exact live successor graph");
+            }
             let successor = match backend
                 .inspect_current_ebpf_graph_successor(
                     current_intent().into_successor_inspection_request(
@@ -47950,18 +49641,31 @@ mod aya_runtime {
                     expected: successor.commitment(),
                 }),
             );
+            let restarted_admission = backend
+                .admit_current_ebpf_graph_successor(
+                    current_intent().into_successor_admission_request(
+                        successor_target(),
+                        successor,
+                        successor_authority,
+                    ),
+                )
+                .await;
+            assert!(
+                matches!(
+                    restarted_admission,
+                    Err(GtpuError::RetryRequired {
+                        operation: "ebpf_current_successor_typed_create"
+                    })
+                ),
+                "a fresh process must request only the exact typed successor registration: {restarted_admission:?}"
+            );
             assert_eq!(
                 backend
-                    .admit_current_ebpf_graph_successor(
-                        current_intent().into_successor_admission_request(
-                            successor_target(),
-                            successor,
-                            successor_authority,
-                        ),
-                    )
+                    .create_device(create)
                     .await
-                    .expect("activate only the exact brokered successor"),
-                crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome::Admitted
+                    .expect("typed create re-registers the exact retained successor")
+                    .ifindex,
+                replacement_ifindex
             );
             assert_eq!(
                 backend
@@ -48006,7 +49710,7 @@ mod aya_runtime {
             // creates exactly the current private root, tenant-A leaf, and
             // paired `<hash>-operation-v1` lock that a normal SDK owner uses.
             let current_a_pin = pin_root.join("tenant-a");
-            let current_a = AyaGtpuRuntime::acquire_reconciler_ownership(&current_a_pin, false)
+            let current_a = AyaGtpuRuntime::acquire_reconciler_ownership(&current_a_pin, None)
                 .expect("create exact current tenant-A ownership on bpffs");
             let control_root = pin_root.join(RECONCILER_CONTROL_DIRECTORY);
             let current_a_leaf = control_root.join(&current_a.control_dir_name);
@@ -48020,8 +49724,24 @@ mod aya_runtime {
                 .and_then(|name| name.to_str())
                 .expect("authority marker name is fixed ASCII");
             let current_a_lock = control_root.join(&current_a.operation_lock_name);
+            let current_a_exclusion = control_root.join(
+                AyaGtpuRuntime::historical_25_legacy_leaf_name(
+                    current_a_pin.file_name().expect("tenant-A leaf"),
+                )
+                .expect("derive tenant-A historical exclusion leaf"),
+            );
             assert!(current_a_leaf.is_dir());
             assert!(current_a_lock.is_dir());
+            assert!(current_a_exclusion.is_dir());
+            assert_eq!(
+                AyaGtpuRuntime::historical_25_control_root_entries(
+                    &File::open(&current_a_exclusion)
+                        .expect("open tenant-A historical exclusion leaf"),
+                    "ebpf_historical_25_pristine_sibling_exclusion",
+                )
+                .expect("tenant-A historical exclusion layout is exact"),
+                [HISTORICAL_25_ORDINARY_EXCLUSION_MARKER]
+            );
             assert!(AyaGtpuRuntime::marker_inventory(
                 &File::open(&current_a_leaf).expect("open current tenant-A leaf"),
             )
@@ -48052,11 +49772,29 @@ mod aya_runtime {
                 "ebpf_historical_25_pristine_sibling_before",
             )
             .expect("inventory exact shared current root");
-            assert_eq!(before.len(), 4);
+            assert_eq!(before.len(), 5);
             assert!(before.contains(&current_a.control_dir_name));
             assert!(before.contains(&current_a.operation_lock_name));
+            assert!(before.contains(
+                &current_a_exclusion
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("historical exclusion name is fixed ASCII")
+                    .to_owned()
+            ));
             assert!(before.contains(&"11".repeat(32)));
             assert!(before.contains(&"22".repeat(32)));
+            for entry in &before {
+                assert!(
+                    AyaGtpuRuntime::historical_25_other_namespace_entry_is_conclusive(
+                        &File::open(&control_root).expect("re-open shared current control root"),
+                        entry,
+                        "ebpf_historical_25_pristine_sibling_classify",
+                    )
+                    .expect("classify bounded tenant-A sibling"),
+                    "shared-root entry is not a conclusive disjoint sibling: {entry}"
+                );
+            }
 
             let target_b = pin_root.join("tenant-b");
             let replacement_ifindex =
@@ -48148,7 +49886,7 @@ mod aya_runtime {
             // the shared root has the exact current-private ownership shape.
             let foreign_current_pin = pin_root.join("tenant-a-current");
             let foreign_current =
-                AyaGtpuRuntime::acquire_reconciler_ownership(&foreign_current_pin, false)
+                AyaGtpuRuntime::acquire_reconciler_ownership(&foreign_current_pin, None)
                     .expect("create exact foreign current ownership");
             let control_root = pin_root.join(RECONCILER_CONTROL_DIRECTORY);
             let foreign_current_leaf = control_root.join(&foreign_current.control_dir_name);
@@ -54079,14 +55817,20 @@ mod tests {
 
             let mut state = self.state();
             state.operations.push("recover_orphaned_historical_graph");
+            let graph = state.historical_25_graphs.get(pin_dir).copied();
+            let committed_effect = graph.is_some_and(|graph| graph.proof_committed)
+                || state.historical_25_receipts.contains_key(pin_dir)
+                || state.historical_25_staging.contains_key(pin_dir)
+                || state.historical_25_operation_markers.contains(pin_dir);
             if let Err(currentness) = currentness.verify_current() {
-                return Ok(Outcome::Refused(
-                    super::historical_recovery_currentness_refusal(currentness),
-                ));
+                return Ok(if committed_effect {
+                    Outcome::Partial(super::historical_recovery_currentness_progress(currentness))
+                } else {
+                    Outcome::Refused(super::historical_recovery_currentness_refusal(currentness))
+                });
             }
             let crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1 =
                 generation;
-            let graph = state.historical_25_graphs.get(pin_dir).copied();
             if managed_state != CurrentRecoveryManagedState::Clear {
                 return Ok(if graph.is_some_and(|graph| graph.proof_committed) {
                     Outcome::Partial(Progress::Indeterminate)
@@ -54169,8 +55913,10 @@ mod tests {
                                 // graph or predecessor leaf, and the fresh
                                 // live authority is for the same target.
                                 if let Err(currentness) = currentness.verify_current() {
-                                    return Ok(Outcome::Refused(
-                                        super::historical_recovery_currentness_refusal(currentness),
+                                    return Ok(Outcome::Partial(
+                                        super::historical_recovery_currentness_progress(
+                                            currentness,
+                                        ),
                                     ));
                                 }
                                 state
@@ -54186,13 +55932,15 @@ mod tests {
                                     .operations
                                     .push("historical_25_terminal_authority_adoption");
                                 if let Err(currentness) = currentness.verify_current() {
-                                    return Ok(Outcome::Refused(
-                                        super::historical_recovery_currentness_refusal(currentness),
+                                    return Ok(Outcome::Partial(
+                                        super::historical_recovery_currentness_progress(
+                                            currentness,
+                                        ),
                                     ));
                                 }
                                 Ok(Outcome::AlreadyAbsent)
                             }
-                            Some(_) => Ok(Outcome::Refused(Refusal::AuthorityMismatch)),
+                            Some(_) => Ok(Outcome::Partial(Progress::AuthorityMismatch)),
                         }
                     }
                     Some(receipt)
@@ -54290,8 +56038,12 @@ mod tests {
                 return Ok(Outcome::Refused(Refusal::IndeterminateState));
             }
             let committed = |reason| {
-                if graph.proof_committed {
-                    Outcome::Partial(Progress::Indeterminate)
+                if committed_effect {
+                    Outcome::Partial(if reason == Refusal::AuthorityMismatch {
+                        Progress::AuthorityMismatch
+                    } else {
+                        Progress::Indeterminate
+                    })
                 } else {
                     Outcome::Refused(reason)
                 }
@@ -54360,8 +56112,8 @@ mod tests {
                 .get(pin_dir)
                 .is_some_and(|stored| *stored != authority)
             {
-                return Ok(if graph.proof_committed {
-                    Outcome::Partial(Progress::Indeterminate)
+                return Ok(if committed_effect {
+                    Outcome::Partial(Progress::AuthorityMismatch)
                 } else {
                     Outcome::Refused(Refusal::AuthorityMismatch)
                 });
@@ -54392,7 +56144,7 @@ mod tests {
                                 || stage == qualified_receipt) => {}
                     (Some(receipt), Some(stage))
                         if receipt == installed_receipt && stage == installed_receipt => {}
-                    _ => return Ok(Outcome::Refused(Refusal::IndeterminateState)),
+                    _ => return Ok(Outcome::Partial(Progress::Indeterminate)),
                 }
                 if state.historical_25_receipts.get(pin_dir).copied() == Some(qualified_receipt)
                     && !state.historical_25_staging.contains_key(pin_dir)
@@ -64907,7 +66659,8 @@ mod tests {
             historical_25_authority_with_guard(Box::new(SequencedHistoricalRecoveryGuard {
                 // Backend entry, runtime entry, and pre-readback checks are
                 // current. The mandatory post-readback check loses the
-                // authority, so no terminal success receipt may escape.
+                // authority, so no terminal success receipt may escape and
+                // the committed effect must remain explicit.
                 successful_checks: 3,
                 refusal: HistoricalEbpfGraphRecoveryAuthorityCurrentness::Changed,
                 checks: checks.clone(),
@@ -64917,11 +66670,11 @@ mod tests {
         let receipt = backend
             .recover_orphaned_historical_ebpf_graph(request)
             .await
-            .expect("post-effect authority loss is a typed refusal receipt");
+            .expect("post-effect authority loss is a typed partial receipt");
         assert_eq!(
             receipt,
-            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
-                crate::HistoricalEbpfGraphRecoveryRefusal::AuthorityChanged
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::AuthorityChanged
             )
         );
         assert_eq!(
@@ -64959,8 +66712,8 @@ mod tests {
             .expect("a transient guard loss remains a typed recovery receipt");
         assert_eq!(
             receipt,
-            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
-                crate::HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch
             )
         );
         assert_eq!(
@@ -65170,11 +66923,11 @@ mod tests {
                 historical_25_recovery_request_for_with_authority("s2bu", wrong_target),
             )
             .await
-            .expect("wrong host commitment is a typed refusal");
+            .expect("wrong host commitment is a typed post-effect fence");
         assert_eq!(
             refused,
-            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
-                crate::HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch
             )
         );
         assert_eq!(
@@ -65198,11 +66951,11 @@ mod tests {
                 historical_25_recovery_request_for_with_authority("s2bu", wrong_graph),
             )
             .await
-            .expect("same target with different graph provenance is a typed refusal");
+            .expect("different graph provenance is a typed post-effect fence");
         assert_eq!(
             refused,
-            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
-                crate::HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::AuthorityMismatch
             )
         );
         assert_eq!(
@@ -65537,8 +67290,8 @@ mod tests {
                 .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
                 .await
                 .unwrap(),
-            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
-                crate::HistoricalEbpfGraphRecoveryRefusal::IndeterminateState
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::Indeterminate
             )
         );
         let graph = runtime.state().historical_25_graphs[&pin_dir];
@@ -65633,10 +67386,10 @@ mod tests {
                 ))
                 .await
                 .unwrap(),
-            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
-                crate::HistoricalEbpfGraphRecoveryRefusal::IndeterminateState
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::Indeterminate
             ),
-            "a Qualified receipt belongs only to its committed replacement name"
+            "a Qualified receipt remains an explicit committed-effect fence for another name"
         );
         {
             let state = runtime.state();
