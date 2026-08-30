@@ -3634,7 +3634,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    let json = serde_json::to_vec(frame).map_err(ProtocolError::Serialization)?;
+    let json = serde_json::to_vec(frame).map_err(ProtocolError::from)?;
     let len = u32::try_from(json.len()).map_err(|_| ProtocolError::FrameTooLarge(json.len()))?;
     writer
         .write_all(&len.to_be_bytes())
@@ -3871,7 +3871,7 @@ where
             } else if let Some(exceeded_at) = buffer.exceeded_at {
                 Err(ProtocolError::FrameTooLarge(exceeded_at))
             } else {
-                Err(ProtocolError::Serialization(error))
+                Err(error.into())
             }
         }
     }
@@ -4536,7 +4536,7 @@ where
             } else if let Some(exceeded_at) = counter.exceeded_at {
                 Err(ProtocolError::FrameTooLarge(exceeded_at))
             } else {
-                Err(ProtocolError::Serialization(error))
+                Err(error.into())
             }
         }
     }
@@ -4677,7 +4677,7 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let payload = read_frame_payload(reader, max_frame_size).await?;
-    serde_json::from_slice(&payload).map_err(ProtocolError::Serialization)
+    serde_json::from_slice(&payload).map_err(ProtocolError::from)
 }
 
 /// Decode one post-bootstrap operation request through the private v5 DTO.
@@ -4689,8 +4689,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let payload = read_frame_payload(reader, max_frame_size).await?;
-    let wire =
-        serde_json::from_slice::<WireRequest>(&payload).map_err(ProtocolError::Serialization)?;
+    let wire = serde_json::from_slice::<WireRequest>(&payload).map_err(ProtocolError::from)?;
     InboundRequest::try_from(wire).map_err(|_| ProtocolError::InvalidWireValue)
 }
 
@@ -4703,8 +4702,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let payload = read_frame_payload(reader, max_frame_size).await?;
-    let wire =
-        serde_json::from_slice::<WireResponse>(&payload).map_err(ProtocolError::Serialization)?;
+    let wire = serde_json::from_slice::<WireResponse>(&payload).map_err(ProtocolError::from)?;
     Response::try_from(wire).map_err(|_| ProtocolError::InvalidWireValue)
 }
 
@@ -4756,7 +4754,7 @@ where
         };
     serde_json::from_slice(&payload)
         .map(Some)
-        .map_err(ProtocolError::Serialization)
+        .map_err(ProtocolError::from)
 }
 
 pub(crate) async fn read_authenticated_frame_payload_within<R>(
@@ -4908,8 +4906,7 @@ where
             Some(payload) => payload,
             None => return Ok(None),
         };
-    let wire =
-        serde_json::from_slice::<WireRequest>(&payload).map_err(ProtocolError::Serialization)?;
+    let wire = serde_json::from_slice::<WireRequest>(&payload).map_err(ProtocolError::from)?;
     InboundRequest::try_from(wire)
         .map(Some)
         .map_err(|_| ProtocolError::InvalidWireValue)

@@ -3979,10 +3979,10 @@ where
     let decoded = serde_ignored::deserialize(&mut deserializer, |_| {
         ignored = true;
     })
-    .map_err(ProtocolError::Serialization)?;
-    deserializer.end().map_err(ProtocolError::Serialization)?;
+    .map_err(ProtocolError::from)?;
+    deserializer.end().map_err(ProtocolError::from)?;
     let mut exact = ExactConsumerJson::new(payload);
-    serde_json::to_writer(&mut exact, &decoded).map_err(ProtocolError::Serialization)?;
+    serde_json::to_writer(&mut exact, &decoded).map_err(ProtocolError::from)?;
     if ignored || !exact.matches() {
         return Err(ProtocolError::InvalidWireValue);
     }
