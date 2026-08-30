@@ -24680,6 +24680,10 @@ fn validated_log_markers_sync(
 thread_local! {
     static COMMITTED_LOG_VALIDATION_DECODED_ROWS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static DURABLE_LOG_AUDIT_FAULTS_FOR_TEST: std::cell::Cell<DurableLogAuditFaultsForTest> =
+        const { std::cell::Cell::new(DurableLogAuditFaultsForTest::NONE) };
 }
 
 #[cfg(test)]
@@ -24694,7 +24698,51 @@ fn committed_log_validation_decoded_rows_for_test() -> usize {
 
 const DURABLE_LOG_AUDIT_WORKERS: usize = 8;
 const DURABLE_LOG_AUDIT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const DURABLE_LOG_AUDIT_BATCH_ROWS: usize = 4_096;
 const DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS: usize = 64;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct DurableLogAuditFaultsForTest {
+    spawn_failure_worker: Option<usize>,
+    panic_worker: Option<usize>,
+}
+
+#[cfg(test)]
+impl DurableLogAuditFaultsForTest {
+    const NONE: Self = Self {
+        spawn_failure_worker: None,
+        panic_worker: None,
+    };
+}
+
+#[cfg(test)]
+fn with_durable_log_audit_faults_for_test<T>(
+    faults: DurableLogAuditFaultsForTest,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(DurableLogAuditFaultsForTest);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DURABLE_LOG_AUDIT_FAULTS_FOR_TEST.with(|configured| configured.set(self.0));
+        }
+    }
+
+    let previous = DURABLE_LOG_AUDIT_FAULTS_FOR_TEST.with(|configured| configured.replace(faults));
+    let _reset = Reset(previous);
+    run()
+}
+
+#[cfg(test)]
+fn reset_durable_log_audit_max_batch_rows_for_test() {
+    DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST.with(|maximum| maximum.set(0));
+}
+
+#[cfg(test)]
+fn durable_log_audit_max_batch_rows_for_test() -> usize {
+    DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST.with(std::cell::Cell::get)
+}
 
 struct EncodedDurableLogAuditRow {
     epoch: i64,
@@ -24723,42 +24771,83 @@ fn durable_log_audit_worker_count(rows: usize, available: usize) -> usize {
     DURABLE_LOG_AUDIT_WORKERS.min(available.max(1)).min(rows)
 }
 
-fn decode_durable_log_audit_batch(
+fn reserve_exact_durable_log_audit_capacity<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+) -> io::Result<()> {
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| io::Error::other("session consensus durable log audit allocation failed"))
+}
+
+fn decode_durable_log_audit_rows(
     rows: &[EncodedDurableLogAuditRow],
     identity: SessionConsensusIdentity,
+) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    let mut decoded = Vec::new();
+    reserve_exact_durable_log_audit_capacity(&mut decoded, rows.len())?;
+    for row in rows {
+        decoded.push(decode_durable_log_audit_row(row, identity)?);
+    }
+    Ok(decoded)
+}
+
+fn decode_durable_log_audit_batch_with_available_parallelism(
+    rows: &[EncodedDurableLogAuditRow],
+    identity: SessionConsensusIdentity,
+    available_parallelism: usize,
 ) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let workers = durable_log_audit_worker_count(
-        rows.len(),
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1),
-    );
+    let workers = durable_log_audit_worker_count(rows.len(), available_parallelism);
     // Ordinary committed-frontier advances normally contain one row. Keep
-    // that hot path allocation- and thread-free; parallelism is reserved for
-    // the large exact audits performed at snapshot and recovery boundaries.
+    // that hot path thread-free; parallelism is reserved for the large exact
+    // audits performed at snapshot and recovery boundaries.
     if workers == 1 {
-        return rows
-            .iter()
-            .map(|row| decode_durable_log_audit_row(row, identity))
-            .collect();
+        return decode_durable_log_audit_rows(rows, identity);
     }
     let rows_per_worker = rows.len().div_ceil(workers);
     std::thread::scope(|scope| {
-        let handles = rows
-            .chunks(rows_per_worker)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|row| decode_durable_log_audit_row(row, identity))
-                        .collect::<io::Result<Vec<_>>>()
+        let mut handles = Vec::new();
+        reserve_exact_durable_log_audit_capacity(&mut handles, workers)?;
+        let mut decoded = Vec::new();
+        reserve_exact_durable_log_audit_capacity(&mut decoded, rows.len())?;
+        let mut spawn_error = None;
+        for (worker_index, chunk) in rows.chunks(rows_per_worker).enumerate() {
+            #[cfg(not(test))]
+            let _ = worker_index;
+            #[cfg(test)]
+            if DURABLE_LOG_AUDIT_FAULTS_FOR_TEST
+                .with(|faults| faults.get().spawn_failure_worker == Some(worker_index))
+            {
+                spawn_error = Some(invalid_data(
+                    "session consensus durable log audit worker spawn failed",
+                ));
+                break;
+            }
+            #[cfg(test)]
+            let panic_worker = DURABLE_LOG_AUDIT_FAULTS_FOR_TEST
+                .with(|faults| faults.get().panic_worker == Some(worker_index));
+            let handle = std::thread::Builder::new()
+                .spawn_scoped(scope, move || {
+                    #[cfg(test)]
+                    if panic_worker {
+                        panic!("injected durable log audit worker failure");
+                    }
+                    decode_durable_log_audit_rows(chunk, identity)
                 })
-            })
-            .collect::<Vec<_>>();
-        let mut decoded = Vec::with_capacity(rows.len());
+                .map_err(|_| {
+                    invalid_data("session consensus durable log audit worker spawn failed")
+                });
+            match handle {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
         // Join in source order so witness insertion and error precedence stay
         // deterministic even though exact row decoding runs concurrently.
         let mut first_error = None;
@@ -24778,10 +24867,25 @@ fn decode_durable_log_audit_batch(
         }
         if let Some(error) = first_error {
             Err(error)
+        } else if let Some(error) = spawn_error {
+            Err(error)
         } else {
             Ok(decoded)
         }
     })
+}
+
+fn decode_durable_log_audit_batch(
+    rows: &[EncodedDurableLogAuditRow],
+    identity: SessionConsensusIdentity,
+) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    decode_durable_log_audit_batch_with_available_parallelism(
+        rows,
+        identity,
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
 }
 
 fn insert_validated_log_rows_in_range_sync(
@@ -24814,24 +24918,68 @@ fn insert_validated_log_rows_in_range_sync(
         let mut encoded_rows = Vec::new();
         let mut encoded_bytes = 0_usize;
         // The last row can cross the byte target by at most one already-
-        // bounded log entry. This keeps allocation below two fixed 16 MiB
-        // envelopes without buffering an unread SQLite row between batches.
-        while encoded_bytes < DURABLE_LOG_AUDIT_BATCH_BYTES {
-            let Some(row) = rows.next().map_err(db_error)? else {
-                break;
+        // bounded log entry. The independent row ceiling also bounds tiny-row
+        // descriptor and allocator overhead without buffering an unread
+        // SQLite row between batches.
+        let mut exhausted = false;
+        let mut read_error = None;
+        while encoded_rows.len() < DURABLE_LOG_AUDIT_BATCH_ROWS
+            && encoded_bytes < DURABLE_LOG_AUDIT_BATCH_BYTES
+        {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    exhausted = true;
+                    break;
+                }
+                Err(error) => {
+                    read_error = Some(db_error(error));
+                    break;
+                }
             };
-            let encoded: Option<Vec<u8>> = row.get(3).map_err(db_error)?;
-            let encoded = encoded
-                .ok_or_else(|| invalid_data("session consensus log entry size is invalid"))?;
-            encoded_bytes = encoded_bytes.saturating_add(encoded.len());
-            encoded_rows.push(EncodedDurableLogAuditRow {
-                epoch: row.get(0).map_err(db_error)?,
-                term: row.get(1).map_err(db_error)?,
-                index: row.get(2).map_err(db_error)?,
-                encoded,
-            });
+            let encoded_row = (|| {
+                let epoch = row.get(0).map_err(db_error)?;
+                let term = row.get(1).map_err(db_error)?;
+                let index = row.get(2).map_err(db_error)?;
+                let encoded: Option<Vec<u8>> = row.get(3).map_err(db_error)?;
+                let encoded = encoded
+                    .ok_or_else(|| invalid_data("session consensus log entry size is invalid"))?;
+                Ok(EncodedDurableLogAuditRow {
+                    epoch,
+                    term,
+                    index,
+                    encoded,
+                })
+            })();
+            let encoded_row = match encoded_row {
+                Ok(encoded_row) => encoded_row,
+                Err(error) => {
+                    read_error = Some(error);
+                    break;
+                }
+            };
+            encoded_bytes = encoded_bytes
+                .checked_add(encoded_row.encoded.len())
+                .ok_or_else(|| invalid_data("session consensus durable log audit size overflow"))?;
+            if encoded_rows.len() == encoded_rows.capacity() {
+                let remaining = DURABLE_LOG_AUDIT_BATCH_ROWS - encoded_rows.len();
+                let growth = if encoded_rows.capacity() == 0 {
+                    8.min(remaining)
+                } else {
+                    encoded_rows.capacity().min(remaining)
+                };
+                reserve_exact_durable_log_audit_capacity(&mut encoded_rows, growth)?;
+            }
+            encoded_rows.push(encoded_row);
         }
+        #[cfg(test)]
+        DURABLE_LOG_AUDIT_MAX_BATCH_ROWS_FOR_TEST.with(|maximum| {
+            maximum.set(maximum.get().max(encoded_rows.len()));
+        });
         if encoded_rows.is_empty() {
+            if let Some(error) = read_error {
+                return Err(error);
+            }
             break;
         }
         for log_id in decode_durable_log_audit_batch(&encoded_rows, identity)? {
@@ -24844,6 +24992,15 @@ fn insert_validated_log_rows_in_range_sync(
                     ));
                 }
             }
+        }
+        // A row-fetch/type/size error follows every successfully buffered row
+        // in source order. Decode those earlier rows first so parallel batching
+        // preserves the former row-by-row error precedence.
+        if let Some(error) = read_error {
+            return Err(error);
+        }
+        if exhausted {
+            break;
         }
     }
     Ok(())
@@ -39570,6 +39727,123 @@ mod tests {
             DURABLE_LOG_AUDIT_WORKERS,
             durable_log_audit_worker_count(4_096, 128)
         );
+    }
+
+    fn encoded_blank_durable_log_audit_rows(count: usize) -> Vec<EncodedDurableLogAuditRow> {
+        (0..count)
+            .map(|index| {
+                let index = u64::try_from(index).expect("audit fixture index fits u64");
+                let entry = blank_entry(index);
+                EncodedDurableLogAuditRow {
+                    epoch: epoch_i64(identity()).expect("audit fixture epoch"),
+                    term: i64::try_from(entry.log_id.leader_id.term)
+                        .expect("audit fixture term fits SQLite"),
+                    index: i64::try_from(index).expect("audit fixture index fits SQLite"),
+                    encoded: encode_json(&entry).expect("encode audit fixture row"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_log_audit_allocation_spawn_and_worker_failures_are_fail_closed() {
+        let mut impossible = Vec::<u8>::new();
+        assert_eq!(
+            reserve_exact_durable_log_audit_capacity(&mut impossible, usize::MAX)
+                .expect_err("impossible audit allocation rejects")
+                .kind(),
+            io::ErrorKind::Other,
+        );
+
+        let rows = encoded_blank_durable_log_audit_rows(128);
+        let spawn_error = with_durable_log_audit_faults_for_test(
+            DurableLogAuditFaultsForTest {
+                spawn_failure_worker: Some(1),
+                panic_worker: None,
+            },
+            || decode_durable_log_audit_batch_with_available_parallelism(&rows, identity(), 4),
+        )
+        .expect_err("worker spawn failure rejects the complete audit");
+        assert_eq!(spawn_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            spawn_error.to_string(),
+            "session consensus durable log audit worker spawn failed",
+        );
+
+        let panic_error = with_durable_log_audit_faults_for_test(
+            DurableLogAuditFaultsForTest {
+                spawn_failure_worker: None,
+                panic_worker: Some(1),
+            },
+            || decode_durable_log_audit_batch_with_available_parallelism(&rows, identity(), 4),
+        )
+        .expect_err("worker panic rejects the complete audit");
+        assert_eq!(panic_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            panic_error.to_string(),
+            "session consensus durable log audit worker failed",
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_log_audit_tiny_corrupt_rows_obey_fixed_batch_cardinality() {
+        let last_index =
+            u64::try_from(DURABLE_LOG_AUDIT_BATCH_ROWS).expect("audit row cap fits u64");
+        let backend = backend_with_blank_logs(last_index).await;
+        let conn = backend.conn.lock().await;
+        conn.execute("UPDATE consensus_log SET entry_json = ?1", [vec![b'x']])
+            .expect("install tiny corrupt audit rows");
+
+        reset_durable_log_audit_max_batch_rows_for_test();
+        let mut witnesses = BTreeMap::new();
+        assert_eq!(
+            insert_validated_log_rows_in_range_sync(
+                &conn,
+                identity(),
+                0,
+                last_index,
+                &mut witnesses,
+            )
+            .expect_err("tiny corrupt rows fail closed")
+            .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(witnesses.is_empty());
+        assert_eq!(
+            durable_log_audit_max_batch_rows_for_test(),
+            DURABLE_LOG_AUDIT_BATCH_ROWS,
+            "one-byte rows cannot grow the coordinator batch beyond its fixed row cap",
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_log_audit_preserves_decode_before_later_row_read_error() {
+        let backend = backend_with_blank_logs(1).await;
+        let conn = backend.conn.lock().await;
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 0",
+            [vec![b'x']],
+        )
+        .expect("install earlier decode error");
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+            .expect("allow later empty-row fixture");
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+            [Vec::<u8>::new()],
+        )
+        .expect("install later row-size error");
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .expect("restore row constraints");
+
+        let expected = decode_consensus_log_entry(b"x")
+            .expect_err("earlier fixture is invalid JSON")
+            .to_string();
+        let mut witnesses = BTreeMap::new();
+        let error =
+            insert_validated_log_rows_in_range_sync(&conn, identity(), 0, 1, &mut witnesses)
+                .expect_err("earlier decode error wins over later row error");
+        assert_eq!(error.to_string(), expected);
+        assert!(witnesses.is_empty());
     }
 
     #[test]
