@@ -8,10 +8,14 @@
 //!
 //! # Protected checkpoint consumption
 //!
-//! Prepared checkpoint requests are obtained only from an SDK-owned
-//! [`ProtectedSessionBackend`] wrapper. The returned affine request captures
-//! its exact scope, caller request ID, sealed mutation, and deadline budget;
-//! only the net-owned consumer composite can turn it into an execution handle.
+//! Prepared CAS and lease checkpoint requests are obtained only from an
+//! SDK-owned [`ProtectedSessionBackend`] wrapper. Protected fenced transitions
+//! use the narrower sealed [`ProtectedFencedTransitionBackend`] boundary,
+//! which needs only [`SessionBackend`] and therefore does not grant a physical
+//! consumer adapter synthetic lease authority. The returned affine request
+//! captures its exact scope, caller request ID, sealed mutation, and deadline
+//! budget; only the net-owned consumer composite can turn it into an execution
+//! handle.
 //! Prepared is local type-state, never a wire or server authorization marker.
 //!
 //! ```compile_fail
@@ -116,7 +120,7 @@ pub use backend::{
     PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
     PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError,
     PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
-    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError,
+    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedFencedTransitionBackend,
     ProtectedRosterEstablishedSuccessor, ProtectedSelectorLedgerBase, ProtectedSessionBackend,
     RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
     ReplicationOp, ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor,

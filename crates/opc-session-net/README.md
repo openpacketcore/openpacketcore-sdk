@@ -295,27 +295,44 @@ separately scoped `FencedTransitionV2PreparedJournal` described in the
 session-store documentation; V2 transport does not create, substitute for, or
 fall back to that durable recovery boundary.
 
-`SessionConsumerPreparedCheckpointBackend` separately exposes the public
-protected V1 prepared fenced-transition router. It composes one protected
-backend allocation with the *complete*, exact same-authenticated-scope roster
-of persistent consumer voters. Construction rejects an incomplete, duplicate,
-or differently bound roster, and canonicalizes accepted voters by node ordinal;
-the caller's input order is not authority. For each request, the router derives
+`SessionConsumerPreparedFencedTransitionBackend` is the public protected V1
+prepared fenced-transition router. It composes one narrow
+`ProtectedFencedTransitionBackend` allocation with the *complete*, exact
+same-authenticated-scope roster of *activated, prewarmed V1 physical voter
+backends*, produced only by
+`SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends`.
+Raw persistent clients cannot construct this router. Construction rejects an
+incomplete, duplicate, differently bound, non-persistent, or unactivated
+roster, and canonicalizes accepted voters by node ordinal; the caller's input
+order is not authority. For each request, the router derives
 one deterministic origin from the authenticated scope, canonical roster, and
 caller-stable `FencedTransitionRequestId`. This is a router over the existing
 V1 `fenced_transition` operation, not V2 receipt-history authority, a V2
 journal, a quorum API, or an activation/readiness probe.
 
+`ProtectedFencedTransitionBackend` is sealed and requires only
+`SessionBackend`; SDK-owned `EncryptingSessionBackend` and
+`RemoteSealingSessionBackend` implement it around any physical
+`SessionBackend`. This lets the fenced router compose the real
+`SessionConsumerFencedTransitionBackend` without inventing lease authority.
+`SessionConsumerPreparedCheckpointBackend` remains the separate full
+protected-session composite for prepared CAS and lease operations, which do
+require `ProtectedSessionBackend` and its lease surface.
+
 `prepare_fenced_transition` keeps the exact outer protected journal token
-private in a move-only `SessionConsumerPreparedFencedTransition` handle. Before
-each physical mutation or status attempt it reprojects and revalidates that
-exact outer token; it never reconstructs a request or substitutes current
-provider/key state. Mutation visits canonical voters from its origin and may
+private in a move-only `SessionConsumerPreparedFencedTransition` handle. The
+sealed boundary never exposes a dispatchable physical prepared token; before
+each physical mutation or status attempt it revalidates the outer token and
+derives only the request view needed by the net-owned router. It never
+reconstructs a request or substitutes current provider/key state. Mutation
+visits canonical voters from its origin and may
 advance only after a proven pre-dispatch `NotTransmitted` result. While setup is
 still pre-dispatch, cancellation is safe and retryable because no application
 bytes can cross the transport boundary. Once dispatch starts, any possible send
 (`OutcomeUnknown`) or cancellation makes the affine handle permanently
 receipt-only; it can never dispatch the mutation again.
+An authenticated-scope `BeforeCallWrite` failure is topology revocation, not a
+rotatable `NotTransmitted` result, and terminalizes the handle.
 
 Receipt-only status is read-only. `status_once` uses the next deterministic
 successor voter, while `status_until_terminal` makes at most one pass over the

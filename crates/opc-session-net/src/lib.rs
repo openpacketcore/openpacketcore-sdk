@@ -77,6 +77,7 @@ pub use consumer::{
     SessionConsumerLeaseMutationError, SessionConsumerMutationError,
     SessionConsumerPreparedCheckpointBackend, SessionConsumerPreparedCheckpointBackendError,
     SessionConsumerPreparedCompareAndSet, SessionConsumerPreparedFencedTransition,
+    SessionConsumerPreparedFencedTransitionBackend,
     SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerPreparedLeaseAcquire,
     SessionConsumerRecoveredFencedTransitionStatus, SessionQuorumConsumerServer,
     SessionQuorumConsumerServerAdmissionSnapshot, SessionQuorumConsumerServerHandle,

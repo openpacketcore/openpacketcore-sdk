@@ -2048,12 +2048,16 @@ provider/key rotation can therefore use the same durable journal path, key,
 and volume. This does not claim host failover, host/volume-loss recovery,
 journal replication, or a second consensus transition.
 
-`SessionConsumerPreparedCheckpointBackend` is the public protected V1
-prepared fenced-transition router for that wrapper. It composes one protected
-backend allocation with the exact complete roster of persistent authenticated
-consumer voters for one scope. Construction rejects an incomplete, duplicate,
-or differently authenticated/bound roster and then canonicalizes the admitted
-voters by node ordinal; caller input order is not authority. For every
+`SessionConsumerPreparedFencedTransitionBackend` is the public protected V1
+prepared fenced-transition router for that wrapper. It composes one sealed
+`ProtectedFencedTransitionBackend` allocation with the exact complete roster
+of activated, prewarmed V1 physical voter backends for one scope. Only
+`SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends`
+may produce the accepted voter values; raw persistent clients, a partial
+roster, or any non-V1 voter cannot construct the router. Construction rejects
+an incomplete, duplicate, or differently authenticated/bound roster and then
+canonicalizes the admitted voters by node ordinal; caller input order is not
+authority. For every
 caller-stable `FencedTransitionRequestId`, the router derives the same origin
 from the authenticated scope, canonical roster, and ID. It uses the existing
 V1 `fenced_transition` operation only. It is not #702's V2 receipt-history
@@ -2061,17 +2065,33 @@ protocol or `FencedTransitionV2PreparedJournal`, and grants neither activation
 or readiness-probe authority nor a new quorum, replication, membership, or
 consensus authority.
 
+`ProtectedFencedTransitionBackend` requires only `SessionBackend`, is sealed,
+and is implemented by `EncryptingSessionBackend` and
+`RemoteSealingSessionBackend` around any physical `SessionBackend`. Therefore
+the router composes directly over the real
+`SessionConsumerFencedTransitionBackend` and MUST NOT grant that physical
+adapter synthetic lease authority. The existing
+`SessionConsumerPreparedCheckpointBackend` remains the distinct complete
+protected-session path for prepared CAS and lease APIs, which require
+`ProtectedSessionBackend` and `SessionLeaseManager`.
+
 Preparation retains the exact outer protected journal token privately in a
-move-only affine handle. The router reprojects and revalidates that exact outer
-token before every physical mutation and receipt-status attempt; it MUST NOT
-reconstruct the request or replace the retained token with current
-provider/key state. Mutation starts at the deterministic origin and visits the
+move-only affine handle. The sealed boundary MUST NOT expose a dispatchable
+physical prepared token. The router revalidates that exact outer token before
+every physical mutation and receipt-status attempt and derives only its
+authenticated-consumer request view; it MUST NOT reconstruct the request or
+replace the retained token with current provider/key state. Mutation starts at
+the deterministic origin and visits the
 canonical voter roster. It MAY advance to another voter only after a proven
 pre-dispatch `NotTransmitted` result. Cancellation during the pre-dispatch
 setup is safe and retryable because no application bytes can cross the
 transport boundary. After dispatch begins, a possible send, including
 `OutcomeUnknown`, or cancellation is ambiguous and MUST permanently make the
 handle receipt-only; it MUST NOT regain mutation authority.
+`BeforeCallWrite(SessionConsumerClientError::Scope)` is a terminal topology
+authority revocation and MUST be returned as rejected
+`StoreError::TopologyAuthorityRevoked`; it MUST NOT be downgraded to a generic
+`NotTransmitted` result or trigger successor mutation dispatch.
 
 Receipt status is read-only. A single status call uses the next deterministic
 canonical successor voter. A status-until-terminal call makes at most one such

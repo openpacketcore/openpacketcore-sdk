@@ -1945,51 +1945,67 @@ fn protected_payload_scope_commitment(namespace: &str) -> Option<[u8; 32]> {
     Some(digest.finalize().into())
 }
 
-/// SDK-owned sealing boundary for protected session backends.
+/// SDK-owned sealing boundary for protected fenced transitions.
 ///
 /// This deliberately remains crate-private: product adapters compose under
 /// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`] instead of
 /// asserting their own payload-protection authority.
-pub(crate) mod protected_session_backend_seal {
+pub(crate) mod protected_fenced_transition_backend_seal {
     pub trait Sealed {
         fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]>;
     }
 }
 
 /// Product-neutral proof that a backend is wrapped by one of the SDK-owned
-/// authenticated payload-protection adapters.
+/// authenticated payload-protection adapters and may revalidate a protected
+/// fenced transition for the authenticated-consumer router.
 ///
 /// This trait is sealed. Third-party stores compose underneath
 /// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`]; remote seal
 /// providers continue to compose through the latter wrapper. They cannot mint
-/// a protected selector authority by implementing this trait themselves.
+/// a protected fenced-transition authority by implementing this trait
+/// themselves.
 ///
 /// ```compile_fail
-/// use opc_session_store::ProtectedSessionBackend;
+/// use opc_session_store::ProtectedFencedTransitionBackend;
 ///
 /// struct ProductBackend;
 ///
 /// // Fails: the SDK-owned sealed supertrait is not externally nameable.
-/// impl ProtectedSessionBackend for ProductBackend {}
+/// impl ProtectedFencedTransitionBackend for ProductBackend {}
 /// ```
 #[async_trait]
-pub trait ProtectedSessionBackend:
-    SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
+pub trait ProtectedFencedTransitionBackend:
+    SessionBackend + protected_fenced_transition_backend_seal::Sealed
 {
-    /// Project one caller-retained protected token to the exact physical
-    /// authenticated-consumer token after revalidating the wrapper journal.
-    /// This performs no dispatch and is intentionally available only through
-    /// the sealed protected-backend contract.
+    /// Revalidate one caller-retained protected token and return its exact
+    /// authenticated-consumer request view.
+    ///
+    /// This never exposes the dispatchable physical prepared token. The
+    /// returned request is suitable only for a router which already owns the
+    /// authenticated persistent transport; the sealed wrapper retains the
+    /// physical token used for direct backend dispatch.
     #[doc(hidden)]
-    async fn project_fenced_transition_for_authenticated_consumer_router(
+    async fn authenticated_consumer_fenced_transition_request(
         &self,
         _prepared: &PreparedFencedTransition,
-    ) -> Result<PreparedFencedTransition, StoreError> {
+        _binding: [u8; 32],
+    ) -> Result<FencedTransitionRequest, StoreError> {
         Err(StoreError::CapabilityNotSupported(
             "authenticated_consumer_prepared_fenced_transition".into(),
         ))
     }
+}
 
+/// Product-neutral proof that a backend supports the complete protected
+/// session-store surface, including lease authority and prepared CAS.
+///
+/// For the narrower authenticated-consumer fenced-transition composition use
+/// [`ProtectedFencedTransitionBackend`]. That boundary intentionally needs
+/// only [`SessionBackend`], so a physical consumer adapter cannot be made to
+/// claim lease authority merely to participate in receipt recovery.
+#[async_trait]
+pub trait ProtectedSessionBackend: ProtectedFencedTransitionBackend + SessionLeaseManager {
     /// Create one caller-provided-ID affine acquire request before any
     /// physical mutation poll. Implementations are restricted to SDK sealing
     /// wrappers.
@@ -2016,7 +2032,7 @@ pub trait ProtectedSessionBackend:
 
 pub(crate) fn protected_payload_scope_commitment_for<B>(backend: &B) -> Option<[u8; 32]>
 where
-    B: ProtectedSessionBackend + ?Sized,
+    B: ProtectedFencedTransitionBackend + ?Sized,
 {
     backend.protected_payload_scope_commitment()
 }
@@ -3773,9 +3789,9 @@ where
     }
 }
 
-impl<B, P> protected_session_backend_seal::Sealed for EncryptingSessionBackend<B, P>
+impl<B, P> protected_fenced_transition_backend_seal::Sealed for EncryptingSessionBackend<B, P>
 where
-    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    B: SessionBackend + ?Sized + 'static,
     P: KeyProvider + ?Sized + 'static,
 {
     fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
@@ -3784,15 +3800,16 @@ where
 }
 
 #[async_trait]
-impl<B, P> ProtectedSessionBackend for EncryptingSessionBackend<B, P>
+impl<B, P> ProtectedFencedTransitionBackend for EncryptingSessionBackend<B, P>
 where
-    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    B: SessionBackend + Send + Sync + ?Sized + 'static,
     P: KeyProvider + Send + Sync + ?Sized + 'static,
 {
-    async fn project_fenced_transition_for_authenticated_consumer_router(
+    async fn authenticated_consumer_fenced_transition_request(
         &self,
         prepared: &PreparedFencedTransition,
-    ) -> Result<PreparedFencedTransition, StoreError> {
+        binding: [u8; 32],
+    ) -> Result<FencedTransitionRequest, StoreError> {
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
@@ -3805,9 +3822,16 @@ where
                 scope_commitment,
             })?;
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
-        Ok(inner)
+        inner.request_for_authenticated_consumer(binding)
     }
+}
 
+#[async_trait]
+impl<B, P> ProtectedSessionBackend for EncryptingSessionBackend<B, P>
+where
+    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    P: KeyProvider + Send + Sync + ?Sized + 'static,
+{
     fn prepare_acquire_with_id(
         &self,
         scope: SessionConsumerScope,
@@ -4869,9 +4893,9 @@ where
     }
 }
 
-impl<B, S> protected_session_backend_seal::Sealed for RemoteSealingSessionBackend<B, S>
+impl<B, S> protected_fenced_transition_backend_seal::Sealed for RemoteSealingSessionBackend<B, S>
 where
-    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    B: SessionBackend + ?Sized + 'static,
     S: RemoteSealProvider + ?Sized + 'static,
 {
     fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
@@ -4880,15 +4904,16 @@ where
 }
 
 #[async_trait]
-impl<B, S> ProtectedSessionBackend for RemoteSealingSessionBackend<B, S>
+impl<B, S> ProtectedFencedTransitionBackend for RemoteSealingSessionBackend<B, S>
 where
-    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    B: SessionBackend + Send + Sync + ?Sized + 'static,
     S: RemoteSealProvider + Send + Sync + ?Sized + 'static,
 {
-    async fn project_fenced_transition_for_authenticated_consumer_router(
+    async fn authenticated_consumer_fenced_transition_request(
         &self,
         prepared: &PreparedFencedTransition,
-    ) -> Result<PreparedFencedTransition, StoreError> {
+        binding: [u8; 32],
+    ) -> Result<FencedTransitionRequest, StoreError> {
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
@@ -4901,9 +4926,16 @@ where
                 scope_commitment,
             })?;
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
-        Ok(inner)
+        inner.request_for_authenticated_consumer(binding)
     }
+}
 
+#[async_trait]
+impl<B, S> ProtectedSessionBackend for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    S: RemoteSealProvider + Send + Sync + ?Sized + 'static,
+{
     fn prepare_acquire_with_id(
         &self,
         scope: SessionConsumerScope,

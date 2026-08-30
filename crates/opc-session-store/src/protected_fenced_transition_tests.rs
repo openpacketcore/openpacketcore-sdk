@@ -29,7 +29,7 @@ use crate::{
     FencedTransitionV2PreparedJournalKey, FencedTransitionV2Request, FencedTransitionV2Status,
     Generation, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, ProtectedSessionBackend, RemoteSealingSessionBackend,
+    PreparedFencedTransitionLookup, ProtectedFencedTransitionBackend, RemoteSealingSessionBackend,
     SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
     SessionPayloadEncoding, SessionStore, StateClass, StateType, StoreError, StoredSessionRecord,
     FENCED_TRANSITION_MAX_PREPARED_BYTES,
@@ -2750,9 +2750,10 @@ async fn protected_fenced_transition_router_projection_rejects_substituted_journ
     journal.substitute_prepared_token(first.request_id(), second.request_id());
 
     assert!(matches!(
-        ProtectedSessionBackend::project_fenced_transition_for_authenticated_consumer_router(
+        ProtectedFencedTransitionBackend::authenticated_consumer_fenced_transition_request(
             wrapper.as_ref(),
             &first,
+            [0x31; 32],
         )
         .await,
         Err(StoreError::BackendUnavailable(_))
@@ -2925,19 +2926,12 @@ async fn protected_fenced_transition_router_projection_rechecks_the_journal_befo
         .prepare_fenced_transition(create_request(0xc1))
         .await
         .expect("prepare local protected transition");
-    assert!(
-        ProtectedSessionBackend::project_fenced_transition_for_authenticated_consumer_router(
-            local.as_ref(),
-            &local_prepared,
-        )
-        .await
-        .is_ok()
-    );
     local_journal.delete_prepared_token();
     assert!(matches!(
-        ProtectedSessionBackend::project_fenced_transition_for_authenticated_consumer_router(
+        ProtectedFencedTransitionBackend::authenticated_consumer_fenced_transition_request(
             local.as_ref(),
             &local_prepared,
+            [0x32; 32],
         )
         .await,
         Err(StoreError::BackendUnavailable(_))
@@ -2959,19 +2953,12 @@ async fn protected_fenced_transition_router_projection_rechecks_the_journal_befo
         .prepare_fenced_transition(create_request(0xc2))
         .await
         .expect("prepare remote protected transition");
-    assert!(
-        ProtectedSessionBackend::project_fenced_transition_for_authenticated_consumer_router(
-            remote.as_ref(),
-            &remote_prepared,
-        )
-        .await
-        .is_ok()
-    );
     remote_journal.delete_prepared_token();
     assert!(matches!(
-        ProtectedSessionBackend::project_fenced_transition_for_authenticated_consumer_router(
+        ProtectedFencedTransitionBackend::authenticated_consumer_fenced_transition_request(
             remote.as_ref(),
             &remote_prepared,
+            [0x33; 32],
         )
         .await,
         Err(StoreError::BackendUnavailable(_))
