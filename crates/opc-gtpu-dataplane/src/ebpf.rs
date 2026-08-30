@@ -20818,14 +20818,22 @@ mod aya_runtime {
             let leaf = pin_dir
                 .file_name()
                 .ok_or_else(|| state_indeterminate(OPERATION))?;
-            let (root, _) = match Self::open_bpffs_namespace_root(configured_root, false, OPERATION)
-            {
-                Ok(root) => root,
-                Err(GtpuError::Io {
-                    kind: io::ErrorKind::NotFound,
-                    ..
-                }) => return Ok(None),
-                Err(error) => return Err(error),
+            let current_root = Self::open_bpffs_namespace_root(configured_root, false, OPERATION);
+            let (root, historical_namespace_root) = match current_root {
+                Ok((root, _)) => (root, false),
+                Err(current_error) => {
+                    match Self::open_historical_25_bpffs_namespace_root(configured_root, OPERATION)
+                    {
+                        Ok((root, _)) => (root, true),
+                        Err(_) => match current_error {
+                            GtpuError::Io {
+                                kind: io::ErrorKind::NotFound,
+                                ..
+                            } => return Ok(None),
+                            error => return Err(error),
+                        },
+                    }
+                }
             };
             let control_root = match rustix::fs::openat(
                 &root,
@@ -20837,10 +20845,20 @@ mod aya_runtime {
                 rustix::fs::Mode::empty(),
             ) {
                 Ok(descriptor) => File::from(descriptor),
-                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(rustix::io::Errno::NOENT) if !historical_namespace_root => return Ok(None),
+                Err(rustix::io::Errno::NOENT) => return Err(state_indeterminate(OPERATION)),
                 Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
             };
-            Self::verify_control_root(&control_root, None, OPERATION)?;
+            let raw_control_metadata = control_root
+                .metadata()
+                .map_err(|error| GtpuError::io(OPERATION, error))?;
+            let predecessor_handoff = historical_namespace_root
+                || !selector_control_directory_mode_is_exact(raw_control_metadata.mode());
+            if predecessor_handoff {
+                Self::historical_25_verify_control_root(&control_root, None, OPERATION)?;
+            } else {
+                Self::verify_control_root(&control_root, None, OPERATION)?;
+            }
             let legacy_name = Self::historical_25_legacy_leaf_name(leaf)?;
             match rustix::fs::openat(
                 &control_root,
@@ -20857,6 +20875,36 @@ mod aya_runtime {
                 Err(rustix::io::Errno::NOENT) => Ok(None),
                 Err(error) => Err(GtpuError::io(OPERATION, error.into())),
             }
+        }
+
+        /// Recognize the exact one-marker predecessor exclusion beside a
+        /// native current terminal without taking or creating authority. The
+        /// terminal reader subsequently reacquires the directory flock and
+        /// revalidates every inode; this observation only prevents a proven
+        /// ordinary-writer reservation from being mistaken for foreign
+        /// residue before that locked path is reachable.
+        fn historical_25_ordinary_exclusion_is_conclusive(
+            control_root: &File,
+            legacy_name: &str,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            let exclusion = match rustix::fs::openat(
+                control_root,
+                legacy_name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => File::from(descriptor),
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(operation, error.into())),
+            };
+            Self::verify_historical_25_ordinary_exclusion_directory(
+                &exclusion, None, None, operation,
+            )?;
+            Ok(true)
         }
 
         /// Classify conclusive live-generation, map-identity, and pin-ABI
@@ -20981,7 +21029,12 @@ mod aya_runtime {
             )
             .map(File::from)
             .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
-            let control_metadata = if predecessor_root {
+            let raw_control_metadata = control_root
+                .metadata()
+                .map_err(|error| GtpuError::io(OPERATION, error))?;
+            let predecessor_handoff = predecessor_root
+                || !selector_control_directory_mode_is_exact(raw_control_metadata.mode());
+            let control_metadata = if predecessor_handoff {
                 Self::historical_25_verify_control_root(&control_root, None, OPERATION)?
             } else {
                 Self::verify_control_root(&control_root, None, OPERATION)?
@@ -41775,17 +41828,27 @@ mod aya_runtime {
             // shape remains indeterminate and never causes us to create an
             // ordinary operation lock merely to investigate it.
             let target_leaf_present = entries.iter().any(|entry| entry == &current_leaf);
+            let target_ordinary_exclusion_is_conclusive =
+                if entries.iter().any(|entry| entry == &legacy_leaf) {
+                    Self::historical_25_ordinary_exclusion_is_conclusive(
+                        &control_root,
+                        &legacy_leaf,
+                        OPERATION,
+                    )
+                    .unwrap_or(false)
+                } else {
+                    true
+                };
             // The native operation lock intentionally shares the staging
             // prefix, but its complete deterministic name is paired current
             // authority rather than an interrupted staging sibling.
-            let target_residue_absent = !entries.iter().any(|entry| {
-                entry == &legacy_leaf
-                    || Self::historical_25_ordinary_exclusion_staging_name_is_reserved(
+            let target_residue_absent = target_ordinary_exclusion_is_conclusive
+                && !entries.iter().any(|entry| {
+                    Self::historical_25_ordinary_exclusion_staging_name_is_reserved(
                         entry,
                         &legacy_leaf,
-                    )
-                    || (entry != &operation_lock && entry.starts_with(&staging_prefix))
-            });
+                    ) || (entry != &operation_lock && entry.starts_with(&staging_prefix))
+                });
             let terminal_candidate = target_leaf_present
                 && target_residue_absent
                 && (entries.iter().any(|entry| entry == &operation_lock)
@@ -48340,6 +48403,101 @@ mod aya_runtime {
             println!("OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN");
         }
 
+        #[test]
+        #[ignore = "requires writable bpffs"]
+        fn historical_25_existing_exclusion_accepts_exact_root_control_mode_matrix() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let sequence = CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let pin_root = PathBuf::from(format!(
+                "/sys/fs/bpf/opc-gtpu-historical-25-mode-matrix-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&pin_root).expect("create unique compatibility-mode root");
+            struct ExactRootCleanup(PathBuf);
+            impl Drop for ExactRootCleanup {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = ExactRootCleanup(pin_root.clone());
+            let pin_dir = pin_root.join("up0");
+            fs::create_dir(&pin_dir).expect("create retained empty graph namespace");
+            let control_root = pin_root.join(RECONCILER_CONTROL_DIRECTORY);
+            fs::create_dir(&control_root).expect("create predecessor authority root");
+            let legacy_leaf = control_root.join(
+                AyaGtpuRuntime::historical_25_legacy_leaf_name(pin_dir.file_name().unwrap())
+                    .expect("legacy up0 authority leaf"),
+            );
+            fs::create_dir(&legacy_leaf).expect("create exact legacy authority leaf");
+            fs::set_permissions(&legacy_leaf, fs::Permissions::from_mode(0o700))
+                .expect("make the legacy authority private");
+            let ordinary_exclusion = legacy_leaf.join(HISTORICAL_25_ORDINARY_EXCLUSION_MARKER);
+            fs::create_dir(&ordinary_exclusion).expect("create the exact exclusion marker");
+            fs::set_permissions(&ordinary_exclusion, fs::Permissions::from_mode(0o700))
+                .expect("make the exclusion marker private");
+
+            let identity = |path: &Path| {
+                let metadata = fs::symlink_metadata(path)
+                    .expect("capture predecessor authority directory identity");
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                )
+            };
+            let identities = [
+                identity(&pin_root),
+                identity(&pin_dir),
+                identity(&control_root),
+                identity(&legacy_leaf),
+                identity(&ordinary_exclusion),
+            ];
+            let inventory = || {
+                let mut entries = fs::read_dir(&control_root)
+                    .expect("inventory predecessor authority root")
+                    .map(|entry| entry.expect("read predecessor entry").file_name())
+                    .collect::<Vec<_>>();
+                entries.sort_unstable();
+                entries
+            };
+            let expected_inventory = inventory();
+            for namespace_root_mode in [0o755, 0o700] {
+                fs::set_permissions(&pin_root, fs::Permissions::from_mode(namespace_root_mode))
+                    .expect("select an authentic namespace-root mode");
+                for control_root_mode in [0o755, 0o700] {
+                    fs::set_permissions(
+                        &control_root,
+                        fs::Permissions::from_mode(control_root_mode),
+                    )
+                    .expect("select an authentic control-root mode");
+                    drop(
+                        AyaGtpuRuntime::acquire_optional_existing_historical_25_ordinary_exclusion(
+                            &pin_dir,
+                        )
+                        .expect("open the exact existing exclusion without creation")
+                        .expect("the exact existing exclusion must remain present"),
+                    );
+                    assert_eq!(
+                        [
+                            identity(&pin_root),
+                            identity(&pin_dir),
+                            identity(&control_root),
+                            identity(&legacy_leaf),
+                            identity(&ordinary_exclusion),
+                        ],
+                        identities,
+                        "mode matrix must preserve every authority inode and owner"
+                    );
+                    assert_eq!(inventory(), expected_inventory);
+                }
+            }
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, iproute2, and a fresh netns"]
         async fn historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex()
@@ -49731,10 +49889,10 @@ mod aya_runtime {
                 matches!(
                     partial_create,
                     Err(GtpuError::StateIndeterminate {
-                        operation: "ebpf_historical_25_ordinary_preflight"
+                        operation: "ebpf_generation_identity"
                     })
                 ),
-                "partial admitted successor must fail closed without mutation: {partial_create:?}"
+                "partial admitted successor must retain the live generation-to-pin refusal without mutation: {partial_create:?}"
             );
             assert!(displaced_partial_map.exists());
             assert!(!partial_map.exists());
@@ -49771,13 +49929,8 @@ mod aya_runtime {
             assert_eq!(current_graph_inventory(), admitted_graph_inventory);
             let swapped_create = backend.create_device(create.clone()).await;
             assert!(
-                matches!(
-                    swapped_create,
-                    Err(GtpuError::StateIndeterminate {
-                        operation: "ebpf_historical_25_ordinary_preflight"
-                    })
-                ),
-                "map-ID-swapped successor must fail closed without mutation: {swapped_create:?}"
+                matches!(swapped_create, Err(GtpuError::AlreadyExists)),
+                "map-ID-swapped successor must retain the live program-to-pin conflict without mutation: {swapped_create:?}"
             );
             assert_eq!(
                 AyaGtpuRuntime::pinned_map_ids(
