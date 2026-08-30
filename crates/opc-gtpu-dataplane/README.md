@@ -1545,12 +1545,19 @@ without mutation. Its opaque fixed-width receipt uses
 checksummed and its `Debug` surface is redacted. After the broker durably
 acknowledges that receipt, `admit_current_ebpf_graph_successor` rechecks the
 complete graph and live guard immediately before retiring each exact authority
-leaf. A response-lost retry returns `AlreadyFinalized` only when the authentic
-R5 provenance and the twice-stable exact successor still match; it does not
-manufacture an absence proof. Wrong tenant/fence/generation, wrong target or
-configuration, live ownership, a surviving or partial authority layout,
-malformed/populated pins, cancellation, and concurrent replacement remain
-no-effect refusals. The ordinary create/read/mutation surfaces keep the
+leaf. The same process then activates only its exact retained odd traffic-gate
+generation; a response-lost retry returns `AlreadyFinalized` without another
+gate write only when that exact active generation, authentic R5 provenance,
+and twice-stable successor still match. A fresh process instead receives the
+bounded `ebpf_current_successor_typed_create` retry and must re-enter the exact
+ordinary typed-create target, which reloads the retained pins before enabling
+traffic. If an activation error cannot prove the paired even generation, the
+SDK fences only the receipt-bound tc hooks, proves their absence, preserves all
+graph/provenance pins, and requires that same typed-create retry. Partial or
+ambiguous fencing remains indeterminate. Wrong tenant/fence/generation, wrong
+target or configuration, live ownership, a surviving or partial authority
+layout, malformed/populated pins, cancellation, and concurrent replacement
+remain no-effect refusals. The ordinary create/read/mutation surfaces keep the
 successor inaccessible until this sequence has completed.
 
 #### Cleanup-only retained graph recovery authority

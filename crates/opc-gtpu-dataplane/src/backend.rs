@@ -527,10 +527,12 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Successful admission retires only the authenticated successor and
     /// terminal authority leaves after effect-adjacent graph/currentness
-    /// revalidation. `AlreadyFinalized` is a read-only response-loss result
-    /// available only while the same authentic historical provenance and
-    /// exact sealed successor still match. The caller must still re-enter the
-    /// ordinary typed create target before the graph becomes usable.
+    /// revalidation. A same-process exact successor is activated only after
+    /// that admission; an exact already-active retry is read-only and returns
+    /// `AlreadyFinalized` without rewriting its traffic gate. A fresh process
+    /// has no loaded activation handle, so successful reauthentication returns
+    /// `GtpuError::RetryRequired` for the ordinary typed-create target before
+    /// the retained graph can become usable.
     async fn admit_current_ebpf_graph_successor(
         &self,
         _request: CurrentEbpfGraphRecoverySuccessorAdmissionRequest,

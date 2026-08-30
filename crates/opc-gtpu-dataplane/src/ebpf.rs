@@ -626,6 +626,20 @@ pub(crate) trait CurrentEbpfGraphRecoveryCurrentnessProbe {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentRecoverySuccessorRegistration {
+    Absent,
+    Pending,
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentRecoverySuccessorActivation {
+    Activated,
+    AlreadyActive,
+    NeedsTypedCreate,
+}
+
 /// One broker-durable receipt and fresh live guard presented at the exact
 /// ordinary graph-creation boundary. The backend owns both values until
 /// attach returns, so this borrowed execution cannot outlive the affine
@@ -776,12 +790,56 @@ struct AsyncCurrentEbpfGraphRecoveryCurrentness<'a> {
     first_failure: Mutex<Option<CurrentEbpfGraphRecoveryAuthorityCurrentness>>,
 }
 
+/// One sticky live check spanning both the affine node-fence authority and
+/// the broker-durable successor receipt.  Activation passes this exact probe
+/// through the odd traffic-gate write, so neither external proof can be lost
+/// between the last admission read and the first packet effect.
+struct AsyncCurrentEbpfGraphRecoverySuccessorCurrentness<'a> {
+    authority: &'a CurrentEbpfGraphRecoveryAuthority,
+    brokered_receipt_commitment: crate::CurrentEbpfGraphRecoveryCommitment,
+    runtime: &'a tokio::runtime::Handle,
+    first_failure: Mutex<Option<CurrentEbpfGraphRecoveryAuthorityCurrentness>>,
+}
+
 impl CurrentEbpfGraphRecoveryCurrentnessProbe for AsyncCurrentEbpfGraphRecoveryCurrentness<'_> {
     fn verify_current(&self) -> Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness> {
         let result = EbpfGtpuDataplaneBackend::await_current_recovery_authority(
             self.authority,
             self.runtime,
         );
+        if let Err(currentness) = result {
+            if let Ok(mut first_failure) = self.first_failure.lock() {
+                first_failure.get_or_insert(currentness);
+            }
+        }
+        result
+    }
+
+    fn first_failure(&self) -> Option<CurrentEbpfGraphRecoveryAuthorityCurrentness> {
+        self.first_failure
+            .lock()
+            .map(|first_failure| *first_failure)
+            .unwrap_or(Some(
+                CurrentEbpfGraphRecoveryAuthorityCurrentness::Unavailable,
+            ))
+    }
+}
+
+impl CurrentEbpfGraphRecoveryCurrentnessProbe
+    for AsyncCurrentEbpfGraphRecoverySuccessorCurrentness<'_>
+{
+    fn verify_current(&self) -> Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness> {
+        let result = EbpfGtpuDataplaneBackend::await_current_recovery_authority(
+            self.authority,
+            self.runtime,
+        )
+        .and_then(|()| {
+            EbpfGtpuDataplaneBackend::await_brokered_current_successor_receipt(
+                self.authority,
+                self.brokered_receipt_commitment,
+                self.runtime,
+            )
+        });
         if let Err(currentness) = result {
             if let Ok(mut first_failure) = self.first_failure.lock() {
                 first_failure.get_or_insert(currentness);
@@ -1470,15 +1528,17 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Lift only the process-local ordinary-runtime fence after durable
     /// successor admission and its external receipt proof both completed.
-    /// This never changes bpffs state and must reject any non-exact loaded
-    /// replacement identity.
+    /// The implementation may update only the exact pinned traffic gate or
+    /// fence the exact receipt-bound tc hooks; it must reject any non-exact
+    /// loaded replacement identity and must never remove graph pins here.
     fn activate_current_recovery_successor(
         &self,
         _replacement: (&str, u32),
         _pin_dir: &Path,
         _tc_priority: u16,
+        _registration: CurrentRecoverySuccessorRegistration,
         _currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
-    ) -> Result<(), GtpuError> {
+    ) -> Result<CurrentRecoverySuccessorActivation, GtpuError> {
         Err(GtpuError::StateIndeterminate {
             operation: "ebpf_current_successor_activation",
         })
@@ -8975,11 +9035,6 @@ impl EbpfGtpuDataplaneBackend {
         let _operation = self.operation_guard()?;
         let (intent, target, receipt, authority) = request.into_parts();
         let binding = authority.binding();
-        let currentness = AsyncCurrentEbpfGraphRecoveryCurrentness {
-            authority: &authority,
-            runtime: authority_runtime,
-            first_failure: Mutex::new(None),
-        };
         let currentness_refusal =
             |currentness| Outcome::Refused(current_recovery_currentness_refusal(currentness));
         if binding != receipt.authority() {
@@ -8987,11 +9042,6 @@ impl EbpfGtpuDataplaneBackend {
                 CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch,
             ));
         }
-        if let Err(currentness) = currentness.verify_current() {
-            return Ok(currentness_refusal(currentness));
-        }
-        let managed_state = self
-            .current_recovery_managed_state(intent.pin_namespace(), intent.replacement_device());
         let resolved = self.resolve_current_successor_target(&intent, target)?;
         if receipt.target_kind() != resolved.configuration.target_kind() {
             return Ok(Outcome::Refused(
@@ -8999,13 +9049,17 @@ impl EbpfGtpuDataplaneBackend {
             ));
         }
         let brokered_receipt_commitment = receipt.commitment();
-        if let Err(currentness) = Self::await_brokered_current_successor_receipt(
-            &authority,
+        let currentness = AsyncCurrentEbpfGraphRecoverySuccessorCurrentness {
+            authority: &authority,
             brokered_receipt_commitment,
-            authority_runtime,
-        ) {
+            runtime: authority_runtime,
+            first_failure: Mutex::new(None),
+        };
+        if let Err(currentness) = currentness.verify_current() {
             return Ok(currentness_refusal(currentness));
         }
+        let managed_state = self
+            .current_recovery_managed_state(intent.pin_namespace(), intent.replacement_device());
         let outcome = match self.inner.runtime.admit_current_recovery_successor(
             Some((resolved.name.as_str(), resolved.ifindex)),
             &resolved.pin_dir,
@@ -9030,40 +9084,85 @@ impl EbpfGtpuDataplaneBackend {
             return Ok(currentness_refusal(currentness));
         }
         if matches!(outcome, Outcome::Admitted | Outcome::AlreadyFinalized) {
-            if let Err(currentness) = Self::await_brokered_current_successor_receipt(
-                &authority,
-                brokered_receipt_commitment,
-                authority_runtime,
-            ) {
-                return Ok(currentness_refusal(currentness));
-            }
             if let Err(currentness) = currentness.verify_current() {
                 return Ok(currentness_refusal(currentness));
             }
-            self.inner.runtime.activate_current_recovery_successor(
+            // Acquire and validate the outer registration before the runtime
+            // can write the odd/live gate.  The guard stays held through that
+            // write; after a successful activation only an infallible flag
+            // update remains, so no broker read or lock acquisition can
+            // return while tc traffic is live but the outer fence is pending.
+            let mut devices = self.devices()?;
+            let mut registration_entry = devices.entry(resolved.ifindex);
+            let registration = match &mut registration_entry {
+                std::collections::hash_map::Entry::Vacant(_) => {
+                    CurrentRecoverySuccessorRegistration::Absent
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let device = entry.get();
+                    let managed_pin_dir = device.grouped.map_or_else(
+                        || self.pin_dir(&device.name),
+                        |grouped| self.grouped_pin_dir(grouped.device_id),
+                    );
+                    if device.name != resolved.name
+                        || managed_pin_dir != resolved.pin_dir
+                        || device.cleanup_only
+                    {
+                        return Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_current_successor_registration",
+                        });
+                    }
+                    if device.successor_pending {
+                        CurrentRecoverySuccessorRegistration::Pending
+                    } else {
+                        CurrentRecoverySuccessorRegistration::Active
+                    }
+                }
+            };
+            let activation = self.inner.runtime.activate_current_recovery_successor(
                 (resolved.name.as_str(), resolved.ifindex),
                 &resolved.pin_dir,
                 self.inner.config.tc_priority,
+                registration,
                 &currentness,
             )?;
-            if let Err(currentness) = Self::await_brokered_current_successor_receipt(
-                &authority,
-                brokered_receipt_commitment,
-                authority_runtime,
-            ) {
-                return Ok(currentness_refusal(currentness));
-            }
-            if let Err(currentness) = currentness.verify_current() {
-                return Ok(currentness_refusal(currentness));
-            }
-            let mut devices = self.devices()?;
-            if let Some(device) = devices.get_mut(&resolved.ifindex) {
-                if device.name != resolved.name || device.cleanup_only {
+            match (registration, activation, registration_entry) {
+                (
+                    CurrentRecoverySuccessorRegistration::Pending,
+                    CurrentRecoverySuccessorActivation::Activated,
+                    std::collections::hash_map::Entry::Occupied(mut entry),
+                ) => {
+                    entry.get_mut().successor_pending = false;
+                }
+                (
+                    CurrentRecoverySuccessorRegistration::Active,
+                    CurrentRecoverySuccessorActivation::AlreadyActive,
+                    std::collections::hash_map::Entry::Occupied(_),
+                ) => {}
+                (
+                    _,
+                    CurrentRecoverySuccessorActivation::NeedsTypedCreate,
+                    std::collections::hash_map::Entry::Occupied(entry),
+                ) => {
+                    entry.remove();
+                    return Err(GtpuError::RetryRequired {
+                        operation: "ebpf_current_successor_typed_create",
+                    });
+                }
+                (
+                    CurrentRecoverySuccessorRegistration::Absent,
+                    CurrentRecoverySuccessorActivation::NeedsTypedCreate,
+                    std::collections::hash_map::Entry::Vacant(_),
+                ) => {
+                    return Err(GtpuError::RetryRequired {
+                        operation: "ebpf_current_successor_typed_create",
+                    });
+                }
+                _ => {
                     return Err(GtpuError::StateIndeterminate {
                         operation: "ebpf_current_successor_registration",
                     });
                 }
-                device.successor_pending = false;
             }
         }
         Ok(outcome)
@@ -14513,6 +14612,7 @@ mod aya_runtime {
     use super::{
         ebpf_pmtu_map_state_is_executable, historical_25_replacement_name_commitment,
         CurrentRecoveryManagedState, CurrentRecoveryPristineObservation,
+        CurrentRecoverySuccessorActivation, CurrentRecoverySuccessorRegistration,
         CurrentTerminalAdmissionExecution, CurrentTerminalSuccessorConfiguration,
         EbpfAttachmentDisposition, EbpfCleanupOnlyAdoption, EbpfEnvironment,
         EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime, EbpfMapUpdateMode,
@@ -16325,6 +16425,11 @@ mod aya_runtime {
         // A terminal successor resets this gate while it is still fenced.
         // It is enabled only by the broker-admission activation cut.
         pending_traffic_observation_gate: Option<u64>,
+        // The exact odd generation written by a completed successor
+        // activation. Same-process response-loss retries must read back this
+        // precise generation and never infer activity from an arbitrary odd
+        // value.
+        active_traffic_observation_gate: Option<u64>,
         // Set only when this runtime itself created the grouped graph's pins
         // and hooks.  It is consumed by the first marker-mint attempt and is
         // cleared by any unbound operation, so a retained or observed graph
@@ -16351,6 +16456,10 @@ mod aya_runtime {
                 .field(
                     "pending_traffic_observation_gate",
                     &self.pending_traffic_observation_gate.is_some(),
+                )
+                .field(
+                    "active_traffic_observation_gate",
+                    &self.active_traffic_observation_gate.is_some(),
                 )
                 .field(
                     "selector_namespace_fresh_provisioning",
@@ -19619,7 +19728,12 @@ mod aya_runtime {
                     || device.tc_priority != tc_priority
                     || device.cleanup_only
                     || (!device.successor_pending
-                        && (!allow_finalized || device.pending_traffic_observation_gate.is_some()))
+                        && (!allow_finalized
+                            || device.pending_traffic_observation_gate.is_some()
+                            || device.active_traffic_observation_gate.is_none()))
+                    || (device.successor_pending
+                        && (device.pending_traffic_observation_gate.is_none()
+                            || device.active_traffic_observation_gate.is_some()))
                     || device._reconciler_ownership.canonical_pin_dir != pin_dir
                 {
                     return Err(GtpuError::AlreadyExists);
@@ -33495,6 +33609,96 @@ mod aya_runtime {
                 )
         }
 
+        /// Fence only the exact receipt-bound hooks after a traffic-gate
+        /// rollback became indeterminate.  The loaded graph, every map pin,
+        /// and all recovery authority remain intact for the caller's next
+        /// typed create.  A partial or ambiguous detach is retained as an
+        /// ordinary-runtime fence and never reported as retry-safe.
+        fn detach_current_successor_hooks_for_typed_create(
+            devices: &mut HashMap<u32, LoadedDevice>,
+            replacement: (&str, u32),
+            pin_dir: &Path,
+            tc_priority: u16,
+            ownership: &Arc<ReconcilerOwnership>,
+            graph_lock: &OperationControlLock,
+        ) -> Result<(), GtpuError> {
+            const OPERATION: &str = "ebpf_current_successor_activation_fence";
+            let mut device = devices
+                .remove(&replacement.1)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let exact = device.interface == replacement.0
+                && device.pin_dir == pin_dir
+                && device.tc_priority == tc_priority
+                && !device.cleanup_only
+                && Arc::ptr_eq(&device._reconciler_ownership, ownership)
+                && device._reconciler_ownership.canonical_pin_dir == pin_dir
+                && device.links.is_some()
+                && Self::loaded_datapath_is_current(replacement.1, &device)
+                && Self::detach_graph_is_exclusive(replacement.1, &device);
+            if !exact {
+                devices.insert(replacement.1, device);
+                return Err(state_indeterminate(OPERATION));
+            }
+            let identity = device.datapath_identity.clone();
+            let links = device
+                .links
+                .take()
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let _detach = detach_datapath_if_current(links, &identity, replacement.1, tc_priority);
+            let mut fenced = Self::detach_graph_is_fenced(replacement.1, &identity, tc_priority)
+                && Self::datapath_identity(&device.ebpf, pin_dir)
+                    .is_ok_and(|current| current == identity)
+                && Self::revalidate_current_control_path(ownership, graph_lock, OPERATION).is_ok();
+            if !fenced {
+                // The ordinary two-link detach may have removed its first
+                // exact hook before the second delete failed or lost its ACK.
+                // Reinventory the complete tc placement and make one bounded
+                // continuation over only the surviving receipt-bound program
+                // ID. A foreign/current-generation replacement is not equal
+                // to the loaded identity and is never passed to the numeric
+                // fence primitive.
+                let current = Self::require_no_foreign_generation(
+                    replacement.1,
+                    tc_priority,
+                    OPERATION,
+                    true,
+                )
+                .map_err(|_| state_indeterminate(OPERATION))?;
+                let exact_survivors = current.iter().all(|program| {
+                    let expected = match program.occupant.program {
+                        SdkDatapathProgram::Uplink => &identity.uplink,
+                        SdkDatapathProgram::Downlink => &identity.downlink,
+                    };
+                    let mut expected_map_ids = expected.map_ids.clone();
+                    expected_map_ids.sort_unstable();
+                    program.occupant.program_id == Some(expected.program_id)
+                        && program.program_tag == expected.program_tag
+                        && program.map_ids == expected_map_ids
+                });
+                if !exact_survivors
+                    || Self::require_current_program_pin_graph(&current, pin_dir).is_err()
+                    || Self::fence_current_hooks(replacement.1, tc_priority, &current).is_err()
+                {
+                    devices.insert(replacement.1, device);
+                    return Err(state_indeterminate(OPERATION));
+                }
+                fenced = Self::detach_graph_is_fenced(replacement.1, &identity, tc_priority)
+                    && Self::datapath_identity(&device.ebpf, pin_dir)
+                        .is_ok_and(|current| current == identity)
+                    && Self::revalidate_current_control_path(ownership, graph_lock, OPERATION)
+                        .is_ok();
+            }
+            if !fenced {
+                devices.insert(replacement.1, device);
+                return Err(state_indeterminate(OPERATION));
+            }
+            // A detach ACK may be lost after both numeric deletes applied.
+            // Exact empty-slot and graph-reference readback above is the only
+            // successful classification in either the Ok or Err case.
+            drop(device);
+            Ok(())
+        }
+
         fn loaded_datapath_cleanup_safe(ifindex: u32, loaded: &LoadedDevice) -> bool {
             let Ok(identity) = Self::datapath_identity(&loaded.ebpf, &loaded.pin_dir) else {
                 return false;
@@ -35692,6 +35896,51 @@ mod aya_runtime {
             }
             Ok(())
         }
+
+        /// Restore the exact even generation paired with one attempted odd
+        /// activation.  A failed `set` is ACK-indeterminate, so readback is
+        /// still attempted and is authoritative only when it observes that
+        /// precise prior even value.  No source rotation or evidence cleanup
+        /// is performed at this rollback boundary.
+        fn disable_traffic_observation_source_exact(
+            ebpf: &mut Ebpf,
+            enabled_gate: u64,
+        ) -> Result<(), GtpuError> {
+            const OPERATION: &str = "ebpf_traffic_source_disable";
+            let disabled_gate = enabled_gate
+                .checked_sub(1)
+                .filter(|gate| *gate != 0 && *gate & 1 == 0)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let map = ebpf
+                .map_mut(GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let mut gate =
+                Array::<_, u64>::try_from(map).map_err(|_| state_indeterminate(OPERATION))?;
+            let _write = gate.set(GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, disabled_gate, 0);
+            if gate
+                .get(&GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, 0)
+                .map_err(|_| state_indeterminate(OPERATION))?
+                != disabled_gate
+            {
+                return Err(state_indeterminate(OPERATION));
+            }
+            Ok(())
+        }
+
+        fn traffic_observation_source_enabled_gate(ebpf: &Ebpf) -> Result<u64, GtpuError> {
+            const OPERATION: &str = "ebpf_traffic_source_enabled_readback";
+            let map = ebpf
+                .map(GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let gate =
+                Array::<_, u64>::try_from(map).map_err(|_| state_indeterminate(OPERATION))?;
+            gate.get(&GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, 0)
+                .map_err(|_| state_indeterminate(OPERATION))?
+                .checked_sub(1)
+                .filter(|disabled| *disabled != 0 && *disabled & 1 == 0)
+                .and_then(|disabled| disabled.checked_add(1))
+                .ok_or_else(|| state_indeterminate(OPERATION))
+        }
     }
 
     impl EbpfGtpuRuntime for AyaGtpuRuntime {
@@ -36050,6 +36299,7 @@ mod aya_runtime {
                     pending_traffic_observation_gate: successor
                         .as_ref()
                         .map(|_| traffic_observation_gate),
+                    active_traffic_observation_gate: None,
                     selector_namespace_fresh_provisioning: false,
                     _reconciler_ownership: Arc::clone(&reconciler_ownership),
                 },
@@ -36451,6 +36701,7 @@ mod aya_runtime {
                     pending_traffic_observation_gate: successor
                         .as_ref()
                         .map(|_| traffic_observation_gate),
+                    active_traffic_observation_gate: None,
                     selector_namespace_fresh_provisioning: !pins_preexisted && successor.is_none(),
                     _reconciler_ownership: Arc::clone(&reconciler_ownership),
                 },
@@ -36837,6 +37088,7 @@ mod aya_runtime {
                     cleanup_only: false,
                     successor_pending: false,
                     pending_traffic_observation_gate: None,
+                    active_traffic_observation_gate: None,
                     selector_namespace_fresh_provisioning: false,
                     _reconciler_ownership: Arc::clone(&reconciler_ownership),
                 },
@@ -37062,6 +37314,7 @@ mod aya_runtime {
                     cleanup_only: true,
                     successor_pending: false,
                     pending_traffic_observation_gate: None,
+                    active_traffic_observation_gate: None,
                     selector_namespace_fresh_provisioning: false,
                     _reconciler_ownership: reconciler_ownership,
                 },
@@ -40271,55 +40524,158 @@ mod aya_runtime {
             replacement: (&str, u32),
             pin_dir: &Path,
             tc_priority: u16,
+            registration: CurrentRecoverySuccessorRegistration,
             currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
-        ) -> Result<(), GtpuError> {
+        ) -> Result<CurrentRecoverySuccessorActivation, GtpuError> {
             const OPERATION: &str = "ebpf_current_successor_activation";
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+            let ownership = {
+                let devices = self
+                    .devices
+                    .lock()
+                    .map_err(|_| GtpuError::io(OPERATION, super::poisoned_lock()))?;
+                let Some(device) = devices.get(&replacement.1) else {
+                    return if registration == CurrentRecoverySuccessorRegistration::Absent {
+                        Ok(CurrentRecoverySuccessorActivation::NeedsTypedCreate)
+                    } else {
+                        Err(state_indeterminate(OPERATION))
+                    };
+                };
+                Arc::clone(&device._reconciler_ownership)
+            };
+            let graph_lock = Self::acquire_operation_control_lock(&ownership, OPERATION)
+                .map_err(|_| state_indeterminate(OPERATION))?;
             Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
             let mut devices = self
                 .devices
                 .lock()
                 .map_err(|_| GtpuError::io(OPERATION, super::poisoned_lock()))?;
-            let Some(device) = devices.get_mut(&replacement.1) else {
-                // A restarted process inspected the retained graph without
-                // loading it. There is no process-local runtime fence to lift.
-                return Ok(());
-            };
+            let device = devices
+                .get_mut(&replacement.1)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
             if device.interface != replacement.0
                 || device.pin_dir != pin_dir
                 || device.tc_priority != tc_priority
                 || device.cleanup_only
+                || !Arc::ptr_eq(&device._reconciler_ownership, &ownership)
                 || device._reconciler_ownership.canonical_pin_dir != pin_dir
             {
                 return Err(state_indeterminate(OPERATION));
             }
-            let gate = device
-                .pending_traffic_observation_gate
-                .ok_or_else(|| state_indeterminate(OPERATION))?;
-            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
-            Self::verify_traffic_observation_source_quiescent(&mut device.ebpf, gate)?;
-            // The odd gate is the first live tc packet effect.  Treat an
-            // enable write/readback failure exactly like a revoked authority:
-            // reset the source before reporting the failed activation.  This
-            // includes the readback immediately following `set`, which can
-            // otherwise leave the odd value live when it fails.
-            let activation = Self::enable_traffic_observation_source(&mut device.ebpf, gate)
-                .and_then(|()| {
-                    Self::current_recovery_require_effect_currentness(currentness, OPERATION)
-                });
-            if let Err(activation_error) = activation {
-                // `reset_traffic_observation_source` writes and verifies the
-                // disabled incarnation before it performs any cleanup.  Do
-                // not discard a reset failure: it is the only evidence that
-                // the external gate could not be returned to a known-safe
-                // state, and admission must remain failed in either case.
-                return match Self::reset_traffic_observation_source(&mut device.ebpf) {
-                    Ok(_) => Err(activation_error),
-                    Err(cleanup_error) => Err(cleanup_error),
-                };
+            Self::revalidate_current_control_path(&ownership, &graph_lock, OPERATION)?;
+            let exact_graph = Self::selector_namespace_graph_identity(
+                replacement.1,
+                device,
+                &ownership,
+                &graph_lock,
+                OPERATION,
+            )?;
+
+            match registration {
+                CurrentRecoverySuccessorRegistration::Active => {
+                    let gate = match (
+                        device.successor_pending,
+                        device.pending_traffic_observation_gate,
+                        device.active_traffic_observation_gate,
+                    ) {
+                        (false, None, Some(gate)) => gate,
+                        _ => return Err(state_indeterminate(OPERATION)),
+                    };
+                    if Self::traffic_observation_source_enabled_gate(&device.ebpf)? != gate {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                    Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+                    Self::revalidate_current_control_path(&ownership, &graph_lock, OPERATION)?;
+                    if Self::selector_namespace_graph_identity(
+                        replacement.1,
+                        device,
+                        &ownership,
+                        &graph_lock,
+                        OPERATION,
+                    )? != exact_graph
+                        || Self::traffic_observation_source_enabled_gate(&device.ebpf)? != gate
+                    {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                    Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+                    return Ok(CurrentRecoverySuccessorActivation::AlreadyActive);
+                }
+                CurrentRecoverySuccessorRegistration::Absent => {
+                    // A split in-process registration is never activated.
+                    // Put the exact gate back to even where its generation is
+                    // known, then fence the hooks below so the next ordinary
+                    // typed create is the sole reattachment boundary.
+                    let gate = match (
+                        device.successor_pending,
+                        device.pending_traffic_observation_gate,
+                        device.active_traffic_observation_gate,
+                    ) {
+                        (true, Some(gate), None) | (false, None, Some(gate)) => Some(gate),
+                        _ => None,
+                    };
+                    if let Some(gate) = gate {
+                        let _ =
+                            Self::disable_traffic_observation_source_exact(&mut device.ebpf, gate);
+                    }
+                }
+                CurrentRecoverySuccessorRegistration::Pending => {
+                    let gate = match (
+                        device.successor_pending,
+                        device.pending_traffic_observation_gate,
+                        device.active_traffic_observation_gate,
+                    ) {
+                        (true, Some(gate), None) => gate,
+                        _ => return Err(state_indeterminate(OPERATION)),
+                    };
+                    let activation = (|| {
+                        Self::verify_traffic_observation_source_quiescent(&mut device.ebpf, gate)?;
+                        Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+                        Self::enable_traffic_observation_source(&mut device.ebpf, gate)?;
+                        Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+                        Self::revalidate_current_control_path(&ownership, &graph_lock, OPERATION)?;
+                        if Self::selector_namespace_graph_identity(
+                            replacement.1,
+                            device,
+                            &ownership,
+                            &graph_lock,
+                            OPERATION,
+                        )? != exact_graph
+                            || Self::traffic_observation_source_enabled_gate(&device.ebpf)? != gate
+                        {
+                            return Err(state_indeterminate(OPERATION));
+                        }
+                        Self::current_recovery_require_effect_currentness(currentness, OPERATION)
+                    })();
+                    match activation {
+                        Ok(()) => {
+                            device.pending_traffic_observation_gate = None;
+                            device.active_traffic_observation_gate = Some(gate);
+                            device.successor_pending = false;
+                            return Ok(CurrentRecoverySuccessorActivation::Activated);
+                        }
+                        Err(activation_error) => {
+                            if Self::disable_traffic_observation_source_exact(
+                                &mut device.ebpf,
+                                gate,
+                            )
+                            .is_ok()
+                            {
+                                return Err(activation_error);
+                            }
+                        }
+                    }
+                }
             }
-            device.pending_traffic_observation_gate = None;
-            device.successor_pending = false;
-            Ok(())
+
+            Self::detach_current_successor_hooks_for_typed_create(
+                &mut devices,
+                replacement,
+                pin_dir,
+                tc_priority,
+                &ownership,
+                &graph_lock,
+            )?;
+            Ok(CurrentRecoverySuccessorActivation::NeedsTypedCreate)
         }
 
         fn transfer_current_recovery_terminal(
@@ -41160,6 +41516,7 @@ mod aya_runtime {
                 cleanup_only: _,
                 successor_pending: _,
                 pending_traffic_observation_gate: _,
+                active_traffic_observation_gate: _,
                 selector_namespace_fresh_provisioning: _,
                 _reconciler_ownership: _ownership,
             } = held;
@@ -48296,6 +48653,8 @@ mod tests {
         // ordinary-runtime fence. A linked terminal successor must pass every
         // packet unchanged until exact broker admission activates it.
         successor_datapath_inert: HashSet<u32>,
+        successor_active_traffic_gate: HashMap<u32, u64>,
+        traffic_observation_gate: HashMap<u32, u64>,
         operations: Vec<&'static str>,
         // Test-only adversarial boundary: a configured map read expires the
         // selector permit before the following exact mutation.
@@ -48519,6 +48878,8 @@ mod tests {
         cleanup_only: HashSet<u32>,
         successor_pending: HashSet<u32>,
         successor_datapath_inert: HashSet<u32>,
+        successor_active_traffic_gate: HashMap<u32, u64>,
+        traffic_observation_gate: HashMap<u32, u64>,
         session_groups:
             HashMap<(u32, [u8; GTPU_SESSION_GROUP_ID_LEN]), [u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
         session_uplink_index:
@@ -48572,6 +48933,8 @@ mod tests {
                 cleanup_only: state.cleanup_only.clone(),
                 successor_pending: state.successor_pending.clone(),
                 successor_datapath_inert: state.successor_datapath_inert.clone(),
+                successor_active_traffic_gate: state.successor_active_traffic_gate.clone(),
+                traffic_observation_gate: state.traffic_observation_gate.clone(),
                 session_groups: state.session_groups.clone(),
                 session_uplink_index: state.session_uplink_index.clone(),
                 session_downlink_index: state.session_downlink_index.clone(),
@@ -49445,6 +49808,12 @@ mod tests {
             Ok(())
         }
 
+        fn next_traffic_observation_gate(current: u64) -> Option<(u64, u64)> {
+            let disabled = current.checked_add(if current & 1 == 0 { 2 } else { 1 })?;
+            let enabled = disabled.checked_add(1)?;
+            Some((disabled, enabled))
+        }
+
         /// Fake observation state is keyed by ifindex whereas the production
         /// maps are keyed by their retained pin graph. Clear both ends of a
         /// grouped relocation so the model cannot retain old-pin evidence.
@@ -49462,6 +49831,14 @@ mod tests {
                 .traffic_observation_redirects
                 .retain(|(ifindex, _), _| !ifindexes.contains(ifindex));
             for ifindex in ifindexes {
+                let current = state
+                    .traffic_observation_gate
+                    .get(&ifindex)
+                    .copied()
+                    .unwrap_or(0);
+                let (disabled, _) = Self::next_traffic_observation_gate(current)
+                    .ok_or_else(|| state_indeterminate("traffic_observation_reset"))?;
+                state.traffic_observation_gate.insert(ifindex, disabled);
                 state.traffic_observation_events.remove(&ifindex);
                 state.traffic_observation_loss.remove(&ifindex);
                 state.traffic_observation_next_sequence.remove(&ifindex);
@@ -49469,6 +49846,47 @@ mod tests {
             Self::fail_after_if_requested(state, "traffic_observation_reset")?;
             Self::crash_if_requested(state, "traffic_observation_reset");
             Ok(())
+        }
+
+        fn enable_traffic_observation_source(
+            state: &mut FakeState,
+            ifindex: u32,
+        ) -> Result<u64, GtpuError> {
+            state.operations.push("traffic_observation_enable");
+            let disabled = state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .copied()
+                .filter(|gate| *gate != 0 && *gate & 1 == 0)
+                .ok_or_else(|| state_indeterminate("traffic_observation_enable"))?;
+            let enabled = disabled
+                .checked_add(1)
+                .ok_or_else(|| state_indeterminate("traffic_observation_enable"))?;
+            state.traffic_observation_gate.insert(ifindex, enabled);
+            Self::fail_after_if_requested(state, "traffic_observation_enable")?;
+            (state.traffic_observation_gate.get(&ifindex).copied() == Some(enabled))
+                .then_some(enabled)
+                .ok_or_else(|| state_indeterminate("traffic_observation_enable"))
+        }
+
+        fn disable_traffic_observation_source_exact(
+            state: &mut FakeState,
+            ifindex: u32,
+            enabled: u64,
+        ) -> Result<(), GtpuError> {
+            state.operations.push("traffic_observation_disable");
+            let disabled = enabled
+                .checked_sub(1)
+                .filter(|gate| *gate != 0 && *gate & 1 == 0)
+                .ok_or_else(|| state_indeterminate("traffic_observation_disable"))?;
+            let write = Self::fail_if_requested(state, "traffic_observation_disable");
+            if write.is_ok() {
+                state.traffic_observation_gate.insert(ifindex, disabled);
+            }
+            let _ack = Self::fail_after_if_requested(state, "traffic_observation_disable");
+            (state.traffic_observation_gate.get(&ifindex).copied() == Some(disabled))
+                .then_some(())
+                .ok_or_else(|| state_indeterminate("traffic_observation_disable"))
         }
 
         /// Mirror the production pre-load TFT schema guard. The fake stores
@@ -50560,6 +50978,8 @@ mod tests {
             if terminal_admission.is_none() {
                 // A fresh process can only enable an already-admitted
                 // successor by completing an ordinary exact retained attach.
+                Self::enable_traffic_observation_source(&mut state, ifindex)?;
+                state.successor_active_traffic_gate.remove(&ifindex);
                 state.successor_datapath_inert.remove(&ifindex);
             }
             Ok(disposition)
@@ -50825,6 +51245,8 @@ mod tests {
                 // See the legacy attach path above: a restart has no
                 // process-local activation handle, so it enables only after
                 // this whole retained attachment has completed.
+                Self::enable_traffic_observation_source(&mut state, ifindex)?;
+                state.successor_active_traffic_gate.remove(&ifindex);
                 state.successor_datapath_inert.remove(&ifindex);
             }
             Ok(disposition)
@@ -50948,6 +51370,7 @@ mod tests {
             // separate broker-admission activation cut.
             state.successor_datapath_inert.insert(ifindex);
             state.successor_pending.insert(ifindex);
+            state.successor_active_traffic_gate.remove(&ifindex);
             if state.current_recovery_terminal_leaves.get(pin_dir) != Some(&sealed)
                 || state.current_recovery_successor_main_leaves.get(pin_dir) != Some(&sealed)
                 || !state.current_recovery_authority_leaves.contains(pin_dir)
@@ -52416,8 +52839,9 @@ mod tests {
             replacement: (&str, u32),
             pin_dir: &Path,
             tc_priority: u16,
+            registration: CurrentRecoverySuccessorRegistration,
             currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
-        ) -> Result<(), GtpuError> {
+        ) -> Result<CurrentRecoverySuccessorActivation, GtpuError> {
             const OPERATION: &str = "fake_current_successor_activation";
             if currentness.verify_current().is_err() || currentness.first_failure().is_some() {
                 return Err(state_indeterminate(OPERATION));
@@ -52442,41 +52866,149 @@ mod tests {
                 exact = true;
             }
             if exact {
+                match registration {
+                    CurrentRecoverySuccessorRegistration::Active => {
+                        let expected_gate = state
+                            .successor_active_traffic_gate
+                            .get(&replacement.1)
+                            .copied();
+                        if state.successor_pending.contains(&replacement.1)
+                            || state.successor_datapath_inert.contains(&replacement.1)
+                            || expected_gate.is_none()
+                            || state.traffic_observation_gate.get(&replacement.1).copied()
+                                != expected_gate
+                        {
+                            return Err(state_indeterminate(OPERATION));
+                        }
+                        if currentness.verify_current().is_err()
+                            || currentness.first_failure().is_some()
+                        {
+                            return Err(state_indeterminate(OPERATION));
+                        }
+                        return Ok(CurrentRecoverySuccessorActivation::AlreadyActive);
+                    }
+                    CurrentRecoverySuccessorRegistration::Absent => {
+                        state.attached.remove(&replacement.1);
+                        state.uplink_filter_ready.remove(&replacement.1);
+                        state.downlink_filter_ready.remove(&replacement.1);
+                        state.uplink_filter_pin_dir.remove(&replacement.1);
+                        state.downlink_filter_pin_dir.remove(&replacement.1);
+                        state.successor_pending.remove(&replacement.1);
+                        state.successor_active_traffic_gate.remove(&replacement.1);
+                        state.successor_datapath_inert.insert(replacement.1);
+                        return Ok(CurrentRecoverySuccessorActivation::NeedsTypedCreate);
+                    }
+                    CurrentRecoverySuccessorRegistration::Pending => {
+                        if !state.successor_pending.contains(&replacement.1)
+                            || !state.successor_datapath_inert.contains(&replacement.1)
+                            || state
+                                .successor_active_traffic_gate
+                                .contains_key(&replacement.1)
+                            || state
+                                .traffic_observation_gate
+                                .get(&replacement.1)
+                                .is_none_or(|gate| *gate == 0 || *gate & 1 != 0)
+                        {
+                            return Err(state_indeterminate(OPERATION));
+                        }
+                    }
+                }
                 if currentness.verify_current().is_err() || currentness.first_failure().is_some() {
                     return Err(state_indeterminate(OPERATION));
                 }
-                // This models the production odd gate write.  A
-                // post-write failure is deliberately injected after this
-                // transition so the tests exercise the live-effect boundary
-                // rather than a preflight refusal.
-                state.operations.push("traffic_observation_enable");
-                state.successor_datapath_inert.remove(&replacement.1);
-                let activation =
-                    Self::fail_after_if_requested(&mut state, "traffic_observation_enable")
-                        .and_then(|()| {
-                            if currentness.verify_current().is_err()
-                                || currentness.first_failure().is_some()
-                            {
-                                Err(state_indeterminate(OPERATION))
-                            } else {
-                                Ok(())
-                            }
-                        });
+                let disabled_gate = state.traffic_observation_gate[&replacement.1];
+                let enabled_gate = disabled_gate
+                    .checked_add(1)
+                    .ok_or_else(|| state_indeterminate(OPERATION))?;
+                // This models the production odd gate write. A post-write
+                // failure is injected after the numeric transition so
+                // packet inertness follows the actual gate or hook state.
+                let activation = Self::enable_traffic_observation_source(&mut state, replacement.1)
+                    .and_then(|_| {
+                        if currentness.verify_current().is_err()
+                            || currentness.first_failure().is_some()
+                        {
+                            Err(state_indeterminate(OPERATION))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                if state.traffic_observation_gate.get(&replacement.1) == Some(&enabled_gate) {
+                    state.successor_datapath_inert.remove(&replacement.1);
+                }
                 if let Err(activation_error) = activation {
-                    // The runtime fence is restored before attempting the
-                    // map reset, so an injected reset failure cannot expose
-                    // traffic or ordinary datapath mutation in this process.
-                    state.successor_datapath_inert.insert(replacement.1);
-                    state.successor_pending.insert(replacement.1);
-                    return match Self::reset_traffic_observation_source(&mut state, [replacement.1])
+                    if Self::disable_traffic_observation_source_exact(
+                        &mut state,
+                        replacement.1,
+                        enabled_gate,
+                    )
+                    .is_ok()
                     {
-                        Ok(()) => Err(activation_error),
-                        Err(cleanup_error) => Err(cleanup_error),
-                    };
+                        state.successor_datapath_inert.insert(replacement.1);
+                        state.successor_pending.insert(replacement.1);
+                        return Err(activation_error);
+                    }
+
+                    // If the exact even gate cannot be proved, detach only
+                    // the exact receipt-bound hooks. All pins and recovery
+                    // receipts remain for the ordinary typed-create retry.
+                    state
+                        .operations
+                        .push("current_successor_uplink_hook_detach");
+                    if Self::fail_if_requested(&mut state, "current_successor_uplink_hook_detach")
+                        .is_err()
+                    {
+                        state
+                            .operations
+                            .push("current_successor_uplink_hook_detach");
+                        Self::fail_if_requested(&mut state, "current_successor_uplink_hook_detach")
+                            .map_err(|_| state_indeterminate(OPERATION))?;
+                    }
+                    state.uplink_filter_ready.remove(&replacement.1);
+                    state.uplink_filter_pin_dir.remove(&replacement.1);
+                    let _ack = Self::fail_after_if_requested(
+                        &mut state,
+                        "current_successor_uplink_hook_detach",
+                    );
+                    state
+                        .operations
+                        .push("current_successor_downlink_hook_detach");
+                    if Self::fail_if_requested(&mut state, "current_successor_downlink_hook_detach")
+                        .is_err()
+                    {
+                        state
+                            .operations
+                            .push("current_successor_downlink_hook_detach");
+                        Self::fail_if_requested(
+                            &mut state,
+                            "current_successor_downlink_hook_detach",
+                        )
+                        .map_err(|_| state_indeterminate(OPERATION))?;
+                    }
+                    state.downlink_filter_ready.remove(&replacement.1);
+                    state.downlink_filter_pin_dir.remove(&replacement.1);
+                    let _ack = Self::fail_after_if_requested(
+                        &mut state,
+                        "current_successor_downlink_hook_detach",
+                    );
+                    state.attached.remove(&replacement.1);
+                    state.successor_pending.remove(&replacement.1);
+                    state.successor_active_traffic_gate.remove(&replacement.1);
+                    state.successor_datapath_inert.insert(replacement.1);
+                    return Ok(CurrentRecoverySuccessorActivation::NeedsTypedCreate);
                 }
                 state.successor_pending.remove(&replacement.1);
+                state
+                    .successor_active_traffic_gate
+                    .insert(replacement.1, enabled_gate);
+                state.successor_datapath_inert.remove(&replacement.1);
+                return Ok(CurrentRecoverySuccessorActivation::Activated);
             }
-            Ok(())
+            if registration == CurrentRecoverySuccessorRegistration::Absent {
+                Ok(CurrentRecoverySuccessorActivation::NeedsTypedCreate)
+            } else {
+                Err(state_indeterminate(OPERATION))
+            }
         }
 
         fn transfer_current_recovery_terminal(
@@ -65095,69 +65627,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_revocation_after_odd_gate_write_re_fences_when_reset_fails() {
+    async fn activation_revocation_after_odd_gate_write_restores_exact_even_and_retry_converges() {
         let (_, runtime, _) = sealed_historical_25_successor().await;
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        let disabled_gate = runtime.state().traffic_observation_gate[&REPLACEMENT_IFINDEX];
+        let resets_before = runtime
+            .state()
+            .operations
+            .iter()
+            .filter(|operation| **operation == "traffic_observation_reset")
+            .count();
+        assert_ne!(disabled_gate, 0);
+        assert_eq!(disabled_gate & 1, 0);
         // The first two checks are pre-write; the third runs after the fake
         // odd gate write and revokes this activation attempt.
         let currentness = ScriptedCurrentEbpfGraphRecoveryCurrentness::unavailable_on(2);
-        runtime.fail_in_order(["traffic_observation_reset"]);
 
         assert!(matches!(
             runtime.activate_current_recovery_successor(
                 ("up0", REPLACEMENT_IFINDEX),
                 &pin_dir,
                 DEFAULT_TC_PRIORITY,
+                CurrentRecoverySuccessorRegistration::Pending,
                 &currentness,
             ),
-            Err(GtpuError::Io {
-                operation: "traffic_observation_reset",
-                ..
+            Err(GtpuError::StateIndeterminate {
+                operation: "fake_current_successor_activation"
             })
         ));
 
         let state = runtime.state();
         assert!(state.operations.contains(&"traffic_observation_enable"));
-        assert!(state.operations.contains(&"traffic_observation_reset"));
+        assert!(state.operations.contains(&"traffic_observation_disable"));
+        assert_eq!(
+            state
+                .operations
+                .iter()
+                .filter(|operation| **operation == "traffic_observation_reset")
+                .count(),
+            resets_before,
+            "activation rollback must not rotate the retained gate generation"
+        );
+        assert_eq!(
+            state.traffic_observation_gate[&REPLACEMENT_IFINDEX], disabled_gate,
+            "revocation after the live cut restores the exact prior even generation"
+        );
         assert!(state
             .successor_datapath_inert
             .contains(&REPLACEMENT_IFINDEX));
         assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
-        assert!(state.traffic_observation_registrations.is_empty());
-        assert!(state.traffic_observation_redirects.is_empty());
         drop(state);
         assert!(
             !runtime.dscp_datapath_usable(REPLACEMENT_IFINDEX)
                 && !runtime.pdp_readback_datapath_usable(REPLACEMENT_IFINDEX),
             "a revoked activation with failed cleanup exposes neither tc traffic nor ordinary mutation"
         );
+        assert_eq!(
+            runtime
+                .activate_current_recovery_successor(
+                    ("up0", REPLACEMENT_IFINDEX),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    CurrentRecoverySuccessorRegistration::Pending,
+                    &TestCurrentEbpfGraphRecoveryCurrentness,
+                )
+                .expect("the exact retained pending generation retries"),
+            CurrentRecoverySuccessorActivation::Activated
+        );
+        let state = runtime.state();
+        assert_eq!(
+            state.traffic_observation_gate[&REPLACEMENT_IFINDEX],
+            disabled_gate + 1
+        );
+        assert!(!state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+        assert!(!state
+            .successor_datapath_inert
+            .contains(&REPLACEMENT_IFINDEX));
     }
 
     #[tokio::test]
-    async fn activation_odd_gate_readback_failure_re_fences_when_reset_fails() {
+    async fn activation_odd_gate_readback_failure_restores_exact_even_and_retry_converges() {
         let (_, runtime, _) = sealed_historical_25_successor().await;
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        let disabled_gate = runtime.state().traffic_observation_gate[&REPLACEMENT_IFINDEX];
+        let resets_before = runtime
+            .state()
+            .operations
+            .iter()
+            .filter(|operation| **operation == "traffic_observation_reset")
+            .count();
         // This failure occurs after the fake odd gate transition, matching an
         // enable-map readback error rather than a pre-write refusal.
         runtime.fail_after_in_order(["traffic_observation_enable"]);
-        runtime.fail_in_order(["traffic_observation_reset"]);
 
         assert!(matches!(
             runtime.activate_current_recovery_successor(
                 ("up0", REPLACEMENT_IFINDEX),
                 &pin_dir,
                 DEFAULT_TC_PRIORITY,
+                CurrentRecoverySuccessorRegistration::Pending,
                 &TestCurrentEbpfGraphRecoveryCurrentness,
             ),
             Err(GtpuError::Io {
-                operation: "traffic_observation_reset",
+                operation: "traffic_observation_enable",
                 ..
             })
         ));
 
         let state = runtime.state();
         assert!(state.operations.contains(&"traffic_observation_enable"));
-        assert!(state.operations.contains(&"traffic_observation_reset"));
+        assert!(state.operations.contains(&"traffic_observation_disable"));
+        assert_eq!(
+            state
+                .operations
+                .iter()
+                .filter(|operation| **operation == "traffic_observation_reset")
+                .count(),
+            resets_before,
+            "an enable acknowledgement failure must not rotate the retry generation"
+        );
+        assert_eq!(
+            state.traffic_observation_gate[&REPLACEMENT_IFINDEX],
+            disabled_gate
+        );
         assert!(state
             .successor_datapath_inert
             .contains(&REPLACEMENT_IFINDEX));
@@ -65170,12 +65762,244 @@ mod tests {
                 && !runtime.pdp_cleanup_datapath_usable(REPLACEMENT_IFINDEX),
             "an indeterminate enable readback cannot activate traffic or map mutation"
         );
+        assert_eq!(
+            runtime
+                .activate_current_recovery_successor(
+                    ("up0", REPLACEMENT_IFINDEX),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    CurrentRecoverySuccessorRegistration::Pending,
+                    &TestCurrentEbpfGraphRecoveryCurrentness,
+                )
+                .expect("an acknowledgement failure preserves the exact retry generation"),
+            CurrentRecoverySuccessorActivation::Activated
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_disable_ack_loss_accepts_exact_even_readback_and_retry_converges() {
+        let (_, runtime, _) = sealed_historical_25_successor().await;
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        let disabled_gate = runtime.state().traffic_observation_gate[&REPLACEMENT_IFINDEX];
+        runtime.fail_after_in_order(["traffic_observation_enable", "traffic_observation_disable"]);
+
+        assert!(matches!(
+            runtime.activate_current_recovery_successor(
+                ("up0", REPLACEMENT_IFINDEX),
+                &pin_dir,
+                DEFAULT_TC_PRIORITY,
+                CurrentRecoverySuccessorRegistration::Pending,
+                &TestCurrentEbpfGraphRecoveryCurrentness,
+            ),
+            Err(GtpuError::Io {
+                operation: "traffic_observation_enable",
+                ..
+            })
+        ));
+        {
+            let state = runtime.state();
+            assert_eq!(
+                state.traffic_observation_gate[&REPLACEMENT_IFINDEX], disabled_gate,
+                "lost disable acknowledgement is resolved only by exact even readback"
+            );
+            assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+            assert!(state
+                .successor_datapath_inert
+                .contains(&REPLACEMENT_IFINDEX));
+            assert!(!state
+                .successor_active_traffic_gate
+                .contains_key(&REPLACEMENT_IFINDEX));
+        }
+        assert_eq!(
+            runtime
+                .activate_current_recovery_successor(
+                    ("up0", REPLACEMENT_IFINDEX),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    CurrentRecoverySuccessorRegistration::Pending,
+                    &TestCurrentEbpfGraphRecoveryCurrentness,
+                )
+                .expect("exact even readback retains the pending retry"),
+            CurrentRecoverySuccessorActivation::Activated
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_disable_failure_detaches_exact_hooks_without_unpinning() {
+        let (backend, runtime, receipt) = sealed_historical_25_successor().await;
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        let before = {
+            let state = runtime.state();
+            (
+                state.pinned_config.clone(),
+                state.schema.clone(),
+                state.historical_25_receipts.clone(),
+                state.historical_25_authorities.clone(),
+                state.historical_25_operation_markers.clone(),
+            )
+        };
+        let resets_before = runtime
+            .state()
+            .operations
+            .iter()
+            .filter(|operation| **operation == "traffic_observation_reset")
+            .count();
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        runtime.fail_in_order([
+            "traffic_observation_disable",
+            "current_successor_downlink_hook_detach",
+        ]);
+
+        assert!(matches!(
+            backend
+                .admit_current_ebpf_graph_successor(
+                    historical_25_successor_intent().into_successor_admission_request(
+                        historical_25_successor_target(),
+                        receipt,
+                        current_recovery_authority_for_successor_receipt(receipt),
+                    ),
+                )
+                .await,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_current_successor_typed_create"
+            })
+        ));
+
+        {
+            let state = runtime.state();
+            assert!(!state.attached.contains_key(&REPLACEMENT_IFINDEX));
+            assert!(!state.uplink_filter_ready.contains(&REPLACEMENT_IFINDEX));
+            assert!(!state.downlink_filter_ready.contains(&REPLACEMENT_IFINDEX));
+            assert!(!state
+                .uplink_filter_pin_dir
+                .contains_key(&REPLACEMENT_IFINDEX));
+            assert!(!state
+                .downlink_filter_pin_dir
+                .contains_key(&REPLACEMENT_IFINDEX));
+            assert_eq!(
+                state
+                    .operations
+                    .iter()
+                    .filter(|operation| **operation == "current_successor_downlink_hook_detach")
+                    .count(),
+                2,
+                "the bounded exact continuation finishes a one-hook partial detach"
+            );
+            assert!(!state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+            assert!(state
+                .successor_datapath_inert
+                .contains(&REPLACEMENT_IFINDEX));
+            assert_eq!(state.traffic_observation_gate[&REPLACEMENT_IFINDEX] & 1, 1);
+            assert!(!state
+                .current_recovery_terminal_leaves
+                .contains_key(&pin_dir));
+            assert!(!state
+                .current_recovery_successor_main_leaves
+                .contains_key(&pin_dir));
+            assert_eq!(
+                (
+                    state.pinned_config.clone(),
+                    state.schema.clone(),
+                    state.historical_25_receipts.clone(),
+                    state.historical_25_authorities.clone(),
+                    state.historical_25_operation_markers.clone(),
+                ),
+                before,
+                "hook fencing preserves every graph pin and historical authority artifact"
+            );
+            assert_eq!(
+                state
+                    .operations
+                    .iter()
+                    .filter(|operation| **operation == "traffic_observation_reset")
+                    .count(),
+                resets_before,
+                "hook-only fencing must not rotate or recreate the graph gate"
+            );
+        }
+
+        let mut recreate = CreateGtpDeviceRequest::new("up0");
+        recreate.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        backend
+            .create_device(recreate)
+            .await
+            .expect("the exact ordinary typed create reattaches the retained graph");
+        let state = runtime.state();
+        assert!(state.attached.contains_key(&REPLACEMENT_IFINDEX));
+        assert!(state.uplink_filter_ready.contains(&REPLACEMENT_IFINDEX));
+        assert!(state.downlink_filter_ready.contains(&REPLACEMENT_IFINDEX));
+        assert_eq!(state.traffic_observation_gate[&REPLACEMENT_IFINDEX] & 1, 1);
+        assert!(!state
+            .successor_datapath_inert
+            .contains(&REPLACEMENT_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn activation_ambiguous_partial_detach_remains_fail_closed_and_preserves_pins() {
+        let (backend, runtime, receipt) = sealed_historical_25_successor().await;
+        let before = {
+            let state = runtime.state();
+            (
+                state.pinned_config.clone(),
+                state.schema.clone(),
+                state.historical_25_receipts.clone(),
+                state.historical_25_authorities.clone(),
+                state.historical_25_operation_markers.clone(),
+            )
+        };
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        runtime.fail_in_order([
+            "traffic_observation_disable",
+            "current_successor_downlink_hook_detach",
+            "current_successor_downlink_hook_detach",
+        ]);
+
+        assert!(matches!(
+            backend
+                .admit_current_ebpf_graph_successor(
+                    historical_25_successor_intent().into_successor_admission_request(
+                        historical_25_successor_target(),
+                        receipt,
+                        current_recovery_authority_for_successor_receipt(receipt),
+                    ),
+                )
+                .await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "fake_current_successor_activation"
+            })
+        ));
+
+        {
+            let state = runtime.state();
+            assert!(state.attached.contains_key(&REPLACEMENT_IFINDEX));
+            assert!(!state.uplink_filter_ready.contains(&REPLACEMENT_IFINDEX));
+            assert!(state.downlink_filter_ready.contains(&REPLACEMENT_IFINDEX));
+            assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+            assert!(!state
+                .successor_active_traffic_gate
+                .contains_key(&REPLACEMENT_IFINDEX));
+            assert_eq!(
+                (
+                    state.pinned_config.clone(),
+                    state.schema.clone(),
+                    state.historical_25_receipts.clone(),
+                    state.historical_25_authorities.clone(),
+                    state.historical_25_operation_markers.clone(),
+                ),
+                before,
+                "ambiguous partial fencing cannot remove graph or provenance pins"
+            );
+        }
+        assert!(matches!(
+            backend.resolve_device("up0").await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_pending"
+            })
+        ));
     }
 
     #[tokio::test]
     async fn historical_25_successor_finalizes_and_restarts_without_new_recovery_identity() {
-        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
-
         let (backend, runtime, receipt) = sealed_historical_25_successor_after_process_loss().await;
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
 
@@ -65203,7 +66027,7 @@ mod tests {
                 state.historical_25_terminal_graph_commitments[&pin_dir],
             )
         };
-        assert_eq!(
+        assert!(matches!(
             backend
                 .admit_current_ebpf_graph_successor(
                     historical_25_successor_intent().into_successor_admission_request(
@@ -65212,10 +66036,11 @@ mod tests {
                         current_recovery_authority_for_successor_receipt(receipt),
                     ),
                 )
-                .await
-                .expect("admit the exact freshly read broker receipt"),
-            Outcome::Admitted
-        );
+                .await,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_current_successor_typed_create"
+            })
+        ));
         {
             let state = runtime.state();
             assert!(!state
@@ -65267,7 +66092,6 @@ mod tests {
 
     #[tokio::test]
     async fn historical_25_successor_partial_finalization_is_registered_but_inaccessible() {
-        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as SuccessorAdmission;
         use crate::CurrentEbpfGraphRecoveryTerminalAdmissionOutcome as Admission;
 
         let (backend, runtime) = backend_with_fake();
@@ -65454,31 +66278,30 @@ mod tests {
         }
         drop(restarted);
         let resumed = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
-        assert_eq!(
+        assert!(matches!(
             resumed
                 .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
                     successor_target(),
                     successor_receipt,
                     current_recovery_authority_for_successor_receipt(successor_receipt),
                 ))
-                .await
-                .expect("resume admission from the retained authority WAL"),
-            SuccessorAdmission::Admitted
-        );
-        assert_eq!(
+                .await,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_current_successor_typed_create"
+            })
+        ));
+        assert!(matches!(
             resumed
-                .admit_current_ebpf_graph_successor(
-                    intent().into_successor_admission_request(
-                        successor_target(),
-                        successor_receipt,
-                        current_recovery_authority_for_successor_receipt(successor_receipt),
-                    ),
-                )
-                .await
-                .expect("repeat the exact broker acknowledgement after response loss"),
-            SuccessorAdmission::AlreadyFinalized,
-            "an already-absent WAL is accepted only while the authentic R5 source and exact successor remain unchanged"
-        );
+                .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
+                    successor_target(),
+                    successor_receipt,
+                    current_recovery_authority_for_successor_receipt(successor_receipt),
+                ),)
+                .await,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_current_successor_typed_create"
+            })
+        ));
         let mut retry = CreateGtpDeviceRequest::new("s2bu-new");
         retry.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         resumed
@@ -65676,8 +66499,6 @@ mod tests {
 
     #[tokio::test]
     async fn historical_25_successor_response_loss_restarts_with_same_recovery_identity() {
-        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
-
         let (backend, runtime, receipt) = sealed_historical_25_successor_after_process_loss().await;
         let identity = {
             let state = runtime.state();
@@ -65722,37 +66543,41 @@ mod tests {
 
         for restart in 0..3 {
             let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
-            assert_eq!(
-                restarted
-                    .admit_current_ebpf_graph_successor(
-                        historical_25_successor_intent().into_successor_admission_request(
-                            historical_25_successor_target(),
-                            receipt,
-                            current_recovery_authority_for_successor_receipt(receipt),
-                        ),
-                    )
-                    .await
-                    .expect("response-loss retry reauthenticates the exact live graph"),
-                Outcome::AlreadyFinalized,
+            assert!(
+                matches!(
+                    restarted
+                        .admit_current_ebpf_graph_successor(
+                            historical_25_successor_intent().into_successor_admission_request(
+                                historical_25_successor_target(),
+                                receipt,
+                                current_recovery_authority_for_successor_receipt(receipt),
+                            ),
+                        )
+                        .await,
+                    Err(GtpuError::RetryRequired {
+                        operation: "ebpf_current_successor_typed_create"
+                    })
+                ),
                 "restart {restart}"
             );
-            let state = runtime.state();
-            let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
-            assert_eq!(state.historical_25_receipts[&pin_dir], identity.0);
-            assert_eq!(state.historical_25_authorities[&pin_dir], identity.1);
-            assert_eq!(
-                state.historical_25_terminal_graph_commitments[&pin_dir],
-                identity.2
-            );
+            let mut request = CreateGtpDeviceRequest::new("up0");
+            request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            restarted
+                .create_device(request)
+                .await
+                .expect("ordinary retained restart converges after exact successor admission");
+            {
+                let state = runtime.state();
+                let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+                assert_eq!(state.historical_25_receipts[&pin_dir], identity.0);
+                assert_eq!(state.historical_25_authorities[&pin_dir], identity.1);
+                assert_eq!(
+                    state.historical_25_terminal_graph_commitments[&pin_dir],
+                    identity.2
+                );
+            }
+            runtime.state().attached.remove(&REPLACEMENT_IFINDEX);
         }
-
-        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
-        let mut request = CreateGtpDeviceRequest::new("up0");
-        request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        restarted
-            .create_device(request)
-            .await
-            .expect("ordinary retained restart converges after exact successor admission");
     }
 
     #[tokio::test]
@@ -65760,7 +66585,7 @@ mod tests {
         use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
 
         let (backend, runtime, receipt) = sealed_historical_25_successor_after_process_loss().await;
-        assert_eq!(
+        assert!(matches!(
             backend
                 .admit_current_ebpf_graph_successor(
                     historical_25_successor_intent().into_successor_admission_request(
@@ -65769,10 +66594,11 @@ mod tests {
                         current_recovery_authority_for_successor_receipt(receipt),
                     ),
                 )
-                .await
-                .expect("admit the authentic brokered successor"),
-            Outcome::Admitted
-        );
+                .await,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_current_successor_typed_create"
+            })
+        ));
         let snapshot = || {
             let state = runtime.state();
             (
@@ -66045,6 +66871,8 @@ mod tests {
             .state()
             .current_recovery_finalized_receipts
             .contains_key(&pin_dir));
+        let active_gate_after_first_admission =
+            runtime.state().successor_active_traffic_gate[&REPLACEMENT_IFINDEX];
         assert!(
             !runtime
                 .state()
@@ -66059,6 +66887,12 @@ mod tests {
                 .contains_key(&pin_dir),
             "the graph WAL was unlinked before the fresh-process retry"
         );
+        let enables_after_first_admission = runtime
+            .state()
+            .operations
+            .iter()
+            .filter(|operation| **operation == "traffic_observation_enable")
+            .count();
         assert_eq!(
             backend
                 .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
@@ -66070,8 +66904,29 @@ mod tests {
                 .expect("same-process response loss reauthenticates the finalized successor"),
             Admission::AlreadyFinalized
         );
+        assert_eq!(
+            runtime
+                .state()
+                .operations
+                .iter()
+                .filter(|operation| **operation == "traffic_observation_enable")
+                .count(),
+            enables_after_first_admission,
+            "an exact already-active retry must not rewrite the live gate"
+        );
+        assert_eq!(
+            runtime.state().successor_active_traffic_gate[&REPLACEMENT_IFINDEX],
+            active_gate_after_first_admission,
+            "the read-only retry retains the exact activated generation"
+        );
         drop(backend);
-        runtime.state().attached.remove(&REPLACEMENT_IFINDEX);
+        {
+            let mut state = runtime.state();
+            state.attached.remove(&REPLACEMENT_IFINDEX);
+            state
+                .successor_active_traffic_gate
+                .remove(&REPLACEMENT_IFINDEX);
+        }
         let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
         let mut forged_bytes = receipt.encode();
         forged_bytes[232] ^= 1;
@@ -66095,17 +66950,28 @@ mod tests {
                 .expect("forged receipt is a bounded refusal"),
             Admission::Refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState)
         );
-        assert_eq!(
+        assert!(matches!(
             restarted
                 .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
                     target(),
                     receipt,
                     current_recovery_authority_for_successor_receipt(receipt),
                 ),)
-                .await
-                .expect("same brokered receipt survives lost response"),
-            Admission::AlreadyFinalized
-        );
+                .await,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_current_successor_typed_create"
+            })
+        ));
+        let mut recreate = CreateGtpDeviceRequest::new("s2bu-old");
+        recreate.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        restarted
+            .create_device(recreate)
+            .await
+            .expect("fresh process re-enters the exact ordinary typed create");
+        assert!(!runtime
+            .state()
+            .successor_datapath_inert
+            .contains(&REPLACEMENT_IFINDEX));
         drop(restarted);
         {
             let mut state = runtime.state();
@@ -70984,13 +71850,19 @@ mod tests {
 
         // Malformed legacy content is classified only after the forwarding
         // safety fence. No map, ownership index, or cleanup authority is
-        // changed; the two hook observations and their pin bindings are the
-        // only expected delta.
+        // changed; the two hook observations, their pin bindings, and the
+        // exact even traffic-fence generation are the only expected delta.
         let mut expected = before;
         expected.uplink_filter_ready.remove(&S2BU_IFINDEX);
         expected.downlink_filter_ready.remove(&S2BU_IFINDEX);
         expected.uplink_filter_pin_dir.remove(&S2BU_IFINDEX);
         expected.downlink_filter_pin_dir.remove(&S2BU_IFINDEX);
+        let current_gate = expected.traffic_observation_gate[&S2BU_IFINDEX];
+        let (disabled_gate, _) = FakeRuntime::next_traffic_observation_gate(current_gate)
+            .expect("cleanup fence has another exact gate generation");
+        expected
+            .traffic_observation_gate
+            .insert(S2BU_IFINDEX, disabled_gate);
         let after = FakeGroupedPublicationSnapshot::capture(&runtime.state());
         assert!(after == expected);
     }
