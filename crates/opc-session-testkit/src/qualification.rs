@@ -1885,7 +1885,8 @@ pub fn session_mtls_candidate_evidence_v2_schema_sha256() -> String {
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION: &str =
     "opc-session-mtls-batch-release-gate-evidence/v1";
 /// Fixed cumulative client setup ceiling for the 48 normal lanes: initial
-/// prewarm plus the bounded loss, rotation, and two four-lane restorations.
+/// prewarm, bounded no-fault idle restoration, loss, rotation, and two
+/// four-lane restorations.
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING: u64 = 168;
 /// Initial prewarm is successful, so only post-prewarm event attempts can fail.
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING: u64 = 120;

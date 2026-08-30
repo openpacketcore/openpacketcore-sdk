@@ -552,15 +552,180 @@ fn assert_no_fault_v2_setup_delta(
             before.setup_failures,
             after.setup_failures,
         );
+        let successes = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_successes",
+            before.setup_successes,
+            after.setup_successes,
+        );
         assert_eq!(
             attempts, 0,
-            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0"
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0, observed_setup_successes={successes}, bound_setup_successes=0"
         );
         assert_eq!(
             failures, 0,
-            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0"
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0, observed_setup_successes={successes}, bound_setup_successes=0"
+        );
+        assert_eq!(
+            successes, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0, observed_setup_successes={successes}, bound_setup_successes=0"
         );
     }
+}
+
+fn verify_v2_prewarm_restoration(
+    client_index: usize,
+    ready_request_connections: usize,
+    initial: PersistentSessionConsumerV2Diagnostics,
+    before: PersistentSessionConsumerV2Diagnostics,
+    after: PersistentSessionConsumerV2Diagnostics,
+) -> Result<u64, String> {
+    let missing_lanes = V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+        .checked_sub(ready_request_connections)
+        .ok_or_else(|| {
+            format!(
+                "ready preload capacity exceeds configured width: client_index={client_index}, ready={ready_request_connections}, configured={V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT}"
+            )
+        })?;
+    let missing_lanes = u64::try_from(missing_lanes)
+        .map_err(|_| "fixed preload restoration width does not fit u64".to_owned())?;
+    if client_index == 0 && missing_lanes != 0 {
+        return Err(format!(
+            "the preload-bearing pool lost warm capacity: missing_lanes={missing_lanes}"
+        ));
+    }
+    let delta = |counter: &str, before: u64, after: u64| {
+        after.checked_sub(before).ok_or_else(|| {
+            format!(
+                "preload restoration counter regressed: client_index={client_index}, counter={counter}, before={before}, after={after}"
+            )
+        })
+    };
+    for (counter, observed, expected) in [
+        (
+            "setup_attempts",
+            delta(
+                "setup_attempts",
+                before.setup_attempts,
+                after.setup_attempts,
+            )?,
+            missing_lanes,
+        ),
+        (
+            "setup_successes",
+            delta(
+                "setup_successes",
+                before.setup_successes,
+                after.setup_successes,
+            )?,
+            missing_lanes,
+        ),
+        (
+            "setup_failures",
+            delta(
+                "setup_failures",
+                before.setup_failures,
+                after.setup_failures,
+            )?,
+            0,
+        ),
+        (
+            "reconnects_from_initial",
+            delta("reconnects", initial.reconnects, after.reconnects)?,
+            missing_lanes,
+        ),
+    ] {
+        if observed != expected {
+            return Err(format!(
+                "preload restoration is not exact: client_index={client_index}, counter={counter}, observed={observed}, expected={expected}"
+            ));
+        }
+    }
+    if after.reused != before.reused {
+        return Err(format!(
+            "prewarm consumed a logical request: client_index={client_index}, before_reused={}, after_reused={}",
+            before.reused, after.reused
+        ));
+    }
+    let fixed_width = V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64;
+    if after.active != fixed_width || after.idle != fixed_width {
+        return Err(format!(
+            "preload restoration did not settle at fixed width: client_index={client_index}, active={}, idle={}, expected={fixed_width}",
+            after.active, after.idle
+        ));
+    }
+    if after.setup_attempts != after.setup_successes.saturating_add(after.setup_failures) {
+        return Err(format!(
+            "preload restoration setup accounting is not conserved: client_index={client_index}, diagnostics={after:?}"
+        ));
+    }
+    Ok(missing_lanes)
+}
+
+#[test]
+fn v2_batch_preload_accounting_separates_idle_restoration_from_operations() {
+    let initial = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 4,
+        setup_successes: 4,
+        active: 4,
+        idle: 4,
+        ..PersistentSessionConsumerV2Diagnostics::default()
+    };
+    let hot_after_operations = PersistentSessionConsumerV2Diagnostics {
+        reused: 196,
+        ..initial
+    };
+    assert_no_fault_v2_setup_delta(
+        "modeled hot-client preload",
+        &[initial],
+        &[hot_after_operations],
+    );
+    assert_eq!(
+        verify_v2_prewarm_restoration(
+            0,
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            initial,
+            hot_after_operations,
+            hot_after_operations,
+        )
+        .expect("the hot pool requires no restoration"),
+        0
+    );
+
+    let post_operations = PersistentSessionConsumerV2Diagnostics {
+        active: 0,
+        idle: 0,
+        reconnects: 4,
+        ..initial
+    };
+    assert_no_fault_v2_setup_delta("modeled 50k preload", &[initial], &[post_operations]);
+
+    let restored = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 8,
+        setup_successes: 8,
+        active: 4,
+        idle: 4,
+        ..post_operations
+    };
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_no_fault_v2_setup_delta(
+                "invalid initial-to-restored window",
+                &[initial],
+                &[restored],
+            );
+        })
+        .is_err(),
+        "the old comparison must reject explicit restoration as part of an operation window"
+    );
+    assert_eq!(
+        verify_v2_prewarm_restoration(1, 0, initial, post_operations, restored)
+            .expect("the measured four-lane deficit restores exactly"),
+        4
+    );
+    assert_eq!(restored.setup_attempts, 8, "cumulative setups are retained");
+    assert_eq!(restored.reconnects, 4, "cumulative reaping is retained");
 }
 
 fn checked_no_fault_setup_delta(
@@ -16620,6 +16785,15 @@ fn run_persistent_consumer_v2_batch_release_gate(
         retained_preload_requests.len(),
         V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
     );
+    let preload_operation_before = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "preload preparation",
+        &initial_prewarm_diagnostics,
+        &preload_operation_before,
+    );
     let (
         preload_recovered_unknown,
         preload_not_transmitted_retries,
@@ -16716,6 +16890,21 @@ fn run_persistent_consumer_v2_batch_release_gate(
             <= V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT,
         "every retained preload mutation replay obeys the fixed per-batch bound"
     );
+    // Close the preload measurement before constructing the later paced
+    // schedule or explicitly restoring idle capacity. The other eleven
+    // pools are intentionally unused during this window and may reap idle
+    // lanes, but neither that retirement nor 50k operations may dial a
+    // replacement connection.
+    let post_preload_diagnostics = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "50k preload",
+        &preload_operation_before,
+        &post_preload_diagnostics,
+    );
+
     let mutation_batches = runtime.block_on(qualification_build_v2_batches(
         MEMBER_COUNT,
         1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES,
@@ -16731,8 +16920,13 @@ fn run_persistent_consumer_v2_batch_release_gate(
     // Long unpaced batches deliberately keep one client hot. Restore and
     // freeze the complete fixed-width pool immediately before latency
     // measurement so setup work is excluded and every measured call is warm.
-    runtime.block_on(async {
+    // The explicit restoration is accounted separately from the causally
+    // closed zero-setup preload window above; its counters remain cumulative
+    // in the release evidence.
+    let preload_restoration = runtime.block_on(async {
         futures_util::future::join_all(clients.iter().map(|client| async {
+            let readiness_before = client.v2_readiness().await;
+            let diagnostics_before = client.v2_diagnostics();
             client
                 .prewarm_v2()
                 .await
@@ -16752,20 +16946,29 @@ fn run_persistent_consumer_v2_batch_release_gate(
                 diagnostics.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
                 "each measured V2 client is fully idle immediately before warm work"
             );
+            (readiness_before, diagnostics_before, diagnostics)
         }))
-        .await;
+        .await
     });
-    // This is the required post-50k preload/restore snapshot. The preload
-    // window must not have created a per-operation transport setup.
-    let post_preload_restore_diagnostics = clients
+    for (client_index, (readiness_before, before, after)) in preload_restoration.iter().enumerate()
+    {
+        assert_eq!(
+            readiness_before.configured_request_connections, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            "preload restoration retains the configured pool width: client_index={client_index}"
+        );
+        verify_v2_prewarm_restoration(
+            client_index,
+            readiness_before.ready_request_connections,
+            initial_prewarm_diagnostics[client_index],
+            *before,
+            *after,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+    let post_preload_restore_diagnostics = preload_restoration
         .iter()
-        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .map(|(_, _, diagnostics)| *diagnostics)
         .collect::<Vec<_>>();
-    assert_no_fault_v2_setup_delta(
-        "50k preload/restore",
-        &initial_prewarm_diagnostics,
-        &post_preload_restore_diagnostics,
-    );
     let measurement_baseline = post_preload_restore_diagnostics.clone();
     let consensus_diagnostics_before_warm_reads = fleet.all_consensus_diagnostics();
 
