@@ -22792,6 +22792,7 @@ mod aya_runtime {
             let mut historical_receipt = false;
             let mut historical_operation_lock = false;
             let mut current_terminal = false;
+            let mut current_finalized_receipt = false;
             let directory = rustix::fs::Dir::read_from(control)
                 .map_err(|error| GtpuError::io("ebpf_selector_marker_enumerate", error.into()))?;
             for entry in directory {
@@ -22855,6 +22856,28 @@ mod aya_runtime {
                         ));
                     }
                     current_terminal = true;
+                    continue;
+                }
+                if name == CURRENT_RECOVERY_FINALIZED_RECEIPT_MAP {
+                    // This fixed-width response-loss receipt is not a marker
+                    // and has no selector, cleanup, or admission authority
+                    // by itself.  It is recognized here solely so a fresh
+                    // process can reach the later, typed reauthentication
+                    // path after both transient WAL pins were unlinked.
+                    // That path re-opens this exact pin and validates the
+                    // map ABI, record, authority, live graph, and brokered
+                    // receipt before returning `AlreadyFinalized`.
+                    Self::pin_leaf_identity(
+                        control,
+                        name,
+                        "ebpf_selector_current_finalized_receipt_enumerate",
+                    )?;
+                    if current_finalized_receipt {
+                        return Err(state_indeterminate(
+                            "ebpf_selector_current_finalized_receipt_enumerate",
+                        ));
+                    }
+                    current_finalized_receipt = true;
                     continue;
                 }
                 if let Some(hex) = name.strip_prefix(AUTHORITY) {
@@ -43817,6 +43840,70 @@ mod aya_runtime {
                     "partial or foreign authority inventory stays indeterminate"
                 );
             }
+        }
+
+        #[test]
+        fn current_finalized_receipt_inventory_allows_only_the_exact_post_wal_leaf() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = std::env::temp_dir().join(format!(
+                "opc-gtpu-finalized-receipt-inventory-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir(&root).expect("create private authority leaf");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("restrict private authority leaf");
+            let receipt = root.join(CURRENT_RECOVERY_FINALIZED_RECEIPT_MAP);
+            fs::write(&receipt, b"fixed-width finalized receipt")
+                .expect("publish finalized receipt after both WAL unlinks");
+            fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600))
+                .expect("preserve exact finalized receipt pin mode");
+
+            // The production inventory runs before the response-loss branch.
+            // With both transient WAL pins absent, this exact receipt must be
+            // inventory-neutral: it grants neither selector authority nor
+            // cleanup authority by itself.
+            let inventory = AyaGtpuRuntime::marker_inventory(
+                &File::open(&root).expect("open authority leaf after restart"),
+            );
+            assert_eq!(
+                inventory.expect("exact finalized receipt is recognized"),
+                (vec![], vec![])
+            );
+
+            for (case, sibling) in [
+                (
+                    "malformed-name",
+                    format!("{CURRENT_RECOVERY_FINALIZED_RECEIPT_MAP}_MALFORMED"),
+                ),
+                ("unknown", "FOREIGN_FINALIZED_RECEIPT".to_string()),
+            ] {
+                fs::write(root.join(&sibling), b"foreign receipt")
+                    .expect("create hostile receipt sibling");
+                fs::set_permissions(root.join(&sibling), fs::Permissions::from_mode(0o600))
+                    .expect("set hostile sibling mode");
+                assert!(
+                    AyaGtpuRuntime::marker_inventory(
+                        &File::open(&root).expect("reopen authority leaf"),
+                    )
+                    .is_err(),
+                    "{case} sibling must remain a fail-closed refusal"
+                );
+                fs::remove_file(root.join(&sibling)).expect("remove isolated hostile sibling");
+            }
+
+            let duplicate = root.join("GTPU_CURRENT_RECOVERY_FINALIZED_RECEIPT_V1_COPY");
+            fs::hard_link(&receipt, &duplicate).expect("create duplicate receipt pin identity");
+            assert!(
+                AyaGtpuRuntime::marker_inventory(
+                    &File::open(&root).expect("reopen duplicate authority leaf"),
+                )
+                .is_err(),
+                "a multiply-linked finalized receipt must remain indeterminate"
+            );
+            fs::remove_file(&duplicate).expect("remove isolated duplicate receipt");
+            fs::remove_dir_all(&root).expect("remove isolated authority leaf");
         }
 
         #[test]
@@ -65761,6 +65848,20 @@ mod tests {
             .state()
             .current_recovery_finalized_receipts
             .contains_key(&pin_dir));
+        assert!(
+            !runtime
+                .state()
+                .current_recovery_terminal_leaves
+                .contains_key(&pin_dir),
+            "the authority WAL was unlinked before the fresh-process retry"
+        );
+        assert!(
+            !runtime
+                .state()
+                .current_recovery_successor_main_leaves
+                .contains_key(&pin_dir),
+            "the graph WAL was unlinked before the fresh-process retry"
+        );
         drop(backend);
         runtime.state().attached.remove(&REPLACEMENT_IFINDEX);
         let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
