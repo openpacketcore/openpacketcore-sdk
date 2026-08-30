@@ -396,9 +396,11 @@ pub enum HistoricalEbpfGraphGeneration {
 /// Explicit caller attestation that the writer of a historical eBPF graph has
 /// stopped.
 ///
-/// This does not authorize removal of forwarding/session state. Historical
-/// recovery separately proves the exact generation, legacy and current
-/// authority domains, map/program/hook identity, and graph directory identity.
+/// This caller attestation is not removal authority by itself. Historical
+/// recovery independently takes both kernel-backed authority locks and proves
+/// the exact generation, legacy and current authority domains,
+/// map/program/hook identity, graph directory identity, and replacement
+/// identity before any effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HistoricalEbpfGraphWriterProof {
     _private: (),
@@ -416,8 +418,9 @@ impl HistoricalEbpfGraphWriterProof {
 /// Explicit caller attestation that all forwarding/session state represented
 /// by a historical eBPF graph has been drained.
 ///
-/// Supplying this proof never bypasses the kernel identity and authority
-/// checks. Without it, a populated historical graph is refused.
+/// This caller attestation is not evidence that the kernel graph is empty.
+/// Supplying it never bypasses the live map, hook, program, identity, and
+/// authority checks; any populated or ambiguous graph remains fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HistoricalEbpfGraphDrainProof {
     _private: (),
@@ -473,8 +476,13 @@ impl HistoricalEbpfGraphRecoveryRequest {
         self
     }
 
-    /// Require the replacement interface to retain this exact identity and
-    /// both of its SDK hook slots to remain empty during recovery.
+    /// Bind recovery to this exact replacement name and ifindex.
+    ///
+    /// Recovery independently proves that the replacement retains this
+    /// identity and that the recorded historical hook state is either the
+    /// exact owned pair or the conclusively detached empty state. It never
+    /// detaches an occupant from a replacement interface that changed
+    /// identity.
     #[must_use]
     pub fn with_replacement_device(mut self, replacement_device: GtpDevice) -> Self {
         self.replacement_device = Some(replacement_device);
@@ -588,11 +596,12 @@ pub enum HistoricalEbpfGraphRecoveryProgress {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HistoricalEbpfGraphRecoveryOutcome {
-    /// The exact graph, its recovery proof, and legacy authority child were
-    /// retired; current-compatible authority is established.
+    /// The exact historical graph and legacy authority child were retired;
+    /// an exact current-compatible terminal receipt remains as durable
+    /// authority for retries and ordinary startup.
     Removed,
-    /// No canonical historical graph remains and current-compatible authority
-    /// was authoritatively established.
+    /// The exact retained terminal receipt proves that the historical graph
+    /// and legacy authority are already absent.
     AlreadyAbsent,
     /// Recovery was refused before deletion was committed.
     Refused(HistoricalEbpfGraphRecoveryRefusal),

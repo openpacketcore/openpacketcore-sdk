@@ -39,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   participant must use a coordinated drained stop/upgrade/start. Mixed
   revision, mixed V2-capability, stale-activation, or prospective-learner
   admission fails before topology or roster mutation.
+- **Authority-safe shipped-25 eBPF graph retirement — `opc-gtpu-dataplane`:**
+  adds a maintenance-only typed recovery request for the exact
+  pre-session-selector/stamp/traffic-observation 25-map generation. Recovery
+  requires explicit writer-stop and traffic-drain attestations, both legacy
+  and current kernel authority locks, exact namespace/generation/map/config/
+  hook/program/replacement identity, and a detached or exactly owned hook
+  state. A dual-pinned, atomically installed phase receipt makes detach, pin
+  removal, graph retirement, legacy-authority retirement, and terminal retry
+  crash-resumable. Ordinary startup performs only a read-only compatibility
+  preflight and remains non-destructive; foreign layouts, populated or
+  malformed state, live owners, replacement races, and ambiguous partial
+  effects remain fail-closed.
 - **Bounded protected atomic fenced-mutation roster — `opc-session-net`,
   `opc-session-store`:** adds an opt-in revision-five persistent mTLS consumer
   profile for one immutable roster of up to eight generic opaque provider

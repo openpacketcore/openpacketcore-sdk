@@ -43,6 +43,10 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   `CurrentEbpfGraphWriterProof`, `CurrentEbpfGraphDrainProof`,
   `CurrentEbpfGraphRecoveryOutcome`, `CurrentEbpfGraphRecoveryRefusal`, and
   `CurrentEbpfGraphRecoveryProgress`,
+  `HistoricalEbpfGraphGeneration`, `HistoricalEbpfGraphRecoveryRequest`,
+  `HistoricalEbpfGraphWriterProof`, `HistoricalEbpfGraphDrainProof`,
+  `HistoricalEbpfGraphRecoveryOutcome`, `HistoricalEbpfGraphRecoveryRefusal`,
+  and `HistoricalEbpfGraphRecoveryProgress`,
   `GtpuLocalEndpointSet`, `GtpuSessionAttachmentSelector`,
   `GtpuSessionGroup`, `GtpuSessionGroupReconcileRequest`,
   `GtpuSessionSelectorProvenance`, and `GtpuSessionSelectorReuseProof`,
@@ -1416,6 +1420,50 @@ maintenance window must therefore still exclude out-of-band bpffs and tc
 mutation. Product-owned writer shutdown, session drain, traffic gating,
 finalizer retry policy, and replacement provisioning remain downstream.
 
+#### Maintenance-only shipped-25 graph retirement
+
+`EbpfGtpuDataplaneBackend::recover_orphaned_historical_ebpf_graph` is the sole
+SDK maintenance boundary for the exact
+`PreSessionSelectorStampTrafficObservationV1` generation. That generation is
+sealed by the embedded
+`bpf/opc-gtpu-datapath-pre-selector-stamp-traffic-observation-v1.bpf.o`
+artifact (SHA-256
+`a4f91b08bbd6eed69d46bf9301390e40bd9d713dff9a454ab6d98a1208cc7ac3`),
+its complete 25-map ABI, canonical fixed-array values, exact program tags and
+map references when hooks survive, and its predecessor leaf-hash authority
+layout. The detached form is accepted only when both recorded hook slots and
+all loaded program references are conclusively absent; map shape alone is not
+provenance.
+
+The request is intentionally separate from ordinary create, resolve, and
+cleanup-only startup. It requires explicit stopped-writer and drained-traffic
+attestations, an exact replacement name/ifindex, and the named frozen
+generation. Those attestations never replace live evidence: the backend takes
+the predecessor and root-bound current flocks in a fixed order, proves exact
+same-owner namespace/graph/authority identities, rejects populated or malformed
+maps, and rechecks replacement, hooks, references, receipts, graph inventory,
+and authority immediately before every effect. Foreign layouts, held leases,
+unknown children, wrong ownership or mode, partial observations, and name or
+ifindex races remain fail-closed.
+
+Recovery publishes one proof map through a deterministic private staging leaf,
+dual-pins it under both authority generations, and atomically installs the
+current leaf before detach or unlink. Phase and identity readback makes every
+published boundary retryable: exact detach, each recorded pin unlink, graph
+absence, legacy-proof removal, namespace-local handoff marker, legacy-leaf
+retirement, and terminal publication. `Removed` leaves the exact current
+`Terminal` receipt in place. `AlreadyAbsent` requires that same request-bound
+detached receipt, the handoff marker, and authoritative absence of the graph,
+legacy leaf, and staging state; never-present or manually altered absence is
+not success.
+
+Ordinary entrypoints perform only an exhaustive read-only compatibility
+preflight. Any complete or partial shipped-25 graph, legacy leaf, staging leaf,
+or nonterminal receipt blocks before ordinary authority creation. Only an exact
+terminal handoff can admit the normal current lifecycle, and it authorizes only
+the bound pin namespace under the shared predecessor root. Maintenance code
+must never replace this API with raw bpffs unlinking or broad root cleanup.
+
 #### Cleanup-only retained graph recovery authority
 
 `EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` is the supported
@@ -1785,8 +1833,9 @@ object is embedded from
 retained only for exact historical-generation evidence, the frozen v2 object is
 retained only for the explicit drained teardown identity proof, and the frozen
 pre-redirect object is retained only to derive the program tags described in
-the next section. None of the three legacy objects runs as the current
-datapath.
+the next section. The sealed pre-selector/stamp/traffic-observation object is
+retained only to authenticate the maintenance-only shipped-25 graph. None of
+the four legacy objects runs as the current datapath.
 
 #### Map ABI and program generations across an upgrade
 
