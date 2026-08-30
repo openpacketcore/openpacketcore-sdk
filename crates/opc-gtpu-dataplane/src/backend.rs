@@ -9,9 +9,10 @@ use crate::model::{
     GtpPdpContext, GtpuCapability, GtpuIpFamilyCapabilities, GtpuProbe,
     GtpuSessionAttachmentSelector, GtpuSessionGroup, GtpuSessionGroupReadback,
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
-    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, PdpContextInstallOutcome,
-    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
+    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, HistoricalEbpfGraphRecoveryOutcome,
+    HistoricalEbpfGraphRecoveryRequest, PdpContextInstallOutcome, PdpContextReadback,
+    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
+    PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
     RemovePdpContextRequest,
 };
 use crate::tft_classifier::{
@@ -441,6 +442,23 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "current_ebpf_graph_recovery",
+        })
+    }
+
+    /// Recover one positively identified orphaned historical eBPF graph.
+    ///
+    /// This maintenance-only contract is separate from ordinary startup and
+    /// current-schema recovery. Implementations must authenticate the named
+    /// frozen graph and its legacy authority layout, acquire the legacy and
+    /// current host-global authority domains in their fixed order, and retain
+    /// durable recovery proof until both graph and legacy authority retirement
+    /// are terminal. Existing implementations fail closed.
+    async fn recover_orphaned_historical_ebpf_graph(
+        &self,
+        _request: HistoricalEbpfGraphRecoveryRequest,
+    ) -> Result<HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "historical_ebpf_graph_recovery",
         })
     }
 

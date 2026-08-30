@@ -378,6 +378,228 @@ pub enum CurrentEbpfGraphRecoveryOutcome {
     Partial(CurrentEbpfGraphRecoveryProgress),
 }
 
+/// A frozen eBPF datapath generation that this SDK can recover only through a
+/// dedicated maintenance operation.
+///
+/// Historical graphs are never adopted by ordinary startup or cleanup-only
+/// recovery. Their authority layout and map/program ABI are a separate
+/// compatibility boundary, so callers must name the exact generation they
+/// intend to retire.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphGeneration {
+    /// The 25-map graph shipped before selector stamps and traffic-observation
+    /// maps were added.
+    PreSessionSelectorStampTrafficObservationV1,
+}
+
+/// Explicit caller attestation that the writer of a historical eBPF graph has
+/// stopped.
+///
+/// This does not authorize removal of forwarding/session state. Historical
+/// recovery separately proves the exact generation, legacy and current
+/// authority domains, map/program/hook identity, and graph directory identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphWriterProof {
+    _private: (),
+}
+
+impl HistoricalEbpfGraphWriterProof {
+    /// Attest that the process which previously owned the historical graph is
+    /// stopped.
+    #[must_use]
+    pub const fn previous_writer_stopped() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Explicit caller attestation that all forwarding/session state represented
+/// by a historical eBPF graph has been drained.
+///
+/// Supplying this proof never bypasses the kernel identity and authority
+/// checks. Without it, a populated historical graph is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphDrainProof {
+    _private: (),
+}
+
+impl HistoricalEbpfGraphDrainProof {
+    /// Attest that every historical session and its traffic have been drained.
+    #[must_use]
+    pub const fn sessions_and_traffic_drained() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Request to recover one exact historical eBPF graph.
+///
+/// This is maintenance-only. It is intentionally distinct from
+/// [`CurrentEbpfGraphRecoveryRequest`] so a normal restart cannot turn an
+/// authenticated old graph into an automatic deletion request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HistoricalEbpfGraphRecoveryRequest {
+    generation: HistoricalEbpfGraphGeneration,
+    pin_namespace: String,
+    replacement_device: Option<GtpDevice>,
+    writer_proof: Option<HistoricalEbpfGraphWriterProof>,
+    drain_proof: Option<HistoricalEbpfGraphDrainProof>,
+}
+
+impl HistoricalEbpfGraphRecoveryRequest {
+    /// Build an unprivileged maintenance request.
+    ///
+    /// Callers must add both independent quiescence attestations before the
+    /// backend can remove anything. Keeping incomplete requests representable
+    /// lets policy code prepare a request before its drain controller has
+    /// completed; it does not make a missing proof an implicit assertion.
+    #[must_use]
+    pub fn new(
+        generation: HistoricalEbpfGraphGeneration,
+        pin_namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            generation,
+            pin_namespace: pin_namespace.into(),
+            replacement_device: None,
+            writer_proof: None,
+            drain_proof: None,
+        }
+    }
+
+    /// Attach the explicit stopped-writer attestation required for removal.
+    #[must_use]
+    pub const fn with_writer_proof(mut self, writer_proof: HistoricalEbpfGraphWriterProof) -> Self {
+        self.writer_proof = Some(writer_proof);
+        self
+    }
+
+    /// Require the replacement interface to retain this exact identity and
+    /// both of its SDK hook slots to remain empty during recovery.
+    #[must_use]
+    pub fn with_replacement_device(mut self, replacement_device: GtpDevice) -> Self {
+        self.replacement_device = Some(replacement_device);
+        self
+    }
+
+    /// Authorize removal after all represented traffic and sessions have been
+    /// drained by the caller.
+    #[must_use]
+    pub const fn with_drain_proof(mut self, drain_proof: HistoricalEbpfGraphDrainProof) -> Self {
+        self.drain_proof = Some(drain_proof);
+        self
+    }
+
+    /// Return the requested historical generation.
+    #[must_use]
+    pub const fn generation(&self) -> HistoricalEbpfGraphGeneration {
+        self.generation
+    }
+
+    /// Return the stable pin namespace below the backend's configured root.
+    #[must_use]
+    pub fn pin_namespace(&self) -> &str {
+        &self.pin_namespace
+    }
+
+    /// Return the independently validated replacement interface identity.
+    #[must_use]
+    pub const fn replacement_device(&self) -> Option<&GtpDevice> {
+        self.replacement_device.as_ref()
+    }
+
+    /// Return the optional prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> Option<HistoricalEbpfGraphWriterProof> {
+        self.writer_proof
+    }
+
+    /// Return the optional populated-graph drain attestation.
+    #[must_use]
+    pub const fn drain_proof(&self) -> Option<HistoricalEbpfGraphDrainProof> {
+        self.drain_proof
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoricalEbpfGraphRecoveryRequest")
+            .field("generation", &self.generation)
+            .field("pin_namespace", &"<redacted-pin-namespace>")
+            .field(
+                "replacement_device",
+                &self
+                    .replacement_device
+                    .as_ref()
+                    .map(|_| "<redacted-interface-identity>"),
+            )
+            .field("writer_proof", &self.writer_proof)
+            .field("drain_proof", &self.drain_proof)
+            .finish()
+    }
+}
+
+/// Stable reason historical eBPF graph recovery was refused.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryRefusal {
+    /// The caller did not attest that the historical writer is stopped.
+    WriterProofRequired,
+    /// The caller did not attest that all historical sessions and traffic are
+    /// drained.
+    DrainProofRequired,
+    /// The replacement interface name no longer resolves to the requested
+    /// ifindex.
+    ReplacementInterfaceIdentityChanged,
+    /// This backend instance already manages the requested replacement or pin
+    /// namespace.
+    ManagedAttachment,
+    /// A legacy leaf-hash authority holder remains live.
+    ActiveLegacyOwner,
+    /// A current root-bound authority holder remains live.
+    ActiveCurrentOwner,
+    /// The graph does not match the named frozen historical generation.
+    HistoricalGenerationMismatch,
+    /// Retained forwarding/session state is populated or cannot be proven
+    /// drained.
+    PopulatedState,
+    /// A pin, program, hook, control directory, or replacement identity is
+    /// foreign, replaced, malformed, or ambiguous.
+    IdentityMismatch,
+    /// Complete stable kernel state, durable proof state, or authority
+    /// migration could not be established.
+    IndeterminateState,
+}
+
+/// Stable progress classification for committed historical graph recovery.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryProgress {
+    /// A proof bound to the exact historical graph and authority identities
+    /// was committed before map-pin removal.
+    ProofCommitted,
+    /// At least one recorded historical map pin was removed; retry the exact
+    /// request to continue the durable cleanup.
+    PinCleanupStarted,
+    /// A committed cleanup could not establish its exact final state.
+    Indeterminate,
+}
+
+/// Classified result of maintenance-only historical eBPF graph recovery.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryOutcome {
+    /// The exact graph, its recovery proof, and legacy authority child were
+    /// retired; current-compatible authority is established.
+    Removed,
+    /// No canonical historical graph remains and current-compatible authority
+    /// was authoritatively established.
+    AlreadyAbsent,
+    /// Recovery was refused before deletion was committed.
+    Refused(HistoricalEbpfGraphRecoveryRefusal),
+    /// Cleanup was committed but incomplete; retry the exact request.
+    Partial(HistoricalEbpfGraphRecoveryProgress),
+}
+
 /// Request to acquire cleanup-only recovery authority over a retained
 /// current-schema eBPF graph.
 ///
@@ -488,6 +710,14 @@ pub enum RetainedGraphCleanupRefusal {
     /// required. Malformed PDP state can be diagnosed after safety fencing or
     /// exact interrupted-commit reduction.
     NotCurrentSchema,
+    /// Read-only qualification proved the exact frozen historical graph
+    /// generation. Ordinary cleanup-only acquisition never adopts or removes
+    /// that generation; a dedicated maintenance recovery request is required.
+    HistoricalGeneration,
+    /// Read-only qualification proved a legacy leaf-hash authority layout.
+    /// Ordinary cleanup-only acquisition never migrates or retires that
+    /// authority; a dedicated maintenance recovery request is required.
+    LegacyAuthorityLayout,
     /// A pin, loaded program, or tc hook is foreign, replaced, or no longer
     /// has the exact SDK-owned identity. Structural repair is required.
     IdentityMismatch,
@@ -3541,6 +3771,40 @@ mod tests {
         assert!(!debug.contains("tenant-sensitive-pin"));
         assert!(!debug.contains("tenant-sensitive-interface"));
         assert!(!debug.contains("41"));
+    }
+
+    #[test]
+    fn historical_graph_recovery_request_requires_explicit_proofs_and_redacts_identity() {
+        let request = HistoricalEbpfGraphRecoveryRequest::new(
+            HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            "tenant-sensitive-historical-pin",
+        )
+        .with_replacement_device(GtpDevice {
+            name: "tenant-sensitive-historical-interface".to_string(),
+            ifindex: 47,
+        });
+        assert_eq!(
+            request.generation(),
+            HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1
+        );
+        assert!(request.writer_proof().is_none());
+        assert!(request.drain_proof().is_none());
+        let complete = request
+            .with_writer_proof(HistoricalEbpfGraphWriterProof::previous_writer_stopped())
+            .with_drain_proof(HistoricalEbpfGraphDrainProof::sessions_and_traffic_drained());
+        assert!(complete.writer_proof().is_some());
+        assert!(complete.drain_proof().is_some());
+        let debug = format!("{complete:?}");
+        for sensitive in [
+            "tenant-sensitive-historical-pin",
+            "tenant-sensitive-historical-interface",
+            "47",
+        ] {
+            assert!(
+                !debug.contains(sensitive),
+                "historical recovery request debug leaked {sensitive}: {debug}"
+            );
+        }
     }
 
     #[test]

@@ -103,10 +103,12 @@ use crate::{
     GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityLease, GtpuTrafficProofAuthorityStore,
     GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt,
     GtpuTrafficProofInvalidation, GtpuTrafficProofPoll, GtpuTrafficProofSession,
-    GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, PdpContextIndeterminateReason,
-    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
-    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
-    PdpContextUplinkSelector, RemovePdpContextRequest, Teid, TftUplinkBearer, TftUplinkClassifier,
+    GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, HistoricalEbpfGraphGeneration,
+    HistoricalEbpfGraphRecoveryOutcome, HistoricalEbpfGraphRecoveryRefusal,
+    HistoricalEbpfGraphRecoveryRequest, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
+    RemovePdpContextRequest, Teid, TftUplinkBearer, TftUplinkClassifier,
     TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
     TftUplinkClassifierRemovalOutcome,
 };
@@ -797,6 +799,40 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         allow_populated: bool,
         managed_state: CurrentRecoveryManagedState,
     ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError>;
+
+    /// Recover an exact frozen historical graph through the dedicated
+    /// maintenance boundary. Ordinary current recovery must never call this.
+    fn recover_orphaned_historical_graph(
+        &self,
+        generation: HistoricalEbpfGraphGeneration,
+        replacement: Option<(&str, u32)>,
+        pin_dir: &Path,
+        tc_priority: u16,
+        allow_populated: bool,
+        managed_state: CurrentRecoveryManagedState,
+    ) -> Result<HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
+        let _ = (
+            generation,
+            replacement,
+            pin_dir,
+            tc_priority,
+            allow_populated,
+            managed_state,
+        );
+        Err(GtpuError::UnsupportedFeature {
+            feature: "historical_ebpf_graph_recovery",
+        })
+    }
+
+    /// Read-only ordinary-cleanup preflight for a historical graph. Returning
+    /// `Some` is a bounded structural refusal; it never takes authority or
+    /// mutates pins, hooks, directories, or maps.
+    fn historical_cleanup_only_refusal(
+        &self,
+        _pin_dir: &Path,
+    ) -> Result<Option<RetainedGraphCleanupRefusal>, GtpuError> {
+        Ok(None)
+    }
 
     /// Read an uplink FAR entry.
     fn far_get(
@@ -7336,6 +7372,91 @@ impl EbpfGtpuDataplaneBackend {
         )
     }
 
+    fn recover_orphaned_historical_graph_sync(
+        &self,
+        request: HistoricalEbpfGraphRecoveryRequest,
+    ) -> Result<HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
+        let _operation = self.operation_guard()?;
+        // These attestations are deliberately checked at the public
+        // maintenance boundary, before runtime authority acquisition can
+        // create or touch any compatibility-control object.
+        if request.writer_proof().is_none() {
+            return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
+                HistoricalEbpfGraphRecoveryRefusal::WriterProofRequired,
+            ));
+        }
+        if request.drain_proof().is_none() {
+            return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
+                HistoricalEbpfGraphRecoveryRefusal::DrainProofRequired,
+            ));
+        }
+        validate_linux_name(request.pin_namespace(), "pin_namespace")?;
+        if let Some(replacement) = request.replacement_device() {
+            validate_linux_name(&replacement.name, "replacement_device.name")?;
+            if replacement.ifindex == 0 {
+                return Err(GtpuError::invalid_config(
+                    "replacement_device.ifindex",
+                    "interface index must be nonzero",
+                ));
+            }
+        }
+        let managed_state = match self.devices() {
+            Ok(devices)
+                if devices.iter().any(|(ifindex, managed)| {
+                    request.replacement_device().is_some_and(|replacement| {
+                        *ifindex == replacement.ifindex || managed.name == replacement.name
+                    }) || managed.name == request.pin_namespace()
+                }) =>
+            {
+                CurrentRecoveryManagedState::Conflict
+            }
+            Ok(_) => CurrentRecoveryManagedState::Clear,
+            Err(_) => CurrentRecoveryManagedState::Indeterminate,
+        };
+        let replacement = request
+            .replacement_device()
+            .map(|device| (device.name.as_str(), device.ifindex));
+        // A refusal is observational: it must not revoke unrelated tenants'
+        // in-process traffic continuity merely because this maintenance
+        // request was malformed, conflicted with a managed attachment, or
+        // could not be classified.  The runtime repeats this gate before any
+        // bpffs mutation, but keep the host-side state equally inert here.
+        match managed_state {
+            CurrentRecoveryManagedState::Clear => {}
+            CurrentRecoveryManagedState::Conflict => {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
+                    HistoricalEbpfGraphRecoveryRefusal::ManagedAttachment,
+                ));
+            }
+            CurrentRecoveryManagedState::Indeterminate => {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(
+                    HistoricalEbpfGraphRecoveryRefusal::IndeterminateState,
+                ));
+            }
+        }
+        let outcome = self.inner.runtime.recover_orphaned_historical_graph(
+            request.generation(),
+            replacement,
+            &self.pin_dir(request.pin_namespace()),
+            self.inner.config.tc_priority,
+            true,
+            managed_state,
+        )?;
+        // Runtime authentication is the first point at which this request is
+        // known to have removed the exact graph.  Even a scoped invalidation
+        // before that result would make an unknown/foreign-layout refusal
+        // mutate unrelated continuity state.
+        if matches!(outcome, HistoricalEbpfGraphRecoveryOutcome::Removed) {
+            if let Some((_, ifindex)) = replacement {
+                self.invalidate_traffic_attempts_on_attachment(
+                    ifindex,
+                    GtpuTrafficProofInvalidation::AuthorityRevoked,
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
     #[cfg(any(target_os = "linux", test))]
     fn acquire_cleanup_only_recovery_sync(
         &self,
@@ -7408,6 +7529,17 @@ impl EbpfGtpuDataplaneBackend {
                     RetainedGraphCleanupRefusal::IndeterminateState,
                 ))
             };
+        }
+        // Ordinary cleanup-only recovery remains non-destructive.  This
+        // read-only qualification turns a known historical graph or legacy
+        // authority into a bounded structural refusal instead of attempting
+        // current ownership acquisition against an incompatible layout.
+        if let Some(refusal) = self
+            .inner
+            .runtime
+            .historical_cleanup_only_refusal(&self.pin_dir(&device.name))?
+        {
+            return Ok(RetainedGraphCleanupClassification::Refused(refusal));
         }
         match self.inner.runtime.adopt_cleanup_only(
             &device.name,
@@ -11417,6 +11549,16 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    async fn recover_orphaned_historical_ebpf_graph(
+        &self,
+        request: HistoricalEbpfGraphRecoveryRequest,
+    ) -> Result<HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
+        self.run_blocking("ebpf_historical_graph_recovery", move |backend| {
+            backend.recover_orphaned_historical_graph_sync(request)
+        })
+        .await
+    }
+
     async fn install_pdp_context(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
         self.run_blocking("ebpf_install_pdp_context", move |backend| {
             backend.install_pdp_context_sync(request)
@@ -11998,7 +12140,9 @@ mod aya_runtime {
         CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryProgress,
         CurrentEbpfGraphRecoveryRefusal, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
         DrainedV2TeardownRefusal, EbpfDatapathGeneration, EbpfHistoricalDatapathGeneration,
-        GtpuError, RetainedGraphCleanupRefusal,
+        GtpuError, HistoricalEbpfGraphGeneration, HistoricalEbpfGraphRecoveryOutcome,
+        HistoricalEbpfGraphRecoveryProgress, HistoricalEbpfGraphRecoveryRefusal,
+        RetainedGraphCleanupRefusal,
     };
 
     /// Attempt the committed classifier load and classify the outcome.
@@ -12175,6 +12319,15 @@ mod aya_runtime {
         0x30, 0x8f, 0x6f, 0xd5, 0xb4, 0xc6, 0x77, 0xcc, 0x3c, 0x21, 0x25, 0xb1, 0x94, 0x86, 0x04,
         0x64, 0xa5,
     ];
+    /// Object shipped by SDK revision e7db129dfa0c39a6203d8ef1bdeae37c4a7a8467
+    /// (`fix(gtpu): defer TFT mark resolution past callbacks`). It is retained
+    /// solely as parse-only identity evidence for the historical maintenance
+    /// contract; no production path can load it as a replacement datapath.
+    const PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DATAPATH_SHA256: [u8; 32] = [
+        0xa4, 0xf9, 0x1b, 0x08, 0xbb, 0xd6, 0xee, 0xd6, 0x9d, 0x46, 0xbf, 0x93, 0x01, 0x39, 0x0e,
+        0x40, 0xbd, 0x9d, 0x71, 0x3d, 0xff, 0x9a, 0x45, 0x4a, 0xb6, 0xd9, 0x8a, 0x12, 0x08, 0xcc,
+        0x7a, 0xc3,
+    ];
     const PRE_REDIRECT_DATAPATH_SHA256: [u8; 32] = [
         0xe4, 0xa4, 0xc9, 0x37, 0x36, 0xb1, 0x46, 0x66, 0x39, 0xfb, 0x52, 0xe4, 0xd4, 0x8b, 0x1c,
         0xab, 0x45, 0x6e, 0xd4, 0xa0, 0xee, 0xfa, 0x0a, 0xc5, 0xdf, 0x7c, 0xa4, 0x61, 0x77, 0xb2,
@@ -12230,6 +12383,61 @@ mod aya_runtime {
                         operation: "ebpf_legacy_v2_object_provenance"
                     })
                 ));
+            }
+        }
+    }
+
+    /// Parse-only provenance authority for the 25-map generation preceding
+    /// selector-stamp and traffic-observation support.
+    mod pre_selector_stamp_traffic_observation_v1_artifact {
+        use super::{AyaGtpuRuntime, GtpuError, LegacyV2ProgramTags};
+
+        const OBJECT: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bpf/opc-gtpu-datapath-pre-selector-stamp-traffic-observation-v1.bpf.o"
+        ));
+
+        pub(super) fn program_tags() -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError>
+        {
+            AyaGtpuRuntime::pre_selector_stamp_traffic_observation_v1_artifact_tags_from(OBJECT)
+        }
+
+        #[cfg(test)]
+        pub(super) fn object_for_privileged_generation_harness() -> &'static [u8] {
+            OBJECT
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use sha2::{Digest, Sha256};
+
+            use super::super::{
+                AyaGtpuRuntime, DATAPATH_OBJECT,
+                PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DATAPATH_SHA256,
+            };
+            use super::OBJECT;
+
+            #[test]
+            fn embedded_object_has_frozen_pre_selector_stamp_provenance() {
+                assert_eq!(
+                    &Sha256::digest(OBJECT)[..],
+                    &PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DATAPATH_SHA256
+                );
+                // This parse validates the sealed 25-entry map manifest,
+                // every ABI field, ByName pinning, and both program sections
+                // before runtime ever considers a live pin graph.
+                assert!(
+                    AyaGtpuRuntime::pre_selector_stamp_traffic_observation_v1_artifact_tags_from(
+                        OBJECT
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    AyaGtpuRuntime::pre_selector_stamp_traffic_observation_v1_artifact_tags_from(
+                        DATAPATH_OBJECT
+                    )
+                    .is_err()
+                );
             }
         }
     }
@@ -12310,6 +12518,79 @@ mod aya_runtime {
         MAP_MARKED_BEARER_OWNER,
         MAP_COUNTERS,
         MAP_CONFIG,
+    ];
+
+    /// Exact retained map names for the historical 25-map graph. This is not
+    /// a prefix-count heuristic: every name, ABI, and program reference is
+    /// checked before maintenance recovery may commit cleanup.
+    const PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES: [&str; 25] = [
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_SOURCE_PORT,
+        MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_UPLINK_PMTU,
+        MAP_UPLINK_PMTU_COUNTERS,
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_DOWNLINK_ENDPOINT_BINDING,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_CONFIG,
+        MAP_SESSION_GROUPS,
+        MAP_SESSION_UPLINK_INDEX,
+        MAP_SESSION_DOWNLINK_INDEX,
+        MAP_SESSION_TRANSACTIONS,
+        MAP_CONFIG_IPV6,
+        MAP_SESSION_SCHEMA,
+        MAP_TFT_CLASSIFIER_SCHEMA,
+        MAP_TFT_CLASSIFIER_META,
+        MAP_TFT_CLASSIFIER_FILTERS,
+        MAP_TFT_CLASSIFIER_COUNTERS,
+    ];
+
+    const PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_UPLINK_MAP_NAMES: [&str; 21] = [
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_SOURCE_PORT,
+        MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_UPLINK_PMTU,
+        MAP_UPLINK_PMTU_COUNTERS,
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_DOWNLINK_ENDPOINT_BINDING,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_CONFIG,
+        MAP_SESSION_GROUPS,
+        MAP_SESSION_UPLINK_INDEX,
+        MAP_CONFIG_IPV6,
+        MAP_TFT_CLASSIFIER_SCHEMA,
+        MAP_TFT_CLASSIFIER_META,
+        MAP_TFT_CLASSIFIER_FILTERS,
+        MAP_TFT_CLASSIFIER_COUNTERS,
+    ];
+
+    const PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DOWNLINK_MAP_NAMES: [&str; 15] = [
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_DOWNLINK_ENDPOINT_BINDING,
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_SOURCE_PORT,
+        MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_SESSION_GROUPS,
+        MAP_SESSION_DOWNLINK_INDEX,
+        MAP_CONFIG_IPV6,
     ];
 
     #[derive(Clone, Copy)]
@@ -12422,6 +12703,188 @@ mod aya_runtime {
             key_size: 4,
             value_size: 4,
             max_entries: 1,
+        },
+    ];
+
+    // This table is copied from the exact `e7db129d` shipped object, rather
+    // than derived from the current map table.  The historical artifact is an
+    // independently sealed ABI: a future change to the current datapath must
+    // not silently broaden what this maintenance operation can remove.
+    const PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS: [FrozenMapSpec; 25] = [
+        FrozenMapSpec {
+            name: MAP_UPLINK_FAR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_FAR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_MARK_FAR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_FAR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_DSCP,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_DSCP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_MARK_DSCP,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_DSCP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_SOURCE_PORT,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_SOURCE_PORT_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_MARK_SOURCE_PORT,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_SOURCE_PORT_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_PMTU,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: UPLINK_PMTU_VALUE_LEN as u32,
+            max_entries: 1,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_PMTU_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: UPLINK_PMTU_COUNTER_SLOTS,
+        },
+        FrozenMapSpec {
+            name: MAP_DOWNLINK_PDR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: DOWNLINK_PDR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_DOWNLINK_MARK_PDR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: MARKED_DOWNLINK_PDR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_DOWNLINK_ENDPOINT_BINDING,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: DOWNLINK_ENDPOINT_BINDING_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_MARKED_BEARER_OWNER,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: MARKED_BEARER_OWNER_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: COUNTER_SLOTS,
+        },
+        FrozenMapSpec {
+            name: MAP_DOWNLINK_BINDING_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: DOWNLINK_BINDING_COUNTER_SLOTS,
+        },
+        FrozenMapSpec {
+            name: MAP_CONFIG,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: 4,
+            max_entries: 1,
+        },
+        FrozenMapSpec {
+            name: MAP_SESSION_GROUPS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_GROUP_ID_LEN as u32,
+            value_size: GTPU_SESSION_GROUP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_SESSION_UPLINK_INDEX,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_UPLINK_KEY_LEN as u32,
+            value_size: GTPU_SESSION_GROUP_REF_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_SESSION_DOWNLINK_INDEX,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_DOWNLINK_KEY_LEN as u32,
+            value_size: GTPU_SESSION_GROUP_REF_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_SESSION_TRANSACTIONS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_GROUP_ID_LEN as u32,
+            value_size: GTPU_SESSION_TRANSACTION_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_CONFIG_IPV6,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: GTPU_SESSION_CONFIG_VALUE_LEN as u32,
+            max_entries: 1,
+        },
+        FrozenMapSpec {
+            name: MAP_SESSION_SCHEMA,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: GTPU_SESSION_SCHEMA_MARKER_LEN as u32,
+            max_entries: 1,
+        },
+        FrozenMapSpec {
+            name: MAP_TFT_CLASSIFIER_SCHEMA,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: TFT_CLASSIFIER_SCHEMA_VALUE_LEN as u32,
+            max_entries: 1,
+        },
+        FrozenMapSpec {
+            name: MAP_TFT_CLASSIFIER_META,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: TFT_CLASSIFIER_KEY_LEN as u32,
+            value_size: TFT_CLASSIFIER_META_VALUE_LEN as u32,
+            max_entries: TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
+        },
+        FrozenMapSpec {
+            name: MAP_TFT_CLASSIFIER_FILTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: TFT_CLASSIFIER_FILTER_KEY_LEN as u32,
+            value_size: TFT_CLASSIFIER_FILTER_VALUE_LEN as u32,
+            max_entries: TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES,
+        },
+        FrozenMapSpec {
+            name: MAP_TFT_CLASSIFIER_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: TFT_CLASSIFIER_COUNTER_SLOTS,
         },
     ];
 
@@ -12783,6 +13246,40 @@ mod aya_runtime {
     const CURRENT_RECOVERY_CHECKSUM_OFFSET: usize = CURRENT_RECOVERY_GRAPH_INODE_OFFSET + 8;
     const CURRENT_RECOVERY_PROOF_LEN: usize = CURRENT_RECOVERY_CHECKSUM_OFFSET + 8;
 
+    // The recovery receipt is pinned inside the locked legacy authority leaf,
+    // never into the historical graph directory.  This makes a committed
+    // cleanup resumable after all 25 graph pins have gone away, while keeping
+    // the receipt in the one namespace that is retired with the old lease.
+    const HISTORICAL_25_RECOVERY_PROOF_MAP: &str = "GTPU_HISTORICAL_25_RECOVERY";
+    // This immutable, empty marker lives only in the root-bound private
+    // current leaf.  It is published under both historical leases after the
+    // exact graph is gone and before the legacy leaf is retired.  It is never
+    // a marker in the shared predecessor root, whose umask-derived mode and
+    // other namespaces must remain untouched.
+    const HISTORICAL_25_ROOT_HANDOFF_MARKER: &str = "GTPU_HISTORICAL_25_ROOT_HANDOFF";
+    const HISTORICAL_25_RECOVERY_MAGIC: [u8; 8] = *b"OPCH25R1";
+    const HISTORICAL_25_RECOVERY_NAMESPACE_OFFSET: usize = 16;
+    const HISTORICAL_25_RECOVERY_LEGACY_DEVICE_OFFSET: usize = 48;
+    const HISTORICAL_25_RECOVERY_LEGACY_INODE_OFFSET: usize = 56;
+    const HISTORICAL_25_RECOVERY_GRAPH_DEVICE_OFFSET: usize = 64;
+    const HISTORICAL_25_RECOVERY_GRAPH_INODE_OFFSET: usize = 72;
+    const HISTORICAL_25_RECOVERY_IFINDEX_OFFSET: usize = 80;
+    const HISTORICAL_25_RECOVERY_TC_PRIORITY_OFFSET: usize = 84;
+    const HISTORICAL_25_RECOVERY_UPLINK_PROGRAM_ID_OFFSET: usize = 88;
+    const HISTORICAL_25_RECOVERY_DOWNLINK_PROGRAM_ID_OFFSET: usize = 92;
+    const HISTORICAL_25_RECOVERY_UPLINK_PROGRAM_TAG_OFFSET: usize = 96;
+    const HISTORICAL_25_RECOVERY_DOWNLINK_PROGRAM_TAG_OFFSET: usize = 104;
+    const HISTORICAL_25_RECOVERY_MAP_IDS_OFFSET: usize = 112;
+    const HISTORICAL_25_RECOVERY_PROOF_MAP_ID_OFFSET: usize = HISTORICAL_25_RECOVERY_MAP_IDS_OFFSET
+        + PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len() * 4;
+    const HISTORICAL_25_RECOVERY_CURRENT_CONTROL_DEVICE_OFFSET: usize =
+        HISTORICAL_25_RECOVERY_PROOF_MAP_ID_OFFSET + 4;
+    const HISTORICAL_25_RECOVERY_CURRENT_CONTROL_INODE_OFFSET: usize =
+        HISTORICAL_25_RECOVERY_CURRENT_CONTROL_DEVICE_OFFSET + 8;
+    const HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET: usize =
+        HISTORICAL_25_RECOVERY_CURRENT_CONTROL_INODE_OFFSET + 8;
+    const HISTORICAL_25_RECOVERY_PROOF_LEN: usize = HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET + 8;
+
     const TC_HANDLE: TcHandle = TcHandle::new(0, 1);
     const RECONCILER_CONTROL_DIRECTORY: &str = "GTPU_RECONCILER_LOCKS";
     const RECONCILER_OPERATION_LOCK_SUFFIX: &str = "-operation-v1";
@@ -12808,6 +13305,15 @@ mod aya_runtime {
     /// is not the immutable control object this protocol authorizes.
     pub(super) const fn selector_control_directory_mode_is_exact(mode: u32) -> bool {
         mode & 0o7777 == 0o700
+    }
+
+    /// `e7db129d` created the shared reconciler root with `create_dir`, so its
+    /// mode was the process umask result, not a shipped `0755` ABI.  The
+    /// compatibility route accepts only an ordinary owner-searchable directory
+    /// with no special bits.  It never changes that shared mode: a per-current-
+    /// leaf receipt is required before current ownership may use this route.
+    pub(super) const fn historical_25_control_root_mode_is_compatible(mode: u32) -> bool {
+        mode & 0o7000 == 0 && mode & 0o700 == 0o700
     }
 
     /// Compare a descriptor identity to the identity captured from the trusted
@@ -12897,7 +13403,59 @@ mod aya_runtime {
         operation_lock_name: String,
         operation_lock_device: u64,
         operation_lock_inode: u64,
+        // A predecessor root created by `e7db129d` can be shared and have an
+        // ordinary umask-derived mode.  In that case normal ownership is
+        // authorized only by the exact immutable hand-off marker in this
+        // namespace's private leaf; its operation flock is that marker, not a
+        // new object in the shared root.
+        historical_25_handoff: Option<Historical25RootHandoff>,
         canonical_pin_dir: PathBuf,
+        namespace_hash: [u8; 32],
+    }
+
+    #[derive(Debug, Clone)]
+    struct Historical25RootHandoff {
+        marker_device: u64,
+        marker_inode: u64,
+        legacy_control_dir_name: String,
+    }
+
+    /// The predecessor's authority leaf. Its intentionally narrower
+    /// validation mirrors the exact construction in `e7db129d`: that release
+    /// used a SHA-256 leaf-name beneath `GTPU_RECONCILER_LOCKS` and flocked the
+    /// directory itself, before the root-bound commitment and private-0700
+    /// controls existed. We accept only that one legacy shape and retain its
+    /// descriptor until retirement.
+    struct Historical25LegacyOwnership {
+        _lease: File,
+        bpffs_root_path: PathBuf,
+        bpffs_root_device: u64,
+        bpffs_root_inode: u64,
+        control_root_device: u64,
+        control_root_inode: u64,
+        control_dir_name: String,
+        control_dir_device: u64,
+        control_dir_inode: u64,
+    }
+
+    /// The current, root-bound namespace lease taken while a predecessor
+    /// leaf-hash lease is still present.  It deliberately binds the current
+    /// namespace digest to the *same* historical control-root inode.  The
+    /// old release created that root without the current private-directory
+    /// mode contract.  The terminal compatibility hand-off never changes that
+    /// shared root: it publishes an immutable receipt in this exact private
+    /// leaf while both leases are held, then retires only the matching legacy
+    /// child.
+    ///
+    /// The leaf itself is a current-format, private `0700` authority inode;
+    /// it is never removed by this operation.  This lets the normal current
+    /// runtime retain the root-bound authority after the exact legacy child is
+    /// retired, without changing another namespace under the shared root.
+    struct Historical25CurrentOwnership {
+        _lease: File,
+        control_dir_name: String,
+        control_dir_device: u64,
+        control_dir_inode: u64,
         namespace_hash: [u8; 32],
     }
 
@@ -13178,6 +13736,17 @@ mod aya_runtime {
         uplink: LegacyV2ProgramIdentity,
         downlink: LegacyV2ProgramIdentity,
         map_ids: [u32; LEGACY_V2_MAP_NAMES.len()],
+    }
+
+    /// Identity collected only after the complete 25-member frozen graph has
+    /// passed pathname, map ABI, object provenance, and loaded-program checks.
+    /// It is intentionally private: IDs and graph coordinates are recovery
+    /// fencing material, never operator diagnostics.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Historical25DatapathIdentity {
+        uplink: LegacyV2ProgramIdentity,
+        downlink: LegacyV2ProgramIdentity,
+        map_ids: [u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13537,6 +14106,39 @@ mod aya_runtime {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Historical25RecoveryRecord {
+        namespace_hash: [u8; 32],
+        legacy_control_device: u64,
+        legacy_control_inode: u64,
+        current_control_device: u64,
+        current_control_inode: u64,
+        graph_device: u64,
+        graph_inode: u64,
+        ifindex: u32,
+        tc_priority: u16,
+        uplink_program_id: u32,
+        downlink_program_id: u32,
+        uplink_program_tag: u64,
+        downlink_program_tag: u64,
+        map_ids: [u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
+        proof_map_id: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Historical25RecoveryProof {
+        record: Historical25RecoveryRecord,
+        map_id: u32,
+    }
+
+    type Historical25ProgramIdentity = (u32, u64);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Historical25ProofCommitError {
+        BeforePublication,
+        PublicationIndeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CurrentRecoveryRecord {
         namespace_hash: [u8; 32],
         allow_populated: bool,
@@ -13555,6 +14157,169 @@ mod aya_runtime {
     struct HeldCurrentPin {
         index: usize,
         data: MapData,
+    }
+
+    impl Historical25RecoveryRecord {
+        fn unbound(
+            namespace_hash: [u8; 32],
+            legacy_control_identity: (u64, u64),
+            current_control_identity: (u64, u64),
+            graph_identity: (u64, u64),
+            attachment: (u32, u16),
+            programs: (Historical25ProgramIdentity, Historical25ProgramIdentity),
+            map_ids: [u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
+        ) -> Self {
+            Self {
+                namespace_hash,
+                legacy_control_device: legacy_control_identity.0,
+                legacy_control_inode: legacy_control_identity.1,
+                current_control_device: current_control_identity.0,
+                current_control_inode: current_control_identity.1,
+                graph_device: graph_identity.0,
+                graph_inode: graph_identity.1,
+                ifindex: attachment.0,
+                tc_priority: attachment.1,
+                uplink_program_id: programs.0 .0,
+                downlink_program_id: programs.1 .0,
+                uplink_program_tag: programs.0 .1,
+                downlink_program_tag: programs.1 .1,
+                map_ids,
+                proof_map_id: 0,
+            }
+        }
+
+        fn bind_to_proof_map(self, proof_map_id: u32) -> Option<Self> {
+            (self.proof_map_id == 0 && proof_map_id != 0).then_some(Self {
+                proof_map_id,
+                ..self
+            })
+        }
+
+        fn encode(self) -> [u8; HISTORICAL_25_RECOVERY_PROOF_LEN] {
+            let mut encoded = [0_u8; HISTORICAL_25_RECOVERY_PROOF_LEN];
+            encoded[..8].copy_from_slice(&HISTORICAL_25_RECOVERY_MAGIC);
+            encoded[8] = 2;
+            encoded[HISTORICAL_25_RECOVERY_NAMESPACE_OFFSET..48]
+                .copy_from_slice(&self.namespace_hash);
+            encoded[HISTORICAL_25_RECOVERY_LEGACY_DEVICE_OFFSET..56]
+                .copy_from_slice(&self.legacy_control_device.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_LEGACY_INODE_OFFSET..64]
+                .copy_from_slice(&self.legacy_control_inode.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_GRAPH_DEVICE_OFFSET..72]
+                .copy_from_slice(&self.graph_device.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_GRAPH_INODE_OFFSET..80]
+                .copy_from_slice(&self.graph_inode.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_IFINDEX_OFFSET..84]
+                .copy_from_slice(&self.ifindex.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_TC_PRIORITY_OFFSET..86]
+                .copy_from_slice(&self.tc_priority.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_UPLINK_PROGRAM_ID_OFFSET..92]
+                .copy_from_slice(&self.uplink_program_id.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_DOWNLINK_PROGRAM_ID_OFFSET..96]
+                .copy_from_slice(&self.downlink_program_id.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_UPLINK_PROGRAM_TAG_OFFSET..104]
+                .copy_from_slice(&self.uplink_program_tag.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_DOWNLINK_PROGRAM_TAG_OFFSET..112]
+                .copy_from_slice(&self.downlink_program_tag.to_ne_bytes());
+            for (index, map_id) in self.map_ids.into_iter().enumerate() {
+                let offset = HISTORICAL_25_RECOVERY_MAP_IDS_OFFSET + index * 4;
+                encoded[offset..offset + 4].copy_from_slice(&map_id.to_ne_bytes());
+            }
+            encoded[HISTORICAL_25_RECOVERY_PROOF_MAP_ID_OFFSET
+                ..HISTORICAL_25_RECOVERY_CURRENT_CONTROL_DEVICE_OFFSET]
+                .copy_from_slice(&self.proof_map_id.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_CURRENT_CONTROL_DEVICE_OFFSET
+                ..HISTORICAL_25_RECOVERY_CURRENT_CONTROL_INODE_OFFSET]
+                .copy_from_slice(&self.current_control_device.to_ne_bytes());
+            encoded[HISTORICAL_25_RECOVERY_CURRENT_CONTROL_INODE_OFFSET
+                ..HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET]
+                .copy_from_slice(&self.current_control_inode.to_ne_bytes());
+            let checksum =
+                teardown_record_checksum(&encoded[..HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET]);
+            encoded[HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET..]
+                .copy_from_slice(&checksum.to_ne_bytes());
+            encoded
+        }
+
+        fn decode(encoded: &[u8; HISTORICAL_25_RECOVERY_PROOF_LEN]) -> Option<Self> {
+            let read_u32 = |offset| {
+                encoded
+                    .get(offset..offset + 4)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u32::from_ne_bytes)
+            };
+            let read_u64 = |offset| {
+                encoded
+                    .get(offset..offset + 8)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u64::from_ne_bytes)
+            };
+            if encoded[..8] != HISTORICAL_25_RECOVERY_MAGIC
+                || encoded[8] != 2
+                || encoded[9..16] != [0; 7]
+                || read_u64(HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET)?
+                    != teardown_record_checksum(&encoded[..HISTORICAL_25_RECOVERY_CHECKSUM_OFFSET])
+            {
+                return None;
+            }
+            let mut namespace_hash = [0; 32];
+            namespace_hash.copy_from_slice(
+                &encoded[HISTORICAL_25_RECOVERY_NAMESPACE_OFFSET
+                    ..HISTORICAL_25_RECOVERY_LEGACY_DEVICE_OFFSET],
+            );
+            let mut map_ids = [0_u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()];
+            for (index, map_id) in map_ids.iter_mut().enumerate() {
+                *map_id = read_u32(HISTORICAL_25_RECOVERY_MAP_IDS_OFFSET + index * 4)?;
+            }
+            let record = Self {
+                namespace_hash,
+                legacy_control_device: read_u64(HISTORICAL_25_RECOVERY_LEGACY_DEVICE_OFFSET)?,
+                legacy_control_inode: read_u64(HISTORICAL_25_RECOVERY_LEGACY_INODE_OFFSET)?,
+                current_control_device: read_u64(
+                    HISTORICAL_25_RECOVERY_CURRENT_CONTROL_DEVICE_OFFSET,
+                )?,
+                current_control_inode: read_u64(
+                    HISTORICAL_25_RECOVERY_CURRENT_CONTROL_INODE_OFFSET,
+                )?,
+                graph_device: read_u64(HISTORICAL_25_RECOVERY_GRAPH_DEVICE_OFFSET)?,
+                graph_inode: read_u64(HISTORICAL_25_RECOVERY_GRAPH_INODE_OFFSET)?,
+                ifindex: read_u32(HISTORICAL_25_RECOVERY_IFINDEX_OFFSET)?,
+                tc_priority: u16::from_ne_bytes(
+                    encoded[HISTORICAL_25_RECOVERY_TC_PRIORITY_OFFSET..86]
+                        .try_into()
+                        .ok()?,
+                ),
+                uplink_program_id: read_u32(HISTORICAL_25_RECOVERY_UPLINK_PROGRAM_ID_OFFSET)?,
+                downlink_program_id: read_u32(HISTORICAL_25_RECOVERY_DOWNLINK_PROGRAM_ID_OFFSET)?,
+                uplink_program_tag: read_u64(HISTORICAL_25_RECOVERY_UPLINK_PROGRAM_TAG_OFFSET)?,
+                downlink_program_tag: read_u64(HISTORICAL_25_RECOVERY_DOWNLINK_PROGRAM_TAG_OFFSET)?,
+                map_ids,
+                proof_map_id: read_u32(HISTORICAL_25_RECOVERY_PROOF_MAP_ID_OFFSET)?,
+            };
+            let map_ids_are_unique = {
+                let mut seen = HashSet::with_capacity(record.map_ids.len());
+                record.map_ids.iter().all(|map_id| seen.insert(*map_id))
+            };
+            (record.namespace_hash != [0; 32]
+                && record.legacy_control_device != 0
+                && record.legacy_control_inode != 0
+                && record.current_control_device != 0
+                && record.current_control_inode != 0
+                && record.graph_device != 0
+                && record.graph_inode != 0
+                && record.ifindex != 0
+                && record.tc_priority != 0
+                && record.uplink_program_id != 0
+                && record.downlink_program_id != 0
+                && record.uplink_program_id != record.downlink_program_id
+                && record.uplink_program_tag != 0
+                && record.downlink_program_tag != 0
+                && record.proof_map_id != 0
+                && record.map_ids.iter().all(|id| *id != 0)
+                && map_ids_are_unique
+                && !record.map_ids.contains(&record.proof_map_id))
+            .then_some(record)
+        }
     }
 
     impl CurrentRecoveryRecord {
@@ -14192,8 +14957,20 @@ mod aya_runtime {
             )
             .map(File::from)
             .map_err(|error| GtpuError::io("ebpf_reconciler_control_root", error.into()))?;
-            let control_root_metadata =
-                Self::verify_control_root(&control_root, None, "ebpf_reconciler_control_root")?;
+            let raw_control_root_metadata = control_root
+                .metadata()
+                .map_err(|error| GtpuError::io("ebpf_reconciler_control_root", error))?;
+            let predecessor_handoff =
+                !selector_control_directory_mode_is_exact(raw_control_root_metadata.mode());
+            let control_root_metadata = if predecessor_handoff {
+                Self::historical_25_verify_control_root(
+                    &control_root,
+                    None,
+                    "ebpf_reconciler_control_root",
+                )?
+            } else {
+                Self::verify_control_root(&control_root, None, "ebpf_reconciler_control_root")?
+            };
             let namespace_hash = Self::selector_namespace_pin_commitment(
                 control_root_metadata.dev(),
                 control_root_metadata.ino(),
@@ -14205,17 +14982,19 @@ mod aya_runtime {
                 control_dir_name.push(char::from(HEX[usize::from(byte >> 4)]));
                 control_dir_name.push(char::from(HEX[usize::from(byte & 0x0f)]));
             }
-            match rustix::fs::mkdirat(
-                &control_root,
-                control_dir_name.as_str(),
-                rustix::fs::Mode::from_bits_truncate(0o700),
-            ) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(error) => {
-                    return Err(GtpuError::io(
-                        "ebpf_reconciler_ownership_create",
-                        error.into(),
-                    ))
+            if !predecessor_handoff {
+                match rustix::fs::mkdirat(
+                    &control_root,
+                    control_dir_name.as_str(),
+                    rustix::fs::Mode::from_bits_truncate(0o700),
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => {
+                        return Err(GtpuError::io(
+                            "ebpf_reconciler_ownership_create",
+                            error.into(),
+                        ))
+                    }
                 }
             }
             let control_dir = rustix::fs::openat(
@@ -14269,11 +15048,19 @@ mod aya_runtime {
             )
             .map(File::from)
             .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_recheck", error.into()))?;
-            Self::verify_control_root(
-                &current_control_root,
-                Some((control_root_metadata.dev(), control_root_metadata.ino())),
-                "ebpf_reconciler_ownership_recheck",
-            )?;
+            if predecessor_handoff {
+                Self::historical_25_verify_control_root(
+                    &current_control_root,
+                    Some((control_root_metadata.dev(), control_root_metadata.ino())),
+                    "ebpf_reconciler_ownership_recheck",
+                )?;
+            } else {
+                Self::verify_control_root(
+                    &current_control_root,
+                    Some((control_root_metadata.dev(), control_root_metadata.ino())),
+                    "ebpf_reconciler_ownership_recheck",
+                )?;
+            }
             let current_control_dir = rustix::fs::openat(
                 &current_control_root,
                 control_dir_name.as_str(),
@@ -14296,22 +15083,76 @@ mod aya_runtime {
                 "ebpf_reconciler_ownership_recheck",
             )?;
 
-            let operation_lock_name = Self::selector_namespace_operation_lock_name(&namespace_hash);
-            match rustix::fs::mkdirat(
-                &current_control_root,
-                operation_lock_name.as_str(),
-                rustix::fs::Mode::from_bits_truncate(0o700),
-            ) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(error) => {
-                    return Err(GtpuError::io(
-                        "ebpf_reconciler_operation_lock_create",
-                        error.into(),
-                    ))
+            let historical_25_handoff = if predecessor_handoff {
+                let legacy_control_dir_name = Self::historical_25_legacy_leaf_name(leaf)?;
+                let (marker_device, marker_inode) = Self::marker_directory_identity(
+                    &current_control_dir,
+                    HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                    None,
+                    "ebpf_reconciler_historical_handoff",
+                )?;
+                match rustix::fs::openat(
+                    &current_control_root,
+                    legacy_control_dir_name.as_str(),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                ) {
+                    Err(rustix::io::Errno::NOENT) => {}
+                    Ok(_) | Err(_) => {
+                        return Err(state_indeterminate("ebpf_reconciler_historical_handoff"))
+                    }
+                }
+                Some(Historical25RootHandoff {
+                    marker_device,
+                    marker_inode,
+                    legacy_control_dir_name,
+                })
+            } else {
+                match rustix::fs::openat(
+                    &current_control_dir,
+                    HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                ) {
+                    Err(rustix::io::Errno::NOENT) => {}
+                    Ok(_) | Err(_) => {
+                        return Err(state_indeterminate("ebpf_reconciler_historical_handoff"))
+                    }
+                }
+                None
+            };
+            let operation_lock_name = historical_25_handoff.as_ref().map_or_else(
+                || Self::selector_namespace_operation_lock_name(&namespace_hash),
+                |_| HISTORICAL_25_ROOT_HANDOFF_MARKER.to_owned(),
+            );
+            let operation_parent = if predecessor_handoff {
+                &current_control_dir
+            } else {
+                &current_control_root
+            };
+            if !predecessor_handoff {
+                match rustix::fs::mkdirat(
+                    operation_parent,
+                    operation_lock_name.as_str(),
+                    rustix::fs::Mode::from_bits_truncate(0o700),
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => {
+                        return Err(GtpuError::io(
+                            "ebpf_reconciler_operation_lock_create",
+                            error.into(),
+                        ))
+                    }
                 }
             }
             let operation_lock = rustix::fs::openat(
-                &current_control_root,
+                operation_parent,
                 operation_lock_name.as_str(),
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::DIRECTORY
@@ -14340,9 +15181,452 @@ mod aya_runtime {
                 operation_lock_name,
                 operation_lock_device: operation_lock_metadata.dev(),
                 operation_lock_inode: operation_lock_metadata.ino(),
+                historical_25_handoff,
                 canonical_pin_dir: pin_dir.to_path_buf(),
                 namespace_hash,
             }))
+        }
+
+        fn historical_25_legacy_leaf_name(leaf: &std::ffi::OsStr) -> Result<String, GtpuError> {
+            let leaf = leaf
+                .to_str()
+                .ok_or_else(|| state_indeterminate("ebpf_historical_25_legacy_leaf"))?;
+            let digest: [u8; 32] = Sha256::digest(leaf.as_bytes()).into();
+            Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+
+        fn historical_25_verify_legacy_directory(
+            descriptor: &File,
+            expected_identity: Option<(u64, u64)>,
+            operation: &'static str,
+        ) -> Result<std::fs::Metadata, GtpuError> {
+            // Do not impose current private-control mode requirements here:
+            // the shipped predecessor created this leaf with `create_dir`,
+            // then authenticated only the no-follow opened directory inode.
+            // Tightening that historical ABI would make authentic stranded
+            // e7db129d graphs unrecoverable.
+            Self::verify_bpffs_descriptor(descriptor, operation)?;
+            let metadata = descriptor
+                .metadata()
+                .map_err(|error| GtpuError::io(operation, error))?;
+            let exact = expected_identity
+                .is_none_or(|(device, inode)| metadata.dev() == device && metadata.ino() == inode);
+            (metadata.file_type().is_dir() && metadata.nlink() == 2 && exact)
+                .then_some(metadata)
+                .ok_or_else(|| state_indeterminate(operation))
+        }
+
+        fn historical_25_legacy_entries(
+            directory: &File,
+            operation: &'static str,
+        ) -> Result<Vec<String>, GtpuError> {
+            let mut entries = Vec::new();
+            for entry in rustix::fs::Dir::read_from(directory)
+                .map_err(|error| GtpuError::io(operation, error.into()))?
+            {
+                let entry = entry.map_err(|error| GtpuError::io(operation, error.into()))?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                let name = std::str::from_utf8(name)
+                    .map_err(|_| state_indeterminate(operation))?
+                    .to_owned();
+                entries.push(name);
+            }
+            entries.sort_unstable();
+            if entries.len() > 1
+                || entries
+                    .first()
+                    .is_some_and(|name| name != HISTORICAL_25_RECOVERY_PROOF_MAP)
+            {
+                return Err(state_indeterminate(operation));
+            }
+            Ok(entries)
+        }
+
+        /// Enumerate the shared predecessor root only for the terminal mode
+        /// migration.  That migration may not change permissions on a root
+        /// which names another namespace, even if that namespace happens to
+        /// use the same SDK binary and uid.
+        fn historical_25_control_root_entries(
+            directory: &File,
+            operation: &'static str,
+        ) -> Result<Vec<String>, GtpuError> {
+            let mut entries = Vec::new();
+            for entry in rustix::fs::Dir::read_from(directory)
+                .map_err(|error| GtpuError::io(operation, error.into()))?
+            {
+                let entry = entry.map_err(|error| GtpuError::io(operation, error.into()))?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                entries.push(
+                    std::str::from_utf8(name)
+                        .map_err(|_| state_indeterminate(operation))?
+                        .to_owned(),
+                );
+            }
+            entries.sort_unstable();
+            Ok(entries)
+        }
+
+        /// Take the old leaf-hash flock. Callers must take this *before* the
+        /// current root-bound lease; the ordering is fixed so a rolling
+        /// upgrade cannot deadlock two maintenance attempts across authority
+        /// generations.
+        fn acquire_historical_25_legacy_ownership(
+            pin_dir: &Path,
+        ) -> Result<Option<Historical25LegacyOwnership>, GtpuError> {
+            let configured_root = pin_dir.parent().ok_or_else(|| {
+                GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
+            })?;
+            let leaf = pin_dir.file_name().ok_or_else(|| {
+                GtpuError::invalid_config(
+                    "pin_namespace",
+                    "pin namespace must have one final component",
+                )
+            })?;
+            let (bpffs_root, root_metadata) = Self::open_bpffs_namespace_root(
+                configured_root,
+                false,
+                "ebpf_historical_25_legacy_root",
+            )?;
+            let control_root = match rustix::fs::openat(
+                &bpffs_root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => File::from(descriptor),
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_historical_25_legacy_root",
+                        error.into(),
+                    ))
+                }
+            };
+            let control_root_metadata = Self::historical_25_verify_control_root(
+                &control_root,
+                None,
+                "ebpf_historical_25_legacy_root",
+            )?;
+            let control_dir_name = Self::historical_25_legacy_leaf_name(leaf)?;
+            let descriptor = match rustix::fs::openat(
+                &control_root,
+                control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => File::from(descriptor),
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_historical_25_legacy_open",
+                        error.into(),
+                    ))
+                }
+            };
+            let metadata = Self::historical_25_verify_legacy_directory(
+                &descriptor,
+                None,
+                "ebpf_historical_25_legacy_open",
+            )?;
+            Self::historical_25_legacy_entries(&descriptor, "ebpf_historical_25_legacy_inventory")?;
+            match rustix::fs::flock(
+                &descriptor,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_historical_25_legacy_lock",
+                        error.into(),
+                    ))
+                }
+            }
+            // Re-descend after flock; an old descriptor never authorizes a
+            // replacement path or a remounted bpffs hierarchy.
+            let (current_root, current_root_metadata) = Self::open_bpffs_namespace_root(
+                configured_root,
+                false,
+                "ebpf_historical_25_legacy_recheck",
+            )?;
+            if current_root_metadata.dev() != root_metadata.dev()
+                || current_root_metadata.ino() != root_metadata.ino()
+            {
+                return Err(state_indeterminate("ebpf_historical_25_legacy_recheck"));
+            }
+            let current_control_root = rustix::fs::openat(
+                &current_root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_legacy_recheck", error.into()))?;
+            Self::historical_25_verify_control_root(
+                &current_control_root,
+                Some((control_root_metadata.dev(), control_root_metadata.ino())),
+                "ebpf_historical_25_legacy_recheck",
+            )?;
+            let current = rustix::fs::openat(
+                &current_control_root,
+                control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_legacy_recheck", error.into()))?;
+            Self::historical_25_verify_legacy_directory(
+                &current,
+                Some((metadata.dev(), metadata.ino())),
+                "ebpf_historical_25_legacy_recheck",
+            )?;
+            Self::historical_25_verify_legacy_directory(
+                &descriptor,
+                Some((metadata.dev(), metadata.ino())),
+                "ebpf_historical_25_legacy_recheck",
+            )?;
+            Ok(Some(Historical25LegacyOwnership {
+                _lease: descriptor,
+                bpffs_root_path: configured_root.to_path_buf(),
+                bpffs_root_device: root_metadata.dev(),
+                bpffs_root_inode: root_metadata.ino(),
+                control_root_device: control_root_metadata.dev(),
+                control_root_inode: control_root_metadata.ino(),
+                control_dir_name,
+                control_dir_device: metadata.dev(),
+                control_dir_inode: metadata.ino(),
+            }))
+        }
+
+        /// Acquire the current-format root-bound namespace lease after the
+        /// historical leaf-hash lease.  The order is part of the compatibility
+        /// protocol: taking the two locks in the opposite order could deadlock
+        /// a rolling upgrade that is simultaneously retiring a stranded graph.
+        fn acquire_historical_25_current_ownership(
+            pin_dir: &Path,
+            legacy: &Historical25LegacyOwnership,
+        ) -> Result<Historical25CurrentOwnership, GtpuError> {
+            let leaf = pin_dir
+                .file_name()
+                .ok_or_else(|| state_indeterminate("ebpf_historical_25_current_leaf"))?;
+            let (root, root_metadata) = Self::open_bpffs_namespace_root(
+                &legacy.bpffs_root_path,
+                false,
+                "ebpf_historical_25_current_root",
+            )?;
+            if root_metadata.dev() != legacy.bpffs_root_device
+                || root_metadata.ino() != legacy.bpffs_root_inode
+            {
+                return Err(state_indeterminate("ebpf_historical_25_current_root"));
+            }
+            let control_root = rustix::fs::openat(
+                &root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_current_root", error.into()))?;
+            let control_metadata = Self::historical_25_verify_control_root(
+                &control_root,
+                Some((legacy.control_root_device, legacy.control_root_inode)),
+                "ebpf_historical_25_current_root",
+            )?;
+            let namespace_hash = Self::selector_namespace_pin_commitment(
+                control_metadata.dev(),
+                control_metadata.ino(),
+                leaf,
+            )?;
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut control_dir_name = String::with_capacity(64);
+            for byte in namespace_hash {
+                control_dir_name.push(char::from(HEX[usize::from(byte >> 4)]));
+                control_dir_name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+            match rustix::fs::mkdirat(
+                &control_root,
+                control_dir_name.as_str(),
+                rustix::fs::Mode::from_bits_truncate(0o700),
+            ) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_historical_25_current_create",
+                        error.into(),
+                    ));
+                }
+            }
+            let descriptor = rustix::fs::openat(
+                &control_root,
+                control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_current_open", error.into()))?;
+            let metadata = Self::verify_control_directory(
+                &descriptor,
+                None,
+                "ebpf_historical_25_current_open",
+            )?;
+            match rustix::fs::flock(
+                &descriptor,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_historical_25_current_lock",
+                        error.into(),
+                    ));
+                }
+            }
+            // Prove that both the shared root and this root-bound child still
+            // name the locked inodes after acquisition.
+            let (current_root, current_root_metadata) = Self::open_bpffs_namespace_root(
+                &legacy.bpffs_root_path,
+                false,
+                "ebpf_historical_25_current_recheck",
+            )?;
+            if current_root_metadata.dev() != legacy.bpffs_root_device
+                || current_root_metadata.ino() != legacy.bpffs_root_inode
+            {
+                return Err(state_indeterminate("ebpf_historical_25_current_recheck"));
+            }
+            let current_control = rustix::fs::openat(
+                &current_root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_current_recheck", error.into()))?;
+            Self::historical_25_verify_control_root(
+                &current_control,
+                Some((legacy.control_root_device, legacy.control_root_inode)),
+                "ebpf_historical_25_current_recheck",
+            )?;
+            let current = rustix::fs::openat(
+                &current_control,
+                control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_current_recheck", error.into()))?;
+            Self::verify_control_directory(
+                &current,
+                Some((metadata.dev(), metadata.ino())),
+                "ebpf_historical_25_current_recheck",
+            )?;
+            Self::verify_control_directory(
+                &descriptor,
+                Some((metadata.dev(), metadata.ino())),
+                "ebpf_historical_25_current_recheck",
+            )?;
+            Ok(Historical25CurrentOwnership {
+                _lease: descriptor,
+                control_dir_name,
+                control_dir_device: metadata.dev(),
+                control_dir_inode: metadata.ino(),
+                namespace_hash,
+            })
+        }
+
+        /// Re-prove the two held authority leaves from the configured root.
+        /// A current leaf that was valid only at acquisition time must never
+        /// authorize proof publication, tc detach, pin removal, or legacy
+        /// retirement after its pathname was replaced.
+        fn historical_25_revalidate_current_ownership(
+            legacy: &Historical25LegacyOwnership,
+            current: &Historical25CurrentOwnership,
+            operation: &'static str,
+        ) -> Result<(File, File), GtpuError> {
+            if legacy.control_dir_name == current.control_dir_name {
+                return Err(state_indeterminate(operation));
+            }
+            let (bpffs_root, root_metadata) =
+                Self::open_bpffs_namespace_root(&legacy.bpffs_root_path, false, operation)?;
+            if root_metadata.dev() != legacy.bpffs_root_device
+                || root_metadata.ino() != legacy.bpffs_root_inode
+            {
+                return Err(state_indeterminate(operation));
+            }
+            let control_root = rustix::fs::openat(
+                &bpffs_root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::historical_25_verify_control_root(
+                &control_root,
+                Some((legacy.control_root_device, legacy.control_root_inode)),
+                operation,
+            )?;
+            let current_dir = rustix::fs::openat(
+                &control_root,
+                current.control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::verify_control_directory(
+                &current_dir,
+                Some((current.control_dir_device, current.control_dir_inode)),
+                operation,
+            )?;
+            Self::verify_control_directory(
+                &current._lease,
+                Some((current.control_dir_device, current.control_dir_inode)),
+                operation,
+            )?;
+            Self::historical_25_verify_legacy_directory(
+                &legacy._lease,
+                Some((legacy.control_dir_device, legacy.control_dir_inode)),
+                operation,
+            )?;
+            let _ = Self::historical_25_open_legacy_control(legacy, operation)?;
+            Ok((control_root, current_dir))
         }
 
         fn open_or_create_bpffs_namespace_root(
@@ -14584,6 +15868,94 @@ mod aya_runtime {
             .ok_or_else(|| state_indeterminate(operation))
         }
 
+        /// Verify the predecessor root only as far as the shipped
+        /// construction can prove it.  Its access mode was umask-derived, but
+        /// it must still be a same-owner, same-inode bpffs directory with owner
+        /// traversal and no special-bit semantics.  This is deliberately not
+        /// a normal-current root verifier.
+        fn historical_25_verify_control_root(
+            descriptor: &File,
+            expected_identity: Option<(u64, u64)>,
+            operation: &'static str,
+        ) -> Result<std::fs::Metadata, GtpuError> {
+            Self::verify_bpffs_descriptor(descriptor, operation)?;
+            let metadata = descriptor
+                .metadata()
+                .map_err(|error| GtpuError::io(operation, error))?;
+            let identity_matches = selector_control_identity_is_exact(
+                metadata.dev(),
+                metadata.ino(),
+                expected_identity,
+            );
+            (metadata.file_type().is_dir()
+                && identity_matches
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.gid() == rustix::process::getegid().as_raw()
+                && metadata.nlink() >= 2
+                && historical_25_control_root_mode_is_compatible(metadata.mode()))
+            .then_some(metadata)
+            .ok_or_else(|| state_indeterminate(operation))
+        }
+
+        fn verify_reconciler_control_root(
+            ownership: &ReconcilerOwnership,
+            descriptor: &File,
+            operation: &'static str,
+        ) -> Result<std::fs::Metadata, GtpuError> {
+            let identity = Some((ownership.control_root_device, ownership.control_root_inode));
+            if ownership.historical_25_handoff.is_some() {
+                Self::historical_25_verify_control_root(descriptor, identity, operation)
+            } else {
+                Self::verify_control_root(descriptor, identity, operation)
+            }
+        }
+
+        /// The receipt makes a non-private predecessor root usable for exactly
+        /// one root-bound current namespace.  It is not an inventory waiver:
+        /// the marker inode is bound, the legacy leaf name must now be absent,
+        /// and callers re-prove all three on every operation.
+        fn verify_historical_25_root_handoff(
+            ownership: &ReconcilerOwnership,
+            control_root: &File,
+            current: &File,
+            operation: &'static str,
+        ) -> Result<(), GtpuError> {
+            let Some(handoff) = ownership.historical_25_handoff.as_ref() else {
+                // Native current ownership must fail closed if a reserved
+                // compatibility marker appears later in its private leaf.
+                return match rustix::fs::openat(
+                    current,
+                    HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                ) {
+                    Err(rustix::io::Errno::NOENT) => Ok(()),
+                    Ok(_) | Err(_) => Err(state_indeterminate(operation)),
+                };
+            };
+            Self::marker_directory_identity(
+                current,
+                HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                Some((handoff.marker_device, handoff.marker_inode)),
+                operation,
+            )?;
+            match rustix::fs::openat(
+                control_root,
+                handoff.legacy_control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Err(rustix::io::Errno::NOENT) => Ok(()),
+                Ok(_) | Err(_) => Err(state_indeterminate(operation)),
+            }
+        }
+
         fn acquire_operation_control_lock(
             ownership: &ReconcilerOwnership,
             operation: &'static str,
@@ -14600,11 +15972,7 @@ mod aya_runtime {
             )
             .map(File::from)
             .map_err(|error| GtpuError::io(operation, error.into()))?;
-            Self::verify_control_root(
-                &control_root,
-                Some((ownership.control_root_device, ownership.control_root_inode)),
-                operation,
-            )?;
+            Self::verify_reconciler_control_root(ownership, &control_root, operation)?;
             let descriptor = rustix::fs::openat(
                 &control_root,
                 ownership.control_dir_name.as_str(),
@@ -14626,8 +15994,19 @@ mod aya_runtime {
                 Some((ownership.control_dir_device, ownership.control_dir_inode)),
                 operation,
             )?;
-            let lock_descriptor = rustix::fs::openat(
+            Self::verify_historical_25_root_handoff(
+                ownership,
                 &control_root,
+                &descriptor,
+                operation,
+            )?;
+            let lock_parent = if ownership.historical_25_handoff.is_some() {
+                &descriptor
+            } else {
+                &control_root
+            };
+            let lock_descriptor = rustix::fs::openat(
+                lock_parent,
                 ownership.operation_lock_name.as_str(),
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::DIRECTORY
@@ -14668,11 +16047,7 @@ mod aya_runtime {
             )
             .map(File::from)
             .map_err(|error| GtpuError::io(operation, error.into()))?;
-            Self::verify_control_root(
-                &current_control_root,
-                Some((ownership.control_root_device, ownership.control_root_inode)),
-                operation,
-            )?;
+            Self::verify_reconciler_control_root(ownership, &current_control_root, operation)?;
             let current_descriptor = rustix::fs::openat(
                 &current_control_root,
                 ownership.control_dir_name.as_str(),
@@ -14689,8 +16064,19 @@ mod aya_runtime {
                 Some((ownership.control_dir_device, ownership.control_dir_inode)),
                 operation,
             )?;
-            let current_lock_descriptor = rustix::fs::openat(
+            Self::verify_historical_25_root_handoff(
+                ownership,
                 &current_control_root,
+                &current_descriptor,
+                operation,
+            )?;
+            let current_lock_parent = if ownership.historical_25_handoff.is_some() {
+                &current_descriptor
+            } else {
+                &current_control_root
+            };
+            let current_lock_descriptor = rustix::fs::openat(
+                current_lock_parent,
                 ownership.operation_lock_name.as_str(),
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::DIRECTORY
@@ -14753,11 +16139,7 @@ mod aya_runtime {
             )
             .map(File::from)
             .map_err(|error| GtpuError::io(operation, error.into()))?;
-            Self::verify_control_root(
-                &control_root,
-                Some((ownership.control_root_device, ownership.control_root_inode)),
-                operation,
-            )?;
+            Self::verify_reconciler_control_root(ownership, &control_root, operation)?;
             let current = rustix::fs::openat(
                 &control_root,
                 ownership.control_dir_name.as_str(),
@@ -14784,8 +16166,14 @@ mod aya_runtime {
                 Some((ownership.control_dir_device, ownership.control_dir_inode)),
                 operation,
             )?;
+            Self::verify_historical_25_root_handoff(ownership, &control_root, &current, operation)?;
+            let current_lock_parent = if ownership.historical_25_handoff.is_some() {
+                &current
+            } else {
+                &control_root
+            };
             let current_lock = rustix::fs::openat(
-                &control_root,
+                current_lock_parent,
                 ownership.operation_lock_name.as_str(),
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::DIRECTORY
@@ -15044,6 +16432,7 @@ mod aya_runtime {
             const LEGACY_TERMINAL: &str = "SELECTOR_TERMINAL_FENCE_V1_";
             let mut authority = Vec::new();
             let mut decommissioned = Vec::new();
+            let mut compatibility = 0_usize;
             let directory = rustix::fs::Dir::read_from(control)
                 .map_err(|error| GtpuError::io("ebpf_selector_marker_enumerate", error.into()))?;
             for entry in directory {
@@ -15056,6 +16445,19 @@ mod aya_runtime {
                 }
                 let name = std::str::from_utf8(bytes)
                     .map_err(|_| state_indeterminate("ebpf_selector_marker_name"))?;
+                if name == HISTORICAL_25_ROOT_HANDOFF_MARKER {
+                    // This fixed, opaque maintenance receipt is interpreted
+                    // only after `verify_historical_25_root_handoff` binds it
+                    // to the ownership object.  It is not a selector marker.
+                    Self::marker_directory_identity(
+                        control,
+                        name,
+                        None,
+                        "ebpf_selector_historical_handoff_enumerate",
+                    )?;
+                    compatibility += 1;
+                    continue;
+                }
                 if let Some(hex) = name.strip_prefix(AUTHORITY) {
                     if hex.len() != 64
                         || !hex
@@ -15109,7 +16511,7 @@ mod aya_runtime {
                 .map_err(|error| GtpuError::io("ebpf_selector_marker_enumerate", error))?;
             control_marker_link_count_is_exact(
                 metadata.nlink(),
-                authority.len() + decommissioned.len(),
+                authority.len() + decommissioned.len() + compatibility,
             )
             .then_some(())
             .ok_or_else(|| state_indeterminate("ebpf_selector_marker_links"))?;
@@ -16463,6 +17865,41 @@ mod aya_runtime {
             Self::object_program_tags(object)
         }
 
+        fn pre_selector_stamp_traffic_observation_v1_artifact_tags_from(
+            bytes: &[u8],
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            if Sha256::digest(bytes)[..]
+                != PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DATAPATH_SHA256
+            {
+                return Err(state_indeterminate("ebpf_historical_25_object_provenance"));
+            }
+            let object = AyaObject::parse(bytes).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_historical_25_object_parse",
+                    invalid_data("historical 25-pin bpf object parse failed"),
+                )
+            })?;
+            if object.maps.len() != PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS.len() {
+                return Err(state_indeterminate("ebpf_historical_25_object_identity"));
+            }
+            for spec in PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS {
+                let map = object
+                    .maps
+                    .get(spec.name)
+                    .ok_or_else(|| state_indeterminate("ebpf_historical_25_object_identity"))?;
+                if map.map_type() != spec.map_type
+                    || map.key_size() != spec.key_size
+                    || map.value_size() != spec.value_size
+                    || map.max_entries() != spec.max_entries
+                    || map.map_flags() != 0
+                    || map.pinning() != PinningType::ByName
+                {
+                    return Err(state_indeterminate("ebpf_historical_25_object_identity"));
+                }
+            }
+            Self::object_program_tags(object)
+        }
+
         fn current_artifact_tags_from(
             bytes: &[u8],
         ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
@@ -16650,6 +18087,11 @@ mod aya_runtime {
             legacy_v2_artifact::program_tags()
         }
 
+        fn pre_selector_stamp_traffic_observation_v1_artifact_tags(
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            pre_selector_stamp_traffic_observation_v1_artifact::program_tags()
+        }
+
         /// Offline tag candidates for every datapath generation this build can
         /// name, derived at most once per process.
         ///
@@ -16718,6 +18160,674 @@ mod aya_runtime {
                 ids[index] = info.id();
             }
             Ok(ids)
+        }
+
+        fn historical_25_named_map_ids(
+            pin_dir: &Path,
+        ) -> Result<
+            [u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
+            LegacyV2IdentityError,
+        > {
+            let entries = Self::current_directory_entries(pin_dir)
+                .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+            if entries.len() != PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()
+                || PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
+                    .iter()
+                    .any(|name| !entries.contains(*name))
+            {
+                return Err(LegacyV2IdentityError::Mismatch);
+            }
+            let mut ids = [0_u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()];
+            for (index, spec) in PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS
+                .iter()
+                .enumerate()
+            {
+                let path = pin_dir.join(spec.name);
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Err(LegacyV2IdentityError::Mismatch);
+                }
+                let info =
+                    MapInfo::from_pin(path).map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                let map_type = info
+                    .map_type()
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                    as u32;
+                if map_type != spec.map_type
+                    || info.name() != kernel_program_name(spec.name)
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.max_entries() != spec.max_entries
+                    || info.map_flags() != 0
+                {
+                    return Err(LegacyV2IdentityError::Mismatch);
+                }
+                ids[index] = info.id();
+            }
+            let mut seen = HashSet::with_capacity(ids.len());
+            if !ids
+                .iter()
+                .all(|map_id| *map_id != 0 && seen.insert(*map_id))
+            {
+                // Two manifest names resolving to one kernel map is not the
+                // shipped pin graph.  Do not let a duplicate escape through
+                // separate uplink/downlink program-map checks.
+                return Err(LegacyV2IdentityError::Mismatch);
+            }
+            Ok(ids)
+        }
+
+        fn historical_25_map_ids_for_names(
+            map_ids: &[u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
+            names: &[&str],
+        ) -> Result<Vec<u32>, LegacyV2IdentityError> {
+            let mut ids = names
+                .iter()
+                .map(|name| {
+                    PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
+                        .iter()
+                        .position(|candidate| candidate == name)
+                        .map(|index| map_ids[index])
+                        .ok_or(LegacyV2IdentityError::Indeterminate)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ids.sort_unstable();
+            (ids.windows(2).all(|pair| pair[0] != pair[1]))
+                .then_some(ids)
+                .ok_or(LegacyV2IdentityError::Mismatch)
+        }
+
+        fn historical_25_datapath_identity(
+            pin_dir: &Path,
+        ) -> Result<Historical25DatapathIdentity, LegacyV2IdentityError> {
+            let map_ids = Self::historical_25_named_map_ids(pin_dir)?;
+            let (uplink_tags, downlink_tags) =
+                Self::pre_selector_stamp_traffic_observation_v1_artifact_tags()
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+            Ok(Historical25DatapathIdentity {
+                uplink: LegacyV2ProgramIdentity {
+                    tags: uplink_tags,
+                    map_ids: Self::historical_25_map_ids_for_names(
+                        &map_ids,
+                        &PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_UPLINK_MAP_NAMES,
+                    )?,
+                },
+                downlink: LegacyV2ProgramIdentity {
+                    tags: downlink_tags,
+                    map_ids: Self::historical_25_map_ids_for_names(
+                        &map_ids,
+                        &PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DOWNLINK_MAP_NAMES,
+                    )?,
+                },
+                map_ids,
+            })
+        }
+
+        fn historical_25_recorded_pin_count(
+            pin_dir: &Path,
+            record: Historical25RecoveryRecord,
+        ) -> Result<usize, LegacyV2IdentityError> {
+            let entries = Self::current_directory_entries(pin_dir)
+                .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+            if entries.iter().any(|entry| {
+                !PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.contains(&entry.as_str())
+            }) {
+                return Err(LegacyV2IdentityError::Mismatch);
+            }
+            let mut present = 0;
+            for (index, spec) in PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS
+                .iter()
+                .enumerate()
+            {
+                let path = pin_dir.join(spec.name);
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(LegacyV2IdentityError::Indeterminate),
+                };
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Err(LegacyV2IdentityError::Mismatch);
+                }
+                let info =
+                    MapInfo::from_pin(&path).map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                let map_type = info
+                    .map_type()
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                    as u32;
+                if info.id() != record.map_ids[index]
+                    || map_type != spec.map_type
+                    || info.name() != kernel_program_name(spec.name)
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.max_entries() != spec.max_entries
+                    || info.map_flags() != 0
+                {
+                    return Err(LegacyV2IdentityError::Mismatch);
+                }
+                present += 1;
+            }
+            Ok(present)
+        }
+
+        fn historical_25_legacy_proof_path(legacy: &Historical25LegacyOwnership) -> PathBuf {
+            legacy
+                .bpffs_root_path
+                .join(RECONCILER_CONTROL_DIRECTORY)
+                .join(&legacy.control_dir_name)
+                .join(HISTORICAL_25_RECOVERY_PROOF_MAP)
+        }
+
+        /// Re-open the old authority hierarchy from the configured bpffs root
+        /// before every proof read or destructive operation.  A held flock on
+        /// an unlinked/replaced directory is not permission to follow a new
+        /// path, so the descriptor identity is part of the proof.
+        fn historical_25_open_legacy_control(
+            legacy: &Historical25LegacyOwnership,
+            operation: &'static str,
+        ) -> Result<File, GtpuError> {
+            let (root, root_metadata) =
+                Self::open_bpffs_namespace_root(&legacy.bpffs_root_path, false, operation)?;
+            if root_metadata.dev() != legacy.bpffs_root_device
+                || root_metadata.ino() != legacy.bpffs_root_inode
+            {
+                return Err(state_indeterminate(operation));
+            }
+            let control_root = rustix::fs::openat(
+                &root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::historical_25_verify_control_root(
+                &control_root,
+                Some((legacy.control_root_device, legacy.control_root_inode)),
+                operation,
+            )?;
+            let legacy_dir = rustix::fs::openat(
+                &control_root,
+                legacy.control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::historical_25_verify_legacy_directory(
+                &legacy_dir,
+                Some((legacy.control_dir_device, legacy.control_dir_inode)),
+                operation,
+            )?;
+            Ok(legacy_dir)
+        }
+
+        fn historical_25_open_graph(
+            legacy: &Historical25LegacyOwnership,
+            pin_dir: &Path,
+            expected_identity: (u64, u64),
+            operation: &'static str,
+        ) -> Result<(File, File), GtpuError> {
+            if pin_dir.parent() != Some(legacy.bpffs_root_path.as_path()) {
+                return Err(state_indeterminate(operation));
+            }
+            let leaf = pin_dir
+                .file_name()
+                .ok_or_else(|| state_indeterminate(operation))?;
+            if leaf.is_empty() || leaf.as_bytes().contains(&b'/') {
+                return Err(state_indeterminate(operation));
+            }
+            let (root, root_metadata) =
+                Self::open_bpffs_namespace_root(&legacy.bpffs_root_path, false, operation)?;
+            if root_metadata.dev() != legacy.bpffs_root_device
+                || root_metadata.ino() != legacy.bpffs_root_inode
+            {
+                return Err(state_indeterminate(operation));
+            }
+            let graph = rustix::fs::openat(
+                &root,
+                leaf,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::verify_bpffs_descriptor(&graph, operation)?;
+            let metadata = graph
+                .metadata()
+                .map_err(|error| GtpuError::io(operation, error))?;
+            if !metadata.file_type().is_dir()
+                || metadata.dev() != expected_identity.0
+                || metadata.ino() != expected_identity.1
+            {
+                return Err(state_indeterminate(operation));
+            }
+            Ok((root, graph))
+        }
+
+        fn historical_25_unlink_recorded_pin(
+            legacy: &Historical25LegacyOwnership,
+            current: &Historical25CurrentOwnership,
+            pin_dir: &Path,
+            record: Historical25RecoveryRecord,
+            index: usize,
+        ) -> Result<bool, GtpuError> {
+            Self::historical_25_revalidate_current_ownership(
+                legacy,
+                current,
+                "ebpf_historical_25_pin_unpin",
+            )?;
+            let spec = PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS
+                .get(index)
+                .ok_or_else(|| state_indeterminate("ebpf_historical_25_pin_unpin"))?;
+            let (_, graph) = Self::historical_25_open_graph(
+                legacy,
+                pin_dir,
+                (record.graph_device, record.graph_inode),
+                "ebpf_historical_25_pin_unpin",
+            )?;
+            let leaf_identity =
+                Self::pin_leaf_identity(&graph, spec.name, "ebpf_historical_25_pin_unpin")?;
+            let info = MapInfo::from_pin(pin_dir.join(spec.name))
+                .map_err(|_| state_indeterminate("ebpf_historical_25_pin_unpin"))?;
+            let map_type = info
+                .map_type()
+                .map_err(|_| state_indeterminate("ebpf_historical_25_pin_unpin"))?
+                as u32;
+            if info.id() != record.map_ids[index]
+                || map_type != spec.map_type
+                || info.name() != kernel_program_name(spec.name)
+                || info.key_size() != spec.key_size
+                || info.value_size() != spec.value_size
+                || info.max_entries() != spec.max_entries
+                || info.map_flags() != 0
+                || Self::pin_leaf_identity(&graph, spec.name, "ebpf_historical_25_pin_unpin")?
+                    != leaf_identity
+            {
+                return Err(state_indeterminate("ebpf_historical_25_pin_unpin"));
+            }
+            match rustix::fs::unlinkat(&graph, spec.name, rustix::fs::AtFlags::empty()) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(error) => {
+                    return Err(GtpuError::io("ebpf_historical_25_pin_unpin", error.into()))
+                }
+            }
+            let _ = Self::historical_25_open_graph(
+                legacy,
+                pin_dir,
+                (record.graph_device, record.graph_inode),
+                "ebpf_historical_25_pin_unpin_recheck",
+            )?;
+            Ok(true)
+        }
+
+        fn historical_25_remove_graph_dir(
+            legacy: &Historical25LegacyOwnership,
+            current: &Historical25CurrentOwnership,
+            pin_dir: &Path,
+            record: Historical25RecoveryRecord,
+        ) -> Result<(), GtpuError> {
+            Self::historical_25_revalidate_current_ownership(
+                legacy,
+                current,
+                "ebpf_historical_25_graph_remove",
+            )?;
+            let (root, graph) = Self::historical_25_open_graph(
+                legacy,
+                pin_dir,
+                (record.graph_device, record.graph_inode),
+                "ebpf_historical_25_graph_remove",
+            )?;
+            let leaf = pin_dir
+                .file_name()
+                .ok_or_else(|| state_indeterminate("ebpf_historical_25_graph_remove"))?;
+            // Keep `graph` open through rmdir: it captures the exact directory
+            // whose empty inventory was just proven, while `root` is the
+            // re-opened authoritative parent used for the removal itself.
+            let metadata = graph
+                .metadata()
+                .map_err(|error| GtpuError::io("ebpf_historical_25_graph_remove", error))?;
+            if metadata.dev() != record.graph_device || metadata.ino() != record.graph_inode {
+                return Err(state_indeterminate("ebpf_historical_25_graph_remove"));
+            }
+            rustix::fs::unlinkat(&root, leaf, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(|error| GtpuError::io("ebpf_historical_25_graph_remove", error.into()))
+        }
+
+        fn historical_25_remove_proof(
+            legacy: &Historical25LegacyOwnership,
+            current: &Historical25CurrentOwnership,
+            proof: Historical25RecoveryProof,
+        ) -> Result<(), GtpuError> {
+            Self::historical_25_revalidate_current_ownership(
+                legacy,
+                current,
+                "ebpf_historical_25_proof_unpin",
+            )?;
+            let legacy_dir =
+                Self::historical_25_open_legacy_control(legacy, "ebpf_historical_25_proof_unpin")?;
+            let path = Self::historical_25_legacy_proof_path(legacy);
+            match MapInfo::from_pin(&path) {
+                Ok(info) if info.id() == proof.map_id => {}
+                Ok(_) | Err(_) => {
+                    return Err(state_indeterminate("ebpf_historical_25_proof_unpin"))
+                }
+            }
+            let identity = Self::pin_leaf_identity(
+                &legacy_dir,
+                HISTORICAL_25_RECOVERY_PROOF_MAP,
+                "ebpf_historical_25_proof_unpin",
+            )?;
+            if Self::pin_leaf_identity(
+                &legacy_dir,
+                HISTORICAL_25_RECOVERY_PROOF_MAP,
+                "ebpf_historical_25_proof_unpin",
+            )? != identity
+            {
+                return Err(state_indeterminate("ebpf_historical_25_proof_unpin"));
+            }
+            rustix::fs::unlinkat(
+                &legacy_dir,
+                HISTORICAL_25_RECOVERY_PROOF_MAP,
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(|error| GtpuError::io("ebpf_historical_25_proof_unpin", error.into()))
+        }
+
+        /// Publish the namespace-local compatibility receipt.  The shared
+        /// predecessor root is intentionally not chmodded or otherwise
+        /// rewritten: it may contain independent CNF/vendor namespaces and
+        /// its original mode is umask-derived rather than an SDK ABI.
+        fn historical_25_publish_root_handoff(
+            legacy: &Historical25LegacyOwnership,
+            current: &Historical25CurrentOwnership,
+        ) -> Result<Option<(u64, u64)>, GtpuError> {
+            const OPERATION: &str = "ebpf_historical_25_control_root_handoff";
+            let (control_root, current_dir) =
+                Self::historical_25_revalidate_current_ownership(legacy, current, OPERATION)?;
+            let root_metadata = control_root
+                .metadata()
+                .map_err(|error| GtpuError::io(OPERATION, error))?;
+            // A native current root needs no compatibility receipt.  Leaving
+            // the current leaf unchanged preserves the normal root-sibling
+            // operation-lock layout after legacy retirement.
+            if selector_control_directory_mode_is_exact(root_metadata.mode()) {
+                return Ok(None);
+            }
+            let legacy_dir = Self::historical_25_open_legacy_control(legacy, OPERATION)?;
+            if !Self::historical_25_legacy_entries(&legacy_dir, OPERATION)?.is_empty() {
+                return Err(state_indeterminate(OPERATION));
+            }
+            let entries = Self::historical_25_control_root_entries(&current_dir, OPERATION)?;
+            match entries.as_slice() {
+                [] => match rustix::fs::mkdirat(
+                    &current_dir,
+                    HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                    rustix::fs::Mode::from_bits_truncate(0o700),
+                ) {
+                    Ok(()) => {}
+                    Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+                },
+                [name] if name == HISTORICAL_25_ROOT_HANDOFF_MARKER => {}
+                _ => return Err(state_indeterminate(OPERATION)),
+            }
+            let marker = rustix::fs::openat(
+                &current_dir,
+                HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+            let marker_metadata = Self::verify_empty_marker_directory(&marker, None, OPERATION)?;
+            Self::sync_control_directory(&marker, OPERATION)?;
+            Self::sync_control_directory(&current_dir, OPERATION)?;
+            let (current_root, rechecked_current) =
+                Self::historical_25_revalidate_current_ownership(legacy, current, OPERATION)?;
+            let rechecked_legacy = Self::historical_25_open_legacy_control(legacy, OPERATION)?;
+            if !Self::historical_25_legacy_entries(&rechecked_legacy, OPERATION)?.is_empty()
+                || Self::historical_25_control_root_entries(&rechecked_current, OPERATION)?
+                    != [HISTORICAL_25_ROOT_HANDOFF_MARKER]
+            {
+                return Err(state_indeterminate(OPERATION));
+            }
+            Self::marker_directory_identity(
+                &rechecked_current,
+                HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                Some((marker_metadata.dev(), marker_metadata.ino())),
+                OPERATION,
+            )?;
+            // Keep the current root descriptor live through this final path
+            // proof; retirement separately re-descends from it before unlink.
+            Self::historical_25_verify_control_root(
+                &current_root,
+                Some((legacy.control_root_device, legacy.control_root_inode)),
+                OPERATION,
+            )?;
+            Ok(Some((marker_metadata.dev(), marker_metadata.ino())))
+        }
+
+        fn historical_25_retire_legacy_leaf(
+            legacy: &Historical25LegacyOwnership,
+            current: &Historical25CurrentOwnership,
+            handoff_marker_identity: Option<(u64, u64)>,
+        ) -> Result<(), GtpuError> {
+            let (root, root_metadata) = Self::open_bpffs_namespace_root(
+                &legacy.bpffs_root_path,
+                false,
+                "ebpf_historical_25_legacy_retire",
+            )?;
+            if root_metadata.dev() != legacy.bpffs_root_device
+                || root_metadata.ino() != legacy.bpffs_root_inode
+            {
+                return Err(state_indeterminate("ebpf_historical_25_legacy_retire"));
+            }
+            let control_root = rustix::fs::openat(
+                &root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_legacy_retire", error.into()))?;
+            Self::historical_25_verify_control_root(
+                &control_root,
+                Some((legacy.control_root_device, legacy.control_root_inode)),
+                "ebpf_historical_25_legacy_retire",
+            )?;
+            Self::historical_25_verify_legacy_directory(
+                &legacy._lease,
+                Some((legacy.control_dir_device, legacy.control_dir_inode)),
+                "ebpf_historical_25_legacy_retire",
+            )?;
+            let legacy_dir = rustix::fs::openat(
+                &control_root,
+                legacy.control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_legacy_retire", error.into()))?;
+            Self::historical_25_verify_legacy_directory(
+                &legacy_dir,
+                Some((legacy.control_dir_device, legacy.control_dir_inode)),
+                "ebpf_historical_25_legacy_retire",
+            )?;
+            if !Self::historical_25_legacy_entries(&legacy_dir, "ebpf_historical_25_legacy_retire")?
+                .is_empty()
+            {
+                return Err(state_indeterminate("ebpf_historical_25_legacy_retire"));
+            }
+            let current_dir = rustix::fs::openat(
+                &control_root,
+                current.control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_historical_25_legacy_retire", error.into()))?;
+            Self::verify_control_directory(
+                &current_dir,
+                Some((current.control_dir_device, current.control_dir_inode)),
+                "ebpf_historical_25_legacy_retire",
+            )?;
+            Self::verify_control_directory(
+                &current._lease,
+                Some((current.control_dir_device, current.control_dir_inode)),
+                "ebpf_historical_25_legacy_retire",
+            )?;
+            match handoff_marker_identity {
+                Some(identity) => {
+                    Self::marker_directory_identity(
+                        &current_dir,
+                        HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                        Some(identity),
+                        "ebpf_historical_25_legacy_retire",
+                    )?;
+                }
+                None if selector_control_directory_mode_is_exact(
+                    control_root
+                        .metadata()
+                        .map_err(|error| GtpuError::io("ebpf_historical_25_legacy_retire", error))?
+                        .mode(),
+                ) => {}
+                None => return Err(state_indeterminate("ebpf_historical_25_legacy_retire")),
+            }
+            rustix::fs::unlinkat(
+                &control_root,
+                legacy.control_dir_name.as_str(),
+                rustix::fs::AtFlags::REMOVEDIR,
+            )
+            .map_err(|error| GtpuError::io("ebpf_historical_25_legacy_retire", error.into()))
+        }
+
+        fn historical_25_read_proof(
+            legacy: &Historical25LegacyOwnership,
+        ) -> Result<Option<Historical25RecoveryProof>, GtpuError> {
+            let _legacy_dir =
+                Self::historical_25_open_legacy_control(legacy, "ebpf_historical_25_proof_read")?;
+            let path = Self::historical_25_legacy_proof_path(legacy);
+            if !legacy_v2_path_is_present(&path, "ebpf_historical_25_proof_read")? {
+                return Ok(None);
+            }
+            let data = MapData::from_pin(&path)
+                .map_err(|_| state_indeterminate("ebpf_historical_25_proof_read"))?;
+            let info = data
+                .info()
+                .map_err(|_| state_indeterminate("ebpf_historical_25_proof_read"))?;
+            let map_type = info
+                .map_type()
+                .map_err(|_| state_indeterminate("ebpf_historical_25_proof_read"))?
+                as u32;
+            if map_type != bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+                || info.key_size() != 4
+                || info.value_size() != HISTORICAL_25_RECOVERY_PROOF_LEN as u32
+                || info.max_entries() != 1
+                || info.map_flags() != 0
+            {
+                return Err(state_indeterminate("ebpf_historical_25_proof_read"));
+            }
+            let map_id = info.id();
+            let proof = Array::<_, [u8; HISTORICAL_25_RECOVERY_PROOF_LEN]>::try_from(
+                Map::from_map_data(data)
+                    .map_err(|_| state_indeterminate("ebpf_historical_25_proof_read"))?,
+            )
+            .map_err(|_| state_indeterminate("ebpf_historical_25_proof_read"))?;
+            let record = Historical25RecoveryRecord::decode(
+                &proof
+                    .get(&0, 0)
+                    .map_err(|_| state_indeterminate("ebpf_historical_25_proof_read"))?,
+            )
+            .ok_or_else(|| state_indeterminate("ebpf_historical_25_proof_read"))?;
+            if record.proof_map_id != map_id
+                || record.legacy_control_device != legacy.control_dir_device
+                || record.legacy_control_inode != legacy.control_dir_inode
+            {
+                return Err(state_indeterminate("ebpf_historical_25_proof_read"));
+            }
+            let _ = Self::historical_25_open_legacy_control(
+                legacy,
+                "ebpf_historical_25_proof_recheck",
+            )?;
+            Ok(Some(Historical25RecoveryProof { record, map_id }))
+        }
+
+        fn commit_historical_25_proof(
+            legacy: &Historical25LegacyOwnership,
+            current: &Historical25CurrentOwnership,
+            record: Historical25RecoveryRecord,
+        ) -> Result<Historical25RecoveryProof, Historical25ProofCommitError> {
+            Self::historical_25_revalidate_current_ownership(
+                legacy,
+                current,
+                "ebpf_historical_25_proof_publish",
+            )
+            .map_err(|_| Historical25ProofCommitError::BeforePublication)?;
+            match Self::historical_25_read_proof(legacy) {
+                Ok(Some(existing)) if existing.record == record => return Ok(existing),
+                Ok(Some(_)) | Err(_) => {
+                    return Err(Historical25ProofCommitError::PublicationIndeterminate)
+                }
+                Ok(None) => {}
+            }
+            let mut map = Array::<MapData, [u8; HISTORICAL_25_RECOVERY_PROOF_LEN]>::create(1, 0)
+                .map_err(|_| Historical25ProofCommitError::BeforePublication)?;
+            let info = map
+                .map()
+                .info()
+                .map_err(|_| Historical25ProofCommitError::BeforePublication)?;
+            let record = record
+                .bind_to_proof_map(info.id())
+                .ok_or(Historical25ProofCommitError::BeforePublication)?;
+            map.set(0, record.encode(), 0)
+                .map_err(|_| Historical25ProofCommitError::BeforePublication)?;
+            // `pin` accepts a path, so renew the descriptor proof immediately
+            // before publication.  A lock on an unlinked old leaf must never
+            // authorize publishing into a replacement authority namespace.
+            Self::historical_25_revalidate_current_ownership(
+                legacy,
+                current,
+                "ebpf_historical_25_proof_publish",
+            )
+            .map_err(|_| Historical25ProofCommitError::BeforePublication)?;
+            if map
+                .pin(Self::historical_25_legacy_proof_path(legacy))
+                .is_err()
+            {
+                return match Self::historical_25_read_proof(legacy) {
+                    Ok(Some(existing)) if existing.record == record => Ok(existing),
+                    Ok(None) => Err(Historical25ProofCommitError::BeforePublication),
+                    Ok(Some(_)) | Err(_) => {
+                        Err(Historical25ProofCommitError::PublicationIndeterminate)
+                    }
+                };
+            }
+            match Self::historical_25_read_proof(legacy) {
+                Ok(Some(existing)) if existing.record == record => Ok(existing),
+                Ok(_) | Err(_) => Err(Historical25ProofCommitError::PublicationIndeterminate),
+            }
         }
 
         fn current_directory_entries(pin_dir: &Path) -> Result<HashSet<String>, GtpuError> {
@@ -17196,6 +19306,142 @@ mod aya_runtime {
                 validate_legacy_v2_config_identity(local_ip)?;
             }
             Ok(!forwarding_state_present)
+        }
+
+        /// Verify the frozen graph's mutable forwarding, session and classifier
+        /// maps are actually empty. The caller's drain proof is necessary but
+        /// not sufficient: a retained entry is contradictory kernel evidence
+        /// and is never deleted by this operation.
+        fn historical_25_maps_are_drained(pin_dir: &Path) -> Result<bool, LegacyV2IdentityError> {
+            let open = |name: &str| {
+                MapData::from_pin(pin_dir.join(name))
+                    .and_then(Map::from_map_data)
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)
+            };
+            let far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(open(
+                MAP_UPLINK_FAR,
+            )?)
+            .map_err(|_| LegacyV2IdentityError::Mismatch)?;
+            let mut marker_seen = false;
+            for entry in far.iter() {
+                let (key, value) = entry.map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                if key == UPLINK_DSCP_SCHEMA_MARKER_KEY
+                    && value == UPLINK_PMTU_SCHEMA_MARKER_VALUE
+                    && !marker_seen
+                {
+                    marker_seen = true;
+                } else {
+                    return Ok(false);
+                }
+            }
+            if !marker_seen {
+                return Err(LegacyV2IdentityError::Mismatch);
+            }
+            macro_rules! require_empty_hash {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = BpfHashMap::<MapData, $key, $value>::try_from(open($name)?)
+                        .map_err(|_| LegacyV2IdentityError::Mismatch)?;
+                    if map
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                        .is_some()
+                    {
+                        return Ok(false);
+                    }
+                }};
+            }
+            require_empty_hash!(
+                MAP_UPLINK_MARK_FAR,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_FAR_VALUE_LEN]
+            );
+            require_empty_hash!(MAP_UPLINK_DSCP, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]);
+            require_empty_hash!(
+                MAP_UPLINK_MARK_DSCP,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_DSCP_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_UPLINK_SOURCE_PORT,
+                [u8; 4],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_UPLINK_MARK_SOURCE_PORT,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN]
+            );
+            require_empty_hash!(MAP_DOWNLINK_PDR, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]);
+            require_empty_hash!(
+                MAP_DOWNLINK_MARK_PDR,
+                [u8; 4],
+                [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_DOWNLINK_ENDPOINT_BINDING,
+                [u8; 4],
+                [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_MARKED_BEARER_OWNER,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; MARKED_BEARER_OWNER_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_SESSION_GROUPS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_GROUP_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_SESSION_UPLINK_INDEX,
+                [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            );
+            require_empty_hash!(
+                MAP_SESSION_DOWNLINK_INDEX,
+                [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            );
+            require_empty_hash!(
+                MAP_SESSION_TRANSACTIONS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_TFT_CLASSIFIER_META,
+                [u8; TFT_CLASSIFIER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_META_VALUE_LEN]
+            );
+            require_empty_hash!(
+                MAP_TFT_CLASSIFIER_FILTERS,
+                [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN]
+            );
+
+            // Force typed opening of every remaining fixed-width map so an
+            // ABI-compatible but inaccessible map cannot hide behind an empty
+            // dynamic inventory. Array entries include durable schema/config
+            // values and counters, not sessions, and are intentionally not
+            // required to be all-zero.
+            let _ = Array::<MapData, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(open(MAP_UPLINK_PMTU)?)
+                .map_err(|_| LegacyV2IdentityError::Mismatch)?;
+            let _ = Array::<MapData, [u8; 4]>::try_from(open(MAP_CONFIG)?)
+                .map_err(|_| LegacyV2IdentityError::Mismatch)?;
+            let _ = Array::<MapData, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(open(
+                MAP_CONFIG_IPV6,
+            )?)
+            .map_err(|_| LegacyV2IdentityError::Mismatch)?;
+            let _ = Array::<MapData, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(open(
+                MAP_SESSION_SCHEMA,
+            )?)
+            .map_err(|_| LegacyV2IdentityError::Mismatch)?;
+            let _ = Array::<MapData, [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>::try_from(open(
+                MAP_TFT_CLASSIFIER_SCHEMA,
+            )?)
+            .map_err(|_| LegacyV2IdentityError::Mismatch)?;
+            Ok(true)
         }
 
         fn pin_abi_mismatch(reason: &'static str) -> GtpuError {
@@ -19506,6 +21752,231 @@ mod aya_runtime {
             } else {
                 CurrentProgramReference::Absent
             })
+        }
+
+        /// A frozen graph is eligible for its first destructive proof only
+        /// when *every* loaded program which references one of its pins is one
+        /// of the two exact artifact-authenticated hooks.  A map reference is
+        /// not ownership: an otherwise invisible foreign program can keep a
+        /// pinned map live, and deleting that map would cross the maintenance
+        /// boundary into another writer's state.
+        fn historical_25_referenced_programs_are_exact(
+            identity: &Historical25DatapathIdentity,
+            uplink_program: Historical25ProgramIdentity,
+            downlink_program: Historical25ProgramIdentity,
+        ) -> Result<bool, GtpuError> {
+            let graph_ids = identity.map_ids.iter().copied().collect::<HashSet<_>>();
+            let expected = |info: &ProgramInfo, program_id, tag, name: &str, map_ids: &[u32]| {
+                let mut observed = match info.map_ids() {
+                    Ok(Some(ids)) => ids,
+                    _ => return false,
+                };
+                let mut expected = map_ids.to_vec();
+                observed.sort_unstable();
+                expected.sort_unstable();
+                info.id() == program_id
+                    && info.name() == kernel_program_name(name)
+                    && info.tag() == tag
+                    && info.program_type() == bpf_prog_type::BPF_PROG_TYPE_SCHED_CLS
+                    && observed == expected
+            };
+            let mut uplink_seen = false;
+            let mut downlink_seen = false;
+            for result in loaded_programs() {
+                let info = result
+                    .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?;
+                let references_graph = info
+                    .map_ids()
+                    .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?
+                    .ok_or_else(|| state_indeterminate("ebpf_historical_25_program_scan"))?
+                    .iter()
+                    .any(|id| graph_ids.contains(id));
+                if !references_graph {
+                    continue;
+                }
+                if expected(
+                    &info,
+                    uplink_program.0,
+                    uplink_program.1,
+                    PROG_UPLINK,
+                    &identity.uplink.map_ids,
+                ) && !uplink_seen
+                {
+                    uplink_seen = true;
+                } else if expected(
+                    &info,
+                    downlink_program.0,
+                    downlink_program.1,
+                    PROG_DOWNLINK,
+                    &identity.downlink.map_ids,
+                ) && !downlink_seen
+                {
+                    downlink_seen = true;
+                } else {
+                    return Ok(false);
+                }
+            }
+            Ok(uplink_seen && downlink_seen)
+        }
+
+        fn historical_25_program_references_absent(
+            map_ids: &[u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
+        ) -> Result<bool, GtpuError> {
+            let graph_ids = map_ids.iter().copied().collect::<HashSet<_>>();
+            for result in loaded_programs() {
+                let info = result
+                    .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?;
+                let references_graph = info
+                    .map_ids()
+                    .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?
+                    .ok_or_else(|| state_indeterminate("ebpf_historical_25_program_scan"))?
+                    .iter()
+                    .any(|id| graph_ids.contains(id));
+                if references_graph {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+
+        fn historical_25_initial_hook_identity(
+            ifindex: u32,
+            tc_priority: u16,
+            identity: &Historical25DatapathIdentity,
+        ) -> Result<(Historical25ProgramIdentity, Historical25ProgramIdentity), GtpuError> {
+            let uplink = filter_observation(
+                ifindex,
+                TcAttachType::Egress,
+                tc_priority,
+                LegacyV2ProgramScan::AllowExact(PROG_UPLINK),
+            )?;
+            let downlink = filter_observation(
+                ifindex,
+                TcAttachType::Ingress,
+                tc_priority,
+                LegacyV2ProgramScan::AllowExact(PROG_DOWNLINK),
+            )?;
+            if uplink.unexpected_legacy_v2_program_seen
+                || downlink.unexpected_legacy_v2_program_seen
+            {
+                return Err(GtpuError::AlreadyExists);
+            }
+            let uplink_program = uplink
+                .owner
+                .as_ref()
+                .map(|owner| {
+                    legacy_v2_artifact_owner_tag(
+                        owner,
+                        PROG_UPLINK,
+                        identity.uplink.tags,
+                        &identity.uplink.map_ids,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .ok_or(GtpuError::AlreadyExists)?;
+            let downlink_program = downlink
+                .owner
+                .as_ref()
+                .map(|owner| {
+                    legacy_v2_artifact_owner_tag(
+                        owner,
+                        PROG_DOWNLINK,
+                        identity.downlink.tags,
+                        &identity.downlink.map_ids,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .ok_or(GtpuError::AlreadyExists)?;
+            let exact_placement =
+                |occupants: &[SdkProgramOccupant], program: SdkDatapathProgram, program_id: u32| {
+                    occupants.len() == 1
+                        && occupants[0].program == program
+                        && occupants[0].parent == program.expected_parent()
+                        && occupants[0].chain == 0
+                        && occupants[0].protocol == TC_PROTOCOL_ALL
+                        && occupants[0].priority == tc_priority
+                        && occupants[0].handle == u32::from(TC_HANDLE)
+                        && occupants[0].program_id == Some(program_id)
+                };
+            if !exact_placement(
+                &sdk_filter_occupants(ifindex, TcAttachType::Egress, tc_priority)?,
+                SdkDatapathProgram::Uplink,
+                uplink_program.0,
+            ) || !exact_placement(
+                &sdk_filter_occupants(ifindex, TcAttachType::Ingress, tc_priority)?,
+                SdkDatapathProgram::Downlink,
+                downlink_program.0,
+            ) {
+                return Err(GtpuError::AlreadyExists);
+            }
+            Ok((uplink_program, downlink_program))
+        }
+
+        fn historical_25_recorded_hook_states(
+            ifindex: u32,
+            tc_priority: u16,
+            record: Historical25RecoveryRecord,
+        ) -> Result<(LegacyV2HookState, LegacyV2HookState), GtpuError> {
+            let uplink = filter_observation(
+                ifindex,
+                TcAttachType::Egress,
+                tc_priority,
+                LegacyV2ProgramScan::AllowExact(PROG_UPLINK),
+            )?;
+            let downlink = filter_observation(
+                ifindex,
+                TcAttachType::Ingress,
+                tc_priority,
+                LegacyV2ProgramScan::AllowExact(PROG_DOWNLINK),
+            )?;
+            if uplink.unexpected_legacy_v2_program_seen
+                || downlink.unexpected_legacy_v2_program_seen
+            {
+                return Err(GtpuError::AlreadyExists);
+            }
+            let state = |owner: Option<FilterOwner>,
+                         name: &str,
+                         program_id: u32,
+                         program_tag: u64,
+                         map_names: &[&str]|
+             -> Result<LegacyV2HookState, GtpuError> {
+                let expected_map_ids =
+                    Self::historical_25_map_ids_for_names(&record.map_ids, map_names)
+                        .map_err(|_| state_indeterminate("ebpf_historical_25_hook_identity"))?;
+                match owner {
+                    None => Ok(LegacyV2HookState::Absent),
+                    Some(owner)
+                        if owner_matches_legacy_v2_record(
+                            &owner,
+                            name,
+                            program_id,
+                            program_tag,
+                            &expected_map_ids,
+                        )? =>
+                    {
+                        Ok(LegacyV2HookState::Exact)
+                    }
+                    Some(_) => Err(GtpuError::AlreadyExists),
+                }
+            };
+            Ok((
+                state(
+                    uplink.owner,
+                    PROG_UPLINK,
+                    record.uplink_program_id,
+                    record.uplink_program_tag,
+                    &PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_UPLINK_MAP_NAMES,
+                )?,
+                state(
+                    downlink.owner,
+                    PROG_DOWNLINK,
+                    record.downlink_program_id,
+                    record.downlink_program_tag,
+                    &PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DOWNLINK_MAP_NAMES,
+                )?,
+            ))
         }
 
         fn validate_replacement_identity(
@@ -24043,6 +26514,582 @@ mod aya_runtime {
             }
         }
 
+        fn recover_orphaned_historical_graph(
+            &self,
+            generation: HistoricalEbpfGraphGeneration,
+            replacement: Option<(&str, u32)>,
+            pin_dir: &Path,
+            tc_priority: u16,
+            allow_populated: bool,
+            managed_state: CurrentRecoveryManagedState,
+        ) -> Result<HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
+            let refused = |reason| Ok(HistoricalEbpfGraphRecoveryOutcome::Refused(reason));
+            let HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1 =
+                generation;
+            // The public backend always passes this only after it has checked
+            // the distinct drained-session proof.  Keep the runtime boundary
+            // fail-closed too: external `EbpfGtpuRuntime` callers cannot turn
+            // the typed maintenance primitive into a populated-graph delete.
+            if !allow_populated {
+                return refused(HistoricalEbpfGraphRecoveryRefusal::PopulatedState);
+            }
+            match managed_state {
+                CurrentRecoveryManagedState::Clear => {}
+                CurrentRecoveryManagedState::Conflict => {
+                    return refused(HistoricalEbpfGraphRecoveryRefusal::ManagedAttachment);
+                }
+                CurrentRecoveryManagedState::Indeterminate => {
+                    return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            }
+            let Some((interface, ifindex)) = replacement else {
+                // The frozen graph never carried an immutable interface
+                // identity in a map.  Its exact live hook pair is therefore a
+                // required part of first-proof authentication, not optional
+                // operator context.
+                return refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch);
+            };
+            match Self::validate_replacement_identity(interface, ifindex) {
+                Ok(()) => {}
+                Err(ReplacementHookObservationError::IdentityChanged) => {
+                    return refused(
+                        HistoricalEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                    );
+                }
+                Err(ReplacementHookObservationError::Indeterminate) => {
+                    return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            }
+
+            // Fixed authority order: predecessor leaf-hash flock, then the
+            // root-inode-bound current lease.  No graph pin, tc hook, or map
+            // is changed above this point.
+            let legacy = match Self::acquire_historical_25_legacy_ownership(pin_dir) {
+                Ok(Some(legacy)) => legacy,
+                Err(GtpuError::AlreadyExists) => {
+                    return refused(HistoricalEbpfGraphRecoveryRefusal::ActiveLegacyOwner);
+                }
+                Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
+                Ok(None) => {
+                    // Exact terminal absence is idempotent, but a graph whose
+                    // predecessor authority is gone is not attributable to
+                    // this maintenance primitive and remains untouched.
+                    return match fs::symlink_metadata(pin_dir) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            let hooks_empty =
+                                sdk_filter_occupants(ifindex, TcAttachType::Egress, tc_priority)
+                                    .and_then(|uplink| {
+                                        sdk_filter_occupants(
+                                            ifindex,
+                                            TcAttachType::Ingress,
+                                            tc_priority,
+                                        )
+                                        .map(|downlink| uplink.is_empty() && downlink.is_empty())
+                                    })
+                                    .and_then(|sdk_empty| {
+                                        Self::cleanup_only_hook_slots_empty(ifindex, tc_priority)
+                                            .map(|slots_empty| sdk_empty && slots_empty)
+                                    });
+                            match hooks_empty {
+                                Ok(true) => Ok(HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent),
+                                Ok(false) => {
+                                    refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch)
+                                }
+                                Err(_) => {
+                                    refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState)
+                                }
+                            }
+                        }
+                        Ok(_) => refused(
+                            HistoricalEbpfGraphRecoveryRefusal::HistoricalGenerationMismatch,
+                        ),
+                        Err(_) => refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
+                    };
+                }
+            };
+            let current = match Self::acquire_historical_25_current_ownership(pin_dir, &legacy) {
+                Ok(current) => current,
+                Err(GtpuError::AlreadyExists) => {
+                    return refused(HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner);
+                }
+                Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
+            };
+            if current.namespace_hash == [0; 32]
+                || current.control_dir_name.is_empty()
+                || current.control_dir_device == 0
+                || current.control_dir_inode == 0
+            {
+                return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+            }
+
+            let graph_metadata = match fs::symlink_metadata(pin_dir) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    metadata
+                }
+                Ok(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // This is a terminal/retry sub-step after exact pins were
+                    // removed.  It may still hold the durable proof if an
+                    // interruption landed between graph rmdir and proof
+                    // retirement, so consume only that exact proof; a graph
+                    // is never recreated to make the retry convenient.
+                    let hooks_empty =
+                        sdk_filter_occupants(ifindex, TcAttachType::Egress, tc_priority)
+                            .and_then(|uplink| {
+                                sdk_filter_occupants(ifindex, TcAttachType::Ingress, tc_priority)
+                                    .map(|downlink| uplink.is_empty() && downlink.is_empty())
+                            })
+                            .and_then(|sdk_empty| {
+                                Self::cleanup_only_hook_slots_empty(ifindex, tc_priority)
+                                    .map(|slots_empty| sdk_empty && slots_empty)
+                            });
+                    if !matches!(hooks_empty, Ok(true)) {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                    let terminal = match Self::historical_25_read_proof(&legacy) {
+                        Ok(Some(proof))
+                            if proof.record.namespace_hash == current.namespace_hash
+                                && proof.record.current_control_device
+                                    == current.control_dir_device
+                                && proof.record.current_control_inode
+                                    == current.control_dir_inode
+                                && proof.record.ifindex == ifindex
+                                && proof.record.tc_priority == tc_priority
+                                && matches!(
+                                    Self::historical_25_program_references_absent(
+                                        &proof.record.map_ids
+                                    ),
+                                    Ok(true)
+                                ) =>
+                        {
+                            if Self::historical_25_remove_proof(&legacy, &current, proof).is_err() {
+                                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                    HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted,
+                                ));
+                            }
+                            true
+                        }
+                        Ok(None) => true,
+                        Ok(Some(_)) | Err(_) => {
+                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                            ));
+                        }
+                    };
+                    debug_assert!(terminal);
+                    let handoff = match Self::historical_25_publish_root_handoff(&legacy, &current)
+                    {
+                        Ok(handoff) => handoff,
+                        Err(_) => {
+                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                            ))
+                        }
+                    };
+                    return match Self::historical_25_retire_legacy_leaf(&legacy, &current, handoff)
+                    {
+                        Ok(()) => Ok(HistoricalEbpfGraphRecoveryOutcome::Removed),
+                        Err(_) => Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        )),
+                    };
+                }
+                Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
+            };
+            if Self::historical_25_open_graph(
+                &legacy,
+                pin_dir,
+                (graph_metadata.dev(), graph_metadata.ino()),
+                "ebpf_historical_25_graph_identity",
+            )
+            .is_err()
+            {
+                return refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch);
+            }
+
+            let existing_proof = match Self::historical_25_read_proof(&legacy) {
+                Ok(proof) => proof,
+                Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
+            };
+            let proof = if let Some(proof) = existing_proof {
+                if proof.record.namespace_hash != current.namespace_hash
+                    || proof.record.current_control_device != current.control_dir_device
+                    || proof.record.current_control_inode != current.control_dir_inode
+                    || proof.record.ifindex != ifindex
+                    || proof.record.tc_priority != tc_priority
+                {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+                proof
+            } else {
+                let identity = match Self::historical_25_datapath_identity(pin_dir) {
+                    Ok(identity) => identity,
+                    Err(LegacyV2IdentityError::Mismatch) => {
+                        return refused(
+                            HistoricalEbpfGraphRecoveryRefusal::HistoricalGenerationMismatch,
+                        );
+                    }
+                    Err(LegacyV2IdentityError::Indeterminate) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                };
+                if Self::historical_25_open_graph(
+                    &legacy,
+                    pin_dir,
+                    (graph_metadata.dev(), graph_metadata.ino()),
+                    "ebpf_historical_25_graph_identity_recheck",
+                )
+                .is_err()
+                {
+                    return refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch);
+                }
+                let (uplink_program, downlink_program) =
+                    match Self::historical_25_initial_hook_identity(ifindex, tc_priority, &identity)
+                    {
+                        Ok(identity) => identity,
+                        Err(GtpuError::AlreadyExists) => {
+                            return refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch);
+                        }
+                        Err(_) => {
+                            return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                        }
+                    };
+                match Self::historical_25_referenced_programs_are_exact(
+                    &identity,
+                    uplink_program,
+                    downlink_program,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch);
+                    }
+                    Err(_) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                }
+                match Self::historical_25_maps_are_drained(pin_dir) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::PopulatedState);
+                    }
+                    Err(LegacyV2IdentityError::Mismatch) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch);
+                    }
+                    Err(LegacyV2IdentityError::Indeterminate) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                }
+                match Self::validate_replacement_identity(interface, ifindex) {
+                    Ok(()) => {}
+                    Err(ReplacementHookObservationError::IdentityChanged) => {
+                        return refused(
+                            HistoricalEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                        );
+                    }
+                    Err(ReplacementHookObservationError::Indeterminate) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                }
+                let record = Historical25RecoveryRecord::unbound(
+                    current.namespace_hash,
+                    (legacy.control_dir_device, legacy.control_dir_inode),
+                    (current.control_dir_device, current.control_dir_inode),
+                    (graph_metadata.dev(), graph_metadata.ino()),
+                    (ifindex, tc_priority),
+                    (uplink_program, downlink_program),
+                    identity.map_ids,
+                );
+                match Self::commit_historical_25_proof(&legacy, &current, record) {
+                    Ok(proof) => proof,
+                    Err(Historical25ProofCommitError::BeforePublication) => {
+                        return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                    Err(Historical25ProofCommitError::PublicationIndeterminate) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                }
+            };
+
+            // From this point a durable proof may have committed.  Every
+            // uncertainty is a retry-required partial outcome, never a new
+            // structural refusal that could tempt a caller to bypass the
+            // recovery fence.
+            if proof.record.namespace_hash != current.namespace_hash
+                || proof.record.current_control_device != current.control_dir_device
+                || proof.record.current_control_inode != current.control_dir_inode
+                || proof.record.ifindex != ifindex
+                || proof.record.tc_priority != tc_priority
+            {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            let recorded_hook_states =
+                || Self::historical_25_recorded_hook_states(ifindex, tc_priority, proof.record);
+            let (mut uplink, mut downlink) = match recorded_hook_states() {
+                Ok(states) => states,
+                Err(_) => {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            };
+            let present_pin_count = match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+                Ok(metadata)
+                    if metadata.file_type().is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.dev() == proof.record.graph_device
+                        && metadata.ino() == proof.record.graph_inode =>
+                {
+                    match Self::historical_25_recorded_pin_count(pin_dir, proof.record) {
+                        Ok(count) => count,
+                        Err(_) => {
+                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                            ));
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            };
+            if present_pin_count != 0
+                && present_pin_count != PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()
+                && (uplink != LegacyV2HookState::Absent || downlink != LegacyV2HookState::Absent)
+            {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            if present_pin_count == PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len() {
+                match Self::historical_25_maps_are_drained(pin_dir) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                    Err(_) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                }
+            }
+            let detach = |attach_type: TcAttachType| {
+                // The public replacement name was bound to `ifindex` before
+                // proof publication. It is never an authority to resolve a
+                // detach: a rename/name-reuse race between a last lookup and
+                // Aya's `attached(name, ..)` would target an unrelated,
+                // foreign interface. Re-prove the exact recorded slot and
+                // delete only by that immutable numeric ifindex.
+                Self::historical_25_revalidate_current_ownership(
+                    &legacy,
+                    &current,
+                    "ebpf_historical_25_tc_detach",
+                )?;
+                let states = recorded_hook_states()?;
+                let expected = match attach_type {
+                    TcAttachType::Egress => states.0,
+                    TcAttachType::Ingress => states.1,
+                    _ => return Err(state_indeterminate("ebpf_historical_25_tc_detach")),
+                };
+                if expected != LegacyV2HookState::Exact {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                tc_filter_detach_by_ifindex(ifindex, attach_type, tc_priority, TC_HANDLE)
+                    .map_err(|error| GtpuError::io("ebpf_historical_25_tc_detach", error))
+            };
+            if uplink == LegacyV2HookState::Exact {
+                let detached = detach(TcAttachType::Egress);
+                (uplink, downlink) = match recorded_hook_states() {
+                    Ok(states) => states,
+                    Err(_) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                };
+                if detached.is_err() && uplink == LegacyV2HookState::Exact {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::ProofCommitted,
+                    ));
+                }
+                if uplink != LegacyV2HookState::Absent {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            }
+            if downlink == LegacyV2HookState::Exact {
+                let detached = detach(TcAttachType::Ingress);
+                (uplink, downlink) = match recorded_hook_states() {
+                    Ok(states) => states,
+                    Err(_) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                };
+                if detached.is_err() && downlink == LegacyV2HookState::Exact {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::ProofCommitted,
+                    ));
+                }
+                if downlink != LegacyV2HookState::Absent {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            }
+            if uplink != LegacyV2HookState::Absent || downlink != LegacyV2HookState::Absent {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            if !matches!(
+                Self::historical_25_program_references_absent(&proof.record.map_ids),
+                Ok(true)
+            ) {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+
+            let mut removed_pin =
+                present_pin_count < PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len();
+            for (index, name) in PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
+                .iter()
+                .enumerate()
+            {
+                let _ = name; // the pin specification owns the exact name.
+                if !matches!(
+                    recorded_hook_states(),
+                    Ok((LegacyV2HookState::Absent, LegacyV2HookState::Absent))
+                ) || !matches!(
+                    Self::historical_25_program_references_absent(&proof.record.map_ids),
+                    Ok(true)
+                ) {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+                let path =
+                    pin_dir.join(PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_SPECS[index].name);
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Ok(metadata)
+                        if !metadata.file_type().is_symlink() && metadata.file_type().is_file() => {
+                    }
+                    Ok(_) | Err(_) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                }
+                if Self::historical_25_unlink_recorded_pin(
+                    &legacy,
+                    &current,
+                    pin_dir,
+                    proof.record,
+                    index,
+                )
+                .is_err()
+                {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        if removed_pin {
+                            HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted
+                        } else {
+                            HistoricalEbpfGraphRecoveryProgress::ProofCommitted
+                        },
+                    ));
+                }
+                removed_pin = true;
+            }
+            match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    match Self::historical_25_recorded_pin_count(pin_dir, proof.record) {
+                        Ok(0) => {}
+                        _ => {
+                            return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                                HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                            ));
+                        }
+                    }
+                    if Self::historical_25_remove_graph_dir(
+                        &legacy,
+                        &current,
+                        pin_dir,
+                        proof.record,
+                    )
+                    .is_err()
+                    {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted,
+                        ));
+                    }
+                }
+                Err(_) => {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            }
+            match Self::historical_25_read_proof(&legacy) {
+                Ok(Some(current_proof)) if current_proof == proof => {}
+                _ => {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            }
+            if Self::historical_25_remove_proof(&legacy, &current, proof).is_err() {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted,
+                ));
+            }
+            let handoff = match Self::historical_25_publish_root_handoff(&legacy, &current) {
+                Ok(handoff) => handoff,
+                Err(_) => {
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ))
+                }
+            };
+            if Self::historical_25_retire_legacy_leaf(&legacy, &current, handoff).is_err() {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted,
+                ));
+            }
+            Ok(HistoricalEbpfGraphRecoveryOutcome::Removed)
+        }
+
+        fn historical_cleanup_only_refusal(
+            &self,
+            pin_dir: &Path,
+        ) -> Result<Option<RetainedGraphCleanupRefusal>, GtpuError> {
+            // This preflight intentionally does not acquire either authority
+            // lease.  It only recognises the complete sealed historical ABI,
+            // keeping ordinary startup/recovery detection-only and
+            // non-destructive.
+            match Self::historical_25_named_map_ids(pin_dir) {
+                Ok(_) => Ok(Some(RetainedGraphCleanupRefusal::HistoricalGeneration)),
+                Err(LegacyV2IdentityError::Mismatch) => Ok(None),
+                Err(LegacyV2IdentityError::Indeterminate) => Ok(None),
+            }
+        }
+
         fn recover_orphaned_current_graph(
             &self,
             replacement: Option<(&str, u32)>,
@@ -27741,6 +30788,100 @@ mod aya_runtime {
         }
 
         #[test]
+        #[ignore = "requires CAP_BPF and writable bpffs"]
+        fn historical_25_tag_candidates_match_the_running_kernel() {
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let pin_dir = std::path::PathBuf::from(format!(
+                "/sys/fs/bpf/opc-gtpu-historical-25-tag-proof-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&pin_dir).expect("create historical tag proof pin directory");
+            let expected =
+                AyaGtpuRuntime::pre_selector_stamp_traffic_observation_v1_artifact_tags()
+                    .expect("derive sealed historical tag candidates");
+            let mut ebpf = EbpfLoader::new()
+                .default_map_pin_directory(&pin_dir)
+                .load(
+                    pre_selector_stamp_traffic_observation_v1_artifact::object_for_privileged_generation_harness(),
+                )
+                .expect("load historical 25 datapath object for live tag proof");
+            for (name, expected) in [(PROG_UPLINK, expected.0), (PROG_DOWNLINK, expected.1)] {
+                let program: &mut SchedClassifier = ebpf
+                    .program_mut(name)
+                    .expect("historical tc program")
+                    .try_into()
+                    .expect("historical program is a tc classifier");
+                program.load().expect("load historical tc program");
+                assert!(
+                    expected.contains(program.info().expect("read live program info").tag()),
+                    "running-kernel tag must be one exact sealed historical candidate"
+                );
+            }
+            drop(ebpf);
+            for name in PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES {
+                fs::remove_file(pin_dir.join(name)).expect("remove historical map pin");
+            }
+            fs::remove_dir(&pin_dir).expect("remove historical tag proof directory");
+            println!("OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN");
+        }
+
+        #[test]
+        fn historical_25_recovery_record_seals_authority_graph_and_program_identity() {
+            let map_ids = std::array::from_fn(|index| u32::try_from(index + 1).unwrap());
+            let unbound = Historical25RecoveryRecord::unbound(
+                [0x11; 32],
+                (2, 3),
+                (4, 5),
+                (6, 7),
+                (7, 50),
+                ((101, 0x0102_0304_0506_0708), (102, 0x1112_1314_1516_1718)),
+                map_ids,
+            );
+            assert_eq!(Historical25RecoveryRecord::decode(&unbound.encode()), None);
+            let record = unbound.bind_to_proof_map(301).unwrap();
+            let encoded = record.encode();
+            assert_eq!(Historical25RecoveryRecord::decode(&encoded), Some(record));
+            for offset in [
+                HISTORICAL_25_RECOVERY_NAMESPACE_OFFSET,
+                HISTORICAL_25_RECOVERY_LEGACY_DEVICE_OFFSET,
+                HISTORICAL_25_RECOVERY_CURRENT_CONTROL_INODE_OFFSET,
+                HISTORICAL_25_RECOVERY_GRAPH_INODE_OFFSET,
+                HISTORICAL_25_RECOVERY_UPLINK_PROGRAM_TAG_OFFSET,
+                HISTORICAL_25_RECOVERY_MAP_IDS_OFFSET,
+            ] {
+                let mut tampered = encoded;
+                tampered[offset] ^= 1;
+                assert_eq!(Historical25RecoveryRecord::decode(&tampered), None);
+            }
+            let mut duplicate_map = record;
+            duplicate_map.map_ids[1] = duplicate_map.map_ids[0];
+            assert_eq!(
+                Historical25RecoveryRecord::decode(&duplicate_map.encode()),
+                None
+            );
+            let mut proof_aliases_graph_map = record;
+            proof_aliases_graph_map.proof_map_id = proof_aliases_graph_map.map_ids[0];
+            assert_eq!(
+                Historical25RecoveryRecord::decode(&proof_aliases_graph_map.encode()),
+                None
+            );
+            let mut duplicate_program = record;
+            duplicate_program.downlink_program_id = duplicate_program.uplink_program_id;
+            assert_eq!(
+                Historical25RecoveryRecord::decode(&duplicate_program.encode()),
+                None
+            );
+            let mut zero_program_tag = record;
+            zero_program_tag.uplink_program_tag = 0;
+            assert_eq!(
+                Historical25RecoveryRecord::decode(&zero_program_tag.encode()),
+                None
+            );
+        }
+
+        #[test]
         fn legacy_v2_teardown_record_rejects_tamper_and_inconsistent_hook_identity() {
             let identity = LegacyV2DatapathIdentity {
                 uplink: LegacyV2ProgramIdentity {
@@ -29212,6 +32353,7 @@ mod tests {
         assert!(operation_lock_name.len() <= 255);
     }
     const LEGACY_V2_PIN_COUNT: usize = 9;
+    const HISTORICAL_25_PIN_COUNT: usize = 25;
     const CURRENT_PIN_COUNT: usize = 25;
 
     struct FakeRuntime {
@@ -29355,6 +32497,22 @@ mod tests {
         v2_pins_remaining: HashMap<PathBuf, usize>,
         current_graphs: HashMap<PathBuf, FakeCurrentGraph>,
         current_recovery_busy: HashSet<PathBuf>,
+        // A deliberately separate model for the maintenance-only frozen graph.
+        // It must not piggyback on current recovery: tests assert the public
+        // boundary never sends this state through ordinary startup recovery.
+        historical_25_graphs: HashMap<PathBuf, FakeHistorical25Graph>,
+        // The current runtime rejects a predecessor shared authority root
+        // until the authenticated maintenance hand-off publishes its exact
+        // current-leaf receipt. The fake retains just enough root state to
+        // prove that a shared umask-derived root remains unmodified.
+        historical_25_control_root_mode: FakeHistorical25ControlRootMode,
+        historical_25_root_handoff_published: bool,
+        // Model a replacement interface name being rebound after historical
+        // proof publication. Its foreign slots must remain untouched: cleanup
+        // is authorized by the recorded numeric ifindex, never the stale name.
+        historical_25_name_rebound_after_proof: bool,
+        foreign_name_rebound_hook_slots: u8,
+        current_authority_replaced_after_proof: bool,
         replacement_identity: FakeReplacementIdentity,
         empty_pin_dirs: HashSet<PathBuf>,
         // Devices adopted cleanup-only: maps ready but forwarding hooks fenced.
@@ -29401,6 +32559,15 @@ mod tests {
         IfindexChanged,
     }
 
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    enum FakeHistorical25ControlRootMode {
+        #[default]
+        CurrentPrivate0700,
+        Predecessor0755,
+        Predecessor0750,
+        Invalid,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct FakeCurrentGraph {
         schema_exact: bool,
@@ -29410,6 +32577,35 @@ mod tests {
         proof_committed: bool,
         proof_allows_populated: bool,
         pins_remaining: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FakeHistorical25Graph {
+        exact_identity: bool,
+        legacy_owner_active: bool,
+        current_owner_active: bool,
+        populated: bool,
+        observation_error: bool,
+        proof_committed: bool,
+        pins_remaining: usize,
+        hooks_remaining: u8,
+        fail_after_first_pin: bool,
+    }
+
+    impl Default for FakeHistorical25Graph {
+        fn default() -> Self {
+            Self {
+                exact_identity: true,
+                legacy_owner_active: false,
+                current_owner_active: false,
+                populated: false,
+                observation_error: false,
+                proof_committed: false,
+                pins_remaining: HISTORICAL_25_PIN_COUNT,
+                hooks_remaining: 2,
+                fail_after_first_pin: false,
+            }
+        }
     }
 
     impl Default for FakeCurrentGraph {
@@ -30896,6 +34092,14 @@ mod tests {
         ) -> Result<EbpfAttachmentDisposition, GtpuError> {
             let mut state = self.state();
             state.operations.push("attach");
+            if state.historical_25_control_root_mode
+                != FakeHistorical25ControlRootMode::CurrentPrivate0700
+                && !state.historical_25_root_handoff_published
+            {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "fake_reconciler_control_root",
+                });
+            }
             if state.attached.contains_key(&ifindex) {
                 return Err(GtpuError::AlreadyExists);
             }
@@ -31507,6 +34711,158 @@ mod tests {
                 .downlink_filter_pin_dir
                 .insert(ifindex, pin_dir.to_path_buf());
             Ok(EbpfAttachmentDisposition::Retained)
+        }
+
+        fn historical_cleanup_only_refusal(
+            &self,
+            pin_dir: &Path,
+        ) -> Result<Option<RetainedGraphCleanupRefusal>, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("historical_cleanup_only_refusal");
+            Ok(state
+                .historical_25_graphs
+                .contains_key(pin_dir)
+                .then_some(RetainedGraphCleanupRefusal::HistoricalGeneration))
+        }
+
+        fn recover_orphaned_historical_graph(
+            &self,
+            generation: crate::HistoricalEbpfGraphGeneration,
+            replacement: Option<(&str, u32)>,
+            pin_dir: &Path,
+            _tc_priority: u16,
+            allow_populated: bool,
+            managed_state: CurrentRecoveryManagedState,
+        ) -> Result<crate::HistoricalEbpfGraphRecoveryOutcome, GtpuError> {
+            use crate::{
+                HistoricalEbpfGraphRecoveryOutcome as Outcome,
+                HistoricalEbpfGraphRecoveryProgress as Progress,
+                HistoricalEbpfGraphRecoveryRefusal as Refusal,
+            };
+
+            let mut state = self.state();
+            state.operations.push("recover_orphaned_historical_graph");
+            let crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1 =
+                generation;
+            let graph = state.historical_25_graphs.get(pin_dir).copied();
+            if managed_state != CurrentRecoveryManagedState::Clear {
+                return Ok(if graph.is_some_and(|graph| graph.proof_committed) {
+                    Outcome::Partial(Progress::Indeterminate)
+                } else {
+                    Outcome::Refused(if managed_state == CurrentRecoveryManagedState::Conflict {
+                        Refusal::ManagedAttachment
+                    } else {
+                        Refusal::IndeterminateState
+                    })
+                });
+            }
+            if !allow_populated || replacement.is_none() {
+                return Ok(Outcome::Refused(Refusal::IdentityMismatch));
+            }
+            if state.replacement_identity != FakeReplacementIdentity::Exact {
+                return Ok(if graph.is_some_and(|graph| graph.proof_committed) {
+                    Outcome::Partial(Progress::Indeterminate)
+                } else {
+                    Outcome::Refused(Refusal::ReplacementInterfaceIdentityChanged)
+                });
+            }
+            let Some(graph) = graph else {
+                return Ok(Outcome::AlreadyAbsent);
+            };
+            if !graph.proof_committed
+                && state.historical_25_control_root_mode == FakeHistorical25ControlRootMode::Invalid
+            {
+                return Ok(Outcome::Refused(Refusal::IndeterminateState));
+            }
+            let committed = |reason| {
+                if graph.proof_committed {
+                    Outcome::Partial(Progress::Indeterminate)
+                } else {
+                    Outcome::Refused(reason)
+                }
+            };
+            if graph.legacy_owner_active {
+                return Ok(committed(Refusal::ActiveLegacyOwner));
+            }
+            if graph.current_owner_active {
+                return Ok(committed(Refusal::ActiveCurrentOwner));
+            }
+            if graph.observation_error {
+                return Ok(committed(Refusal::IndeterminateState));
+            }
+            if !graph.exact_identity {
+                return Ok(committed(Refusal::HistoricalGenerationMismatch));
+            }
+            if !graph.proof_committed && graph.populated {
+                return Ok(Outcome::Refused(Refusal::PopulatedState));
+            }
+            if !graph.proof_committed {
+                state
+                    .historical_25_graphs
+                    .get_mut(pin_dir)
+                    .expect("historical graph cannot disappear while fake authority is held")
+                    .proof_committed = true;
+            }
+            if state.historical_25_name_rebound_after_proof {
+                // The stale public name now denotes foreign slots. Production
+                // must use the record's numeric ifindex after an exact owner
+                // reproof, so this unrelated replacement remains untouched.
+                state
+                    .operations
+                    .push("historical_25_detach_recorded_ifindex");
+            }
+            if state.current_authority_replaced_after_proof {
+                // Current-leaf identity is an authority input to every
+                // destructive phase. A replacement after durable proof is a
+                // retry-required partial, never a hook/pin mutation.
+                return Ok(Outcome::Partial(Progress::Indeterminate));
+            }
+            let graph = state
+                .historical_25_graphs
+                .get(pin_dir)
+                .copied()
+                .expect("proof graph");
+            if graph.hooks_remaining != 0 {
+                state
+                    .historical_25_graphs
+                    .get_mut(pin_dir)
+                    .expect("historical graph cannot disappear while fake authority is held")
+                    .hooks_remaining = 0;
+            }
+            let graph = state
+                .historical_25_graphs
+                .get(pin_dir)
+                .copied()
+                .expect("hook graph");
+            if graph.pins_remaining != 0 && graph.fail_after_first_pin {
+                let graph = state
+                    .historical_25_graphs
+                    .get_mut(pin_dir)
+                    .expect("historical graph cannot disappear while fake authority is held");
+                graph.pins_remaining = graph.pins_remaining.saturating_sub(1);
+                graph.fail_after_first_pin = false;
+                return Ok(Outcome::Partial(Progress::PinCleanupStarted));
+            }
+            if graph.pins_remaining != 0 {
+                state
+                    .historical_25_graphs
+                    .get_mut(pin_dir)
+                    .expect("historical graph cannot disappear while fake authority is held")
+                    .pins_remaining = 0;
+            }
+            match state.historical_25_control_root_mode {
+                FakeHistorical25ControlRootMode::CurrentPrivate0700 => {}
+                FakeHistorical25ControlRootMode::Predecessor0755
+                | FakeHistorical25ControlRootMode::Predecessor0750 => {
+                    state.historical_25_root_handoff_published = true;
+                    state.operations.push("historical_25_control_root_handoff");
+                }
+                FakeHistorical25ControlRootMode::Invalid => {
+                    return Ok(Outcome::Partial(Progress::Indeterminate));
+                }
+            }
+            state.historical_25_graphs.remove(pin_dir);
+            Ok(Outcome::Removed)
         }
 
         fn recover_orphaned_current_graph(
@@ -37190,6 +40546,21 @@ mod tests {
         assert!(!aya_runtime::selector_control_directory_mode_is_exact(
             0o1700
         ));
+        assert!(aya_runtime::historical_25_control_root_mode_is_compatible(
+            0o755
+        ));
+        assert!(aya_runtime::historical_25_control_root_mode_is_compatible(
+            0o700
+        ));
+        assert!(aya_runtime::historical_25_control_root_mode_is_compatible(
+            0o775
+        ));
+        assert!(aya_runtime::historical_25_control_root_mode_is_compatible(
+            0o750
+        ));
+        assert!(!aya_runtime::historical_25_control_root_mode_is_compatible(
+            0o4755
+        ));
         assert!(aya_runtime::selector_control_identity_is_exact(
             11,
             13,
@@ -40081,6 +43452,394 @@ mod tests {
         } else {
             request
         }
+    }
+
+    fn historical_25_recovery_request() -> crate::HistoricalEbpfGraphRecoveryRequest {
+        crate::HistoricalEbpfGraphRecoveryRequest::new(
+            crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            "s2bu-historical",
+        )
+        .with_replacement_device(GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        })
+        .with_writer_proof(crate::HistoricalEbpfGraphWriterProof::previous_writer_stopped())
+        .with_drain_proof(crate::HistoricalEbpfGraphDrainProof::sessions_and_traffic_drained())
+    }
+
+    fn seed_historical_25(runtime: &FakeRuntime) -> PathBuf {
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu-historical");
+        runtime
+            .state()
+            .historical_25_graphs
+            .insert(pin_dir.clone(), FakeHistorical25Graph::default());
+        pin_dir
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_has_a_dedicated_maintenance_runtime_contract() {
+        let (backend, _runtime) = backend_with_fake();
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_requires_both_proofs_before_runtime_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        let missing_writer = crate::HistoricalEbpfGraphRecoveryRequest::new(
+            crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            "s2bu-historical",
+        )
+        .with_replacement_device(GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        })
+        .with_drain_proof(crate::HistoricalEbpfGraphDrainProof::sessions_and_traffic_drained());
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(missing_writer)
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
+                crate::HistoricalEbpfGraphRecoveryRefusal::WriterProofRequired
+            )
+        );
+        assert_eq!(
+            runtime.state().historical_25_graphs[&pin_dir],
+            FakeHistorical25Graph::default()
+        );
+        assert!(!runtime
+            .state()
+            .operations
+            .contains(&"recover_orphaned_historical_graph"));
+
+        let missing_drain = crate::HistoricalEbpfGraphRecoveryRequest::new(
+            crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            "s2bu-historical",
+        )
+        .with_replacement_device(GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        })
+        .with_writer_proof(crate::HistoricalEbpfGraphWriterProof::previous_writer_stopped());
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(missing_drain)
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
+                crate::HistoricalEbpfGraphRecoveryRefusal::DrainProofRequired
+            )
+        );
+        assert_eq!(
+            runtime.state().historical_25_graphs[&pin_dir],
+            FakeHistorical25Graph::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_refuses_untrusted_or_live_state_before_proof() {
+        for (case, graph, refusal) in [
+            (
+                "wrong historical graph identity",
+                FakeHistorical25Graph {
+                    exact_identity: false,
+                    ..FakeHistorical25Graph::default()
+                },
+                crate::HistoricalEbpfGraphRecoveryRefusal::HistoricalGenerationMismatch,
+            ),
+            (
+                "drain observation error",
+                FakeHistorical25Graph {
+                    observation_error: true,
+                    ..FakeHistorical25Graph::default()
+                },
+                crate::HistoricalEbpfGraphRecoveryRefusal::IndeterminateState,
+            ),
+            (
+                "retained forwarding state",
+                FakeHistorical25Graph {
+                    populated: true,
+                    ..FakeHistorical25Graph::default()
+                },
+                crate::HistoricalEbpfGraphRecoveryRefusal::PopulatedState,
+            ),
+            (
+                "active legacy authority",
+                FakeHistorical25Graph {
+                    legacy_owner_active: true,
+                    ..FakeHistorical25Graph::default()
+                },
+                crate::HistoricalEbpfGraphRecoveryRefusal::ActiveLegacyOwner,
+            ),
+            (
+                "active current authority",
+                FakeHistorical25Graph {
+                    current_owner_active: true,
+                    ..FakeHistorical25Graph::default()
+                },
+                crate::HistoricalEbpfGraphRecoveryRefusal::ActiveCurrentOwner,
+            ),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_historical_25(&runtime);
+            runtime
+                .state()
+                .historical_25_graphs
+                .insert(pin_dir.clone(), graph);
+            let before = runtime.state().historical_25_graphs[&pin_dir];
+            let outcome = backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                crate::HistoricalEbpfGraphRecoveryOutcome::Refused(refusal),
+                "{case}"
+            );
+            assert_eq!(
+                runtime.state().historical_25_graphs[&pin_dir],
+                before,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_25_managed_attachment_refusal_does_not_revoke_traffic_attempts() {
+        let (backend, _runtime, _group, authority) = traffic_proof_fixture(0x7a).await;
+        let _session = begin_traffic_proof(&backend, &authority)
+            .await
+            .expect("live traffic attempt");
+        assert_eq!(backend.traffic_attempts().unwrap().len(), 1);
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
+                crate::HistoricalEbpfGraphRecoveryRefusal::ManagedAttachment
+            )
+        );
+        assert!(backend
+            .traffic_attempts()
+            .unwrap()
+            .values()
+            .all(|attempt| attempt.invalidated.is_none()));
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_refuses_hostile_predecessor_root_before_proof_or_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode = FakeHistorical25ControlRootMode::Invalid;
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
+                crate::HistoricalEbpfGraphRecoveryRefusal::IndeterminateState
+            )
+        );
+        let graph = runtime.state().historical_25_graphs[&pin_dir];
+        assert!(!graph.proof_committed);
+        assert_eq!(graph.hooks_remaining, 2);
+        assert_eq!(graph.pins_remaining, HISTORICAL_25_PIN_COUNT);
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_refuses_current_leaf_replacement_before_hook_or_pin_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().current_authority_replaced_after_proof = true;
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::Indeterminate
+            )
+        );
+        let graph = runtime.state().historical_25_graphs[&pin_dir];
+        assert!(graph.proof_committed);
+        assert_eq!(graph.hooks_remaining, 2);
+        assert_eq!(graph.pins_remaining, HISTORICAL_25_PIN_COUNT);
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_is_resumable_and_idempotent_after_partial_removal() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime
+            .state()
+            .historical_25_graphs
+            .get_mut(&pin_dir)
+            .expect("seeded graph")
+            .fail_after_first_pin = true;
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted
+            )
+        );
+        let partial = runtime.state().historical_25_graphs[&pin_dir];
+        assert!(partial.proof_committed);
+        assert_eq!(partial.hooks_remaining, 0);
+        assert_eq!(partial.pins_remaining, HISTORICAL_25_PIN_COUNT - 1);
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        assert!(!runtime.state().historical_25_graphs.contains_key(&pin_dir));
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_uses_recorded_ifindex_after_replacement_name_rebind() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        {
+            let mut state = runtime.state();
+            // The request name was exact while the durable proof was made,
+            // then a foreign interface inherited that name. A name-based Aya
+            // link would detach the foreign slots; the historical graph must
+            // instead be cleaned through the recorded numeric ifindex.
+            state.historical_25_name_rebound_after_proof = true;
+            state.foreign_name_rebound_hook_slots = 2;
+        }
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        let state = runtime.state();
+        assert!(!state.historical_25_graphs.contains_key(&pin_dir));
+        assert_eq!(state.foreign_name_rebound_hook_slots, 2);
+        assert!(state
+            .operations
+            .contains(&"historical_25_detach_recorded_ifindex"));
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_hands_off_predecessor_0755_root_before_normal_attach() {
+        let (backend, runtime) = backend_with_fake();
+        seed_historical_25(&runtime);
+        {
+            let mut state = runtime.state();
+            state.historical_25_control_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+        }
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(
+                state.historical_25_control_root_mode,
+                FakeHistorical25ControlRootMode::Predecessor0755
+            );
+            assert!(state.historical_25_root_handoff_published);
+            assert!(state
+                .operations
+                .contains(&"historical_25_control_root_handoff"));
+        }
+
+        // This exercises the ordinary acquisition route immediately after
+        // recovery. The shared predecessor root retains its original mode;
+        // only the exact private-leaf receipt enables normal attach.
+        backend.create_device(create_request()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_25_recovery_hands_off_shared_predecessor_root_without_mutating_other_namespaces(
+    ) {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        {
+            let mut state = runtime.state();
+            state.historical_25_control_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0750;
+        }
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        {
+            let state = runtime.state();
+            assert!(!state.historical_25_graphs.contains_key(&pin_dir));
+            assert_eq!(
+                state.historical_25_control_root_mode,
+                FakeHistorical25ControlRootMode::Predecessor0750
+            );
+            assert!(state.historical_25_root_handoff_published);
+        }
+        backend.create_device(create_request()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_cleanup_recovery_only_detects_historical_25_and_never_invokes_maintenance() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        runtime
+            .state()
+            .historical_25_graphs
+            .insert(pin_dir.clone(), FakeHistorical25Graph::default());
+
+        assert_eq!(
+            backend
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::HistoricalGeneration
+            )
+        );
+        let state = runtime.state();
+        assert!(state.historical_25_graphs.contains_key(&pin_dir));
+        assert!(state
+            .operations
+            .contains(&"historical_cleanup_only_refusal"));
+        assert!(!state
+            .operations
+            .contains(&"recover_orphaned_historical_graph"));
     }
 
     #[tokio::test]
