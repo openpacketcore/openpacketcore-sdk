@@ -2843,6 +2843,17 @@ pub struct HistoricalEbpfGraphRecoveryAuthority {
     guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
 }
 
+/// Private discriminator for the mutually exclusive authority sources.
+///
+/// A graph-bound authority may resume its exact retained R5 transaction, but
+/// it can never authorize the graph-free pristine terminal.  Only the opaque
+/// SDK-issued pristine inspection token can select that read-only path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoricalEbpfGraphRecoveryAuthorityKind {
+    ExactDetached,
+    PristineAbsence,
+}
+
 impl HistoricalEbpfGraphRecoveryAuthority {
     /// Construct one R5 authority for an exact SDK-inspected detached graph.
     ///
@@ -2894,6 +2905,14 @@ impl HistoricalEbpfGraphRecoveryAuthority {
     #[must_use]
     pub const fn binding(&self) -> HistoricalEbpfGraphRecoveryAuthorityBinding {
         self.binding
+    }
+
+    pub(crate) const fn kind(&self) -> HistoricalEbpfGraphRecoveryAuthorityKind {
+        if self.expected_challenge.is_some() {
+            HistoricalEbpfGraphRecoveryAuthorityKind::ExactDetached
+        } else {
+            HistoricalEbpfGraphRecoveryAuthorityKind::PristineAbsence
+        }
     }
 
     pub(crate) fn verify_current(
