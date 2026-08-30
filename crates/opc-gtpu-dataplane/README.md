@@ -44,8 +44,10 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   `CurrentEbpfGraphRecoveryOutcome`, `CurrentEbpfGraphRecoveryRefusal`, and
   `CurrentEbpfGraphRecoveryProgress`,
   `HistoricalEbpfGraphGeneration`, `HistoricalEbpfGraphRecoveryRequest`,
+  `HistoricalEbpfGraphRecoveryIntent`, `HistoricalEbpfGraphRecoveryAuthority`,
+  `HistoricalEbpfGraphRecoveryCurrentnessGuard`,
   `HistoricalEbpfGraphWriterProof`, `HistoricalEbpfGraphDrainProof`,
-  `HistoricalEbpfGraphRecoveryOutcome`, `HistoricalEbpfGraphRecoveryRefusal`,
+  `HistoricalEbpfGraphRecoveryReceipt`, `HistoricalEbpfGraphRecoveryOutcome`, `HistoricalEbpfGraphRecoveryRefusal`,
   and `HistoricalEbpfGraphRecoveryProgress`,
   `GtpuLocalEndpointSet`, `GtpuSessionAttachmentSelector`,
   `GtpuSessionGroup`, `GtpuSessionGroupReconcileRequest`,
@@ -1316,13 +1318,15 @@ forwarding state production-ready.
 
 #### Orphaned current-schema graph recovery
 
-`GtpuDataplaneBackend::recover_orphaned_current_ebpf_graph` is the supported
-maintenance boundary for a current-schema graph whose original process and
-interface namespace are gone while its map graph remains in node-persistent
-bpffs. Product code must not unlink those pins directly. The optional
-replacement interface is validated independently and may have a different
-ifindex; neither the old nor replacement ifindex contributes to the persistent
-graph lease identity.
+`GtpuDataplaneBackend::recover_orphaned_current_ebpf_graph_with_authority` is
+the supported maintenance boundary for a current-schema graph whose original
+process and interface namespace are gone while its map graph remains in
+node-persistent bpffs. Product code must not unlink those pins directly. The
+legacy unbound `recover_orphaned_current_ebpf_graph` deliberately returns
+`AuthorityRequired` before observation or mutation. The optional replacement
+interface is validated independently and may have a different ifindex; neither
+the old nor replacement ifindex contributes to the persistent graph lease
+identity.
 
 Before constructing `CurrentEbpfGraphWriterProof`, the caller must establish
 that the prior process cannot write the graph. A graph with retained forwarding
@@ -1352,36 +1356,50 @@ pin, foreign object, or inconsistent observation fails closed.
 
 ```rust,no_run
 use opc_gtpu_dataplane::{
-    CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryOutcome,
-    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof, GtpDevice,
+    CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryAuthority,
+    CurrentEbpfGraphRecoveryIntent, CurrentEbpfGraphRecoveryOutcome,
+    CurrentEbpfGraphRecoveryRefusal, CurrentEbpfGraphWriterProof, GtpDevice,
     GtpuDataplaneBackend,
 };
 
+# fn acquire_live_authority() -> Result<CurrentEbpfGraphRecoveryAuthority, Box<dyn std::error::Error>> { unimplemented!() }
 # async fn recover(
 #     backend: &dyn GtpuDataplaneBackend,
 #     replacement: GtpDevice,
 #     drained: bool,
 # ) -> Result<(), Box<dyn std::error::Error>> {
-let mut request = CurrentEbpfGraphRecoveryRequest::new(
+let mut intent = CurrentEbpfGraphRecoveryIntent::new(
     "s2bu",
     CurrentEbpfGraphWriterProof::previous_writer_stopped(),
 )
 .with_replacement_device(replacement);
 if drained {
-    request = request.with_drain_proof(
+    intent = intent.with_drain_proof(
         CurrentEbpfGraphDrainProof::sessions_and_traffic_drained(),
     );
 }
 
 loop {
+    // Acquire a fresh external node fence and live async guard for every
+    // attempt. The authority-bearing request is intentionally not Clone.
+    let authority = acquire_live_authority()?;
     match backend
-        .recover_orphaned_current_ebpf_graph(request.clone())
+        .recover_orphaned_current_ebpf_graph_with_authority(
+            intent.clone().into_request_with_authority(authority),
+        )
         .await?
     {
         CurrentEbpfGraphRecoveryOutcome::Removed
         | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent => break,
         CurrentEbpfGraphRecoveryOutcome::Partial(_) => {
-            // Preserve the same attestations and retry this exact namespace.
+            // Preserve the cloneable intent and reacquire authority.
+        }
+        CurrentEbpfGraphRecoveryOutcome::Refused(
+            CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema,
+        ) => {
+            // Only this exact discriminator may start a separate historical
+            // R5 attempt, with a newly acquired historical authority.
+            break;
         }
         CurrentEbpfGraphRecoveryOutcome::Refused(reason) => {
             return Err(std::io::Error::other(format!(
@@ -1439,11 +1457,18 @@ provenance. An exact historical attached pair is reported as
 The request is intentionally separate from ordinary create, resolve, and
 cleanup-only startup. It requires explicit stopped-writer and drained-traffic
 attestations, an exact replacement name/ifindex, and the named frozen
-generation. Those attestations never replace live evidence: the backend takes
+generation. It also consumes a non-`Clone` R5
+`HistoricalEbpfGraphRecoveryAuthority`: opaque scope, predecessor-basis,
+host/root/leaf commitments, a nonzero fence epoch, and a nonzero operation ID
+plus an asynchronous live-currentness guard. A caller retains a cloneable
+`HistoricalEbpfGraphRecoveryIntent` and obtains a newly live authority for
+each retry with `into_request_with_authority`; an authority-bearing request is
+not reusable. Those attestations never replace live evidence: the backend takes
 the predecessor and root-bound current flocks in a fixed order, proves exact
 same-owner namespace/graph/authority identities, rejects populated or malformed
-maps, and rechecks replacement, hooks, references, receipts, graph inventory,
-and authority immediately before every effect. Foreign layouts, held leases,
+maps, and awaits the guard after both locks, immediately before and after every
+irreversible proof/pin/directory/leaf/terminal-write effect, and before a
+terminal return. Foreign layouts, held leases,
 unknown children, wrong ownership or mode, partial observations, and name or
 ifindex races remain fail-closed.
 
@@ -1453,10 +1478,36 @@ current leaf before any pin unlink. Phase and identity readback makes every
 published boundary retryable: each recorded pin unlink, graph absence,
 legacy-proof removal, namespace-local handoff marker, legacy-leaf retirement,
 and terminal publication. `Removed` leaves the exact current `Terminal`
-receipt in place. `AlreadyAbsent` requires that same request-bound detached
-receipt, the handoff marker, and authoritative absence of the graph, legacy
-leaf, and staging state; never-present or manually altered absence is not
-success.
+receipt in place. An authenticated terminal `AlreadyAbsent` requires that
+same request-bound detached receipt, the handoff marker, and authoritative
+absence of the graph, legacy leaf, and staging state. A genuinely never-created
+target is separately reported as read-only `PristineAbsence`: it still needs
+live external authority and conclusive target absence, but writes no receipt,
+marker, root, or synthetic graph provenance. Every call returns
+`HistoricalEbpfGraphRecoveryReceipt`, binding the
+R5 authority projection, recovery/artifact/ABI/KAT/codec identities, typed
+outcome, terminal-absence proof, and—on terminal success—the exact persisted
+graph commitment. Unpublished `OPCH25R4` proof records decode only as unbound
+predecessors and refuse without migration or mutation; ownership is never
+inferred from them.
+
+`historical_ebpf_recovery_compatibility_kat(challenge)` is an unprivileged,
+pure build-artifact check. Its typed receipt binds the shipped generation,
+embedded-object SHA-256, exact 25-map ABI digest, program section/tag
+expectations, 25-entry namespace-commitment vector, R5 contract IDs, and a
+domain-separated response to `challenge`. Its
+`compatibility_contract_digest().as_bytes()` is a stable, non-sensitive
+32-byte SHA-256 value for cross-language policy pins: it hashes the literal
+`opc.gtpu.historical-ebpf-recovery-kat\0compatibility-contract\0r5` domain,
+authority/recovery/R5-codec/KAT identities, fixed `GTPU_RECONCILER_LOCKS`
+control-root identity, shipped-generation byte `0x05`, embedded object and ABI
+digests, ordered section/tag expectations, and all 25 ordered namespace
+commitments. For this SDK artifact it is
+`8503fd8b6961a6c8cce0246c5f6a7ca73933f2aec84bfb5b71cc25e1ca2122e6`.
+`verify_challenge_response` verifies SHA-256 over the distinct
+`opc.gtpu.historical-ebpf-recovery-kat\0challenge-response\0r5` domain, that
+contract digest, and the caller's 32-byte challenge. It exposes no object bytes
+and makes no kernel or bpffs claim.
 
 Ordinary entrypoints perform only an exhaustive read-only compatibility
 preflight. Any complete or partial shipped-25 graph, legacy leaf, staging leaf,
@@ -1482,10 +1533,11 @@ recovery:
   re-enable forwarding the instant retained entries exist — before the consumer
   has had a chance to remove stale contexts. Cleanup-only acquisition never
   attaches or reattaches the forwarding hooks before cleanup is complete.
-- `recover_orphaned_current_ebpf_graph` deletes the whole graph and requires
-  the old interface namespace to be gone. Cleanup-only acquisition never
-  deletes the graph and requires the interface to still resolve to the expected
-  ifindex.
+- `recover_orphaned_current_ebpf_graph_with_authority` deletes the whole graph
+  only under a freshly live affine external authority and requires the old
+  interface namespace to be gone. The unbound method refuses with
+  `AuthorityRequired`. Cleanup-only acquisition never deletes the graph and
+  requires the interface to still resolve to the expected ifindex.
 
 Before granting authority the backend proves the expected name/ifindex pair,
 then performs a complete read-only inventory and ABI/capacity validation of all
