@@ -17096,6 +17096,9 @@ fn run_persistent_consumer_v2_batch_release_gate(
             * (V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY),
     )
     .expect("bounded voter representative count");
+    println!(
+        "V2_BATCH_RELEASE_GATE_STATUS_COHORTS local={status_local_delta} ingress={status_ingress_delta} representatives={status_representative_delta} leader={status_leader_delta} proposals={status_proposal_delta} ideal_voter_representatives={expected_voter_representatives}",
+    );
     assert_eq!(status_ingress_delta, expected_voter_representatives);
     assert_eq!(status_representative_delta, expected_voter_representatives);
     assert_eq!(status_leader_delta, expected_voter_representatives);
