@@ -14250,6 +14250,23 @@ mod aya_runtime {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Historical25AttachedCommittedReceipt {
+        record: Historical25RecoveryRecord,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Historical25RecoveryRecordObservation {
+        Detached(Historical25RecoveryRecord),
+        AttachedCommitted(Historical25AttachedCommittedReceipt),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Historical25RecoveryProofObservation {
+        Detached(Historical25RecoveryProof),
+        AttachedCommitted(Historical25AttachedCommittedReceipt),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Historical25ProofLeaf {
         LegacyRecovery,
         CurrentHandoff,
@@ -14327,6 +14344,13 @@ mod aya_runtime {
     enum Historical25ProofCommitError {
         BeforePublication,
         PublicationIndeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Historical25PinUnlinkOutcome {
+        Absent,
+        Removed,
+        RemovedRecheckIndeterminate,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14494,7 +14518,9 @@ mod aya_runtime {
             encoded
         }
 
-        fn decode(encoded: &[u8; HISTORICAL_25_RECOVERY_PROOF_LEN]) -> Option<Self> {
+        fn decode_observation(
+            encoded: &[u8; HISTORICAL_25_RECOVERY_PROOF_LEN],
+        ) -> Option<Historical25RecoveryRecordObservation> {
             let read_u32 = |offset| {
                 encoded
                     .get(offset..offset + 4)
@@ -14573,6 +14599,19 @@ mod aya_runtime {
                 record.map_ids.iter().all(|map_id| seen.insert(*map_id))
             };
             let detached_programs = record.is_detached();
+            let attached_programs = record.uplink_program_id != 0
+                && record.downlink_program_id != 0
+                && record.uplink_program_id != record.downlink_program_id
+                && record.uplink_program_tag != 0
+                && record.downlink_program_tag != 0;
+            let program_identity_valid = match record.phase {
+                Historical25RecoveryPhase::Qualified | Historical25RecoveryPhase::Installed => {
+                    detached_programs || attached_programs
+                }
+                Historical25RecoveryPhase::GraphAbsent | Historical25RecoveryPhase::Terminal => {
+                    detached_programs
+                }
+            };
             let current_identity_valid = match record.phase {
                 Historical25RecoveryPhase::Qualified => {
                     record.current_control_device == 0 && record.current_control_inode == 0
@@ -14592,13 +14631,29 @@ mod aya_runtime {
                 && record.graph_device != 0
                 && record.graph_inode != 0
                 && record.ifindex != 0
-                && detached_programs
+                && program_identity_valid
                 && record.tc_priority != 0
                 && record.proof_map_id != 0
                 && record.map_ids.iter().all(|id| *id != 0)
                 && map_ids_are_unique
                 && !record.map_ids.contains(&record.proof_map_id))
-            .then_some(record)
+            .then_some({
+                if detached_programs {
+                    Historical25RecoveryRecordObservation::Detached(record)
+                } else {
+                    Historical25RecoveryRecordObservation::AttachedCommitted(
+                        Historical25AttachedCommittedReceipt { record },
+                    )
+                }
+            })
+        }
+
+        #[cfg(test)]
+        fn decode(encoded: &[u8; HISTORICAL_25_RECOVERY_PROOF_LEN]) -> Option<Self> {
+            match Self::decode_observation(encoded)? {
+                Historical25RecoveryRecordObservation::Detached(record) => Some(record),
+                Historical25RecoveryRecordObservation::AttachedCommitted(_) => None,
+            }
         }
     }
 
@@ -19653,7 +19708,7 @@ mod aya_runtime {
             replacement: (&str, u32),
             tc_priority: u16,
             index: usize,
-        ) -> Result<bool, GtpuError> {
+        ) -> Result<Historical25PinUnlinkOutcome, GtpuError> {
             let record = proof.record;
             Self::historical_25_cleanup_effect_fence(
                 Historical25EffectFence::new(
@@ -19717,18 +19772,22 @@ mod aya_runtime {
             )?;
             match rustix::fs::unlinkat(&graph, spec.name, rustix::fs::AtFlags::empty()) {
                 Ok(()) => {}
-                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(rustix::io::Errno::NOENT) => return Ok(Historical25PinUnlinkOutcome::Absent),
                 Err(error) => {
                     return Err(GtpuError::io("ebpf_historical_25_pin_unpin", error.into()))
                 }
             }
-            let _ = Self::historical_25_open_graph(
+            if Self::historical_25_open_graph(
                 legacy,
                 pin_dir,
                 (record.graph_device, record.graph_inode),
                 "ebpf_historical_25_pin_unpin_recheck",
-            )?;
-            Ok(true)
+            )
+            .is_err()
+            {
+                return Ok(Historical25PinUnlinkOutcome::RemovedRecheckIndeterminate);
+            }
+            Ok(Historical25PinUnlinkOutcome::Removed)
         }
 
         fn historical_25_remove_graph_dir(
@@ -20241,11 +20300,11 @@ mod aya_runtime {
                 .map_err(|_| state_indeterminate(operation))
         }
 
-        fn historical_25_read_proof_at(
+        fn historical_25_read_proof_observation_at(
             path: &Path,
             proof_leaf: Historical25ProofLeaf,
             operation: &'static str,
-        ) -> Result<Option<Historical25RecoveryProof>, GtpuError> {
+        ) -> Result<Option<Historical25RecoveryProofObservation>, GtpuError> {
             let Some(parent) = Self::historical_25_open_proof_parent(path, proof_leaf, operation)?
             else {
                 return Ok(None);
@@ -20278,33 +20337,72 @@ mod aya_runtime {
                 Map::from_map_data(data).map_err(|_| state_indeterminate(operation))?,
             )
             .map_err(|_| state_indeterminate(operation))?;
-            let record = Historical25RecoveryRecord::decode(
+            let observation = Historical25RecoveryRecord::decode_observation(
                 &proof
                     .get(&0, 0)
                     .map_err(|_| state_indeterminate(operation))?,
             )
             .ok_or_else(|| state_indeterminate(operation))?;
-            if record.proof_map_id != map_id
+            let proof_map_id = match observation {
+                Historical25RecoveryRecordObservation::Detached(record) => record.proof_map_id,
+                Historical25RecoveryRecordObservation::AttachedCommitted(receipt) => {
+                    receipt.record.proof_map_id
+                }
+            };
+            if proof_map_id != map_id
                 || Self::pin_leaf_identity(&parent, leaf, operation)? != expected_leaf_identity
             {
                 return Err(state_indeterminate(operation));
             }
-            Ok(Some(Historical25RecoveryProof { record, map_id }))
+            Ok(Some(match observation {
+                Historical25RecoveryRecordObservation::Detached(record) => {
+                    Historical25RecoveryProofObservation::Detached(Historical25RecoveryProof {
+                        record,
+                        map_id,
+                    })
+                }
+                Historical25RecoveryRecordObservation::AttachedCommitted(receipt) => {
+                    Historical25RecoveryProofObservation::AttachedCommitted(receipt)
+                }
+            }))
         }
 
-        fn historical_25_read_proof(
-            legacy: &Historical25LegacyOwnership,
+        fn historical_25_read_proof_at(
+            path: &Path,
+            proof_leaf: Historical25ProofLeaf,
+            operation: &'static str,
         ) -> Result<Option<Historical25RecoveryProof>, GtpuError> {
+            match Self::historical_25_read_proof_observation_at(path, proof_leaf, operation)? {
+                Some(Historical25RecoveryProofObservation::Detached(proof)) => Ok(Some(proof)),
+                Some(Historical25RecoveryProofObservation::AttachedCommitted(_)) => {
+                    Err(state_indeterminate(operation))
+                }
+                None => Ok(None),
+            }
+        }
+
+        fn historical_25_read_proof_observation(
+            legacy: &Historical25LegacyOwnership,
+        ) -> Result<Option<Historical25RecoveryProofObservation>, GtpuError> {
             let _legacy_dir =
                 Self::historical_25_open_legacy_control(legacy, "ebpf_historical_25_proof_read")?;
-            let proof = Self::historical_25_read_proof_at(
+            let observation = Self::historical_25_read_proof_observation_at(
                 &Self::historical_25_legacy_proof_path(legacy),
                 Historical25ProofLeaf::LegacyRecovery,
                 "ebpf_historical_25_proof_read",
             )?;
-            if let Some(proof) = proof {
-                if proof.record.legacy_control_device != legacy.control_dir_device
-                    || proof.record.legacy_control_inode != legacy.control_dir_inode
+            if let Some(observation) = observation {
+                let legacy_control_identity = match observation {
+                    Historical25RecoveryProofObservation::Detached(proof) => (
+                        proof.record.legacy_control_device,
+                        proof.record.legacy_control_inode,
+                    ),
+                    Historical25RecoveryProofObservation::AttachedCommitted(receipt) => (
+                        receipt.record.legacy_control_device,
+                        receipt.record.legacy_control_inode,
+                    ),
+                };
+                if legacy_control_identity != (legacy.control_dir_device, legacy.control_dir_inode)
                 {
                     return Err(state_indeterminate("ebpf_historical_25_proof_read"));
                 }
@@ -20312,13 +20410,25 @@ mod aya_runtime {
                     legacy,
                     "ebpf_historical_25_proof_recheck",
                 )?;
-                return Ok(Some(proof));
+                return Ok(Some(observation));
             }
             let _ = Self::historical_25_open_legacy_control(
                 legacy,
                 "ebpf_historical_25_proof_recheck",
             )?;
             Ok(None)
+        }
+
+        fn historical_25_read_proof(
+            legacy: &Historical25LegacyOwnership,
+        ) -> Result<Option<Historical25RecoveryProof>, GtpuError> {
+            match Self::historical_25_read_proof_observation(legacy)? {
+                Some(Historical25RecoveryProofObservation::Detached(proof)) => Ok(Some(proof)),
+                Some(Historical25RecoveryProofObservation::AttachedCommitted(_)) => {
+                    Err(state_indeterminate("ebpf_historical_25_proof_read"))
+                }
+                None => Ok(None),
+            }
         }
 
         fn historical_25_write_proof_at(
@@ -28999,8 +29109,19 @@ mod aya_runtime {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                 Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
             };
-            let existing_proof = match Self::historical_25_read_proof(&legacy) {
-                Ok(proof) => proof,
+            let existing_proof = match Self::historical_25_read_proof_observation(&legacy) {
+                Ok(Some(Historical25RecoveryProofObservation::Detached(proof))) => Some(proof),
+                Ok(Some(Historical25RecoveryProofObservation::AttachedCommitted(_))) => {
+                    // A canonical attached receipt could have been committed by
+                    // the immediately preceding implementation before it was
+                    // tightened to refuse attached graphs. It is durable proof
+                    // that the operation started, but it can never authorize an
+                    // effect: preserve it and require an operator-visible retry.
+                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+                Ok(None) => None,
                 Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
             };
             let (current, mut proof, legacy_proof_retired) = if let Some(proof) = existing_proof {
@@ -29440,7 +29561,7 @@ mod aya_runtime {
                         ));
                     }
                 }
-                if Self::historical_25_unlink_recorded_pin(
+                match Self::historical_25_unlink_recorded_pin(
                     &legacy,
                     &current,
                     pin_dir,
@@ -29448,18 +29569,26 @@ mod aya_runtime {
                     (interface, ifindex),
                     tc_priority,
                     index,
-                )
-                .is_err()
-                {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        if removed_pin {
-                            HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted
-                        } else {
-                            HistoricalEbpfGraphRecoveryProgress::ProofCommitted
-                        },
-                    ));
+                ) {
+                    Ok(Historical25PinUnlinkOutcome::Absent)
+                    | Ok(Historical25PinUnlinkOutcome::Removed) => {
+                        removed_pin = true;
+                    }
+                    Ok(Historical25PinUnlinkOutcome::RemovedRecheckIndeterminate) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted,
+                        ));
+                    }
+                    Err(_) => {
+                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                            if removed_pin {
+                                HistoricalEbpfGraphRecoveryProgress::PinCleanupStarted
+                            } else {
+                                HistoricalEbpfGraphRecoveryProgress::ProofCommitted
+                            },
+                        ));
+                    }
                 }
-                removed_pin = true;
             }
             match fs::symlink_metadata(pin_dir) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -34197,6 +34326,16 @@ mod aya_runtime {
             attached_qualified.downlink_program_id = 102;
             attached_qualified.uplink_program_tag = 0x0102_0304_0506_0708;
             attached_qualified.downlink_program_tag = 0x1112_1314_1516_1718;
+            let attached_receipt = Historical25AttachedCommittedReceipt {
+                record: attached_qualified,
+            };
+            assert_eq!(
+                Historical25RecoveryRecord::decode_observation(&attached_qualified.encode()),
+                Some(Historical25RecoveryRecordObservation::AttachedCommitted(
+                    attached_receipt
+                )),
+                "a canonical predecessor receipt must remain observable without becoming an effect proof"
+            );
             assert_eq!(
                 Historical25RecoveryRecord::decode(&attached_qualified.encode()),
                 None,
@@ -34204,9 +34343,26 @@ mod aya_runtime {
             );
             let installed_attached = attached_qualified.install_current((20, 21)).unwrap();
             assert_eq!(
+                Historical25RecoveryRecord::decode_observation(&installed_attached.encode()),
+                Some(Historical25RecoveryRecordObservation::AttachedCommitted(
+                    Historical25AttachedCommittedReceipt {
+                        record: installed_attached,
+                    }
+                )),
+                "a committed predecessor receipt must be classified after restart"
+            );
+            assert_eq!(
                 Historical25RecoveryRecord::decode(&installed_attached.encode()),
                 None,
                 "an older attached installed receipt must resume fail-closed"
+            );
+            let mut aliased_program_identity = installed_attached;
+            aliased_program_identity.downlink_program_id =
+                aliased_program_identity.uplink_program_id;
+            assert_eq!(
+                Historical25RecoveryRecord::decode_observation(&aliased_program_identity.encode()),
+                None,
+                "the predecessor never authenticated one program ID as both hooks"
             );
             let mut attached_graph_absent = installed_attached;
             attached_graph_absent.phase = Historical25RecoveryPhase::GraphAbsent;
@@ -34214,6 +34370,11 @@ mod aya_runtime {
                 Historical25RecoveryRecord::decode(&attached_graph_absent.encode()),
                 None,
                 "graph-absent authority must encode a detached graph"
+            );
+            assert_eq!(
+                Historical25RecoveryRecord::decode_observation(&attached_graph_absent.encode()),
+                None,
+                "an attached terminal-phase receipt is malformed, not resumable"
             );
 
             let detached = Historical25RecoveryRecord::unbound(
@@ -34270,6 +34431,11 @@ mod aya_runtime {
             assert_eq!(
                 Historical25RecoveryRecord::decode(&mixed_attachment.encode()),
                 None
+            );
+            assert_eq!(
+                Historical25RecoveryRecord::decode_observation(&mixed_attachment.encode()),
+                None,
+                "partial program identity must remain malformed"
             );
         }
 
