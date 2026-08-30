@@ -675,6 +675,10 @@ pub(crate) enum HistoricalEbpfGraphRecoveryTerminalSnapshot {
 /// runtime returns this only after it has re-proved the exact target under
 /// the authority leaf and operation locks; the backend never synthesizes a
 /// terminal receipt from an outcome alone.
+// This mirrors the historical snapshot above: keeping the fixed-width
+// authority tuple stack-only and `Copy` avoids allocating after the locked
+// terminal observation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurrentEbpfGraphRecoveryTerminalSnapshot {
     PristineAbsence,
@@ -803,6 +807,24 @@ impl HistoricalEbpfGraphRecoveryCurrentnessProbe for TestHistoricalEbpfGraphReco
 struct TestCurrentEbpfGraphRecoveryCurrentness;
 
 #[cfg(test)]
+struct ScriptedCurrentEbpfGraphRecoveryCurrentness {
+    fail_on_check: usize,
+    checks: std::sync::atomic::AtomicUsize,
+    first_failure: Mutex<Option<crate::CurrentEbpfGraphRecoveryAuthorityCurrentness>>,
+}
+
+#[cfg(test)]
+impl ScriptedCurrentEbpfGraphRecoveryCurrentness {
+    fn unavailable_on(fail_on_check: usize) -> Self {
+        Self {
+            fail_on_check,
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            first_failure: Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(test)]
 struct TestCurrentEbpfGraphRecoveryAuthorityGuard;
 
 #[cfg(test)]
@@ -827,6 +849,34 @@ impl crate::CurrentEbpfGraphRecoveryCurrentnessGuard
 impl CurrentEbpfGraphRecoveryCurrentnessProbe for TestCurrentEbpfGraphRecoveryCurrentness {
     fn verify_current(&self) -> Result<(), crate::CurrentEbpfGraphRecoveryAuthorityCurrentness> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl CurrentEbpfGraphRecoveryCurrentnessProbe for ScriptedCurrentEbpfGraphRecoveryCurrentness {
+    fn verify_current(&self) -> Result<(), crate::CurrentEbpfGraphRecoveryAuthorityCurrentness> {
+        if self
+            .checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == self.fail_on_check
+        {
+            let failure = crate::CurrentEbpfGraphRecoveryAuthorityCurrentness::Unavailable;
+            if let Ok(mut first_failure) = self.first_failure.lock() {
+                first_failure.get_or_insert(failure);
+            }
+            Err(failure)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn first_failure(&self) -> Option<crate::CurrentEbpfGraphRecoveryAuthorityCurrentness> {
+        self.first_failure
+            .lock()
+            .map(|failure| *failure)
+            .unwrap_or(Some(
+                crate::CurrentEbpfGraphRecoveryAuthorityCurrentness::Unavailable,
+            ))
     }
 }
 
@@ -16629,28 +16679,8 @@ mod aya_runtime {
             graph_device: u64,
             graph_inode: u64,
             authority: crate::CurrentEbpfGraphRecoveryAuthorityBinding,
-            historical_handoff: Option<Historical25RecoveryRecord>,
         ) -> Self {
             let host_commitments = authority.host_commitments();
-            let (
-                terminal_source,
-                source_historical_generation,
-                source_historical_graph_commitment,
-                source_historical_compatibility_digest,
-            ) = match historical_handoff.filter(|record| record.is_terminal()) {
-                Some(record) => (
-                    CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff,
-                    record.generation,
-                    record.graph_commitment,
-                    record.compatibility_contract_digest,
-                ),
-                None => (
-                    CurrentRecoveryTerminalSourceKind::CurrentGraph,
-                    0,
-                    [0; 32],
-                    [0; 32],
-                ),
-            };
             Self {
                 phase: CurrentRecoveryPhase::InProgress,
                 namespace_hash,
@@ -16667,10 +16697,10 @@ mod aya_runtime {
                 leaf_commitment: host_commitments.leaf().bytes(),
                 fence_epoch: authority.fence_epoch().get(),
                 operation_id: authority.operation_id().bytes(),
-                terminal_source,
-                source_historical_generation,
-                source_historical_graph_commitment,
-                source_historical_compatibility_digest,
+                terminal_source: CurrentRecoveryTerminalSourceKind::CurrentGraph,
+                source_historical_generation: 0,
+                source_historical_graph_commitment: [0; 32],
+                source_historical_compatibility_digest: [0; 32],
                 prior_scope_commitment: [0; 32],
                 prior_predecessor_basis_commitment: [0; 32],
                 prior_host_commitment: [0; 32],
@@ -16680,6 +16710,55 @@ mod aya_runtime {
                 prior_operation_id: [0; 16],
                 prior_terminal_receipt_commitment: [0; 32],
             }
+        }
+
+        /// Construct the current-domain terminal WAL that authenticates one
+        /// already completed shipped-R5 handoff. This is deliberately not a
+        /// current graph record: the zero current identity fields prevent the
+        /// 25-map source from being interpreted as a fabricated 34-map graph.
+        fn terminal_from_historical_handoff(
+            namespace_hash: [u8; 32],
+            authority: crate::CurrentEbpfGraphRecoveryAuthorityBinding,
+            historical: Historical25RecoveryRecord,
+        ) -> Option<Self> {
+            if !historical.is_terminal()
+                || historical.generation != 1
+                || historical.graph_commitment == [0; 32]
+                || historical.compatibility_contract_digest
+                    != historical_25_compatibility_contract_digest()
+            {
+                return None;
+            }
+            let host_commitments = authority.host_commitments();
+            Some(Self {
+                phase: CurrentRecoveryPhase::Terminal,
+                namespace_hash,
+                allow_populated: false,
+                map_ids: [0; CURRENT_MAP_NAMES.len()],
+                graph_device: 0,
+                graph_inode: 0,
+                proof_map_id: 0,
+                authority_contract: current_recovery_authority_contract_commitment(),
+                scope_commitment: authority.scope_commitment().bytes(),
+                predecessor_basis_commitment: authority.predecessor_basis_commitment().bytes(),
+                host_commitment: host_commitments.host().bytes(),
+                root_commitment: host_commitments.root().bytes(),
+                leaf_commitment: host_commitments.leaf().bytes(),
+                fence_epoch: authority.fence_epoch().get(),
+                operation_id: authority.operation_id().bytes(),
+                terminal_source: CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff,
+                source_historical_generation: historical.generation,
+                source_historical_graph_commitment: historical.graph_commitment,
+                source_historical_compatibility_digest: historical.compatibility_contract_digest,
+                prior_scope_commitment: [0; 32],
+                prior_predecessor_basis_commitment: [0; 32],
+                prior_host_commitment: [0; 32],
+                prior_root_commitment: [0; 32],
+                prior_leaf_commitment: [0; 32],
+                prior_fence_epoch: 0,
+                prior_operation_id: [0; 16],
+                prior_terminal_receipt_commitment: [0; 32],
+            })
         }
 
         fn matches_authority(
@@ -16757,14 +16836,30 @@ mod aya_runtime {
 
         fn terminal_graph_commitment(self) -> [u8; 32] {
             let mut digest = Sha256::new();
-            digest.update(b"opc.gtpu.current-ebpf-terminal-graph\0r1");
+            match self.terminal_source {
+                CurrentRecoveryTerminalSourceKind::CurrentGraph => {
+                    digest.update(b"opc.gtpu.current-ebpf-terminal-graph\0r1");
+                }
+                CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff => {
+                    digest.update(b"opc.gtpu.current-ebpf-terminal-historical-r5\0r1");
+                }
+            }
             digest.update(crate::CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID.as_bytes());
             digest.update(crate::CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID.as_bytes());
             digest.update(self.namespace_hash);
-            digest.update(self.graph_device.to_be_bytes());
-            digest.update(self.graph_inode.to_be_bytes());
-            for map_id in self.map_ids {
-                digest.update(map_id.to_be_bytes());
+            match self.terminal_source {
+                CurrentRecoveryTerminalSourceKind::CurrentGraph => {
+                    digest.update(self.graph_device.to_be_bytes());
+                    digest.update(self.graph_inode.to_be_bytes());
+                    for map_id in self.map_ids {
+                        digest.update(map_id.to_be_bytes());
+                    }
+                }
+                CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff => {
+                    digest.update([self.source_historical_generation]);
+                    digest.update(self.source_historical_graph_commitment);
+                    digest.update(self.source_historical_compatibility_digest);
+                }
             }
             digest.update(self.proof_map_id.to_be_bytes());
             digest.finalize().into()
@@ -17082,9 +17177,6 @@ mod aya_runtime {
             };
             (record.namespace_hash != [0; 32]
                 && record.proof_map_id != 0
-                && record.graph_device != 0
-                && record.graph_inode != 0
-                && record.map_ids.iter().all(|id| *id != 0)
                 && record.authority_contract == current_recovery_authority_contract_commitment()
                 && record.scope_commitment != [0; 32]
                 && record.predecessor_basis_commitment != [0; 32]
@@ -17095,12 +17187,20 @@ mod aya_runtime {
                 && record.operation_id != [0; 16]
                 && match record.terminal_source {
                     CurrentRecoveryTerminalSourceKind::CurrentGraph => {
-                        record.source_historical_generation == 0
+                        record.graph_device != 0
+                            && record.graph_inode != 0
+                            && record.map_ids.iter().all(|id| *id != 0)
+                            && record.source_historical_generation == 0
                             && record.source_historical_graph_commitment == [0; 32]
                             && record.source_historical_compatibility_digest == [0; 32]
                     }
                     CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff => {
-                        record.source_historical_generation == 1
+                        record.is_terminal()
+                            && !record.allow_populated
+                            && record.graph_device == 0
+                            && record.graph_inode == 0
+                            && record.map_ids == [0; CURRENT_MAP_NAMES.len()]
+                            && record.source_historical_generation == 1
                             && record.source_historical_graph_commitment != [0; 32]
                             && record.source_historical_compatibility_digest
                                 == historical_25_compatibility_contract_digest()
@@ -18456,6 +18556,28 @@ mod aya_runtime {
                         || (first == HISTORICAL_25_OPERATION_LOCK_MARKER
                             && second == HISTORICAL_25_ROOT_HANDOFF_MARKER) =>
                 {
+                    (false, true)
+                }
+                [first, second, third]
+                    if [first.as_str(), second.as_str(), third.as_str()]
+                        .into_iter()
+                        .all(|entry| {
+                            [
+                                HISTORICAL_25_ROOT_HANDOFF_MARKER,
+                                HISTORICAL_25_OPERATION_LOCK_MARKER,
+                                CURRENT_RECOVERY_TERMINAL_PROOF_MAP,
+                            ]
+                            .contains(&entry)
+                        })
+                        && first != second
+                        && first != third
+                        && second != third =>
+                {
+                    // A current-domain terminal map may be added only after
+                    // the R5 proof/operation pair is terminal. Its contents
+                    // are authenticated by the current reader; accepting the
+                    // fixed third leaf here merely keeps the predecessor
+                    // handoff traversable for that exact readback and retry.
                     (false, true)
                 }
                 _ => (false, false),
@@ -20664,6 +20786,7 @@ mod aya_runtime {
             let mut decommissioned = Vec::new();
             let mut historical_receipt = false;
             let mut historical_operation_lock = false;
+            let mut current_terminal = false;
             let directory = rustix::fs::Dir::read_from(control)
                 .map_err(|error| GtpuError::io("ebpf_selector_marker_enumerate", error.into()))?;
             for entry in directory {
@@ -20708,6 +20831,25 @@ mod aya_runtime {
                         ));
                     }
                     historical_operation_lock = true;
+                    continue;
+                }
+                if name == CURRENT_RECOVERY_TERMINAL_PROOF_MAP {
+                    // This fixed current-domain WAL leaf is interpreted only
+                    // by `read_current_terminal_proof`; selector inventory
+                    // grants it no authority. It must nevertheless remain a
+                    // single exact pin leaf so a completed R5 handoff can be
+                    // re-opened after the direct terminal publication cut.
+                    Self::pin_leaf_identity(
+                        control,
+                        name,
+                        "ebpf_selector_current_terminal_enumerate",
+                    )?;
+                    if current_terminal {
+                        return Err(state_indeterminate(
+                            "ebpf_selector_current_terminal_enumerate",
+                        ));
+                    }
+                    current_terminal = true;
                     continue;
                 }
                 if let Some(hex) = name.strip_prefix(AUTHORITY) {
@@ -27204,6 +27346,148 @@ mod aya_runtime {
             )
         }
 
+        fn historical_handoff_matches_current_terminal(
+            ownership: &ReconcilerOwnership,
+            record: CurrentRecoveryRecord,
+        ) -> bool {
+            record.is_terminal()
+                && record.terminal_source == CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff
+                && ownership
+                    .historical_25_handoff
+                    .as_ref()
+                    .is_some_and(|handoff| {
+                        let historical = handoff.receipt.proof.record;
+                        historical.is_terminal()
+                            && historical.namespace_hash == ownership.namespace_hash
+                            && historical.generation == record.source_historical_generation
+                            && historical.graph_commitment
+                                == record.source_historical_graph_commitment
+                            && historical.compatibility_contract_digest
+                                == record.source_historical_compatibility_digest
+                    })
+        }
+
+        /// Validate the graph-absence evidence in the record's own source
+        /// domain. A shipped-R5 terminal never routes its zero current map
+        /// inventory through the current-program scanner.
+        fn current_terminal_source_absence_is_proven(
+            ownership: &ReconcilerOwnership,
+            terminal: CurrentRecoveryProof,
+        ) -> Result<bool, GtpuError> {
+            if !terminal.record.is_terminal() {
+                return Ok(false);
+            }
+            match terminal.record.terminal_source {
+                CurrentRecoveryTerminalSourceKind::CurrentGraph => Ok(matches!(
+                    Self::current_program_references(&terminal.record.map_ids, None),
+                    Ok(CurrentProgramReference::Absent)
+                )),
+                CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff => Ok(
+                    Self::historical_handoff_matches_current_terminal(ownership, terminal.record)
+                        && matches!(
+                            fs::symlink_metadata(&ownership.canonical_pin_dir),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound
+                        ),
+                ),
+            }
+        }
+
+        fn current_terminal_can_precede_present_graph(
+            ownership: &ReconcilerOwnership,
+            terminal: CurrentRecoveryProof,
+            graph_identity: (u64, u64),
+            authority: crate::CurrentEbpfGraphRecoveryAuthorityBinding,
+        ) -> Result<bool, GtpuError> {
+            if !terminal.record.is_terminal()
+                || !terminal.record.matches_authority_target(authority)
+                || graph_identity.0 == 0
+                || graph_identity.1 == 0
+            {
+                return Ok(false);
+            }
+            match terminal.record.terminal_source {
+                CurrentRecoveryTerminalSourceKind::CurrentGraph => {
+                    Ok((terminal.record.graph_device, terminal.record.graph_inode)
+                        != graph_identity
+                        && matches!(
+                            Self::current_program_references(&terminal.record.map_ids, None),
+                            Ok(CurrentProgramReference::Absent)
+                        ))
+                }
+                CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff => {
+                    let Some(historical) = ownership
+                        .historical_25_handoff
+                        .as_ref()
+                        .map(|handoff| handoff.receipt.proof.record)
+                    else {
+                        return Ok(false);
+                    };
+                    Ok(Self::historical_handoff_matches_current_terminal(
+                        ownership,
+                        terminal.record,
+                    ) && (historical.graph_device, historical.graph_inode) != graph_identity
+                        && Self::historical_25_program_references_absent(&historical.map_ids)?)
+                }
+            }
+        }
+
+        fn exact_map_id_inventories_are_disjoint(predecessor: &[u32], current: &[u32]) -> bool {
+            let exact = |ids: &[u32]| {
+                !ids.is_empty()
+                    && ids
+                        .iter()
+                        .enumerate()
+                        .all(|(index, id)| *id != 0 && ids[..index].iter().all(|prior| prior != id))
+            };
+            exact(predecessor)
+                && exact(current)
+                && predecessor.iter().all(|id| !current.contains(id))
+        }
+
+        fn current_terminal_precedes_current_record(
+            ownership: &ReconcilerOwnership,
+            terminal: CurrentRecoveryProof,
+            current: CurrentRecoveryRecord,
+        ) -> Result<bool, GtpuError> {
+            let Some(authority) = current.authority_binding() else {
+                return Ok(false);
+            };
+            if current.terminal_source != CurrentRecoveryTerminalSourceKind::CurrentGraph
+                || current.graph_device == 0
+                || current.graph_inode == 0
+                || current.map_ids.contains(&0)
+                || !Self::current_terminal_can_precede_present_graph(
+                    ownership,
+                    terminal,
+                    (current.graph_device, current.graph_inode),
+                    authority,
+                )?
+            {
+                return Ok(false);
+            }
+            match terminal.record.terminal_source {
+                CurrentRecoveryTerminalSourceKind::CurrentGraph => {
+                    Ok(Self::exact_map_id_inventories_are_disjoint(
+                        &terminal.record.map_ids,
+                        &current.map_ids,
+                    ))
+                }
+                CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff => {
+                    let Some(historical) = ownership
+                        .historical_25_handoff
+                        .as_ref()
+                        .map(|handoff| handoff.receipt.proof.record)
+                    else {
+                        return Ok(false);
+                    };
+                    Ok(Self::exact_map_id_inventories_are_disjoint(
+                        &historical.map_ids,
+                        &current.map_ids,
+                    ))
+                }
+            }
+        }
+
         fn read_current_recovery_proof_at(
             path: PathBuf,
             ownership: &ReconcilerOwnership,
@@ -27413,11 +27697,20 @@ mod aya_runtime {
             Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
             let expected =
                 Self::promote_current_recovery_proof_to_terminal(ownership, expected, currentness)?;
-            match Self::read_current_terminal_proof(ownership) {
+            let predecessor = match Self::read_current_terminal_proof(ownership) {
                 Ok(Some(existing)) if existing == expected => return Ok(expected),
+                Ok(Some(existing))
+                    if Self::current_terminal_precedes_current_record(
+                        ownership,
+                        existing,
+                        expected.record,
+                    )? =>
+                {
+                    Some(existing)
+                }
                 Ok(Some(_)) | Err(_) => return Err(state_indeterminate(OPERATION)),
-                Ok(None) => {}
-            }
+                Ok(None) => None,
+            };
             if Self::read_current_recovery_proof(ownership)? != Some(expected)
                 || !matches!(
                     Self::current_graph_directory_matches(ownership, expected.record),
@@ -27427,6 +27720,57 @@ mod aya_runtime {
                 return Err(state_indeterminate(OPERATION));
             }
             let path = Self::current_recovery_terminal_proof_path(ownership)?;
+            let _predecessor_data = if let Some(predecessor) = predecessor {
+                if Self::read_current_terminal_proof(ownership)? != Some(predecessor)
+                    || !Self::current_terminal_precedes_current_record(
+                        ownership,
+                        predecessor,
+                        expected.record,
+                    )?
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                let data = MapData::from_pin(&path).map_err(|_| state_indeterminate(OPERATION))?;
+                if data
+                    .info()
+                    .map_err(|_| state_indeterminate(OPERATION))?
+                    .id()
+                    != predecessor.map_id
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                if Self::read_current_recovery_proof(ownership)? != Some(expected)
+                    || !matches!(
+                        Self::current_graph_directory_matches(ownership, expected.record),
+                        Ok(true)
+                    )
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+                rustix::fs::unlinkat(
+                    &ownership._lease,
+                    CURRENT_RECOVERY_TERMINAL_PROOF_MAP,
+                    rustix::fs::AtFlags::empty(),
+                )
+                .map_err(|_| state_indeterminate(OPERATION))?;
+                Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+                if Self::read_current_terminal_proof(ownership)?.is_some() {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                Some(data)
+            } else {
+                None
+            };
+            if Self::read_current_recovery_proof(ownership)? != Some(expected)
+                || !matches!(
+                    Self::current_graph_directory_matches(ownership, expected.record),
+                    Ok(true)
+                )
+            {
+                return Err(state_indeterminate(OPERATION));
+            }
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
             if proof_data.pin(&path).is_err() {
                 return match Self::read_current_terminal_proof(ownership) {
                     Ok(Some(existing)) if existing == expected => Ok(expected),
@@ -27442,6 +27786,120 @@ mod aya_runtime {
             // crash cut could make a later empty graph look terminal.
             Self::sync_control_directory(&ownership._lease, OPERATION)?;
             Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+            Ok(expected)
+        }
+
+        /// Publish a current-domain terminal WAL directly from one exact,
+        /// retained shipped-R5 handoff. The historical graph is already gone,
+        /// so there is no current in-graph proof to promote or second-pin.
+        /// Every pre/post publication observation is made under the retained
+        /// operation flock and the externally live currentness guard.
+        fn publish_historical_handoff_current_terminal_proof(
+            ownership: &ReconcilerOwnership,
+            operation_lock: &OperationControlLock,
+            replacement: (&str, u32),
+            tc_priority: u16,
+            authority: crate::CurrentEbpfGraphRecoveryAuthorityBinding,
+            currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
+        ) -> Result<CurrentRecoveryProof, GtpuError> {
+            const OPERATION: &str = "ebpf_current_historical_handoff_terminal_publish";
+            let historical = ownership
+                .historical_25_handoff
+                .as_ref()
+                .map(|handoff| handoff.receipt.proof.record)
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let unbound = CurrentRecoveryRecord::terminal_from_historical_handoff(
+                ownership.namespace_hash,
+                authority,
+                historical,
+            )
+            .ok_or_else(|| state_indeterminate(OPERATION))?;
+
+            let exact_preflight = || {
+                Self::revalidate_current_control_path(ownership, operation_lock, OPERATION)?;
+                if !matches!(Self::read_current_recovery_proof(ownership), Ok(None))
+                    || !matches!(
+                        fs::symlink_metadata(&ownership.canonical_pin_dir),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound
+                    )
+                    || !matches!(
+                        Self::replacement_cleanup_absence_proven(replacement, tc_priority),
+                        Ok(true)
+                    )
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                Ok(())
+            };
+
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+            exact_preflight()?;
+            match Self::read_current_terminal_proof(ownership) {
+                Ok(Some(existing))
+                    if existing.record.matches_unbound(unbound)
+                        && Self::current_terminal_source_absence_is_proven(
+                            ownership, existing,
+                        )? =>
+                {
+                    Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+                    exact_preflight()?;
+                    return Ok(existing);
+                }
+                Ok(Some(_)) | Err(_) => return Err(state_indeterminate(OPERATION)),
+                Ok(None) => {}
+            }
+
+            let mut proof = Array::<MapData, [u8; CURRENT_RECOVERY_PROOF_LEN]>::create(1, 0)
+                .map_err(|_| state_indeterminate(OPERATION))?;
+            let info = proof
+                .map()
+                .info()
+                .map_err(|_| state_indeterminate(OPERATION))?;
+            if info
+                .map_type()
+                .map_err(|_| state_indeterminate(OPERATION))? as u32
+                != bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+                || info.key_size() != 4
+                || info.value_size() != CURRENT_RECOVERY_PROOF_LEN as u32
+                || info.max_entries() != 1
+                || info.map_flags() != 0
+            {
+                return Err(state_indeterminate(OPERATION));
+            }
+            let record = unbound
+                .bind_to_proof_map(info.id())
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            proof
+                .set(0, record.encode(), 0)
+                .map_err(|_| state_indeterminate(OPERATION))?;
+            let expected = CurrentRecoveryProof {
+                record,
+                map_id: info.id(),
+            };
+
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+            exact_preflight()?;
+            if !matches!(Self::read_current_terminal_proof(ownership), Ok(None)) {
+                return Err(state_indeterminate(OPERATION));
+            }
+            let path = Self::current_recovery_terminal_proof_path(ownership)?;
+            if proof.pin(&path).is_err() {
+                return match Self::read_current_terminal_proof(ownership) {
+                    Ok(Some(existing)) if existing == expected => Ok(existing),
+                    Ok(Some(_)) | Ok(None) | Err(_) => Err(state_indeterminate(OPERATION)),
+                };
+            }
+            Self::sync_control_directory(&ownership._lease, OPERATION)?;
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+            exact_preflight()?;
+            if Self::read_current_terminal_proof(ownership)? != Some(expected)
+                || !Self::current_terminal_source_absence_is_proven(ownership, expected)?
+            {
+                return Err(state_indeterminate(OPERATION));
+            }
+            Self::sync_control_directory(&ownership._lease, OPERATION)?;
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+            exact_preflight()?;
             Ok(expected)
         }
 
@@ -28033,8 +28491,8 @@ mod aya_runtime {
             }
             if Self::read_current_terminal_proof(ownership)? != Some(terminal)
                 || !matches!(
-                    Self::current_program_references(&terminal.record.map_ids, None),
-                    Ok(CurrentProgramReference::Absent)
+                    Self::current_terminal_source_absence_is_proven(ownership, terminal),
+                    Ok(true)
                 )
             {
                 return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
@@ -28071,7 +28529,9 @@ mod aya_runtime {
                     }
                 }
                 Ok(metadata)
-                    if metadata.file_type().is_dir()
+                    if terminal.record.terminal_source
+                        == CurrentRecoveryTerminalSourceKind::CurrentGraph
+                        && metadata.file_type().is_dir()
                         && !metadata.file_type().is_symlink()
                         && (metadata.dev(), metadata.ino())
                             == (terminal.record.graph_device, terminal.record.graph_inode) =>
@@ -34517,8 +34977,8 @@ mod aya_runtime {
                     Err(error) if error.kind() == io::ErrorKind::NotFound
                 )
                 || !matches!(
-                    Self::current_program_references(&terminal.record.map_ids, None),
-                    Ok(CurrentProgramReference::Absent)
+                    Self::current_terminal_source_absence_is_proven(&ownership, terminal),
+                    Ok(true)
                 )
             {
                 return Ok(None);
@@ -34616,8 +35076,8 @@ mod aya_runtime {
                     Err(error) if error.kind() == io::ErrorKind::NotFound
                 )
                 || !matches!(
-                    Self::current_program_references(&terminal.record.map_ids, None),
-                    Ok(CurrentProgramReference::Absent)
+                    Self::current_terminal_source_absence_is_proven(&ownership, terminal),
+                    Ok(true)
                 )
             {
                 return Ok(None);
@@ -34823,7 +35283,7 @@ mod aya_runtime {
                     }
                     Err(error) => return Err(error),
                 };
-            let _graph_lock =
+            let graph_lock =
                 Self::acquire_operation_control_lock(&ownership, "ebpf_current_graph_recovery")?;
             if let Err(currentness) = currentness.verify_current() {
                 return authority_refused(currentness);
@@ -34837,11 +35297,6 @@ mod aya_runtime {
                     ));
                 }
             };
-            if let Some(terminal) = terminal_proof {
-                if !terminal.record.matches_authority(authority) {
-                    return refused(CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch);
-                }
-            }
             let existing_proof = match Self::read_current_recovery_proof(&ownership) {
                 Ok(proof) => proof,
                 Err(_) => {
@@ -34863,9 +35318,21 @@ mod aya_runtime {
             };
             if let (Some(terminal), Some(proof)) = (terminal_proof, existing_proof) {
                 if terminal != proof {
-                    return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
-                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
-                    ));
+                    match Self::current_terminal_precedes_current_record(
+                        &ownership,
+                        terminal,
+                        proof.record,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) if !terminal.record.matches_authority_target(authority) => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch);
+                        }
+                        Ok(false) | Err(_) => {
+                            return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                                CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                            ));
+                        }
+                    }
                 }
             }
             if let Some(proof) = existing_proof {
@@ -34883,29 +35350,78 @@ mod aya_runtime {
                     currentness,
                 );
             }
-            if let Some(terminal) = terminal_proof {
-                return Self::complete_current_terminal_recovery(
-                    &ownership,
-                    terminal,
-                    replacement,
-                    tc_priority,
-                    managed_state,
-                    authority,
-                    currentness,
-                );
-            }
-            match managed_state {
-                CurrentRecoveryManagedState::Clear => {}
-                CurrentRecoveryManagedState::Conflict => {
-                    return refused(CurrentEbpfGraphRecoveryRefusal::ManagedAttachment);
-                }
-                CurrentRecoveryManagedState::Indeterminate => {
-                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
-                }
-            }
-
             let metadata = match fs::symlink_metadata(&ownership.canonical_pin_dir) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if let Some(terminal) = terminal_proof {
+                        return Self::complete_current_terminal_recovery(
+                            &ownership,
+                            terminal,
+                            replacement,
+                            tc_priority,
+                            managed_state,
+                            authority,
+                            currentness,
+                        );
+                    }
+                    match managed_state {
+                        CurrentRecoveryManagedState::Clear => {}
+                        CurrentRecoveryManagedState::Conflict => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::ManagedAttachment);
+                        }
+                        CurrentRecoveryManagedState::Indeterminate => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                        }
+                    }
+                    if ownership.historical_25_handoff.is_some() {
+                        let Some(replacement) = replacement else {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                        };
+                        match Self::replacement_cleanup_absence_proven(replacement, tc_priority) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+                            }
+                            Err(ReplacementHookObservationError::IdentityChanged) => {
+                                return refused(
+                                    CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                                );
+                            }
+                            Err(ReplacementHookObservationError::Indeterminate) => {
+                                return refused(
+                                    CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                                );
+                            }
+                        }
+                        return match Self::publish_historical_handoff_current_terminal_proof(
+                            &ownership,
+                            &graph_lock,
+                            replacement,
+                            tc_priority,
+                            authority,
+                            currentness,
+                        ) {
+                            Ok(terminal)
+                                if terminal.record.matches_authority(authority)
+                                    && matches!(
+                                        Self::current_terminal_source_absence_is_proven(
+                                            &ownership, terminal,
+                                        ),
+                                        Ok(true)
+                                    ) =>
+                            {
+                                Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent)
+                            }
+                            Ok(_) => Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                                CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                            )),
+                            Err(_) => match currentness.first_failure() {
+                                Some(currentness) => authority_refused(currentness),
+                                None => Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                                )),
+                            },
+                        };
+                    }
                     if let Some(replacement) = replacement {
                         return match Self::replacement_cleanup_absence_proven(replacement, tc_priority) {
                             Ok(true) => Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent),
@@ -34927,6 +35443,50 @@ mod aya_runtime {
             };
             if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
                 return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+            }
+            let terminal_predecessor = if let Some(terminal) = terminal_proof {
+                if terminal.record.terminal_source
+                    == CurrentRecoveryTerminalSourceKind::CurrentGraph
+                    && (terminal.record.graph_device, terminal.record.graph_inode)
+                        == (metadata.dev(), metadata.ino())
+                {
+                    return Self::complete_current_terminal_recovery(
+                        &ownership,
+                        terminal,
+                        replacement,
+                        tc_priority,
+                        managed_state,
+                        authority,
+                        currentness,
+                    );
+                }
+                match Self::current_terminal_can_precede_present_graph(
+                    &ownership,
+                    terminal,
+                    (metadata.dev(), metadata.ino()),
+                    authority,
+                ) {
+                    Ok(true) => Some(terminal),
+                    Ok(false) if !terminal.record.matches_authority_target(authority) => {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch);
+                    }
+                    Ok(false) | Err(_) => {
+                        return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                            CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            match managed_state {
+                CurrentRecoveryManagedState::Clear => {}
+                CurrentRecoveryManagedState::Conflict => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::ManagedAttachment);
+                }
+                CurrentRecoveryManagedState::Indeterminate => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
             }
             if Self::existing_canonical_pin_dir(&ownership, "ebpf_current_graph_pin_dir").is_err() {
                 return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
@@ -35101,11 +35661,23 @@ mod aya_runtime {
                 metadata.dev(),
                 metadata.ino(),
                 authority,
-                ownership
-                    .historical_25_handoff
-                    .as_ref()
-                    .map(|handoff| handoff.receipt.proof.record),
             );
+            if let Some(predecessor) = terminal_predecessor {
+                if Self::read_current_terminal_proof(&ownership)? != Some(predecessor)
+                    || !matches!(
+                        Self::current_terminal_precedes_current_record(
+                            &ownership,
+                            predecessor,
+                            record,
+                        ),
+                        Ok(true)
+                    )
+                {
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            }
             let proof = match Self::commit_current_recovery_proof(&ownership, record) {
                 Ok(proof) => proof,
                 Err(CurrentProofCommitError::BeforePublication) => {
@@ -37677,7 +38249,6 @@ mod aya_runtime {
                 41,
                 42,
                 super::super::test_current_ebpf_graph_recovery_authority_binding(),
-                None,
             )
             .bind_to_proof_map(99)
             .unwrap();
@@ -37702,12 +38273,141 @@ mod aya_runtime {
                         41,
                         42,
                         super::super::test_current_ebpf_graph_recovery_authority_binding(),
-                        None,
                     )
                     .encode(),
                 ),
                 None
             );
+        }
+
+        #[test]
+        fn historical_handoff_current_terminal_codec_never_accepts_current_graph_identity() {
+            let map_ids = std::array::from_fn(|index| u32::try_from(index + 1).unwrap());
+            let mut historical = Historical25RecoveryRecord::unbound(
+                super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                [0x11; 32],
+                [0x12; 16],
+                (2, 3),
+                (6, 7),
+                (
+                    historical_25_replacement_name_commitment("up0").unwrap(),
+                    7,
+                    50,
+                ),
+                ((0, 0), (0, 0)),
+                map_ids,
+            );
+            historical.phase = Historical25RecoveryPhase::Terminal;
+            let record = CurrentRecoveryRecord::terminal_from_historical_handoff(
+                [0x11; 32],
+                super::super::test_current_ebpf_graph_recovery_authority_binding(),
+                historical,
+            )
+            .expect("exact R5 terminal constructs a source-tagged current WAL")
+            .bind_to_proof_map(99)
+            .expect("bind direct terminal proof map");
+            assert_eq!(
+                CurrentRecoveryRecord::decode(&record.encode()),
+                Some(record)
+            );
+
+            let mut with_current_graph_identity = record;
+            with_current_graph_identity.graph_device = 41;
+            with_current_graph_identity.graph_inode = 42;
+            with_current_graph_identity.map_ids = [73; CURRENT_MAP_NAMES.len()];
+            assert_eq!(
+                CurrentRecoveryRecord::decode(&with_current_graph_identity.encode()),
+                None,
+                "an R5 terminal cannot carry a fabricated current graph identity"
+            );
+            let mut in_progress = record;
+            in_progress.phase = CurrentRecoveryPhase::InProgress;
+            assert_eq!(CurrentRecoveryRecord::decode(&in_progress.encode()), None);
+            let mut populated = record;
+            populated.allow_populated = true;
+            assert_eq!(CurrentRecoveryRecord::decode(&populated.encode()), None);
+
+            let mut wrong_generation = historical;
+            wrong_generation.generation = 2;
+            assert_eq!(
+                CurrentRecoveryRecord::terminal_from_historical_handoff(
+                    [0x11; 32],
+                    super::super::test_current_ebpf_graph_recovery_authority_binding(),
+                    wrong_generation,
+                ),
+                None
+            );
+            let mut wrong_contract = historical;
+            wrong_contract.compatibility_contract_digest[0] ^= 1;
+            assert_eq!(
+                CurrentRecoveryRecord::terminal_from_historical_handoff(
+                    [0x11; 32],
+                    super::super::test_current_ebpf_graph_recovery_authority_binding(),
+                    wrong_contract,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn historical_handoff_inventory_accepts_only_the_exact_terminal_bridge_leaf() {
+            let proof = HISTORICAL_25_ROOT_HANDOFF_MARKER.to_string();
+            let operation = HISTORICAL_25_OPERATION_LOCK_MARKER.to_string();
+            let terminal = CURRENT_RECOVERY_TERMINAL_PROOF_MAP.to_string();
+            for entries in [
+                vec![proof.clone(), operation.clone(), terminal.clone()],
+                vec![proof.clone(), terminal.clone(), operation.clone()],
+                vec![operation.clone(), proof.clone(), terminal.clone()],
+                vec![operation.clone(), terminal.clone(), proof.clone()],
+                vec![terminal.clone(), proof.clone(), operation.clone()],
+                vec![terminal.clone(), operation.clone(), proof.clone()],
+            ] {
+                assert_eq!(
+                    AyaGtpuRuntime::historical_25_handoff_inventory(&entries),
+                    (false, true)
+                );
+            }
+            for entries in [
+                vec![proof.clone(), terminal.clone()],
+                vec![operation.clone(), terminal.clone()],
+                vec![proof.clone(), operation.clone(), "FOREIGN".to_string()],
+                vec![
+                    proof.clone(),
+                    operation.clone(),
+                    terminal.clone(),
+                    "FOREIGN".to_string(),
+                ],
+            ] {
+                assert_eq!(
+                    AyaGtpuRuntime::historical_25_handoff_inventory(&entries),
+                    (false, false),
+                    "partial or foreign authority inventory stays indeterminate"
+                );
+            }
+        }
+
+        #[test]
+        fn terminal_supersession_requires_exact_disjoint_map_id_inventories() {
+            let predecessor = [1_u32, 2, 3];
+            let current = [4_u32, 5, 6];
+            assert!(AyaGtpuRuntime::exact_map_id_inventories_are_disjoint(
+                &predecessor,
+                &current
+            ));
+            for (left, right) in [
+                (&[][..], &current[..]),
+                (&predecessor[..], &[][..]),
+                (&[0, 2, 3][..], &current[..]),
+                (&predecessor[..], &[0, 5, 6][..]),
+                (&[1, 1, 3][..], &current[..]),
+                (&predecessor[..], &[4, 4, 6][..]),
+                (&predecessor[..], &[3, 5, 6][..]),
+            ] {
+                assert!(
+                    !AyaGtpuRuntime::exact_map_id_inventories_are_disjoint(left, right),
+                    "zero, duplicate, empty, or overlapping inventories fail closed"
+                );
+            }
         }
 
         #[test]
@@ -41862,6 +42562,7 @@ mod tests {
         proof_committed: bool,
         proof_allows_populated: bool,
         pins_remaining: usize,
+        graph_commitment: [u8; 32],
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41981,6 +42682,7 @@ mod tests {
                 proof_committed: false,
                 proof_allows_populated: false,
                 pins_remaining: CURRENT_PIN_COUNT,
+                graph_commitment: [0xc1; 32],
             }
         }
     }
@@ -42251,6 +42953,39 @@ mod tests {
             self.state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn current_terminal_source_is_exact(
+            state: &FakeState,
+            pin_dir: &Path,
+            source: crate::CurrentEbpfGraphRecoveryTerminalSource,
+        ) -> bool {
+            match source {
+                crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph => true,
+                crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                    exact_historical_graph_commitment,
+                } => {
+                    state
+                        .historical_25_terminal_graph_commitments
+                        .get(pin_dir)
+                        .is_some_and(|commitment| {
+                            *commitment == exact_historical_graph_commitment.bytes()
+                        })
+                        && state
+                            .historical_25_receipts
+                            .get(pin_dir)
+                            .is_some_and(|receipt| {
+                                receipt.phase == FakeHistorical25ReceiptPhase::Terminal
+                                    && receipt.current_proof
+                                    && receipt.same_map_id
+                                    && !receipt.legacy_proof
+                            })
+                        && state.historical_25_operation_markers.contains(pin_dir)
+                        && !state.historical_25_legacy_leaves.contains(pin_dir)
+                        && !state.historical_25_staging.contains_key(pin_dir)
+                        && state.historical_25_authorities.contains_key(pin_dir)
+                }
+            }
         }
 
         fn historical_25_ordinary_preflight(
@@ -44819,7 +45554,14 @@ mod tests {
                 return Ok(None);
             }
             let snapshot = match state.current_recovery_terminal_leaves.get(pin_dir) {
-                Some(terminal) if terminal.authority == authority => {
+                Some(terminal)
+                    if terminal.authority == authority
+                        && Self::current_terminal_source_is_exact(
+                            &state,
+                            pin_dir,
+                            terminal.source,
+                        ) =>
+                {
                     let graph =
                         crate::CurrentEbpfGraphRecoveryCommitment::new(terminal.graph_commitment)
                             .map_err(|_| state_indeterminate("fake_current_terminal_snapshot"))?;
@@ -44833,13 +45575,9 @@ mod tests {
                 None if !state.current_recovery_authority_leaves.contains(pin_dir)
                         && !state.historical_25_legacy_leaves.contains(pin_dir)
                         && !state.historical_25_staging.contains_key(pin_dir)
-                        // A terminal R5 handoff is a distinct 25-map codec,
-                        // not an OPCCURR3 current terminal WAL.  In
-                        // particular, do not re-label its historical graph
-                        // commitment as a current 34-map receipt, and do not
-                        // collapse it into pristine absence.  A later current
-                        // cleanup may coexist with this exact handoff, but it
-                        // must first publish its own authenticated WAL.
+                        // A terminal R5 handoff is never pristine absence. It
+                        // first has to publish the source-tagged current WAL
+                        // in recovery; snapshot itself remains read-only.
                         && !state
                             .historical_25_receipts
                             .get(pin_dir)
@@ -44892,6 +45630,9 @@ mod tests {
             else {
                 return Ok(None);
             };
+            if !Self::current_terminal_source_is_exact(&state, pin_dir, terminal.source) {
+                return Ok(None);
+            }
             let graph =
                 match crate::CurrentEbpfGraphRecoveryCommitment::new(terminal.graph_commitment) {
                     Ok(graph) => graph,
@@ -44986,6 +45727,29 @@ mod tests {
                     },
                 ));
             }
+            let historical_terminal_source = state
+                .historical_25_receipts
+                .get(pin_dir)
+                .filter(|receipt| {
+                    receipt.phase == FakeHistorical25ReceiptPhase::Terminal
+                        && receipt.current_proof
+                        && receipt.same_map_id
+                        && !receipt.legacy_proof
+                        && state.historical_25_operation_markers.contains(pin_dir)
+                        && !state.historical_25_legacy_leaves.contains(pin_dir)
+                        && !state.historical_25_staging.contains_key(pin_dir)
+                        && state.historical_25_authorities.contains_key(pin_dir)
+                })
+                .and_then(|_| state.historical_25_terminal_graph_commitments.get(pin_dir))
+                .copied()
+                .and_then(|commitment| {
+                    crate::HistoricalEbpfGraphRecoveryCommitment::new(commitment).ok()
+                })
+                .map(|exact_historical_graph_commitment| {
+                    crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                        exact_historical_graph_commitment,
+                    }
+                });
             if matches!(
                 state.historical_25_control_root_mode,
                 FakeHistorical25ControlRootMode::Predecessor0700
@@ -44993,17 +45757,7 @@ mod tests {
                     | FakeHistorical25ControlRootMode::Predecessor0750
             ) {
                 let terminal_handoff = state.historical_25_root_handoff_published
-                    && state.historical_25_operation_markers.contains(pin_dir)
-                    && !state.historical_25_legacy_leaves.contains(pin_dir)
-                    && state
-                        .historical_25_receipts
-                        .get(pin_dir)
-                        .is_some_and(|receipt| {
-                            receipt.phase == FakeHistorical25ReceiptPhase::Terminal
-                                && receipt.current_proof
-                                && receipt.same_map_id
-                                && !receipt.legacy_proof
-                        });
+                    && historical_terminal_source.is_some();
                 if !terminal_handoff {
                     return Ok(
                         if state
@@ -45083,13 +45837,58 @@ mod tests {
                     ));
                 }
                 if let Some(terminal) = state.current_recovery_terminal_leaves.get(pin_dir) {
-                    return Ok(if terminal.authority == authority {
-                        CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
-                    } else {
+                    return Ok(if terminal.authority != authority {
                         CurrentEbpfGraphRecoveryOutcome::Refused(
                             CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch,
                         )
+                    } else if !Self::current_terminal_source_is_exact(
+                        &state,
+                        pin_dir,
+                        terminal.source,
+                    ) {
+                        CurrentEbpfGraphRecoveryOutcome::Refused(
+                            CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                        )
+                    } else {
+                        CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
                     });
+                }
+                if let Some(source) = historical_terminal_source {
+                    if state.current_recovery_authority_leaves.contains(pin_dir) {
+                        return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                            CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                        ));
+                    }
+                    if let Err(currentness) = currentness.verify_current() {
+                        return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                            current_recovery_currentness_refusal(currentness),
+                        ));
+                    }
+                    state
+                        .current_recovery_authority_leaves
+                        .insert(pin_dir.to_path_buf());
+                    state.current_recovery_terminal_leaves.insert(
+                        pin_dir.to_path_buf(),
+                        FakeCurrentTerminalWal {
+                            authority,
+                            graph_commitment: [0xc5; 32],
+                            source,
+                            adoption: None,
+                        },
+                    );
+                    state
+                        .operations
+                        .push("current_historical_handoff_terminal_wal");
+                    Self::crash_if_requested(
+                        &mut state,
+                        "current_historical_handoff_terminal_wal_publish",
+                    );
+                    if let Err(currentness) = currentness.verify_current() {
+                        return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                            current_recovery_currentness_refusal(currentness),
+                        ));
+                    }
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent);
                 }
                 if state.current_recovery_authority_leaves.contains(pin_dir) {
                     return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
@@ -45146,11 +45945,26 @@ mod tests {
                     CurrentEbpfGraphRecoveryRefusal::PopulatedState,
                 ));
             }
-            // The fake mirrors the production post-WAL crash cuts exactly:
-            // once a terminal map exists, only a graph with zero recorded
-            // pins can resume proof retirement/rmdir. It never recreates a
-            // proof or rolls maps back from the old in-memory record.
-            if let Some(terminal) = state.current_recovery_terminal_leaves.get(pin_dir) {
+            // A terminal for this exact graph is the post-WAL crash cut and
+            // can resume only after every recorded map pin is gone. A
+            // distinct, exact terminal may precede a later graph generation
+            // at the same target; only maintenance can replace it after the
+            // later graph has itself reached terminal.
+            let terminal_predecessor = state
+                .current_recovery_terminal_leaves
+                .get(pin_dir)
+                .copied()
+                .filter(|terminal| {
+                    terminal.graph_commitment != graph.graph_commitment
+                        && terminal.authority.host_commitments() == authority.host_commitments()
+                        && Self::current_terminal_source_is_exact(&state, pin_dir, terminal.source)
+                });
+            if let Some(terminal) = state
+                .current_recovery_terminal_leaves
+                .get(pin_dir)
+                .copied()
+                .filter(|terminal| terminal_predecessor != Some(*terminal))
+            {
                 if terminal.authority != authority {
                     return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
                         CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch,
@@ -45178,6 +45992,18 @@ mod tests {
                 }
                 state.current_graphs.remove(pin_dir);
                 return Ok(CurrentEbpfGraphRecoveryOutcome::Removed);
+            }
+            if state.current_recovery_terminal_leaves.contains_key(pin_dir)
+                && terminal_predecessor.is_none()
+            {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            if !graph.proof_committed && graph.pins_remaining != CURRENT_PIN_COUNT {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                    CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                ));
             }
             if !graph.proof_committed {
                 if Self::fail_if_requested(&mut state, "current_proof_commit").is_err() {
@@ -45262,28 +46088,15 @@ mod tests {
             // finally removes the graph directory. Keep the fake's crash
             // cuts in this order so an empty/proofless directory cannot be
             // mistaken for a terminal merely by a test-only restoration.
-            let terminal_source = state
-                .historical_25_terminal_graph_commitments
-                .get(pin_dir)
-                .copied()
-                .and_then(|commitment| {
-                    crate::HistoricalEbpfGraphRecoveryCommitment::new(commitment).ok()
-                })
-                .map(|exact_historical_graph_commitment| {
-                    crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
-                        exact_historical_graph_commitment,
-                    }
-                })
-                .unwrap_or(crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph);
-            state
-                .current_recovery_terminal_leaves
-                .entry(pin_dir.to_path_buf())
-                .or_insert(FakeCurrentTerminalWal {
+            state.current_recovery_terminal_leaves.insert(
+                pin_dir.to_path_buf(),
+                FakeCurrentTerminalWal {
                     authority,
-                    graph_commitment: [0xc1; 32],
-                    source: terminal_source,
+                    graph_commitment: graph.graph_commitment,
+                    source: crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
                     adoption: None,
-                });
+                },
+            );
             if Self::fail_if_requested(&mut state, "current_terminal_wal_publish").is_err() {
                 return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
                     CurrentEbpfGraphRecoveryProgress::Indeterminate,
@@ -55744,11 +56557,399 @@ mod tests {
             )
         );
 
+        let repeated = backend
+            .recover_orphaned_current_ebpf_graph_with_authority_receipt(
+                current_recovery_authorized_request("s2bu-historical"),
+            )
+            .await
+            .expect("the exact terminal bridge is idempotent");
+        assert_eq!(
+            repeated.outcome(),
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+        assert_eq!(repeated.terminal_kind(), receipt.terminal_kind());
+        assert_eq!(
+            repeated.exact_graph_commitment(),
+            receipt.exact_graph_commitment()
+        );
+        assert_eq!(
+            repeated.terminal_receipt_commitment(),
+            receipt.terminal_receipt_commitment()
+        );
+        assert_eq!(repeated.terminal_source(), receipt.terminal_source());
+
         let state = runtime.state();
         assert!(!state.current_graphs.contains_key(&pin_dir));
         assert!(state
             .current_recovery_terminal_leaves
             .contains_key(&pin_dir));
+        assert_eq!(
+            state
+                .operations
+                .iter()
+                .filter(|operation| { **operation == "current_historical_handoff_terminal_wal" })
+                .count(),
+            1,
+            "an idempotent retry does not publish a second terminal WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_25_terminal_wal_is_superseded_only_by_later_exact_current_generations() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode =
+            FakeHistorical25ControlRootMode::Predecessor0755;
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .expect("retire the exact detached shipped-25 graph"),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph_with_authority(
+                    current_recovery_authorized_request("s2bu-historical"),
+                )
+                .await
+                .expect("publish the exact historical-source current WAL"),
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+
+        for graph_commitment in [[0xc1; 32], [0xc2; 32]] {
+            runtime.state().current_graphs.insert(
+                pin_dir.clone(),
+                FakeCurrentGraph {
+                    graph_commitment,
+                    ..FakeCurrentGraph::default()
+                },
+            );
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph_with_authority(
+                        current_recovery_authorized_request("s2bu-historical"),
+                    )
+                    .await
+                    .expect("retire the later exact current generation"),
+                CurrentEbpfGraphRecoveryOutcome::Removed
+            );
+            {
+                let state = runtime.state();
+                assert!(!state.current_graphs.contains_key(&pin_dir));
+                let terminal = state.current_recovery_terminal_leaves[&pin_dir];
+                assert_eq!(
+                    terminal.source,
+                    crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph
+                );
+                assert_eq!(terminal.graph_commitment, graph_commitment);
+            }
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph_with_authority(
+                        current_recovery_authorized_request("s2bu-historical"),
+                    )
+                    .await
+                    .expect("the replacement terminal is idempotent"),
+                CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+            );
+        }
+
+        let terminal_before = runtime.state().current_recovery_terminal_leaves[&pin_dir];
+        runtime.state().current_graphs.insert(
+            pin_dir.clone(),
+            FakeCurrentGraph {
+                graph_commitment: terminal_before.graph_commitment,
+                ..FakeCurrentGraph::default()
+            },
+        );
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph_with_authority(
+                    current_recovery_authorized_request("s2bu-historical"),
+                )
+                .await
+                .expect("same-generation terminal conflict is typed"),
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::Indeterminate
+            )
+        );
+        let state = runtime.state();
+        assert_eq!(
+            state.current_recovery_terminal_leaves[&pin_dir],
+            terminal_before
+        );
+        assert_eq!(
+            state.current_graphs[&pin_dir].pins_remaining,
+            CURRENT_PIN_COUNT
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_25_terminal_wal_never_authorizes_wrong_target_or_live_graph_cleanup() {
+        for case in ["wrong-target", "live-owner"] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_historical_25(&runtime);
+            runtime.state().historical_25_control_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+            assert_eq!(
+                backend
+                    .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                    .await
+                    .expect("retire the exact detached shipped-25 graph"),
+                crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+            );
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph_with_authority(
+                        current_recovery_authorized_request("s2bu-historical"),
+                    )
+                    .await
+                    .expect("publish the exact historical-source current WAL"),
+                CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+            );
+            {
+                let mut state = runtime.state();
+                state.current_graphs.insert(
+                    pin_dir.clone(),
+                    FakeCurrentGraph {
+                        active_owner: case == "live-owner",
+                        ..FakeCurrentGraph::default()
+                    },
+                );
+                if case == "wrong-target" {
+                    let commitment =
+                        |byte| crate::CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+                    state
+                        .current_recovery_terminal_leaves
+                        .get_mut(&pin_dir)
+                        .expect("published historical terminal")
+                        .authority = crate::CurrentEbpfGraphRecoveryAuthority::new(
+                        commitment(0x91),
+                        commitment(0x92),
+                        std::num::NonZeroU64::new(1).unwrap(),
+                        crate::CurrentEbpfGraphRecoveryOperationId::new([0x93; 16]).unwrap(),
+                        crate::CurrentEbpfGraphRecoveryHostCommitments::new(
+                            commitment(0xa4),
+                            commitment(0x95),
+                            commitment(0x96),
+                        ),
+                        Box::new(TestCurrentEbpfGraphRecoveryAuthorityGuard),
+                    )
+                    .binding();
+                }
+            }
+            let graph_before = runtime.state().current_graphs[&pin_dir];
+            let terminal_before = runtime.state().current_recovery_terminal_leaves[&pin_dir];
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph_with_authority(
+                        current_recovery_authorized_request("s2bu-historical"),
+                    )
+                    .await
+                    .expect("unsafe supersession is a typed refusal"),
+                CurrentEbpfGraphRecoveryOutcome::Refused(if case == "wrong-target" {
+                    CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch
+                } else {
+                    CurrentEbpfGraphRecoveryRefusal::ActiveOwner
+                }),
+                "{case}"
+            );
+            let state = runtime.state();
+            assert_eq!(state.current_graphs[&pin_dir], graph_before, "{case}");
+            assert_eq!(
+                state.current_recovery_terminal_leaves[&pin_dir], terminal_before,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_25_current_terminal_bridge_resumes_after_publication_crash_cut() {
+        let runtime = FakeRuntime::new();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode =
+            FakeHistorical25ControlRootMode::Predecessor0755;
+        let historical_authority = historical_25_authority().binding();
+        assert_eq!(
+            runtime
+                .recover_orphaned_historical_graph(
+                    crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+                    Some(("s2bu", S2BU_IFINDEX)),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    true,
+                    CurrentRecoveryManagedState::Clear,
+                    historical_authority,
+                    &TestHistoricalEbpfGraphRecoveryCurrentness,
+                )
+                .expect("retire the exact R5 graph"),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+
+        runtime.crash_after_in_order(["current_historical_handoff_terminal_wal_publish"]);
+        let current_authority = test_current_ebpf_graph_recovery_authority_binding();
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.recover_orphaned_current_graph(
+                Some(("s2bu-new", REPLACEMENT_IFINDEX)),
+                &pin_dir,
+                DEFAULT_TC_PRIORITY,
+                true,
+                CurrentRecoveryManagedState::Clear,
+                current_authority,
+                &TestCurrentEbpfGraphRecoveryCurrentness,
+            )
+        }));
+        assert!(first.is_err(), "the post-publication crash cut must fire");
+        assert!(runtime.state().crashes_after.is_empty());
+        assert!(runtime
+            .state()
+            .current_recovery_terminal_leaves
+            .contains_key(&pin_dir));
+
+        assert_eq!(
+            runtime
+                .recover_orphaned_current_graph(
+                    Some(("s2bu-new", REPLACEMENT_IFINDEX)),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    true,
+                    CurrentRecoveryManagedState::Clear,
+                    current_authority,
+                    &TestCurrentEbpfGraphRecoveryCurrentness,
+                )
+                .expect("resume from the durable source-tagged current WAL"),
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+        let terminal = runtime.state().current_recovery_terminal_leaves[&pin_dir];
+        assert_eq!(
+            terminal.source,
+            crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment:
+                    crate::HistoricalEbpfGraphRecoveryCommitment::new([0x19; 32])
+                        .expect("fixed historical commitment"),
+            }
+        );
+    }
+
+    #[test]
+    fn historical_25_current_terminal_bridge_cancellation_is_prepublication_and_retryable() {
+        let runtime = FakeRuntime::new();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode =
+            FakeHistorical25ControlRootMode::Predecessor0755;
+        assert_eq!(
+            runtime
+                .recover_orphaned_historical_graph(
+                    crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+                    Some(("s2bu", S2BU_IFINDEX)),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    true,
+                    CurrentRecoveryManagedState::Clear,
+                    historical_25_authority().binding(),
+                    &TestHistoricalEbpfGraphRecoveryCurrentness,
+                )
+                .expect("retire the exact R5 graph"),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+
+        let authority = test_current_ebpf_graph_recovery_authority_binding();
+        assert_eq!(
+            runtime
+                .recover_orphaned_current_graph(
+                    Some(("s2bu-new", REPLACEMENT_IFINDEX)),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    true,
+                    CurrentRecoveryManagedState::Clear,
+                    authority,
+                    &ScriptedCurrentEbpfGraphRecoveryCurrentness::unavailable_on(2),
+                )
+                .expect("lost currentness is a typed refusal"),
+            CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::AuthorityChanged
+            )
+        );
+        {
+            let state = runtime.state();
+            assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
+            assert!(!state
+                .current_recovery_terminal_leaves
+                .contains_key(&pin_dir));
+        }
+
+        assert_eq!(
+            runtime
+                .recover_orphaned_current_graph(
+                    Some(("s2bu-new", REPLACEMENT_IFINDEX)),
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    true,
+                    CurrentRecoveryManagedState::Clear,
+                    authority,
+                    &TestCurrentEbpfGraphRecoveryCurrentness,
+                )
+                .expect("a fresh live guard resumes the unchanged operation"),
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_25_current_terminal_bridge_refuses_incomplete_source_authority() {
+        for missing in [
+            "graph_commitment",
+            "historical_authority",
+            "operation_marker",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_historical_25(&runtime);
+            runtime.state().historical_25_control_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+            assert_eq!(
+                backend
+                    .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                    .await
+                    .expect("retire exact historical graph"),
+                crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+            );
+            {
+                let mut state = runtime.state();
+                match missing {
+                    "graph_commitment" => {
+                        state
+                            .historical_25_terminal_graph_commitments
+                            .remove(&pin_dir);
+                    }
+                    "historical_authority" => {
+                        state.historical_25_authorities.remove(&pin_dir);
+                    }
+                    "operation_marker" => {
+                        state.historical_25_operation_markers.remove(&pin_dir);
+                    }
+                    _ => unreachable!("fixed incomplete authority case"),
+                }
+            }
+
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph_with_authority(
+                        current_recovery_authorized_request("s2bu-historical"),
+                    )
+                    .await
+                    .expect("incomplete handoff is a typed refusal"),
+                CurrentEbpfGraphRecoveryOutcome::Refused(
+                    CurrentEbpfGraphRecoveryRefusal::IndeterminateState
+                ),
+                "missing {missing}"
+            );
+            let state = runtime.state();
+            assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
+            assert!(!state
+                .current_recovery_terminal_leaves
+                .contains_key(&pin_dir));
+        }
     }
 
     #[tokio::test]
@@ -55967,6 +57168,11 @@ mod tests {
                 FakeHistorical25ReceiptPhase::Terminal
             );
             assert!(state.historical_25_operation_markers.contains(&pin_dir));
+            assert_eq!(
+                state.current_recovery_terminal_leaves[&pin_dir].source,
+                crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+                "a real current graph remains current-source even under an inherited R5 root"
+            );
         }
     }
 
@@ -56378,11 +57584,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proof_disappearance_at_each_cleanup_stage_restores_the_exact_fence() {
-        for failure in [
-            "current_proof_disappear_before_cleanup",
-            "current_proof_disappear_during_cleanup",
-            "current_proof_disappear_before_finalization",
+    async fn proof_disappearance_at_each_cleanup_stage_never_recreates_authority() {
+        for (failure, expected_pins) in [
+            ("current_proof_disappear_before_cleanup", CURRENT_PIN_COUNT),
+            (
+                "current_proof_disappear_during_cleanup",
+                CURRENT_PIN_COUNT - 1,
+            ),
+            ("current_proof_disappear_before_finalization", 0),
         ] {
             let (backend, runtime) = backend_with_fake();
             let pin_dir = seed_current_orphan(&runtime, false);
@@ -56396,29 +57605,52 @@ mod tests {
                     .await
                     .unwrap(),
                 CurrentEbpfGraphRecoveryOutcome::Partial(
-                    CurrentEbpfGraphRecoveryProgress::ProofCommitted
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate
                 ),
                 "failure boundary {failure}"
             );
             let graph = runtime.state().current_graphs[&pin_dir];
-            assert!(graph.proof_committed, "failure boundary {failure}");
+            assert!(!graph.proof_committed, "failure boundary {failure}");
             assert_eq!(
-                graph.pins_remaining, CURRENT_PIN_COUNT,
+                graph.pins_remaining, expected_pins,
                 "failure boundary {failure}"
+            );
+            assert!(
+                !runtime
+                    .state()
+                    .current_recovery_terminal_leaves
+                    .contains_key(&pin_dir),
+                "a disappeared preterminal proof cannot manufacture terminal authority"
             );
         }
     }
 
     #[tokio::test]
-    async fn failed_proof_restore_at_each_cleanup_stage_never_leaves_an_unfenced_graph() {
-        for failure in [
-            "current_proof_disappear_before_cleanup",
-            "current_proof_disappear_during_cleanup",
-            "current_proof_disappear_before_finalization",
+    async fn proofless_retry_only_reproves_a_complete_unchanged_graph() {
+        for (failure, expected_pins, retry_outcome) in [
+            (
+                "current_proof_disappear_before_cleanup",
+                CURRENT_PIN_COUNT,
+                CurrentEbpfGraphRecoveryOutcome::Removed,
+            ),
+            (
+                "current_proof_disappear_during_cleanup",
+                CURRENT_PIN_COUNT - 1,
+                CurrentEbpfGraphRecoveryOutcome::Refused(
+                    CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                ),
+            ),
+            (
+                "current_proof_disappear_before_finalization",
+                0,
+                CurrentEbpfGraphRecoveryOutcome::Refused(
+                    CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                ),
+            ),
         ] {
             let (backend, runtime) = backend_with_fake();
             let pin_dir = seed_current_orphan(&runtime, false);
-            runtime.fail_in_order([failure, "current_proof_restore"]);
+            runtime.fail_in_order([failure]);
 
             assert_eq!(
                 backend
@@ -56427,13 +57659,33 @@ mod tests {
                     )
                     .await
                     .unwrap(),
-                CurrentEbpfGraphRecoveryOutcome::Removed,
+                CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate
+                ),
                 "failure boundary {failure}"
             );
-            assert!(
-                !runtime.state().current_graphs.contains_key(&pin_dir),
+            assert_eq!(
+                runtime.state().current_graphs[&pin_dir].pins_remaining,
+                expected_pins,
                 "failure boundary {failure}"
             );
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph_with_authority(
+                        authorize_current_recovery_request(current_recovery_request(false)),
+                    )
+                    .await
+                    .unwrap(),
+                retry_outcome,
+                "retry boundary {failure}"
+            );
+            if expected_pins == CURRENT_PIN_COUNT {
+                assert!(!runtime.state().current_graphs.contains_key(&pin_dir));
+            } else {
+                let graph = runtime.state().current_graphs[&pin_dir];
+                assert!(!graph.proof_committed);
+                assert_eq!(graph.pins_remaining, expected_pins);
+            }
         }
     }
 

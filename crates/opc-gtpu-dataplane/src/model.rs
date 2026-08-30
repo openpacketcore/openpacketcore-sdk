@@ -2053,6 +2053,10 @@ impl HistoricalEbpfGraphRecoveryAuthority {
     /// inspection object: the live guard must prove this exact challenge is
     /// still bound by the broker on every currentness check. Recovery then
     /// recomputes it while its effect locks are held before any mutation.
+    // Each argument is one independently typed dimension of the affine
+    // authority tuple; collapsing them into positional primitives would
+    // weaken the public construction boundary.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         scope_commitment: HistoricalEbpfGraphRecoveryCommitment,

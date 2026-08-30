@@ -1299,9 +1299,9 @@ mod tests {
         );
         assert!(matches!(
             backend.recover_orphaned_current_ebpf_graph(request).await,
-            Err(GtpuError::UnsupportedFeature {
-                feature: "current_ebpf_graph_recovery"
-            })
+            Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::AuthorityRequired
+            ))
         ));
 
         let retired_drain_request =
