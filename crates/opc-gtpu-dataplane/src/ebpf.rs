@@ -20519,7 +20519,21 @@ mod aya_runtime {
                 let (authority_markers, decommissioned_markers) =
                     match Self::marker_inventory(&descriptor) {
                         Ok(inventory) => inventory,
-                        Err(_) => return Ok(false),
+                        Err(_) => {
+                            // A predecessor 0700 leaf also satisfies the
+                            // native current-directory envelope. Its exact R5
+                            // proof pin is intentionally not selector-marker
+                            // grammar, so a native parse failure must reach
+                            // the already strict predecessor decoder before
+                            // this disjoint sibling can be classified. Unknown
+                            // or malformed contents still return false there.
+                            return Self::historical_25_other_namespace_legacy_leaf_is_conclusive(
+                                control_root,
+                                entry,
+                                &descriptor,
+                                operation,
+                            );
+                        }
                     };
                 let native_operation_lock_is_conclusive =
                     Self::current_native_operation_lock_is_conclusive(
@@ -46662,19 +46676,36 @@ mod aya_runtime {
                     .checked_sub(u32::try_from(index).expect("bounded map index"))
                     .expect("map id remains nonzero")
             });
+            let namespace_hash = [0x51; 32];
+            let graph_identity = (6, 7);
+            let replacement = (
+                historical_25_replacement_name_commitment("foreign-up0")
+                    .expect("canonical foreign replacement name"),
+                77,
+                50,
+            );
+            let programs = ((2, 3), (4, 5));
+            let graph_commitment = historical_25_graph_commitment(
+                namespace_hash,
+                graph_identity,
+                replacement,
+                programs,
+                map_ids,
+            );
+            let inspection = crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
+                crate::HistoricalEbpfGraphRecoveryCommitment::new(graph_commitment)
+                    .expect("derived foreign graph commitment is nonzero"),
+            );
             let record = Historical25RecoveryRecord::unbound(
-                super::super::test_historical_ebpf_graph_recovery_authority_binding(),
-                [0x51; 32],
+                super::super::test_historical_ebpf_graph_recovery_authority_binding_for_inspection(
+                    inspection,
+                ),
+                namespace_hash,
                 [0x52; 16],
                 (legacy_metadata.dev(), legacy_metadata.ino()),
-                (0, 0),
-                (
-                    historical_25_replacement_name_commitment("foreign-up0")
-                        .expect("canonical foreign replacement name"),
-                    77,
-                    50,
-                ),
-                ((2, 3), (4, 5)),
+                graph_identity,
+                replacement,
+                programs,
                 map_ids,
             )
             .bind_to_proof_map(
@@ -46685,6 +46716,13 @@ mod aya_runtime {
                     .id(),
             )
             .expect("bind exact foreign R5 proof record");
+            assert_eq!(
+                Historical25RecoveryRecord::decode_observation(&record.encode()),
+                Some(Historical25RecoveryRecordObservation::AttachedCommitted(
+                    Historical25AttachedCommittedReceipt { record },
+                )),
+                "the disjoint Qualified fixture must itself be checksum- and authority-canonical",
+            );
             proof_map
                 .set(0, record.encode(), 0)
                 .expect("write exact foreign R5 proof record");
