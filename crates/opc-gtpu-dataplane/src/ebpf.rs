@@ -64139,6 +64139,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_25_recovery_handoff_is_authoritatively_absent_to_startup_cleanup() {
+        let mut fake = FakeRuntime::new();
+        fake.ifindexes
+            .insert("up0".to_string(), REPLACEMENT_IFINDEX);
+        let runtime = Arc::new(fake);
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        {
+            let mut state = runtime.state();
+            state
+                .historical_25_graphs
+                .insert(pin_dir.clone(), FakeHistorical25Graph::default());
+            state.historical_25_legacy_leaves.insert(pin_dir.clone());
+            state.historical_25_control_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+            state.expected_historical_replacement = Some(("up0".to_string(), REPLACEMENT_IFINDEX));
+        }
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(
+                    historical_25_recovery_request_for_namespace_with_authority(
+                        "up0",
+                        "up0",
+                        REPLACEMENT_IFINDEX,
+                        historical_25_authority(),
+                    ),
+                )
+                .await
+                .expect("retire the exact detached shipped-25 up0 graph"),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        drop(backend);
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let classification = restarted
+            .acquire_cleanup_only_recovery(RetainedGraphCleanupRequest::new(
+                GtpDevice {
+                    name: "up0".to_string(),
+                    ifindex: REPLACEMENT_IFINDEX,
+                },
+                Ipv4Addr::new(192, 0, 2, 1),
+                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            ))
+            .await
+            .expect("the startup cleanup observer classifies the retired graph");
+        assert_eq!(
+            classification,
+            RetainedGraphCleanupClassification::AlreadyAbsent,
+            "the exact historical terminal is not a live retained current graph"
+        );
+
+        let mut create = CreateGtpDeviceRequest::new("up0");
+        create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let created = restarted
+            .create_device(create)
+            .await
+            .expect("ordinary typed creation consumes only the SDK-authenticated handoff");
+        assert_eq!(created.ifindex, REPLACEMENT_IFINDEX);
+        let state = runtime.state();
+        assert!(state.historical_25_receipts.contains_key(&pin_dir));
+        assert!(state.historical_25_authorities.contains_key(&pin_dir));
+        assert!(state.historical_25_operation_markers.contains(&pin_dir));
+        assert!(!state.historical_25_legacy_leaves.contains(&pin_dir));
+    }
+
+    #[tokio::test]
     async fn historical_25_recovery_hands_off_shared_predecessor_root_without_mutating_other_namespaces(
     ) {
         let (backend, runtime) = backend_with_fake();
