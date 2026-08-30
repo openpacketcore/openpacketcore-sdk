@@ -7,10 +7,17 @@ use crate::model::{
     CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest,
     CurrentEbpfGraphRecoveryAuthorizedRequest, CurrentEbpfGraphRecoveryOutcome,
     CurrentEbpfGraphRecoveryReceipt, CurrentEbpfGraphRecoveryRefusal,
-    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphRecoveryTerminalTransferRequest,
-    DrainedV2TeardownOutcome, DrainedV2TeardownRequest, GtpDevice, GtpPdpContext, GtpuCapability,
-    GtpuIpFamilyCapabilities, GtpuProbe, GtpuSessionAttachmentSelector, GtpuSessionGroup,
-    GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphRecoverySuccessorAdmissionOutcome,
+    CurrentEbpfGraphRecoverySuccessorAdmissionRequest,
+    CurrentEbpfGraphRecoverySuccessorInspectionOutcome,
+    CurrentEbpfGraphRecoverySuccessorInspectionRequest,
+    CurrentEbpfGraphRecoveryTerminalAdmissionOutcome,
+    CurrentEbpfGraphRecoveryTerminalAdmissionRequest,
+    CurrentEbpfGraphRecoveryTerminalInspectionOutcome,
+    CurrentEbpfGraphRecoveryTerminalTransferRequest, DrainedV2TeardownOutcome,
+    DrainedV2TeardownRequest, GtpDevice, GtpPdpContext, GtpuCapability, GtpuIpFamilyCapabilities,
+    GtpuProbe, GtpuSessionAttachmentSelector, GtpuSessionGroup, GtpuSessionGroupReadback,
+    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector,
     HistoricalEbpfGraphRecoveryInspectionOutcome, HistoricalEbpfGraphRecoveryInspectionRequest,
     HistoricalEbpfGraphRecoveryReceipt, HistoricalEbpfGraphRecoveryRequest,
@@ -482,6 +489,57 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Read and authenticate one graph-free retained current-terminal WAL
+    /// without changing bpffs, hooks, maps, or authority records.
+    ///
+    /// The affine request proves a fresh live target exclusion for the whole
+    /// inspection. A successful result is only a broker-durable predecessor;
+    /// mutation requires a later call to
+    /// [`Self::transfer_current_ebpf_graph_terminal`] with a separately fresh
+    /// affine authority. `NoAuthenticatedTerminal` is never an absence proof.
+    async fn inspect_current_ebpf_graph_terminal(
+        &self,
+        _request: CurrentEbpfGraphRecoveryAuthorizedRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryTerminalInspectionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_terminal_inspection",
+        })
+    }
+
+    /// Reauthenticate one exact retained successor under its unchanged live
+    /// authority without changing bpffs, hooks, maps, or authority records.
+    ///
+    /// An authenticated result binds the complete sealed WAL plus its consumed
+    /// predecessor receipt and exact typed ordinary-create target. It is not a
+    /// target-absence proof and cannot transfer or replace authority; a later
+    /// broker-durable admission remains mandatory.
+    async fn inspect_current_ebpf_graph_successor(
+        &self,
+        _request: CurrentEbpfGraphRecoverySuccessorInspectionRequest,
+    ) -> Result<CurrentEbpfGraphRecoverySuccessorInspectionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_successor_inspection",
+        })
+    }
+
+    /// Reauthenticate one broker-durable sealed-successor receipt under a
+    /// separately fresh guard for the identical authority binding.
+    ///
+    /// Successful admission retires only the authenticated successor and
+    /// terminal authority leaves after effect-adjacent graph/currentness
+    /// revalidation. `AlreadyFinalized` is a read-only response-loss result
+    /// available only while the same authentic historical provenance and
+    /// exact sealed successor still match. The caller must still re-enter the
+    /// ordinary typed create target before the graph becomes usable.
+    async fn admit_current_ebpf_graph_successor(
+        &self,
+        _request: CurrentEbpfGraphRecoverySuccessorAdmissionRequest,
+    ) -> Result<CurrentEbpfGraphRecoverySuccessorAdmissionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_successor_admission",
+        })
+    }
+
     /// Authenticate and transfer a retained current-terminal WAL to a new
     /// affine authority without deleting the WAL.
     ///
@@ -496,6 +554,25 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ) -> Result<CurrentEbpfGraphRecoveryReceipt, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "current_ebpf_graph_terminal_transfer",
+        })
+    }
+
+    /// Acknowledge one exact authenticated current terminal after the caller
+    /// has durably committed its receipt in the external recovery broker.
+    ///
+    /// This is deliberately separate from recovery and transfer: neither can
+    /// admit ordinary graph creation merely by reaching a terminal kernel
+    /// state or returning a response. Implementations must reauthenticate the
+    /// sole graph-free authority pin under a fresh affine authority and must
+    /// not mutate bpffs while admitting it. Admission is process-local and
+    /// one-shot; a restart or failed creation requires another durable-broker
+    /// acknowledgement.
+    async fn admit_current_ebpf_graph_terminal(
+        &self,
+        _request: CurrentEbpfGraphRecoveryTerminalAdmissionRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryTerminalAdmissionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_terminal_admission",
         })
     }
 

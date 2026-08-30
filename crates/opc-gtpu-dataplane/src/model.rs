@@ -38,16 +38,23 @@ pub const CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION: u16 = 1;
 /// current-graph terminal evidence.  A legacy outcome alone is never a
 /// terminal receipt.
 pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID: &str =
-    "opc.gtpu.current-ebpf-recovery-terminal-wal.r1";
+    "opc.gtpu.current-ebpf-recovery-terminal-wal.r2";
 
 /// Stable codec identity of the redaction-safe current terminal receipt
 /// commitment used by an external broker's retired-to-new authority CAS.
 pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID: &str =
-    "opc.gtpu.current-ebpf-recovery-terminal-receipt.r1";
+    "opc.gtpu.current-ebpf-recovery-terminal-receipt.r2";
 
 /// Stable codec identity of an authenticated current terminal transfer.
 pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID: &str =
-    "opc.gtpu.current-ebpf-recovery-terminal-transfer.r1";
+    "opc.gtpu.current-ebpf-recovery-terminal-transfer.r2";
+/// Fixed width of one broker-durable authenticated terminal transfer.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN: usize = 264;
+/// Stable codec identity of an authenticated sealed-successor receipt.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID: &str =
+    "opc.gtpu.current-ebpf-recovery-successor-receipt.r1";
+/// Fixed width of one broker-durable sealed-successor receipt.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN: usize = 416;
 
 /// Closed provenance of the graph evidence retained by an authenticated
 /// current-terminal WAL.
@@ -515,6 +522,10 @@ impl CurrentEbpfGraphRecoveryCommitment {
         }
     }
 
+    pub(crate) const fn from_fixed_digest(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
     #[must_use]
     pub(crate) const fn bytes(self) -> [u8; 32] {
         self.0
@@ -828,10 +839,11 @@ impl CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
         authority: CurrentEbpfGraphRecoveryAuthorityBinding,
         graph: CurrentEbpfGraphRecoveryCommitment,
         source: CurrentEbpfGraphRecoveryTerminalSource,
+        adoption: Option<CurrentEbpfGraphRecoveryTerminalAdoption>,
     ) -> Self {
         let host = authority.host_commitments();
         let mut digest = Sha256::new();
-        digest.update(b"opc.gtpu.current-ebpf-terminal-receipt\\0r1");
+        digest.update(b"opc.gtpu.current-ebpf-terminal-receipt\0r2");
         digest.update(CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID.as_bytes());
         digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID.as_bytes());
         digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
@@ -855,6 +867,23 @@ impl CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
                 digest.update(HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID.as_bytes());
                 digest.update(HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID.as_bytes());
                 digest.update(exact_historical_graph_commitment.bytes());
+            }
+        }
+        match adoption {
+            None => digest.update([0]),
+            Some(adoption) => {
+                digest.update([1]);
+                let prior = adoption.prior_authority();
+                let prior_host = prior.host_commitments();
+                digest.update(prior.contract_version().to_be_bytes());
+                digest.update(prior.scope_commitment().bytes());
+                digest.update(prior.predecessor_basis_commitment().bytes());
+                digest.update(prior.fence_epoch().get().to_be_bytes());
+                digest.update(prior.operation_id().bytes());
+                digest.update(prior_host.host().bytes());
+                digest.update(prior_host.root().bytes());
+                digest.update(prior_host.leaf().bytes());
+                digest.update(adoption.prior_terminal_receipt_commitment().as_bytes());
             }
         }
         Self(digest.finalize().into())
@@ -968,6 +997,464 @@ impl CurrentEbpfGraphRecoveryTerminalTransfer {
     ) -> CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
         self.prior_terminal_receipt_commitment
     }
+
+    /// Return the domain-separated commitment a newly issued transfer
+    /// authority must carry as its predecessor basis.
+    ///
+    /// This binds the fresh affine authority to the complete broker-durable
+    /// transfer envelope, including the exact prior authority, terminal
+    /// receipt, codec identities, and record checksum. A merely target-equal
+    /// authority cannot relabel a retained terminal.
+    #[must_use]
+    pub fn predecessor_basis_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-transfer-basis\0r2");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID.as_bytes());
+        digest.update(self.encode());
+        CurrentEbpfGraphRecoveryCommitment(digest.finalize().into())
+    }
+
+    /// Return the fixed-width redaction-safe predecessor basis for a durable
+    /// cross-language authority CAS.
+    ///
+    /// These bytes reveal only a domain-separated digest of the already
+    /// redaction-safe transfer record. They contain no path, interface,
+    /// object ID, endpoint, key, or payload. A broker can persist them and
+    /// reconstruct the opaque commitment with
+    /// [`CurrentEbpfGraphRecoveryCommitment::new`].
+    #[must_use]
+    pub fn predecessor_basis_commitment_bytes(self) -> [u8; 32] {
+        self.predecessor_basis_commitment().bytes()
+    }
+
+    /// Encode the exact predecessor as a fixed-width, redaction-safe broker
+    /// record. The record contains only opaque commitments, one fence epoch,
+    /// one operation nonce, and a checksum; it contains no path, interface,
+    /// map/program ID, endpoint, key, or payload. Decoding does not authorize
+    /// mutation: the live runtime still authenticates every component against
+    /// the retained terminal WAL under a separate affine authority.
+    #[must_use]
+    pub fn encode(self) -> [u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN] {
+        const CHECKSUM_OFFSET: usize = 232;
+        let mut encoded = [0_u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN];
+        encoded[..8].copy_from_slice(b"OPCTRXR2");
+        encoded[8..10]
+            .copy_from_slice(&CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION.to_be_bytes());
+        let authority = self.prior_authority;
+        encoded[16..48].copy_from_slice(&authority.scope_commitment().bytes());
+        encoded[48..80].copy_from_slice(&authority.predecessor_basis_commitment().bytes());
+        encoded[80..88].copy_from_slice(&authority.fence_epoch().get().to_be_bytes());
+        encoded[88..104].copy_from_slice(&authority.operation_id().bytes());
+        let host = authority.host_commitments();
+        encoded[104..136].copy_from_slice(&host.host().bytes());
+        encoded[136..168].copy_from_slice(&host.root().bytes());
+        encoded[168..200].copy_from_slice(&host.leaf().bytes());
+        encoded[200..CHECKSUM_OFFSET]
+            .copy_from_slice(&self.prior_terminal_receipt_commitment.as_bytes());
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-transfer-record\0r2");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        encoded[CHECKSUM_OFFSET..].copy_from_slice(&digest.finalize());
+        encoded
+    }
+
+    /// Decode one exact broker record. Malformed, zero, wrong-version, or
+    /// checksum-invalid bytes are rejected before any runtime call.
+    #[must_use]
+    pub fn decode(
+        encoded: [u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN],
+    ) -> Option<Self> {
+        const CHECKSUM_OFFSET: usize = 232;
+        if encoded[..8] != *b"OPCTRXR2"
+            || u16::from_be_bytes(encoded[8..10].try_into().ok()?)
+                != CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION
+            || encoded[10..16] != [0; 6]
+        {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-transfer-record\0r2");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        if encoded[CHECKSUM_OFFSET..] != digest.finalize()[..] {
+            return None;
+        }
+        let commitment = |range: std::ops::Range<usize>| {
+            CurrentEbpfGraphRecoveryCommitment::new(encoded[range].try_into().ok()?).ok()
+        };
+        let prior_authority = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(16..48)?,
+            commitment(48..80)?,
+            NonZeroU64::new(u64::from_be_bytes(encoded[80..88].try_into().ok()?))?,
+            CurrentEbpfGraphRecoveryOperationId::new(encoded[88..104].try_into().ok()?).ok()?,
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(104..136)?,
+                commitment(136..168)?,
+                commitment(168..200)?,
+            ),
+        );
+        let prior_terminal_receipt_commitment =
+            CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+                encoded[200..CHECKSUM_OFFSET].try_into().ok()?,
+            )
+            .ok()?;
+        Some(Self::new(
+            prior_authority,
+            prior_terminal_receipt_commitment,
+        ))
+    }
+}
+
+/// Read-only classification of a retained current terminal WAL.
+///
+/// `NoAuthenticatedTerminal` is deliberately not an absence proof. Only the
+/// normal receipt API can return a guarded pristine-absence receipt. An
+/// authenticated result is safe to persist and later present to the separate
+/// affine transfer operation, but it grants no mutation authority by itself.
+#[non_exhaustive]
+#[allow(clippy::large_enum_variant)] // Preserve the authenticated transfer-by-value public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryTerminalInspectionOutcome {
+    /// One exact graph-free WAL was authenticated under the requested target.
+    Authenticated(CurrentEbpfGraphRecoveryTerminalTransfer),
+    /// No transferable terminal was observed; target absence is not proven.
+    NoAuthenticatedTerminal,
+    /// Complete stable target authority could not be established.
+    Refused(CurrentEbpfGraphRecoveryRefusal),
+}
+
+/// Exact ordinary-create target expected behind a retained successor WAL.
+///
+/// The SDK consumes the complete typed request so it can bind the immutable
+/// successor record to legacy versus grouped authority, stable pin namespace,
+/// replacement ifindex, local endpoint configuration, and PMTU policy. Debug
+/// output remains redacted through the request types' bounded projections.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoverySuccessorTarget {
+    Legacy(CreateGtpDeviceRequest),
+    Grouped(CreateGtpDeviceEndpointSetRequest),
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Legacy(_) => {
+                f.write_str("CurrentEbpfGraphRecoverySuccessorTarget::Legacy(<redacted>)")
+            }
+            Self::Grouped(_) => {
+                f.write_str("CurrentEbpfGraphRecoverySuccessorTarget::Grouped(<redacted>)")
+            }
+        }
+    }
+}
+
+/// Affine, read-only request to authenticate one exact retained successor.
+pub struct CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    target: CurrentEbpfGraphRecoverySuccessorTarget,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    /// Bind this exact recovery intent and ordinary-create target to the
+    /// unchanged live authority recorded by a retained successor WAL.
+    #[must_use]
+    pub fn into_successor_inspection_request(
+        self,
+        target: CurrentEbpfGraphRecoverySuccessorTarget,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+        CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+            intent: self,
+            target,
+            authority,
+        }
+    }
+}
+
+impl CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoverySuccessorTarget,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.target, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoverySuccessorInspectionRequest")
+            .field("intent", &self.intent)
+            .field("target", &self.target)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+/// Opaque authentication of one exact sealed successor publication.
+///
+/// The receipt binds the unchanged authority, the consumed predecessor
+/// terminal receipt, target/configuration commitments, the sealed graph
+/// commitment, and a digest of the complete canonical successor WAL. Callers
+/// cannot construct it and must durably acknowledge the exact value before
+/// presenting it through the separate affine admission request.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoverySuccessorReceipt {
+    authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+    target_kind: u8,
+    predecessor_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+    record_commitment: CurrentEbpfGraphRecoveryCommitment,
+    target_commitment: CurrentEbpfGraphRecoveryCommitment,
+    configuration_commitment: CurrentEbpfGraphRecoveryCommitment,
+    graph_commitment: CurrentEbpfGraphRecoveryCommitment,
+}
+
+impl CurrentEbpfGraphRecoverySuccessorReceipt {
+    pub(crate) const fn authenticated(
+        authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        target_kind: u8,
+        predecessor_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+        record_commitment: CurrentEbpfGraphRecoveryCommitment,
+        target_commitment: CurrentEbpfGraphRecoveryCommitment,
+        configuration_commitment: CurrentEbpfGraphRecoveryCommitment,
+        graph_commitment: CurrentEbpfGraphRecoveryCommitment,
+    ) -> Self {
+        Self {
+            authority,
+            target_kind,
+            predecessor_receipt_commitment,
+            record_commitment,
+            target_commitment,
+            configuration_commitment,
+            graph_commitment,
+        }
+    }
+
+    #[must_use]
+    pub const fn authority(self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.authority
+    }
+
+    #[must_use]
+    pub(crate) const fn target_kind(self) -> u8 {
+        self.target_kind
+    }
+
+    pub(crate) const fn predecessor_receipt_commitment(
+        self,
+    ) -> CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
+        self.predecessor_receipt_commitment
+    }
+
+    pub(crate) const fn target_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.target_commitment
+    }
+
+    pub(crate) const fn configuration_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.configuration_commitment
+    }
+
+    pub(crate) const fn graph_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.graph_commitment
+    }
+
+    /// Stable redaction-safe commitment an external broker can persist before
+    /// a separate admission attempt. Admission still reauthenticates the live
+    /// WAL; this digest alone never grants mutation authority.
+    #[must_use]
+    pub fn commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-successor-receipt\0r1");
+        digest.update(self.authority.scope_commitment().bytes());
+        digest.update(self.authority.predecessor_basis_commitment().bytes());
+        digest.update(self.authority.fence_epoch().get().to_be_bytes());
+        digest.update(self.authority.operation_id().bytes());
+        let host = self.authority.host_commitments();
+        digest.update(host.host().bytes());
+        digest.update(host.root().bytes());
+        digest.update(host.leaf().bytes());
+        digest.update([self.target_kind]);
+        digest.update(self.predecessor_receipt_commitment.as_bytes());
+        digest.update(self.record_commitment.bytes());
+        digest.update(self.target_commitment.bytes());
+        digest.update(self.configuration_commitment.bytes());
+        digest.update(self.graph_commitment.bytes());
+        CurrentEbpfGraphRecoveryCommitment::from_fixed_digest(digest.finalize().into())
+    }
+
+    /// Encode this broker token without exposing paths, map/program IDs,
+    /// interface names, endpoints, or raw WAL bytes.
+    #[must_use]
+    pub fn encode(self) -> [u8; CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN] {
+        const CHECKSUM_OFFSET: usize = 384;
+        let mut encoded = [0_u8; CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN];
+        encoded[..8].copy_from_slice(b"OPCSUCR1");
+        encoded[8..10]
+            .copy_from_slice(&CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION.to_be_bytes());
+        encoded[10] = self.target_kind;
+        encoded[11] = 4;
+        encoded[16..48].copy_from_slice(&self.authority.scope_commitment().bytes());
+        encoded[48..80].copy_from_slice(&self.authority.predecessor_basis_commitment().bytes());
+        encoded[80..88].copy_from_slice(&self.authority.fence_epoch().get().to_be_bytes());
+        encoded[88..104].copy_from_slice(&self.authority.operation_id().bytes());
+        let host = self.authority.host_commitments();
+        encoded[104..136].copy_from_slice(&host.host().bytes());
+        encoded[136..168].copy_from_slice(&host.root().bytes());
+        encoded[168..200].copy_from_slice(&host.leaf().bytes());
+        encoded[200..232].copy_from_slice(&self.predecessor_receipt_commitment.as_bytes());
+        encoded[232..264].copy_from_slice(&self.record_commitment.bytes());
+        encoded[264..296].copy_from_slice(&self.target_commitment.bytes());
+        encoded[296..328].copy_from_slice(&self.configuration_commitment.bytes());
+        encoded[328..360].copy_from_slice(&self.graph_commitment.bytes());
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-successor-receipt-codec\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        encoded[CHECKSUM_OFFSET..].copy_from_slice(&digest.finalize());
+        encoded
+    }
+
+    /// Decode one canonical redaction-safe broker token. Decoding never
+    /// grants authority; every admission reopens and reauthenticates the exact
+    /// live target under a fresh affine guard.
+    pub fn decode(
+        encoded: [u8; CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN],
+    ) -> Option<Self> {
+        const CHECKSUM_OFFSET: usize = 384;
+        if encoded[..8] != *b"OPCSUCR1"
+            || u16::from_be_bytes(encoded[8..10].try_into().ok()?)
+                != CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION
+            || !matches!(encoded[10], 1 | 2)
+            || encoded[11] != 4
+            || encoded[12..16] != [0; 4]
+            || encoded[360..CHECKSUM_OFFSET] != [0; 24]
+        {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-successor-receipt-codec\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        if encoded[CHECKSUM_OFFSET..] != digest.finalize()[..] {
+            return None;
+        }
+        let commitment = |range: std::ops::Range<usize>| {
+            CurrentEbpfGraphRecoveryCommitment::new(encoded[range].try_into().ok()?).ok()
+        };
+        let authority = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(16..48)?,
+            commitment(48..80)?,
+            NonZeroU64::new(u64::from_be_bytes(encoded[80..88].try_into().ok()?))?,
+            CurrentEbpfGraphRecoveryOperationId::new(encoded[88..104].try_into().ok()?).ok()?,
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(104..136)?,
+                commitment(136..168)?,
+                commitment(168..200)?,
+            ),
+        );
+        Some(Self::authenticated(
+            authority,
+            encoded[10],
+            CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+                encoded[200..232].try_into().ok()?,
+            )
+            .ok()?,
+            commitment(232..264)?,
+            commitment(264..296)?,
+            commitment(296..328)?,
+            commitment(328..360)?,
+        ))
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentEbpfGraphRecoverySuccessorReceipt(<opaque>)")
+    }
+}
+
+/// Read-only classification of one retained current-successor publication.
+#[non_exhaustive]
+#[allow(clippy::large_enum_variant)] // Preserve the opaque affine receipt-by-value public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoverySuccessorInspectionOutcome {
+    /// One exact sealed successor was authenticated under the unchanged
+    /// authority binding.
+    Authenticated(CurrentEbpfGraphRecoverySuccessorReceipt),
+    /// No same-authority successor was observed; target absence is not proven.
+    NoAuthenticatedSuccessor,
+    /// Complete stable successor authority could not be established.
+    Refused(CurrentEbpfGraphRecoveryRefusal),
+}
+
+/// Affine acknowledgement of one broker-durable successor receipt.
+pub struct CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    target: CurrentEbpfGraphRecoverySuccessorTarget,
+    receipt: CurrentEbpfGraphRecoverySuccessorReceipt,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    #[must_use]
+    pub fn into_successor_admission_request(
+        self,
+        target: CurrentEbpfGraphRecoverySuccessorTarget,
+        receipt: CurrentEbpfGraphRecoverySuccessorReceipt,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+        CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+            intent: self,
+            target,
+            receipt,
+            authority,
+        }
+    }
+}
+
+impl CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoverySuccessorTarget,
+        CurrentEbpfGraphRecoverySuccessorReceipt,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.target, self.receipt, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoverySuccessorAdmissionRequest")
+            .field("intent", &self.intent)
+            .field("target", &self.target)
+            .field("receipt", &self.receipt)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoverySuccessorAdmissionOutcome {
+    /// The exact authority WAL was retired after reauthentication.
+    Admitted,
+    /// The authority WAL was already absent and the broker token still
+    /// matched the exact sealed successor graph.
+    AlreadyFinalized,
+    Refused(CurrentEbpfGraphRecoveryRefusal),
 }
 
 /// Affine request to authenticate and transfer a retained current-terminal
@@ -1209,6 +1696,7 @@ impl CurrentEbpfGraphRecoveryReceipt {
                     authority,
                     exact_graph_commitment,
                     terminal_source,
+                    terminal_adoption,
                 ),
             ),
         }
@@ -1282,6 +1770,92 @@ impl CurrentEbpfGraphRecoveryReceipt {
     pub const fn terminal_wal_codec_identity(self) -> &'static str {
         CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID
     }
+}
+
+/// Affine post-persistence admission for one authenticated current-terminal
+/// receipt.
+///
+/// The caller must construct this request only after its external recovery
+/// broker has durably committed the exact [`CurrentEbpfGraphRecoveryReceipt`].
+/// Supplying the receipt is not sufficient by itself: the SDK reopens the
+/// retained authority leaf, requires the sole graph-free `AuthorityOnly`
+/// publication cut, compares the complete canonical receipt commitment, and
+/// checks this fresh live authority at every observation boundary.  A
+/// successful admission authorizes one later ordinary creation of the exact
+/// replacement graph in this backend process; it does not delete bpffs state
+/// or authorize a terminal transfer.
+pub struct CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    receipt: CurrentEbpfGraphRecoveryReceipt,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    /// Bind a broker-durable authenticated terminal receipt to a fresh live
+    /// authority for one ordinary-graph admission attempt.
+    #[must_use]
+    pub fn into_terminal_admission_request(
+        self,
+        receipt: CurrentEbpfGraphRecoveryReceipt,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+        CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+            intent: self,
+            receipt,
+            authority,
+        }
+    }
+}
+
+impl CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+    /// Return the retryable non-authorizing request plan.
+    #[must_use]
+    pub const fn intent(&self) -> &CurrentEbpfGraphRecoveryIntent {
+        &self.intent
+    }
+
+    /// Return the exact broker-durable terminal receipt being acknowledged.
+    #[must_use]
+    pub const fn receipt(&self) -> CurrentEbpfGraphRecoveryReceipt {
+        self.receipt
+    }
+
+    /// Return the receipt-safe binding of the fresh live authority.
+    #[must_use]
+    pub const fn authority_binding(&self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.authority.binding()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoveryReceipt,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.receipt, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoveryTerminalAdmissionRequest")
+            .field("intent", &self.intent)
+            .field("receipt", &self.receipt)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+/// Bounded result of acknowledging one broker-durable current terminal.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryTerminalAdmissionOutcome {
+    /// The exact authenticated `AuthorityOnly` terminal is admitted for one
+    /// later ordinary graph creation in this backend process.
+    Admitted,
+    /// Admission did not change kernel state or authorize ordinary creation.
+    Refused(CurrentEbpfGraphRecoveryRefusal),
 }
 
 /// A frozen eBPF datapath generation that this SDK can recover only through a
@@ -6331,6 +6905,149 @@ mod tests {
                 .terminal_receipt_commitment()
                 .expect("authenticated terminal has a canonical commitment")
         );
+        let encoded = transfer.encode();
+        let kat_hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        const EXPECTED_RECEIPT: &str =
+            "12de6a11ffbd257e646c71e73edfaf1a8401537db00a26d7f8e263020fdad38f";
+        const EXPECTED_TRANSFER: &str = concat!(
+            "4f504354525852320001000000000000",
+            "5151515151515151515151515151515151515151515151515151515151515151",
+            "5252525252525252525252525252525252525252525252525252525252525252",
+            "0000000000000007",
+            "53535353535353535353535353535353",
+            "5454545454545454545454545454545454545454545454545454545454545454",
+            "5555555555555555555555555555555555555555555555555555555555555555",
+            "5656565656565656565656565656565656565656565656565656565656565656",
+            "12de6a11ffbd257e646c71e73edfaf1a8401537db00a26d7f8e263020fdad38f",
+            "9af15c8bfce72de4d271ac331ae946b5e29fd6ebda5e08b37cfce67340773e14",
+        );
+        const EXPECTED_BASIS: &str =
+            "08e77c78b6df941304ca8599d5315e304f0574a3fe680098826b321291f1eadb";
+        assert_eq!(
+            kat_hex(&transfer.prior_terminal_receipt_commitment().as_bytes()),
+            EXPECTED_RECEIPT,
+            "r2 terminal receipt KAT"
+        );
+        assert_eq!(kat_hex(&encoded), EXPECTED_TRANSFER, "r2 transfer KAT");
+        assert_eq!(
+            kat_hex(&transfer.predecessor_basis_commitment_bytes()),
+            EXPECTED_BASIS,
+            "r2 fresh-authority predecessor basis KAT"
+        );
+        assert_eq!(
+            CurrentEbpfGraphRecoveryTerminalTransfer::decode(encoded),
+            Some(transfer)
+        );
+        assert_eq!(
+            CurrentEbpfGraphRecoveryTerminalTransfer::decode(encoded)
+                .expect("decoded transfer")
+                .predecessor_basis_commitment(),
+            transfer.predecessor_basis_commitment(),
+            "the authority predecessor basis is stable across broker persistence"
+        );
+        for offset in 0..CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN {
+            let mut tampered = encoded;
+            tampered[offset] ^= 1;
+            assert_eq!(
+                CurrentEbpfGraphRecoveryTerminalTransfer::decode(tampered),
+                None,
+                "tampered broker transfer byte {offset}"
+            );
+        }
+
+        let adopted = CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+            binding,
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            commitment(0x57),
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            Some(CurrentEbpfGraphRecoveryTerminalAdoption::new(
+                binding,
+                transfer.prior_terminal_receipt_commitment(),
+            )),
+        );
+        assert_ne!(
+            adopted.terminal_receipt_commitment(),
+            terminal.terminal_receipt_commitment(),
+            "the r2 receipt must bind the complete transfer-adoption envelope"
+        );
+        let adopted_transfer =
+            CurrentEbpfGraphRecoveryTerminalTransfer::from_authenticated_receipt(adopted)
+                .expect("adopted terminal remains transferable");
+        assert_ne!(
+            adopted_transfer.predecessor_basis_commitment(),
+            transfer.predecessor_basis_commitment(),
+            "the fresh authority basis changes with the authenticated predecessor receipt"
+        );
+    }
+
+    #[test]
+    fn current_successor_receipt_is_canonical_tamper_evident_and_redacted() {
+        use std::num::NonZeroU64;
+
+        let commitment = |byte| CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+        let binding = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(0x61),
+            commitment(0x62),
+            NonZeroU64::new(11).unwrap(),
+            CurrentEbpfGraphRecoveryOperationId::new([0x63; 16]).unwrap(),
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(0x64),
+                commitment(0x65),
+                commitment(0x66),
+            ),
+        );
+        let historical_commitment = HistoricalEbpfGraphRecoveryCommitment::new([0x67; 32]).unwrap();
+        let predecessor_receipt = CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+            binding,
+            commitment(0x68),
+            CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment: historical_commitment,
+            },
+            None,
+        );
+        let receipt = CurrentEbpfGraphRecoverySuccessorReceipt::authenticated(
+            binding,
+            1,
+            predecessor_receipt,
+            commitment(0x69),
+            commitment(0x6a),
+            commitment(0x6b),
+            commitment(0x6c),
+        );
+        let encoded = receipt.encode();
+        let decoded = CurrentEbpfGraphRecoverySuccessorReceipt::decode(encoded)
+            .expect("canonical successor receipt decodes");
+        assert_eq!(decoded, receipt);
+        assert_eq!(decoded.commitment(), receipt.commitment());
+
+        for offset in 0..CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN {
+            let mut tampered = encoded;
+            tampered[offset] ^= 1;
+            assert_eq!(
+                CurrentEbpfGraphRecoverySuccessorReceipt::decode(tampered),
+                None,
+                "tampered successor receipt byte {offset}"
+            );
+        }
+
+        assert_eq!(
+            format!("{receipt:?}"),
+            "CurrentEbpfGraphRecoverySuccessorReceipt(<opaque>)"
+        );
+        let target = CurrentEbpfGraphRecoverySuccessorTarget::Legacy(CreateGtpDeviceRequest::new(
+            "tenant-sensitive-up0",
+        ));
+        let rendered = format!("{target:?}");
+        assert_eq!(
+            rendered,
+            "CurrentEbpfGraphRecoverySuccessorTarget::Legacy(<redacted>)"
+        );
+        assert!(!rendered.contains("tenant-sensitive-up0"));
     }
 
     #[test]

@@ -1338,7 +1338,7 @@ removed, the eBPF backend:
 - acquires a nonblocking exclusive `flock` on a permanent control-directory
   inode keyed only by the validated pin namespace below the canonical shared
   bpffs root;
-- validates the canonical graph directory and the exact current 21-map names,
+- validates the canonical graph directory and the exact current 34-map names,
   ABIs, schema markers, configuration, PMTU state, and kernel map IDs;
 - loads the committed current classifier artifacts against those exact maps
   only after the read-only inventory succeeds, derives their exact program
@@ -1415,7 +1415,7 @@ loop {
 ```
 
 The first authorized mutation publishes a checksummed proof map bound to the
-namespace hash, canonical graph device/inode, all 25 exact map IDs, populated
+namespace hash, canonical graph device/inode, all 34 exact map IDs, populated
 state authorization, and the proof map's own kernel ID. Normal create/adopt
 fences on that reserved proof. Every surviving map and the proof remain open by
 FD during cleanup. An ordinary unlink or final directory-removal failure
@@ -1427,9 +1427,26 @@ the proof pinned and an exact retry continues from the recorded map IDs. The
 proof-aware state machine also keeps a disappeared, renamed, reindexed, or
 newly managed replacement retry in typed `Partial` state after publication;
 those changes cannot turn committed cleanup into terminal refusal. The proof
-pin is removed last. A crash in the final
-proof-to-directory window is idempotently classified as an absent empty graph,
-never as a new graph.
+map is promoted to its terminal phase and second-pinned as a checksummed,
+fsynced authority-leaf WAL before the in-graph proof is removed. Only that WAL
+authorizes the final empty-directory removal or a later `AlreadyAbsent`
+classification. A missing graph, empty graph directory, marker, or legacy
+outcome without the exact WAL remains indeterminate and is never treated as
+fresh absence.
+
+The receipt API projects an authenticated terminal WAL into a bounded,
+redaction-safe terminal receipt. If the process loses the response after WAL
+publication, a fresh live target authority may use
+`inspect_current_ebpf_graph_terminal` to authenticate the unchanged terminal
+without creating or deleting state. The returned fixed-width r2 transfer
+record includes the exact prior authority and receipt commitment and can be
+persisted by an external broker. A later transfer authority must carry the
+record's domain-separated predecessor-basis commitment; target equality alone
+is insufficient. Transfer revalidates the graph, hooks, loaded-program
+references, source receipt, locks, canonical paths, and an empty selector
+authority/decommission inventory before and after rewriting the same WAL. A
+wrong target, stale receipt, surviving authority, held lease, malformed source,
+or changed live guard fails closed and leaves the WAL in place.
 
 The permanent control directory is intentionally not deleted, avoiding an
 inode-replacement lease split between cooperating processes. The lock cannot
@@ -1516,6 +1533,26 @@ terminal handoff can admit the normal current lifecycle, and it authorizes only
 the bound pin namespace under the shared predecessor root. Maintenance code
 must never replace this API with raw bpffs unlinking or broad root cleanup.
 
+The terminal handoff is not itself permission to drop authority before the
+replacement graph is durable. The broker first admits the authenticated
+historical terminal, then the exact typed ordinary-create target publishes and
+seals the complete current map/program/hook/configuration graph while retaining
+that predecessor authority. If the process loses the finalization response,
+`inspect_current_ebpf_graph_successor` reauthenticates the same sealed graph,
+consumed terminal receipt, target kind, configuration, and unchanged authority
+without mutation. Its opaque fixed-width receipt uses
+`CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID`; every byte is
+checksummed and its `Debug` surface is redacted. After the broker durably
+acknowledges that receipt, `admit_current_ebpf_graph_successor` rechecks the
+complete graph and live guard immediately before retiring each exact authority
+leaf. A response-lost retry returns `AlreadyFinalized` only when the authentic
+R5 provenance and the twice-stable exact successor still match; it does not
+manufacture an absence proof. Wrong tenant/fence/generation, wrong target or
+configuration, live ownership, a surviving or partial authority layout,
+malformed/populated pins, cancellation, and concurrent replacement remain
+no-effect refusals. The ordinary create/read/mutation surfaces keep the
+successor inaccessible until this sequence has completed.
+
 #### Cleanup-only retained graph recovery authority
 
 `EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` is the supported
@@ -1541,7 +1578,7 @@ recovery:
 
 Before granting authority the backend proves the expected name/ifindex pair,
 then performs a complete read-only inventory and ABI/capacity validation of all
-25 current map pins before binding CONFIG or any other typed map. Only the exact
+34 current map pins before binding CONFIG or any other typed map. Only the exact
 current PMTU-v5 graph is accepted: cleanup acquisition never creates a missing
 pin, migrates an older schema, or advances a schema marker. A canonical nonzero
 endpoint is then compared with the caller's configured local S2b-U address. The
