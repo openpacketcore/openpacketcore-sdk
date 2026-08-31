@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, StreamExt};
 use futures_util::FutureExt;
+use opc_key::{KeyProvider, RemoteSealProvider};
 use opc_session_store::consumer::{
     session_consumer_identity_commitment, session_consumer_roster_ingress_operation,
     session_consumer_roster_scope_commitment, SessionConsumerRosterAdmissionCapsule,
@@ -33,17 +34,18 @@ use opc_session_store::consumer::{
 };
 use opc_session_store::{
     checked_session_deadline, session_consumer_batch_result_into_store,
-    validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
-    CompareAndSet, CompareAndSetResult, FencedTransitionExecuteError, FencedTransitionObservation,
+    validate_record_expiry_preflights_profile, validate_stored_record_expiry_profile,
+    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
+    EncryptingSessionBackend, FencedTransitionExecuteError, FencedTransitionObservation,
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
     FencedTransitionStatus, FencedTransitionV2RequestId, LeaseError, LeaseGuard, OwnerId,
     PreparedCheckpointBudget, PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
     PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
     PreparedCompareAndSetStatus as PreparedCasStatus, PreparedCompareAndSetStatusError,
-    PreparedFencedTransition, PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
-    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedFencedTransitionBackend,
-    ProtectedSessionBackend, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
-    SessionBackend, SessionConsensusNodeId, SessionConsumerAuthorization,
+    PreparedFencedTransition, PreparedFencedTransitionJournal, PreparedLeaseAcquireExecuteError,
+    PreparedLeaseAcquirePrepareError, PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError,
+    ProtectedSessionBackend, RecordExpiryPreflight, RemoteSealingSessionBackend, RestoreScanPage,
+    RestoreScanRequest, SessionBackend, SessionConsensusNodeId, SessionConsumerAuthorization,
     SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
     SessionConsumerCompareAndSetReceiptOutcome, SessionConsumerCompareAndSetRequest,
     SessionConsumerCompareAndSetStatus, SessionConsumerFencedTransitionError,
@@ -207,6 +209,22 @@ fn consumer_operation_requires_roster_capability(operation: &SessionConsumerOper
             | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
             | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. }
             | SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority { .. }
+    )
+}
+
+/// The V1 atomic-transition wire opcodes are deliberately not available from
+/// a public one-voter client.  Their only SDK transport admission is the
+/// private exact-roster port retained beneath
+/// [`SessionConsumerPreparedFencedTransitionBackend`].  In particular, a
+/// caller must not be able to use the generic request surface to reconstruct
+/// a raw physical adapter after an affine handle has become receipt-only.
+fn consumer_operation_requires_affine_fenced_transition_route(
+    operation: &SessionConsumerOperation,
+) -> bool {
+    matches!(
+        operation,
+        SessionConsumerOperation::FencedTransition { .. }
+            | SessionConsumerOperation::FencedTransitionStatus { .. }
     )
 }
 
@@ -962,6 +980,12 @@ pub enum SessionConsumerClientError {
     /// Mutual TLS authentication or the expected server identity failed.
     #[error("session consumer authentication failed")]
     Authentication,
+    /// The authenticated peer or its Hello topology no longer matches the
+    /// exact configured authority. This is distinct from a transient local
+    /// credential/setup failure: protected prepared mutation must stop rather
+    /// than rotate to another voter under a revoked topology.
+    #[error("session consumer topology authority was revoked")]
+    AuthorityRevoked,
     /// Cluster/configuration/epoch scope was rejected.
     #[error("session consumer scope was rejected")]
     Scope,
@@ -1486,9 +1510,40 @@ const fn consumer_rejection_into_client_error(
 ) -> SessionConsumerClientError {
     match rejection {
         SessionConsumerRejection::ScopeMismatch => SessionConsumerClientError::Scope,
+        SessionConsumerRejection::TopologyMismatch => SessionConsumerClientError::AuthorityRevoked,
         SessionConsumerRejection::MalformedRequest => SessionConsumerClientError::Protocol,
         SessionConsumerRejection::Unauthorized => SessionConsumerClientError::Authentication,
         SessionConsumerRejection::Unavailable => SessionConsumerClientError::Unavailable,
+    }
+}
+
+/// Classify the server-side V1/V2 Hello binding before application admission.
+///
+/// Scope is a distinct policy boundary. Once scope matches, every remaining
+/// exact-roster field is authority rather than ordinary authentication: a
+/// changed node, voter count, or roster commitment requires activation of a
+/// new roster and must never become a rotatable credential failure.
+#[derive(Clone, Copy)]
+struct ConsumerHelloBinding {
+    scope: SessionConsumerScope,
+    server_node_id: u64,
+    voter_count: usize,
+    roster_commitment: [u8; 32],
+}
+
+fn consumer_hello_rejection(
+    presented: ConsumerHelloBinding,
+    expected: ConsumerHelloBinding,
+) -> Option<SessionConsumerRejection> {
+    if presented.scope != expected.scope {
+        Some(SessionConsumerRejection::ScopeMismatch)
+    } else if presented.server_node_id != expected.server_node_id
+        || presented.voter_count != expected.voter_count
+        || presented.roster_commitment != expected.roster_commitment
+    {
+        Some(SessionConsumerRejection::TopologyMismatch)
+    } else {
+        None
     }
 }
 
@@ -3743,6 +3798,7 @@ fn response_retires_connection_authority(response: &SessionConsumerResponse) -> 
         response,
         SessionConsumerResponse::Rejected(
             SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::TopologyMismatch
                 | SessionConsumerRejection::Unauthorized
                 | SessionConsumerRejection::MalformedRequest
         )
@@ -4983,13 +5039,14 @@ fn invalid_authenticated_consumer_fenced_transition() -> StoreError {
     StoreError::Serialization("prepared_fenced_transition_invalid".into())
 }
 
-/// Redaction-safe construction failure for
-/// [`SessionConsumerFencedTransitionBackend`].
+/// Redaction-safe construction failure for the net-private physical
+/// fenced-transition adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("authenticated consumer identity is unavailable")]
-pub struct SessionConsumerFencedTransitionBackendError;
+pub(crate) struct SessionConsumerFencedTransitionBackendError;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 enum SessionConsumerFencedTransitionClient {
     Stateless(Box<StatelessSessionConsumerClient>),
     Persistent(PersistentSessionConsumerClient),
@@ -5101,20 +5158,508 @@ fn activated_consumer_fenced_transition_readiness_unavailable() -> StoreError {
     StoreError::BackendUnavailable("authenticated consumer activation readiness unavailable".into())
 }
 
-/// Narrow [`SessionBackend`] adapter for the atomic fenced-transition subset
-/// of an authenticated consumer client.
+/// Net-private [`SessionBackend`] adapter for the atomic fenced-transition
+/// subset of an authenticated consumer client.
 ///
-/// This intentionally does not implement `SessionLeaseManager` and every
-/// unrelated backend operation rejects locally before client/transport I/O.
-/// Its prepared tokens carry an opaque binding to the local authenticated
-/// consumer identity and stable cluster identity; endpoint, leader, server
-/// identity, and mutable configuration scope are deliberately excluded so a
-/// normal authenticated failover remains usable.
+/// It never leaves this module. The public affine facade owns the only safe
+/// roster activation constructor and retains this physical implementation
+/// below an erased SDK sealing wrapper, so there is no public lowering path
+/// from an affine prepared-fenced handle to [`SessionBackend`].
 #[derive(Clone)]
-pub struct SessionConsumerFencedTransitionBackend {
+pub(crate) struct SessionConsumerFencedTransitionBackend {
     client: SessionConsumerFencedTransitionClient,
     binding_commitment: [u8; 32],
     activated_readiness: Option<ActivatedConsumerFencedTransitionReadiness>,
+}
+
+/// Opaque exact voter set produced only after every persistent voter has
+/// completed the authenticated V1 activation prewarm.
+pub struct ActivatedSessionConsumerFencedTransitionVoters {
+    router: Arc<PreparedConsumerRouter>,
+}
+
+impl fmt::Debug for ActivatedSessionConsumerFencedTransitionVoters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ActivatedSessionConsumerFencedTransitionVoters(<redacted>)")
+    }
+}
+
+/// Per-handle routing state for one protected exact V1 transition.
+///
+/// The public handle and the net-private physical backend share this one
+/// allocation.  It is deliberately not keyed by request ID in a facade-wide
+/// map: a second handle cannot inherit another handle's cursor or spend its
+/// mutation budget.
+struct PreparedFencedTransitionRoute {
+    request_id: FencedTransitionRequestId,
+    mutation_cursor: AtomicUsize,
+    mutation_attempts: AtomicUsize,
+    status_cursor: AtomicUsize,
+    // The physical backend owns the only point at which a protected wrapper
+    // can reach transport. Keep its exact checked-out lane and call-local
+    // write observation together so an outer cancellation can distinguish
+    // journal/capability work (still pre-write) from a positive Call write
+    // without exposing either primitive through the public facade.
+    retained_lane: StdMutex<
+        Option<(
+            usize,
+            PersistentRetainedRequestLane,
+            Arc<PreparedFencedTransitionWriteBoundary>,
+        )>,
+    >,
+}
+
+impl PreparedFencedTransitionRoute {
+    fn new(request_id: FencedTransitionRequestId, origin: usize) -> Self {
+        Self {
+            request_id,
+            mutation_cursor: AtomicUsize::new(origin),
+            mutation_attempts: AtomicUsize::new(0),
+            status_cursor: AtomicUsize::new(origin.wrapping_add(1)),
+            retained_lane: StdMutex::new(None),
+        }
+    }
+
+    fn request_id(&self) -> FencedTransitionRequestId {
+        self.request_id
+    }
+
+    fn begin_mutation_attempt(&self, voter_count: usize) -> bool {
+        self.mutation_attempts.fetch_add(1, Ordering::AcqRel) < voter_count
+    }
+
+    /// Install the exact checked-out lane that was authenticated before
+    /// dispatch admission. Replacing a stale reservation is safe because it
+    /// has not written; dropping it retires the lane rather than returning it
+    /// for an unrelated caller to steal.
+    fn install_retained_lane(
+        &self,
+        voter: usize,
+        lane: PersistentRetainedRequestLane,
+        write_boundary: Arc<PreparedFencedTransitionWriteBoundary>,
+    ) {
+        let mut retained = self
+            .retained_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(retained.replace((voter, lane, write_boundary)));
+    }
+
+    fn take_retained_lane(
+        &self,
+        voter: usize,
+    ) -> Option<(
+        PersistentRetainedRequestLane,
+        Arc<PreparedFencedTransitionWriteBoundary>,
+    )> {
+        let mut retained = self
+            .retained_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match retained.take() {
+            Some((current, lane, write_boundary)) if current == voter => {
+                Some((lane, write_boundary))
+            }
+            Some((_current, lane, write_boundary)) => {
+                drop((lane, write_boundary));
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn discard_retained_lane(&self) {
+        let mut retained = self
+            .retained_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(retained.take());
+    }
+
+    fn mutation_voter(&self, voter_count: usize) -> usize {
+        prepared_voter_index(self.mutation_cursor.load(Ordering::Acquire), voter_count)
+    }
+
+    fn rotate_after_not_transmitted(&self) {
+        self.mutation_cursor.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A receipt traversal must begin after the voter on which dispatch may
+    /// actually have crossed the write boundary.  The deterministic request
+    /// origin is only the first candidate: proven pre-write failures can
+    /// rotate dispatch before an ambiguous send occurs.
+    fn begin_receipt_after_current_mutation_voter(&self, voter_count: usize) {
+        let voter = self.mutation_voter(voter_count);
+        self.status_cursor
+            .store(voter.wrapping_add(1), Ordering::Release);
+    }
+
+    fn status_voter(&self, voter_count: usize) -> usize {
+        prepared_voter_index(self.status_cursor.load(Ordering::Acquire), voter_count)
+    }
+
+    fn next_status_voter(&self, voter_count: usize) -> usize {
+        prepared_voter_index(
+            self.status_cursor.fetch_add(1, Ordering::AcqRel),
+            voter_count,
+        )
+    }
+
+    fn rotate_after_status_setup_failure(&self) {
+        self.status_cursor.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Private observation shared by the affine guard and the physical backend.
+/// It latches only after the call writer accepts bytes or the transport
+/// returns an exact post-write classification; setup, journal lookup, token
+/// decoding, and a pending zero-byte writer stay pre-dispatch.
+struct PreparedFencedTransitionWriteBoundary {
+    write_progress: Arc<FrameWriteProgress>,
+    may_have_sent: AtomicBool,
+    latched: AtomicBool,
+    route: Arc<PreparedFencedTransitionRoute>,
+    voter_count: usize,
+}
+
+impl PreparedFencedTransitionWriteBoundary {
+    fn new(
+        write_progress: Arc<FrameWriteProgress>,
+        route: Arc<PreparedFencedTransitionRoute>,
+        voter_count: usize,
+    ) -> Self {
+        Self {
+            write_progress,
+            may_have_sent: AtomicBool::new(false),
+            latched: AtomicBool::new(false),
+            route,
+            voter_count,
+        }
+    }
+
+    fn mark_may_have_sent(&self) {
+        self.may_have_sent.store(true, Ordering::Release);
+    }
+
+    /// Record an actual physical attempt exactly once. This is deliberately
+    /// callable from a cancellation drop path: `FrameWriteProgress` is an
+    /// absorbing transport observation and therefore remains valid after the
+    /// inner wrapper future has been dropped.
+    fn latch_possible_send(&self) -> bool {
+        if !self.write_progress.accepted_any() && !self.may_have_sent.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.latched.swap(true, Ordering::AcqRel) {
+            // A caller can reach this only after a bounded setup reservation.
+            // The cap cannot reject a write that already crossed the boundary;
+            // it merely prevents any additional physical leg from starting.
+            let _ = self.route.begin_mutation_attempt(self.voter_count);
+            self.route
+                .begin_receipt_after_current_mutation_voter(self.voter_count);
+        }
+        true
+    }
+}
+
+/// Clears a route-held checkout if the wrapper future is cancelled before the
+/// private physical backend consumes it. This makes that cancellation release
+/// capacity without manufacturing a post-write classification.
+struct PreparedFencedTransitionLaneGuard {
+    route: Arc<PreparedFencedTransitionRoute>,
+}
+
+impl PreparedFencedTransitionLaneGuard {
+    fn new(route: Arc<PreparedFencedTransitionRoute>) -> Self {
+        Self { route }
+    }
+}
+
+impl Drop for PreparedFencedTransitionLaneGuard {
+    fn drop(&mut self) {
+        self.route.discard_retained_lane();
+    }
+}
+
+/// Net-private physical V1 backend for one affine transition handle. It owns
+/// a complete activated roster but no global per-request cursor map.
+struct ActivatedFencedTransitionBackend {
+    router: Arc<PreparedConsumerRouter>,
+    route: Arc<PreparedFencedTransitionRoute>,
+    preparation_deadline: tokio::time::Instant,
+    preparation_attempt_timeout: Duration,
+}
+
+impl ActivatedFencedTransitionBackend {
+    fn new(
+        router: Arc<PreparedConsumerRouter>,
+        route: Arc<PreparedFencedTransitionRoute>,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<Self, SessionConsumerPreparedCheckpointBackendError> {
+        if router.clients.is_empty() {
+            return Err(SessionConsumerPreparedCheckpointBackendError);
+        }
+        Ok(Self {
+            router,
+            route,
+            preparation_deadline: budget.original_deadline(),
+            preparation_attempt_timeout: budget.physical_attempt_timeout(),
+        })
+    }
+
+    fn binding(&self) -> Result<[u8; 32], StoreError> {
+        let mut digest = Sha256::new();
+        digest.update(b"openpacketcore/session-consumer/prepared-fenced-exact-roster/v1\0");
+        digest.update(self.router.fenced_transition_binding()?);
+        Ok(digest.finalize().into())
+    }
+
+    fn decode(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionRequest, StoreError> {
+        let request = prepared.request_for_authenticated_consumer(self.binding()?)?;
+        if request.request_id() != self.route.request_id() {
+            return Err(invalid_authenticated_consumer_fenced_transition());
+        }
+        Ok(request)
+    }
+
+    fn preparation_attempt_deadline(&self) -> Option<tokio::time::Instant> {
+        tokio::time::Instant::now()
+            .checked_add(self.preparation_attempt_timeout)
+            .map(|deadline| deadline.min(self.preparation_deadline))
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for ActivatedFencedTransitionBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::minimal()
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        // A nonfinite descriptor carries only the fixed profile shape. The
+        // default `SessionBackend` contract accepts it locally, and no remote
+        // clock can make an absent expiry stale. Preserve that contract here:
+        // this prevents an otherwise pointless A/B/C authority sweep for the
+        // normal non-expiring SWm transition while still validating hostile
+        // descriptor shape before any wrapper/provider work.
+        validate_record_expiry_preflights_profile(preflights)?;
+        if preflights.iter().all(|preflight| !preflight.is_finite()) {
+            return Ok(());
+        }
+        // Expiry authority is a read-only RPC, but it is not local: pinning
+        // it to voter A would make a non-origin A outage reject every affine
+        // request before the exact prepared route can run. Traverse the same
+        // deterministic A/B/C order from this handle's origin. Each physical
+        // read has the caller's one-attempt cap and all reads share the
+        // immutable preparation deadline. Retrying an interrupted read is
+        // safe because it cannot mutate or spend dispatch authority.
+        let mut last_unavailable = None;
+        for offset in 0..self.router.clients.len() {
+            let Some(deadline) = self.preparation_attempt_deadline() else {
+                break;
+            };
+            if deadline <= tokio::time::Instant::now() {
+                break;
+            }
+            let client = &self.router.clients[prepared_voter_index(
+                self.route
+                    .mutation_voter(self.router.clients.len())
+                    .wrapping_add(offset),
+                self.router.clients.len(),
+            )];
+            let request = SessionConsumerRequest::new(
+                self.router.scope,
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::PreflightRecordExpiry {
+                    preflights: preflights.to_vec(),
+                },
+            );
+            let response = tokio::time::timeout_at(
+                deadline,
+                client.execute_classified_before(&request, deadline, 1),
+            )
+            .await;
+            match response {
+                Ok(Ok(SessionConsumerResponse::PreflightRecordExpiry(Ok(())))) => return Ok(()),
+                Ok(Ok(SessionConsumerResponse::PreflightRecordExpiry(Err(error)))) => {
+                    if matches!(error, SessionConsumerStoreError::Unavailable) {
+                        last_unavailable = Some(StoreError::BackendUnavailable(
+                            "prepared fenced expiry authority unavailable".into(),
+                        ));
+                    } else {
+                        return Err(error.into_store_error());
+                    }
+                }
+                Ok(Ok(SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::ScopeMismatch
+                    | SessionConsumerRejection::TopologyMismatch
+                    | SessionConsumerRejection::Unauthorized,
+                )))
+                | Ok(Err(
+                    SessionConsumerCallError::BeforeCallWrite(
+                        SessionConsumerClientError::Scope
+                        | SessionConsumerClientError::AuthorityRevoked,
+                    )
+                    | SessionConsumerCallError::MayHaveSent(
+                        SessionConsumerClientError::Scope
+                        | SessionConsumerClientError::AuthorityRevoked,
+                    ),
+                )) => return Err(StoreError::TopologyAuthorityRevoked),
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                    last_unavailable = Some(StoreError::BackendUnavailable(
+                        "prepared fenced expiry authority unavailable".into(),
+                    ));
+                }
+            }
+        }
+        Err(last_unavailable.unwrap_or_else(|| {
+            StoreError::BackendUnavailable(
+                "prepared fenced expiry authority deadline elapsed".into(),
+            )
+        }))
+    }
+
+    async fn get(
+        &self,
+        _key: &opc_session_store::SessionKey,
+    ) -> Result<Option<opc_session_store::StoredSessionRecord>, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn observe_fenced_transition(
+        &self,
+        key: &opc_session_store::SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        self.router.clients[0]
+            .observe_fenced_transition(key.clone())
+            .await
+    }
+
+    async fn compare_and_set(
+        &self,
+        _operation: CompareAndSet,
+    ) -> Result<CompareAndSetResult, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+    async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+    async fn batch(&self, _operations: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        Ok(Some(AtomicFencedTransitionCapability::V1))
+    }
+
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        true
+    }
+
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> bool {
+        self.decode(prepared).is_ok()
+    }
+
+    async fn prepare_fenced_transition(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        opc_session_store::validate_consensus_physical_fenced_transition_request(&request)?;
+        if request.request_id() != self.route.request_id() {
+            return Err(invalid_authenticated_consumer_fenced_transition());
+        }
+        PreparedFencedTransition::from_unprotected_request(request)?
+            .with_authenticated_consumer_binding(self.binding()?)
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        let request = self
+            .decode(prepared)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let voter = self.route.mutation_voter(self.router.clients.len());
+        let client = &self.router.clients[voter];
+        let (retained, write_boundary) = self
+            .route
+            .take_retained_lane(voter)
+            .ok_or(FencedTransitionExecuteError::NotTransmitted)?;
+        // The outer affine token reserved this exact connection before it
+        // entered dispatch. Do not fall back to ordinary pool admission here:
+        // a lane stolen or retired before this point is a proven pre-write
+        // failure, never an OutcomeUnknown-producing cold send.
+        let consumer_request = SessionConsumerRequest::new(
+            self.router.scope,
+            consumer_fenced_transition_request_id(&request),
+            SessionConsumerOperation::FencedTransition {
+                request: Box::new(request.clone()),
+            },
+        );
+        let response = client
+            .execute_reserved_request_lane(&consumer_request, retained)
+            .await;
+        if matches!(
+            &response,
+            Ok(_) | Err(SessionConsumerCallError::MayHaveSent(_))
+        ) {
+            // A complete response necessarily follows a Call write; the
+            // explicit transport variant preserves the same fact when the
+            // response was lost. A pending/zero-byte cancellation leaves the
+            // boundary clear instead.
+            write_boundary.mark_may_have_sent();
+        }
+        let _ = write_boundary.latch_possible_send();
+        prepared_fenced_transition_execute_response(&request, response)
+    }
+
+    async fn fenced_transition_status(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionStatus, StoreError> {
+        let request = self.decode(prepared)?;
+        let voter = self.route.next_status_voter(self.router.clients.len());
+        let client = &self.router.clients[voter];
+        let (retained, _write_boundary) =
+            self.route.take_retained_lane(voter).ok_or_else(|| {
+                StoreError::BackendUnavailable("prepared fenced receipt unavailable".into())
+            })?;
+        // Status uses the same exact reservation discipline as mutation, but
+        // its outer caller may safely rotate after this read-only lane fails.
+        let consumer_request = SessionConsumerRequest::new(
+            self.router.scope,
+            consumer_fenced_transition_request_id(&request),
+            SessionConsumerOperation::FencedTransitionStatus {
+                request: Box::new(request.clone()),
+            },
+        );
+        match prepared_fenced_transition_status_response(
+            client
+                .execute_reserved_request_lane(&consumer_request, retained)
+                .await,
+        ) {
+            Ok(status) => Ok(status),
+            Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked) => {
+                Err(StoreError::TopologyAuthorityRevoked)
+            }
+            Err(_) => Err(StoreError::BackendUnavailable(
+                "prepared fenced receipt unavailable".into(),
+            )),
+        }
+    }
 }
 
 /// Redacted construction failure for a protected prepared-checkpoint
@@ -5122,6 +5667,12 @@ pub struct SessionConsumerFencedTransitionBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("prepared consumer voter set has no common authenticated authority")]
 pub struct SessionConsumerPreparedCheckpointBackendError;
+
+/// Redacted construction failure for the activated protected V1
+/// fenced-transition facade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("prepared fenced voter roster is not an activated exact V1 authority")]
+pub struct SessionConsumerPreparedFencedTransitionBackendError;
 
 /// Net-owned composition of one protected backend allocation and a private
 /// same-scope consumer router. It supplies the scope to the SDK sealing
@@ -5227,45 +5778,159 @@ where
     }
 }
 
-/// Net-owned composition for only protected V1 fenced transitions.
+/// Private construction boundary for an erased SDK protection wrapper.
 ///
-/// Unlike [`SessionConsumerPreparedCheckpointBackend`], this dedicated
-/// boundary requires no lease authority. It therefore composes an SDK sealing
-/// wrapper directly over [`SessionConsumerFencedTransitionBackend`] with the
-/// complete persistent voter roster, without granting the physical consumer
-/// any unrelated session-store capability.
-pub struct SessionConsumerPreparedFencedTransitionBackend<B: ?Sized> {
-    backend: Arc<B>,
-    router: Arc<PreparedConsumerRouter>,
+/// The factory is never public, so callers cannot obtain either the wrapper
+/// or the physical exact-roster backend below it. A fresh wrapper is created
+/// for each affine handle so its private physical backend can share only that
+/// handle's deterministic cursor and attempt cap.
+trait PreparedFencedTransitionWrapperFactory: Send + Sync {
+    fn wrap(&self, physical: Arc<dyn SessionBackend>) -> Arc<dyn SessionBackend>;
 }
 
-impl<B: ?Sized> fmt::Debug for SessionConsumerPreparedFencedTransitionBackend<B> {
+struct LocalAeadPreparedFencedTransitionWrapper<P: ?Sized> {
+    provider: Arc<P>,
+    backend_namespace: Arc<str>,
+    journal: Arc<PreparedFencedTransitionJournal>,
+}
+
+impl<P> PreparedFencedTransitionWrapperFactory for LocalAeadPreparedFencedTransitionWrapper<P>
+where
+    P: KeyProvider + Send + Sync + 'static + ?Sized,
+{
+    fn wrap(&self, physical: Arc<dyn SessionBackend>) -> Arc<dyn SessionBackend> {
+        Arc::new(
+            EncryptingSessionBackend::new(
+                physical,
+                Arc::clone(&self.provider),
+                self.backend_namespace.to_string(),
+            )
+            .with_fenced_transition_journal(Arc::clone(&self.journal)),
+        )
+    }
+}
+
+struct RemoteSealPreparedFencedTransitionWrapper<S: ?Sized> {
+    provider: Arc<S>,
+    backend_namespace: Arc<str>,
+    journal: Arc<PreparedFencedTransitionJournal>,
+}
+
+impl<S> PreparedFencedTransitionWrapperFactory for RemoteSealPreparedFencedTransitionWrapper<S>
+where
+    S: RemoteSealProvider + Send + Sync + 'static + ?Sized,
+{
+    fn wrap(&self, physical: Arc<dyn SessionBackend>) -> Arc<dyn SessionBackend> {
+        Arc::new(
+            RemoteSealingSessionBackend::new(
+                physical,
+                Arc::clone(&self.provider),
+                self.backend_namespace.to_string(),
+            )
+            .with_fenced_transition_journal(Arc::clone(&self.journal)),
+        )
+    }
+}
+
+/// Net-owned affine facade for only protected V1 fenced transitions.
+///
+/// Unlike [`SessionConsumerPreparedCheckpointBackend`], this dedicated
+/// boundary requires no lease authority. It accepts only an opaque complete
+/// V1-prewarmed roster and retains every SDK wrapper behind a private erased
+/// [`SessionBackend`] object. It exposes neither a backend nor a wrapper
+/// getter, so a caller cannot lower an affine handle into a replayable
+/// physical transition token.
+///
+/// ```compile_fail
+/// use opc_session_net::SessionConsumerFencedTransitionBackend;
+///
+/// // The physical adapter is crate-private: consumers cannot lower the
+/// // facade into a replayable raw SessionBackend.
+/// let _ = SessionConsumerFencedTransitionBackend::persistent;
+/// ```
+pub struct SessionConsumerPreparedFencedTransitionBackend {
+    router: Arc<PreparedConsumerRouter>,
+    wrapper_factory: Arc<dyn PreparedFencedTransitionWrapperFactory>,
+}
+
+impl fmt::Debug for SessionConsumerPreparedFencedTransitionBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionConsumerPreparedFencedTransitionBackend(<redacted>)")
     }
 }
 
-impl<B> SessionConsumerPreparedFencedTransitionBackend<B>
-where
-    B: ProtectedFencedTransitionBackend + 'static,
-{
-    /// Compose one protected fenced-transition backend allocation with the
-    /// exact activated, prewarmed V1 voter backends.
-    ///
-    /// Call [`SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends`]
-    /// first and pass every returned backend here. Raw persistent clients are
-    /// deliberately not accepted: every voter must have proven V1 capability
-    /// before this protected router can exist.
-    pub fn persistent(
-        backend: Arc<B>,
-        voters: impl IntoIterator<Item = SessionConsumerFencedTransitionBackend>,
-    ) -> Result<Self, SessionConsumerPreparedCheckpointBackendError> {
-        Ok(Self {
-            backend,
-            router: Arc::new(PreparedConsumerRouter::persistent_activated_fenced_voters(
-                voters,
-            )?),
+impl SessionConsumerPreparedFencedTransitionBackend {
+    /// Activate and prewarm the complete exact V1 voter roster for this
+    /// facade. The returned roster is opaque and can only be consumed once by
+    /// one of this type's sealing constructors; raw clients and physical
+    /// backends never leave the net crate.
+    pub async fn persistent_exact_voter_prewarm_roster(
+        voters: impl IntoIterator<Item = PersistentSessionConsumerClient>,
+    ) -> Result<ActivatedSessionConsumerFencedTransitionVoters, StoreError> {
+        let voters =
+            SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends(voters)
+                .await?;
+        let router = PreparedConsumerRouter::persistent_activated_fenced_voters(voters)
+            .map_err(|_| activated_consumer_fenced_transition_readiness_unavailable())?;
+        Ok(ActivatedSessionConsumerFencedTransitionVoters {
+            router: Arc::new(router),
         })
+    }
+
+    /// Construct the local-AEAD protected facade from one opaque activated,
+    /// exact V1 voter roster. The physical router and wrapper are retained
+    /// privately and are never returned to the caller.
+    pub fn persistent_encrypting<P>(
+        voters: ActivatedSessionConsumerFencedTransitionVoters,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+        journal: Arc<PreparedFencedTransitionJournal>,
+    ) -> Result<Self, SessionConsumerPreparedFencedTransitionBackendError>
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        Ok(Self {
+            router: voters.router,
+            wrapper_factory: Arc::new(LocalAeadPreparedFencedTransitionWrapper {
+                provider,
+                backend_namespace: Arc::from(backend_namespace.into()),
+                journal,
+            }),
+        })
+    }
+
+    /// Construct the remote-seal protected facade from one opaque activated,
+    /// exact V1 voter roster. Like the local-AEAD constructor, this retains
+    /// the provider and all physical dispatch authority privately.
+    pub fn persistent_remote_sealing<S>(
+        voters: ActivatedSessionConsumerFencedTransitionVoters,
+        provider: Arc<S>,
+        backend_namespace: impl Into<String>,
+        journal: Arc<PreparedFencedTransitionJournal>,
+    ) -> Result<Self, SessionConsumerPreparedFencedTransitionBackendError>
+    where
+        S: RemoteSealProvider + Send + Sync + 'static + ?Sized,
+    {
+        Ok(Self {
+            router: voters.router,
+            wrapper_factory: Arc::new(RemoteSealPreparedFencedTransitionWrapper {
+                provider,
+                backend_namespace: Arc::from(backend_namespace.into()),
+                journal,
+            }),
+        })
+    }
+
+    fn backend_for_route(
+        &self,
+        route: Arc<PreparedFencedTransitionRoute>,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<Arc<dyn SessionBackend>, StoreError> {
+        let physical: Arc<dyn SessionBackend> = Arc::new(
+            ActivatedFencedTransitionBackend::new(Arc::clone(&self.router), route, budget)
+                .map_err(|_| invalid_authenticated_consumer_fenced_transition())?,
+        );
+        Ok(self.wrapper_factory.wrap(physical))
     }
 
     /// Prepare one protected V1 fenced transition and retain its exact
@@ -5285,24 +5950,40 @@ where
                 "prepared fenced transition deadline elapsed".into(),
             ));
         }
+        let route = Arc::new(PreparedFencedTransitionRoute::new(
+            request.request_id(),
+            self.router.fenced_transition_origin(request.request_id()),
+        ));
+        let physical = Arc::new(
+            ActivatedFencedTransitionBackend::new(
+                Arc::clone(&self.router),
+                Arc::clone(&route),
+                budget,
+            )
+            .map_err(|_| invalid_authenticated_consumer_fenced_transition())?,
+        );
+        let physical: Arc<dyn SessionBackend> = physical;
+        let backend = self.wrapper_factory.wrap(physical);
         let prepared =
-            tokio::time::timeout_at(deadline, self.backend.prepare_fenced_transition(request))
+            tokio::time::timeout_at(deadline, backend.prepare_fenced_transition(request))
                 .await
                 .map_err(|_| {
                     StoreError::BackendUnavailable(
                         "prepared fenced transition deadline elapsed".into(),
                     )
                 })??;
-        let projection: Arc<dyn ProtectedFencedTransitionBackend> = self.backend.clone();
-        tokio::time::timeout_at(
-            deadline,
-            self.router
-                .consume_fenced_transition(projection, prepared, budget),
-        )
-        .await
-        .map_err(|_| {
-            StoreError::BackendUnavailable("prepared fenced transition deadline elapsed".into())
-        })?
+        Ok(SessionConsumerPreparedFencedTransition {
+            inner: PersistentPreparedFencedTransitionToken {
+                backend,
+                router: Arc::clone(&self.router),
+                _prepared: Arc::new(prepared),
+                budget,
+                voter_count: self.router.clients.len(),
+                route,
+                state: PreparedRequestState::new(0),
+                terminal_receipt: StdMutex::new(None),
+            },
+        })
     }
 
     /// Reopen a durably prepared transition as a receipt-only handle.
@@ -5321,19 +6002,35 @@ where
                 "prepared fenced transition deadline elapsed".into(),
             ));
         }
+        let route = Arc::new(PreparedFencedTransitionRoute::new(
+            request_id,
+            self.router.fenced_transition_origin(request_id),
+        ));
+        // Journal recovery is local. Do not require all voters to be ready
+        // here: a receipt remains safely observable from another exact voter
+        // when the former writer is down. The status-only handle warms its
+        // next deterministic voter immediately before each capped read.
+        let backend = self.backend_for_route(Arc::clone(&route), budget)?;
         tokio::time::timeout_at(deadline, async {
-            match self
-                .backend
+            match backend
                 .recover_prepared_fenced_transition(request_id)
                 .await?
             {
                 opc_session_store::PreparedFencedTransitionLookup::Found(prepared) => {
-                    let projection: Arc<dyn ProtectedFencedTransitionBackend> =
-                        self.backend.clone();
-                    self.router
-                        .consume_fenced_transition_status_only(projection, prepared, budget)
-                        .await
-                        .map(Some)
+                    let state = PreparedRequestState::new(0);
+                    state.receipt_only();
+                    Ok(Some(SessionConsumerRecoveredFencedTransitionStatus {
+                        inner: PersistentPreparedFencedTransitionToken {
+                            backend: Arc::clone(&backend),
+                            router: Arc::clone(&self.router),
+                            _prepared: Arc::new(prepared),
+                            budget,
+                            voter_count: self.router.clients.len(),
+                            route: Arc::clone(&route),
+                            state,
+                            terminal_receipt: StdMutex::new(None),
+                        },
+                    }))
                 }
                 opc_session_store::PreparedFencedTransitionLookup::Absent => Ok(None),
                 _ => Err(invalid_authenticated_consumer_fenced_transition()),
@@ -5350,7 +6047,7 @@ impl PreparedConsumerRouter {
     fn persistent(
         clients: impl IntoIterator<Item = PersistentSessionConsumerClient>,
     ) -> Result<Self, SessionConsumerPreparedCheckpointBackendError> {
-        let mut clients: Vec<_> = clients.into_iter().collect();
+        let clients: Vec<_> = clients.into_iter().collect();
         if clients.is_empty() || clients.len() > MAX_PREPARED_CONSUMER_VOTERS {
             return Err(SessionConsumerPreparedCheckpointBackendError);
         }
@@ -5374,10 +6071,6 @@ impl PreparedConsumerRouter {
         {
             return Err(SessionConsumerPreparedCheckpointBackendError);
         }
-        // The caller's input order is not durable authority.  Sort by the
-        // canonical node ordinal before deriving any request's origin so a
-        // restarted worker reaches the same origin/successor sequence.
-        clients.sort_unstable_by_key(|client| client.pool.client.voter.node_id());
         Ok(Self {
             clients: clients.into(),
             scope,
@@ -5404,7 +6097,7 @@ impl PreparedConsumerRouter {
         }) {
             return Err(SessionConsumerPreparedCheckpointBackendError);
         }
-        let clients = voters
+        let mut clients = voters
             .into_iter()
             .map(|backend| match backend.client {
                 SessionConsumerFencedTransitionClient::Persistent(client) => client,
@@ -5413,6 +6106,12 @@ impl PreparedConsumerRouter {
                 }
             })
             .collect::<Vec<_>>();
+        // Only the opaque activated V1 roster has the stronger affine-router
+        // contract. Its caller input order is not durable authority, so pin
+        // A/B/C by canonical node ordinal before any per-handle cursor is
+        // derived. The older generic prepared CAS/lease router deliberately
+        // retains its caller-provided ordering for compatibility.
+        clients.sort_unstable_by_key(|client| client.pool.client.voter.node_id());
         Self::persistent(clients)
     }
 }
@@ -5449,9 +6148,8 @@ impl fmt::Debug for SessionConsumerFencedTransitionBackend {
 }
 
 impl SessionConsumerFencedTransitionBackend {
-    /// Adapt a stateless authenticated consumer client to the atomic physical
-    /// transition surface.
-    pub fn stateless(
+    #[allow(dead_code)]
+    fn from_stateless(
         client: StatelessSessionConsumerClient,
     ) -> Result<Self, SessionConsumerFencedTransitionBackendError> {
         let binding_commitment = authenticated_consumer_binding(
@@ -5465,9 +6163,15 @@ impl SessionConsumerFencedTransitionBackend {
         })
     }
 
-    /// Adapt a persistent authenticated consumer client to the atomic
-    /// physical transition surface.
-    pub fn persistent(
+    #[allow(dead_code)]
+    pub(crate) fn stateless(
+        client: StatelessSessionConsumerClient,
+    ) -> Result<Self, SessionConsumerFencedTransitionBackendError> {
+        Self::from_stateless(client)
+    }
+
+    #[allow(dead_code)]
+    fn from_persistent(
         client: PersistentSessionConsumerClient,
     ) -> Result<Self, SessionConsumerFencedTransitionBackendError> {
         let binding_commitment = authenticated_consumer_binding(
@@ -5483,6 +6187,13 @@ impl SessionConsumerFencedTransitionBackend {
             binding_commitment,
             activated_readiness: None,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn persistent(
+        client: PersistentSessionConsumerClient,
+    ) -> Result<Self, SessionConsumerFencedTransitionBackendError> {
+        Self::from_persistent(client)
     }
 
     /// Construct one physical backend per voter after one off-hot-path exact
@@ -5505,7 +6216,7 @@ impl SessionConsumerFencedTransitionBackend {
     /// same-identity certificate renewal and explicit reauthentication do not
     /// invalidate it. A semantic authority change requires reconstruction and
     /// a new prewarm before the worker can be Ready again.
-    pub async fn persistent_exact_voter_prewarm_backends(
+    pub(crate) async fn persistent_exact_voter_prewarm_backends(
         voters: impl IntoIterator<Item = PersistentSessionConsumerClient>,
     ) -> Result<Vec<Self>, StoreError> {
         let voters: Vec<_> = voters.into_iter().collect();
@@ -5535,11 +6246,28 @@ impl SessionConsumerFencedTransitionBackend {
             return Err(activated_consumer_fenced_transition_readiness_unavailable());
         }
 
-        let capabilities = futures_util::future::join_all(
-            voters
-                .iter()
-                .map(PersistentSessionConsumerClient::fenced_transition_capability),
-        )
+        // Activation is deliberately off the IKE/request hot path. Establish
+        // the complete configured lane width before the capability proof, so
+        // the first protected dispatch or receipt lookup cannot spend its
+        // short physical attempt cap opening the remaining default lanes.
+        // `prewarm` has its own fixed pool/setup bounds and the fan-out keeps
+        // this one operation per exact voter rather than creating nested
+        // voter loops.
+        let capabilities = futures_util::future::join_all(voters.iter().map(|client| async {
+            let readiness = client.prewarm().await.map_err(|error| match error {
+                SessionConsumerClientError::Scope
+                | SessionConsumerClientError::AuthorityRevoked => {
+                    StoreError::TopologyAuthorityRevoked
+                }
+                _ => activated_consumer_fenced_transition_readiness_unavailable(),
+            })?;
+            if !readiness.ready
+                || readiness.ready_request_connections != readiness.configured_request_connections
+            {
+                return Err(activated_consumer_fenced_transition_readiness_unavailable());
+            }
+            client.fenced_transition_capability().await
+        }))
         .await;
         for capability in capabilities {
             match capability? {
@@ -5834,6 +6562,20 @@ impl SessionBackend for SessionConsumerFencedTransitionBackend {
 /// The type holds only an endpoint, expected service identity, mTLS material,
 /// and scope. It owns no local database, replica directory, snapshot, quorum
 /// member identity, voter/learner state, or consensus peer.
+///
+/// ```compile_fail
+/// use opc_session_net::StatelessSessionConsumerClient;
+/// use opc_session_store::FencedTransitionRequest;
+///
+/// async fn cannot_lower_to_a_v1_physical_call(
+///     client: StatelessSessionConsumerClient,
+///     request: &FencedTransitionRequest,
+/// ) {
+///     // The physical V1 call is crate-private. The public generic `execute`
+///     // also rejects this opcode before connection setup.
+///     let _ = client.fenced_transition(request).await;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct StatelessSessionConsumerClient {
     resolve: RemoteAddrResolver,
@@ -6415,7 +7157,7 @@ impl StatelessSessionConsumerClient {
             .map_err(|_| SessionConsumerClientError::Authentication)?;
         if peer.spiffe_id().as_str() != self.voter.tls_identity() {
             return Err(ConsumerSetupError::Client(
-                SessionConsumerClientError::Authentication,
+                SessionConsumerClientError::AuthorityRevoked,
             ));
         }
         let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
@@ -6539,14 +7281,37 @@ impl StatelessSessionConsumerClient {
                 checked_consumer_frame_size(ack.request_frame_size)
                     .map_err(SessionConsumerClientError::from)?
             }
+            ConsumerWireResponse::HelloAck(ack) if ack.scope != self.scope() => {
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::Scope,
+                ));
+            }
+            ConsumerWireResponse::HelloAck(ack)
+                if ack.server_node_id != self.voter.node_id().get()
+                    || usize::from(ack.voter_count) != self.voter.voter_count()
+                    || ack.roster_commitment != self.voter.roster_commitment() =>
+            {
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::AuthorityRevoked,
+                ));
+            }
             ConsumerWireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
                 return Err(ConsumerSetupError::Client(
                     SessionConsumerClientError::Scope,
                 ));
             }
-            ConsumerWireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
+            ConsumerWireResponse::HelloRejected(SessionConsumerRejection::TopologyMismatch) => {
                 return Err(ConsumerSetupError::Client(
-                    SessionConsumerClientError::Authentication,
+                    SessionConsumerClientError::AuthorityRevoked,
+                ));
+            }
+            ConsumerWireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
+                // This is an authenticated V1 Hello rejection, not a local
+                // TLS/key-material failure. The exact activated authority no
+                // longer authorizes this peer, so an affine prepared handle
+                // must stop rather than rotate its mutation or receipt route.
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::AuthorityRevoked,
                 ));
             }
             _ => {
@@ -6926,11 +7691,17 @@ impl StatelessSessionConsumerClient {
     /// disconnected, or times out after transmission, the caller retains the
     /// request ID and may make its own recovery decision using an authoritative
     /// read; mutation helpers map that condition to their explicit unknown
-    /// outcome errors.
+    /// outcome errors. V1 `FencedTransition` and
+    /// `FencedTransitionStatus` requests are intentionally rejected before
+    /// connection setup: use the opaque activated-roster
+    /// [`SessionConsumerPreparedFencedTransitionBackend`] facade instead.
     pub async fn execute(
         &self,
         request: SessionConsumerRequest,
     ) -> Result<SessionConsumerResponse, SessionConsumerClientError> {
+        if consumer_operation_requires_affine_fenced_transition_route(request.operation()) {
+            return Err(SessionConsumerClientError::Protocol);
+        }
         self.execute_classified(request)
             .await
             .map_err(SessionConsumerCallError::into_client_error)
@@ -7141,6 +7912,11 @@ impl StatelessSessionConsumerClient {
             ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
                 return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                     cause: SessionConsumerClientError::Scope,
+                });
+            }
+            ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::TopologyMismatch) => {
+                return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::AuthorityRevoked,
                 });
             }
             ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
@@ -7565,8 +8341,12 @@ impl StatelessSessionConsumerClient {
         }
     }
 
-    /// Submit exactly one complete atomic transition without automatic replay.
-    pub async fn fenced_transition(
+    /// Net-private physical submission for the activated affine V1 router.
+    ///
+    /// Public callers use [`SessionConsumerPreparedFencedTransitionBackend`],
+    /// which owns the exact activated roster and removes dispatch authority
+    /// after any ambiguous send.
+    pub(crate) async fn fenced_transition(
         &self,
         request: &FencedTransitionRequest,
     ) -> Result<FencedTransitionOutcome, SessionConsumerFencedTransitionMutationError> {
@@ -7583,14 +8363,18 @@ impl StatelessSessionConsumerClient {
         )
     }
 
-    /// Recover the typed retained status using the identical transition body.
-    pub async fn fenced_transition_status(
+    /// Net-private physical receipt lookup for the activated affine V1 router.
+    pub(crate) async fn fenced_transition_status(
         &self,
         request: &FencedTransitionRequest,
     ) -> Result<SessionConsumerFencedTransitionStatus, StoreError> {
         let request_id = consumer_fenced_transition_request_id(request);
         match self
-            .execute(self.request(
+            // This net-private route deliberately bypasses the public generic
+            // `execute` gate.  The public method rejects V1 transition
+            // opcodes so a downstream caller cannot lower an affine handle;
+            // the activated router retains the sole physical status port.
+            .execute_classified(self.request(
                 request_id,
                 SessionConsumerOperation::FencedTransitionStatus {
                     request: Box::new(request.clone()),
@@ -10353,6 +11137,9 @@ impl PersistentSessionConsumerV2Pool {
             ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
                 return Err(SessionConsumerClientError::Scope);
             }
+            ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::TopologyMismatch) => {
+                return Err(SessionConsumerClientError::AuthorityRevoked);
+            }
             ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
                 return Err(SessionConsumerClientError::Authentication);
             }
@@ -11132,6 +11919,7 @@ fn v2_response_retires_connection_authority(response: &SessionConsumerV2Response
             response,
             SessionConsumerV2Response::Rejected(
                 SessionConsumerRejection::ScopeMismatch
+                    | SessionConsumerRejection::TopologyMismatch
                     | SessionConsumerRejection::Unauthorized
                     | SessionConsumerRejection::MalformedRequest
             )
@@ -11383,6 +12171,13 @@ struct PersistentConsumerTestHooks {
     warm_return_pause_once: AtomicBool,
     warm_return_entered: Arc<Notify>,
     warm_return_release: Arc<Notify>,
+    // Test-only admission cut immediately after an affine caller has
+    // retained an authenticated lane. This is deliberately later than the
+    // normal queue hooks: it exercises an at-cap wake without pretending a
+    // failed setup consumed a receipt cursor.
+    retained_lane_pause_once: AtomicBool,
+    retained_lane_entered: Arc<Notify>,
+    retained_lane_release: Arc<Notify>,
     queued_lane_pause_once: AtomicBool,
     queued_lane_assigned: Arc<Notify>,
     queued_lane_release: Arc<Notify>,
@@ -11405,6 +12200,9 @@ impl PersistentConsumerTestHooks {
             warm_return_pause_once: AtomicBool::new(false),
             warm_return_entered: Arc::new(Notify::new()),
             warm_return_release: Arc::new(Notify::new()),
+            retained_lane_pause_once: AtomicBool::new(false),
+            retained_lane_entered: Arc::new(Notify::new()),
+            retained_lane_release: Arc::new(Notify::new()),
             queued_lane_pause_once: AtomicBool::new(false),
             queued_lane_assigned: Arc::new(Notify::new()),
             queued_lane_release: Arc::new(Notify::new()),
@@ -11459,7 +12257,12 @@ struct PersistentSessionConsumerPool {
     pending: Arc<Semaphore>,
     watches: Arc<Semaphore>,
     prewarm: Arc<Semaphore>,
+    // Full-width administrative prewarm and one-lane affine readiness have
+    // different postconditions. They therefore never join the same setup
+    // flight: a retained-lane caller must not mistake a full-pool result (or
+    // vice versa) for its own proof.
     warm_lane: StdMutex<Option<Arc<PersistentWarmLaneFlight>>>,
+    retained_warm_lane: StdMutex<Option<Arc<PersistentWarmLaneFlight>>>,
     /// The resolver result most recently proven by `ensure_warm_request_capacity`.
     /// Lanes connected to a prior target are retired instead of being reused
     /// or republished after that proof.
@@ -11710,6 +12513,21 @@ struct PersistentCheckedOutConnection {
     pool: Arc<PersistentSessionConsumerPool>,
     connection: Option<ConsumerConnection>,
     registered: bool,
+}
+
+/// One authenticated lane held continuously from the affine pre-dispatch
+/// setup proof through its one exact request. It owns normal pending/lane
+/// admission, so another facade cannot steal the just-proven connection and
+/// force a hidden cold connect after dispatch authority has been spent.
+struct PersistentRetainedRequestLane {
+    connection: PersistentCheckedOutConnection,
+    activity: PersistentCallActivity,
+    admission: PersistentCapacityAdmission,
+    deadline: tokio::time::Instant,
+    // The affine facade keeps a clone of this exact call-local observation
+    // after it hands the checkout to the opaque wrapper. It is the only
+    // evidence that a cancelled inner future crossed the wire boundary.
+    write_progress: Arc<FrameWriteProgress>,
 }
 
 /// Releases a logical admission before waking warm-capacity maintenance.
@@ -11968,6 +12786,23 @@ impl PersistentSessionConsumerPool {
         self.warm_capacity_snapshot(0).0
     }
 
+    /// Return the number of currently retained, authenticated idle request
+    /// lanes for the current resolver target. A checked-out lane cannot prove
+    /// that the next affine attempt will avoid fresh setup, so the protected
+    /// router deliberately requires an idle retained lane here.
+    fn current_idle_warm_capacity(&self) -> usize {
+        let target = self
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_idle_for_target(&mut idle, target.address);
+        idle.len()
+    }
+
     /// Snapshot authenticated current capacity and all established physical
     /// lanes under one target -> idle -> checked-out lock order.  A lane in a
     /// connect attempt is instead protected by its logical lane permit; the
@@ -12101,6 +12936,32 @@ impl PersistentSessionConsumerPool {
         }))
     }
 
+    fn begin_retained_warm_lane(
+        self: &Arc<Self>,
+    ) -> Result<
+        Result<PersistentWarmLaneLeader, Arc<PersistentWarmLaneFlight>>,
+        SessionConsumerClientError,
+    > {
+        if self.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let mut flight = self
+            .retained_warm_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = flight.as_ref() {
+            if existing.result().is_none() {
+                return Ok(Err(Arc::clone(existing)));
+            }
+        }
+        let next = Arc::new(PersistentWarmLaneFlight::new());
+        *flight = Some(Arc::clone(&next));
+        Ok(Ok(PersistentWarmLaneLeader {
+            flight: next,
+            completed: false,
+        }))
+    }
+
     fn ensure_idle_reaper(self: &Arc<Self>) {
         if self.phase() != PersistentShutdownPhase::Running {
             return;
@@ -12201,7 +13062,7 @@ impl PersistentSessionConsumerPool {
             SessionConsumerClientError::Authentication => {
                 counter_increment(&self.counters.authentication);
             }
-            SessionConsumerClientError::Scope => {
+            SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked => {
                 counter_increment(&self.counters.scope);
             }
             SessionConsumerClientError::Protocol => {
@@ -12819,6 +13680,19 @@ impl PersistentSessionConsumerPool {
 /// Clones share one bounded pool; they never silently serialize all work onto
 /// a clone-local socket. A socket is returned to the pool only after one exact
 /// correlated response completes, so cancellation after write drops it.
+///
+/// ```compile_fail
+/// use opc_session_net::PersistentSessionConsumerClient;
+/// use opc_session_store::FencedTransitionRequest;
+///
+/// async fn cannot_lower_to_a_v1_physical_call(
+///     client: PersistentSessionConsumerClient,
+///     request: &FencedTransitionRequest,
+/// ) {
+///     // Only the opaque activated-roster facade can use this method.
+///     let _ = client.fenced_transition_status(request).await;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct PersistentSessionConsumerClient {
     pool: Arc<PersistentSessionConsumerPool>,
@@ -13089,6 +13963,7 @@ impl PersistentSessionConsumerClient {
             // leaving normal call admission independent.
             prewarm: Arc::clone(&request_prewarm),
             warm_lane: StdMutex::new(None),
+            retained_warm_lane: StdMutex::new(None),
             warm_target: StdMutex::new(PersistentWarmTarget::default()),
             checked_out: StdMutex::new(Vec::with_capacity(config.request_connections)),
             warm_capacity_changed: Notify::new(),
@@ -13431,7 +14306,11 @@ impl PersistentSessionConsumerClient {
     /// Execute one complete typed request on a fair fixed request lane while
     /// retaining its transport effect boundary. The request is borrowed so
     /// an ambiguous outcome always leaves the exact durable ID and body in
-    /// caller ownership for authoritative recovery.
+    /// caller ownership for authoritative recovery. V1
+    /// `FencedTransition` and `FencedTransitionStatus` requests are rejected
+    /// before lane admission; their only SDK transport route is the opaque
+    /// activated-roster [`SessionConsumerPreparedFencedTransitionBackend`]
+    /// facade.
     pub async fn execute(
         &self,
         request: &SessionConsumerRequest,
@@ -13439,7 +14318,9 @@ impl PersistentSessionConsumerClient {
         // Roster capsules are meaningful only through the consumed
         // `AuthenticatedRosterConsumer` held by the private concrete port.
         // A hand-built generic request fails before it reaches a socket.
-        if consumer_operation_requires_roster_capability(request.operation()) {
+        if consumer_operation_requires_roster_capability(request.operation())
+            || consumer_operation_requires_affine_fenced_transition_route(request.operation())
+        {
             return Err(PersistentSessionConsumerExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
@@ -13770,6 +14651,113 @@ impl PersistentSessionConsumerClient {
         }
     }
 
+    /// Execute through a lane reserved by the affine router. This path never
+    /// falls back to cold setup: losing the reserved lane is conclusively
+    /// pre-write and must be reported as such to the router, not converted to
+    /// an ambiguous post-dispatch send.
+    async fn execute_reserved_request_lane(
+        &self,
+        request: &SessionConsumerRequest,
+        retained: PersistentRetainedRequestLane,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        let PersistentRetainedRequestLane {
+            mut connection,
+            activity,
+            admission,
+            deadline,
+            write_progress,
+        } = retained;
+        let started = tokio::time::Instant::now();
+        if started >= deadline {
+            drop(activity);
+            drop(admission);
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Deadline,
+            ));
+        }
+        if request.scope() != self.pool.client.scope()
+            || !consumer_operation_matches_transport(
+                request.operation(),
+                self.pool.client.transport_capability,
+            )
+            || matches!(request.operation(), SessionConsumerOperation::Watch { .. })
+            || !consumer_request_has_exact_fenced_transition_id(request)
+            || request.validate().is_err()
+        {
+            drop(activity);
+            drop(admission);
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
+        let (pre_request_deadline, pre_request_budget_active) =
+            self.pool.client.pre_request_deadline(started, deadline);
+        let outcome = PersistentCallOutcome::new(
+            Arc::clone(&self.pool),
+            &write_progress,
+            consumer_operation_is_effectful(request.operation()),
+        );
+        let shutdown = self.pool.shutdown_tx.subscribe();
+        let result = self
+            .pool
+            .client
+            .execute_on_connection_with_progress(
+                connection
+                    .connection_mut()
+                    .ok_or(SessionConsumerCallError::BeforeCallWrite(
+                        SessionConsumerClientError::Protocol,
+                    ))?,
+                request,
+                pre_request_deadline,
+                pre_request_budget_active,
+                deadline,
+                Some((shutdown, &self.pool.shutdown_phase)),
+                &write_progress,
+            )
+            .await;
+        if matches!(
+            &result,
+            Ok(response)
+                if !response_retires_connection_authority(response)
+                    && !response_is_outcome_unknown(request.operation(), response)
+        ) {
+            connection.return_idle();
+        }
+        drop(activity);
+        drop(admission);
+        outcome.complete();
+        match result {
+            Ok(response) => {
+                match &response {
+                    SessionConsumerResponse::Rejected(rejection) => self
+                        .pool
+                        .record_failure(consumer_rejection_into_client_error(*rejection)),
+                    _ if response_is_outcome_unknown(request.operation(), &response) => {
+                        self.pool
+                            .record_failure(SessionConsumerClientError::Unavailable);
+                        counter_increment(&self.pool.counters.outcome_unknown);
+                    }
+                    _ if response_is_known_failure(&response) => {
+                        self.pool
+                            .record_failure(SessionConsumerClientError::Unavailable);
+                    }
+                    _ => {
+                        counter_increment(&self.pool.counters.successes);
+                    }
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                self.pool.record_error(
+                    error.into_client_error(),
+                    matches!(error, SessionConsumerCallError::MayHaveSent(_)),
+                    consumer_operation_is_effectful(request.operation()),
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Reconnect an exact, read-only fenced-transition receipt lookup after a
     /// post-write transport loss.  Every attempt carries the same consumer
     /// request ID and immutable transition body, and all attempts share one
@@ -13934,10 +14922,10 @@ impl PersistentSessionConsumerClient {
         }
     }
 
-    /// Submit exactly one complete atomic transition over a persistent lane.
+    /// Net-private physical submission for the activated affine V1 router.
     /// A post-write timeout or EOF retires the lane and returns the exact
     /// caller-owned transition ID as an unknown outcome.
-    pub async fn fenced_transition(
+    pub(crate) async fn fenced_transition(
         &self,
         request: &FencedTransitionRequest,
     ) -> Result<FencedTransitionOutcome, SessionConsumerFencedTransitionMutationError> {
@@ -13954,8 +14942,8 @@ impl PersistentSessionConsumerClient {
         )
     }
 
-    /// Recover one retained transition status through a persistent read lane.
-    pub async fn fenced_transition_status(
+    /// Net-private physical receipt lookup for the activated affine V1 router.
+    pub(crate) async fn fenced_transition_status(
         &self,
         request: &FencedTransitionRequest,
     ) -> Result<SessionConsumerFencedTransitionStatus, StoreError> {
@@ -14774,6 +15762,81 @@ impl PersistentSessionConsumerClient {
             .ok_or(SessionConsumerClientError::Unavailable)
     }
 
+    /// Establish one retained authenticated request lane for a protected
+    /// affine attempt. This intentionally differs from activation/prewarm:
+    /// it does not refill the configured pool width, so an idle-reaped voter
+    /// consumes at most one bounded resolver/TCP/TLS/Hello setup before the
+    /// router can classify a proven pre-write failure and rotate.
+    async fn establish_one_retained_request_lane(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        let _gate = self
+            .acquire_warm_permit(&self.pool.prewarm, deadline, &mut shutdown)
+            .await?;
+        let _activity = self.pool.register_prewarm()?;
+
+        let resolve = (self.pool.client.resolve)();
+        tokio::pin!(resolve);
+        let target = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+            result = tokio::time::timeout_at(deadline, &mut resolve) => match result {
+                Ok(Ok(target)) if tokio::time::Instant::now() < deadline => target,
+                Ok(Ok(_)) | Err(_) => return Err(SessionConsumerClientError::Deadline),
+                Ok(Err(_)) => return Err(SessionConsumerClientError::Unavailable),
+            }
+        };
+        let target_generation = self.pool.publish_warm_target(target);
+        if self.pool.current_idle_warm_capacity() != 0 {
+            return Ok(());
+        }
+
+        // A retained lane is enough for exactly one subsequent affine call.
+        // Use ordinary bounded admission rather than a full-pool reservation;
+        // cancellation before publication drops every permit and connection.
+        let pending = self
+            .acquire_warm_permit(&self.pool.pending, deadline, &mut shutdown)
+            .await?;
+        let lane = match self
+            .acquire_warm_permit(&self.pool.lanes, deadline, &mut shutdown)
+            .await
+        {
+            Ok(lane) => lane,
+            Err(error) => {
+                drop(pending);
+                return Err(error);
+            }
+        };
+        let admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        if self.pool.current_idle_warm_capacity() != 0 {
+            drop(admission);
+            return Ok(());
+        }
+        let connection = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => Err(SessionConsumerClientError::ShuttingDown),
+            result = self.pool.connect_with_physical_admission(
+                deadline,
+                None,
+                None,
+                true,
+                Some(target),
+            ) => result,
+        };
+        let mut connection = connection?;
+        connection.warm_target_generation = target_generation;
+        self.pool.return_idle(connection);
+        drop(admission);
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        (self.pool.current_idle_warm_capacity() != 0)
+            .then_some(())
+            .ok_or(SessionConsumerClientError::Unavailable)
+    }
+
     async fn join_warm_request_lane(
         &self,
         flight: Arc<PersistentWarmLaneFlight>,
@@ -14836,6 +15899,90 @@ impl PersistentSessionConsumerClient {
             self.pool.test_hooks.warm_return_release.notified().await;
         }
         result
+    }
+
+    /// Ensure just one authenticated idle request lane is retained before an
+    /// affine router admits a physical dispatch or receipt probe. Unlike the
+    /// administrative full-pool warm operation, this is safe on a live hot
+    /// path: it is bounded before dispatch and never opens more than one lane.
+    async fn ensure_retained_request_lane_before(
+        &self,
+        caller_deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        if self.pool.current_idle_warm_capacity() != 0 {
+            return Ok(());
+        }
+        let started = tokio::time::Instant::now();
+        let mut deadline = caller_deadline.min(
+            started
+                .checked_add(self.pool.config.setup_timeout)
+                .ok_or(SessionConsumerClientError::Deadline)?,
+        );
+        if let Some(pre_request_deadline) = self
+            .pool
+            .client
+            .pre_request_connection_timeout
+            .and_then(|timeout| started.checked_add(timeout))
+        {
+            deadline = deadline.min(pre_request_deadline);
+        }
+        if deadline <= started {
+            return Err(SessionConsumerClientError::Deadline);
+        }
+        match self.pool.begin_retained_warm_lane()? {
+            Ok(leader) => leader.complete(self.establish_one_retained_request_lane(deadline).await),
+            Err(flight) => self.join_warm_request_lane(flight, deadline).await,
+        }
+    }
+
+    /// Prove and atomically check out one authenticated lane for an affine
+    /// attempt. The returned lease is intentionally not published back to
+    /// idle until its exact request completes, preventing a concurrent
+    /// facade from stealing the setup result between readiness and dispatch.
+    async fn reserve_retained_request_lane_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<PersistentRetainedRequestLane, SessionConsumerClientError> {
+        self.ensure_retained_request_lane_before(deadline).await?;
+        let started = tokio::time::Instant::now();
+        if started >= deadline {
+            return Err(SessionConsumerClientError::Deadline);
+        }
+        let (pending, lane) = self.pool.admit_call(started, deadline).await?;
+        let admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        let activity = match self.pool.register_call() {
+            Ok(activity) => activity,
+            Err(error) => {
+                drop(admission);
+                return Err(error);
+            }
+        };
+        let Some(connection) = self.pool.take_idle() else {
+            drop(activity);
+            drop(admission);
+            return Err(SessionConsumerClientError::Unavailable);
+        };
+        let retained = PersistentRetainedRequestLane {
+            connection,
+            activity,
+            admission,
+            deadline,
+            write_progress: Arc::new(FrameWriteProgress::new()),
+        };
+        #[cfg(test)]
+        if self
+            .pool
+            .test_hooks
+            .retained_lane_pause_once
+            .swap(false, Ordering::SeqCst)
+        {
+            self.pool.test_hooks.retained_lane_entered.notify_waiters();
+            self.pool.test_hooks.retained_lane_release.notified().await;
+        }
+        Ok(retained)
     }
 
     /// Ensure the configured request capacity is authenticated for the current
@@ -15038,71 +16185,6 @@ impl PreparedConsumerRouter {
         ]) as usize)
             % self.clients.len()
     }
-
-    async fn consume_fenced_transition(
-        self: &Arc<Self>,
-        projection: Arc<dyn ProtectedFencedTransitionBackend>,
-        prepared: PreparedFencedTransition,
-        budget: PreparedCheckpointBudget,
-    ) -> Result<SessionConsumerPreparedFencedTransition, StoreError> {
-        let request = projection
-            .authenticated_consumer_fenced_transition_request(
-                &prepared,
-                self.fenced_transition_binding()?,
-            )
-            .await?;
-        opc_session_store::validate_consensus_physical_fenced_transition_request(&request)?;
-        if tokio::time::Instant::now() >= budget.original_deadline() {
-            return Err(StoreError::BackendUnavailable(
-                "prepared fenced transition deadline elapsed".into(),
-            ));
-        }
-        let request_id = prepared.request_id();
-        Ok(SessionConsumerPreparedFencedTransition {
-            inner: PersistentPreparedFencedTransitionToken {
-                router: Arc::clone(self),
-                projection,
-                _prepared: Arc::new(prepared),
-                request: Arc::new(request),
-                budget,
-                state: PreparedRequestState::new(self.fenced_transition_origin(request_id)),
-                terminal_receipt: StdMutex::new(None),
-            },
-        })
-    }
-
-    async fn consume_fenced_transition_status_only(
-        self: &Arc<Self>,
-        projection: Arc<dyn ProtectedFencedTransitionBackend>,
-        prepared: PreparedFencedTransition,
-        budget: PreparedCheckpointBudget,
-    ) -> Result<SessionConsumerRecoveredFencedTransitionStatus, StoreError> {
-        let request = projection
-            .authenticated_consumer_fenced_transition_request(
-                &prepared,
-                self.fenced_transition_binding()?,
-            )
-            .await?;
-        opc_session_store::validate_consensus_physical_fenced_transition_request(&request)?;
-        if tokio::time::Instant::now() >= budget.original_deadline() {
-            return Err(StoreError::BackendUnavailable(
-                "prepared fenced transition deadline elapsed".into(),
-            ));
-        }
-        let state = PreparedRequestState::new(self.fenced_transition_origin(prepared.request_id()));
-        state.receipt_only();
-        Ok(SessionConsumerRecoveredFencedTransitionStatus {
-            inner: PersistentPreparedFencedTransitionToken {
-                router: Arc::clone(self),
-                projection,
-                _prepared: Arc::new(prepared),
-                request: Arc::new(request),
-                budget,
-                state,
-                terminal_receipt: StdMutex::new(None),
-            },
-        })
-    }
 }
 
 fn prepared_voter_index(cursor: usize, voter_count: usize) -> usize {
@@ -15114,6 +16196,11 @@ const PREPARED_PREPARING: u8 = 1;
 const PREPARED_DISPATCHING: u8 = 2;
 const PREPARED_RECEIPT_ONLY: u8 = 3;
 const PREPARED_TERMINAL: u8 = 4;
+// A full receipt round is bounded by the roster size and the caller's
+// physical-attempt cap. Pause briefly between nonterminal rounds so an
+// immediately replicated receipt can become visible without turning
+// NotFound/Unavailable into a tight polling loop.
+const PREPARED_FENCED_STATUS_ROUND_BACKOFF: Duration = Duration::from_millis(5);
 
 struct PreparedRequestState {
     phase: AtomicU8,
@@ -15151,6 +16238,7 @@ impl PreparedRequestState {
             .map(|_| PreparedPreparationGuard {
                 state: self,
                 completed: false,
+                physical_write_boundary: None,
             })
             .map_err(|_| ())
     }
@@ -15214,6 +16302,10 @@ impl PreparedRequestState {
 struct PreparedPreparationGuard<'a> {
     state: &'a PreparedRequestState,
     completed: bool,
+    // Affine protected-fenced execution arms this with the exact private
+    // physical backend boundary. Other prepared operations continue to use
+    // `PreparedDispatchGuard` directly.
+    physical_write_boundary: Option<Arc<PreparedFencedTransitionWriteBoundary>>,
 }
 
 impl<'a> PreparedPreparationGuard<'a> {
@@ -15239,11 +16331,35 @@ impl<'a> PreparedPreparationGuard<'a> {
         self.state.terminal();
         self.completed = true;
     }
+
+    fn arm_physical_write_boundary(
+        &mut self,
+        physical_write_boundary: Arc<PreparedFencedTransitionWriteBoundary>,
+    ) {
+        self.physical_write_boundary = Some(physical_write_boundary);
+    }
+
+    fn receipt_only(&mut self) {
+        self.state.receipt_only();
+        self.completed = true;
+    }
 }
 
 impl Drop for PreparedPreparationGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
+            if self
+                .physical_write_boundary
+                .as_ref()
+                .is_some_and(|boundary| boundary.latch_possible_send())
+            {
+                // The lower, net-private backend crossed its physical
+                // dispatch admission point. A cancelled wrapper future may
+                // already have written, so preserve only receipt authority.
+                self.state.receipt_only();
+                self.completed = true;
+                return;
+            }
             let _ = self.state.phase.compare_exchange(
                 PREPARED_PREPARING,
                 PREPARED_READY,
@@ -15308,6 +16424,12 @@ pub enum SessionConsumerPreparedFencedTransitionStatusError {
     NotExecuted,
     #[error("prepared fenced transition deadline elapsed")]
     Deadline,
+    /// One physical receipt attempt reached its configured cap while the
+    /// immutable outer deadline remains live. This is retryable only by the
+    /// SDK-owned status-only runner; callers must not infer any mutation
+    /// authority from it.
+    #[error("prepared fenced transition receipt attempt deadline elapsed")]
+    AttemptDeadline,
     #[error("prepared fenced transition authority was revoked")]
     TopologyAuthorityRevoked,
     #[error("prepared fenced transition receipt is unavailable")]
@@ -15402,13 +16524,16 @@ impl SessionConsumerRecoveredFencedTransitionStatus {
 }
 
 struct PersistentPreparedFencedTransitionToken {
+    backend: Arc<dyn SessionBackend>,
+    // The opaque activated exact roster is retained solely for read-only
+    // readiness proof before a handle enters mutation or receipt I/O.
     router: Arc<PreparedConsumerRouter>,
-    projection: Arc<dyn ProtectedFencedTransitionBackend>,
-    // Retain the opaque prepared bytes as the immutable authority even though
-    // dispatch uses the one decoded, validated physical request below.
+    // Retain the opaque outer bytes as the immutable authority. Only the
+    // protected wrapper below this handle may strip protection.
     _prepared: Arc<PreparedFencedTransition>,
-    request: Arc<FencedTransitionRequest>,
     budget: PreparedCheckpointBudget,
+    voter_count: usize,
+    route: Arc<PreparedFencedTransitionRoute>,
     state: PreparedRequestState,
     terminal_receipt: StdMutex<
         Option<Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError>>,
@@ -15416,28 +16541,6 @@ struct PersistentPreparedFencedTransitionToken {
 }
 
 impl PersistentPreparedFencedTransitionToken {
-    async fn request_from_current_journal(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<FencedTransitionRequest, StoreError> {
-        let request = tokio::time::timeout_at(
-            deadline,
-            self.projection
-                .authenticated_consumer_fenced_transition_request(
-                    &self._prepared,
-                    self.router.fenced_transition_binding()?,
-                ),
-        )
-        .await
-        .map_err(|_| {
-            StoreError::BackendUnavailable("prepared fenced transition deadline elapsed".into())
-        })??;
-        if request != *self.request {
-            return Err(invalid_authenticated_consumer_fenced_transition());
-        }
-        Ok(request)
-    }
-
     fn cached_terminal_receipt(
         &self,
     ) -> Option<Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError>>
@@ -15464,93 +16567,221 @@ impl PersistentPreparedFencedTransitionToken {
         result
     }
 
+    /// Keep warm setup for one deterministic receipt voter outside the status
+    /// admission guard. Unlike mutation preparation, receipt recovery must
+    /// not require all voters: another exact voter can expose the same
+    /// durable receipt while the former writer is unavailable. A failed setup
+    /// advances only this read-only cursor; cancellation leaves it untouched.
+    async fn ensure_status_readiness(
+        &self,
+        setup_deadline: tokio::time::Instant,
+        outer_deadline: tokio::time::Instant,
+        physical_cap_active: bool,
+    ) -> Result<
+        (usize, PersistentRetainedRequestLane),
+        SessionConsumerPreparedFencedTransitionStatusError,
+    > {
+        let voter = self.route.status_voter(self.voter_count);
+        match self.router.clients[voter]
+            .reserve_retained_request_lane_before(setup_deadline)
+            .await
+        {
+            Ok(lane) => Ok((voter, lane)),
+            Err(
+                SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked,
+            ) => {
+                let error =
+                    SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked;
+                let _ = self.terminal_receipt(Err(error));
+                Err(error)
+            }
+            Err(SessionConsumerClientError::Deadline)
+                if !physical_cap_active && tokio::time::Instant::now() >= outer_deadline =>
+            {
+                Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
+            }
+            Err(_) => {
+                self.route.rotate_after_status_setup_failure();
+                Err(if physical_cap_active {
+                    SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline
+                } else {
+                    SessionConsumerPreparedFencedTransitionStatusError::Unavailable
+                })
+            }
+        }
+    }
+
     async fn execute_once(&self) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
         let mut preparation = Some(
             self.state
                 .begin_preparation()
                 .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?,
         );
-        let mut dispatch: Option<PreparedDispatchGuard<'_>> = None;
-        for _ in 0..self.router.clients.len() {
+        // Authenticate the exact durable outer token before even reserving a
+        // cold voter lane. This is intentionally bounded by the preparation
+        // deadline, and the sealing wrapper performs no provider or transport
+        // work here. Keep the same validation below the retained lane as the
+        // final immediate-before-dispatch boundary.
+        if !matches!(
+            tokio::time::timeout_at(
+                self.budget.original_deadline(),
+                self.backend
+                    .preflight_protected_fenced_transition_token(&self._prepared),
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            preparation
+                .as_mut()
+                .expect("preparation remains owned")
+                .terminal();
+            return Err(FencedTransitionExecuteError::NotTransmitted);
+        }
+        for _ in 0..self.voter_count {
             let now = tokio::time::Instant::now();
-            let Some(physical_deadline) = now.checked_add(self.budget.physical_attempt_timeout())
+            let Some(attempt_cap_deadline) =
+                now.checked_add(self.budget.physical_attempt_timeout())
             else {
-                terminal_prepared_execution(&mut preparation, &mut dispatch);
+                preparation
+                    .as_mut()
+                    .expect("preparation remains owned")
+                    .terminal();
                 return Err(FencedTransitionExecuteError::NotTransmitted);
             };
-            let deadline = self.budget.original_deadline().min(physical_deadline);
-            if deadline <= now {
-                terminal_prepared_execution(&mut preparation, &mut dispatch);
+            // One immutable per-candidate physical cap covers both retained
+            // lane setup and the eventual request. Do not mint a fresh RPC
+            // cap after setup: a cold candidate must not consume two caps.
+            let attempt_deadline = self.budget.original_deadline().min(attempt_cap_deadline);
+            if attempt_deadline <= now {
+                preparation
+                    .as_mut()
+                    .expect("preparation remains owned")
+                    .terminal();
                 return Err(FencedTransitionExecuteError::NotTransmitted);
             }
-            if self.request_from_current_journal(deadline).await.is_err() {
-                terminal_prepared_execution(&mut preparation, &mut dispatch);
-                return Err(FencedTransitionExecuteError::NotTransmitted);
-            }
-            let client = self.router.mutation_client(&self.state.mutation_cursor);
-            match client.ensure_warm_request_capacity_before(deadline).await {
-                Ok(()) => {}
-                Err(SessionConsumerClientError::Scope) => {
-                    terminal_prepared_execution(&mut preparation, &mut dispatch);
+            // Activation proves the immutable roster; each dispatch proves
+            // only its deterministic candidate can retain one authenticated
+            // lane. This setup is conclusively pre-write and separately
+            // capped, so a generic failure may rotate without consuming an
+            // affine mutation attempt.
+            let voter = self.route.mutation_voter(self.voter_count);
+            let retained = match self.router.clients[voter]
+                .reserve_retained_request_lane_before(attempt_deadline)
+                .await
+            {
+                Ok(retained) => retained,
+                Err(
+                    SessionConsumerClientError::Scope
+                    | SessionConsumerClientError::AuthorityRevoked,
+                ) => {
+                    preparation
+                        .as_mut()
+                        .expect("preparation remains owned")
+                        .terminal();
                     return Err(FencedTransitionExecuteError::Rejected(
                         StoreError::TopologyAuthorityRevoked,
                     ));
                 }
                 Err(_) => {
                     self.state.not_transmitted();
+                    self.route.rotate_after_not_transmitted();
                     continue;
                 }
-            }
-            if self.request_from_current_journal(deadline).await.is_err() {
-                terminal_prepared_execution(&mut preparation, &mut dispatch);
-                return Err(FencedTransitionExecuteError::NotTransmitted);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                terminal_prepared_execution(&mut preparation, &mut dispatch);
-                return Err(FencedTransitionExecuteError::NotTransmitted);
-            }
-            let dispatch = match dispatch.as_mut() {
-                Some(dispatch) => dispatch,
-                None => {
-                    let preparation = preparation
-                        .take()
-                        .ok_or(FencedTransitionExecuteError::NotTransmitted)?;
-                    dispatch.insert(
-                        preparation
-                            .begin_dispatch()
-                            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?,
-                    )
-                }
             };
-            let request = SessionConsumerRequest::new(
-                self.router.scope,
-                consumer_fenced_transition_request_id(self.request.as_ref()),
-                SessionConsumerOperation::FencedTransition {
-                    request: Box::new((*self.request).clone()),
-                },
-            );
-            let response = client
-                .execute_classified_before(&request, deadline, 1)
-                .await;
-            match prepared_fenced_transition_execute_response(self.request.as_ref(), response) {
-                Ok(outcome) => {
-                    dispatch.terminal();
+            // Setup itself is conclusively pre-write. Recapture only to
+            // reject an at-cap wakeup; never derive another full RPC window.
+            let now = tokio::time::Instant::now();
+            if now >= attempt_deadline {
+                drop(retained);
+                self.state.not_transmitted();
+                self.route.rotate_after_not_transmitted();
+                continue;
+            }
+            let write_boundary = Arc::new(PreparedFencedTransitionWriteBoundary::new(
+                Arc::clone(&retained.write_progress),
+                Arc::clone(&self.route),
+                self.voter_count,
+            ));
+            preparation
+                .as_mut()
+                .expect("preparation remains owned")
+                .arm_physical_write_boundary(Arc::clone(&write_boundary));
+            self.route
+                .install_retained_lane(voter, retained, Arc::clone(&write_boundary));
+            // Dropping this guard on outer cancellation releases a lane that
+            // the wrapper never consumed. The preparation guard separately
+            // reads the shared write boundary to distinguish that path from a
+            // possible send below the private physical backend.
+            let _retained_lane = PreparedFencedTransitionLaneGuard::new(Arc::clone(&self.route));
+            // Keep the timeout future in this scope so it is dropped before
+            // inspecting the shared transport observation below. A pending
+            // zero-byte writer is then proven pre-write; a positive Call
+            // write remains latched even though its wrapper future is gone.
+            let result = {
+                let timed = tokio::time::timeout_at(
+                    attempt_deadline,
+                    self.backend.fenced_transition(&self._prepared),
+                );
+                timed.await
+            };
+            match result {
+                Ok(Ok(outcome)) => {
+                    preparation
+                        .as_mut()
+                        .expect("preparation remains owned")
+                        .terminal();
                     return Ok(outcome);
                 }
-                Err(FencedTransitionExecuteError::NotTransmitted) => {
+                Ok(Err(FencedTransitionExecuteError::NotTransmitted)) => {
+                    if write_boundary.latch_possible_send() {
+                        preparation
+                            .as_mut()
+                            .expect("preparation remains owned")
+                            .receipt_only();
+                        return Err(FencedTransitionExecuteError::OutcomeUnknown {
+                            request_id: self._prepared.request_id(),
+                        });
+                    }
                     self.state.not_transmitted();
+                    self.route.rotate_after_not_transmitted();
                 }
-                Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }) => {
-                    dispatch.receipt_only();
+                Ok(Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })) => {
+                    preparation
+                        .as_mut()
+                        .expect("preparation remains owned")
+                        .receipt_only();
                     return Err(FencedTransitionExecuteError::OutcomeUnknown { request_id });
                 }
-                Err(error) => {
-                    dispatch.terminal();
+                Ok(Err(error)) => {
+                    preparation
+                        .as_mut()
+                        .expect("preparation remains owned")
+                        .terminal();
                     return Err(error);
+                }
+                Err(_) if write_boundary.latch_possible_send() => {
+                    preparation
+                        .as_mut()
+                        .expect("preparation remains owned")
+                        .receipt_only();
+                    return Err(FencedTransitionExecuteError::OutcomeUnknown {
+                        request_id: self._prepared.request_id(),
+                    });
+                }
+                Err(_) => {
+                    // The protected wrapper timed out before the net-private
+                    // backend crossed physical dispatch admission. This is a
+                    // proven pre-write timeout, so an alternate leg remains
+                    // safe under the same immutable outer budget.
+                    self.state.not_transmitted();
+                    self.route.rotate_after_not_transmitted();
                 }
             }
         }
-        terminal_prepared_execution(&mut preparation, &mut dispatch);
+        preparation
+            .as_mut()
+            .expect("preparation remains owned")
+            .terminal();
         Err(FencedTransitionExecuteError::NotTransmitted)
     }
 
@@ -15558,10 +16789,6 @@ impl PersistentPreparedFencedTransitionToken {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
-        let _attempt = self
-            .state
-            .begin_status()
-            .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)?;
         if let Some(result) = self.cached_terminal_receipt() {
             return result;
         }
@@ -15572,55 +16799,92 @@ impl PersistentPreparedFencedTransitionToken {
         if deadline <= now || deadline > self.budget.original_deadline() {
             return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
         }
+        // A malformed, missing, or mismatched durable outer token is a local
+        // fail-closed condition. Check it before a cold receipt lane can
+        // connect, negotiate TLS/Hello, or admit a status request; the wrapper
+        // will validate it again immediately before the status dispatch.
+        match tokio::time::timeout_at(
+            deadline,
+            self.backend
+                .preflight_protected_fenced_transition_token(&self._prepared),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return self.terminal_receipt(Err(
+                    SessionConsumerPreparedFencedTransitionStatusError::Unavailable,
+                ));
+            }
+            Err(_) => return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+        }
+        // Local journal authentication consumes only the immutable outer
+        // budget. Recapture the physical-cap origin after it succeeds, so it
+        // cannot shorten the one capped transport attempt below.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+        }
+        // One immutable physical cap covers both candidate lane setup and the
+        // exact receipt RPC. A cold/blackholed voter therefore cannot consume
+        // an extra cap before the deterministic cursor reaches its successor.
         let attempt_deadline = deadline.min(
             now.checked_add(self.budget.physical_attempt_timeout())
                 .ok_or(SessionConsumerPreparedFencedTransitionStatusError::Deadline)?,
         );
-        if self
-            .request_from_current_journal(attempt_deadline)
-            .await
-            .is_err()
-        {
-            return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable);
+        let physical_cap_active = attempt_deadline < deadline;
+        let (voter, retained) = self
+            .ensure_status_readiness(attempt_deadline, deadline, physical_cap_active)
+            .await?;
+        let now = tokio::time::Instant::now();
+        if now >= attempt_deadline {
+            drop(retained);
+            // Reservation succeeded, so this voter has consumed its one
+            // bounded read-only opportunity even though no receipt frame was
+            // admitted. Advance before returning: otherwise a scheduler wake
+            // exactly at the immutable cap pins every later status call to
+            // the same cold voter and starves its deterministic successor.
+            self.route.rotate_after_status_setup_failure();
+            return Err(if physical_cap_active {
+                SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline
+            } else {
+                SessionConsumerPreparedFencedTransitionStatusError::Deadline
+            });
         }
-        let client = self.router.receipt_client(&self.state.status_cursor);
-        match client
-            .ensure_warm_request_capacity_before(attempt_deadline)
-            .await
+        let _attempt = self
+            .state
+            .begin_status()
+            .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)?;
+        if let Some(result) = self.cached_terminal_receipt() {
+            return result;
+        }
+        if !self.state.status_allowed() {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted);
+        }
+        let write_boundary = Arc::new(PreparedFencedTransitionWriteBoundary::new(
+            Arc::clone(&retained.write_progress),
+            Arc::clone(&self.route),
+            self.voter_count,
+        ));
+        self.route
+            .install_retained_lane(voter, retained, write_boundary);
+        let _retained_lane = PreparedFencedTransitionLaneGuard::new(Arc::clone(&self.route));
+        let result = match tokio::time::timeout_at(
+            attempt_deadline,
+            self.backend.fenced_transition_status(&self._prepared),
+        )
+        .await
         {
-            Ok(()) => {}
-            Err(SessionConsumerClientError::Scope) => {
-                return self.terminal_receipt(Err(
-                    SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked,
-                ));
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
+                Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked)
             }
-            Err(SessionConsumerClientError::Deadline) => {
-                return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+            Ok(Err(_)) => Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+            Err(_) if physical_cap_active => {
+                Err(SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline)
             }
-            Err(_) => return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
-        }
-        if self
-            .request_from_current_journal(attempt_deadline)
-            .await
-            .is_err()
-        {
-            return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable);
-        }
-        if tokio::time::Instant::now() >= attempt_deadline {
-            return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
-        }
-        let request = SessionConsumerRequest::new(
-            self.router.scope,
-            consumer_fenced_transition_request_id(self.request.as_ref()),
-            SessionConsumerOperation::FencedTransitionStatus {
-                request: Box::new((*self.request).clone()),
-            },
-        );
-        let result = prepared_fenced_transition_status_response(
-            client
-                .execute_classified_before(&request, attempt_deadline, 1)
-                .await,
-        );
+            Err(_) => Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+        };
         match result {
             Ok(FencedTransitionStatus::NotFound)
             | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable) => result,
@@ -15636,19 +16900,36 @@ impl PersistentPreparedFencedTransitionToken {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
-        let mut last = Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable);
-        for _ in 0..self.router.clients.len() {
-            let result = self.status_once(deadline).await;
-            if prepared_fenced_transition_status_retryable_before(&result, deadline)? {
-                last = result;
-            } else {
-                return result;
+        // The caller cannot lengthen the authority retained by preparation.
+        // Reject before status admission so an accidentally later deadline
+        // neither consumes a voter cursor nor keeps this handle asleep beyond
+        // its immutable IKE/request budget.
+        if let Some(result) = self.cached_terminal_receipt() {
+            return result;
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now || deadline > self.budget.original_deadline() {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+        }
+        loop {
+            for _ in 0..self.voter_count {
+                let result = self.status_once(deadline).await;
+                if !prepared_fenced_transition_status_retryable_before(&result, deadline)? {
+                    return result;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+                }
             }
+            let now = tokio::time::Instant::now();
+            let Some(next_round) = now.checked_add(PREPARED_FENCED_STATUS_ROUND_BACKOFF) else {
+                return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+            };
+            tokio::time::sleep_until(next_round.min(deadline)).await;
             if tokio::time::Instant::now() >= deadline {
                 return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
             }
         }
-        last
     }
 }
 
@@ -15659,12 +16940,15 @@ fn prepared_fenced_transition_status_retryable_before(
     match result {
         Ok(FencedTransitionStatus::NotFound)
         | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
-        | Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline) => {
+        | Err(SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline) => {
             if tokio::time::Instant::now() >= deadline {
                 Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
             } else {
                 Ok(true)
             }
+        }
+        Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline) => {
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
         }
         _ => Ok(false),
     }
@@ -15676,8 +16960,12 @@ fn prepared_fenced_transition_execute_response(
 ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
     if matches!(
         &response,
-        Err(SessionConsumerCallError::BeforeCallWrite(
-            SessionConsumerClientError::Scope
+        Ok(SessionConsumerResponse::Rejected(
+            SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::TopologyMismatch
+                | SessionConsumerRejection::Unauthorized,
+        )) | Err(SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked
         ))
     ) {
         return Err(FencedTransitionExecuteError::Rejected(
@@ -15695,11 +16983,19 @@ fn prepared_fenced_transition_status_response(
             consumer_status_into_fenced_transition(status)
                 .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
         }
-        Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
+        Ok(SessionConsumerResponse::Rejected(
+            SessionConsumerRejection::ScopeMismatch
+            | SessionConsumerRejection::TopologyMismatch
+            | SessionConsumerRejection::Unauthorized,
+        ))
         | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope))
-        | Err(SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Scope)) => {
-            Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked)
-        }
+        | Err(SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Scope))
+        | Err(SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::AuthorityRevoked,
+        ))
+        | Err(SessionConsumerCallError::MayHaveSent(
+            SessionConsumerClientError::AuthorityRevoked,
+        )) => Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked),
         Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Deadline))
         | Err(SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Deadline)) => {
             Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
@@ -15995,7 +17291,10 @@ impl PersistentPreparedCompareAndSetToken {
             Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
                 SessionConsumerCompareAndSetStatus::NotFound,
             ))) => Ok(PreparedCasStatus::NotFound),
-            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::TopologyMismatch,
+            ))
             | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
                 Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked)
             }
@@ -16159,7 +17458,7 @@ fn classify_prepared_lease_acquire_rejection(
     rejection: SessionConsumerRejection,
 ) -> PreparedLeaseAcquireExecuteError {
     match rejection {
-        SessionConsumerRejection::ScopeMismatch => {
+        SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::TopologyMismatch => {
             PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked
         }
         SessionConsumerRejection::Unavailable => PreparedLeaseAcquireExecuteError::Unavailable,
@@ -16350,7 +17649,10 @@ impl PersistentSessionConsumerClient {
 
 fn rejection_into_store_error(rejection: SessionConsumerRejection) -> StoreError {
     match rejection {
-        SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::Unauthorized => {
+        SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::TopologyMismatch => {
+            StoreError::TopologyAuthorityRevoked
+        }
+        SessionConsumerRejection::Unauthorized => {
             StoreError::BackendUnavailable("consumer authorization rejected".into())
         }
         SessionConsumerRejection::MalformedRequest => {
@@ -16367,7 +17669,9 @@ fn rejection_into_store_error(rejection: SessionConsumerRejection) -> StoreError
 /// peer-declared rejection into an ambiguous lease loss.
 fn rejection_into_lease_error(rejection: SessionConsumerRejection) -> LeaseError {
     match rejection {
-        SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::Unauthorized => {
+        SessionConsumerRejection::ScopeMismatch
+        | SessionConsumerRejection::TopologyMismatch
+        | SessionConsumerRejection::Unauthorized => {
             // The caller's current authority is no longer usable.
             LeaseError::StaleFence
         }
@@ -17583,16 +18887,20 @@ async fn handle_server_connection_v2(
     }
     let response_frame_size =
         checked_consumer_frame_size(hello.response_frame_size)?.min(max_frame_size);
-    let hello_rejection = if hello.scope != scope {
-        Some(SessionConsumerRejection::ScopeMismatch)
-    } else if hello.expected_server_node_id != server_node_id
-        || usize::from(hello.voter_count) != voter_count
-        || hello.roster_commitment != roster_commitment
-    {
-        Some(SessionConsumerRejection::Unauthorized)
-    } else {
-        None
-    };
+    let hello_rejection = consumer_hello_rejection(
+        ConsumerHelloBinding {
+            scope: hello.scope,
+            server_node_id: hello.expected_server_node_id,
+            voter_count: usize::from(hello.voter_count),
+            roster_commitment: hello.roster_commitment,
+        },
+        ConsumerHelloBinding {
+            scope,
+            server_node_id,
+            voter_count,
+            roster_commitment,
+        },
+    );
     if let Some(hello_rejection) = hello_rejection {
         let _ = write_consumer_v2_response_supervised(
             &mut writer,
@@ -18101,16 +19409,20 @@ async fn handle_server_connection(
             return Err(ProtocolError::UnexpectedResponse);
         }
     }
-    let hello_rejection = if hello.scope != authorizer.scope() {
-        Some(SessionConsumerRejection::ScopeMismatch)
-    } else if hello.expected_server_node_id != authorizer.local_node_id().get()
-        || usize::from(hello.voter_count) != authorizer.voter_count()
-        || hello.roster_commitment != *authorizer.roster_commitment().as_bytes()
-    {
-        Some(SessionConsumerRejection::Unauthorized)
-    } else {
-        None
-    };
+    let hello_rejection = consumer_hello_rejection(
+        ConsumerHelloBinding {
+            scope: hello.scope,
+            server_node_id: hello.expected_server_node_id,
+            voter_count: usize::from(hello.voter_count),
+            roster_commitment: hello.roster_commitment,
+        },
+        ConsumerHelloBinding {
+            scope: authorizer.scope(),
+            server_node_id: authorizer.local_node_id().get(),
+            voter_count: authorizer.voter_count(),
+            roster_commitment: *authorizer.roster_commitment().as_bytes(),
+        },
+    );
     if let Some(hello_rejection) = hello_rejection {
         let rejection_deadline = setup_deadline.min(lifecycle.retire_at()).min(
             tokio::time::Instant::now()
@@ -19311,18 +20623,19 @@ mod tests {
         authenticated_consumer_binding, classify_call_write_error,
         classify_prepared_lease_acquire_error, classify_prepared_lease_acquire_rejection,
         complete_before_deadline, consumer_connection_current,
-        consumer_execute_into_fenced_transition, consumer_fresh_admission_is_current,
+        consumer_execute_into_fenced_transition, consumer_fenced_transition_request_id,
+        consumer_fresh_admission_is_current, consumer_hello_rejection,
         consumer_operation_is_effectful, consumer_payload_fragments_exceed_frame,
-        consumer_public_response_from_wire, consumer_request_has_exact_fenced_transition_id,
-        consumer_response_fits, consumer_timeout_response, consumer_tls_setup_error,
-        consumer_watch_error_is_legal, consumer_wire_response_from_public,
-        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
-        fenced_transition_response, lease_error_matches_operation,
-        lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
-        lease_response, mutation_response, persistent_execute_error,
-        persistent_roster_execute_error_for_request, poll_persistent_consumer_setup_io,
-        poll_persistent_reconnect_setup, prepared_fenced_transition_execute_response,
-        prepared_fenced_transition_status_response,
+        consumer_public_response_from_wire, consumer_rejection_into_client_error,
+        consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
+        consumer_timeout_response, consumer_tls_setup_error, consumer_watch_error_is_legal,
+        consumer_wire_response_from_public, decode_consumer_frame_payload,
+        ensure_pre_request_budget_remaining, exact_correlation, fenced_transition_response,
+        lease_error_matches_operation, lease_mutation_status_matches_request,
+        lease_mutation_status_wire_matches_request, lease_response, mutation_response,
+        persistent_execute_error, persistent_roster_execute_error_for_request,
+        poll_persistent_consumer_setup_io, poll_persistent_reconnect_setup,
+        prepared_fenced_transition_execute_response, prepared_fenced_transition_status_response,
         prepared_fenced_transition_status_retryable_before, prepared_router_roster_is_distinct,
         prepared_voter_index, publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
         read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
@@ -19333,30 +20646,33 @@ mod tests {
         write_consumer_call_rejection_supervised, BorrowedConsumerCall,
         BorrowedConsumerCallResponse, BorrowedConsumerWireRequest, BorrowedConsumerWireResponse,
         BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerCorrelation,
-        ConsumerFrameReadProgress, ConsumerHello, ConsumerHelloAck, ConsumerLeaseWireContext,
-        ConsumerOperationKind, ConsumerProgressReader, ConsumerServerCancellation,
-        ConsumerServerSetupTestHooks, ConsumerSessionLeaseMutationResultWire,
-        ConsumerSessionLeaseMutationStatusWire, ConsumerSessionResponseWire, ConsumerSetupError,
-        ConsumerSetupPhase, ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2CallResponse,
-        ConsumerV2WireRequest, ConsumerV2WireResponse, ConsumerVoterBinding, ConsumerWatchTerminal,
+        ConsumerFrameReadProgress, ConsumerHello, ConsumerHelloAck, ConsumerHelloBinding,
+        ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerProgressReader,
+        ConsumerServerCancellation, ConsumerServerSetupTestHooks,
+        ConsumerSessionLeaseMutationResultWire, ConsumerSessionLeaseMutationStatusWire,
+        ConsumerSessionResponseWire, ConsumerSetupError, ConsumerSetupPhase,
+        ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2CallResponse, ConsumerV2WireRequest,
+        ConsumerV2WireResponse, ConsumerVoterBinding, ConsumerWatchTerminal,
         ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
         PersistentCapacityAdmission, PersistentCheckedOutConnection, PersistentConsumerCounters,
         PersistentConsumerIoBarrier, PersistentConsumerReconnectControl,
         PersistentConsumerShutdownIo, PersistentConsumerShutdownReader,
         PersistentConsumerShutdownWriter, PersistentPreparedCompareAndSetToken,
-        PersistentPreparedLeaseAcquireToken, PersistentReconnectSetup,
-        PersistentRosterExecuteError, PersistentSessionConsumerClient,
-        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
-        PersistentSessionConsumerExecuteError, PersistentSessionConsumerV2ExecuteError,
-        PersistentSetupAttempt, PersistentShutdownPhase, PersistentV2LaneActor,
-        PersistentV2LaneCall, PersistentV2LaneLifetime, PersistentV2LaneState,
-        PersistentV2PreCallTestHook, PersistentWatchRecovery, PreparedConsumerRouter,
-        PreparedLeaseAcquireDispatchResult, PreparedRequestState, QueuedConsumerWatchItem,
-        SessionConsumerAuthorization, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
-        SessionConsumerCallError, SessionConsumerChange, SessionConsumerClientError,
-        SessionConsumerFencedTransitionBackend, SessionConsumerFencedTransitionMutationError,
-        SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-        SessionConsumerPreparedCheckpointBackend, SessionConsumerPreparedFencedTransitionBackend,
+        PersistentPreparedFencedTransitionToken, PersistentPreparedLeaseAcquireToken,
+        PersistentReconnectSetup, PersistentRetainedRequestLane, PersistentRosterExecuteError,
+        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
+        PersistentSessionConsumerV2ExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
+        PersistentV2LaneActor, PersistentV2LaneCall, PersistentV2LaneLifetime,
+        PersistentV2LaneState, PersistentV2PreCallTestHook, PersistentWatchRecovery,
+        PreparedConsumerRouter, PreparedFencedTransitionRoute,
+        PreparedFencedTransitionWriteBoundary, PreparedLeaseAcquireDispatchResult,
+        PreparedRequestState, QueuedConsumerWatchItem, SessionConsumerAuthorization,
+        SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerCallError,
+        SessionConsumerChange, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+        SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
+        SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
+        SessionConsumerPreparedFencedTransitionBackend,
         SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerRejection,
         SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
         DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
@@ -19408,8 +20724,9 @@ mod tests {
         SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
         SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
         SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-        SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
-        StoreError, StoredSessionRecord, FENCED_TRANSITION_OUTCOME_RETENTION, MAX_SESSION_TTL,
+        SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, StateClass,
+        StateType, StoreError, StoredSessionRecord, FENCED_TRANSITION_OUTCOME_RETENTION,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -19470,6 +20787,204 @@ mod tests {
                 SessionConsumerClientError::Deadline,
             ))),
             Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
+        );
+    }
+
+    #[test]
+    fn hello_node_count_and_roster_mismatches_revoke_topology_authority() {
+        let exact_scope = scope();
+        let exact_commitment = [0x81; 32];
+        for (presented_node, presented_count, presented_commitment) in [
+            (2, 3, exact_commitment),
+            (1, 5, exact_commitment),
+            (1, 3, [0x82; 32]),
+        ] {
+            let rejection = consumer_hello_rejection(
+                ConsumerHelloBinding {
+                    scope: exact_scope,
+                    server_node_id: presented_node,
+                    voter_count: presented_count,
+                    roster_commitment: presented_commitment,
+                },
+                ConsumerHelloBinding {
+                    scope: exact_scope,
+                    server_node_id: 1,
+                    voter_count: 3,
+                    roster_commitment: exact_commitment,
+                },
+            );
+            assert_eq!(
+                rejection,
+                Some(SessionConsumerRejection::TopologyMismatch),
+                "each exact V1 Hello topology field is an authority boundary"
+            );
+            assert_eq!(
+                consumer_rejection_into_client_error(
+                    rejection.expect("topology mismatch was classified")
+                ),
+                SessionConsumerClientError::AuthorityRevoked,
+                "a valid peer topology change is not generic bad credentials"
+            );
+        }
+        assert_eq!(
+            consumer_rejection_into_client_error(SessionConsumerRejection::Unauthorized),
+            SessionConsumerClientError::Authentication,
+            "bad credentials retain their distinct, non-topology classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_generic_clients_reject_v1_fenced_opcodes_before_transport() {
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless.clone())
+            .expect("default persistent configuration is valid");
+        let transition = authenticated_consumer_record_free_request(0x6e, false).await;
+        let request_id = SessionConsumerRequestId::from_bytes(*transition.request_id().as_bytes());
+        let persistent_before = persistent.diagnostics().await;
+
+        for operation in [
+            SessionConsumerOperation::FencedTransition {
+                request: Box::new(transition.clone()),
+            },
+            SessionConsumerOperation::FencedTransitionStatus {
+                request: Box::new(transition.clone()),
+            },
+        ] {
+            let request = SessionConsumerRequest::new(scope(), request_id, operation);
+            assert_eq!(
+                stateless.execute(request.clone()).await,
+                Err(SessionConsumerClientError::Protocol),
+                "the public stateless client never opens a raw V1 physical lane"
+            );
+            assert_eq!(
+                persistent.execute(&request).await,
+                Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol,
+                }),
+                "the public persistent client never opens a raw V1 physical lane"
+            );
+        }
+
+        assert_eq!(
+            persistent.diagnostics().await,
+            persistent_before,
+            "generic V1 opcode rejection occurs before resolver, setup, or lane admission"
+        );
+        persistent.shutdown().await;
+    }
+
+    struct StatusCallCounterBackend {
+        status_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for StatusCallCounterBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::minimal()
+        }
+
+        async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Err(StoreError::BackendUnavailable("test backend".into()))
+        }
+
+        async fn compare_and_set(
+            &self,
+            _operation: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            Err(StoreError::BackendUnavailable("test backend".into()))
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Err(StoreError::BackendUnavailable("test backend".into()))
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Err(StoreError::BackendUnavailable("test backend".into()))
+        }
+
+        async fn batch(
+            &self,
+            _operations: Vec<SessionOp>,
+        ) -> Result<Vec<SessionOpResult>, StoreError> {
+            Err(StoreError::BackendUnavailable("test backend".into()))
+        }
+
+        async fn fenced_transition_status(
+            &self,
+            _prepared: &PreparedFencedTransition,
+        ) -> Result<FencedTransitionStatus, StoreError> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FencedTransitionStatus::NotFound)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepared_fenced_status_until_rejects_later_caller_deadline_without_io() {
+        let original_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let caller_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let route = Arc::new(PreparedFencedTransitionRoute::new(
+            FencedTransitionRequestId::from_bytes([0x5a; 16]),
+            0,
+        ));
+        let state = PreparedRequestState::new(0);
+        state.receipt_only();
+        let request = authenticated_consumer_record_free_request(0x5a, false).await;
+        let token = PersistentPreparedFencedTransitionToken {
+            backend: Arc::new(StatusCallCounterBackend {
+                status_calls: Arc::clone(&status_calls),
+            }),
+            // This deliberately invalid zero-voter router is never used: the
+            // test proves a caller-supplied later deadline rejects before the
+            // new all-voter readiness proof can begin any I/O.
+            router: Arc::new(PreparedConsumerRouter {
+                clients: Vec::<PersistentSessionConsumerClient>::new().into(),
+                scope: scope(),
+                origin_cursor: AtomicUsize::new(0),
+            }),
+            _prepared: Arc::new(
+                PreparedFencedTransition::from_unprotected_request(request)
+                    .expect("valid retained test transition"),
+            ),
+            budget: PreparedCheckpointBudget::new(original_deadline, Duration::from_millis(100))
+                .expect("valid immutable test budget"),
+            voter_count: 3,
+            route: Arc::clone(&route),
+            state,
+            terminal_receipt: StdMutex::new(None),
+        };
+
+        assert_eq!(
+            token.status_until_terminal(caller_deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+            "a later caller deadline cannot extend the immutable preparation budget"
+        );
+        assert_eq!(
+            status_calls.load(Ordering::SeqCst),
+            0,
+            "invalid outer time is rejected before a receipt RPC is admitted"
+        );
+        assert_eq!(
+            route.status_cursor.load(Ordering::Acquire),
+            1,
+            "the rejected call does not spend a deterministic receipt voter"
+        );
+    }
+
+    #[test]
+    fn prepared_fenced_route_starts_receipts_after_actual_ambiguous_writer() {
+        let route = PreparedFencedTransitionRoute::new(
+            FencedTransitionRequestId::from_bytes([0x5b; 16]),
+            0,
+        );
+        assert!(route.begin_mutation_attempt(3));
+        route.rotate_after_not_transmitted(); // A proved pre-write; B is next.
+        assert!(route.begin_mutation_attempt(3));
+        route.begin_receipt_after_current_mutation_voter(3); // B may have written.
+        assert_eq!(
+            route.next_status_voter(3),
+            2,
+            "receipt recovery begins at C, after actual ambiguous writer B"
         );
     }
 
@@ -19534,6 +21049,91 @@ mod tests {
             .unwrap_or_else(|_| panic!("replacement dispatch guard"));
         dispatch.terminal();
         assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_TERMINAL);
+    }
+
+    #[tokio::test]
+    async fn retained_zero_byte_pending_writer_cancellation_keeps_affine_transition_ready() {
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless)
+            .expect("test persistent consumer");
+        let transition = authenticated_consumer_record_free_request(0x5c, false).await;
+        let request = SessionConsumerRequest::new(
+            scope(),
+            consumer_fenced_transition_request_id(&transition),
+            SessionConsumerOperation::FencedTransition {
+                request: Box::new(transition),
+            },
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (pending, lane) = persistent
+            .pool
+            .admit_call(tokio::time::Instant::now(), deadline)
+            .await
+            .expect("one reserved affine lane admission");
+        let activity = persistent
+            .pool
+            .register_call()
+            .expect("one reserved affine call activity");
+        let (connection, _) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Box::new(PendingWriter),
+        );
+        let write_progress = Arc::new(crate::protocol::FrameWriteProgress::new());
+        let retained = PersistentRetainedRequestLane {
+            connection: PersistentCheckedOutConnection::new(
+                Arc::clone(&persistent.pool),
+                connection,
+            ),
+            activity,
+            admission: PersistentCapacityAdmission::new(
+                Arc::clone(&persistent.pool),
+                pending,
+                lane,
+            ),
+            deadline,
+            write_progress: Arc::clone(&write_progress),
+        };
+        let route = Arc::new(PreparedFencedTransitionRoute::new(
+            FencedTransitionRequestId::from_bytes([0x5c; 16]),
+            0,
+        ));
+        let boundary = Arc::new(PreparedFencedTransitionWriteBoundary::new(
+            Arc::clone(&write_progress),
+            Arc::clone(&route),
+            3,
+        ));
+        let state = PreparedRequestState::new(0);
+        let mut preparation = state.begin_preparation().expect("affine preparation");
+        preparation.arm_physical_write_boundary(Arc::clone(&boundary));
+
+        {
+            let call = persistent.execute_reserved_request_lane(&request, retained);
+            tokio::pin!(call);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(call.as_mut(), context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(
+            !write_progress.accepted_any(),
+            "the controlled live writer is pending without accepting a Call byte"
+        );
+        // The private physical future has now gone away. The affine guard
+        // must inspect the retained observation rather than treating entry to
+        // the wrapper/transport stack itself as an ambiguous send.
+        drop(preparation);
+
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_READY);
+        assert_eq!(route.mutation_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(route.mutation_voter(3), 0);
+        assert_eq!(route.status_voter(3), 1);
+        assert!(
+            state.begin_preparation().is_ok(),
+            "the same affine handle retains its original candidate after a zero-byte cancellation"
+        );
+        persistent.shutdown().await;
     }
 
     // RED: dropping an execute future after dispatch ownership is acquired
@@ -21804,16 +23404,35 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PublicProtectedFencedStatusBehavior {
         Unavailable,
+        Unauthorized,
         Timeout,
         Recorded,
+        NotFound,
+        NotFoundThenRecorded,
+    }
+
+    #[derive(Clone, Copy)]
+    enum PublicProtectedFencedMutationBehavior {
+        CommitThenLoseResponse,
+        Unauthorized,
+    }
+
+    #[derive(Clone, Copy)]
+    enum PublicProtectedFencedPreflightBehavior {
+        Available,
+        Unavailable,
     }
 
     struct PublicProtectedFencedVoterConsumer {
         voter: &'static str,
         mutation_calls: Arc<AtomicUsize>,
+        preflight_order: Arc<StdMutex<Vec<&'static str>>>,
         status_order: Arc<StdMutex<Vec<&'static str>>>,
+        status_calls: Arc<AtomicUsize>,
         recorded_outcome: Arc<StdMutex<Option<FencedTransitionOutcome>>>,
+        preflight_behavior: PublicProtectedFencedPreflightBehavior,
         status_behavior: PublicProtectedFencedStatusBehavior,
+        mutation_behavior: PublicProtectedFencedMutationBehavior,
     }
 
     fn public_protected_fenced_recorded_outcome(
@@ -21860,13 +23479,38 @@ mod tests {
                         AtomicFencedTransitionCapability::V1,
                     ))
                 }
+                SessionConsumerOperation::PreflightRecordExpiry { .. } => {
+                    self.preflight_order
+                        .lock()
+                        .expect("preflight order lock")
+                        .push(self.voter);
+                    match self.preflight_behavior {
+                        PublicProtectedFencedPreflightBehavior::Available => {
+                            SessionConsumerResponse::PreflightRecordExpiry(Ok(()))
+                        }
+                        PublicProtectedFencedPreflightBehavior::Unavailable => {
+                            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+                        }
+                    }
+                }
                 SessionConsumerOperation::FencedTransition { .. } => {
-                    self.mutation_calls.fetch_add(1, Ordering::SeqCst);
-                    // Commit is modeled by the service-side counter. The
-                    // authenticated response is then lost after the write.
-                    std::future::pending::<SessionConsumerResponse>().await
+                    match self.mutation_behavior {
+                        PublicProtectedFencedMutationBehavior::CommitThenLoseResponse => {
+                            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+                            // Commit is modeled by the service-side counter.
+                            // The authenticated response is then lost after
+                            // the write.
+                            std::future::pending::<SessionConsumerResponse>().await
+                        }
+                        PublicProtectedFencedMutationBehavior::Unauthorized => {
+                            SessionConsumerResponse::Rejected(
+                                SessionConsumerRejection::Unauthorized,
+                            )
+                        }
+                    }
                 }
                 SessionConsumerOperation::FencedTransitionStatus { .. } => {
+                    let status_call = self.status_calls.fetch_add(1, Ordering::SeqCst);
                     self.status_order
                         .lock()
                         .expect("status order lock")
@@ -21874,6 +23518,11 @@ mod tests {
                     match self.status_behavior {
                         PublicProtectedFencedStatusBehavior::Unavailable => {
                             SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+                        }
+                        PublicProtectedFencedStatusBehavior::Unauthorized => {
+                            SessionConsumerResponse::Rejected(
+                                SessionConsumerRejection::Unauthorized,
+                            )
                         }
                         PublicProtectedFencedStatusBehavior::Timeout => {
                             // Cross the real authenticated service boundary,
@@ -21884,6 +23533,34 @@ mod tests {
                             std::future::pending::<SessionConsumerResponse>().await
                         }
                         PublicProtectedFencedStatusBehavior::Recorded => {
+                            let SessionConsumerOperation::FencedTransitionStatus {
+                                request: transition,
+                            } = request.operation()
+                            else {
+                                unreachable!("status branch keeps its operation")
+                            };
+                            let outcome = public_protected_fenced_recorded_outcome(transition);
+                            *self.recorded_outcome.lock().expect("recorded outcome lock") =
+                                Some(outcome.clone());
+                            SessionConsumerResponse::FencedTransitionStatus(Ok(
+                                SessionConsumerFencedTransitionStatus::Recorded(Box::new(Ok(
+                                    outcome,
+                                ))),
+                            ))
+                        }
+                        PublicProtectedFencedStatusBehavior::NotFound => {
+                            SessionConsumerResponse::FencedTransitionStatus(Ok(
+                                SessionConsumerFencedTransitionStatus::NotFound,
+                            ))
+                        }
+                        PublicProtectedFencedStatusBehavior::NotFoundThenRecorded
+                            if status_call == 0 =>
+                        {
+                            SessionConsumerResponse::FencedTransitionStatus(Ok(
+                                SessionConsumerFencedTransitionStatus::NotFound,
+                            ))
+                        }
+                        PublicProtectedFencedStatusBehavior::NotFoundThenRecorded => {
                             let SessionConsumerOperation::FencedTransitionStatus {
                                 request: transition,
                             } = request.operation()
@@ -22534,13 +24211,20 @@ mod tests {
     }
 
     struct PublicProtectedFencedAcceptanceFixture {
-        composite: SessionConsumerPreparedFencedTransitionBackend<
-            EncryptingSessionBackend<SessionConsumerFencedTransitionBackend, MemoryKeyProvider>,
-        >,
+        composite: SessionConsumerPreparedFencedTransitionBackend,
         mutation_calls: [Arc<AtomicUsize>; 3],
+        preflight_order: Arc<StdMutex<Vec<&'static str>>>,
         status_order: Arc<StdMutex<Vec<&'static str>>>,
+        status_calls: [Arc<AtomicUsize>; 3],
         recorded_outcome: Arc<StdMutex<Option<FencedTransitionOutcome>>>,
         servers: Vec<super::SessionQuorumConsumerServerHandle>,
+        addresses: Vec<SocketAddr>,
+        authorities: Vec<opc_session_store::SessionConsumerVoterAuthority>,
+        voter_identities: Vec<SpiffeId>,
+        roster: opc_session_store::SessionConsumerRoster,
+        grant: opc_session_store::SessionConsumerAuthorizationGrant,
+        client_material: RotatableClientMaterial,
+        journal_path: PathBuf,
         _journal_directory: tempfile::TempDir,
     }
 
@@ -22550,10 +24234,133 @@ mod tests {
                 server.abort_and_wait().await;
             }
         }
+
+        /// Replace one listener with the same TLS identity but a different
+        /// authenticated local node. This reaches the real Hello authority
+        /// boundary: TLS still succeeds, while the server must reject before
+        /// the application consumer sees a mutation or receipt lookup.
+        async fn replace_voter_with_node_authority_mismatch(&mut self, index: usize) {
+            assert!(index < self.servers.len());
+            self.servers.remove(index).abort_and_wait().await;
+            self.composite.router.clients[index]
+                .request_reauthentication()
+                .expect("retire every prewarmed lane before topology test");
+
+            let mismatched_node = self.authorities[(index + 1) % self.authorities.len()].node_id();
+            let authorizer = SessionConsumerAuthorizer::try_new(
+                self.roster
+                    .clone()
+                    .authorization_manifest(mismatched_node, [self.grant.clone()])
+                    .expect("different exact local voter remains a valid manifest"),
+            )
+            .expect("topology-mismatched authorizer");
+            let voter = ["A", "B", "C"][index];
+            let (server, address) = SessionQuorumConsumerServer::new(
+                Arc::new(PublicProtectedFencedVoterConsumer {
+                    voter,
+                    mutation_calls: Arc::clone(&self.mutation_calls[index]),
+                    preflight_order: Arc::clone(&self.preflight_order),
+                    status_order: Arc::clone(&self.status_order),
+                    status_calls: Arc::new(AtomicUsize::new(0)),
+                    recorded_outcome: Arc::clone(&self.recorded_outcome),
+                    preflight_behavior: PublicProtectedFencedPreflightBehavior::Available,
+                    status_behavior: PublicProtectedFencedStatusBehavior::Unavailable,
+                    mutation_behavior:
+                        PublicProtectedFencedMutationBehavior::CommitThenLoseResponse,
+                }),
+                self.client_material
+                    .trusted_server_config(self.voter_identities[index].as_str()),
+                authorizer,
+            )
+            .listen(self.addresses[index])
+            .await
+            .expect("replace listener with topology-mismatched authority");
+            assert_eq!(
+                address, self.addresses[index],
+                "the client reaches the replacement only through its activated endpoint"
+            );
+            self.servers.insert(index, server);
+        }
+
+        /// Replace one listener with the same authenticated authority but an
+        /// explicit application authorization denial. This keeps the real
+        /// request on its exact activated voter and distinguishes a typed
+        /// server denial from transient TLS/setup material failures.
+        async fn replace_voter_with_unauthorized_mutation(&mut self, index: usize) {
+            assert!(index < self.servers.len());
+            self.servers.remove(index).abort_and_wait().await;
+            self.composite.router.clients[index]
+                .request_reauthentication()
+                .expect("retire every prewarmed lane before authorization test");
+
+            let authorizer = SessionConsumerAuthorizer::try_new(
+                self.roster
+                    .clone()
+                    .authorization_manifest(self.authorities[index].node_id(), [self.grant.clone()])
+                    .expect("same exact local voter remains a valid manifest"),
+            )
+            .expect("authorization-denying test authorizer");
+            let voter = ["A", "B", "C"][index];
+            let (server, address) = SessionQuorumConsumerServer::new(
+                Arc::new(PublicProtectedFencedVoterConsumer {
+                    voter,
+                    mutation_calls: Arc::clone(&self.mutation_calls[index]),
+                    preflight_order: Arc::clone(&self.preflight_order),
+                    status_order: Arc::clone(&self.status_order),
+                    status_calls: Arc::new(AtomicUsize::new(0)),
+                    recorded_outcome: Arc::clone(&self.recorded_outcome),
+                    preflight_behavior: PublicProtectedFencedPreflightBehavior::Available,
+                    status_behavior: PublicProtectedFencedStatusBehavior::Unavailable,
+                    mutation_behavior: PublicProtectedFencedMutationBehavior::Unauthorized,
+                }),
+                self.client_material
+                    .trusted_server_config(self.voter_identities[index].as_str()),
+                authorizer,
+            )
+            .listen(self.addresses[index])
+            .await
+            .expect("replace listener with authorization denial");
+            assert_eq!(
+                address, self.addresses[index],
+                "the client reaches the replacement only through its activated endpoint"
+            );
+            self.servers.insert(index, server);
+        }
     }
 
     async fn public_protected_fenced_acceptance_fixture(
         statuses: [PublicProtectedFencedStatusBehavior; 3],
+        preflights: [PublicProtectedFencedPreflightBehavior; 3],
+    ) -> PublicProtectedFencedAcceptanceFixture {
+        public_protected_fenced_acceptance_fixture_with_connection_policy(
+            statuses, preflights, None, None,
+        )
+        .await
+    }
+
+    /// Build the public facade fixture with an optional deliberately short
+    /// idle lifecycle and resolver delay. The policy is test-only: production
+    /// construction still uses the normal persistent-client defaults.
+    async fn public_protected_fenced_acceptance_fixture_with_connection_policy(
+        statuses: [PublicProtectedFencedStatusBehavior; 3],
+        preflights: [PublicProtectedFencedPreflightBehavior; 3],
+        idle_timeout: Option<Duration>,
+        resolver_delay: Option<Duration>,
+    ) -> PublicProtectedFencedAcceptanceFixture {
+        public_protected_fenced_acceptance_fixture_with_connection_policies(
+            statuses,
+            preflights,
+            idle_timeout,
+            [resolver_delay; 3],
+        )
+        .await
+    }
+
+    async fn public_protected_fenced_acceptance_fixture_with_connection_policies(
+        statuses: [PublicProtectedFencedStatusBehavior; 3],
+        preflights: [PublicProtectedFencedPreflightBehavior; 3],
+        idle_timeout: Option<Duration>,
+        resolver_delays: [Option<Duration>; 3],
     ) -> PublicProtectedFencedAcceptanceFixture {
         let client_identity = material_spiffe("public-protected-fenced-client");
         let voter_identities = [
@@ -22581,6 +24388,9 @@ mod tests {
         )
         .expect("public protected fenced grant");
         let mutation_calls = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let status_calls: [Arc<AtomicUsize>; 3] =
+            std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let preflight_order = Arc::new(StdMutex::new(Vec::new()));
         let status_order = Arc::new(StdMutex::new(Vec::new()));
         let recorded_outcome = Arc::new(StdMutex::new(None));
         let mut servers = Vec::with_capacity(3);
@@ -22599,9 +24409,14 @@ mod tests {
                 Arc::new(PublicProtectedFencedVoterConsumer {
                     voter,
                     mutation_calls: Arc::clone(&mutation_calls[index]),
+                    preflight_order: Arc::clone(&preflight_order),
                     status_order: Arc::clone(&status_order),
+                    status_calls: Arc::clone(&status_calls[index]),
                     recorded_outcome: Arc::clone(&recorded_outcome),
+                    preflight_behavior: preflights[index],
                     status_behavior: statuses[index],
+                    mutation_behavior:
+                        PublicProtectedFencedMutationBehavior::CommitThenLoseResponse,
                 }),
                 client_material.trusted_server_config(identity.as_str()),
                 authorizer,
@@ -22619,26 +24434,46 @@ mod tests {
         }
         let clients = addresses
             .iter()
-            .zip(authorities)
-            .map(|(address, authority)| {
-                PersistentSessionConsumerClient::from_stateless(
-                    StatelessSessionConsumerClient::new(
+            .zip(authorities.iter().cloned())
+            .enumerate()
+            .map(|(index, (address, authority))| {
+                let stateless = match resolver_delays[index] {
+                    Some(delay) => {
+                        let address = *address;
+                        let resolver: RemoteAddrResolver = Arc::new(move || {
+                            Box::pin(async move {
+                                tokio::time::sleep(delay).await;
+                                Ok(address)
+                            })
+                        });
+                        StatelessSessionConsumerClient::new_with_resolver(
+                            resolver,
+                            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                            authority,
+                            client_material.config(),
+                        )
+                    }
+                    None => StatelessSessionConsumerClient::new(
                         *address,
                         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                         authority,
                         client_material.config(),
                     ),
-                )
-                .expect("public protected fenced persistent voter")
+                };
+                let stateless = match idle_timeout {
+                    Some(timeout) => stateless.with_idle_timeout(timeout),
+                    None => stateless,
+                };
+                PersistentSessionConsumerClient::from_stateless(stateless)
+                    .expect("public protected fenced persistent voter")
             })
             .collect::<Vec<_>>();
         let activated_voters =
-            SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends(
+            SessionConsumerPreparedFencedTransitionBackend::persistent_exact_voter_prewarm_roster(
                 clients,
             )
             .await
             .expect("every exact public voter prewarms and proves V1");
-        let physical = Arc::new(activated_voters[0].clone());
         let journal_directory = tempfile::tempdir().expect("prepared journal directory");
         #[cfg(unix)]
         {
@@ -22653,28 +24488,42 @@ mod tests {
         let journal_path: PathBuf = journal_directory.path().join("prepared.sqlite3");
         let journal = Arc::new(
             PreparedFencedTransitionJournal::create_new(
-                journal_path,
+                journal_path.clone(),
                 PreparedFencedTransitionJournalKey::from_bytes([0x6d; 32]),
             )
             .expect("prepared journal"),
         );
-        let wrapper = Arc::new(
-            EncryptingSessionBackend::new(
-                physical,
-                Arc::new(MemoryKeyProvider::new()),
-                "public-protected-fenced",
+        let provider = Arc::new(MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                KeyId::new("public-protected-fenced-key").expect("test key ID"),
+                KeyPurpose::Session,
+                TenantId::new("public-protected-fenced").expect("test tenant"),
+                Zeroizing::new([0x6d; AES_256_GCM_SIV_KEY_LEN]),
             )
-            .with_fenced_transition_journal(journal),
-        );
-        let composite =
-            SessionConsumerPreparedFencedTransitionBackend::persistent(wrapper, activated_voters)
-                .expect("public protected fenced three-voter composite");
+            .expect("install public protected fenced key");
+        let composite = SessionConsumerPreparedFencedTransitionBackend::persistent_encrypting(
+            activated_voters,
+            provider,
+            "public-protected-fenced",
+            journal,
+        )
+        .expect("public protected fenced three-voter composite");
         PublicProtectedFencedAcceptanceFixture {
             composite,
             mutation_calls,
+            preflight_order,
             status_order,
+            status_calls,
             recorded_outcome,
             servers,
+            addresses,
+            authorities,
+            voter_identities: voters.into_iter().map(|(identity, _)| identity).collect(),
+            roster,
+            grant,
+            client_material,
+            journal_path,
             _journal_directory: journal_directory,
         }
     }
@@ -22704,10 +24553,61 @@ mod tests {
         .expect("public protected fenced delete request")
     }
 
+    fn public_protected_fenced_create_request_with_expiry(
+        request_id: FencedTransitionRequestId,
+        finite_expiry: bool,
+    ) -> FencedTransitionRequest {
+        let key = SessionKey {
+            tenant: TenantId::new("public-protected-fenced").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"public-protected-fenced-preflight")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("public-protected-fenced-preflight-owner").expect("test owner");
+        let lease = FencedTransitionLease::acquire(
+            key.clone(),
+            owner.clone(),
+            FenceToken::new(0),
+            Duration::from_secs(30),
+        )
+        .expect("bounded acquire");
+        let now = Timestamp::now_utc();
+        FencedTransitionRequest::new(
+            request_id,
+            lease.clone(),
+            FencedTransitionMutation::create(StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: lease.committed_fence().expect("bounded committed fence"),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("public-protected-fenced-preflight"),
+                expires_at: finite_expiry.then(|| {
+                    checked_session_deadline(now, Duration::from_secs(30))
+                        .expect("bounded record expiry")
+                }),
+                payload: EncryptedSessionPayload::new([0x9d]),
+            }),
+        )
+        .expect("public protected fenced create request")
+    }
+
+    fn public_protected_fenced_create_request(
+        request_id: FencedTransitionRequestId,
+    ) -> FencedTransitionRequest {
+        public_protected_fenced_create_request_with_expiry(request_id, true)
+    }
+
+    fn public_protected_fenced_nonfinite_create_request(
+        request_id: FencedTransitionRequestId,
+    ) -> FencedTransitionRequest {
+        public_protected_fenced_create_request_with_expiry(request_id, false)
+    }
+
     fn public_protected_fenced_request_on_a(
-        composite: &SessionConsumerPreparedFencedTransitionBackend<
-            EncryptingSessionBackend<SessionConsumerFencedTransitionBackend, MemoryKeyProvider>,
-        >,
+        composite: &SessionConsumerPreparedFencedTransitionBackend,
         fill: u8,
     ) -> FencedTransitionRequest {
         (fill..=u8::MAX)
@@ -22718,12 +24618,987 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_protected_fenced_preflight_rotates_a_unavailable_to_b() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [
+                PublicProtectedFencedPreflightBehavior::Unavailable,
+                PublicProtectedFencedPreflightBehavior::Available,
+                PublicProtectedFencedPreflightBehavior::Available,
+            ],
+        )
+        .await;
+        let request_id =
+            public_protected_fenced_request_on_a(&fixture.composite, 0x31).request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let _prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                public_protected_fenced_create_request(request_id),
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("read-only expiry preflight rotates to B before preparation");
+        assert_eq!(
+            fixture
+                .preflight_order
+                .lock()
+                .expect("preflight order lock")
+                .as_slice(),
+            ["A", "B"],
+            "an unavailable nonterminal expiry authority rotates in the affine route order"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "preflight is read-only and never spends mutation authority"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_nonfinite_expiry_preflight_is_local() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Unavailable; 3],
+        )
+        .await;
+        let request_id =
+            public_protected_fenced_request_on_a(&fixture.composite, 0x33).request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let _prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                public_protected_fenced_nonfinite_create_request(request_id),
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("nonfinite expiry validates locally without authority transport");
+        assert!(
+            fixture
+                .preflight_order
+                .lock()
+                .expect("preflight order lock")
+                .is_empty(),
+            "an absent record expiry performs no remote A/B/C preflight"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "local profile validation cannot spend mutation authority"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_mutation_hello_topology_revocation_is_terminal_without_rotation(
+    ) {
+        let mut fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x35);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("all-voter readiness succeeds before topology changes");
+        fixture.replace_voter_with_node_authority_mismatch(0).await;
+
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::Rejected(
+                StoreError::TopologyAuthorityRevoked,
+            )),
+            "an authenticated Hello node mismatch revokes exact topology authority"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "the failed A Hello reaches no application mutation and cannot rotate to B/C"
+        );
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "a terminal authority loss cannot restore the single mutation authority"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "a second caller invocation remains locally sealed and sends nothing"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_mutation_unauthorized_is_terminal_without_rotation() {
+        let mut fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x51);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("local preparation succeeds before application authorization changes");
+        fixture.replace_voter_with_unauthorized_mutation(0).await;
+
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::Rejected(
+                StoreError::TopologyAuthorityRevoked,
+            )),
+            "an authenticated application Unauthorized revokes the affine authority"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "A's authorization denial cannot rotate a mutation to B or C"
+        );
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "the terminal application denial seals the execute handle"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_status_unauthorized_is_terminal_without_c_poll() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Unauthorized,
+                PublicProtectedFencedStatusBehavior::Recorded,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x52);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("public protected fenced transition prepares");
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+            "A commits exactly once before its response is lost"
+        );
+
+        assert_eq!(
+            prepared.status_until_terminal(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked),
+            "B's authenticated authorization denial is terminal rather than rotatable"
+        );
+        assert_eq!(
+            fixture
+                .status_order
+                .lock()
+                .expect("status order lock")
+                .as_slice(),
+            ["B"],
+            "the terminal B response prevents a stale C receipt lookup"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 0, 0],
+            "status authority never restores or replays the ambiguous mutation"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_prepare_is_local_before_candidate_authority_check() {
+        let mut fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x36);
+        fixture.replace_voter_with_node_authority_mismatch(0).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let budget = PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+            .expect("bounded public protected fenced budget");
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(request, budget)
+            .await
+            .expect("preparation is local and does not make an availability-hostile roster sweep");
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::Rejected(
+                StoreError::TopologyAuthorityRevoked,
+            )),
+            "the deterministic mutation candidate proves its authenticated authority before dispatch"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "candidate authority revocation reaches no physical mutation"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_recovered_status_hello_topology_revocation_is_terminal_without_io(
+    ) {
+        let mut fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x37);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("journal preparation succeeds before recovery");
+        drop(prepared);
+
+        // Recovery begins at the successor of A, B. Give only B the same-TLS
+        // but different-node server so a terminal Hello rejection proves the
+        // recovered handle did not poll C or attempt a new mutation.
+        fixture.replace_voter_with_node_authority_mismatch(1).await;
+        let mut recovered = fixture
+            .composite
+            .recover_fenced_transition_status(
+                request_id,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded recovered fenced budget"),
+            )
+            .await
+            .expect("recovery opens the retained local journal row")
+            .expect("prepared journal row remains available");
+
+        assert_eq!(
+            recovered.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked),
+            "the exact activated roster revocation is terminal for recovered status"
+        );
+        assert_eq!(
+            recovered.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked),
+            "the terminal revocation is cached instead of rotating another receipt voter"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "recovered status has no mutation authority"
+        );
+        assert!(
+            fixture
+                .status_order
+                .lock()
+                .expect("status order lock")
+                .is_empty(),
+            "the Hello rejection occurs before B application status and never polls C"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_activation_prewarms_default_width_before_first_dispatch() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let client = &fixture.composite.router.clients[0];
+        let readiness = client.readiness().await;
+        let before = client.diagnostics().await;
+        assert!(readiness.ready);
+        assert_eq!(
+            readiness.configured_request_connections,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+            "the public fixture uses the production default lane width"
+        );
+        assert_eq!(
+            readiness.ready_request_connections,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+            "activation retains every default request lane before it is exposed"
+        );
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x39);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("public protected fenced transition prepares");
+
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+            "the first A dispatch reaches the service and loses only its response"
+        );
+        let after = client.diagnostics().await;
+        assert_eq!(
+            after.setup_attempts, before.setup_attempts,
+            "the first hot dispatch does not establish a leftover default lane"
+        );
+        assert_eq!(
+            after.resolve_attempts, before.resolve_attempts,
+            "the first hot dispatch does not re-enter resolver setup"
+        );
+        assert_eq!(
+            fixture.mutation_calls[0].load(Ordering::SeqCst),
+            1,
+            "the already-warm lane reaches exactly one application mutation"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_invalid_outer_token_fails_before_cold_lane_setup() {
+        for failure in ["missing", "corrupt", "byte-mismatched"] {
+            let fixture = public_protected_fenced_acceptance_fixture(
+                [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+                [PublicProtectedFencedPreflightBehavior::Available; 3],
+            )
+            .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let budget = PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                .expect("bounded public protected fenced budget");
+            let mut mutation = fixture
+                .composite
+                .prepare_fenced_transition(
+                    public_protected_fenced_request_on_a(&fixture.composite, 0x3d),
+                    budget,
+                )
+                .await
+                .expect("prepare mutation token before cold-lane test");
+            let mut status = fixture
+                .composite
+                .prepare_fenced_transition(
+                    public_protected_fenced_delete_request(FencedTransitionRequestId::from_bytes(
+                        [0xa3; 16],
+                    )),
+                    budget,
+                )
+                .await
+                .expect("prepare status token before cold-lane test");
+            status.inner.state.receipt_only();
+
+            // The journal's authenticated membership and row binding reject every
+            // invalid durable outer state locally before either handle can reserve
+            // the cold lane below it.
+            let connection = rusqlite::Connection::open(&fixture.journal_path)
+                .expect("open prepared journal invalid-token fixture");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("enable prepared journal invalid-token fixture");
+            assert_eq!(
+            match failure {
+                "missing" => connection.execute(
+                    "DELETE FROM prepared_fenced_transition_journal",
+                    [],
+                ),
+                "corrupt" => connection.execute(
+                    "UPDATE prepared_fenced_transition_journal SET prepared_token = zeroblob(1)",
+                    [],
+                ),
+                "byte-mismatched" => connection.execute(
+                    "UPDATE prepared_fenced_transition_journal SET prepared_token = zeroblob(2)",
+                    [],
+                ),
+                _ => unreachable!("fixed invalid-token fixture"),
+            }
+            .expect("invalidate every prepared outer token"),
+            2,
+        );
+
+            // Retire every prewarmed lane. Any accidental reservation below the
+            // preflight would now resolve, connect, perform TLS and Hello, then
+            // reach an application operation.
+            for client in fixture.composite.router.clients.iter() {
+                client
+                    .request_reauthentication()
+                    .expect("retire warm test lane before exact-token check");
+            }
+            let before = futures_util::future::join_all(
+                fixture
+                    .composite
+                    .router
+                    .clients
+                    .iter()
+                    .map(PersistentSessionConsumerClient::diagnostics),
+            )
+            .await;
+
+            assert_eq!(
+                mutation.execute_once().await,
+                Err(FencedTransitionExecuteError::NotTransmitted),
+                "a journal byte mismatch is a local pre-dispatch mutation failure"
+            );
+            assert_eq!(
+                status.status_once(deadline).await,
+                Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+                "a journal byte mismatch is a local fail-closed receipt failure"
+            );
+
+            let after = futures_util::future::join_all(
+                fixture
+                    .composite
+                    .router
+                    .clients
+                    .iter()
+                    .map(PersistentSessionConsumerClient::diagnostics),
+            )
+            .await;
+            for (before, after) in before.iter().zip(after.iter()) {
+                assert_eq!(after.setup_attempts, before.setup_attempts);
+                assert_eq!(after.tcp_attempts, before.tcp_attempts);
+                assert_eq!(after.tls_attempts, before.tls_attempts);
+                assert_eq!(after.hello_attempts, before.hello_attempts);
+            }
+            assert_eq!(
+                fixture
+                    .mutation_calls
+                    .each_ref()
+                    .map(|calls| calls.load(Ordering::SeqCst)),
+                [0, 0, 0],
+                "local token rejection sends no mutation"
+            );
+            assert_eq!(
+                fixture
+                    .status_calls
+                    .each_ref()
+                    .map(|calls| calls.load(Ordering::SeqCst)),
+                [0, 0, 0],
+                "local token rejection sends no receipt status"
+            );
+            fixture.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_zero_byte_writer_cancellation_retries_same_origin() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x3a);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("public protected fenced transition prepares");
+
+        // Replace only the lane that this exact A-origin call will check out.
+        // The following already-authenticated A lane remains live, proving a
+        // zero-byte cancellation retains the same deterministic candidate
+        // instead of silently rotating or becoming receipt-only.
+        let writer_entered = Arc::new(Notify::new());
+        {
+            let mut idle = fixture.composite.router.clients[0]
+                .pool
+                .idle
+                .lock()
+                .expect("A idle lane lock");
+            idle.front_mut()
+                .expect("activation retained an A lane")
+                .writer = Box::new(NotifyingPendingWriter {
+                entered: Arc::clone(&writer_entered),
+            });
+        }
+        let entered = writer_entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        let mut execute = Box::pin(prepared.execute_once());
+        tokio::select! {
+            biased;
+            _ = &mut entered => {}
+            result = &mut execute => panic!("zero-byte A writer completed unexpectedly: {result:?}"),
+        }
+        drop(execute);
+
+        assert_eq!(
+            prepared.inner.state.phase.load(Ordering::Acquire),
+            PREPARED_READY,
+            "cancellation while the retained writer has accepted zero bytes remains pre-dispatch"
+        );
+        assert_eq!(
+            prepared
+                .inner
+                .route
+                .mutation_attempts
+                .load(Ordering::Acquire),
+            0,
+            "zero-byte cancellation does not spend a mutation leg"
+        );
+        assert_eq!(prepared.inner.route.mutation_voter(3), 0);
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "the live server receives no mutation from the pending zero-byte writer"
+        );
+
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+            "the same A origin remains dispatchable and its next warm lane carries the one mutation"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 0, 0],
+            "only the retried same-origin Call reaches the application"
+        );
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "the positive A write leaves the public handle receipt-only"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_positive_writer_cancellation_is_receipt_only() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x3b);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("public protected fenced transition prepares");
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let writer_started = Arc::new(Notify::new());
+        {
+            let mut idle = fixture.composite.router.clients[0]
+                .pool
+                .idle
+                .lock()
+                .expect("A idle lane lock");
+            let connection = idle.front_mut().expect("activation retained an A lane");
+            connection.writer = Box::new(PartialPendingWriter {
+                accepted: Arc::clone(&accepted),
+                accepted_ciphertext_writes: Some(Arc::clone(
+                    &connection.accepted_ciphertext_writes,
+                )),
+                started: Arc::clone(&writer_started),
+                wrote_prefix: false,
+            });
+        }
+        let started = writer_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let mut execute = Box::pin(prepared.execute_once());
+        tokio::select! {
+            biased;
+            _ = &mut started => {}
+            result = &mut execute => panic!("positive A writer completed unexpectedly: {result:?}"),
+        }
+        assert!(
+            accepted.load(Ordering::SeqCst) > 0,
+            "the controlled retained writer accepted a positive Call prefix"
+        );
+        drop(execute);
+
+        assert!(
+            prepared.inner.state.status_allowed(),
+            "a positive Call byte seals the public handle to receipt recovery on cancellation"
+        );
+        assert_eq!(
+            prepared
+                .inner
+                .route
+                .mutation_attempts
+                .load(Ordering::Acquire),
+            1,
+            "the exact positive A write consumes one physical mutation leg"
+        );
+        assert_eq!(prepared.inner.route.next_status_voter(3), 1);
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "the synthetic partial writer has no server-side mutation response to replay"
+        );
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "receipt-only cancellation cannot dispatch a second mutation on B or C"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "the sealed facade makes no second application mutation"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_cold_origin_setup_rotates_to_one_retained_successor_lane() {
+        // Activation's complete four-lane proof is intentionally off the hot
+        // path. After idle retirement, A's one-lane setup exceeds the 100ms
+        // pre-dispatch cap, while B can establish exactly one retained lane
+        // and receive the single mutation.
+        let fixture = public_protected_fenced_acceptance_fixture_with_connection_policies(
+            [PublicProtectedFencedStatusBehavior::Unavailable; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+            Some(Duration::from_secs(1)),
+            [Some(Duration::from_millis(150)), None, None],
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        for client in fixture.composite.router.clients.iter() {
+            wait_for_raw_idle_count(client, 0).await;
+        }
+        let cold = futures_util::future::join_all(
+            fixture
+                .composite
+                .router
+                .clients
+                .iter()
+                .map(PersistentSessionConsumerClient::diagnostics),
+        )
+        .await;
+
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x3d);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded hot mutation cap"),
+            )
+            .await
+            .expect("local preparation cannot make an availability-hostile roster sweep");
+        let after_prepare = futures_util::future::join_all(
+            fixture
+                .composite
+                .router
+                .clients
+                .iter()
+                .map(PersistentSessionConsumerClient::diagnostics),
+        )
+        .await;
+        assert_eq!(
+            after_prepare, cold,
+            "preparation performs no hot-path setup"
+        );
+
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+            "A's conclusively pre-write setup timeout rotates to B's one retained lane"
+        );
+        let after_execute = futures_util::future::join_all(
+            fixture
+                .composite
+                .router
+                .clients
+                .iter()
+                .map(PersistentSessionConsumerClient::diagnostics),
+        )
+        .await;
+        assert_eq!(
+            after_execute[1].setup_attempts,
+            cold[1].setup_attempts + 1,
+            "B opens exactly one retained lane rather than refilling the default width"
+        );
+        assert_eq!(
+            after_execute[2].setup_attempts, cold[2].setup_attempts,
+            "C is not touched after B becomes the dispatched candidate"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 1, 0],
+            "only the successor with a retained pre-write lane receives one mutation"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_recovered_status_caps_cold_b_then_converges_on_c() {
+        let fixture = public_protected_fenced_acceptance_fixture_with_connection_policies(
+            [
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Recorded,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+            Some(Duration::from_secs(1)),
+            [None, Some(Duration::from_millis(150)), None],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x3f);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded hot receipt cap"),
+            )
+            .await
+            .expect("preparation initially establishes the durable journal row");
+        drop(prepared);
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        for client in fixture.composite.router.clients.iter() {
+            wait_for_raw_idle_count(client, 0).await;
+        }
+        let cold = futures_util::future::join_all(
+            fixture
+                .composite
+                .router
+                .clients
+                .iter()
+                .map(PersistentSessionConsumerClient::diagnostics),
+        )
+        .await;
+        let mut recovered = fixture
+            .composite
+            .recover_fenced_transition_status(
+                request_id,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded recovered fenced budget"),
+            )
+            .await
+            .expect("local recovery does not require a network readiness fan-out")
+            .expect("prepared journal row remains available");
+        let after_recovery = futures_util::future::join_all(
+            fixture
+                .composite
+                .router
+                .clients
+                .iter()
+                .map(PersistentSessionConsumerClient::diagnostics),
+        )
+        .await;
+        assert_eq!(
+            after_recovery, cold,
+            "receipt-only recovery is local and does not warm any voter"
+        );
+
+        assert!(matches!(
+            recovered.status_until_terminal(deadline).await,
+            Ok(FencedTransitionStatus::Recorded(_))
+        ));
+        let after_status = futures_util::future::join_all(
+            fixture
+                .composite
+                .router
+                .clients
+                .iter()
+                .map(PersistentSessionConsumerClient::diagnostics),
+        )
+        .await;
+        assert_eq!(
+            after_status[2].setup_attempts,
+            cold[2].setup_attempts + 1,
+            "C establishes one retained receipt lane after B's bounded cold setup fails"
+        );
+        assert_eq!(
+            fixture
+                .status_order
+                .lock()
+                .expect("status order lock")
+                .as_slice(),
+            ["C"],
+            "B's blackholed setup consumes no application status RPC before C converges"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "recovered status retains no mutation authority"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_status_checkout_at_cap_rotates_to_c() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Recorded,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x40);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("public protected fenced transition prepares");
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+            "A's accepted write begins receipt-only traversal on B"
+        );
+
+        // Let B's retained checkout succeed, then hold only its scheduler
+        // return past the one immutable physical cap. No B receipt frame may
+        // be sent, but this bounded opportunity is still spent: the next
+        // explicit receipt lookup must start at C rather than starving there.
+        {
+            let b_hooks = &fixture.composite.router.clients[1].pool.test_hooks;
+            b_hooks
+                .retained_lane_pause_once
+                .store(true, Ordering::SeqCst);
+            let entered = b_hooks.retained_lane_entered.notified();
+            tokio::pin!(entered);
+            entered.as_mut().enable();
+            let mut first = Box::pin(prepared.status_once(deadline));
+            tokio::select! {
+                biased;
+                _ = &mut entered => {}
+                result = &mut first => panic!("B checkout returned before its controlled cap cut: {result:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            b_hooks.retained_lane_release.notify_one();
+            assert_eq!(
+                first.await,
+                Err(SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline),
+                "an at-cap B checkout sends no receipt frame and reports its typed physical cap"
+            );
+        }
+        assert_eq!(prepared.inner.route.status_voter(3), 2);
+        assert!(
+            fixture
+                .status_order
+                .lock()
+                .expect("status order lock")
+                .is_empty(),
+            "the stalled checkout reached no B application status handler"
+        );
+
+        assert!(matches!(
+            prepared.status_once(deadline).await,
+            Ok(FencedTransitionStatus::Recorded(_))
+        ));
+        assert_eq!(
+            fixture
+                .status_order
+                .lock()
+                .expect("status order lock")
+                .as_slice(),
+            ["C"],
+            "the next status call consumes C exactly once"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 0, 0],
+            "receipt retry never restores mutation authority"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn public_protected_fenced_transition_rotates_b_unavailable_to_c_recorded() {
-        let fixture = public_protected_fenced_acceptance_fixture([
-            PublicProtectedFencedStatusBehavior::Unavailable,
-            PublicProtectedFencedStatusBehavior::Unavailable,
-            PublicProtectedFencedStatusBehavior::Recorded,
-        ])
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Recorded,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
         .await;
         let request = public_protected_fenced_request_on_a(&fixture.composite, 0x41);
         let request_id = request.request_id();
@@ -22794,12 +25669,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_protected_fenced_recovered_status_skips_a_down_successor_to_c() {
+        let mut fixture = public_protected_fenced_acceptance_fixture(
+            [
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Recorded,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x45);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("public protected fenced transition prepares");
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+            "A commits once before its response is lost"
+        );
+        drop(prepared);
+
+        // B is the recovered handle's deterministic successor. Retire its
+        // authenticated lanes and take its listener down so B's next setup
+        // is proven unavailable before application status. Recovery itself
+        // must remain local, then C can return the same durable receipt.
+        fixture.servers.remove(1).abort_and_wait().await;
+        fixture.composite.router.clients[1]
+            .request_reauthentication()
+            .expect("retire B's warm lanes before receipt recovery");
+        let mut recovered = fixture
+            .composite
+            .recover_fenced_transition_status(
+                request_id,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded recovered fenced budget"),
+            )
+            .await
+            .expect("local journal recovery does not require down B")
+            .expect("prepared journal row remains available");
+        assert!(matches!(
+            recovered.status_until_terminal(deadline).await,
+            Ok(FencedTransitionStatus::Recorded(_))
+        ));
+        assert_eq!(
+            fixture
+                .status_order
+                .lock()
+                .expect("status order lock")
+                .as_slice(),
+            ["C"],
+            "B setup rotates status-only recovery directly to C without a B application RPC"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 0, 0],
+            "down-voter receipt setup cannot restore or replay mutation authority"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn public_protected_fenced_transition_rotates_b_attempt_timeout_to_c() {
-        let fixture = public_protected_fenced_acceptance_fixture([
-            PublicProtectedFencedStatusBehavior::Unavailable,
-            PublicProtectedFencedStatusBehavior::Timeout,
-            PublicProtectedFencedStatusBehavior::Recorded,
-        ])
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Timeout,
+                PublicProtectedFencedStatusBehavior::Recorded,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
         .await;
         let request = public_protected_fenced_request_on_a(&fixture.composite, 0x61);
         let request_id = request.request_id();
@@ -22851,12 +25801,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_protected_fenced_status_repeats_roster_until_later_receipt_converges() {
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [
+                PublicProtectedFencedStatusBehavior::NotFound,
+                PublicProtectedFencedStatusBehavior::NotFoundThenRecorded,
+                PublicProtectedFencedStatusBehavior::NotFound,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x71);
+        let request_id = request.request_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("public protected fenced transition prepares");
+
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+            "the first voter commits but loses its response"
+        );
+        let status = prepared.status_until_terminal(deadline).await;
+        let recorded = fixture
+            .recorded_outcome
+            .lock()
+            .expect("recorded outcome lock")
+            .clone()
+            .expect("B records the same receipt on the second status round");
+        assert_eq!(
+            status,
+            Ok(FencedTransitionStatus::Recorded(Box::new(Ok(recorded)))),
+            "status-only rounds continue while the immutable outer deadline remains live"
+        );
+        assert_eq!(
+            fixture
+                .status_order
+                .lock()
+                .expect("status order lock")
+                .as_slice(),
+            ["B", "C", "A", "B"],
+            "all voters first report the same prepared identity absent before B converges"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 0, 0],
+            "later receipt visibility cannot restore mutation replay authority"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn public_protected_fenced_transition_exhausts_all_receipt_voters_without_replay() {
-        let fixture = public_protected_fenced_acceptance_fixture([
-            PublicProtectedFencedStatusBehavior::Timeout,
-            PublicProtectedFencedStatusBehavior::Unavailable,
-            PublicProtectedFencedStatusBehavior::Unavailable,
-        ])
+        let fixture = public_protected_fenced_acceptance_fixture(
+            [
+                PublicProtectedFencedStatusBehavior::Timeout,
+                PublicProtectedFencedStatusBehavior::Unavailable,
+                PublicProtectedFencedStatusBehavior::Unavailable,
+            ],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
         .await;
         let request = public_protected_fenced_request_on_a(&fixture.composite, 0x81);
         let request_id = request.request_id();
@@ -22880,14 +25894,18 @@ mod tests {
             Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
             "the final A receipt attempt reports its exact typed deadline"
         );
-        assert_eq!(
-            fixture
-                .status_order
-                .lock()
-                .expect("status order lock")
-                .as_slice(),
-            ["B", "C", "A"],
-            "one absolute budget traverses every canonical receipt voter"
+        let status_order = fixture
+            .status_order
+            .lock()
+            .expect("status order lock")
+            .clone();
+        assert!(
+            status_order.len() > 3
+                && status_order
+                    .iter()
+                    .enumerate()
+                    .all(|(index, voter)| *voter == ["B", "C", "A"][index % 3]),
+            "one absolute budget continues deterministic full read-only voter rounds"
         );
         assert_eq!(
             fixture
@@ -23353,6 +26371,34 @@ mod tests {
         }
 
         fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A live retained lane whose Call writer never accepts a byte. The
+    /// notification lets the public affine-facade test cancel only after the
+    /// physical backend has reached the exact writer, rather than while it is
+    /// still warming or unsealing the protected token.
+    struct NotifyingPendingWriter {
+        entered: Arc<Notify>,
+    }
+
+    impl AsyncWrite for NotifyingPendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.entered.notify_waiters();
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.entered.notify_waiters();
             Poll::Pending
         }
 

@@ -2049,14 +2049,15 @@ and volume. This does not claim host failover, host/volume-loss recovery,
 journal replication, or a second consensus transition.
 
 `SessionConsumerPreparedFencedTransitionBackend` is the public protected V1
-prepared fenced-transition router for that wrapper. It composes one sealed
-`ProtectedFencedTransitionBackend` allocation with the exact complete roster
-of activated, prewarmed V1 physical voter backends for one scope. Only
-`SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends`
-may produce the accepted voter values; raw persistent clients, a partial
-roster, or any non-V1 voter cannot construct the router. Construction rejects
-an incomplete, duplicate, or differently authenticated/bound roster and then
-canonicalizes the admitted voters by node ordinal; caller input order is not
+prepared fenced-transition facade for that wrapper. Its
+`persistent_exact_voter_prewarm_roster` constructor consumes the complete set
+of persistent clients for one scope, activates and prewarms every V1 physical
+voter internally, and returns an opaque roster value. Only the facade's
+local-AEAD and remote-sealing constructors can consume that value; neither a
+raw physical backend nor a dispatchable voter value leaves the net crate. A
+partial roster or any non-V1 voter fails activation. The facade rejects an
+incomplete, duplicate, or differently authenticated/bound roster and
+canonicalizes admitted voters by node ordinal; caller input order is not
 authority. For every
 caller-stable `FencedTransitionRequestId`, the router derives the same origin
 from the authenticated scope, canonical roster, and ID. It uses the existing
@@ -2065,10 +2066,10 @@ protocol or `FencedTransitionV2PreparedJournal`, and grants neither activation
 or readiness-probe authority nor a new quorum, replication, membership, or
 consensus authority.
 
-`ProtectedFencedTransitionBackend` requires only `SessionBackend`, is sealed,
-and is implemented by `EncryptingSessionBackend` and
-`RemoteSealingSessionBackend` around any physical `SessionBackend`. Therefore
-the router composes directly over the real
+`ProtectedFencedTransitionBackend` is a sealed, methodless marker; it has no
+`SessionBackend` supertrait. `EncryptingSessionBackend` and
+`RemoteSealingSessionBackend` implement it around inner types that separately
+implement `SessionBackend`. Therefore the router composes directly over the real
 `SessionConsumerFencedTransitionBackend` and MUST NOT grant that physical
 adapter synthetic lease authority. The existing
 `SessionConsumerPreparedCheckpointBackend` remains the distinct complete
@@ -2094,12 +2095,13 @@ authority revocation and MUST be returned as rejected
 `NotTransmitted` result or trigger successor mutation dispatch.
 
 Receipt status is read-only. A single status call uses the next deterministic
-canonical successor voter. A status-until-terminal call makes at most one such
-successor pass under the single immutable caller absolute deadline, with every
-physical attempt additionally capped by the prepared physical-attempt budget.
-It can end with `NotFound`, unavailable, or deadline, none of which is a
-terminal receipt or proof that a delayed mutation cannot commit. A terminal
-receipt is cached locally. Restart recovery returns only the status-only
+canonical successor voter. A status-until-terminal call repeats bounded
+canonical-roster passes under the single immutable caller absolute deadline,
+with every physical attempt additionally capped by the prepared
+physical-attempt budget. It can end with a deadline; `NotFound`, unavailable,
+or a per-attempt deadline remains nonterminal while outer budget remains. None
+is proof that a delayed mutation cannot commit. A terminal receipt is cached
+locally. Restart recovery returns only the status-only
 `SessionConsumerRecoveredFencedTransitionStatus` handle; it deliberately has
 no execute authority, even if the recovered token is otherwise valid.
 

@@ -3198,6 +3198,7 @@ struct ConsensusAcceptedSetupHook {
 
 #[cfg(test)]
 impl ConsensusAcceptedSetupHook {
+    #[cfg(feature = "insecure-test")]
     fn new() -> Arc<Self> {
         Arc::new(Self {
             entered: Notify::new(),

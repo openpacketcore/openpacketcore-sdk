@@ -1789,6 +1789,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     assert_eq!(
         testkit["features"],
         serde_json::json!({
+            "consumer-fixture": ["dep:rcgen", "dep:rustls-pki-types"],
             "default": [],
             "foundation-insecure": ["opc-session-net/insecure-test"]
         })

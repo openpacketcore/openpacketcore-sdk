@@ -1,38 +1,89 @@
-//! External-crate visibility check for the narrow protected fenced path.
+//! External-crate visibility check for the sealed prepared-fenced facade.
 
 use std::sync::Arc;
 
-use opc_key::MemoryKeyProvider;
+use opc_key::{KeyProvider, MemoryKeyProvider, RemoteSealProvider};
 use opc_session_net::{
-    SessionConsumerFencedTransitionBackend, SessionConsumerPreparedCheckpointBackendError,
-    SessionConsumerPreparedFencedTransitionBackend,
+    ActivatedSessionConsumerFencedTransitionVoters, SessionConsumerPreparedFencedTransitionBackend,
+    SessionConsumerPreparedFencedTransitionBackendError,
 };
-use opc_session_store::{
-    EncryptingSessionBackend, ProtectedFencedTransitionBackend, SessionBackend,
-};
-
-type PublicPhysical = SessionConsumerFencedTransitionBackend;
-type PublicProtected = EncryptingSessionBackend<PublicPhysical, MemoryKeyProvider>;
-type PublicComposite = SessionConsumerPreparedFencedTransitionBackend<PublicProtected>;
-
-fn accepts_only_the_narrow_public_boundary<T: ProtectedFencedTransitionBackend + ?Sized>() {}
+use opc_session_store::PreparedFencedTransitionJournal;
 
 fn public_persistent_constructor(
-    backend: Arc<PublicProtected>,
-    voters: Vec<SessionConsumerFencedTransitionBackend>,
-) -> Result<PublicComposite, SessionConsumerPreparedCheckpointBackendError> {
-    SessionConsumerPreparedFencedTransitionBackend::persistent(backend, voters)
+    voters: ActivatedSessionConsumerFencedTransitionVoters,
+    provider: Arc<MemoryKeyProvider>,
+    journal: Arc<PreparedFencedTransitionJournal>,
+) -> Result<
+    SessionConsumerPreparedFencedTransitionBackend,
+    SessionConsumerPreparedFencedTransitionBackendError,
+> {
+    SessionConsumerPreparedFencedTransitionBackend::persistent_encrypting(
+        voters,
+        provider,
+        "external-facade",
+        journal,
+    )
+}
+
+fn public_erased_local_constructor(
+    voters: ActivatedSessionConsumerFencedTransitionVoters,
+    provider: Arc<dyn KeyProvider>,
+    journal: Arc<PreparedFencedTransitionJournal>,
+) -> Result<
+    SessionConsumerPreparedFencedTransitionBackend,
+    SessionConsumerPreparedFencedTransitionBackendError,
+> {
+    SessionConsumerPreparedFencedTransitionBackend::persistent_encrypting(
+        voters,
+        provider,
+        "external-erased-local-facade",
+        journal,
+    )
+}
+
+fn public_erased_remote_constructor(
+    voters: ActivatedSessionConsumerFencedTransitionVoters,
+    provider: Arc<dyn RemoteSealProvider>,
+    journal: Arc<PreparedFencedTransitionJournal>,
+) -> Result<
+    SessionConsumerPreparedFencedTransitionBackend,
+    SessionConsumerPreparedFencedTransitionBackendError,
+> {
+    SessionConsumerPreparedFencedTransitionBackend::persistent_remote_sealing(
+        voters,
+        provider,
+        "external-erased-remote-facade",
+        journal,
+    )
 }
 
 #[test]
-fn narrow_prepared_fenced_composite_is_public_and_needs_no_lease_authority() {
-    accepts_only_the_narrow_public_boundary::<PublicProtected>();
-    fn assert_session_backend<T: SessionBackend>() {}
-    assert_session_backend::<PublicPhysical>();
-
+fn activated_roster_is_the_only_public_fenced_facade_input() {
     let _ = public_persistent_constructor
         as fn(
-            Arc<PublicProtected>,
-            Vec<SessionConsumerFencedTransitionBackend>,
-        ) -> Result<PublicComposite, SessionConsumerPreparedCheckpointBackendError>;
+            ActivatedSessionConsumerFencedTransitionVoters,
+            Arc<MemoryKeyProvider>,
+            Arc<PreparedFencedTransitionJournal>,
+        ) -> Result<
+            SessionConsumerPreparedFencedTransitionBackend,
+            SessionConsumerPreparedFencedTransitionBackendError,
+        >;
+    let _ = public_erased_local_constructor
+        as fn(
+            ActivatedSessionConsumerFencedTransitionVoters,
+            Arc<dyn KeyProvider>,
+            Arc<PreparedFencedTransitionJournal>,
+        ) -> Result<
+            SessionConsumerPreparedFencedTransitionBackend,
+            SessionConsumerPreparedFencedTransitionBackendError,
+        >;
+    let _ = public_erased_remote_constructor
+        as fn(
+            ActivatedSessionConsumerFencedTransitionVoters,
+            Arc<dyn RemoteSealProvider>,
+            Arc<PreparedFencedTransitionJournal>,
+        ) -> Result<
+            SessionConsumerPreparedFencedTransitionBackend,
+            SessionConsumerPreparedFencedTransitionBackendError,
+        >;
 }

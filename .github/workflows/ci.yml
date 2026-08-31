@@ -554,7 +554,7 @@ jobs:
             ordinary)
               skips=()
               for timing_contract in "${timing_contracts[@]}"; do
-                skips+=(--skip "$timing_contract")
+                skips+=(--skip "stateless_quorum_consumer::$timing_contract")
               done
               cargo test --locked \
                 -p opc-session-net \
@@ -573,11 +573,11 @@ jobs:
                   --all-features \
                   --target i686-unknown-linux-gnu \
                   --quiet \
-                  --test stateless_quorum_consumer \
+                  --lib \
                   -- \
                   --test-threads=1 \
                   --exact \
-                  "$timing_contract"
+                  "stateless_quorum_consumer::$timing_contract"
               done
               for timing_contract in "${optimized_roster_contracts[@]}"; do
                 env CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
@@ -585,11 +585,11 @@ jobs:
                   --all-features \
                   --target i686-unknown-linux-gnu \
                   --quiet \
-                  --test stateless_quorum_consumer \
+                  --lib \
                   -- \
                   --test-threads=1 \
                   --exact \
-                  "$timing_contract"
+                  "stateless_quorum_consumer::$timing_contract"
               done
               ;;
             *)

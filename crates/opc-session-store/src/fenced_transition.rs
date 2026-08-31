@@ -1234,6 +1234,14 @@ impl FencedTransitionExecuteError {
 /// logged, placed in metrics, or included in diagnostics. The frame digest
 /// detects accidental modification but is not a substitute for the V2
 /// journal's authenticated durable binding.
+///
+/// The low-level physical-token adapter hooks remain public only for complete
+/// cross-crate [`crate::SessionBackend`] implementations. They do not expose
+/// or authorize the session-consumer crate's private exact-roster transport;
+/// public one-voter session-consumer clients reject V1 transition opcodes
+/// before connection setup. Applications composing their own physical backend
+/// own that backend's replay and recovery contract and must use the opaque
+/// activated consumer facade for the SDK all-voter affine guarantee.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PreparedFencedTransition {
     canonical: Zeroizing<Vec<u8>>,
@@ -1243,10 +1251,12 @@ pub struct PreparedFencedTransition {
 impl PreparedFencedTransition {
     /// Prepare an exact request at a capable unprotected backend boundary.
     ///
-    /// This low-level adapter hook exists for [`crate::SessionBackend`]
-    /// implementations. Application code should prepare through the complete
-    /// journaled protected backend so every layer is retained durably before
-    /// dispatch.
+    /// This low-level adapter hook exists for complete
+    /// [`crate::SessionBackend`] implementations. It has no authority to
+    /// dispatch through the session-consumer transport; that transport's
+    /// physical V1 port is private to its activated exact-roster facade.
+    /// Application code should prepare through the complete journaled
+    /// protected backend so every layer is retained durably before dispatch.
     #[doc(hidden)]
     pub fn from_unprotected_request(request: FencedTransitionRequest) -> Result<Self, StoreError> {
         request.validate()?;
@@ -1303,7 +1313,9 @@ impl PreparedFencedTransition {
     ///
     /// This SDK adapter hook intentionally accepts only a fixed-width
     /// commitment. It never exposes the protected request body or any local
-    /// SPIFFE identity material to callers.
+    /// SPIFFE identity material to callers. Its public visibility is for a
+    /// complete cross-crate physical backend implementation, not a lowering
+    /// capability for the session-consumer facade.
     #[doc(hidden)]
     pub fn with_authenticated_consumer_binding(
         self,
@@ -1321,7 +1333,8 @@ impl PreparedFencedTransition {
     ///
     /// This SDK adapter hook fails closed before returning a request whenever
     /// the token was made by a different consumer boundary. A V2 outer wrapper
-    /// must reload and pass the journaled token unchanged.
+    /// must reload and pass the journaled token unchanged. It does not grant
+    /// access to the session-consumer crate's private physical dispatch port.
     #[doc(hidden)]
     pub fn request_for_authenticated_consumer(
         &self,
@@ -1363,7 +1376,9 @@ impl PreparedFencedTransition {
     /// This low-level adapter method rejects tokens that still carry an
     /// SDK-owned protection layer. Application code should pass the opaque
     /// token back to the same composed [`crate::SessionBackend`] instead of
-    /// inspecting or reconstructing its physical request.
+    /// inspecting or reconstructing its physical request. This hook cannot
+    /// lower a consumer facade because that facade exposes neither this token
+    /// nor its private physical backend.
     #[doc(hidden)]
     pub fn request_for_unprotected_backend(&self) -> Result<FencedTransitionRequest, StoreError> {
         let body = self

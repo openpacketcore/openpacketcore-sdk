@@ -68,8 +68,8 @@ private paths or credentials.
 
 ```text
 env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
-  cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
-  persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal \
+  cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal \
   -- --exact --nocapture
 
 result: PASS
@@ -80,8 +80,8 @@ assertion: exactly two accepted roster mutations (PollAdmit, Terminalize)
 ```
 
 ```text
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
-  persistent_three_voter_protected_roster_durable_crash_cut_matrix \
+cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_durable_crash_cut_matrix \
   -- --exact --nocapture
 
 result: PASS within the complete 39-test production transport target
@@ -109,8 +109,8 @@ The 13 frozen cuts are:
     non-transmitted first send, then resent byte-identically after restart.
 
 ```text
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
-  persistent_three_voter_protected_roster_not_found_after_outcome_unknown_requires_adoption \
+cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_not_found_after_outcome_unknown_requires_adoption \
   -- --exact --nocapture
 
 result: PASS
@@ -119,17 +119,17 @@ assertion: NotFound is non-exclusionary; no terminal or publication mutation;
 ```
 
 ```text
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
-  persistent_three_voter_protected_roster_established_before_publication_survives_full_restart \
+cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_established_before_publication_survives_full_restart \
   -- --exact --nocapture
 
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
-  persistent_three_voter_protected_roster_publication_published_before_acknowledgement_survives_full_restart \
+cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_publication_published_before_acknowledgement_survives_full_restart \
   -- --exact --nocapture
 
 env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
-  cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
-  persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart \
+  cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart \
   -- --exact --nocapture
 
 result: PASS (all three full-fleet durable-reopen cases)
@@ -150,8 +150,8 @@ The focused conclusive-Aborted production-path case is:
 
 ```text
 env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
-  cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
-  persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart \
+  cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart \
   -- --exact --nocapture
 
 result: PASS
@@ -239,14 +239,14 @@ assertions: no needless startup writer; no late interrupt during rollback;
 The same bytes pass the affected real topology cases:
 
 ```text
-cargo test --locked -p opc-session-net --all-features --test stateless_quorum_consumer \
-  persistent_three_voter_protected_roster_survives_real_os_process_loss \
+cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_protected_roster_survives_real_os_process_loss \
   -- --exact --nocapture --test-threads=1
 result: PASS; 193.86s
 
 CARGO_PROFILE_TEST_OPT_LEVEL=1 \
-  cargo test --locked -p opc-session-net --all-features --test stateless_quorum_consumer \
-  persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running \
+  cargo test --locked -p opc-session-net --all-features --lib \
+  stateless_quorum_consumer::persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running \
   -- --exact --nocapture --test-threads=1
 result: PASS; 36.44s
 ```
@@ -279,7 +279,7 @@ result: PASS
 cargo test --locked -p opc-session-store --lib 'recovery::tests::' -- --nocapture
 result: PASS; 44 passed, 0 failed
 
-cargo test --locked -p opc-session-net --all-features --test stateless_quorum_consumer \
+cargo test --locked -p opc-session-net --all-features --lib stateless_quorum_consumer:: \
   -- --nocapture
 result: PASS; 43 passed, 0 failed, 2 release-only latency tests ignored
 ```

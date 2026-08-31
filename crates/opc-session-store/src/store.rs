@@ -92,7 +92,7 @@ impl<B: SessionBackend> SessionStore<B> {
     }
 }
 
-impl<B: ProtectedSessionBackend> SessionStore<B> {
+impl<B: ProtectedSessionBackend + SessionBackend> SessionStore<B> {
     /// Mint the protected base consumed by the dataplane's selector-ledger
     /// key derivation.
     ///

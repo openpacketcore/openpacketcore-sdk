@@ -41,6 +41,16 @@
 
 #![forbid(unsafe_code)]
 
+// The historical physical-adapter qualification suite is compiled as an
+// in-crate test module. This retains its protocol coverage without publishing
+// a raw SessionBackend lowering surface to downstream crates.
+#[cfg(test)]
+extern crate self as opc_session_net;
+
+#[cfg(all(test, feature = "test-control"))]
+#[doc(hidden)]
+pub(crate) use consumer::SessionConsumerFencedTransitionBackend;
+
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod client;
 pub mod consensus;
@@ -57,6 +67,9 @@ pub mod protocol;
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod server;
 #[cfg(test)]
+#[path = "../tests/stateless_quorum_consumer.rs"]
+mod stateless_quorum_consumer;
+#[cfg(test)]
 mod test_support;
 
 #[cfg(feature = "legacy-session-net-compat")]
@@ -66,18 +79,18 @@ pub use consensus::{
     SessionConsensusServerHandle,
 };
 pub use consumer::{
-    session_consumer_payload_budget, PersistentSessionConsumerClient,
-    PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
-    PersistentSessionConsumerDiagnostics, PersistentSessionConsumerExecuteError,
-    PersistentSessionConsumerReadiness, PersistentSessionConsumerShutdownReport,
-    PersistentSessionConsumerV2Diagnostics, PersistentSessionConsumerV2ExecuteError,
-    RosterIngressSigner, RosterIngressSignerError, SessionConsumerAuthorizationError,
-    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
-    SessionConsumerFencedTransitionBackendError, SessionConsumerFencedTransitionMutationError,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-    SessionConsumerPreparedCheckpointBackend, SessionConsumerPreparedCheckpointBackendError,
-    SessionConsumerPreparedCompareAndSet, SessionConsumerPreparedFencedTransition,
-    SessionConsumerPreparedFencedTransitionBackend,
+    session_consumer_payload_budget, ActivatedSessionConsumerFencedTransitionVoters,
+    PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+    PersistentSessionConsumerConfigError, PersistentSessionConsumerDiagnostics,
+    PersistentSessionConsumerExecuteError, PersistentSessionConsumerReadiness,
+    PersistentSessionConsumerShutdownReport, PersistentSessionConsumerV2Diagnostics,
+    PersistentSessionConsumerV2ExecuteError, RosterIngressSigner, RosterIngressSignerError,
+    SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
+    SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
+    SessionConsumerPreparedCheckpointBackendError, SessionConsumerPreparedCompareAndSet,
+    SessionConsumerPreparedFencedTransition, SessionConsumerPreparedFencedTransitionBackend,
+    SessionConsumerPreparedFencedTransitionBackendError,
     SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerPreparedLeaseAcquire,
     SessionConsumerRecoveredFencedTransitionStatus, SessionQuorumConsumerServer,
     SessionQuorumConsumerServerAdmissionSnapshot, SessionQuorumConsumerServerHandle,

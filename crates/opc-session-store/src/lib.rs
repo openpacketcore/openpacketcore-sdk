@@ -10,9 +10,10 @@
 //!
 //! Prepared CAS and lease checkpoint requests are obtained only from an
 //! SDK-owned [`ProtectedSessionBackend`] wrapper. Protected fenced transitions
-//! use the narrower sealed [`ProtectedFencedTransitionBackend`] boundary,
-//! which needs only [`SessionBackend`] and therefore does not grant a physical
-//! consumer adapter synthetic lease authority. The returned affine request
+//! use the narrower sealed [`ProtectedFencedTransitionBackend`] marker. It
+//! deliberately exposes neither a [`SessionBackend`] nor a physical request,
+//! so a consumer adapter cannot claim synthetic lease authority or lower a
+//! recovered handle into a replayable mutation. The returned affine request
 //! captures its exact scope, caller request ID, sealed mutation, and deadline
 //! budget; only the net-owned consumer composite can turn it into an execution
 //! handle.

@@ -29,9 +29,9 @@ use crate::{
     FencedTransitionV2PreparedJournalKey, FencedTransitionV2Request, FencedTransitionV2Status,
     Generation, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, ProtectedFencedTransitionBackend, RemoteSealingSessionBackend,
-    SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
-    SessionPayloadEncoding, SessionStore, StateClass, StateType, StoreError, StoredSessionRecord,
+    PreparedFencedTransitionLookup, RemoteSealingSessionBackend, SessionBackend, SessionKey,
+    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionStore, StateClass, StateType, StoreError, StoredSessionRecord,
     FENCED_TRANSITION_MAX_PREPARED_BYTES,
 };
 
@@ -2750,13 +2750,8 @@ async fn protected_fenced_transition_router_projection_rejects_substituted_journ
     journal.substitute_prepared_token(first.request_id(), second.request_id());
 
     assert!(matches!(
-        ProtectedFencedTransitionBackend::authenticated_consumer_fenced_transition_request(
-            wrapper.as_ref(),
-            &first,
-            [0x31; 32],
-        )
-        .await,
-        Err(StoreError::BackendUnavailable(_))
+        wrapper.fenced_transition(&first).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
     ));
     assert_eq!(spy.dispatches(), 0);
     assert!(spy.statuses().is_empty());
@@ -2928,13 +2923,8 @@ async fn protected_fenced_transition_router_projection_rechecks_the_journal_befo
         .expect("prepare local protected transition");
     local_journal.delete_prepared_token();
     assert!(matches!(
-        ProtectedFencedTransitionBackend::authenticated_consumer_fenced_transition_request(
-            local.as_ref(),
-            &local_prepared,
-            [0x32; 32],
-        )
-        .await,
-        Err(StoreError::BackendUnavailable(_))
+        local.fenced_transition(&local_prepared).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
     ));
     assert_eq!(local_spy.dispatches(), 0);
     assert!(local_spy.statuses().is_empty());
@@ -2955,13 +2945,8 @@ async fn protected_fenced_transition_router_projection_rechecks_the_journal_befo
         .expect("prepare remote protected transition");
     remote_journal.delete_prepared_token();
     assert!(matches!(
-        ProtectedFencedTransitionBackend::authenticated_consumer_fenced_transition_request(
-            remote.as_ref(),
-            &remote_prepared,
-            [0x33; 32],
-        )
-        .await,
-        Err(StoreError::BackendUnavailable(_))
+        remote.fenced_transition(&remote_prepared).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
     ));
     assert_eq!(remote_spy.dispatches(), 0);
     assert!(remote_spy.statuses().is_empty());

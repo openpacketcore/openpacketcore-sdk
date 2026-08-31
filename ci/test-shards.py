@@ -60,8 +60,12 @@ HARNESS = ["--test-threads=4"]
 # Running them beside unrelated Tokio runtimes makes the assertion measure
 # process scheduling and fixture teardown instead of the request path. Keep
 # the production bounds exact and give each timing contract its own process.
-QUIESCENT_INTEGRATION_TARGET = "stateless_quorum_consumer"
-QUIESCENT_INTEGRATION_TESTS = (
+# This historical suite is deliberately compiled as a crate-private lib test
+# module. It exercises raw physical adapters which must not be public merely
+# to keep an old integration target compiling. Its sensitive contracts remain
+# isolated, but use their libtest-qualified names below.
+QUIESCENT_LIB_MODULE = "stateless_quorum_consumer"
+QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
@@ -78,7 +82,7 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
     "lagging_replica_installs_compacted_snapshot_without_losing_committed_state",
     "fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect",
 )
-OPTIMIZED_QUIESCENT_INTEGRATION_TESTS = frozenset(
+OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -87,7 +91,7 @@ OPTIMIZED_QUIESCENT_INTEGRATION_TESTS = frozenset(
         "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
     }
 )
-if not OPTIMIZED_QUIESCENT_INTEGRATION_TESTS.issubset(QUIESCENT_INTEGRATION_TESTS):
+if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
 # Keep O1 confined to the snapshot/restart roster proofs.
 # Applying it to unrelated expiry/fault tests changes their lifecycle timing
@@ -170,20 +174,23 @@ def shard_ids(plan: dict) -> list[str]:
     return ids
 
 
-def quiescent_integration_command(name: str) -> list[str]:
-    """Run one wall-time-sensitive contract in its exact isolated profile."""
+def qualified_quiescent_lib_test(name: str) -> str:
+    return f"{QUIESCENT_LIB_MODULE}::{name}"
+
+
+def quiescent_lib_command(name: str) -> list[str]:
+    """Run one private-lib timing contract in its exact isolated profile."""
     profile = (
         ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
-        if name in OPTIMIZED_QUIESCENT_INTEGRATION_TESTS
+        if name in OPTIMIZED_QUIESCENT_LIB_TESTS
         else []
     )
     return profile + SELECTION + [
-        "--test",
-        QUIESCENT_INTEGRATION_TARGET,
+        "--lib",
         "--",
         "--test-threads=1",
         "--exact",
-        name,
+        qualified_quiescent_lib_test(name),
     ]
 
 
@@ -200,13 +207,8 @@ def quiescent_consensus_openraft_command(name: str) -> list[str]:
 
 
 def quiescent_contracts() -> tuple:
-    """The target-specific contracts that require a fresh test process."""
+    """Integration-target contracts that require a fresh test process."""
     return (
-        (
-            QUIESCENT_INTEGRATION_TARGET,
-            QUIESCENT_INTEGRATION_TESTS,
-            quiescent_integration_command,
-        ),
         (
             QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
             QUIESCENT_CONSENSUS_OPENRAFT_TESTS,
@@ -227,8 +229,18 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         # substring by default, which would also swallow a future test whose
         # name merely starts with a fleet test's name.
         skips = [arg for name in named for arg in ("--skip", name)]
+        # The raw-adapter qualification module is now crate-private, so it
+        # runs inside this ordinary --lib process. Exclude each timing
+        # contract here and run it below in its own --lib process; otherwise
+        # its literal timing bounds become a process-concurrency test.
+        lib_skips = [
+            arg
+            for name in QUIESCENT_LIB_TESTS
+            for arg in ("--skip", qualified_quiescent_lib_test(name))
+        ]
         return [
-            SELECTION + ["--lib", "--bins", "--", *HARNESS],
+            SELECTION + ["--lib", "--bins", "--", *HARNESS, "--exact", *lib_skips],
+            *[quiescent_lib_command(name) for name in QUIESCENT_LIB_TESTS],
             list(EXAMPLES),
             SELECTION + ["--doc", "--", *HARNESS],
             SELECTION
@@ -333,7 +345,8 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     proves the shard actually issues the invocations that cover them, so
     dropping (say) the doctest command cannot pass unnoticed.
     """
-    misc = [" ".join(command) for command in commands(plan, "misc", targets)]
+    misc_commands = commands(plan, "misc", targets)
+    misc = [" ".join(command) for command in misc_commands]
     required = {
         "unit tests": " --lib --bins ",
         "example compile check": "cargo build ",
@@ -343,6 +356,24 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     for label, fragment in required.items():
         if not any(fragment in f"{command} " for command in misc):
             sys.exit(f"the misc shard no longer runs {label}")
+    if len(QUIESCENT_LIB_TESTS) != len(set(QUIESCENT_LIB_TESTS)):
+        sys.exit("private-lib isolated timing contracts are duplicated")
+    lib_skip = ["--exact"] + [
+        arg
+        for name in QUIESCENT_LIB_TESTS
+        for arg in ("--skip", qualified_quiescent_lib_test(name))
+    ]
+    if misc_commands[0][-len(lib_skip) :] != lib_skip:
+        sys.exit(
+            "the misc ordinary --lib process must skip every private-lib "
+            "timing contract exactly once"
+        )
+    expected_lib_isolated = [quiescent_lib_command(name) for name in QUIESCENT_LIB_TESTS]
+    if misc_commands[1 : 1 + len(expected_lib_isolated)] != expected_lib_isolated:
+        sys.exit(
+            "the misc shard must run private-lib timing contracts once each, "
+            "in their declared module-qualified name order"
+        )
     for index, group in enumerate(plan["heavy"]["shards"]):
         if not group:
             # `--exact` with no names disables filtering, so an empty group
@@ -483,6 +514,20 @@ def list_quiescent_test(target: str, name: str) -> list[str]:
     ]
 
 
+def list_quiescent_lib_test(name: str) -> list[str]:
+    """Resolve one private-lib contract with its exact CI invocation."""
+    qualified = qualified_quiescent_lib_test(name)
+    command = SELECTION + ["--lib", "--", "--list", "--exact", qualified]
+    out = subprocess.run(
+        command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
+    ).stdout
+    return [
+        line.rsplit(":", 1)[0]
+        for line in out.splitlines()
+        if line.endswith(": test")
+    ]
+
+
 def precheck(plan: dict, shard: str) -> None:
     """Fail a heavy shard whose named tests no longer resolve.
 
@@ -497,6 +542,19 @@ def precheck(plan: dict, shard: str) -> None:
     # burn six runners before the gates job reported it.
     targets = integration_targets()
     verify(plan, targets)
+    if shard == "misc":
+        for name in QUIESCENT_LIB_TESTS:
+            qualified = qualified_quiescent_lib_test(name)
+            selected = list_quiescent_lib_test(name)
+            if selected != [qualified]:
+                sys.exit(
+                    "misc private-lib timing contract does not resolve exactly "
+                    f"once: expected {qualified!r}, selected {selected!r}"
+                )
+        print(
+            "misc private-lib timing contracts resolve exactly once: "
+            f"{len(QUIESCENT_LIB_TESTS)}"
+        )
     buckets = assign(plan, targets)
     if shard in buckets:
         contracts = [
