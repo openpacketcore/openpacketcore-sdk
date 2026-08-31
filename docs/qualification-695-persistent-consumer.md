@@ -361,7 +361,7 @@ accumulated four deterministic 40 ms setup delays; the proposed reuse
 expectation was one setup and failed with `left: 4`, `right: 1`:
 
 ```text
-opc-heavy cargo test --locked -p opc-session-net --test stateless_quorum_consumer stateless_serial_calls_red_require_authenticated_connection_reuse -- --exact --nocapture --test-threads=1
+opc-heavy cargo test --locked -p opc-session-net --all-features --lib stateless_quorum_consumer::stateless_serial_calls_red_require_authenticated_connection_reuse -- --exact --nocapture --test-threads=1
 ```
 
 The retained stateless characterization is named

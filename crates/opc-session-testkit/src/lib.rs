@@ -3,6 +3,8 @@
 //! Provides clock skew, network partition, and fault injection fixtures.
 //! This is an internal testkit crate and is not published.
 
+#[cfg(feature = "consumer-fixture")]
+pub mod authenticated_consumer_fixture;
 pub mod qualification;
 pub mod qualification_concurrent_v5;
 pub mod qualification_kubernetes;
@@ -20,6 +22,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
+#[cfg(feature = "consumer-fixture")]
+use opc_session_store::SessionConsumerRoster;
 use opc_session_store::{
     Clock, ConsensusSessionStore, DurableReadinessState, QuorumReplicaDescriptor,
     QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity, ReplicaEndpoint,
@@ -205,6 +209,8 @@ pub struct ConsensusTestCluster {
     stores: Vec<ConsensusSessionStore>,
     paths: BTreeMap<(usize, usize), Arc<InProcessConsensusPeer>>,
     identity: SessionConsensusIdentity,
+    #[cfg(feature = "consumer-fixture")]
+    consumer_roster: SessionConsumerRoster,
 }
 
 impl ConsensusTestCluster {
@@ -265,6 +271,10 @@ impl ConsensusTestCluster {
                     .expect("consensus test node ID")
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "consumer-fixture")]
+        let consumer_roster = topologies[0]
+            .session_consumer_roster()
+            .expect("consensus test consumer roster");
 
         let mut paths = BTreeMap::new();
         for source in 0..member_count {
@@ -316,6 +326,8 @@ impl ConsensusTestCluster {
             stores,
             paths,
             identity,
+            #[cfg(feature = "consumer-fixture")]
+            consumer_roster,
         };
         cluster.wait_ready().await;
         cluster
@@ -332,6 +344,14 @@ impl ConsensusTestCluster {
     /// Exact cluster/configuration/epoch scope used by this test fleet.
     pub const fn consensus_identity(&self) -> SessionConsensusIdentity {
         self.identity
+    }
+
+    /// Return the internally retained exact roster for testkit-owned
+    /// authenticated listener construction. It is deliberately crate-private:
+    /// public fixtures expose only the sealed affine facade.
+    #[cfg(feature = "consumer-fixture")]
+    pub(crate) fn consumer_roster(&self) -> &SessionConsumerRoster {
+        &self.consumer_roster
     }
 
     /// Connect or isolate every consensus path to and from one member.
@@ -400,10 +420,16 @@ fn test_replica_id(index: usize) -> Result<ReplicaId, QuorumTopologyError> {
 }
 
 fn test_member(index: usize) -> Result<QuorumReplicaDescriptor, QuorumTopologyError> {
+    #[cfg(feature = "consumer-fixture")]
+    let tls_identity = format!(
+        "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consensus/instance/{index}"
+    );
+    #[cfg(not(feature = "consumer-fixture"))]
+    let tls_identity = format!("spiffe://test/consensus/replica/{index}");
     Ok(QuorumReplicaDescriptor::new(
         test_replica_id(index)?,
         ReplicaEndpoint::new(format!("consensus-test-replica-{index}.invalid"), 7443)?,
-        ReplicaTlsIdentity::new(format!("spiffe://test/consensus/replica/{index}"))?,
+        ReplicaTlsIdentity::new(tls_identity)?,
         ReplicaFailureDomain::new(format!("consensus-test-failure-domain-{index}"))?,
         ReplicaBackingIdentity::new(format!("consensus-test-backing-{index}"))?,
     ))

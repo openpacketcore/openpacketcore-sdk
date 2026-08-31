@@ -307,6 +307,12 @@ fn assert_fixed_zero_diagnostics(diagnostics: PersistentSessionConsumerDiagnosti
             scope: 0,
             protocol: 0,
             deadline: 0,
+            completed_operations: 0,
+            completed_operation_successes: 0,
+            completed_operation_not_transmitted: 0,
+            completed_operation_outcome_unknown: 0,
+            completed_operation_other_failures: 0,
+            completed_operation_unsafe_failures: 0,
         }
     );
 }
@@ -1021,6 +1027,15 @@ async fn prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted() 
     );
     assert_eq!(diagnostics.idle, LANES as u64);
     assert!(diagnostics.reused >= 16);
+    assert_eq!(
+        diagnostics.completed_operations, 16,
+        "each read-only capability probe receives one exclusive final classification"
+    );
+    assert_eq!(diagnostics.completed_operation_successes, 16);
+    assert_eq!(diagnostics.completed_operation_not_transmitted, 0);
+    assert_eq!(diagnostics.completed_operation_outcome_unknown, 0);
+    assert_eq!(diagnostics.completed_operation_other_failures, 0);
+    assert_eq!(diagnostics.completed_operation_unsafe_failures, 0);
     let debug = format!("{client:?}");
     for canary in privacy_canaries {
         assert!(
@@ -1593,7 +1608,6 @@ async fn lane_retires_before_the_4097th_call_and_correlation_restarts_on_replace
         scope,
         config(1, 0, 1),
     );
-
     client.prewarm().await.expect("prewarm one lane");
     for _ in 0..=opc_session_net::MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
         assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
@@ -1933,6 +1947,7 @@ async fn typed_consumer_watch_is_rejected_before_resolution_or_global_cursor_exp
         scope,
         config(1, 0, 1),
     );
+    let diagnostics_before = client.diagnostics().await;
 
     assert!(matches!(
         client.open_watch(0).await,
@@ -1953,6 +1968,30 @@ async fn typed_consumer_watch_is_rejected_before_resolution_or_global_cursor_exp
     assert_eq!(diagnostics.tls_attempts, 0);
     assert_eq!(diagnostics.hello_attempts, 0);
     assert_eq!(diagnostics.watch_active, 0);
+    assert_eq!(
+        diagnostics.completed_operations,
+        diagnostics_before.completed_operations + 2
+    );
+    assert_eq!(
+        diagnostics.completed_operation_not_transmitted,
+        diagnostics_before.completed_operation_not_transmitted + 2
+    );
+    assert_eq!(
+        diagnostics.completed_operation_successes,
+        diagnostics_before.completed_operation_successes
+    );
+    assert_eq!(
+        diagnostics.completed_operation_outcome_unknown,
+        diagnostics_before.completed_operation_outcome_unknown
+    );
+    assert_eq!(
+        diagnostics.completed_operation_other_failures,
+        diagnostics_before.completed_operation_other_failures
+    );
+    assert_eq!(
+        diagnostics.completed_operation_unsafe_failures,
+        diagnostics_before.completed_operation_unsafe_failures
+    );
 
     client.shutdown().await;
     handle.abort_and_wait().await;

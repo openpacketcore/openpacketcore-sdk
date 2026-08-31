@@ -2048,6 +2048,63 @@ provider/key rotation can therefore use the same durable journal path, key,
 and volume. This does not claim host failover, host/volume-loss recovery,
 journal replication, or a second consensus transition.
 
+`SessionConsumerPreparedFencedTransitionBackend` is the public protected V1
+prepared fenced-transition facade for that wrapper. Its
+`persistent_exact_voter_prewarm_roster` constructor consumes the complete set
+of persistent clients for one scope, activates and prewarms every V1 physical
+voter internally, and returns an opaque roster value. Only the facade's
+local-AEAD and remote-sealing constructors can consume that value; neither a
+raw physical backend nor a dispatchable voter value leaves the net crate. A
+partial roster or any non-V1 voter fails activation. The facade rejects an
+incomplete, duplicate, or differently authenticated/bound roster and
+canonicalizes admitted voters by node ordinal; caller input order is not
+authority. For every
+caller-stable `FencedTransitionRequestId`, the router derives the same origin
+from the authenticated scope, canonical roster, and ID. It uses the existing
+V1 `fenced_transition` operation only. It is not #702's V2 receipt-history
+protocol or `FencedTransitionV2PreparedJournal`, and grants neither activation
+or readiness-probe authority nor a new quorum, replication, membership, or
+consensus authority.
+
+`ProtectedFencedTransitionBackend` is a sealed, methodless marker; it has no
+`SessionBackend` supertrait. `EncryptingSessionBackend` and
+`RemoteSealingSessionBackend` implement it around inner types that separately
+implement `SessionBackend`. Therefore the router composes directly over the real
+`SessionConsumerFencedTransitionBackend` and MUST NOT grant that physical
+adapter synthetic lease authority. The existing
+`SessionConsumerPreparedCheckpointBackend` remains the distinct complete
+protected-session path for prepared CAS and lease APIs, which require
+`ProtectedSessionBackend` and `SessionLeaseManager`.
+
+Preparation retains the exact outer protected journal token privately in a
+move-only affine handle. The sealed boundary MUST NOT expose a dispatchable
+physical prepared token. The router revalidates that exact outer token before
+every physical mutation and receipt-status attempt and derives only its
+authenticated-consumer request view; it MUST NOT reconstruct the request or
+replace the retained token with current provider/key state. Mutation starts at
+the deterministic origin and visits the
+canonical voter roster. It MAY advance to another voter only after a proven
+pre-dispatch `NotTransmitted` result. Cancellation during the pre-dispatch
+setup is safe and retryable because no application bytes can cross the
+transport boundary. After dispatch begins, a possible send, including
+`OutcomeUnknown`, or cancellation is ambiguous and MUST permanently make the
+handle receipt-only; it MUST NOT regain mutation authority.
+`BeforeCallWrite(SessionConsumerClientError::Scope)` is a terminal topology
+authority revocation and MUST be returned as rejected
+`StoreError::TopologyAuthorityRevoked`; it MUST NOT be downgraded to a generic
+`NotTransmitted` result or trigger successor mutation dispatch.
+
+Receipt status is read-only. A single status call uses the next deterministic
+canonical successor voter. A status-until-terminal call repeats bounded
+canonical-roster passes under the single immutable caller absolute deadline,
+with every physical attempt additionally capped by the prepared
+physical-attempt budget. It can end with a deadline; `NotFound`, unavailable,
+or a per-attempt deadline remains nonterminal while outer budget remains. None
+is proof that a delayed mutation cannot commit. A terminal receipt is cached
+locally. Restart recovery returns only the status-only
+`SessionConsumerRecoveredFencedTransitionStatus` handle; it deliberately has
+no execute authority, even if the recovered token is otherwise valid.
+
 Journal provisioning and reopening are distinct. A deployment MUST call
 `PreparedFencedTransitionJournal::create_new` exactly once for a missing path
 and `open_existing` on every restart. Reopening never creates or initializes a

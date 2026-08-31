@@ -1,5 +1,7 @@
 //! Contract tests for the production stateless quorum-consumer boundary.
 
+#![cfg(feature = "test-control")]
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -44,11 +46,11 @@ use opc_session_net::{
     SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
     SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
     SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-    SessionConsumerPreparedCheckpointBackend, SessionQuorumConsumerServer,
-    SessionQuorumConsumerServerHandle, SessionReauthenticationControl, SessionReplicationManifest,
-    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN, SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION,
-    SESSION_QUORUM_CONSUMER_V2_ALPN,
+    SessionConsumerPreparedCheckpointBackend, SessionConsumerPreparedFencedTransitionBackend,
+    SessionQuorumConsumerServer, SessionQuorumConsumerServerHandle, SessionReauthenticationControl,
+    SessionReplicationManifest, StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE,
+    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN,
+    SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_V2_ALPN,
 };
 use opc_session_net::{
     FencedMutationRosterAbsentAdmissionProposal as AbsentAdmissionProposal,
@@ -592,6 +594,48 @@ fn fs_verity_snapshot_tempdir(prefix: &str) -> tempfile::TempDir {
     }
 }
 
+/// Probe the exact immutable-snapshot seal boundary before starting the
+/// multi-process process-loss workload.
+///
+/// The process-loss proof requires a real fixed snapshot, not a best-effort
+/// substitute. Developer machines without fs-verity therefore report the
+/// explicit capability absence before any voter engine starts. The qualified
+/// CI lane sets `OPC_FS_VERITY_QUALIFICATION=required`, in which case any
+/// inability to seal is a hard failure rather than a skip.
+#[cfg(feature = "test-control")]
+fn process_loss_fs_verity_available() -> bool {
+    use std::os::fd::AsFd as _;
+
+    let probe_directory = fs_verity_snapshot_tempdir("process-loss-verity-probe-");
+    let probe_path = probe_directory.path().join("probe");
+    let probe = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe_path)
+        .expect("create process-loss fs-verity capability probe");
+    probe
+        .sync_all()
+        .expect("sync process-loss fs-verity capability probe");
+    drop(probe);
+    let probe = std::fs::File::open(&probe_path)
+        .expect("reopen process-loss fs-verity capability probe read-only");
+    match opc_fs_verity_sys::enable_fixed_profile(probe.as_fd()) {
+        Ok(_) => true,
+        Err(error)
+            if std::env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref()
+                == Some(std::ffi::OsStr::new("required")) =>
+        {
+            panic!("required process-loss fs-verity qualification cannot seal: {error:?}");
+        }
+        Err(error) => {
+            eprintln!(
+                "process-loss qualification skipped: fixed fs-verity snapshots are unavailable: {error:?}"
+            );
+            false
+        }
+    }
+}
+
 /// Test-only listener ownership that aborts a live consumer server if an
 /// assertion unwinds before the test can await its normal shutdown.
 struct AbortConsumerServerOnDrop(Option<SessionQuorumConsumerServerHandle>);
@@ -635,6 +679,14 @@ enum ThreeVoterFleetDirectory {
 enum ThreeVoterFleetSnapshotDirectory {
     Owned(tempfile::TempDir),
     Reopened(PathBuf),
+}
+
+/// Test-process guards retained across a full fleet restart. Keeping these
+/// together prevents the restart constructor from accepting two independent
+/// lifetime-bound arguments.
+struct ThreeVoterFleetRestartGuards {
+    test_gate: tokio::sync::SemaphorePermit<'static>,
+    metrics_test_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl ThreeVoterFleetSnapshotDirectory {
@@ -689,6 +741,11 @@ struct ThreeVoterConsumerFleet {
     read_barrier_delay: Option<Duration>,
     roster_attestation_root: Option<RosterAttestationTrustRootV1>,
     test_gate: Option<tokio::sync::SemaphorePermit<'static>>,
+    /// The former integration target ran in a separate process.  Now that
+    /// this raw-only suite is compiled as an in-crate module, retain the
+    /// package-wide metric isolation for the complete lifetime of every
+    /// consensus listener and engine it creates.
+    metrics_test_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
 
 impl Drop for ThreeVoterConsumerFleet {
@@ -776,14 +833,23 @@ impl ThreeVoterConsumerFleet {
         roster_attestation_root: Option<RosterAttestationTrustRootV1>,
         directory: ThreeVoterFleetDirectory,
         snapshot_directory: ThreeVoterFleetSnapshotDirectory,
-        inherited_test_gate: Option<tokio::sync::SemaphorePermit<'static>>,
+        inherited_guards: Option<ThreeVoterFleetRestartGuards>,
     ) -> Self {
-        let test_gate = match inherited_test_gate {
-            Some(test_gate) => test_gate,
-            None => THREE_VOTER_FLEET_TEST_GATE
-                .acquire()
-                .await
-                .expect("three-voter test gate remains open"),
+        let (test_gate, metrics_test_guard) = match inherited_guards {
+            Some(ThreeVoterFleetRestartGuards {
+                test_gate,
+                metrics_test_guard,
+            }) => (test_gate, metrics_test_guard),
+            None => {
+                let metrics_test_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+                    .lock()
+                    .await;
+                let test_gate = THREE_VOTER_FLEET_TEST_GATE
+                    .acquire()
+                    .await
+                    .expect("three-voter test gate remains open");
+                (test_gate, metrics_test_guard)
+            }
         };
         let members = (0..THREE_VOTER_COUNT)
             .map(three_voter_member)
@@ -991,6 +1057,7 @@ impl ThreeVoterConsumerFleet {
             read_barrier_delay,
             roster_attestation_root,
             test_gate: Some(test_gate),
+            metrics_test_guard: Some(metrics_test_guard),
         };
         for result in futures_util::future::join_all(
             fleet
@@ -1457,6 +1524,10 @@ impl ThreeVoterConsumerFleet {
             .test_gate
             .take()
             .expect("full restart retains three-voter test gate");
+        let metrics_test_guard = self
+            .metrics_test_guard
+            .take()
+            .expect("full restart retains metric test isolation");
         drop(self);
         Self::start_with_topology_in_directory(
             pki,
@@ -1465,7 +1536,10 @@ impl ThreeVoterConsumerFleet {
             roster_attestation_root,
             directory,
             snapshot_directory,
-            Some(test_gate),
+            Some(ThreeVoterFleetRestartGuards {
+                test_gate,
+                metrics_test_guard,
+            }),
         )
         .await
     }
@@ -3321,8 +3395,8 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
     );
     assert_eq!(
         wrong_scope_client.capabilities().await,
-        Err(SessionConsumerClientError::Authentication),
-        "a topology-derived authority for another server must not reach the service"
+        Err(SessionConsumerClientError::AuthorityRevoked),
+        "a topology-derived authority for another server must revoke before reaching the service"
     );
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
     handle.abort_and_wait().await;
@@ -4519,7 +4593,7 @@ async fn consumer_mtls_role_identity_and_server_identity_mismatches_fail_closed(
     );
     assert_eq!(
         wrong_server_identity.capabilities().await,
-        Err(SessionConsumerClientError::Authentication)
+        Err(SessionConsumerClientError::AuthorityRevoked)
     );
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     handle.abort_and_wait().await;
@@ -4643,8 +4717,8 @@ async fn protected_roster_mtls_identity_and_server_identity_mismatches_fail_clos
     );
     assert_eq!(
         wrong_server_identity.prewarm().await,
-        Err(SessionConsumerClientError::Authentication),
-        "a wrong protected-roster expected server identity must fail authentication"
+        Err(SessionConsumerClientError::AuthorityRevoked),
+        "a wrong protected-roster expected server identity must revoke topology authority"
     );
     assert!(
         wrong_server_identity.diagnostics().await.tls_attempts > 0,
@@ -6271,6 +6345,236 @@ async fn prepared_cas_cold_response_loss_latency_comparison() {
     let sample =
         warm_prepared_cas_response_loss_sample(16 * 1024, Duration::from_millis(100), false).await;
     eprintln!("cold prepared CAS n=1 (single observation; p50/p95/p99 not estimated): {sample:?}");
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test]
+async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_restart() {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let client_spiffe = spiffe("three-voter-public-fenced-client");
+
+    // Every endpoint is the real OpenRaft-backed consumer service. The test
+    // wrapper only withholds a successful mutation response; it never
+    // fabricates a receipt or submits an operation itself. Wrapping all three
+    // lets the opaque public router select its canonical origin without this
+    // test reaching through the facade to choose a physical voter.
+    let mut loss_servers = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut loss_addresses = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut response_losses = Vec::with_capacity(THREE_VOTER_COUNT);
+    for index in 0..THREE_VOTER_COUNT {
+        let response_loss = Arc::new(CommitThenLoseConsumerResponse::transition(Arc::new(
+            fleet.stores[index].consumer_service(),
+        )));
+        let (server, address) = SessionQuorumConsumerServer::new(
+            response_loss.clone(),
+            pki.server_config(&three_voter_spiffe(index)),
+            three_voter_authorizer(&fleet.stores[index], &client_spiffe).await,
+        )
+        .listen(
+            "127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("public response-loss listener"),
+        )
+        .await
+        .expect("start public response-loss listener");
+        response_losses.push(response_loss);
+        loss_servers.push(server);
+        loss_addresses.push(address);
+    }
+    let persistent_voters = loss_addresses
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, address)| {
+            PersistentSessionConsumerClient::try_from_stateless(
+                StatelessSessionConsumerClient::new(
+                    address,
+                    rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                    fleet.voter_authority(index),
+                    pki.client_config(&client_spiffe),
+                ),
+                PersistentSessionConsumerConfig::default(),
+            )
+            .expect("public persistent exact voter")
+        })
+        .collect::<Vec<_>>();
+    let activated =
+        SessionConsumerPreparedFencedTransitionBackend::persistent_exact_voter_prewarm_roster(
+            persistent_voters,
+        )
+        .await
+        .expect("all real V1 voters prewarm before public composition");
+    let journal_directory = tempfile::tempdir().expect("public fenced journal directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            journal_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make public fenced journal directory private");
+    }
+    let journal = Arc::new(
+        PreparedFencedTransitionJournal::create_new(
+            journal_directory.path().join("prepared.sqlite"),
+            PreparedFencedTransitionJournalKey::from_bytes([0x3b; 32]),
+        )
+        .expect("create public fenced journal"),
+    );
+    let provider = CountingKeyProvider::with_active_session_key();
+    let facade = SessionConsumerPreparedFencedTransitionBackend::persistent_encrypting(
+        activated,
+        Arc::clone(&provider),
+        "consumer-three-voter-public-fenced",
+        Arc::clone(&journal),
+    )
+    .expect("compose public exact-voter facade");
+    let request = fenced_create_request(0xa1);
+    let request_id = request.request_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut prepared = facade
+        .prepare_fenced_transition(
+            request,
+            PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                .expect("bounded public response-loss budget"),
+        )
+        .await
+        .expect("public facade prepares the exact journaled identity");
+
+    assert!(matches!(
+        prepared.execute_once().await,
+        Err(FencedTransitionExecuteError::OutcomeUnknown {
+            request_id: returned_request_id
+        }) if returned_request_id == request_id
+    ));
+    let mutation_counts = response_losses
+        .iter()
+        .map(|response_loss| response_loss.transition_calls.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        1,
+        mutation_counts.iter().sum::<usize>(),
+        "one real public-facade mutation commits before its response is lost"
+    );
+    let writer = mutation_counts
+        .iter()
+        .position(|calls| *calls == 1)
+        .expect("one physical voter accepted the mutation");
+    drop(prepared);
+    drop(facade);
+    for server in loss_servers {
+        server.abort_and_wait().await;
+    }
+    drop(response_losses);
+
+    // This is a full three-voter OpenRaft/SQLite restart, not a retained
+    // connection or a modeled receipt map. Rebuild the public facade from the
+    // retained journal so the only available authority is status-only.
+    let fleet = fleet.restart_all().await;
+    fleet.wait_all_ready().await;
+    let mut recovery_servers = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut recovery_addresses = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut recovery_observers = Vec::with_capacity(THREE_VOTER_COUNT);
+    for index in 0..THREE_VOTER_COUNT {
+        let observer = Arc::new(CommitThenLoseConsumerResponse::transition(Arc::new(
+            fleet.stores[index].consumer_service(),
+        )));
+        observer.lose_transition.store(false, Ordering::SeqCst);
+        let (server, address) = SessionQuorumConsumerServer::new(
+            observer.clone(),
+            pki.server_config(&three_voter_spiffe(index)),
+            three_voter_authorizer(&fleet.stores[index], &client_spiffe).await,
+        )
+        .listen(
+            "127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("public recovery listener"),
+        )
+        .await
+        .expect("start public recovery listener");
+        recovery_observers.push(observer);
+        recovery_servers.push(server);
+        recovery_addresses.push(address);
+    }
+    let recovery_voters = recovery_addresses
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, address)| {
+            PersistentSessionConsumerClient::try_from_stateless(
+                StatelessSessionConsumerClient::new(
+                    address,
+                    rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                    fleet.voter_authority(index),
+                    pki.client_config(&client_spiffe),
+                ),
+                PersistentSessionConsumerConfig::default(),
+            )
+            .expect("public restarted persistent voter")
+        })
+        .collect::<Vec<_>>();
+    let recovery_activated =
+        SessionConsumerPreparedFencedTransitionBackend::persistent_exact_voter_prewarm_roster(
+            recovery_voters,
+        )
+        .await
+        .expect("restarted exact voters prewarm before recovery");
+    let recovery_facade = SessionConsumerPreparedFencedTransitionBackend::persistent_encrypting(
+        recovery_activated,
+        Arc::clone(&provider),
+        "consumer-three-voter-public-fenced",
+        Arc::clone(&journal),
+    )
+    .expect("recompose public facade after restart");
+    let before_status = fleet.application_sequences().await;
+    let status_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut recovered = recovery_facade
+        .recover_fenced_transition_status(
+            request_id,
+            PreparedCheckpointBudget::new(status_deadline, Duration::from_millis(100))
+                .expect("bounded public recovery budget"),
+        )
+        .await
+        .expect("public recovery opens the retained journal row")
+        .expect("committed response-loss row remains durable");
+    let status = recovered.status_until_terminal(status_deadline).await;
+    assert!(matches!(
+        status,
+        Ok(FencedTransitionStatus::Recorded(ref outcome)) if outcome.as_ref().is_ok()
+    ));
+    let status_counts = recovery_observers
+        .iter()
+        .map(|observer| observer.status_calls.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        1,
+        status_counts.iter().sum::<usize>(),
+        "recovered public handle performs one real durable receipt lookup"
+    );
+    assert_eq!(
+        0, status_counts[writer],
+        "receipt recovery begins at the successor of the actual ambiguous writer"
+    );
+    assert!(
+        recovery_observers
+            .iter()
+            .all(|observer| observer.transition_calls.load(Ordering::SeqCst) == 0),
+        "the recovered public handle cannot replay a mutation after restart"
+    );
+    assert_eq!(
+        before_status,
+        fleet.application_sequences().await,
+        "receipt-only recovery appends no second OpenRaft mutation"
+    );
+
+    drop(recovered);
+    drop(recovery_facade);
+    for server in recovery_servers {
+        server.abort_and_wait().await;
+    }
+    fleet.shutdown().await;
 }
 
 #[cfg(feature = "test-control")]
@@ -13530,17 +13834,25 @@ const PROTECTED_ROSTER_PROCESS_LOSS_PHASE_ENV: &str = "OPC_PROTECTED_ROSTER_PROC
 const PROTECTED_ROSTER_PROCESS_LOSS_STATE_ENV: &str = "OPC_PROTECTED_ROSTER_PROCESS_LOSS_STATE";
 #[cfg(feature = "test-control")]
 const PROTECTED_ROSTER_PROCESS_LOSS_TEST: &str =
-    "persistent_three_voter_protected_roster_survives_real_os_process_loss";
+    "stateless_quorum_consumer::persistent_three_voter_protected_roster_survives_real_os_process_loss";
 #[cfg(feature = "test-control")]
 fn install_protected_roster_process_loss_child_panic_hook() {
-    std::panic::set_hook(Box::new(|panic| match panic.location() {
-        Some(location) => eprintln!(
-            "process-loss child panic; test_source={}; line={}; column={}",
-            location.file().ends_with("stateless_quorum_consumer.rs"),
-            location.line(),
-            location.column(),
-        ),
-        None => eprintln!("process-loss child panic; location=unknown"),
+    std::panic::set_hook(Box::new(|panic| {
+        let message = panic
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        match panic.location() {
+            Some(location) => eprintln!(
+                "process-loss child panic; test_source={}; line={}; column={}; message={message}",
+                location.file().ends_with("stateless_quorum_consumer.rs"),
+                location.line(),
+                location.column(),
+            ),
+            None => eprintln!("process-loss child panic; location=unknown; message={message}"),
+        }
     }));
 }
 #[cfg(feature = "test-control")]
@@ -13830,12 +14142,6 @@ async fn acquire_protected_roster_process_loss_successor(
                 }
             }
         }
-        Err(_) => {
-            eprintln!(
-                "process-loss {phase} successor acquire failed; classification=unknown_error_variant"
-            );
-            panic!("process-loss {phase} successor acquire returned an unknown error variant");
-        }
     }
 }
 
@@ -13906,7 +14212,7 @@ impl ProtectedRosterProcessLossChild {
         // foreground cleanup can therefore always transfer ownership instead
         // of dropping an unreaped Child.
         let _ = protected_roster_process_loss_reaper(phase);
-        let child = Command::new(std::env::current_exe().expect("current integration-test binary"))
+        let child = Command::new(std::env::current_exe().expect("current test binary"))
             .arg("--exact")
             .arg(PROTECTED_ROSTER_PROCESS_LOSS_TEST)
             .arg("--nocapture")
@@ -15470,6 +15776,9 @@ async fn persistent_three_voter_protected_roster_survives_real_os_process_loss()
         }
         Some(_) => panic!("invalid protected-roster process-loss phase"),
         None => {
+            if !process_loss_fs_verity_available() {
+                return;
+            }
             // Child processes have their own process-local gate. Hold this
             // process's permit while orchestrating them so their real
             // three-voter snapshot workload cannot overlap another heavy

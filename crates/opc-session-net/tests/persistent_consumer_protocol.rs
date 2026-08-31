@@ -642,16 +642,30 @@ async fn accept_hello_and_call(
     (tls, call)
 }
 
+fn assert_typed_hello_error(
+    result: Result<BackendCapabilities, SessionConsumerClientError>,
+    expected: SessionConsumerClientError,
+    server_spiffe: &str,
+    client_spiffe: &str,
+) {
+    let error = result.expect_err("malicious peer must fail closed");
+    assert_eq!(error, expected);
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains(server_spiffe));
+    assert!(!rendered.contains(client_spiffe));
+}
+
 fn assert_typed_protocol_error(
     result: Result<BackendCapabilities, SessionConsumerClientError>,
     server_spiffe: &str,
     client_spiffe: &str,
 ) {
-    let error = result.expect_err("malicious peer must fail closed");
-    assert_eq!(error, SessionConsumerClientError::Protocol);
-    let rendered = format!("{error:?} {error}");
-    assert!(!rendered.contains(server_spiffe));
-    assert!(!rendered.contains(client_spiffe));
+    assert_typed_hello_error(
+        result,
+        SessionConsumerClientError::Protocol,
+        server_spiffe,
+        client_spiffe,
+    );
 }
 
 async fn assert_malicious_semantic_response_is_unconfirmed(
@@ -750,12 +764,18 @@ async fn assert_malicious_semantic_wire_response_is_unconfirmed(
 
 #[tokio::test]
 async fn hello_ack_v6_identity_mismatches_fail_closed_without_a_call() {
-    for wrong in [
-        "revision-five",
-        "scope",
-        "server-node-id",
-        "voter-count",
-        "roster-commitment",
+    for (wrong, expected) in [
+        ("revision-five", SessionConsumerClientError::Protocol),
+        ("scope", SessionConsumerClientError::Scope),
+        (
+            "server-node-id",
+            SessionConsumerClientError::AuthorityRevoked,
+        ),
+        ("voter-count", SessionConsumerClientError::AuthorityRevoked),
+        (
+            "roster-commitment",
+            SessionConsumerClientError::AuthorityRevoked,
+        ),
     ] {
         let pki = TestPki::new();
         let server_spiffe = spiffe(&format!("hello-{wrong}-server"));
@@ -799,7 +819,12 @@ async fn hello_ack_v6_identity_mismatches_fail_closed_without_a_call() {
             &client_spiffe,
             consumer_voter_fixture(1, &server_spiffe).authority,
         );
-        assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
+        assert_typed_hello_error(
+            client.capabilities().await,
+            expected,
+            &server_spiffe,
+            &client_spiffe,
+        );
         server.await.expect("malicious server");
     }
 }

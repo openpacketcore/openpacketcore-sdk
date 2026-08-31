@@ -1369,6 +1369,24 @@ where
 /// result returns [`StoreError::BackendOperationOutcomeUnavailable`]. No async
 /// wrapper may detach unbounded blocking work; a blocking adapter must use a
 /// bounded queue/worker set and retain ownership until the worker exits.
+///
+/// # V1 fenced-transition extension boundary
+///
+/// The V1 fenced-transition hooks remain implementable so a product can
+/// provide a complete local or independently transported store backend. Such
+/// an implementation owns its physical transport and recovery contract; it
+/// is not authority to lower an SDK-owned affine consumer handle. In
+/// particular, the authenticated session-consumer crate does not expose its
+/// physical V1 adapter, and its public one-voter clients reject the V1
+/// `FencedTransition` and `FencedTransitionStatus` wire operations before
+/// connection setup. The only SDK route to those consumer operations is its
+/// opaque activated exact-roster facade.
+///
+/// This distinction is necessary because Rust cannot grant only the net crate
+/// access to a public store extension trait. Applications that implement
+/// these hooks directly are trusted backend implementations and must not
+/// represent that composition as the consumer facade's all-voter, affine
+/// no-replay guarantee.
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
     /// Process-local instance root declared by this backend adapter.
@@ -1504,6 +1522,24 @@ pub trait SessionBackend: Send + Sync {
         _prepared: &PreparedFencedTransition,
     ) -> bool {
         false
+    }
+
+    /// Locally authenticate the exact protected V1 token before a consumer
+    /// reserves transport capacity for it.
+    ///
+    /// This is a deliberately narrow SDK-internal admission hook. The default
+    /// fails closed, and only SDK-owned sealing wrappers override it. An
+    /// override must validate the exact durable outer journal token and its
+    /// protection locally; it must not perform provider, capability, physical
+    /// backend, or transport I/O, and it must not expose an unprotected token.
+    /// Execute and status retain their own immediately-before-dispatch
+    /// validation as the final effect boundary.
+    #[doc(hidden)]
+    async fn preflight_protected_fenced_transition_token(
+        &self,
+        _prepared: &PreparedFencedTransition,
+    ) -> Result<(), StoreError> {
+        Err(unsupported_protected_fenced_transition())
     }
 
     /// Validate and retain the exact physical request that execute and status
@@ -1945,12 +1981,12 @@ fn protected_payload_scope_commitment(namespace: &str) -> Option<[u8; 32]> {
     Some(digest.finalize().into())
 }
 
-/// SDK-owned sealing boundary for protected session backends.
+/// SDK-owned sealing boundary for protected fenced transitions.
 ///
 /// This deliberately remains crate-private: product adapters compose under
 /// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`] instead of
 /// asserting their own payload-protection authority.
-pub(crate) mod protected_session_backend_seal {
+pub(crate) mod protected_fenced_transition_backend_seal {
     pub trait Sealed {
         fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]>;
     }
@@ -1962,19 +1998,50 @@ pub(crate) mod protected_session_backend_seal {
 /// This trait is sealed. Third-party stores compose underneath
 /// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`]; remote seal
 /// providers continue to compose through the latter wrapper. They cannot mint
-/// a protected selector authority by implementing this trait themselves.
+/// a protected fenced-transition authority by implementing this trait
+/// themselves.
+///
+/// The marker intentionally has no [`SessionBackend`] supertrait and no
+/// dispatchable-token accessor. A protected consumer must retain the physical
+/// backend privately; adding either capability here would let an external
+/// caller lower an affine, receipt-only recovery handle into a replayable
+/// physical transition.
 ///
 /// ```compile_fail
-/// use opc_session_store::ProtectedSessionBackend;
+/// use opc_session_store::ProtectedFencedTransitionBackend;
 ///
 /// struct ProductBackend;
 ///
 /// // Fails: the SDK-owned sealed supertrait is not externally nameable.
-/// impl ProtectedSessionBackend for ProductBackend {}
+/// impl ProtectedFencedTransitionBackend for ProductBackend {}
 /// ```
+///
+/// ```compile_fail
+/// use opc_session_store::{PreparedFencedTransition, ProtectedFencedTransitionBackend};
+///
+/// fn cannot_lower<B: ProtectedFencedTransitionBackend>(
+///     backend: &B,
+///     prepared: &PreparedFencedTransition,
+/// ) {
+///     let _ = backend.fenced_transition(prepared);
+/// }
+/// ```
+pub trait ProtectedFencedTransitionBackend:
+    protected_fenced_transition_backend_seal::Sealed
+{
+}
+
+/// Product-neutral proof that a backend supports the complete protected
+/// session-store surface, including lease authority and prepared CAS.
+///
+/// For the narrower authenticated-consumer fenced-transition composition use
+/// [`ProtectedFencedTransitionBackend`]. That boundary is a marker only:
+/// the net-owned affine consumer retains its physical [`SessionBackend`]
+/// privately, so it cannot be used to claim lease authority or lower an
+/// affine recovery handle into a replayable request.
 #[async_trait]
 pub trait ProtectedSessionBackend:
-    SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
+    ProtectedFencedTransitionBackend + SessionBackend + SessionLeaseManager
 {
     /// Create one caller-provided-ID affine acquire request before any
     /// physical mutation poll. Implementations are restricted to SDK sealing
@@ -2002,7 +2069,7 @@ pub trait ProtectedSessionBackend:
 
 pub(crate) fn protected_payload_scope_commitment_for<B>(backend: &B) -> Option<[u8; 32]>
 where
-    B: ProtectedSessionBackend + ?Sized,
+    B: ProtectedFencedTransitionBackend + ?Sized,
 {
     backend.protected_payload_scope_commitment()
 }
@@ -3064,6 +3131,24 @@ where
         }
     }
 
+    async fn preflight_protected_fenced_transition_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<(), StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
+    }
+
     async fn prepare_fenced_transition(
         &self,
         request: FencedTransitionRequest,
@@ -3759,14 +3844,22 @@ where
     }
 }
 
-impl<B, P> protected_session_backend_seal::Sealed for EncryptingSessionBackend<B, P>
+impl<B, P> protected_fenced_transition_backend_seal::Sealed for EncryptingSessionBackend<B, P>
 where
-    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    B: SessionBackend + ?Sized + 'static,
     P: KeyProvider + ?Sized + 'static,
 {
     fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
         protected_payload_scope_commitment(self.backend_namespace())
     }
+}
+
+#[async_trait]
+impl<B, P> ProtectedFencedTransitionBackend for EncryptingSessionBackend<B, P>
+where
+    B: SessionBackend + Send + Sync + ?Sized + 'static,
+    P: KeyProvider + Send + Sync + ?Sized + 'static,
+{
 }
 
 #[async_trait]
@@ -4141,6 +4234,24 @@ where
             }
             _ => Ok(None),
         }
+    }
+
+    async fn preflight_protected_fenced_transition_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<(), StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
     }
 
     async fn prepare_fenced_transition(
@@ -4836,14 +4947,22 @@ where
     }
 }
 
-impl<B, S> protected_session_backend_seal::Sealed for RemoteSealingSessionBackend<B, S>
+impl<B, S> protected_fenced_transition_backend_seal::Sealed for RemoteSealingSessionBackend<B, S>
 where
-    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    B: SessionBackend + ?Sized + 'static,
     S: RemoteSealProvider + ?Sized + 'static,
 {
     fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
         protected_payload_scope_commitment(self.backend_namespace())
     }
+}
+
+#[async_trait]
+impl<B, S> ProtectedFencedTransitionBackend for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + Send + Sync + ?Sized + 'static,
+    S: RemoteSealProvider + Send + Sync + ?Sized + 'static,
+{
 }
 
 #[async_trait]

@@ -985,8 +985,8 @@ async fn server_rejects_v6_hello_identity_mismatches_before_any_consumer_effect(
             "{mismatch} is rejected"
         );
         assert_eq!(
-            rejection["body"], "Unauthorized",
-            "identity mismatch is not admitted as a consumer"
+            rejection["body"], "TopologyMismatch",
+            "an exact-roster identity mismatch revokes topology authority before consumer admission"
         );
     }
     assert_eq!(

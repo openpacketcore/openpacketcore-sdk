@@ -295,6 +295,57 @@ separately scoped `FencedTransitionV2PreparedJournal` described in the
 session-store documentation; V2 transport does not create, substitute for, or
 fall back to that durable recovery boundary.
 
+`SessionConsumerPreparedFencedTransitionBackend` is the public protected V1
+prepared fenced-transition facade. Its
+`persistent_exact_voter_prewarm_roster` constructor consumes the complete set
+of same-authenticated-scope persistent clients, activates and prewarms every
+V1 physical voter internally, and returns an opaque roster value. Only the
+facade's local-AEAD and remote-sealing constructors can consume that value;
+neither a raw physical backend nor a dispatchable voter value leaves the net
+crate. Activation rejects an incomplete, duplicate, differently bound, or
+non-persistent roster and canonicalizes accepted voters by node ordinal; the
+caller's input order is not authority. For each request, the facade derives
+one deterministic origin from the authenticated scope, canonical roster, and
+caller-stable `FencedTransitionRequestId`. This is a router over the existing
+V1 `fenced_transition` operation, not V2 receipt-history authority, a V2
+journal, a quorum API, or an activation/readiness probe.
+
+`ProtectedFencedTransitionBackend` is a sealed, methodless marker; it does
+not have a `SessionBackend` supertrait. SDK-owned `EncryptingSessionBackend`
+and `RemoteSealingSessionBackend` implement it around inner types that
+separately implement `SessionBackend`. This lets the fenced router compose the real
+`SessionConsumerFencedTransitionBackend` without inventing lease authority.
+`SessionConsumerPreparedCheckpointBackend` remains the separate full
+protected-session composite for prepared CAS and lease operations, which do
+require `ProtectedSessionBackend` and its lease surface.
+
+`prepare_fenced_transition` keeps the exact outer protected journal token
+private in a move-only `SessionConsumerPreparedFencedTransition` handle. The
+sealed boundary never exposes a dispatchable physical prepared token; before
+each physical mutation or status attempt it revalidates the outer token and
+derives only the request view needed by the net-owned router. It never
+reconstructs a request or substitutes current provider/key state. Mutation
+visits canonical voters from its origin and may
+advance only after a proven pre-dispatch `NotTransmitted` result. While setup is
+still pre-dispatch, cancellation is safe and retryable because no application
+bytes can cross the transport boundary. Once dispatch starts, any possible send
+(`OutcomeUnknown`) or cancellation makes the affine handle permanently
+receipt-only; it can never dispatch the mutation again.
+An authenticated-scope `BeforeCallWrite` failure is topology revocation, not a
+rotatable `NotTransmitted` result, and terminalizes the handle.
+
+Receipt-only status is read-only. `status_once` uses the next deterministic
+successor voter, while `status_until_terminal` repeats bounded canonical-roster
+passes under the one immutable caller absolute deadline, with each physical
+attempt capped by the prepared physical-attempt budget. It may finish with a
+deadline rather than a terminal receipt; a `NotFound`, unavailable, or
+per-attempt deadline result remains nonterminal while outer budget remains.
+None of those outcomes proves that a delayed mutation cannot commit. A terminal
+receipt is cached locally. After restart,
+`recover_fenced_transition_status` returns only
+`SessionConsumerRecoveredFencedTransitionStatus`, which has receipt/status
+authority and deliberately no execution method.
+
 For a fenced transition, the public consumer request ID is byte-identical to
 the nested transition ID. The internal receipt ID is domain-separated by
 authenticated consumer identity, stable cluster identity, and that public ID;
