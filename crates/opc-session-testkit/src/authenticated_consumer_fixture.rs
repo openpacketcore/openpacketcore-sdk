@@ -1,9 +1,10 @@
 //! Production-shaped authenticated consumer fixture for downstream SDK tests.
 //!
 //! The fixture owns its OpenRaft voters, mTLS listeners, persistent clients,
-//! and prepared-request journal. Its only consumer-facing output is the
-//! opaque [`SessionConsumerPreparedFencedTransitionBackend`]; it deliberately
-//! exposes no physical client, backend, prepared token, or activated roster.
+//! and prepared-request journal. It offers either the opaque
+//! [`SessionConsumerPreparedFencedTransitionBackend`] or a paired, ordinary
+//! durable consumer view that shares its exact authority; neither route
+//! exposes a physical client, prepared token, or activated roster.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -12,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -21,17 +23,23 @@ use opc_identity::{
 use opc_key::KeyProvider;
 use opc_session_net::{
     PersistentSessionConsumerClient, PersistentSessionConsumerConfig, SessionConsumerAuthorizer,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError,
     SessionConsumerPreparedFencedTransitionBackend,
     SessionConsumerPreparedFencedTransitionBackendError, SessionQuorumConsumerServer,
     SessionQuorumConsumerServerHandle, StatelessSessionConsumerClient,
 };
 use opc_session_store::{
-    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant,
-    SessionConsumerAuthorizationGrantError, SessionConsumerChange, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerRoster,
+    BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
+    FencedTransitionExecuteError, FencedTransitionOutcome, FencedTransitionRequest, LeaseError,
+    LeaseGuard, OwnerId, PreparedCheckpointBudget, PreparedFencedTransitionJournal,
+    PreparedFencedTransitionJournalKey, RecordExpiryPreflight, RestoreScanCursorProfile,
+    RestoreScanPage, RestoreScanRequest, SessionBackend, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
+    SessionConsumerChange, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerRoster,
     SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerVoterAuthority,
-    SessionQuorumConsumer, StoreError,
+    SessionKey, SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer, StoreError,
+    StoredSessionRecord,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::SpiffeId;
@@ -63,13 +71,159 @@ pub enum AuthenticatedPreparedFencedTransitionFixtureError {
     Listener(#[from] io::Error),
 }
 
+/// Failure while advancing the fixture's real authoritative store through a
+/// caller-supplied successor transition.
+///
+/// This test-only control preserves the caller's exact request identity and
+/// immutable deadline budget. It never exposes a prepared token, client, or
+/// router and does not turn ambiguous delivery into a replay.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AuthenticatedPreparedFencedTransitionFixtureSuccessorError {
+    /// Constructing a fresh authenticated facade for this semantic test
+    /// control failed before the successor could be prepared.
+    #[error(transparent)]
+    Reopen(#[from] AuthenticatedPreparedFencedTransitionFixtureError),
+    /// The opaque facade rejected preparation before an authoritative
+    /// transition was dispatched.
+    #[error(transparent)]
+    Prepare(#[from] StoreError),
+    /// The one permitted opaque dispatch did not return a confirmed outcome.
+    #[error(transparent)]
+    Execute(#[from] FencedTransitionExecuteError),
+}
+
+/// Paired authenticated fixture composition for one product test process.
+///
+/// It owns no additional authority: its general encrypted consumer backend,
+/// opaque prepared-fenced facade, and facade reopener share the fixture's
+/// exact authenticated three-voter client fleet, prepared journal, and local
+/// sealing namespace. The physical clients, journal key, listener addresses,
+/// and any prepared token remain private.
+pub struct AuthenticatedPreparedFencedTransitionFixturePair<'fixture, P: ?Sized> {
+    general_backend: AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P>,
+    prepared_fenced_transition_facade: SessionConsumerPreparedFencedTransitionBackend,
+    facade_reopener: AuthenticatedPreparedFencedTransitionFacadeReopener<'fixture, P>,
+}
+
+impl<P: ?Sized> fmt::Debug for AuthenticatedPreparedFencedTransitionFixturePair<'_, P> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedPreparedFencedTransitionFixturePair(<redacted>)")
+    }
+}
+
+/// Reopen-only capability for a fresh opaque facade over an existing fixture
+/// journal.
+///
+/// This models a new product process. It can create a new facade connected to
+/// the same authenticated voters and sealed prepared journal, but never
+/// exposes a client, endpoint, router, journal credential, or raw prepared
+/// request.
+pub struct AuthenticatedPreparedFencedTransitionFacadeReopener<'fixture, P: ?Sized> {
+    fixture: &'fixture AuthenticatedPreparedFencedTransitionFixture,
+    provider: Arc<P>,
+    backend_namespace: Arc<str>,
+    journal: Arc<PreparedFencedTransitionJournal>,
+}
+
+impl<P: ?Sized> Clone for AuthenticatedPreparedFencedTransitionFacadeReopener<'_, P> {
+    fn clone(&self) -> Self {
+        Self {
+            fixture: self.fixture,
+            provider: Arc::clone(&self.provider),
+            backend_namespace: Arc::clone(&self.backend_namespace),
+            journal: Arc::clone(&self.journal),
+        }
+    }
+}
+
+impl<P: ?Sized> fmt::Debug for AuthenticatedPreparedFencedTransitionFacadeReopener<'_, P> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedPreparedFencedTransitionFacadeReopener(<redacted>)")
+    }
+}
+
+/// General encrypted durable consumer backend paired with the fixture's
+/// opaque prepared-fenced facade.
+///
+/// This is intentionally a normal [`SessionBackend`] plus
+/// [`SessionLeaseManager`] surface, so it satisfies
+/// [`opc_session_store::SessionStoreBackend`]. Its private client fleet is
+/// the exact same authenticated three-voter fleet used by the paired facade.
+/// V1/V2 fenced-transition entry points deliberately retain the trait's
+/// fail-closed defaults: only the opaque facade can prepare, dispatch, or
+/// reopen a prepared fenced transition.
+pub struct AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P: ?Sized> {
+    inner: Arc<EncryptingSessionBackend<FixtureGeneralConsumerBackend, P>>,
+    counters: Arc<FixtureGeneralConsumerCounters>,
+}
+
+impl<P: ?Sized> Clone for AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            counters: Arc::clone(&self.counters),
+        }
+    }
+}
+
+impl<P: ?Sized> fmt::Debug for AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("AuthenticatedPreparedFencedTransitionFixtureGeneralBackend(<redacted>)")
+    }
+}
+
+/// Private ordinary-operation mTLS port retained inside the paired general
+/// backend. Its three persistent clients share pools with the opaque facade;
+/// none is exposed by the public testkit API.
+#[derive(Clone)]
+struct FixtureGeneralConsumerBackend {
+    clients: Arc<[PersistentSessionConsumerClient]>,
+    next_client: Arc<AtomicUsize>,
+}
+
+impl FixtureGeneralConsumerBackend {
+    fn new(clients: Vec<PersistentSessionConsumerClient>) -> Self {
+        debug_assert_eq!(clients.len(), FIXTURE_VOTER_COUNT);
+        Self {
+            clients: Arc::from(clients),
+            next_client: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn client(&self) -> PersistentSessionConsumerClient {
+        let index = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        self.clients[index].clone()
+    }
+}
+
+#[derive(Default)]
+struct FixtureGeneralConsumerCounters {
+    mutations: AtomicUsize,
+    compare_and_set: AtomicUsize,
+}
+
+fn increment_fixture_counter(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
+impl fmt::Debug for FixtureGeneralConsumerBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FixtureGeneralConsumerBackend(<redacted>)")
+    }
+}
+
 /// A real three-voter authenticated consumer lab for downstream facade tests.
 ///
 /// This is test-support only, but it uses the same production constructors as
 /// an application: each listener receives a store-issued authorization
 /// manifest, each client uses mTLS plus a topology-issued voter authority,
 /// and the facade accepts only an opaque V1-prewarmed roster. The fixture
-/// owns every lower layer and returns only the affine facade.
+/// owns every lower layer and returns only an affine facade or a paired
+/// ordinary backend whose V1 transition methods fail closed.
 pub struct AuthenticatedPreparedFencedTransitionFixture {
     cluster: ConsensusTestCluster,
     roster: SessionConsumerRoster,
@@ -79,6 +233,7 @@ pub struct AuthenticatedPreparedFencedTransitionFixture {
     voters: Vec<FixtureVoter>,
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
+    general_consumer_counters: Arc<FixtureGeneralConsumerCounters>,
     listeners: Vec<SessionQuorumConsumerServerHandle>,
     _journal_directory: tempfile::TempDir,
     journal_path: PathBuf,
@@ -95,6 +250,8 @@ pub struct AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
     fenced_transition_calls: usize,
     fenced_transition_status_calls: usize,
     forced_fenced_transition_status_misses: usize,
+    general_mutation_calls: usize,
+    general_compare_and_set_calls: usize,
 }
 
 impl AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
@@ -116,11 +273,333 @@ impl AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
     pub const fn forced_fenced_transition_status_misses(self) -> usize {
         self.forced_fenced_transition_status_misses
     }
+
+    /// Number of ordinary general-backend mutation calls. This is separate
+    /// from the opaque V1 facade count so product tests can prove they did not
+    /// fall back to generic CAS/lease mutation during prepared recovery.
+    pub const fn general_mutation_calls(self) -> usize {
+        self.general_mutation_calls
+    }
+
+    /// Number of ordinary general-backend compare-and-set calls.
+    pub const fn general_compare_and_set_calls(self) -> usize {
+        self.general_compare_and_set_calls
+    }
 }
 
 impl fmt::Debug for AuthenticatedPreparedFencedTransitionFixture {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AuthenticatedPreparedFencedTransitionFixture(<redacted>)")
+    }
+}
+
+impl<'fixture, P> AuthenticatedPreparedFencedTransitionFixturePair<'fixture, P>
+where
+    P: KeyProvider + Send + Sync + 'static + ?Sized,
+{
+    /// Clone the paired general durable consumer backend.
+    ///
+    /// The clone shares the authenticated three-voter pools, local sealing
+    /// namespace, and ordinary-session authority with the facade held here.
+    #[must_use]
+    pub fn general_backend(&self) -> AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P> {
+        self.general_backend.clone()
+    }
+
+    /// Borrow the initial opaque prepared-fenced facade.
+    ///
+    /// Use [`Self::into_parts`] when the product test must take ownership of
+    /// the facade while retaining a fresh-process reopener.
+    #[must_use]
+    pub const fn prepared_fenced_transition_facade(
+        &self,
+    ) -> &SessionConsumerPreparedFencedTransitionBackend {
+        &self.prepared_fenced_transition_facade
+    }
+
+    /// Clone the reopener for a simulated fresh product process.
+    #[must_use]
+    pub fn facade_reopener(
+        &self,
+    ) -> AuthenticatedPreparedFencedTransitionFacadeReopener<'fixture, P> {
+        self.facade_reopener.clone()
+    }
+
+    /// Separate the paired general backend, initial facade, and reopener.
+    ///
+    /// This is the intended product-test composition boundary. The returned
+    /// values share one underlying voter authority and journal/sealing scope;
+    /// none reveals lower-level transport or prepared-request material.
+    pub fn into_parts(
+        self,
+    ) -> (
+        AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P>,
+        SessionConsumerPreparedFencedTransitionBackend,
+        AuthenticatedPreparedFencedTransitionFacadeReopener<'fixture, P>,
+    ) {
+        (
+            self.general_backend,
+            self.prepared_fenced_transition_facade,
+            self.facade_reopener,
+        )
+    }
+}
+
+impl<'fixture, P> AuthenticatedPreparedFencedTransitionFacadeReopener<'fixture, P>
+where
+    P: KeyProvider + Send + Sync + 'static + ?Sized,
+{
+    /// Open a fresh opaque facade over the same authenticated voters and
+    /// durable prepared-request journal.
+    ///
+    /// The resulting facade has no dispatch authority for a request prepared
+    /// by a prior facade. Recovery remains receipt-only through the exact
+    /// caller-owned transition identity.
+    pub async fn reopen_prepared_fenced_transition_facade(
+        &self,
+    ) -> Result<
+        SessionConsumerPreparedFencedTransitionBackend,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    > {
+        self.fixture
+            .open_local_aead_from_clients(
+                self.fixture.persistent_clients()?,
+                Arc::clone(&self.provider),
+                self.backend_namespace.to_string(),
+                Arc::clone(&self.journal),
+            )
+            .await
+    }
+
+    /// Advance the fixture's real authority through one caller-supplied
+    /// successor transition.
+    ///
+    /// This semantic test control prepares and dispatches exactly once through
+    /// a fresh opaque facade. It preserves the request's stable identity and
+    /// caller-owned absolute deadline; an ambiguous outcome is returned as-is
+    /// and is never replayed or replaced with a new identity.
+    pub async fn advance_authoritative_successor(
+        &self,
+        request: FencedTransitionRequest,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<FencedTransitionOutcome, AuthenticatedPreparedFencedTransitionFixtureSuccessorError>
+    {
+        let deadline = budget.original_deadline();
+        let facade =
+            tokio::time::timeout_at(deadline, self.reopen_prepared_fenced_transition_facade())
+                .await
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "authenticated fixture successor deadline elapsed before dispatch".into(),
+                    )
+                })??;
+        let mut prepared = facade.prepare_fenced_transition(request, budget).await?;
+        Ok(prepared.execute_once().await?)
+    }
+}
+
+#[async_trait]
+impl<P> SessionBackend for AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P>
+where
+    P: KeyProvider + Send + Sync + 'static + ?Sized,
+{
+    fn restore_scan_cursor_profile(&self) -> Option<RestoreScanCursorProfile> {
+        self.inner.restore_scan_cursor_profile()
+    }
+
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.inner.preflight_record_expiry(preflights).await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        increment_fixture_counter(&self.counters.mutations);
+        increment_fixture_counter(&self.counters.compare_and_set);
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
+        increment_fixture_counter(&self.counters.mutations);
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        increment_fixture_counter(&self.counters.mutations);
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        if ops.iter().any(|op| !matches!(op, SessionOp::Get { .. })) {
+            increment_fixture_counter(&self.counters.mutations);
+        }
+        self.inner.batch(ops).await
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        self.inner.scan_restore_records(request).await
+    }
+}
+
+#[async_trait]
+impl<P> SessionLeaseManager for AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<P>
+where
+    P: KeyProvider + Send + Sync + 'static + ?Sized,
+{
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, LeaseError> {
+        increment_fixture_counter(&self.counters.mutations);
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        increment_fixture_counter(&self.counters.mutations);
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
+        increment_fixture_counter(&self.counters.mutations);
+        self.inner.release(lease).await
+    }
+}
+
+#[async_trait]
+impl SessionBackend for FixtureGeneralConsumerBackend {
+    fn restore_scan_cursor_profile(&self) -> Option<RestoreScanCursorProfile> {
+        Some(RestoreScanCursorProfile::DurableOpaqueV1)
+    }
+
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.client()
+            .capabilities()
+            .await
+            .unwrap_or_else(|_| BackendCapabilities::minimal())
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.client()
+            .preflight_record_expiry(preflights.to_vec())
+            .await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.client().get(key.clone()).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.client()
+            .compare_and_set_with_id(SessionConsumerRequestId::new(), &op)
+            .await
+            .map_err(fixture_mutation_error)
+    }
+
+    async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
+        self.client()
+            .delete_fenced_with_id(SessionConsumerRequestId::new(), lease)
+            .await
+            .map_err(fixture_mutation_error)
+    }
+
+    async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        self.client()
+            .refresh_ttl_with_id(SessionConsumerRequestId::new(), lease, ttl)
+            .await
+            .map_err(fixture_mutation_error)
+    }
+
+    async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        self.client()
+            .batch_with_id(SessionConsumerRequestId::new(), &ops)
+            .await
+            .map_err(fixture_mutation_error)
+    }
+
+    async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        self.client().scan_restore_records(request).await
+    }
+}
+
+#[async_trait]
+impl SessionLeaseManager for FixtureGeneralConsumerBackend {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, LeaseError> {
+        self.client()
+            .acquire_with_id(SessionConsumerRequestId::new(), key, &owner, ttl)
+            .await
+            .map_err(fixture_lease_mutation_error)
+    }
+
+    async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        self.client()
+            .renew_with_id(SessionConsumerRequestId::new(), lease, ttl)
+            .await
+            .map_err(fixture_lease_mutation_error)
+    }
+
+    async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
+        self.client()
+            .release_with_id(SessionConsumerRequestId::new(), &lease)
+            .await
+            .map_err(fixture_lease_mutation_error)
+    }
+}
+
+fn fixture_mutation_error(error: SessionConsumerMutationError) -> StoreError {
+    match error {
+        SessionConsumerMutationError::Store(error) => error,
+        // Keep fixture diagnostics/error surfaces nonidentifying.  The typed
+        // error has already established the no-frame-write classification;
+        // exposing its transport detail would add no recovery value here.
+        SessionConsumerMutationError::NotTransmitted { .. } => StoreError::BackendUnavailable(
+            "authenticated fixture general mutation was not transmitted".into(),
+        ),
+        SessionConsumerMutationError::OutcomeUnknown { .. } => {
+            StoreError::FencedTransitionOutcomeUnknown
+        }
+        _ => StoreError::BackendUnavailable(
+            "authenticated fixture general mutation unavailable".into(),
+        ),
+    }
+}
+
+fn fixture_lease_mutation_error(error: SessionConsumerLeaseMutationError) -> LeaseError {
+    match error {
+        SessionConsumerLeaseMutationError::Lease(error) => error,
+        // See `fixture_mutation_error`: retain the classification without
+        // surfacing transport details from the authenticated client.
+        SessionConsumerLeaseMutationError::NotTransmitted { .. } => {
+            LeaseError::Backend("authenticated fixture general lease was not transmitted".into())
+        }
+        SessionConsumerLeaseMutationError::OutcomeUnknown { .. } => {
+            LeaseError::OperationOutcomeUnavailable
+        }
+        _ => LeaseError::Backend("authenticated fixture general lease unavailable".into()),
     }
 }
 
@@ -144,6 +623,7 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         let client_config = pki.client_config(FIXTURE_CLIENT_SPIFFE);
         let lose_next_fenced_transition_response = Arc::new(AtomicBool::new(false));
         let fenced_transition_status_misses_remaining = Arc::new(AtomicUsize::new(0));
+        let general_consumer_counters = Arc::new(FixtureGeneralConsumerCounters::default());
 
         let store_indexes = (0..FIXTURE_VOTER_COUNT)
             .map(|index| (cluster.store(index).status().node_id, index))
@@ -197,6 +677,7 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             voters,
             lose_next_fenced_transition_response,
             fenced_transition_status_misses_remaining,
+            general_consumer_counters,
             listeners,
             _journal_directory: journal_directory,
             journal_path,
@@ -222,8 +703,87 @@ impl AuthenticatedPreparedFencedTransitionFixture {
     where
         P: KeyProvider + Send + Sync + 'static + ?Sized,
     {
-        let clients = self
-            .voters
+        self.open_local_aead_from_clients(
+            self.persistent_clients()?,
+            provider,
+            backend_namespace,
+            self.open_journal()?,
+        )
+        .await
+    }
+
+    /// Construct a paired ordinary durable backend and opaque prepared-fenced
+    /// facade over the same authenticated three-voter authority.
+    ///
+    /// `into_parts` yields the ordinary backend, the initial affine facade,
+    /// and a reopen-only capability for a simulated fresh process. All three
+    /// share this fixture's exact journal path/key and local-AEAD namespace;
+    /// no method reveals a client, a voter address, an activated roster, or a
+    /// prepared transition token.
+    pub async fn open_local_aead_pair<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+    ) -> Result<
+        AuthenticatedPreparedFencedTransitionFixturePair<'_, P>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        let backend_namespace: Arc<str> = Arc::from(backend_namespace.into());
+        let clients = self.persistent_clients()?;
+        let journal = self.open_journal()?;
+        let prepared_fenced_transition_facade = self
+            .open_local_aead_from_clients(
+                clients.clone(),
+                Arc::clone(&provider),
+                backend_namespace.to_string(),
+                Arc::clone(&journal),
+            )
+            .await?;
+        let general_backend = AuthenticatedPreparedFencedTransitionFixtureGeneralBackend {
+            inner: Arc::new(
+                EncryptingSessionBackend::new(
+                    Arc::new(FixtureGeneralConsumerBackend::new(clients)),
+                    Arc::clone(&provider),
+                    backend_namespace.to_string(),
+                )
+                .with_fenced_transition_journal(Arc::clone(&journal)),
+            ),
+            counters: Arc::clone(&self.general_consumer_counters),
+        };
+        Ok(AuthenticatedPreparedFencedTransitionFixturePair {
+            general_backend,
+            prepared_fenced_transition_facade,
+            facade_reopener: AuthenticatedPreparedFencedTransitionFacadeReopener {
+                fixture: self,
+                provider,
+                backend_namespace,
+                journal,
+            },
+        })
+    }
+
+    fn open_journal(
+        &self,
+    ) -> Result<
+        Arc<PreparedFencedTransitionJournal>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    > {
+        Ok(Arc::new(PreparedFencedTransitionJournal::open_existing(
+            &self.journal_path,
+            self.journal_key.clone(),
+        )?))
+    }
+
+    fn persistent_clients(
+        &self,
+    ) -> Result<
+        Vec<PersistentSessionConsumerClient>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    > {
+        self.voters
             .iter()
             .map(|voter| {
                 PersistentSessionConsumerClient::try_from_stateless(
@@ -236,16 +796,28 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                     PersistentSessionConsumerConfig::default(),
                 )
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AuthenticatedPreparedFencedTransitionFixtureError::PersistentClient)
+    }
+
+    async fn open_local_aead_from_clients<P>(
+        &self,
+        clients: Vec<PersistentSessionConsumerClient>,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+        journal: Arc<PreparedFencedTransitionJournal>,
+    ) -> Result<
+        SessionConsumerPreparedFencedTransitionBackend,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
         let activated =
             SessionConsumerPreparedFencedTransitionBackend::persistent_exact_voter_prewarm_roster(
                 clients,
             )
             .await?;
-        let journal = Arc::new(PreparedFencedTransitionJournal::open_existing(
-            &self.journal_path,
-            self.journal_key.clone(),
-        )?);
         Ok(
             SessionConsumerPreparedFencedTransitionBackend::persistent_encrypting(
                 activated,
@@ -308,6 +880,14 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                         .load(Ordering::SeqCst)
                 })
                 .sum(),
+            general_mutation_calls: self
+                .general_consumer_counters
+                .mutations
+                .load(Ordering::SeqCst),
+            general_compare_and_set_calls: self
+                .general_consumer_counters
+                .compare_and_set
+                .load(Ordering::SeqCst),
         }
     }
 
@@ -579,18 +1159,22 @@ mod tests {
         provider
     }
 
-    fn fixture_request(
-        request_id: FencedTransitionRequestId,
-        tenant: TenantId,
-    ) -> FencedTransitionRequest {
-        let key = SessionKey {
+    fn fixture_key(tenant: TenantId) -> SessionKey {
+        SessionKey {
             tenant,
             nf_kind: NetworkFunctionKind::smf(),
             key_type: SessionKeyType::PduSession,
             stable_id: Bytes::from_static(b"prepared-fenced-fixture-session")
                 .try_into()
                 .expect("fixture stable session ID"),
-        };
+        }
+    }
+
+    fn fixture_request(
+        request_id: FencedTransitionRequestId,
+        tenant: TenantId,
+    ) -> FencedTransitionRequest {
+        let key = fixture_key(tenant);
         let owner = OwnerId::new("prepared-fenced-fixture-owner").expect("fixture owner");
         let lease = FencedTransitionLease::acquire(
             key.clone(),
@@ -619,6 +1203,146 @@ mod tests {
     fn fixture_budget(deadline: tokio::time::Instant) -> PreparedCheckpointBudget {
         PreparedCheckpointBudget::new(deadline, Duration::from_millis(250))
             .expect("fixture immutable request budget")
+    }
+
+    fn assert_session_store_backend<T: opc_session_store::SessionStoreBackend>() {}
+
+    #[tokio::test]
+    async fn fixture_general_fallback_counters_cover_public_preflight_and_sealing_failures() {
+        let tenant = fixture_tenant();
+        let fixture =
+            AuthenticatedPreparedFencedTransitionFixture::start([fixture_scope(tenant.clone())])
+                .await
+                .expect("start authenticated three-voter fixture");
+        let provider = Arc::new(MemoryKeyProvider::new());
+        let pair = fixture
+            .open_local_aead_pair(provider, "fixture-fallback-accounting")
+            .await
+            .expect("compose paired authenticated fixture authority");
+        let (general, _facade, _reopener) = pair.into_parts();
+        let key = fixture_key(tenant);
+        let owner = OwnerId::new("fixture-fallback-accounting-owner").expect("fixture owner");
+        let lease = general
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .expect("seed one general lease");
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 1);
+
+        assert_eq!(
+            general
+                .renew(&lease, Duration::MAX)
+                .await
+                .expect_err("invalid TTL must fail before the physical backend"),
+            LeaseError::InvalidSessionTtl
+        );
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 2);
+
+        let fence = lease.fence();
+        let error = general
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: StoredSessionRecord {
+                    key: key.clone(),
+                    generation: Generation::new(1),
+                    owner,
+                    fence,
+                    state_class: StateClass::AuthoritativeSession,
+                    state_type: StateType::from_static("fixture-fallback-accounting"),
+                    expires_at: None,
+                    payload: EncryptedSessionPayload::new([0x2c]),
+                },
+            })
+            .await
+            .expect_err("missing local seal key must fail before physical CAS dispatch");
+        assert!(matches!(error, StoreError::Crypto(_)));
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 3);
+        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 1);
+
+        general
+            .batch(vec![SessionOp::Get { key }])
+            .await
+            .expect("read-only batch remains ordinary read traffic");
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 3);
+        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn fixture_pair_shares_authenticated_authority_and_reopens_without_v1_lowering() {
+        let tenant = fixture_tenant();
+        let provider = fixture_provider(tenant.clone());
+        let fixture =
+            AuthenticatedPreparedFencedTransitionFixture::start([fixture_scope(tenant.clone())])
+                .await
+                .expect("start authenticated three-voter fixture");
+        let pair = fixture
+            .open_local_aead_pair(Arc::clone(&provider), "fixture-paired-authority")
+            .await
+            .expect("compose paired authenticated fixture authority");
+        assert_session_store_backend::<
+            AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<MemoryKeyProvider>,
+        >();
+        let (general, facade, reopener) = pair.into_parts();
+        let request_id = FencedTransitionRequestId::from_bytes([0x30; 16]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = facade
+            .prepare_fenced_transition(
+                fixture_request(request_id, tenant.clone()),
+                fixture_budget(deadline),
+            )
+            .await
+            .expect("prepare through the initial opaque facade");
+        prepared
+            .execute_once()
+            .await
+            .expect("the opaque facade commits through the shared authority");
+
+        let record = general
+            .get(&fixture_key(tenant))
+            .await
+            .expect("the paired general mTLS backend reads the same authority")
+            .expect("the opaque facade committed the authoritative record");
+        assert_eq!(record.generation, Generation::new(1));
+        assert_eq!(
+            general
+                .fenced_transition_capability()
+                .await
+                .expect("general backend reports its fail-closed V1 capability"),
+            None,
+            "the paired general backend cannot lower the opaque V1 route"
+        );
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
+        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 0);
+
+        drop(prepared);
+        drop(facade);
+        let reopened = reopener
+            .reopen_prepared_fenced_transition_facade()
+            .await
+            .expect("a fresh process facade reopens the same journal");
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut recovered = reopened
+            .recover_fenced_transition_status(request_id, fixture_budget(recovery_deadline))
+            .await
+            .expect("recover exact retained transition identity")
+            .expect("the paired facade journal retains the prepared identity");
+        let receipt = recovered
+            .status_until_terminal(recovery_deadline)
+            .await
+            .expect("fresh facade recovery is status-only");
+        assert!(matches!(receipt, FencedTransitionStatus::Recorded(result) if result.is_ok()));
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_calls(),
+            1,
+            "recovery on the fresh facade never replays the original mutation"
+        );
+
+        drop(recovered);
+        drop(reopened);
+        drop(reopener);
+        drop(general);
+        fixture.shutdown().await.expect("shut down fixture");
     }
 
     #[tokio::test]

@@ -1414,6 +1414,30 @@ pub struct PersistentSessionConsumerDiagnostics {
     pub scope: u64,
     pub protocol: u64,
     pub deadline: u64,
+    /// Coherent count of completed physical operations classified at the
+    /// persistent-client effect boundary.
+    ///
+    /// The six `completed_operation_*` fields below are captured under one
+    /// lock. The four class fields are mutually exclusive and always sum to
+    /// this total in a single snapshot; `unsafe_failures` is their direct
+    /// overlapping safety aggregate. Admission decisions must use these
+    /// fields rather than subtracting the legacy, independently sampled error
+    /// counters above.
+    pub completed_operations: u64,
+    /// Completed physical operations with a confirmed response.
+    pub completed_operation_successes: u64,
+    /// Completed operations proven not to have written an application frame.
+    pub completed_operation_not_transmitted: u64,
+    /// Effectful operations whose application frame may have been written.
+    pub completed_operation_outcome_unknown: u64,
+    /// Completed operations that were neither successful, proven-unsent, nor
+    /// effect-ambiguous (for example a confirmed rejection or a read failure
+    /// after an application frame).
+    pub completed_operation_other_failures: u64,
+    /// Completed failure outcomes unsafe for a caller to treat as
+    /// conclusively unsent.  This is a direct counter, not a difference of
+    /// overlapping diagnostic fields.
+    pub completed_operation_unsafe_failures: u64,
 }
 
 /// Conservative transport-capacity readiness only.
@@ -3873,20 +3897,25 @@ fn response_is_outcome_unknown(
 /// though the authenticated lane can often be reused safely.
 fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
     match response {
-        SessionConsumerResponse::FencedTransition(Err(_))
+        SessionConsumerResponse::FencedTransitionCapability(Err(_))
+        | SessionConsumerResponse::FencedTransition(Err(_))
         | SessionConsumerResponse::Get(Err(_))
         | SessionConsumerResponse::ObserveFencedTransition(Err(_))
         | SessionConsumerResponse::FencedTransitionStatus(Err(_))
+        | SessionConsumerResponse::LeaseMutationStatus(Err(_))
+        | SessionConsumerResponse::CompareAndSetStatus(Err(_))
         | SessionConsumerResponse::PreflightRecordExpiry(Err(_))
         | SessionConsumerResponse::CompareAndSet(Err(_))
         | SessionConsumerResponse::DeleteFenced(Err(_))
         | SessionConsumerResponse::RefreshTtl(Err(_))
         | SessionConsumerResponse::ScanRestoreRecords(Err(_)) => true,
         SessionConsumerResponse::FencedMutationRosterPollAdmit(
-            SessionConsumerRosterAdmissionMutationResponse::Rejected(_),
+            SessionConsumerRosterAdmissionMutationResponse::NotTransmitted
+            | SessionConsumerRosterAdmissionMutationResponse::Rejected(_),
         )
         | SessionConsumerResponse::FencedMutationRosterTerminalize(
-            SessionConsumerRosterTerminalMutationResponse::Rejected(_),
+            SessionConsumerRosterTerminalMutationResponse::NotTransmitted
+            | SessionConsumerRosterTerminalMutationResponse::Rejected(_),
         )
         | SessionConsumerResponse::FencedMutationRosterAdmissionStatus(
             SessionConsumerRosterAdmissionReadResponse::Rejected(_),
@@ -3910,11 +3939,32 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
         SessionConsumerResponse::AcquireLease(Err(_))
         | SessionConsumerResponse::RenewLease(Err(_))
         | SessionConsumerResponse::ReleaseLease(Err(_)) => true,
+        SessionConsumerResponse::LeaseMutationStatus(Ok(
+            SessionConsumerLeaseMutationStatus::Recorded(result),
+        )) => result.is_err(),
+        SessionConsumerResponse::CompareAndSetStatus(Ok(
+            SessionConsumerCompareAndSetStatus::Recorded(
+                SessionConsumerCompareAndSetReceiptOutcome::Rejected(_),
+            ),
+        )) => true,
         SessionConsumerResponse::FencedTransitionStatus(Ok(
             SessionConsumerFencedTransitionStatus::Recorded(result),
         )) => result.is_err(),
         SessionConsumerResponse::Rejected(_) => true,
         _ => false,
+    }
+}
+
+fn completed_operation_class(
+    operation: &SessionConsumerOperation,
+    response: &SessionConsumerResponse,
+) -> PersistentCompletedOperationClass {
+    if response_is_outcome_unknown(operation, response) {
+        PersistentCompletedOperationClass::OutcomeUnknown
+    } else if response_is_known_failure(response) {
+        PersistentCompletedOperationClass::OtherFailure
+    } else {
+        PersistentCompletedOperationClass::Success
     }
 }
 
@@ -9423,6 +9473,57 @@ async fn reconnect_persistent_consumer_watch(
     Err(last_error)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PersistentCompletedOperationClass {
+    #[default]
+    Success,
+    NotTransmitted,
+    OutcomeUnknown,
+    OtherFailure,
+}
+
+/// One coherent, mutually exclusive completed-operation snapshot.
+///
+/// The legacy pool counters intentionally retain their individual low-cost
+/// atomics for observability. They cannot safely be combined to decide
+/// whether a call may have crossed its effect boundary, so this small
+/// separately locked accounting record is the authoritative public summary
+/// for that decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PersistentCompletedOperationCounters {
+    total: u64,
+    successes: u64,
+    not_transmitted: u64,
+    outcome_unknown: u64,
+    other_failures: u64,
+    unsafe_failures: u64,
+}
+
+impl PersistentCompletedOperationCounters {
+    fn record(&mut self, class: PersistentCompletedOperationClass) {
+        if self.total == u64::MAX {
+            return;
+        }
+        self.total = self.total.saturating_add(1);
+        match class {
+            PersistentCompletedOperationClass::Success => {
+                self.successes = self.successes.saturating_add(1);
+            }
+            PersistentCompletedOperationClass::NotTransmitted => {
+                self.not_transmitted = self.not_transmitted.saturating_add(1);
+            }
+            PersistentCompletedOperationClass::OutcomeUnknown => {
+                self.outcome_unknown = self.outcome_unknown.saturating_add(1);
+                self.unsafe_failures = self.unsafe_failures.saturating_add(1);
+            }
+            PersistentCompletedOperationClass::OtherFailure => {
+                self.other_failures = self.other_failures.saturating_add(1);
+                self.unsafe_failures = self.unsafe_failures.saturating_add(1);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct PersistentConsumerCounters {
     setup_attempts: AtomicU64,
@@ -9460,6 +9561,7 @@ struct PersistentConsumerCounters {
     scope: AtomicU64,
     protocol: AtomicU64,
     deadline: AtomicU64,
+    completed_operations: StdMutex<PersistentCompletedOperationCounters>,
 }
 
 /// Redaction-safe revision-5 V2 lane counters. V1 and V2 retain distinct
@@ -12500,8 +12602,15 @@ impl Drop for PersistentCallOutcome<'_> {
             .record_failure(SessionConsumerClientError::Unavailable);
         if self.write_progress.accepted_any() && self.effectful {
             counter_increment(&self.pool.counters.outcome_unknown);
+            self.pool
+                .record_completed_operation(PersistentCompletedOperationClass::OutcomeUnknown);
         } else if !self.write_progress.accepted_any() {
             counter_increment(&self.pool.counters.not_transmitted);
+            self.pool
+                .record_completed_operation(PersistentCompletedOperationClass::NotTransmitted);
+        } else {
+            self.pool
+                .record_completed_operation(PersistentCompletedOperationClass::OtherFailure);
         }
     }
 }
@@ -13083,6 +13192,14 @@ impl PersistentSessionConsumerPool {
         }
     }
 
+    fn record_completed_operation(&self, class: PersistentCompletedOperationClass) {
+        self.counters
+            .completed_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(class);
+    }
+
     fn record_error(
         &self,
         error: SessionConsumerClientError,
@@ -13092,8 +13209,12 @@ impl PersistentSessionConsumerPool {
         self.record_failure(error);
         if may_have_sent && effectful {
             counter_increment(&self.counters.outcome_unknown);
+            self.record_completed_operation(PersistentCompletedOperationClass::OutcomeUnknown);
         } else if !may_have_sent {
             counter_increment(&self.counters.not_transmitted);
+            self.record_completed_operation(PersistentCompletedOperationClass::NotTransmitted);
+        } else {
+            self.record_completed_operation(PersistentCompletedOperationClass::OtherFailure);
         }
     }
 
@@ -13623,6 +13744,11 @@ impl PersistentSessionConsumerPool {
 
     fn snapshot(&self, idle: u64) -> PersistentSessionConsumerDiagnostics {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let completed_operations = *self
+            .counters
+            .completed_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = tokio::time::Instant::now();
         let pool_wait_oldest_age_millis = self
             .wait_started
@@ -13671,6 +13797,12 @@ impl PersistentSessionConsumerPool {
             scope: load(&self.counters.scope),
             protocol: load(&self.counters.protocol),
             deadline: load(&self.counters.deadline),
+            completed_operations: completed_operations.total,
+            completed_operation_successes: completed_operations.successes,
+            completed_operation_not_transmitted: completed_operations.not_transmitted,
+            completed_operation_outcome_unknown: completed_operations.outcome_unknown,
+            completed_operation_other_failures: completed_operations.other_failures,
+            completed_operation_unsafe_failures: completed_operations.unsafe_failures,
         }
     }
 }
@@ -14321,6 +14453,11 @@ impl PersistentSessionConsumerClient {
         if consumer_operation_requires_roster_capability(request.operation())
             || consumer_operation_requires_affine_fenced_transition_route(request.operation())
         {
+            self.pool.record_error(
+                SessionConsumerClientError::Protocol,
+                false,
+                consumer_operation_is_effectful(request.operation()),
+            );
             return Err(PersistentSessionConsumerExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
@@ -14541,6 +14678,11 @@ impl PersistentSessionConsumerClient {
         // before its safe read-only reconnect can even acquire a lane.
         let started = tokio::time::Instant::now();
         if started >= deadline {
+            self.pool.record_error(
+                SessionConsumerClientError::Deadline,
+                false,
+                consumer_operation_is_effectful(request.operation()),
+            );
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Deadline,
             ));
@@ -14638,6 +14780,8 @@ impl PersistentSessionConsumerClient {
                         counter_increment(&self.pool.counters.successes);
                     }
                 }
+                let completed_class = completed_operation_class(request.operation(), &response);
+                self.pool.record_completed_operation(completed_class);
                 Ok(response)
             }
             Err(error) => {
@@ -14671,6 +14815,11 @@ impl PersistentSessionConsumerClient {
         if started >= deadline {
             drop(activity);
             drop(admission);
+            self.pool.record_error(
+                SessionConsumerClientError::Deadline,
+                false,
+                consumer_operation_is_effectful(request.operation()),
+            );
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Deadline,
             ));
@@ -14686,6 +14835,11 @@ impl PersistentSessionConsumerClient {
         {
             drop(activity);
             drop(admission);
+            self.pool.record_error(
+                SessionConsumerClientError::Protocol,
+                false,
+                consumer_operation_is_effectful(request.operation()),
+            );
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Protocol,
             ));
@@ -14745,6 +14899,8 @@ impl PersistentSessionConsumerClient {
                         counter_increment(&self.pool.counters.successes);
                     }
                 }
+                let completed_class = completed_operation_class(request.operation(), &response);
+                self.pool.record_completed_operation(completed_class);
                 Ok(response)
             }
             Err(error) => {
@@ -15342,6 +15498,8 @@ impl PersistentSessionConsumerClient {
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
         let _ = start_sequence;
+        self.pool
+            .record_error(SessionConsumerClientError::Unsupported, false, false);
         Err(consumer_watch_unsupported_store_error())
     }
 
@@ -20622,7 +20780,7 @@ mod tests {
     use super::{
         authenticated_consumer_binding, classify_call_write_error,
         classify_prepared_lease_acquire_error, classify_prepared_lease_acquire_rejection,
-        complete_before_deadline, consumer_connection_current,
+        complete_before_deadline, completed_operation_class, consumer_connection_current,
         consumer_execute_into_fenced_transition, consumer_fenced_transition_request_id,
         consumer_fresh_admission_is_current, consumer_hello_rejection,
         consumer_operation_is_effectful, consumer_payload_fragments_exceed_frame,
@@ -20654,12 +20812,14 @@ mod tests {
         ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2CallResponse, ConsumerV2WireRequest,
         ConsumerV2WireResponse, ConsumerVoterBinding, ConsumerWatchTerminal,
         ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
-        PersistentCapacityAdmission, PersistentCheckedOutConnection, PersistentConsumerCounters,
-        PersistentConsumerIoBarrier, PersistentConsumerReconnectControl,
-        PersistentConsumerShutdownIo, PersistentConsumerShutdownReader,
-        PersistentConsumerShutdownWriter, PersistentPreparedCompareAndSetToken,
-        PersistentPreparedFencedTransitionToken, PersistentPreparedLeaseAcquireToken,
-        PersistentReconnectSetup, PersistentRetainedRequestLane, PersistentRosterExecuteError,
+        PersistentCapacityAdmission, PersistentCheckedOutConnection,
+        PersistentCompletedOperationClass, PersistentCompletedOperationCounters,
+        PersistentConsumerCounters, PersistentConsumerIoBarrier,
+        PersistentConsumerReconnectControl, PersistentConsumerShutdownIo,
+        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
+        PersistentPreparedCompareAndSetToken, PersistentPreparedFencedTransitionToken,
+        PersistentPreparedLeaseAcquireToken, PersistentReconnectSetup,
+        PersistentRetainedRequestLane, PersistentRosterExecuteError,
         PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
         PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
         PersistentSessionConsumerV2ExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
@@ -20674,9 +20834,11 @@ mod tests {
         SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
         SessionConsumerPreparedFencedTransitionBackend,
         SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerRejection,
-        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
-        DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
-        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        SessionConsumerRosterAdmissionMutationResponse,
+        SessionConsumerRosterTerminalMutationResponse, SessionQuorumConsumer,
+        SessionQuorumConsumerServer, StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -20865,10 +21027,18 @@ mod tests {
             );
         }
 
+        let mut expected = persistent_before;
+        expected.failures = expected.failures.saturating_add(2);
+        expected.not_transmitted = expected.not_transmitted.saturating_add(2);
+        expected.protocol = expected.protocol.saturating_add(2);
+        expected.completed_operations = expected.completed_operations.saturating_add(2);
+        expected.completed_operation_not_transmitted = expected
+            .completed_operation_not_transmitted
+            .saturating_add(2);
         assert_eq!(
             persistent.diagnostics().await,
-            persistent_before,
-            "generic V1 opcode rejection occurs before resolver, setup, or lane admission"
+            expected,
+            "generic V1 opcode rejection records one exclusive safe completion per call without resolver, setup, or lane admission"
         );
         persistent.shutdown().await;
     }
@@ -34804,6 +34974,23 @@ mod tests {
             assert_eq!(diagnostics.not_transmitted, u64::from(!partial));
             assert_eq!(diagnostics.outcome_unknown, u64::from(partial));
             assert_eq!(diagnostics.deadline, 1);
+            assert_eq!(diagnostics.completed_operations, 1);
+            assert_eq!(
+                diagnostics.completed_operation_not_transmitted,
+                u64::from(!partial),
+                "a pre-write deadline is the exclusive safe class"
+            );
+            assert_eq!(
+                diagnostics.completed_operation_outcome_unknown,
+                u64::from(partial),
+                "a deadline after accepted bytes is exclusively outcome-unknown"
+            );
+            assert_eq!(diagnostics.completed_operation_other_failures, 0);
+            assert_eq!(
+                diagnostics.completed_operation_unsafe_failures,
+                u64::from(partial),
+                "admission can consume this field without subtracting deadline from not-transmitted"
+            );
         }
     }
 
@@ -34903,6 +35090,20 @@ mod tests {
             assert_eq!(diagnostics.not_transmitted, u64::from(!partial));
             assert_eq!(diagnostics.outcome_unknown, u64::from(partial));
             assert_eq!(diagnostics.shutdown, 1);
+            assert_eq!(diagnostics.completed_operations, 1);
+            assert_eq!(
+                diagnostics.completed_operation_not_transmitted,
+                u64::from(!partial)
+            );
+            assert_eq!(
+                diagnostics.completed_operation_outcome_unknown,
+                u64::from(partial)
+            );
+            assert_eq!(diagnostics.completed_operation_other_failures, 0);
+            assert_eq!(
+                diagnostics.completed_operation_unsafe_failures,
+                u64::from(partial)
+            );
         }
     }
 
@@ -35565,6 +35766,129 @@ mod tests {
                 true,
             ),
             "a status read cannot extend its immutable deadline through redispatch",
+        );
+    }
+
+    #[test]
+    fn completed_operation_snapshot_is_exclusive_under_concurrent_writers() {
+        let counters = Arc::new(PersistentConsumerCounters::default());
+        let workers = [
+            PersistentCompletedOperationClass::Success,
+            PersistentCompletedOperationClass::NotTransmitted,
+            PersistentCompletedOperationClass::OutcomeUnknown,
+            PersistentCompletedOperationClass::OtherFailure,
+        ]
+        .into_iter()
+        .map(|class| {
+            let counters = Arc::clone(&counters);
+            std::thread::spawn(move || {
+                for _ in 0..1_000 {
+                    counters
+                        .completed_operations
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record(class);
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("completed-operation writer finishes");
+        }
+
+        let snapshot = *counters
+            .completed_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(snapshot.total, 4_000);
+        assert_eq!(
+            snapshot.total,
+            snapshot.successes
+                + snapshot.not_transmitted
+                + snapshot.outcome_unknown
+                + snapshot.other_failures,
+            "one snapshot needs no subtraction across overlapping legacy counters"
+        );
+        assert_eq!(
+            snapshot.unsafe_failures,
+            snapshot.outcome_unknown + snapshot.other_failures,
+            "unsafe outcomes have a direct coherent total"
+        );
+    }
+
+    #[test]
+    fn completed_operation_snapshot_freezes_as_one_coherent_record_at_saturation() {
+        let mut counters = PersistentCompletedOperationCounters {
+            total: u64::MAX - 1,
+            successes: u64::MAX - 1,
+            ..PersistentCompletedOperationCounters::default()
+        };
+        counters.record(PersistentCompletedOperationClass::OtherFailure);
+        let saturated = counters;
+        counters.record(PersistentCompletedOperationClass::OutcomeUnknown);
+
+        assert_eq!(counters, saturated);
+        assert_eq!(counters.total, u64::MAX);
+        assert_eq!(
+            u128::from(counters.total),
+            u128::from(counters.successes)
+                + u128::from(counters.not_transmitted)
+                + u128::from(counters.outcome_unknown)
+                + u128::from(counters.other_failures)
+        );
+        assert_eq!(
+            u128::from(counters.unsafe_failures),
+            u128::from(counters.outcome_unknown) + u128::from(counters.other_failures)
+        );
+    }
+
+    #[test]
+    fn completed_response_classifier_fails_closed_for_every_typed_failure_family() {
+        let operation = SessionConsumerOperation::Capabilities;
+        let failures = [
+            SessionConsumerResponse::FencedTransitionCapability(Err(
+                SessionConsumerStoreError::Unavailable,
+            )),
+            SessionConsumerResponse::LeaseMutationStatus(Err(
+                SessionConsumerStoreError::Unavailable,
+            )),
+            SessionConsumerResponse::CompareAndSetStatus(Err(
+                SessionConsumerStoreError::Unavailable,
+            )),
+            SessionConsumerResponse::LeaseMutationStatus(Ok(
+                SessionConsumerLeaseMutationStatus::Recorded(Box::new(Err(
+                    SessionConsumerLeaseError::Expired,
+                ))),
+            )),
+            SessionConsumerResponse::CompareAndSetStatus(Ok(
+                SessionConsumerCompareAndSetStatus::Recorded(
+                    SessionConsumerCompareAndSetReceiptOutcome::Rejected(
+                        SessionConsumerStoreError::Unavailable,
+                    ),
+                ),
+            )),
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::NotTransmitted,
+            ),
+            SessionConsumerResponse::FencedMutationRosterTerminalize(
+                SessionConsumerRosterTerminalMutationResponse::NotTransmitted,
+            ),
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable),
+        ];
+
+        for response in failures {
+            assert_eq!(
+                completed_operation_class(&operation, &response),
+                PersistentCompletedOperationClass::OtherFailure,
+                "a typed non-success cannot enter the coherent success counter"
+            );
+        }
+        assert_eq!(
+            completed_operation_class(
+                &operation,
+                &SessionConsumerResponse::Capabilities(BackendCapabilities::minimal()),
+            ),
+            PersistentCompletedOperationClass::Success
         );
     }
 
