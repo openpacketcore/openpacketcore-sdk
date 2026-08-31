@@ -6433,6 +6433,11 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
     .expect("compose public exact-voter facade");
     let request = fenced_create_request(0xa1);
     let request_id = request.request_id();
+    let key = request.lease().key().clone();
+    let committed_fence = request
+        .lease()
+        .committed_fence()
+        .expect("test acquire commits a nonzero fence");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut prepared = facade
         .prepare_fenced_transition(
@@ -6443,12 +6448,35 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
         .await
         .expect("public facade prepares the exact journaled identity");
 
+    let (execute_result, committed_writer) = {
+        let transition_committed_0 = response_losses[0].transition_committed.notified();
+        let transition_committed_1 = response_losses[1].transition_committed.notified();
+        let transition_committed_2 = response_losses[2].transition_committed.notified();
+        tokio::pin!(transition_committed_0);
+        tokio::pin!(transition_committed_1);
+        tokio::pin!(transition_committed_2);
+        transition_committed_0.as_mut().enable();
+        transition_committed_1.as_mut().enable();
+        transition_committed_2.as_mut().enable();
+        let execute_result = prepared.execute_once().await;
+        let committed_writer = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
+            tokio::select! {
+                _ = &mut transition_committed_0 => 0,
+                _ = &mut transition_committed_1 => 1,
+                _ = &mut transition_committed_2 => 2,
+            }
+        })
+        .await
+        .expect("the public facade reaches one real durable commit after response loss");
+        (execute_result, committed_writer)
+    };
     assert!(matches!(
-        prepared.execute_once().await,
+        execute_result,
         Err(FencedTransitionExecuteError::OutcomeUnknown {
             request_id: returned_request_id
         }) if returned_request_id == request_id
     ));
+    loss_servers[committed_writer].abort();
     let mutation_counts = response_losses
         .iter()
         .map(|response_loss| response_loss.transition_calls.load(Ordering::SeqCst))
@@ -6462,6 +6490,7 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
         .iter()
         .position(|calls| *calls == 1)
         .expect("one physical voter accepted the mutation");
+    assert_eq!(committed_writer, writer);
     drop(prepared);
     drop(facade);
     for server in loss_servers {
@@ -6471,7 +6500,8 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
 
     // This is a full three-voter OpenRaft/SQLite restart, not a retained
     // connection or a modeled receipt map. Rebuild the public facade from the
-    // retained journal so the only available authority is status-only.
+    // retained journal without retaining a prepared execution handle; recovery
+    // therefore observes the authoritative committed head through the facade.
     let fleet = fleet.restart_all().await;
     fleet.wait_all_ready().await;
     let mut recovery_servers = Vec::with_capacity(THREE_VOTER_COUNT);
@@ -6498,6 +6528,9 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
         recovery_servers.push(server);
         recovery_addresses.push(address);
     }
+    let canonical_recovery_index = (0..THREE_VOTER_COUNT)
+        .min_by_key(|index| fleet.voter_authority(*index).node_id())
+        .expect("the restarted roster has one canonical voter");
     let recovery_voters = recovery_addresses
         .iter()
         .copied()
@@ -6529,6 +6562,46 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
     )
     .expect("recompose public facade after restart");
     let before_status = fleet.application_sequences().await;
+    let observed = recovery_facade
+        .observe_fenced_transition(&key)
+        .await
+        .expect("public facade reads the restarted quorum's exact head and fence");
+    let observed_record = observed
+        .record()
+        .expect("the committed transition leaves an authoritative head");
+    assert_eq!(observed_record.key, key);
+    assert_eq!(observed_record.generation, Generation::new(1));
+    assert_eq!(observed_record.fence, committed_fence);
+    assert_eq!(observed_record.payload.as_bytes(), [0xa1]);
+    assert_eq!(
+        observed_record.payload.encoding(),
+        SessionPayloadEncoding::Plaintext,
+        "facade observation returns the wrapper-decrypted caller view"
+    );
+    assert_eq!(observed.current_fence(), committed_fence);
+    let after_canonical_observation = fleet.application_sequences().await;
+    assert!(
+        after_canonical_observation[canonical_recovery_index]
+            > before_status[canonical_recovery_index],
+        "the authoritative read crosses a fresh consensus barrier at its canonical ingress"
+    );
+    let canonical_observation_sequence = after_canonical_observation[canonical_recovery_index];
+    fleet
+        .wait_all_application_sequences(canonical_observation_sequence)
+        .await;
+    let after_observation = fleet.application_sequences().await;
+    assert!(
+        after_observation
+            .iter()
+            .all(|sequence| *sequence >= canonical_observation_sequence),
+        "all voters converge through the canonical read barrier before no-mutation accounting"
+    );
+    assert!(
+        recovery_observers
+            .iter()
+            .all(|observer| observer.transition_calls.load(Ordering::SeqCst) == 0),
+        "head/fence observation exposes no raw transition dispatch authority"
+    );
     let status_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut recovered = recovery_facade
         .recover_fenced_transition_status(
@@ -6564,7 +6637,7 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
         "the recovered public handle cannot replay a mutation after restart"
     );
     assert_eq!(
-        before_status,
+        after_observation,
         fleet.application_sequences().await,
         "receipt-only recovery appends no second OpenRaft mutation"
     );

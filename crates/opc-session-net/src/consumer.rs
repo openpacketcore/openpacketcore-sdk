@@ -5481,6 +5481,68 @@ impl ActivatedFencedTransitionBackend {
     }
 }
 
+/// Net-private read-only physical backend for one opaque prepared-fenced
+/// facade. It deliberately owns only the activated router, so wrapping it
+/// cannot restore prepare, dispatch, or receipt authority.
+struct ActivatedFencedTransitionObservationBackend {
+    router: Arc<PreparedConsumerRouter>,
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for ActivatedFencedTransitionObservationBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::minimal()
+    }
+
+    async fn get(
+        &self,
+        _key: &opc_session_store::SessionKey,
+    ) -> Result<Option<opc_session_store::StoredSessionRecord>, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn observe_fenced_transition(
+        &self,
+        key: &opc_session_store::SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        // The activated roster is canonicalized by node ordinal before this
+        // facade exists. Its first client is therefore a stable authenticated
+        // coordinator for this exact authority, rather than caller input.
+        self.router.clients[0]
+            .observe_fenced_transition(key.clone())
+            .await
+    }
+
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        Ok(Some(AtomicFencedTransitionCapability::V1))
+    }
+
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        true
+    }
+
+    async fn compare_and_set(
+        &self,
+        _operation: CompareAndSet,
+    ) -> Result<CompareAndSetResult, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn batch(&self, _operations: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+}
+
 #[async_trait::async_trait]
 impl SessionBackend for ActivatedFencedTransitionBackend {
     async fn capabilities(&self) -> BackendCapabilities {
@@ -5898,6 +5960,17 @@ where
 /// // facade into a replayable raw SessionBackend.
 /// let _ = SessionConsumerFencedTransitionBackend::persistent;
 /// ```
+///
+/// ```compile_fail
+/// use opc_session_net::SessionConsumerPreparedFencedTransitionBackend;
+/// use opc_session_store::SessionBackend;
+///
+/// fn needs_raw_mutation_authority(_: &dyn SessionBackend) {}
+///
+/// fn cannot_lower(facade: &SessionConsumerPreparedFencedTransitionBackend) {
+///     needs_raw_mutation_authority(facade);
+/// }
+/// ```
 pub struct SessionConsumerPreparedFencedTransitionBackend {
     router: Arc<PreparedConsumerRouter>,
     wrapper_factory: Arc<dyn PreparedFencedTransitionWrapperFactory>,
@@ -5981,6 +6054,30 @@ impl SessionConsumerPreparedFencedTransitionBackend {
                 .map_err(|_| invalid_authenticated_consumer_fenced_transition())?,
         );
         Ok(self.wrapper_factory.wrap(physical))
+    }
+
+    fn observation_backend(&self) -> Arc<dyn SessionBackend> {
+        self.wrapper_factory
+            .wrap(Arc::new(ActivatedFencedTransitionObservationBackend {
+                router: Arc::clone(&self.router),
+            }))
+    }
+
+    /// Read the current record head and durable fence floor for one exact key
+    /// from this facade's activated V1 authority.
+    ///
+    /// The observation goes through the same local-AEAD or remote-sealing
+    /// wrapper as the prepared transition, so a present record is returned in
+    /// caller-visible protected-payload form. This API keeps its physical
+    /// adapter private and adds no raw backend, prepared token, direct-mutation,
+    /// or receipt-dispatch authority.
+    pub async fn observe_fenced_transition(
+        &self,
+        key: &opc_session_store::SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        self.observation_backend()
+            .observe_fenced_transition(key)
+            .await
     }
 
     /// Prepare one protected V1 fenced transition and retain its exact

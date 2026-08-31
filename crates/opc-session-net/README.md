@@ -346,6 +346,13 @@ receipt is cached locally. After restart,
 `SessionConsumerRecoveredFencedTransitionStatus`, which has receipt/status
 authority and deliberately no execution method.
 
+`observe_fenced_transition` is the facade's separate read-only recovery
+surface. It reads one exact record head and durable fence floor through the
+canonical member of the already activated roster and the same local-AEAD or
+remote-sealing wrapper as a prepared transition. It does not lower the facade
+to `SessionBackend`, expose a token, or add prepare, direct-mutation, replay,
+or receipt-dispatch authority.
+
 For a fenced transition, the public consumer request ID is byte-identical to
 the nested transition ID. The internal receipt ID is domain-separated by
 authenticated consumer identity, stable cluster identity, and that public ID;
