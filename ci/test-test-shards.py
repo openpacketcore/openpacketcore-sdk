@@ -129,5 +129,56 @@ class ManifestTestSourceAuditTests(unittest.TestCase):
         )
 
 
+class QuiescentShardPlanTests(unittest.TestCase):
+    """The protected private-lib contracts must remain total and disjoint."""
+
+    def test_optimized_contracts_have_a_dedicated_shard(self) -> None:
+        ordinary = TEST_SHARDS.quiescent_lib_tests_for_shard("misc")
+        optimized = TEST_SHARDS.quiescent_lib_tests_for_shard(
+            TEST_SHARDS.OPTIMIZED_QUIESCENT_SHARD
+        )
+
+        self.assertEqual((*ordinary, *optimized), TEST_SHARDS.QUIESCENT_LIB_TESTS)
+        self.assertEqual(set(ordinary) & set(optimized), set())
+        self.assertEqual(
+            set(optimized), TEST_SHARDS.OPTIMIZED_QUIESCENT_LIB_TESTS
+        )
+
+    def test_optimized_shard_preserves_exact_o1_commands(self) -> None:
+        plan = {"heavy": {"shards": []}}
+        optimized = TEST_SHARDS.quiescent_lib_tests_for_shard(
+            TEST_SHARDS.OPTIMIZED_QUIESCENT_SHARD
+        )
+
+        commands = TEST_SHARDS.commands(
+            plan, TEST_SHARDS.OPTIMIZED_QUIESCENT_SHARD, []
+        )
+
+        self.assertEqual(
+            commands,
+            [
+                TEST_SHARDS.quiescent_lib_command(name)
+                for name in optimized
+            ],
+        )
+        self.assertTrue(
+            all(
+                command[:2] == ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
+                for command in commands
+            )
+        )
+        self.assertTrue(
+            all(
+                "--test-threads=1" in command and "--exact" in command
+                for command in commands
+            )
+        )
+        listed = TEST_SHARDS.quiescent_lib_list_command(optimized[0])
+        self.assertEqual(
+            listed,
+            [*commands[0][:-2], "--list", *commands[0][-2:]],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
