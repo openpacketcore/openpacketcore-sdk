@@ -59,8 +59,7 @@ use opc_session_store::{
     Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig,
     ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
     SessionConsensusIdentity, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusWireRequest, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerLeaseMutationOperation,
+    SessionConsensusRpcFamily, SessionConsensusWireRequest, SessionConsumerLeaseMutationOperation,
     SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
     SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
@@ -15241,28 +15240,44 @@ fn run_consumer_multiprocess_qualification(
         }
     }
 
+    // The replacement-leader receipt query below must retain the identity
+    // that submitted this mutation. A consumer receipt namespace is bound to
+    // the authenticated client, not to the particular endpoint that first
+    // accepted the Call.
+    let known_request_id = SessionConsumerRequestId::from_bytes([0x41; 16]);
+    let known_key = stateless_consumer_key(0);
+    let known_owner = OwnerId::new("qualification-consumer-owner").expect("consumer owner");
+    let known_ttl = Duration::from_secs(30);
     let known_request = SessionConsumerRequest::new(
         scope,
-        SessionConsumerRequestId::from_bytes([0x41; 16]),
+        known_request_id,
         SessionConsumerOperation::AcquireLease {
-            key: stateless_consumer_key(0),
-            owner: OwnerId::new("qualification-consumer-owner").expect("consumer owner"),
-            ttl: Duration::from_secs(30),
+            key: known_key.clone(),
+            owner: known_owner.clone(),
+            ttl: known_ttl,
         },
     );
     let known_response = runtime
-        .block_on(clients[0].execute(known_request.clone()))
+        .block_on(clients[1].execute(known_request.clone()))
         .expect("known consumer mutation response");
-    assert!(matches!(
-        known_response,
-        SessionConsumerResponse::AcquireLease(Ok(_))
-    ));
+    let known_lease = match &known_response {
+        SessionConsumerResponse::AcquireLease(Ok(lease)) => lease.clone(),
+        _ => panic!("known consumer mutation must return an acquired lease"),
+    };
     let recovered_known_response = runtime
-        .block_on(clients[0].execute(known_request))
+        .block_on(clients[1].execute(known_request))
         .expect("exact known consumer mutation retry");
     assert!(
         recovered_known_response == known_response,
         "a known durable consumer success must be recoverable by its retained request ID"
+    );
+    let known_lease_status = SessionConsumerLeaseMutationRequest::new(
+        known_request_id,
+        SessionConsumerLeaseMutationOperation::Acquire {
+            key: known_key,
+            owner: known_owner,
+            ttl: known_ttl,
+        },
     );
     if let Some(measurements) = persistent_measurements.as_mut() {
         measurements.general_lane.admission_operations = 1;
@@ -15588,65 +15603,24 @@ fn run_consumer_multiprocess_qualification(
         first_atomic_transition.request_id().as_bytes(),
         "the public and nested atomic transition IDs must be byte-identical"
     );
-    let first_atomic_outcome = match runtime
-        .block_on(clients[1].execute(first_atomic_request.clone()))
-        .expect("first atomic transition response")
-    {
-        SessionConsumerResponse::FencedTransition(Ok(outcome)) => {
-            assert!(
-                outcome.matches_request(&first_atomic_transition),
-                "the atomic transition outcome must exactly match its request"
-            );
-            outcome
-        }
-        _ => panic!("first atomic transition must return a typed success"),
-    };
-    assert_eq!(
-        runtime
-            .block_on(clients[1].execute(first_atomic_request.clone()))
-            .expect("first atomic transition replay response"),
-        SessionConsumerResponse::FencedTransition(Ok(first_atomic_outcome.clone())),
-        "the exact atomic transition replay must return its recorded outcome"
+    // PR #745 moved V1 transition dispatch and receipt recovery behind the
+    // opaque, activated-roster facade. A public one-voter client may retain
+    // the capability/observation reads above, but it must never lower a raw
+    // V1 request into an application Call. Keep this qualifier at the public
+    // boundary and assert the typed pre-write failure for both client forms.
+    assert!(
+        matches!(
+            runtime.block_on(clients[1].execute(first_atomic_request.clone())),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "the public consumer route must reject a V1 transition before any Call byte"
     );
-    let conflicting_atomic_lease = FencedTransitionLease::acquire(
-        first_atomic_key.clone(),
-        first_atomic_owner.clone(),
-        first_atomic_fence,
-        Duration::from_secs(31),
-    )
-    .expect("build conflicting atomic acquire action");
-    let conflicting_atomic_transition = FencedTransitionRequest::new(
-        first_atomic_id,
-        conflicting_atomic_lease,
-        FencedTransitionMutation::create(first_atomic_record.clone()),
-    )
-    .expect("build conflicting atomic transition");
-    let fence_negative_boundary_rejections = u8::from(matches!(
-        runtime
-            .block_on(clients[1].execute(SessionConsumerRequest::new(
-                scope,
-                SessionConsumerRequestId::from_bytes(first_atomic_id_bytes),
-                SessionConsumerOperation::FencedTransition {
-                    request: Box::new(conflicting_atomic_transition),
-                },
-            )))
-            .expect("conflicting atomic transition response"),
-        SessionConsumerResponse::FencedTransition(Err(
-            SessionConsumerFencedTransitionError::RequestConflict
-        ))
-    ));
-    assert_eq!(
-        fence_negative_boundary_rejections, 1,
-        "a different atomic body under one retained ID must be a typed fence boundary conflict"
-    );
-    if let Some(measurements) = persistent_measurements.as_mut() {
-        measurements.fence_positive_observations = 1;
-        measurements.fence_negative_boundary_rejections = fence_negative_boundary_rejections;
-        measurements.general_lane.status_operations = 1;
-        measurements.general_lane.fence_positive_observations = 1;
-        measurements.general_lane.fence_negative_boundary_rejections =
-            fence_negative_boundary_rejections;
-    }
     let first_atomic_status_request = SessionConsumerRequest::new(
         scope,
         SessionConsumerRequestId::from_bytes(first_atomic_id_bytes),
@@ -15654,17 +15628,26 @@ fn run_consumer_multiprocess_qualification(
             request: Box::new(first_atomic_transition.clone()),
         },
     );
-    assert_eq!(
-        runtime
-            .block_on(clients[1].execute(first_atomic_status_request.clone()))
-            .expect("first atomic transition status response"),
-        SessionConsumerResponse::FencedTransitionStatus(Ok(
-            SessionConsumerFencedTransitionStatus::Recorded(Box::new(Ok(
-                first_atomic_outcome.clone()
-            )))
-        )),
-        "the first atomic transition status must retain the original success"
+    assert!(
+        matches!(
+            runtime.block_on(clients[1].execute(first_atomic_status_request.clone())),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "the public consumer route must reject V1 receipt recovery before any Call byte"
     );
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.fence_positive_observations = 1;
+        measurements.fence_negative_boundary_rejections = 1;
+        measurements.general_lane.status_operations = 1;
+        measurements.general_lane.fence_positive_observations = 1;
+        measurements.general_lane.fence_negative_boundary_rejections = 1;
+    }
 
     // Keep the consumer outcome proof and the leader-loss proof distinct. A
     // known quorum result does not imply that every follower has already
@@ -15773,10 +15756,10 @@ fn run_consumer_multiprocess_qualification(
                 .map(|_| report.node_index)
         })
         .expect("coherent replacement leader");
-    // Status identities are deliberately namespaced by the authenticated
+    // Receipt identities are deliberately namespaced by the authenticated
     // consumer, independently of the server endpoint. Build a fresh transport
     // to the replacement leader with the same identity that submitted the
-    // first transition; using an arbitrary endpoint-local client here would
+    // retained lease; using an arbitrary endpoint-local client here would
     // correctly query a different receipt namespace and return NotFound.
     let (replacement_identity_source, replacement_identity_receiver) = watch::channel(Some(
         fleet.pki.consumer_identity_state(&consumer_identities[1]),
@@ -15812,15 +15795,24 @@ fn run_consumer_multiprocess_qualification(
         "the same authenticated consumer must establish replacement-leader transport"
     );
     assert_eq!(
-        runtime
-            .block_on(leader_survivor_client.execute(first_atomic_status_request))
-            .expect("recovered atomic transition status response"),
-        SessionConsumerResponse::FencedTransitionStatus(Ok(
-            SessionConsumerFencedTransitionStatus::Recorded(Box::new(Ok(
-                first_atomic_outcome.clone()
-            )))
-        )),
-        "the replacement leader must recover the exact prior atomic outcome"
+        runtime.block_on(leader_survivor_client.lease_mutation_status(&known_lease_status)),
+        Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(Ok(
+            SessionConsumerLeaseMutationResult::Acquire(known_lease.clone())
+        )))),
+        "the replacement leader must recover the exact prior lease outcome"
+    );
+    assert!(
+        matches!(
+            runtime.block_on(leader_survivor_client.execute(first_atomic_status_request)),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "leader replacement must retain the public V1 receipt-recovery boundary"
     );
     if let Some(measurements) = persistent_measurements.as_mut() {
         measurements.general_lane.after_leader_loss_operations = 1;
@@ -15846,20 +15838,7 @@ fn run_consumer_multiprocess_qualification(
                 .after_leader_loss_operations = 1;
         }
     }
-    assert_eq!(
-        runtime
-            .block_on(leader_survivor_client.execute(SessionConsumerRequest::new(
-                scope,
-                SessionConsumerRequestId::from_bytes([0x63; 16]),
-                SessionConsumerOperation::Get {
-                    key: first_atomic_key.clone(),
-                },
-            )))
-            .expect("recovered atomic record response"),
-        SessionConsumerResponse::Get(Ok(Some(first_atomic_record.clone()))),
-        "the replacement leader must read the created atomic record"
-    );
-
+    // The public V1 route remains unavailable after leader replacement.
     let second_atomic_key = qualification_fenced_transition_key(1);
     let second_atomic_fence = match runtime
         .block_on(leader_survivor_client.execute(SessionConsumerRequest::new(
@@ -15924,40 +15903,18 @@ fn run_consumer_multiprocess_qualification(
         second_atomic_transition.request_id().as_bytes(),
         "the failover public and nested transition IDs must be byte-identical"
     );
-    let second_atomic_outcome = match runtime
-        .block_on(leader_survivor_client.execute(second_atomic_request.clone()))
-        .expect("second atomic transition response")
-    {
-        SessionConsumerResponse::FencedTransition(Ok(outcome)) => {
-            assert!(
-                outcome.matches_request(&second_atomic_transition),
-                "the replacement-leader atomic outcome must exactly match its request"
-            );
-            outcome
-        }
-        _ => panic!("replacement leader must return a typed atomic success"),
-    };
-    assert_eq!(
-        runtime
-            .block_on(leader_survivor_client.execute(second_atomic_request))
-            .expect("second atomic transition replay response"),
-        SessionConsumerResponse::FencedTransition(Ok(second_atomic_outcome.clone())),
-        "the replacement leader must replay the second atomic outcome"
-    );
-    assert_eq!(
-        runtime
-            .block_on(leader_survivor_client.execute(SessionConsumerRequest::new(
-                scope,
-                SessionConsumerRequestId::from_bytes(second_atomic_id_bytes),
-                SessionConsumerOperation::FencedTransitionStatus {
-                    request: Box::new(second_atomic_transition),
-                },
-            )))
-            .expect("second atomic transition status response"),
-        SessionConsumerResponse::FencedTransitionStatus(Ok(
-            SessionConsumerFencedTransitionStatus::Recorded(Box::new(Ok(second_atomic_outcome)))
-        )),
-        "the replacement leader must retain the second atomic success"
+    assert!(
+        matches!(
+            runtime.block_on(leader_survivor_client.execute(second_atomic_request.clone())),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "the replacement leader must retain the public V1 transition boundary"
     );
     let leader_failover_request_id = SessionConsumerRequestId::from_bytes([0x51; 16]);
     let leader_failover_key = stateless_consumer_key(2);
