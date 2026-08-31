@@ -10,8 +10,8 @@ on:
 permissions:
   contents: read
 
-# This workflow now requests 26 concurrent jobs per run (20 job definitions;
-# one expands to a 6-way shard matrix and one to a 2-way matrix). Without a
+# This workflow now requests 27 concurrent jobs per run (20 job definitions;
+# one expands to a 7-way shard matrix and one to a 2-way matrix). Without a
 # concurrency group a superseded push keeps its whole fleet running and the
 # replacement run queues behind it, which costs far more wall clock than the
 # sharding saves. Runs on main are never cancelled.
@@ -162,7 +162,7 @@ jobs:
         # Keep in step with `python3 ci/test-shards.py ids`; the rust-gates
         # plan check fails the run if the plan itself stops covering
         # everything, and the aggregator below fails if a shard is dropped.
-        shard: [misc, it-0, it-1, it-2, heavy-0, heavy-1]
+        shard: [misc, quiescent-o1, it-0, it-1, it-2, heavy-0, heavy-1]
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -185,9 +185,9 @@ jobs:
       # not add a `cargo clean` here, since rust-cache saves in a post-step
       # and would archive an empty target directory.
       # Per-shard keys: the legs build different target sets, so one shared
-      # key would make all six race to save the same multi-gigabyte archive
+      # key would make all seven race to save the same multi-gigabyte archive
       # while giving each a worse hit rate than its own. Only main saves:
-      # six archives per pull request would churn the repository's shared
+      # seven archives per pull request would churn the repository's shared
       # 10 GB cache quota and evict the entries the shards restore from.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

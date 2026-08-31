@@ -96,6 +96,7 @@ if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
 # Keep O1 confined to the snapshot/restart roster proofs.
 # Applying it to unrelated expiry/fault tests changes their lifecycle timing
 # and would no longer qualify the repository's ordinary test profile.
+OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"
 
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
@@ -253,7 +254,7 @@ def assign(plan: dict, targets: list[str]) -> dict[str, list[str]]:
 
 
 def shard_ids(plan: dict) -> list[str]:
-    ids = ["misc"]
+    ids = ["misc", OPTIMIZED_QUIESCENT_SHARD]
     ids += [f"it-{i}" for i in range(int(plan["integration_shards"]))]
     ids += [f"heavy-{i}" for i in range(len(plan["heavy"]["shards"]))]
     return ids
@@ -277,6 +278,30 @@ def quiescent_lib_command(name: str) -> list[str]:
         "--exact",
         qualified_quiescent_lib_test(name),
     ]
+
+
+def quiescent_lib_list_command(name: str) -> list[str]:
+    """List one private-lib contract using its isolated CI profile."""
+    command = quiescent_lib_command(name)
+    command.insert(-2, "--list")
+    return command
+
+
+def quiescent_lib_tests_for_shard(shard: str) -> tuple[str, ...]:
+    """Return the private-lib timing contracts owned by one serial shard."""
+    if shard == "misc":
+        return tuple(
+            name
+            for name in QUIESCENT_LIB_TESTS
+            if name not in OPTIMIZED_QUIESCENT_LIB_TESTS
+        )
+    if shard == OPTIMIZED_QUIESCENT_SHARD:
+        return tuple(
+            name
+            for name in QUIESCENT_LIB_TESTS
+            if name in OPTIMIZED_QUIESCENT_LIB_TESTS
+        )
+    return ()
 
 
 def quiescent_consensus_openraft_command(name: str) -> list[str]:
@@ -325,11 +350,24 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         ]
         return [
             SELECTION + ["--lib", "--bins", "--", *HARNESS, "--exact", *lib_skips],
-            *[quiescent_lib_command(name) for name in QUIESCENT_LIB_TESTS],
+            *[
+                quiescent_lib_command(name)
+                for name in quiescent_lib_tests_for_shard(shard)
+            ],
             list(EXAMPLES),
             SELECTION + ["--doc", "--", *HARNESS],
             SELECTION
             + ["--test", heavy["target"], "--", *HARNESS, "--exact", *skips],
+        ]
+
+    if shard == OPTIMIZED_QUIESCENT_SHARD:
+        # The O1 snapshot/restart proofs retain their exact serial commands,
+        # but compile once on their own runner. Keeping them behind misc's
+        # broad lib/bin run exceeded that job's hard 60-minute budget before
+        # the first O1 test process could start.
+        return [
+            quiescent_lib_command(name)
+            for name in quiescent_lib_tests_for_shard(shard)
         ]
 
     if shard.startswith("heavy-"):
@@ -453,11 +491,35 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
             "the misc ordinary --lib process must skip every private-lib "
             "timing contract exactly once"
         )
-    expected_lib_isolated = [quiescent_lib_command(name) for name in QUIESCENT_LIB_TESTS]
-    if misc_commands[1 : 1 + len(expected_lib_isolated)] != expected_lib_isolated:
+    expected_misc_isolated = [
+        quiescent_lib_command(name)
+        for name in quiescent_lib_tests_for_shard("misc")
+    ]
+    if misc_commands[1 : 1 + len(expected_misc_isolated)] != expected_misc_isolated:
         sys.exit(
-            "the misc shard must run private-lib timing contracts once each, "
+            "the misc shard must run its private-lib timing contracts once each, "
             "in their declared module-qualified name order"
+        )
+    optimized_commands = commands(plan, OPTIMIZED_QUIESCENT_SHARD, targets)
+    expected_optimized_isolated = [
+        quiescent_lib_command(name)
+        for name in quiescent_lib_tests_for_shard(OPTIMIZED_QUIESCENT_SHARD)
+    ]
+    if optimized_commands != expected_optimized_isolated:
+        sys.exit(
+            "the optimized private-lib shard must run its timing contracts "
+            "once each, in their declared module-qualified name order"
+        )
+    expected_all_isolated = [
+        quiescent_lib_command(name) for name in QUIESCENT_LIB_TESTS
+    ]
+    if (
+        [*expected_misc_isolated, *expected_optimized_isolated]
+        != expected_all_isolated
+    ):
+        sys.exit(
+            "private-lib timing contracts must be partitioned between the "
+            "ordinary and optimized shards in their declared order"
         )
     for index, group in enumerate(plan["heavy"]["shards"]):
         if not group:
@@ -517,7 +579,11 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
                 f"{owner} must skip every isolated timing contract exactly "
                 "once in its ordinary multi-test process"
             )
-    print(f"shard commands ok: misc issues {len(misc)} invocations")
+    print(
+        "shard commands ok: "
+        f"misc issues {len(misc)} invocations; "
+        f"{OPTIMIZED_QUIESCENT_SHARD} issues {len(optimized_commands)}"
+    )
 
 
 def verify(plan: dict, targets: list[str]) -> None:
@@ -602,7 +668,7 @@ def list_quiescent_test(target: str, name: str) -> list[str]:
 def list_quiescent_lib_test(name: str) -> list[str]:
     """Resolve one private-lib contract with its exact CI invocation."""
     qualified = qualified_quiescent_lib_test(name)
-    command = SELECTION + ["--lib", "--", "--list", "--exact", qualified]
+    command = quiescent_lib_list_command(name)
     out = subprocess.run(
         command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
     ).stdout
@@ -624,21 +690,22 @@ def precheck(plan: dict, shard: str) -> None:
     """
     # Every shard re-checks the plan itself: rust-tests legs start alongside
     # rust-gates rather than after it, so without this a broken plan would
-    # burn six runners before the gates job reported it.
+    # burn seven runners before the gates job reported it.
     targets = integration_targets()
     verify(plan, targets)
-    if shard == "misc":
-        for name in QUIESCENT_LIB_TESTS:
+    isolated_lib_tests = quiescent_lib_tests_for_shard(shard)
+    if isolated_lib_tests:
+        for name in isolated_lib_tests:
             qualified = qualified_quiescent_lib_test(name)
             selected = list_quiescent_lib_test(name)
             if selected != [qualified]:
                 sys.exit(
-                    "misc private-lib timing contract does not resolve exactly "
-                    f"once: expected {qualified!r}, selected {selected!r}"
+                    f"{shard} private-lib timing contract does not resolve "
+                    f"exactly once: expected {qualified!r}, selected {selected!r}"
                 )
         print(
-            "misc private-lib timing contracts resolve exactly once: "
-            f"{len(QUIESCENT_LIB_TESTS)}"
+            f"{shard} private-lib timing contracts resolve exactly once: "
+            f"{len(isolated_lib_tests)}"
         )
     buckets = assign(plan, targets)
     if shard in buckets:
