@@ -3871,12 +3871,17 @@ where
                         .validate_lookup(request.compacted_terminal_lookup(history_epoch))
                         .map_err(|_| ExecutorError::AuthorityRejected)?;
                 }
-                // A V2 compact row deliberately retains only its profile-V2
-                // terminal identity. A successor recovery has no immutable
-                // admission to compare it with, so accepting it here would
-                // weaken the V2 exact-binding check.
-                ProfiledTerminalConflictTombstone::V2(_) => {
-                    return Err(ExecutorError::AuthorityRejected);
+                // V2 compact rows retain a sealed V2 terminal identity. Its
+                // profile-aware lookup validation binds the same recovery
+                // identity as V1, including the original admission
+                // provenance and successor's strictly higher fence.
+                ProfiledTerminalConflictTombstone::V2(tombstone) => {
+                    tombstone
+                        .validate_lookup_for_profile(
+                            super::canonical::Profile::v2(),
+                            request.compacted_terminal_lookup(history_epoch),
+                        )
+                        .map_err(|_| ExecutorError::AuthorityRejected)?;
                 }
             }
             return Ok(RecoveryResult::Compacted);
@@ -6681,6 +6686,7 @@ mod production_runtime_cut_matrix_tests {
         registration: Option<BackendRegistration>,
         current_authority: Option<AuthorityBinding>,
         committed: Option<CommittedTerminal>,
+        compacted_recovery: Option<(u64, ProfiledTerminalConflictTombstone)>,
         compact_next_terminal: bool,
         lose_next_terminal_reply: bool,
         next_admission_not_transmitted: bool,
@@ -6716,6 +6722,35 @@ mod production_runtime_cut_matrix_tests {
                 .lock()
                 .expect("test backend state")
                 .current_authority = Some(authority);
+        }
+
+        fn install_v2_compacted_recovery(
+            &self,
+            request: &RegistrationRequest,
+            successor: AuthorityBinding,
+        ) {
+            let request_id =
+                RequestId::bind(1, request.admission()).expect("V2 compact recovery request ID");
+            let registration =
+                BackendRegistration::issue([0xA6; 32], request_id, request.admission())
+                    .expect("V2 compact recovery registration");
+            let terminal = TerminalRecord::new(
+                request.admission(),
+                request_id,
+                Phase::Aborted,
+                vec![[0xA7; 32]; request.admission().members().len()],
+            )
+            .expect("V2 compact recovery terminal");
+            let tombstone = TerminalConflictTombstone::new(request.admission(), &terminal)
+                .expect("V2 compact recovery tombstone");
+            let mut state = self.state.lock().expect("test backend state");
+            state.admission = Some(Arc::clone(&request.admission));
+            state.registration = Some(registration);
+            state.current_authority = Some(successor);
+            state.compacted_recovery = Some((
+                request_id.history_epoch(),
+                ProfiledTerminalConflictTombstone::V2(tombstone),
+            ));
         }
 
         fn compact_next_terminal(&self) {
@@ -6870,6 +6905,12 @@ mod production_runtime_cut_matrix_tests {
                 || request.authority().expires_at() <= Timestamp::now_utc()
             {
                 return Ok(RegistrationDecision::Reject(BackendRejection::Authority));
+            }
+            if let Some((history_epoch, tombstone)) = state.compacted_recovery.clone() {
+                return Ok(RegistrationDecision::Compacted {
+                    history_epoch,
+                    tombstone,
+                });
             }
             let admission = Arc::clone(admission);
             if let Some(committed) = state.committed.clone() {
@@ -7462,6 +7503,50 @@ mod production_runtime_cut_matrix_tests {
             .expect("registration request")
     }
 
+    fn v2_request_with_members(width: u8) -> RegistrationRequest {
+        let owner = OwnerId::new("runtime-v2-cut-owner").expect("owner");
+        let members = (0_u8..width)
+            .map(|ordinal| {
+                Member::new(
+                    ordinal,
+                    MemberOperationId::from_bytes([ordinal + 0x21; 16]).expect("operation ID"),
+                    vec![0xD4, ordinal],
+                    u64::from(ordinal) + 1,
+                )
+                .expect("member")
+            })
+            .collect();
+        let proposal = AdmissionProposal::new(
+            Profile::v2(),
+            RosterId::from_bytes([0xD5; 16]).expect("roster ID"),
+            members,
+            EstablishedMutation::create_checkpoint(opc_session_store::StateType::from_static(
+                "runtime-v2-created",
+            )),
+            b"runtime-v2-cut-plan".to_vec(),
+            b"runtime-v2-cut-checkpoint".to_vec(),
+            b"runtime-v2-cut-result".to_vec(),
+        )
+        .expect("V2 proposal");
+        let admission = Admission::authenticate(
+            proposal,
+            SessionKey {
+                tenant: TenantId::from_static("runtime-v2-cut-tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: StableId::new(Bytes::from_static(b"runtime-v2-cut-key"))
+                    .expect("stable ID"),
+            },
+            Scope::from_digest([0xD6; 32]),
+            owner.clone(),
+            FenceToken::new(1),
+            Generation::new(1),
+        )
+        .expect("V2 admission");
+        RegistrationRequest::new(admission, owner, FenceToken::new(1), 7, Generation::new(1))
+            .expect("V2 registration request")
+    }
+
     fn test_recovery_lease() -> LeaseMetadata {
         let acquired_at = Timestamp::now_utc()
             .add_seconds(-1)
@@ -7931,6 +8016,32 @@ mod production_runtime_cut_matrix_tests {
             1,
             "status cannot invoke admission mutation"
         );
+    }
+
+    #[tokio::test]
+    async fn v2_compacted_successor_recovery_is_a_valid_status_only_outcome() {
+        let request = v2_request_with_members(1);
+        let provider = Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun));
+        let backend = Arc::new(CutBackend::default());
+        let recovery = successor(&request, 2);
+        backend.install_v2_compacted_recovery(&request, recovery.authority().clone());
+        let executor = RosterExecutor::new_v2(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            CutAttestor::new(request.admission().scope()),
+            NonZeroUsize::new(1).expect("provider capacity"),
+        );
+
+        assert!(matches!(
+            executor.recover(recovery).await,
+            Ok(RecoveryResult::Compacted)
+        ));
+        assert!(backend.admission_calls().is_empty());
+        assert!(backend.terminal_calls().is_empty());
+        assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
