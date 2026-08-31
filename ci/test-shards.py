@@ -103,18 +103,26 @@ if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
 # deliberately below it).
 MIN_INTEGRATION_TARGETS = 240
 
+# Cargo normally discovers every direct ``tests/*.rs`` source automatically.
+# ``opc-session-net`` deliberately opts out so its raw physical-adapter suite
+# can remain a crate-private lib module. Once automatic discovery is disabled,
+# however, a newly added sibling source is otherwise absent from both Cargo
+# metadata and this sharder. Keep that one intentional private module explicit
+# and reject every other unregistered direct test source.
+PRIVATE_INTEGRATION_TEST_SOURCES = {
+    (
+        "opc-session-net",
+        "tests/stateless_quorum_consumer.rs",
+    ): "raw physical adapters are exercised only through the crate-private lib module",
+}
+
 
 def load_plan() -> dict:
     return json.loads(PLAN_PATH.read_text())
 
 
-def integration_targets() -> list[str]:
-    """Every integration-test target name in the workspace, minus opc-persist.
-
-    Names are deduplicated: several crates define e.g. tests/corpus_replay.rs,
-    and ``--test corpus_replay`` selects all of them, so they form one
-    indivisible partition unit.
-    """
+def workspace_packages() -> list[dict]:
+    """Return the workspace package metadata used by every shard check."""
     raw = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
         cwd=ROOT,
@@ -122,8 +130,85 @@ def integration_targets() -> list[str]:
         stdout=subprocess.PIPE,
         check=True,
     ).stdout
+    return json.loads(raw)["packages"]
+
+
+def manifest_test_source_errors(
+    packages: list[dict],
+    private_sources: dict[tuple[str, str], str] | None = None,
+) -> list[str]:
+    """List direct integration sources Cargo would silently omit from CI.
+
+    Nested ``tests/**/mod.rs`` files are support modules rather than Cargo
+    integration targets, so this intentionally audits only direct
+    ``tests/*.rs`` sources. An exemption must remain both present and
+    unregistered; that makes the deliberate crate-private module visible to
+    review while preventing it from turning into an open-ended exclusion.
+    """
+    if private_sources is None:
+        private_sources = PRIVATE_INTEGRATION_TEST_SOURCES
+    errors: list[str] = []
+    matched_exemptions: set[tuple[str, str]] = set()
+    for package in packages:
+        name = package["name"]
+        root = Path(package["manifest_path"]).parent
+        tests = root / "tests"
+        if not tests.is_dir():
+            continue
+        cargo_test_sources = {
+            Path(target["src_path"]).resolve()
+            for target in package["targets"]
+            if "test" in target["kind"] and target.get("test", True)
+        }
+        for source in sorted(tests.glob("*.rs")):
+            relative = source.relative_to(root).as_posix()
+            exemption = (name, relative)
+            registered = source.resolve() in cargo_test_sources
+            if exemption in private_sources:
+                matched_exemptions.add(exemption)
+                if registered:
+                    errors.append(
+                        f"private integration-test exemption {name}:{relative} "
+                        "is now a Cargo target; remove the exemption"
+                    )
+            elif not registered:
+                errors.append(
+                    f"integration-test source {name}:{relative} is absent from "
+                    "Cargo metadata; register it in Cargo.toml or add a narrow "
+                    "private-module exemption"
+                )
+    stale = set(private_sources) - matched_exemptions
+    for name, relative in sorted(stale):
+        errors.append(
+            f"private integration-test exemption {name}:{relative} does not "
+            "match an unregistered direct tests/*.rs source"
+        )
+    return errors
+
+
+def verify_manifest_test_sources(packages: list[dict]) -> None:
+    """Fail closed if a direct integration source cannot reach any shard."""
+    errors = manifest_test_source_errors(packages)
+    if errors:
+        sys.exit("\n".join(errors))
+    print(
+        "manifest test-source audit ok: every direct tests/*.rs source is a "
+        "Cargo target or one explicit crate-private module"
+    )
+
+
+def integration_targets(packages: list[dict] | None = None) -> list[str]:
+    """Every integration-test target name in the workspace, minus opc-persist.
+
+    Names are deduplicated: several crates define e.g. tests/corpus_replay.rs,
+    and ``--test corpus_replay`` selects all of them, so they form one
+    indivisible partition unit.
+    """
+    if packages is None:
+        packages = workspace_packages()
+    verify_manifest_test_sources(packages)
     names: set[str] = set()
-    for package in json.loads(raw)["packages"]:
+    for package in packages:
         if package["name"] == "opc-persist":
             continue
         for target in package["targets"]:

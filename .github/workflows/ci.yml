@@ -121,6 +121,9 @@ jobs:
       # exactly once. The shards do not wait on this job -- they run the same
       # check themselves in their precheck step -- so this is the readable
       # place to see a plan failure, not the thing that gates them.
+      - name: Test test-shard manifest audit
+        run: python3 ci/test-test-shards.py
+
       - name: Verify test shard plan
         run: python3 ci/test-shards.py verify
 
