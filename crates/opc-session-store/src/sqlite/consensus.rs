@@ -41587,7 +41587,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn classifier_rejects_active_latch_created_after_an_absent_preflight() {
+    async fn classifier_rejects_sidecar_created_after_an_absent_preflight() {
         let directory = tempfile::tempdir().expect("absent latch directory");
         let database = directory.path().join("sessions.sqlite");
         let snapshot_dir = directory.path().join("snapshots");
@@ -41607,26 +41607,18 @@ mod tests {
         drop(core);
         drop(backend);
 
-        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
-            .is_err()
-        {
-            return;
-        }
-        let latch = OperatorRecoveryLatch {
-            identity: identity(),
-            recovery_epoch: 1,
-            plan_digest: [0xB4; 32],
-            audit_pending: false,
-        };
-        let database_for_hook = database.clone();
-        install_latch_classify_before_final_revalidation_hook(move |_| {
-            ensure_operator_recovery_latch_sync(&database_for_hook, latch)
-                .expect("create active latch after absent preflight");
+        install_latch_classify_before_final_revalidation_hook(move |path| {
+            // This is intentionally a plain sidecar rather than a fixture
+            // written through the durable-record helper. The absent branch
+            // must fail closed for *any* newly appeared recovery artifact,
+            // even on a filesystem which cannot construct persistent identity.
+            std::fs::write(path, b"recovery sidecar appeared after preflight")
+                .expect("create sidecar after absent preflight");
         });
         let connection = Connection::open(&database).expect("open classifier connection");
         let error =
             match classify_operator_recovery_latch_with_connection_sync(&database, &connection) {
-                Ok(_) => panic!("active latch created after absent preflight must fail"),
+                Ok(_) => panic!("sidecar created after absent preflight must fail"),
                 Err(error) => error,
             };
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
@@ -41697,17 +41689,31 @@ mod tests {
         .expect("initialize fresh compatibility core");
         drop(core);
         drop(backend);
-        let connection = Connection::open(&database).expect("open fresh compatibility connection");
-
         // RED: a 5.14 filesystem can reject both generic persistent identity
         // facilities. GREEN: with no sidecar to replay across a crash, fresh
-        // admission and the periodic Clear probe use only live descriptor/path
-        // fencing and remain available.
+        // backend reopen, consensus startup, and the first periodic Clear
+        // probe use only live descriptor/path fencing and remain available.
         for failure in [
             opc_fs_verity_sys::PersistentFileIdentityFailure::FilesystemUuidUnsupported,
             opc_fs_verity_sys::PersistentFileIdentityFailure::FileHandleFidUnsupported,
         ] {
             force_persistent_identity_failure_for_test(Some(failure));
+            let reopened = SqliteSessionBackend::open(&database)
+                .expect("reopen pristine backend without persistent identity");
+            let reopened_core = SqliteConsensusCore::initialize(
+                &reopened,
+                directory
+                    .path()
+                    .join(format!("reopened-snapshots-{}", failure.as_str())),
+                identity(),
+                members.clone(),
+                test_member_bindings(&members),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            .expect("start pristine consensus core without persistent identity");
+            let connection = reopened_core.conn.lock().await;
             assert!(
                 classify_operator_recovery_latch_with_connection_sync(&database, &connection)
                     .expect("fresh classifier must not require persistent identity")
@@ -41719,6 +41725,9 @@ mod tests {
                 probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
                     .expect("fresh periodic probe must not require persistent identity"),
             );
+            drop(connection);
+            drop(reopened_core);
+            drop(reopened);
             force_persistent_identity_failure_for_test(None);
         }
 
@@ -41737,6 +41746,8 @@ mod tests {
         force_persistent_identity_failure_for_test(Some(
             opc_fs_verity_sys::PersistentFileIdentityFailure::FilesystemUuidUnsupported,
         ));
+        let connection =
+            Connection::open(&database).expect("open sidecar compatibility connection");
         let classifier_error =
             match classify_operator_recovery_latch_with_connection_sync(&database, &connection) {
                 Ok(_) => panic!("durable recovery sidecar must remain fail-closed"),
@@ -41756,6 +41767,52 @@ mod tests {
                 .to_string()
                 .contains("filesystem-uuid-unsupported"),
             "periodic recovery path must expose only the bounded category: {probe_error}"
+        );
+        force_persistent_identity_failure_for_test(None);
+
+        // A terminal sidecar has the same crash-boundary requirement. Its
+        // contents are deliberately not relied on here: persistent identity
+        // is required before a recovery-capable artifact can be admitted.
+        let sidecar =
+            operator_recovery_latch_path(&database).expect("derive terminal sidecar path");
+        std::fs::remove_file(&sidecar).expect("remove active sidecar");
+        let database_incarnation = operator_recovery_file_incarnation(
+            &File::open(&database).expect("open database for terminal incarnation"),
+        )
+        .expect("qualify database incarnation for terminal fixture");
+        write_latch_file(
+            &sidecar,
+            OperatorRecoveryLatchRecord::terminal(
+                latch,
+                database_incarnation,
+                OperatorRecoveryTerminalPhase::Consumed,
+                None,
+            ),
+            true,
+        )
+        .expect("publish terminal recovery sidecar");
+        force_persistent_identity_failure_for_test(Some(
+            opc_fs_verity_sys::PersistentFileIdentityFailure::FileHandleFidUnsupported,
+        ));
+        let classifier_error =
+            match classify_operator_recovery_latch_with_connection_sync(&database, &connection) {
+                Ok(_) => panic!("terminal recovery sidecar must remain fail-closed"),
+                Err(error) => error,
+            };
+        assert!(
+            classifier_error
+                .to_string()
+                .contains("file-handle-fid-unsupported"),
+            "terminal recovery classifier must expose only the bounded category: {classifier_error}"
+        );
+        let probe_error =
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect_err("periodic terminal probe must remain fail-closed");
+        assert!(
+            probe_error
+                .to_string()
+                .contains("file-handle-fid-unsupported"),
+            "terminal recovery probe must expose only the bounded category: {probe_error}"
         );
         force_persistent_identity_failure_for_test(None);
     }

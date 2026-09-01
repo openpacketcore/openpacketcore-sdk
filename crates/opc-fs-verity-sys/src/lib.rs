@@ -47,6 +47,13 @@ pub const PERSISTENT_FILE_HANDLE_MAX_BYTES: usize = 128;
 /// compatibility paths. Callers must fail closed when neither pair is
 /// available; device numbers, mount IDs and timestamps are not substitutes
 /// across remount or crash recovery.
+///
+/// Btrfs clone/seed mount arrangements that intentionally retain a duplicate
+/// filesystem ID, including a temporary `temp_fsid`, are not supported for
+/// durable recovery availability. Such mounts can make distinct clone
+/// instances indistinguishable at the filesystem-UUID boundary. Deployments
+/// using them must treat recovery as unavailable; this API does not weaken the
+/// comparison to admit that topology.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PersistentFileIdentity {
     filesystem_uuid: [u8; 16],
@@ -378,12 +385,15 @@ pub fn measure_exact_profile(fd: BorrowedFd<'_>) -> Result<[u8; DIGEST_BYTES], E
 /// Read a stable, comparison-only identity for an already-open regular file.
 ///
 /// The returned value normally combines `FS_IOC_GETFSUUID` with
-/// `name_to_handle_at(fd, "", ..., AT_EMPTY_PATH | AT_HANDLE_FID)`.  On XFS,
-/// a pre-6.5/6.9 kernel may instead provide the filesystem UUID through
-/// `XFS_IOC_FSGEOMETRY_V1` and an ordinary generation-bearing export handle.
-/// Both paths are descriptor-only and never reopen by handle.  A missing UUID
-/// or unsupported handle fails closed; callers must not replace this identity
-/// with mount IDs, timestamps, or device/inode numbers across a crash boundary.
+/// `name_to_handle_at(fd, "", ..., AT_EMPTY_PATH | AT_HANDLE_FID)`. On XFS
+/// and Btrfs, a pre-6.5/6.9 kernel may instead provide its filesystem UUID via
+/// `XFS_IOC_FSGEOMETRY_V1` or `BTRFS_IOC_FS_INFO`, respectively, and an
+/// ordinary generation-bearing export handle. Both paths are descriptor-only
+/// and never reopen by handle. Duplicate-FSID or temporary-`temp_fsid` Btrfs
+/// clone/seed mounts are unsupported for durable recovery availability, even
+/// when an ioctl happens to succeed. A missing UUID or unsupported handle
+/// fails closed; callers must not replace this identity with mount IDs,
+/// timestamps, or device/inode numbers across a crash boundary.
 #[cfg(unix)]
 pub fn persistent_file_identity(fd: BorrowedFd<'_>) -> Result<PersistentFileIdentity, Error> {
     platform::persistent_file_identity(fd)
