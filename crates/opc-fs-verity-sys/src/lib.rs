@@ -269,20 +269,10 @@ impl Error {
     /// code instead of formatting the underlying error source.
     pub fn persistent_file_identity_failure(&self) -> PersistentFileIdentityFailure {
         match self {
-            Self::ReadFilesystemUuid(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS)
-                ) =>
-            {
+            Self::ReadFilesystemUuid(error) if filesystem_uuid_is_unsupported(error) => {
                 PersistentFileIdentityFailure::FilesystemUuidUnsupported
             }
-            Self::ReadFileHandle(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
-                ) =>
-            {
+            Self::ReadFileHandle(error) if file_handle_fid_is_unsupported(error) => {
                 PersistentFileIdentityFailure::FileHandleFidUnsupported
             }
             Self::InvalidFileHandle | Self::FileHandleTooLarge { .. } => {
@@ -306,6 +296,32 @@ impl Error {
             | Self::Unsupported => PersistentFileIdentityFailure::Other,
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_uuid_is_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS)
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filesystem_uuid_is_unsupported(_error: &io::Error) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn file_handle_fid_is_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn file_handle_fid_is_unsupported(_error: &io::Error) -> bool {
+    false
 }
 
 /// Enable the fixed fs-verity profile and return its SHA-256 digest.
