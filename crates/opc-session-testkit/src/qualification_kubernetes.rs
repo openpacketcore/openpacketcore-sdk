@@ -338,6 +338,9 @@ pub fn render_qualification_kubernetes_manifest(
             workspace_directory: PathBuf::from(WORKSPACE_DIRECTORY),
             database_path: PathBuf::from(DATABASE_PATH),
             snapshot_directory: PathBuf::from(SNAPSHOT_DIRECTORY),
+            snapshot_root_directory: None,
+            snapshot_root_device: None,
+            snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
             transport: QualificationTransportConfig::ProjectedMtls(
                 QualificationProjectedMtlsConfig {
@@ -894,6 +897,9 @@ mod tests {
                     serde_json::from_str(encoded).expect("strict node config");
                 assert_eq!(node.schema_version, QUALIFICATION_NODE_SCHEMA_VERSION);
                 assert_eq!(node.node_index, node_index);
+                assert_eq!(node.snapshot_root_directory, None);
+                assert_eq!(node.snapshot_root_device, None);
+                assert_eq!(node.snapshot_root_inode, None);
                 assert_eq!(
                     node.configuration_generation,
                     format!("release-sha256-{}", "a".repeat(64))

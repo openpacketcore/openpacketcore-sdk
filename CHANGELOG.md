@@ -8,6 +8,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Create-only absent-predecessor protected roster — `opc-session-net`,
+  `opc-session-store`:** adds an independent Profile V2 for the case where the
+  authoritative session row must not exist before admission. The exact
+  persistent `opc-session-consumer/4` lane uses consumer revision 6 and
+  schema 2, requires unanimous explicit V2 activation on every fixed-durable
+  voter, and fails closed instead of downgrading to the frozen present-row
+  `/3` profile. Its first atomic `PollAdmitted` mutation authenticates the
+  exact tenant/scope/key/owner/current fence and reserves proven key absence;
+  its second and only other roster mutation either re-proves absence and
+  inserts the SDK-fixed generation-one checkpoint with an exact retained
+  `Established` receipt, or retains exact nonpublishing `Aborted` bytes while
+  leaving the key absent. Provider execution, status, adoption, reconciliation,
+  compensation, and publication remain outside consensus. Ambiguous writes
+  are status/adoption-only, `NotFound` is non-exclusionary, and only a direct
+  proven-`NotTransmitted` result permits an identical-byte retransmission.
+  The startup-owned
+  `from_fenced_mutation_roster_v2_stateless` /
+  `into_fenced_mutation_roster_v2_provider_adapter` composition retains one
+  bounded persistent pool and one provider set for an exact authority scope;
+  no per-call client or network setup is exposed. V2 has distinct canonical,
+  activation, admission, reservation, terminal, snapshot, and recovery
+  carriers, so no V1 object or certificate can authorize it.
+
+  Compatibility note: frozen V1 `/3` bytes, API behavior, schema 1, and durable
+  format 4 remain unchanged. Activating V2 advances that replica to durable
+  format 5. The new create-only consensus operation adds a public
+  `ReplicationOp` variant and advances the exact direct wire-schema revision
+  from 7 to 8, so exhaustive downstream matches must be updated and every
+  participant must use a coordinated drained stop/upgrade/start. Mixed
+  revision, mixed V2-capability, stale-activation, or prospective-learner
+  admission fails before topology or roster mutation.
+- **Authority-safe shipped-25 eBPF graph retirement — `opc-gtpu-dataplane`:**
+  adds a maintenance-only typed recovery request for the exact
+  pre-session-selector/stamp/traffic-observation 25-map generation. Recovery
+  requires explicit writer-stop and traffic-drain attestations, both legacy
+  and current kernel authority locks, exact namespace/generation/map/config/
+  replacement identity, and a conclusively detached hook/program state. Even
+  the exact historical attached pair is a typed, mutation-free refusal. A
+  dual-pinned, atomically installed phase receipt makes pin removal, graph
+  retirement, legacy-authority retirement, and terminal retry crash-resumable.
+  Ordinary startup performs only a read-only compatibility preflight and
+  remains non-destructive; foreign layouts, populated or malformed state,
+  live owners, replacement races, and ambiguous partial effects remain
+  fail-closed.
+- **Bounded protected atomic fenced-mutation roster — `opc-session-net`,
+  `opc-session-store`:** adds an opt-in revision-five persistent mTLS consumer
+  profile for one immutable roster of up to eight generic opaque provider
+  effects. One pre-effect `PollAdmitted` quorum transaction retains stable
+  caller IDs, ordered descriptors, exact protected plan/checkpoint/result, and
+  a future terminal-history reservation; provider prepare/execute/status/adopt
+  remains local and yields only SDK-issued conclusive proofs. One second
+  all-or-none quorum transaction binds every proof to the authoritative record
+  and returns durable `Established` or nonpublishing `Aborted` exact bytes.
+  Only `Established` can create publication authority. Same-body replay,
+  changed-body conflict, status-only recovery after ambiguity, higher-fence
+  takeover, restart/snapshot/key-rotation recovery, deterministic 24-hour
+  bounded reclaim, fixed diagnostics, and a real three-voter 13-cut mTLS
+  matrix preserve the two-remote-mutation hot path without exposing raw
+  consensus or creating per-subscriber resources.
 - **Finite S2b Create Session Response F-TEID receive policy —
   `opc-proto-gtpv2c`:**
   `S2bCreateSessionResponseReceivePolicy` and the one-shot
@@ -593,6 +652,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Modelling grouped-IE flag bits remains deferred.
 
 ### Changed
+- **Prepared protected atomic transitions — `opc-session-store` (breaking):**
+  `SessionBackend` now separates `prepare_fenced_transition` from execution and
+  status and adds typed `NotTransmitted`/`OutcomeUnknown` execution errors.
+  Local and remote protection wrappers seal create/update exactly once after
+  expiry preflight, leave delete/refresh provider-free, and unprotect only
+  returned observations. Protected atomic capability now remains closed unless
+  the outer wrapper has an SDK `PreparedFencedTransitionJournal` on a private
+  durable volume. The journal immutably HMAC-binds the complete opaque physical
+  token to its caller-stable request ID before dispatch, so a new process can
+  recover exact bytes without readback or provider/key reuse after ambiguity,
+  `NotFound`, endpoint/leader change, or record-key/provider rotation.
+  Authenticated consumer clients use an explicit least-authority physical
+  bridge below the same wrappers; unrelated backend and lease-coordination
+  authority remains unavailable. This protected composition advertises V2 over
+  an exact V1 physical store/consumer, while unjournaled wrappers fail closed.
+  The token and journal have fixed independent schemas and redacted failures;
+  their contents must never enter logs, metrics, diagnostics, fixtures, or
+  evidence. Recovery requires the same durable volume/path, independent journal
+  key, protection mode/namespace, stable consumer identity and cluster; host or
+  volume loss is not covered. Rollback requires a prior drain or retaining the
+  compatible reader/journal through every unresolved delayed proposal.
+- **HTTP/2 empty-DATA-frame remediation — `opc-sbi`:** raises the direct `h2`
+  floor to 0.4.16, removing RUSTSEC-2026-0258 without an advisory allowlist.
 - **Native async management-audit acknowledgement — `opc-mgmt-audit`,
   `opc-mgmt-audit-store`, `opc-gnmi-server`, and `opc-netconf-server`:**
   `AuditSink` now has an object-safe, source-compatible `record_async` method
@@ -3872,7 +3954,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may record at most one new
   availability episode while the expired member rejoins; it must recover
   inside the existing 26-second SLO and be fully settled before the clean
-  baseline. A second or late episode fails closed. The complete expiry/rejoin
+  baseline. Consecutive typed retry outcomes retain the separate exact
+  eight-outcome ceiling without being misclassified as new episodes. A second
+  or late episode fails closed. The complete expiry/rejoin
   interval has an 85/161 per-node new-attempt and reconnect bound: the ordinary
   24/40 allowance, at most fifteen five-second refresh rounds over the
   four/eight incident directed paths, and one scheduled post-hard-expiry
@@ -3884,7 +3968,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this as `new-attempts-plus-baseline-outstanding/v1`. Cancellation-classified
   `abandoned` outcomes, protocol/backend outcomes, and drain overruns remain
   forbidden throughout the fault and clean intervals. Schedule v6 advances the
-  checkpoint to `member-scoped-reauth-settled-baseline/v3` and binds its rolling
+  checkpoint to `member-scoped-reauth-settled-baseline/v4` and binds its rolling
   proof as `common-key-pulse-all-active-key-coverage/v1`. Recovery continuity
   polls use a
   non-intrusive workload snapshot; authoritative watch-head settlement keeps

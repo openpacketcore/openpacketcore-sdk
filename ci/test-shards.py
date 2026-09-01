@@ -16,7 +16,9 @@ selection builds it with ``all-apps``.
 
 Cargo launches the test binaries itself, so the harness argv, working
 directory and every ``CARGO_*`` variable a test may read stay exactly what the
-single-job run provided.
+single-job run provided, except for the explicitly enumerated protected-roster
+and snapshot/restart proofs that compile at test profile O1 without changing
+their literal authority bounds.
 
 Usage:
     test-shards.py ids                 # shard ids, one per line (CI matrix)
@@ -54,23 +56,74 @@ SELECTION = ["cargo", "test", *PACKAGES, "--quiet"]
 EXAMPLES = ["cargo", "build", *PACKAGES, "--quiet", "--examples"]
 HARNESS = ["--test-threads=4"]
 
+# These tests intentionally prove literal authority or operation budgets.
+# Running them beside unrelated Tokio runtimes makes the assertion measure
+# process scheduling and fixture teardown instead of the request path. Keep
+# the production bounds exact and give each timing contract its own process.
+# This historical suite is deliberately compiled as a crate-private lib test
+# module. It exercises raw physical adapters which must not be public merely
+# to keep an old integration target compiling. Its sensitive contracts remain
+# isolated, but use their libtest-qualified names below.
+QUIESCENT_LIB_MODULE = "stateless_quorum_consumer"
+QUIESCENT_LIB_TESTS = (
+    "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
+    "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
+    "persistent_three_voter_first_transition_has_one_leader_activation_proof",
+    "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
+    "persistent_three_voter_protected_roster_survives_real_os_process_loss",
+    "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
+    "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
+    "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+    "persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running",
+    "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
+)
+QUIESCENT_CONSENSUS_OPENRAFT_TARGET = "consensus_openraft"
+QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
+    "lagging_replica_installs_compacted_snapshot_without_losing_committed_state",
+    "fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect",
+)
+OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
+    {
+        "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
+        "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
+        "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+        "persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running",
+        "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
+    }
+)
+if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
+    raise RuntimeError("optimized timing tests must also be isolated timing tests")
+# Keep O1 confined to the snapshot/restart roster proofs.
+# Applying it to unrelated expiry/fault tests changes their lifecycle timing
+# and would no longer qualify the repository's ordinary test profile.
+OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"
+
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
-# (249 today).
+# (verify the live inventory with `test-shards.py verify`; keep this floor
+# deliberately below it).
 MIN_INTEGRATION_TARGETS = 240
+
+# Cargo normally discovers every direct ``tests/*.rs`` source automatically.
+# ``opc-session-net`` deliberately opts out so its raw physical-adapter suite
+# can remain a crate-private lib module. Once automatic discovery is disabled,
+# however, a newly added sibling source is otherwise absent from both Cargo
+# metadata and this sharder. Keep that one intentional private module explicit
+# and reject every other unregistered direct test source.
+PRIVATE_INTEGRATION_TEST_SOURCES = {
+    (
+        "opc-session-net",
+        "tests/stateless_quorum_consumer.rs",
+    ): "raw physical adapters are exercised only through the crate-private lib module",
+}
 
 
 def load_plan() -> dict:
     return json.loads(PLAN_PATH.read_text())
 
 
-def integration_targets() -> list[str]:
-    """Every integration-test target name in the workspace, minus opc-persist.
-
-    Names are deduplicated: several crates define e.g. tests/corpus_replay.rs,
-    and ``--test corpus_replay`` selects all of them, so they form one
-    indivisible partition unit.
-    """
+def workspace_packages() -> list[dict]:
+    """Return the workspace package metadata used by every shard check."""
     raw = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
         cwd=ROOT,
@@ -78,8 +131,85 @@ def integration_targets() -> list[str]:
         stdout=subprocess.PIPE,
         check=True,
     ).stdout
+    return json.loads(raw)["packages"]
+
+
+def manifest_test_source_errors(
+    packages: list[dict],
+    private_sources: dict[tuple[str, str], str] | None = None,
+) -> list[str]:
+    """List direct integration sources Cargo would silently omit from CI.
+
+    Nested ``tests/**/mod.rs`` files are support modules rather than Cargo
+    integration targets, so this intentionally audits only direct
+    ``tests/*.rs`` sources. An exemption must remain both present and
+    unregistered; that makes the deliberate crate-private module visible to
+    review while preventing it from turning into an open-ended exclusion.
+    """
+    if private_sources is None:
+        private_sources = PRIVATE_INTEGRATION_TEST_SOURCES
+    errors: list[str] = []
+    matched_exemptions: set[tuple[str, str]] = set()
+    for package in packages:
+        name = package["name"]
+        root = Path(package["manifest_path"]).parent
+        tests = root / "tests"
+        if not tests.is_dir():
+            continue
+        cargo_test_sources = {
+            Path(target["src_path"]).resolve()
+            for target in package["targets"]
+            if "test" in target["kind"] and target.get("test", True)
+        }
+        for source in sorted(tests.glob("*.rs")):
+            relative = source.relative_to(root).as_posix()
+            exemption = (name, relative)
+            registered = source.resolve() in cargo_test_sources
+            if exemption in private_sources:
+                matched_exemptions.add(exemption)
+                if registered:
+                    errors.append(
+                        f"private integration-test exemption {name}:{relative} "
+                        "is now a Cargo target; remove the exemption"
+                    )
+            elif not registered:
+                errors.append(
+                    f"integration-test source {name}:{relative} is absent from "
+                    "Cargo metadata; register it in Cargo.toml or add a narrow "
+                    "private-module exemption"
+                )
+    stale = set(private_sources) - matched_exemptions
+    for name, relative in sorted(stale):
+        errors.append(
+            f"private integration-test exemption {name}:{relative} does not "
+            "match an unregistered direct tests/*.rs source"
+        )
+    return errors
+
+
+def verify_manifest_test_sources(packages: list[dict]) -> None:
+    """Fail closed if a direct integration source cannot reach any shard."""
+    errors = manifest_test_source_errors(packages)
+    if errors:
+        sys.exit("\n".join(errors))
+    print(
+        "manifest test-source audit ok: every direct tests/*.rs source is a "
+        "Cargo target or one explicit crate-private module"
+    )
+
+
+def integration_targets(packages: list[dict] | None = None) -> list[str]:
+    """Every integration-test target name in the workspace, minus opc-persist.
+
+    Names are deduplicated: several crates define e.g. tests/corpus_replay.rs,
+    and ``--test corpus_replay`` selects all of them, so they form one
+    indivisible partition unit.
+    """
+    if packages is None:
+        packages = workspace_packages()
+    verify_manifest_test_sources(packages)
     names: set[str] = set()
-    for package in json.loads(raw)["packages"]:
+    for package in packages:
         if package["name"] == "opc-persist":
             continue
         for target in package["targets"]:
@@ -124,10 +254,77 @@ def assign(plan: dict, targets: list[str]) -> dict[str, list[str]]:
 
 
 def shard_ids(plan: dict) -> list[str]:
-    ids = ["misc"]
+    ids = ["misc", OPTIMIZED_QUIESCENT_SHARD]
     ids += [f"it-{i}" for i in range(int(plan["integration_shards"]))]
     ids += [f"heavy-{i}" for i in range(len(plan["heavy"]["shards"]))]
     return ids
+
+
+def qualified_quiescent_lib_test(name: str) -> str:
+    return f"{QUIESCENT_LIB_MODULE}::{name}"
+
+
+def quiescent_lib_command(name: str) -> list[str]:
+    """Run one private-lib timing contract in its exact isolated profile."""
+    profile = (
+        ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
+        if name in OPTIMIZED_QUIESCENT_LIB_TESTS
+        else []
+    )
+    return profile + SELECTION + [
+        "--lib",
+        "--",
+        "--test-threads=1",
+        "--exact",
+        qualified_quiescent_lib_test(name),
+    ]
+
+
+def quiescent_lib_list_command(name: str) -> list[str]:
+    """List one private-lib contract using its isolated CI profile."""
+    command = quiescent_lib_command(name)
+    command.insert(-2, "--list")
+    return command
+
+
+def quiescent_lib_tests_for_shard(shard: str) -> tuple[str, ...]:
+    """Return the private-lib timing contracts owned by one serial shard."""
+    if shard == "misc":
+        return tuple(
+            name
+            for name in QUIESCENT_LIB_TESTS
+            if name not in OPTIMIZED_QUIESCENT_LIB_TESTS
+        )
+    if shard == OPTIMIZED_QUIESCENT_SHARD:
+        return tuple(
+            name
+            for name in QUIESCENT_LIB_TESTS
+            if name in OPTIMIZED_QUIESCENT_LIB_TESTS
+        )
+    return ()
+
+
+def quiescent_consensus_openraft_command(name: str) -> list[str]:
+    """Run one snapshot contract alone with no competing test runtime."""
+    return SELECTION + [
+        "--test",
+        QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
+        "--",
+        "--test-threads=1",
+        "--exact",
+        name,
+    ]
+
+
+def quiescent_contracts() -> tuple:
+    """Integration-target contracts that require a fresh test process."""
+    return (
+        (
+            QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
+            QUIESCENT_CONSENSUS_OPENRAFT_TESTS,
+            quiescent_consensus_openraft_command,
+        ),
+    )
 
 
 def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
@@ -142,12 +339,35 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         # substring by default, which would also swallow a future test whose
         # name merely starts with a fleet test's name.
         skips = [arg for name in named for arg in ("--skip", name)]
+        # The raw-adapter qualification module is now crate-private, so it
+        # runs inside this ordinary --lib process. Exclude each timing
+        # contract here and run it below in its own --lib process; otherwise
+        # its literal timing bounds become a process-concurrency test.
+        lib_skips = [
+            arg
+            for name in QUIESCENT_LIB_TESTS
+            for arg in ("--skip", qualified_quiescent_lib_test(name))
+        ]
         return [
-            SELECTION + ["--lib", "--bins", "--", *HARNESS],
+            SELECTION + ["--lib", "--bins", "--", *HARNESS, "--exact", *lib_skips],
+            *[
+                quiescent_lib_command(name)
+                for name in quiescent_lib_tests_for_shard(shard)
+            ],
             list(EXAMPLES),
             SELECTION + ["--doc", "--", *HARNESS],
             SELECTION
             + ["--test", heavy["target"], "--", *HARNESS, "--exact", *skips],
+        ]
+
+    if shard == OPTIMIZED_QUIESCENT_SHARD:
+        # The O1 snapshot/restart proofs retain their exact serial commands,
+        # but compile once on their own runner. Keeping them behind misc's
+        # broad lib/bin run exceeded that job's hard 60-minute budget before
+        # the first O1 test process could start.
+        return [
+            quiescent_lib_command(name)
+            for name in quiescent_lib_tests_for_shard(shard)
         ]
 
     if shard.startswith("heavy-"):
@@ -166,7 +386,34 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     selected = [arg for name in buckets[shard] for arg in ("--test", name)]
     if not selected:
         sys.exit(f"shard {shard} selected no targets; the plan is broken")
-    return [SELECTION + selected + ["--", *HARNESS]]
+    contracts = [
+        contract
+        for contract in quiescent_contracts()
+        if contract[0] in buckets[shard]
+    ]
+    if not contracts:
+        return [SELECTION + selected + ["--", *HARNESS]]
+
+    # libtest's skip filter is substring-based unless --exact is present. The
+    # ordinary invocation still runs every other test in this target, while a
+    # fresh process runs each timing contract alone with no competing runtime.
+    skips = [
+        arg
+        for _, names, _ in contracts
+        for name in names
+        for arg in ("--skip", name)
+    ]
+    ordinary = (
+        SELECTION
+        + selected
+        + ["--", *HARNESS, "--exact", *skips]
+    )
+    isolated = [
+        command(name)
+        for _, names, command in contracts
+        for name in names
+    ]
+    return [ordinary, *isolated]
 
 
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -221,7 +468,8 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     proves the shard actually issues the invocations that cover them, so
     dropping (say) the doctest command cannot pass unnoticed.
     """
-    misc = [" ".join(command) for command in commands(plan, "misc", targets)]
+    misc_commands = commands(plan, "misc", targets)
+    misc = [" ".join(command) for command in misc_commands]
     required = {
         "unit tests": " --lib --bins ",
         "example compile check": "cargo build ",
@@ -231,12 +479,111 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     for label, fragment in required.items():
         if not any(fragment in f"{command} " for command in misc):
             sys.exit(f"the misc shard no longer runs {label}")
+    if len(QUIESCENT_LIB_TESTS) != len(set(QUIESCENT_LIB_TESTS)):
+        sys.exit("private-lib isolated timing contracts are duplicated")
+    lib_skip = ["--exact"] + [
+        arg
+        for name in QUIESCENT_LIB_TESTS
+        for arg in ("--skip", qualified_quiescent_lib_test(name))
+    ]
+    if misc_commands[0][-len(lib_skip) :] != lib_skip:
+        sys.exit(
+            "the misc ordinary --lib process must skip every private-lib "
+            "timing contract exactly once"
+        )
+    expected_misc_isolated = [
+        quiescent_lib_command(name)
+        for name in quiescent_lib_tests_for_shard("misc")
+    ]
+    if misc_commands[1 : 1 + len(expected_misc_isolated)] != expected_misc_isolated:
+        sys.exit(
+            "the misc shard must run its private-lib timing contracts once each, "
+            "in their declared module-qualified name order"
+        )
+    optimized_commands = commands(plan, OPTIMIZED_QUIESCENT_SHARD, targets)
+    expected_optimized_isolated = [
+        quiescent_lib_command(name)
+        for name in quiescent_lib_tests_for_shard(OPTIMIZED_QUIESCENT_SHARD)
+    ]
+    if optimized_commands != expected_optimized_isolated:
+        sys.exit(
+            "the optimized private-lib shard must run its timing contracts "
+            "once each, in their declared module-qualified name order"
+        )
+    expected_all_isolated = [
+        quiescent_lib_command(name) for name in QUIESCENT_LIB_TESTS
+    ]
+    if (
+        [*expected_misc_isolated, *expected_optimized_isolated]
+        != expected_all_isolated
+    ):
+        sys.exit(
+            "private-lib timing contracts must be partitioned between the "
+            "ordinary and optimized shards in their declared order"
+        )
     for index, group in enumerate(plan["heavy"]["shards"]):
         if not group:
             # `--exact` with no names disables filtering, so an empty group
             # would silently re-run the entire heavy target.
             sys.exit(f"heavy-{index} names no tests; remove the group instead")
-    print(f"shard commands ok: misc issues {len(misc)} invocations")
+
+    buckets = assign(plan, targets)
+    declared_names: set[str] = set()
+    for target, names, _ in quiescent_contracts():
+        if not names:
+            sys.exit(f"{target!r} has no isolated timing contracts")
+        if len(names) != len(set(names)):
+            sys.exit(f"{target!r} repeats an isolated timing contract")
+        if target not in targets:
+            sys.exit(f"isolated timing-contract target {target!r} does not exist")
+        duplicate = declared_names & set(names)
+        if duplicate:
+            sys.exit(f"isolated timing contracts are duplicated: {sorted(duplicate)}")
+        declared_names.update(names)
+
+        owners = [
+            bucket_shard
+            for bucket_shard, bucket_targets in buckets.items()
+            if target in bucket_targets
+        ]
+        if len(owners) != 1:
+            sys.exit(
+                f"{target!r} must belong to exactly one integration shard, "
+                f"found {owners}"
+            )
+        owner = owners[0]
+        owner_contracts = [
+            contract
+            for contract in quiescent_contracts()
+            if contract[0] in buckets[owner]
+        ]
+        owner_commands = commands(plan, owner, targets)
+        expected_isolated = [
+            command(name)
+            for _, contract_names, command in owner_contracts
+            for name in contract_names
+        ]
+        if owner_commands[1:] != expected_isolated:
+            sys.exit(
+                f"{owner} must run isolated timing contracts once each, in "
+                "their declared target and name order"
+            )
+        skip = ["--exact"] + [
+            arg
+            for _, contract_names, _ in owner_contracts
+            for name in contract_names
+            for arg in ("--skip", name)
+        ]
+        if owner_commands[0][-len(skip) :] != skip:
+            sys.exit(
+                f"{owner} must skip every isolated timing contract exactly "
+                "once in its ordinary multi-test process"
+            )
+    print(
+        "shard commands ok: "
+        f"misc issues {len(misc)} invocations; "
+        f"{OPTIMIZED_QUIESCENT_SHARD} issues {len(optimized_commands)}"
+    )
 
 
 def verify(plan: dict, targets: list[str]) -> None:
@@ -298,6 +645,40 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> set[str]:
     }
 
 
+def list_quiescent_test(target: str, name: str) -> list[str]:
+    """Resolve the isolated timing contract using its exact CI invocation."""
+    command = SELECTION + [
+        "--test",
+        target,
+        "--",
+        "--list",
+        "--exact",
+        name,
+    ]
+    out = subprocess.run(
+        command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
+    ).stdout
+    return [
+        line.rsplit(":", 1)[0]
+        for line in out.splitlines()
+        if line.endswith(": test")
+    ]
+
+
+def list_quiescent_lib_test(name: str) -> list[str]:
+    """Resolve one private-lib contract with its exact CI invocation."""
+    qualified = qualified_quiescent_lib_test(name)
+    command = quiescent_lib_list_command(name)
+    out = subprocess.run(
+        command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
+    ).stdout
+    return [
+        line.rsplit(":", 1)[0]
+        for line in out.splitlines()
+        if line.endswith(": test")
+    ]
+
+
 def precheck(plan: dict, shard: str) -> None:
     """Fail a heavy shard whose named tests no longer resolve.
 
@@ -309,8 +690,41 @@ def precheck(plan: dict, shard: str) -> None:
     """
     # Every shard re-checks the plan itself: rust-tests legs start alongside
     # rust-gates rather than after it, so without this a broken plan would
-    # burn six runners before the gates job reported it.
-    verify(plan, integration_targets())
+    # burn seven runners before the gates job reported it.
+    targets = integration_targets()
+    verify(plan, targets)
+    isolated_lib_tests = quiescent_lib_tests_for_shard(shard)
+    if isolated_lib_tests:
+        for name in isolated_lib_tests:
+            qualified = qualified_quiescent_lib_test(name)
+            selected = list_quiescent_lib_test(name)
+            if selected != [qualified]:
+                sys.exit(
+                    f"{shard} private-lib timing contract does not resolve "
+                    f"exactly once: expected {qualified!r}, selected {selected!r}"
+                )
+        print(
+            f"{shard} private-lib timing contracts resolve exactly once: "
+            f"{len(isolated_lib_tests)}"
+        )
+    buckets = assign(plan, targets)
+    if shard in buckets:
+        contracts = [
+            contract
+            for contract in quiescent_contracts()
+            if contract[0] in buckets[shard]
+        ]
+        for target, names, _ in contracts:
+            for name in names:
+                selected = list_quiescent_test(target, name)
+                if selected != [name]:
+                    sys.exit(
+                        f"{shard} cannot resolve isolated test {name!r} in "
+                        f"{target!r} exactly once; selected {selected}"
+                    )
+        if contracts:
+            count = sum(len(names) for _, names, _ in contracts)
+            print(f"{shard} isolated timing contracts resolve exactly once: {count}")
     if not shard.startswith("heavy-"):
         return
     group = plan["heavy"]["shards"][int(shard.split("-", 1)[1])]

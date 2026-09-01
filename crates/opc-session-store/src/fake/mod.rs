@@ -22,9 +22,10 @@ use crate::{
     backend::{
         next_replication_sequence, validate_replication_log_page_owned,
         validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_at,
-        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-        ReplicationLogRange, ReplicationOp, ReplicationTxId, ReplicationWatchCursor,
-        SessionBackend, SessionOp, SessionOpResult, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+        ProtectedRosterEstablishedSuccessor, ReplicationEntry, ReplicationLogRange, ReplicationOp,
+        ReplicationTxId, ReplicationWatchCursor, SessionBackend, SessionOp, SessionOpResult,
+        MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -35,7 +36,7 @@ use crate::{
     replication_watch::{prepare_watch_registration, ReplicationWatcher},
     restore::{
         compare_restore_records, restore_record_retained_bytes, RestoreScanCursor, RestoreScanPage,
-        RestoreScanRequest, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+        RestoreScanRequest, RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
         RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
     },
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -117,6 +118,9 @@ struct LeaseEntry {
     credential_id: u64,
     owner: OwnerId,
     fence: FenceToken,
+    /// The lease issuance time is distinct from its renewable expiry. The
+    /// protected-roster replication command authenticates both fields.
+    acquired_at: Timestamp,
     expires_at: Timestamp,
     guard_expires_at: Timestamp,
 }
@@ -146,6 +150,9 @@ impl Default for FakeBackendLimits {
 }
 
 impl FakeSessionBackend {
+    const PROTECTED_ROSTER_PROFILE_V2_CAPABILITY: &'static str =
+        "protected_roster_profile_v2_not_activated";
+
     /// Create a new fake backend with all capabilities enabled.
     pub fn new() -> Self {
         Self::with_capabilities(BackendCapabilities::all_enabled())
@@ -464,6 +471,11 @@ impl FakeSessionBackend {
         now: Timestamp,
         max_tracked_keys: usize,
     ) -> Result<(), StoreError> {
+        if Self::contains_protected_roster_established_create(&op) {
+            return Err(StoreError::CapabilityNotSupported(
+                Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+            ));
+        }
         match op {
             ReplicationOp::CompareAndSet {
                 key,
@@ -580,6 +592,7 @@ impl FakeSessionBackend {
                         credential_id,
                         owner,
                         fence,
+                        acquired_at: now,
                         expires_at,
                         guard_expires_at: expires_at,
                     },
@@ -603,6 +616,11 @@ impl FakeSessionBackend {
                     return Err(StoreError::StaleFence);
                 }
                 Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                let acquired_at = state
+                    .leases
+                    .get(&mk)
+                    .map(|entry| entry.acquired_at)
+                    .ok_or(StoreError::StaleFence)?;
                 state.leases.insert(
                     mk.clone(),
                     LeaseEntry {
@@ -610,6 +628,7 @@ impl FakeSessionBackend {
                         credential_id,
                         owner,
                         fence,
+                        acquired_at,
                         expires_at,
                         guard_expires_at: expires_at,
                     },
@@ -639,6 +658,80 @@ impl FakeSessionBackend {
                 state.key_fences.insert(mk, fence);
                 Ok(())
             }
+            ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            } => {
+                // This cannot reuse generic CAS: recovery can establish the
+                // terminal under a higher current guard while the immutable
+                // admitted row deliberately retains its original provenance.
+                if expected_record.key != key
+                    || expected_record.expires_at.is_some()
+                    || credential_id == 0
+                    || guard_expires_at <= guard_acquired_at
+                    || fence < expected_record.fence
+                {
+                    return Err(StoreError::StaleFence);
+                }
+                let mk = Self::map_key(&key);
+                let current_fence = Self::current_fence(state, &mk);
+                if current_fence > fence {
+                    return Err(StoreError::StaleFence);
+                }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                let Some(lease_entry) = state.leases.get(&mk) else {
+                    return Err(StoreError::StaleFence);
+                };
+                if !lease_entry.active
+                    || lease_entry.credential_id != credential_id
+                    || lease_entry.owner != owner
+                    || lease_entry.fence != fence
+                    || lease_entry.acquired_at != guard_acquired_at
+                    || lease_entry.guard_expires_at != guard_expires_at
+                {
+                    return Err(StoreError::StaleFence);
+                }
+                if guard_expires_at <= now || lease_entry.expires_at <= now {
+                    return Err(StoreError::LeaseExpired);
+                }
+                if state.records.get(&mk) != Some(&expected_record) {
+                    return Err(StoreError::CasConflict);
+                }
+
+                match *successor {
+                    ProtectedRosterEstablishedSuccessor::Put { record } => {
+                        if record.key != key
+                            || record.expires_at.is_some()
+                            || record.owner != expected_record.owner
+                            || record.fence != expected_record.fence
+                            || record.generation <= expected_record.generation
+                        {
+                            return Err(StoreError::CasConflict);
+                        }
+                        state.records.insert(mk.clone(), *record);
+                    }
+                    ProtectedRosterEstablishedSuccessor::Delete => {
+                        if state.records.remove(&mk).is_none() {
+                            return Err(StoreError::CasConflict);
+                        }
+                    }
+                    ProtectedRosterEstablishedSuccessor::NoOp => {}
+                }
+                state.key_fences.insert(mk, fence);
+                state.next_fence = state.next_fence.max(fence.get().saturating_add(1));
+                Ok(())
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { .. } => {
+                Err(StoreError::CapabilityNotSupported(
+                    Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+                ))
+            }
             ReplicationOp::Batch { ops } => {
                 for op in ops {
                     Self::apply_replicated_op_with_state(state, op, now, max_tracked_keys)?;
@@ -646,6 +739,24 @@ impl FakeSessionBackend {
                 Ok(())
             }
         }
+    }
+
+    fn contains_protected_roster_established_create(op: &ReplicationOp) -> bool {
+        let mut pending = vec![op];
+        while let Some(operation) = pending.pop() {
+            match operation {
+                ReplicationOp::ProtectedRosterEstablishedCreate { .. } => return true,
+                ReplicationOp::Batch { ops } => pending.extend(ops),
+                ReplicationOp::CompareAndSet { .. }
+                | ReplicationOp::DeleteFenced { .. }
+                | ReplicationOp::RefreshTtl { .. }
+                | ReplicationOp::AcquireLease { .. }
+                | ReplicationOp::RenewLease { .. }
+                | ReplicationOp::ReleaseLease { .. }
+                | ReplicationOp::ProtectedRosterEstablished { .. } => {}
+            }
+        }
+        false
     }
 
     fn next_direct_replication_sequence(
@@ -692,6 +803,14 @@ impl FakeSessionBackend {
         entries: Vec<ReplicationEntry>,
     ) -> Result<FakeBackendState, StoreError> {
         validate_replication_prefix(&entries)?;
+        if entries
+            .iter()
+            .any(|entry| Self::contains_protected_roster_established_create(&entry.op))
+        {
+            return Err(StoreError::CapabilityNotSupported(
+                Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+            ));
+        }
         let mut staged = FakeBackendState::empty();
 
         for entry in entries {
@@ -892,10 +1011,10 @@ impl SessionBackend for FakeSessionBackend {
             let next_payload_bytes = payload_bytes
                 .checked_add(record.payload.len())
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-            if next_payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            if next_payload_bytes > RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES {
                 if records.is_empty() {
                     return Err(StoreError::RestoreScanResponseTooLarge {
-                        max_bytes: RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+                        max_bytes: RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
                     });
                 }
                 has_more = true;
@@ -961,6 +1080,11 @@ impl SessionBackend for FakeSessionBackend {
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
+        if Self::contains_protected_roster_established_create(&entry.op) {
+            return Err(StoreError::CapabilityNotSupported(
+                Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+            ));
+        }
         let mut state = self.inner.lock().await;
         let mut staged = state.stage_data();
         let now = self.clock.now_utc();
@@ -1114,6 +1238,7 @@ impl SessionLeaseManager for FakeSessionBackend {
                 credential_id,
                 owner: owner.clone(),
                 fence,
+                acquired_at: now,
                 expires_at,
                 guard_expires_at: expires_at,
             },

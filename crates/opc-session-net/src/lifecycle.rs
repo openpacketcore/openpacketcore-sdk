@@ -296,6 +296,7 @@ impl ReconnectGate {
         }
     }
 
+    #[cfg(any(feature = "legacy-session-net-compat", test))]
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
@@ -318,6 +319,20 @@ impl ReconnectGate {
         deadline: tokio::time::Instant,
         generation: u64,
         material: Option<opc_tls::TlsMaterialEpoch>,
+    ) -> ReconnectAdmission {
+        self.acquire_classified_with_jitter(deadline, generation, material, Duration::ZERO)
+            .await
+    }
+
+    /// Acquire one shared reconnect attempt and publish `failure_jitter` as
+    /// part of that attempt's single cooldown deadline. Waiting callers never
+    /// apply independent sleeps, so they observe one bounded backoff edge.
+    pub(crate) async fn acquire_classified_with_jitter(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        generation: u64,
+        material: Option<opc_tls::TlsMaterialEpoch>,
+        failure_jitter: Duration,
     ) -> ReconnectAdmission {
         let epoch = ReconnectEpoch {
             generation,
@@ -367,12 +382,56 @@ impl ReconnectGate {
         ReconnectAdmission::Admitted(ReconnectAttempt {
             gate: Arc::clone(self),
             epoch,
+            failure_jitter: failure_jitter.min(self.policy.reconnect_backoff_max()),
             _permit: permit,
             finished: false,
         })
     }
 
-    fn finish(&self, epoch: ReconnectEpoch, succeeded: bool) {
+    /// Publish one coalesced cooldown after a cached connection is proven
+    /// unusable before a new setup begins. Concurrent losses in the same epoch
+    /// share the already-published edge instead of multiplying backoff or
+    /// starting independent recovery probes.
+    pub(crate) fn publish_failure_cooldown(
+        &self,
+        generation: u64,
+        material: Option<opc_tls::TlsMaterialEpoch>,
+        failure_jitter: Duration,
+    ) {
+        let epoch = ReconnectEpoch {
+            generation,
+            material,
+        };
+        self.observe_epoch(generation, material);
+        let published = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.epoch != Some(epoch) {
+                false
+            } else {
+                let now = tokio::time::Instant::now();
+                if state.next_attempt_at.is_some_and(|deadline| deadline > now) {
+                    false
+                } else {
+                    let delay = state
+                        .backoff
+                        .checked_add(failure_jitter)
+                        .unwrap_or(self.policy.reconnect_backoff_max())
+                        .min(self.policy.reconnect_backoff_max());
+                    state.next_attempt_at = Some(now.checked_add(delay).unwrap_or(now));
+                    state.backoff = self.policy.next_backoff(state.backoff);
+                    true
+                }
+            }
+        };
+        if published {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn finish(&self, epoch: ReconnectEpoch, succeeded: bool, failure_jitter: Duration) {
         let mut state = self
             .state
             .lock()
@@ -388,7 +447,12 @@ impl ReconnectGate {
             return;
         }
         let now = tokio::time::Instant::now();
-        state.next_attempt_at = Some(now.checked_add(state.backoff).unwrap_or(now));
+        let delay = state
+            .backoff
+            .checked_add(failure_jitter)
+            .unwrap_or(self.policy.reconnect_backoff_max())
+            .min(self.policy.reconnect_backoff_max());
+        state.next_attempt_at = Some(now.checked_add(delay).unwrap_or(now));
         state.backoff = self.policy.next_backoff(state.backoff);
     }
 }
@@ -404,6 +468,7 @@ pub(crate) enum ReconnectAdmission {
 pub(crate) struct ReconnectAttempt {
     gate: Arc<ReconnectGate>,
     epoch: ReconnectEpoch,
+    failure_jitter: Duration,
     _permit: OwnedSemaphorePermit,
     finished: bool,
 }
@@ -555,12 +620,12 @@ impl ReconnectAttempt {
     }
 
     pub(crate) fn succeeded(mut self) {
-        self.gate.finish(self.epoch, true);
+        self.gate.finish(self.epoch, true, Duration::ZERO);
         self.finished = true;
     }
 
     pub(crate) fn failed(mut self) {
-        self.gate.finish(self.epoch, false);
+        self.gate.finish(self.epoch, false, self.failure_jitter);
         self.finished = true;
     }
 }
@@ -568,7 +633,7 @@ impl ReconnectAttempt {
 impl Drop for ReconnectAttempt {
     fn drop(&mut self) {
         if !self.finished {
-            self.gate.finish(self.epoch, false);
+            self.gate.finish(self.epoch, false, self.failure_jitter);
         }
     }
 }
@@ -911,6 +976,39 @@ impl ConnectionLifecycle {
         current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
         peer_key: &[u8],
     ) {
+        self.observe_rotation_with_jitter(
+            now,
+            current_generation,
+            current_material_epoch,
+            None,
+            self.policy.deterministic_jitter(peer_key),
+        );
+    }
+
+    pub(crate) fn observe_authenticated_rotation(
+        &mut self,
+        now: tokio::time::Instant,
+        current_generation: u64,
+        current_material_status: opc_tls::TlsMaterialStatus,
+        material_jitter: Duration,
+    ) {
+        self.observe_rotation_with_jitter(
+            now,
+            current_generation,
+            Some(current_material_status.epoch()),
+            Some(current_material_status.published_at()),
+            material_jitter.min(self.policy.rotation_jitter()),
+        );
+    }
+
+    fn observe_rotation_with_jitter(
+        &mut self,
+        now: tokio::time::Instant,
+        current_generation: u64,
+        current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+        material_published_at: Option<tokio::time::Instant>,
+        material_jitter: Duration,
+    ) {
         let retirement = if current_generation != self.generation {
             // Explicit reauthentication is an operator command to prove a
             // current-generation handshake now. Material publications use
@@ -920,7 +1018,9 @@ impl ConnectionLifecycle {
             Some((now, RetirementReason::Explicit))
         } else if current_material_epoch != self.evidence.material_epoch {
             Some((
-                now.checked_add(self.policy.deterministic_jitter(peer_key))
+                material_published_at
+                    .unwrap_or(now)
+                    .checked_add(material_jitter)
                     .unwrap_or(now),
                 RetirementReason::MaterialEpoch,
             ))
@@ -943,6 +1043,14 @@ impl ConnectionLifecycle {
 
     pub(crate) const fn admitted_material_epoch(&self) -> Option<opc_tls::TlsMaterialEpoch> {
         self.evidence.material_epoch
+    }
+
+    pub(crate) fn peer_certificate_effective_expiry(&self) -> Option<opc_types::Timestamp> {
+        self.evidence.peer_certificate_expiry.map(|evidence| {
+            evidence
+                .leaf_expires_at
+                .min(evidence.certificate_chain_expires_at)
+        })
     }
 
     #[cfg(feature = "legacy-session-net-compat")]
@@ -1055,6 +1163,11 @@ impl ConnectionLifecycle {
 
     pub(crate) fn record_hard_overrun(&self) {
         self.metrics.record_hard_overrun();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hard_overrun_recorded(&self) -> bool {
+        self.metrics.hard_overrun_recorded.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -1452,6 +1565,80 @@ mod tests {
         for task in tasks {
             task.await.expect("lane task");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_gate_publishes_one_shared_failure_jitter_deadline() {
+        let gate = ReconnectGate::new(policy());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let ReconnectAdmission::Admitted(initial) = gate
+            .acquire_classified_with_jitter(deadline, 0, None, Duration::from_millis(7))
+            .await
+        else {
+            panic!("initial jittered attempt is admitted");
+        };
+        initial.failed();
+
+        let waiting_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting_gate.acquire(deadline, 0, None).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(16)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the 10ms minimum and one 7ms jitter sample form one shared edge"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        waiter
+            .await
+            .expect("jitter waiter task")
+            .expect("jitter waiter admission")
+            .succeeded();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_gate_coalesces_concurrent_cached_lane_losses() {
+        let gate = ReconnectGate::new(policy());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        gate.publish_failure_cooldown(0, None, Duration::from_millis(7));
+        gate.publish_failure_cooldown(0, None, Duration::from_millis(30));
+
+        let waiting_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting_gate.acquire(deadline, 0, None).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(16)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the first 10ms+7ms shared loss edge remains authoritative"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        waiter
+            .await
+            .expect("coalesced loss waiter task")
+            .expect("coalesced loss admission")
+            .succeeded();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_gate_ignores_late_cached_loss_from_superseded_epoch() {
+        let gate = ReconnectGate::new(policy());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        gate.observe_epoch(1, None);
+
+        // A lane admitted before explicit reauthentication may fail after the
+        // new generation is already visible. Its late loss cannot install a
+        // cooldown in the fresh epoch.
+        gate.publish_failure_cooldown(0, None, Duration::from_millis(30));
+
+        gate.acquire(deadline, 1, None)
+            .await
+            .expect("fresh epoch remains immediately admissible")
+            .succeeded();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            deadline - Duration::from_secs(1)
+        );
     }
 
     #[tokio::test(start_paused = true)]

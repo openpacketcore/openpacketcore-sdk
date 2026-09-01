@@ -12,10 +12,58 @@ documentation = "https://docs.rs/opc-session-net"
 keywords = ["5g", "cnf", "session", "replication", "packet-core"]
 categories = ["network-programming", "data-structures"]
 publish = false # experimental: not published until graduation
+autotests = false
+
+[[test]]
+name = "authenticated_replica_identity"
+path = "tests/authenticated_replica_identity.rs"
+
+[[test]]
+name = "consensus_transport"
+path = "tests/consensus_transport.rs"
+
+[[test]]
+name = "persistent_consumer_boundaries"
+path = "tests/persistent_consumer_boundaries.rs"
+
+[[test]]
+name = "persistent_consumer_protocol"
+path = "tests/persistent_consumer_protocol.rs"
+
+[[test]]
+name = "persistent_consumer_transport"
+path = "tests/persistent_consumer_transport.rs"
+
+[[test]]
+name = "placement_policy"
+path = "tests/placement_policy.rs"
+
+[[test]]
+name = "prepared_fenced_public_api"
+path = "tests/prepared_fenced_public_api.rs"
+
+[[test]]
+name = "rotation_bootstrap_retirement"
+path = "tests/rotation_bootstrap_retirement.rs"
+
+[[test]]
+name = "rotation_fault_matrix"
+path = "tests/rotation_fault_matrix.rs"
+
+[[test]]
+name = "session_store_facade"
+path = "tests/session_store_facade.rs"
+
+[[test]]
+name = "three_node_quorum"
+path = "tests/three_node_quorum.rs"
 
 [features]
 default = []
 insecure-test = []
+# Non-production controls used only by deterministic consensus integration
+# qualification. Canonical CI enables this through `--all-features`.
+test-control = ["opc-session-store/test-control"]
 # Quarantined protocol-v5 remote-backend RPCs. This compatibility surface
 # includes direct mutations and raw replication-log/rebuild authority and must
 # not be enabled on a production Openraft endpoint.
@@ -30,7 +78,9 @@ opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros"] }
 serde = { workspace = true, features = ["derive"] }
+postcard = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 serde_ignored = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -39,16 +89,20 @@ tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+time = { workspace = true }
+rand = { workspace = true }
+opc-key = { path = "../opc-key", version = "0.2.0" }
 
 [dev-dependencies]
+opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }
-opc-key = { path = "../opc-key", version = "0.2.0" }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
 futures-util = "0.3"
 rcgen = { workspace = true }
-time = { workspace = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 
 [lints]

@@ -30,11 +30,22 @@ pub const RESTORE_SCAN_DEFAULT_PAGE_SIZE: usize = 256;
 /// Hard maximum restore scan page size.
 pub const RESTORE_SCAN_MAX_PAGE_SIZE: usize = 1024;
 
-/// Hard maximum combined payload bytes returned by one restore page.
+/// Hard maximum combined stored-payload bytes returned by one local restore
+/// page. Session-net applies its own smaller frame-safe wire budget.
 ///
-/// Backends must stop before crossing this limit. A single record whose
-/// payload exceeds the limit is rejected rather than returned partially.
-pub const RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+/// This is deliberately larger than the session-net v5 wire-page payload
+/// budget. Standalone SQLite advertises this same stored-record limit, and a
+/// local restore scan must be able to return one record at that exact limit,
+/// including a local-AEAD or remote-seal envelope. Network adapters apply
+/// their independent frame-safe wire budget before serializing or accepting
+/// a page.
+pub const RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
+
+/// Compatibility name for the local restore-page stored-payload budget.
+///
+/// New transport code must use its own fixed wire budget rather than deriving
+/// one from this local storage limit.
+pub const RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES: usize = RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES;
 
 /// Hard maximum logical bytes retained by one restore page.
 ///
@@ -434,12 +445,12 @@ impl RestoreScanCursor {
                     ..=RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES)
                     .contains(&decoded_len) => {}
             0 | RESTORE_SCAN_CURSOR_VERSION => {
-                return Err("restore scan cursor has an invalid length")
+                return Err("restore scan cursor has an invalid length");
             }
             _ => return Err("restore scan cursor version is unsupported"),
         }
         let mut bytes = Vec::with_capacity(decoded_len);
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let high =
                 decode_hex_nibble(pair[0]).ok_or("restore scan cursor is not hexadecimal")?;
             let low = decode_hex_nibble(pair[1]).ok_or("restore scan cursor is not hexadecimal")?;
@@ -837,7 +848,7 @@ impl RestoreScanPage {
                 )
             })
         })?;
-        if payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+        if payload_bytes > RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES {
             return Err(StoreError::InvalidRestoreScanResponse(
                 "restore scan exceeded the page payload-byte limit".to_string(),
             ));

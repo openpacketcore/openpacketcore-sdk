@@ -2634,16 +2634,13 @@ fn classify_rule_readback_with_protocol_evidence(
         if candidate.family != expected_family || candidate.priority != Some(request.priority) {
             continue;
         }
-        candidate_count = candidate_count.checked_add(1).ok_or_else(|| {
-            RouteSteeringError::indeterminate(ReadbackIndeterminateReason::LimitExceeded)
-        })?;
         if candidate.has_unrepresented_attributes || candidate.resident.is_none() {
             return Ok((
                 RuleReadback::Indeterminate(ReadbackIndeterminateReason::UnrepresentableObject),
                 RuleProtocolReadbackEvidence::None,
             ));
         }
-        let current = match candidate.resident {
+        let current = match candidate.resident.as_ref() {
             Some(current) => current,
             None => {
                 return Ok((
@@ -2652,6 +2649,13 @@ fn classify_rule_readback_with_protocol_evidence(
                 ));
             }
         };
+        if is_provably_disjoint_owned_source_only_sibling(request, &candidate, current) {
+            continue;
+        }
+        let current = current.clone();
+        candidate_count = candidate_count.checked_add(1).ok_or_else(|| {
+            RouteSteeringError::indeterminate(ReadbackIndeterminateReason::LimitExceeded)
+        })?;
         if candidate_count == 1 && current == *request && candidate.fixed_kernel_semantics_exact {
             protocol_evidence = match candidate.protocol {
                 Some(LINUX_ROUTE_STEERING_PROTOCOL) => RuleProtocolReadbackEvidence::Confirmed,
@@ -2700,6 +2704,106 @@ fn classify_rule_readback_with_protocol_evidence(
             RuleProtocolReadbackEvidence::None,
         )),
     }
+}
+
+/// Whether two source selectors are provably disjoint IP prefix sets.
+///
+/// This returns `true` only for two non-wildcard prefixes of the same family
+/// whose network bits differ within their shared prefix length. It ignores
+/// host bits, and returns `false` for absent, wildcard, cross-family, or
+/// out-of-range selectors so callers fail closed unless disjointness is
+/// certain.
+fn source_prefixes_are_provably_disjoint(
+    first: Option<IpPrefix>,
+    second: Option<IpPrefix>,
+) -> bool {
+    match (first, second) {
+        (
+            Some(IpPrefix {
+                address: IpAddr::V4(first),
+                prefix_len: first_len,
+            }),
+            Some(IpPrefix {
+                address: IpAddr::V4(second),
+                prefix_len: second_len,
+            }),
+        ) => prefix_octets_are_provably_disjoint(
+            &first.octets(),
+            first_len,
+            &second.octets(),
+            second_len,
+            32,
+        ),
+        (
+            Some(IpPrefix {
+                address: IpAddr::V6(first),
+                prefix_len: first_len,
+            }),
+            Some(IpPrefix {
+                address: IpAddr::V6(second),
+                prefix_len: second_len,
+            }),
+        ) => prefix_octets_are_provably_disjoint(
+            &first.octets(),
+            first_len,
+            &second.octets(),
+            second_len,
+            128,
+        ),
+        _ => false,
+    }
+}
+
+fn prefix_octets_are_provably_disjoint(
+    first: &[u8],
+    first_len: u8,
+    second: &[u8],
+    second_len: u8,
+    max_prefix_len: u8,
+) -> bool {
+    if first_len == 0
+        || second_len == 0
+        || first_len > max_prefix_len
+        || second_len > max_prefix_len
+    {
+        return false;
+    }
+    let shared_prefix_len = first_len.min(second_len);
+    let whole_bytes = usize::from(shared_prefix_len / 8);
+    if first[..whole_bytes] != second[..whole_bytes] {
+        return true;
+    }
+    let remaining_bits = shared_prefix_len % 8;
+    if remaining_bits == 0 {
+        return false;
+    }
+    let mask = u8::MAX << (8 - remaining_bits);
+    first[whole_bytes] & mask != second[whole_bytes] & mask
+}
+
+/// A sibling can be excluded only when it is an otherwise exact owned rule
+/// whose source selector cannot match any packet selected by `request`.
+///
+/// In particular, source-only is literal: both rules use the same table and
+/// have a source selector but no destination or firewall-mark selector. Any
+/// extra kernel semantics, ownership-marker difference, wildcard, overlap, or
+/// other modeled mismatch remains a candidate and therefore cannot relax
+/// exact convergence or deletion identity.
+fn is_provably_disjoint_owned_source_only_sibling(
+    request: &RuleRequest,
+    candidate: &ParsedRuleCandidate,
+    resident: &RuleRequest,
+) -> bool {
+    candidate.fixed_kernel_semantics_exact
+        && !candidate.has_unrepresented_attributes
+        && candidate.protocol == Some(LINUX_ROUTE_STEERING_PROTOCOL)
+        && request.destination.is_none()
+        && request.fwmark.is_none()
+        && resident.destination.is_none()
+        && resident.fwmark.is_none()
+        && resident.table == request.table
+        && resident.priority == request.priority
+        && source_prefixes_are_provably_disjoint(request.source, resident.source)
 }
 
 fn nonzero_candidate_count(candidate_count: u16) -> Result<NonZeroU16, RouteSteeringError> {
@@ -3614,6 +3718,19 @@ mod tests {
         RuleRequest {
             source: Some(IpPrefix::new(
                 IpAddr::V6("2001:db8:200::10".parse().unwrap()),
+                128,
+            )),
+            destination: None,
+            fwmark: None,
+            table: 1000,
+            priority: 900,
+        }
+    }
+
+    fn ipv6_collection_rule_at(host: u16) -> RuleRequest {
+        RuleRequest {
+            source: Some(IpPrefix::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0x0200, 0, 0, 0, 0, host)),
                 128,
             )),
             destination: None,
@@ -4727,6 +4844,205 @@ mod tests {
             .requests()
             .iter()
             .any(|request| { u16::from_ne_bytes([request[4], request[5]]) == RTM_DELRULE }));
+    }
+
+    #[test]
+    fn source_only_same_priority_siblings_are_distinct_for_exact_readback() {
+        for (first, second) in [
+            (collection_rule(10), collection_rule(11)),
+            (ipv6_collection_rule_at(10), ipv6_collection_rule_at(11)),
+        ] {
+            let first_body = encode_rule_request(&first).unwrap();
+            let second_body = encode_rule_request(&second).unwrap();
+
+            assert_eq!(
+                classify_rule_readback(&second, &[first_body.clone(), second_body]).unwrap(),
+                RuleReadback::ExactPresent
+            );
+            assert_eq!(
+                classify_rule_readback(&second, &[first_body]).unwrap(),
+                RuleReadback::Absent
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_only_same_priority_siblings_converge_and_remove_independently() {
+        for (first, second) in [
+            (collection_rule(10), collection_rule(11)),
+            (ipv6_collection_rule_at(10), ipv6_collection_rule_at(11)),
+        ] {
+            let first_body = encode_rule_request(&first).unwrap();
+            let second_body = encode_rule_request(&second).unwrap();
+            let transport = ScriptedTransport::new(vec![
+                // The first UE's rule is resident before installing the second.
+                ScriptedResponse::Dump(Ok(vec![first_body.clone()])),
+                ScriptedResponse::Transaction(Ok(None)),
+                ScriptedResponse::Dump(Ok(vec![first_body.clone(), second_body.clone()])),
+                // Exact deletion of the second UE must retain the first UE.
+                ScriptedResponse::Dump(Ok(vec![first_body.clone(), second_body])),
+                ScriptedResponse::Transaction(Ok(None)),
+                ScriptedResponse::Dump(Ok(vec![first_body.clone()])),
+            ]);
+            let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+
+            assert_eq!(
+                backend.converge_rule(second.clone()).await.unwrap(),
+                RuleConvergenceOutcome::Installed
+            );
+            backend.remove_converged_rule(second.clone()).await.unwrap();
+
+            assert_eq!(
+                classify_rule_readback(&first, std::slice::from_ref(&first_body)).unwrap(),
+                RuleReadback::ExactPresent
+            );
+            assert_eq!(
+                classify_rule_readback(&second, &[first_body]).unwrap(),
+                RuleReadback::Absent
+            );
+
+            let deletes = transport
+                .requests()
+                .into_iter()
+                .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+                .collect::<Vec<_>>();
+            assert_eq!(deletes.len(), 1);
+            assert_eq!(
+                parse_rule_candidate(netlink_body(&deletes[0]))
+                    .unwrap()
+                    .and_then(|candidate| candidate.resident),
+                Some(second)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_only_siblings_fail_closed_without_strict_disjointness_evidence() {
+        let first = collection_rule(10);
+        let second = collection_rule(11);
+        let second_body = encode_rule_request(&second).unwrap();
+
+        let duplicate =
+            match classify_rule_readback(&second, &[second_body.clone(), second_body.clone()])
+                .unwrap()
+            {
+                RuleReadback::Conflict(conflict) => conflict,
+                other => panic!("duplicate exact rule was not rejected: {other:?}"),
+            };
+        assert_eq!(duplicate.candidate_count().get(), 2);
+
+        let mut overlapping = first.clone();
+        overlapping.source = Some(prefix([192, 0, 2, 0], 24));
+        assert!(matches!(
+            classify_rule_readback(
+                &second,
+                &[
+                    encode_rule_request(&overlapping).unwrap(),
+                    second_body.clone()
+                ],
+            )
+            .unwrap(),
+            RuleReadback::Conflict(_)
+        ));
+
+        let mut wildcard = encode_rule_request(&first).unwrap();
+        wildcard[2] = 0;
+        assert!(matches!(
+            classify_rule_readback(&second, &[wildcard, second_body.clone()]).unwrap(),
+            RuleReadback::Conflict(_)
+        ));
+
+        let mut destination_rule = first.clone();
+        destination_rule.destination = Some(prefix([198, 51, 100, 10], 32));
+        let mut mark_rule = first.clone();
+        mark_rule.fwmark = Some(FirewallMark {
+            value: 1,
+            mask: u32::MAX,
+        });
+        for non_source_only in [destination_rule, mark_rule] {
+            assert!(matches!(
+                classify_rule_readback(
+                    &second,
+                    &[
+                        encode_rule_request(&non_source_only).unwrap(),
+                        second_body.clone(),
+                    ],
+                )
+                .unwrap(),
+                RuleReadback::Conflict(_)
+            ));
+        }
+
+        let mut non_stock = encode_rule_request(&first).unwrap();
+        non_stock[3] = 1;
+        assert!(matches!(
+            classify_rule_readback(&second, &[non_stock, second_body.clone()]).unwrap(),
+            RuleReadback::Conflict(_)
+        ));
+
+        let mut discarded_marker = encode_rule_request(&first).unwrap();
+        remove_attr(&mut discarded_marker, FIB_RULE_HEADER_LEN, FRA_PROTOCOL);
+        let mut substituted_marker = encode_rule_request(&first).unwrap();
+        set_attr_u8(
+            &mut substituted_marker,
+            FIB_RULE_HEADER_LEN,
+            FRA_PROTOCOL,
+            0,
+        );
+        for marker_mismatched in [discarded_marker, substituted_marker] {
+            assert!(matches!(
+                classify_rule_readback(&second, &[marker_mismatched, second_body.clone()]).unwrap(),
+                RuleReadback::Conflict(_)
+            ));
+        }
+
+        let mut unrepresentable = encode_rule_request(&first).unwrap();
+        append_attr_u32_ne(&mut unrepresentable, 0x3ffe, 1).unwrap();
+        assert_eq!(
+            classify_rule_readback(&second, &[unrepresentable, second_body.clone()]).unwrap(),
+            RuleReadback::Indeterminate(ReadbackIndeterminateReason::UnrepresentableObject)
+        );
+
+        let mut malformed = encode_rule_request(&first).unwrap();
+        remove_attr(&mut malformed, FIB_RULE_HEADER_LEN, FRA_SRC);
+        let backend =
+            LinuxRouteSteeringBackend::with_transport(CapturingTransport::with_dump_bodies(vec![
+                malformed,
+                second_body,
+            ]));
+        assert_eq!(
+            backend.read_rule(&second).await.unwrap(),
+            RuleReadback::Indeterminate(ReadbackIndeterminateReason::MalformedReply)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_only_sibling_removal_reports_a_reintroduced_target_as_concurrent() {
+        let first = collection_rule(10);
+        let second = collection_rule(11);
+        let first_body = encode_rule_request(&first).unwrap();
+        let second_body = encode_rule_request(&second).unwrap();
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(vec![first_body.clone(), second_body.clone()])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![first_body, second_body])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+
+        assert!(matches!(
+            backend.remove_converged_rule(second).await,
+            Err(RouteSteeringError::ReadbackIndeterminate {
+                reason: ReadbackIndeterminateReason::ConcurrentModification,
+            })
+        ));
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .map(|request| read_u16_ne(request, 4).unwrap())
+                .collect::<Vec<_>>(),
+            vec![RTM_GETRULE, RTM_DELRULE, RTM_GETRULE]
+        );
     }
 
     #[test]

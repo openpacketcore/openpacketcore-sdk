@@ -293,6 +293,9 @@ impl SbiServerBuilder {
     }
 }
 
+// Axum middleware uses `Response` for short-circuit errors; boxing it would
+// change the framework handler contract.
+#[allow(clippy::result_large_err)]
 async fn auth_middleware(
     State((auth_policy, production_mode)): State<(Option<Arc<dyn SbiAuth>>, bool)>,
     mut req: axum::extract::Request,
@@ -356,6 +359,9 @@ async fn auth_middleware(
     Ok(next.run(req).await)
 }
 
+// Axum middleware uses `Response` for short-circuit overload errors; boxing it
+// would change the framework handler contract.
+#[allow(clippy::result_large_err)]
 async fn admission_middleware(
     State((max, counter)): State<(usize, Arc<AtomicUsize>)>,
     req: axum::extract::Request,

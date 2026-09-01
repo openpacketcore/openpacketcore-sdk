@@ -119,9 +119,15 @@ the prefixes are provably disjoint. Overlap, exact duplicates, destination or
 firewall-mark siblings, wildcard selectors, foreign collisions, ownership-
 tagged objects that cannot be represented, and ambiguous resident state fail
 closed before destructive cleanup. This preserves the conservative singleton
-contract, where multiple candidates at the broad family/priority collision key
-remain ambiguous, while providing an exact collection-level removal target
-that preserves disjoint siblings.
+contract except for one narrow Linux-only singleton readback/removal exception:
+stock, protocol-`242`-owned, same-table, source-only rules with provably
+disjoint non-`/0` source prefixes may coexist as siblings. Linux then proves
+the exact target absent after deletion while preserving those siblings; it does
+not claim the entire broad family/priority key is absent. Every other sibling,
+including malformed, unknown, unrepresentable, foreign, overlapping,
+wildcard, destination-qualified, or firewall-mark-qualified state remains
+fail-closed rather than being excluded from the broad collision key. Collection
+reconciliation remains the authoritative complete-set path for siblings.
 
 Linux and mock reconciliation perform one authoritative workflow serialized
 among clones of the same backend: validate a complete bounded resident
@@ -162,8 +168,8 @@ before invoking reconciliation; the SDK does not persist intent. Protocol
 `242` is still only a namespace-local reservation, not authentication, so safe
 cleanup depends on one orchestrated exclusive writer for each declared scope
 and external coordination for overlapping scopes or deliberate marker reuse.
-Legacy static routes, untagged rules, singleton convergence, and their existing
-migration requirements remain unchanged. Scripted Linux tests cover
+Legacy static routes, untagged rules, and their existing migration requirements
+remain unchanged. Scripted Linux tests cover
 same-priority sibling install, exact retry, and targeted removal; foreign
 conflict and cross-set prefix-overlap rejection without mutation, including an
 exact retry; marker omission/substitution rollback preserving owned state;
@@ -1177,16 +1183,17 @@ post-expiry replacement advances only the recovered member's explicit
 reauthentication generation, proves fresh bidirectional incident paths, leaves
 unrelated survivor explicit/material-epoch retirement counters unchanged, and
 settles lifecycle plus survivor availability before the next phase baseline.
-That schedule-bound `member-scoped-reauth-settled-baseline/v3` checkpoint
+That schedule-bound `member-scoped-reauth-settled-baseline/v4` checkpoint
 starts its 86-second fail-safe and 60-second two-stage server tail at the atomic
 projected-data rename, then requires a final 2.5-second outbound quiet tail.
 A prepublication common-key pulse plus 13-second observation checkpoints
 requires one active key to advance on every survivor observer and conservatively
 bounds that pulse's actual event gap to 26 seconds. An independent 26-second
 checkpoint requires every active key on every observer and cannot be reset by a
-faster key. At most one rejoin
-interruption/recovery pair per survivor may settle within that SLO; a second or
-late episode fails closed. The checkpoint also retains bounded 85/161 per-node
+faster key. At most one rejoin availability episode per survivor may settle
+within that SLO. Its consecutive typed retry outcomes remain separately
+bounded by the unchanged eight-outcome ceiling; a second or late episode fails
+closed. The checkpoint also retains bounded 85/161 per-node
 fault-era new-attempt/reconnect evidence (ordinary 24/40, fifteen five-second
 refresh rounds over four/eight incident paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved

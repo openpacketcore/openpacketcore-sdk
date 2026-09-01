@@ -76,61 +76,8 @@ fn decode_manifest(
     SessionHaCandidateManifestV4::from_json(&encoded)
 }
 
-fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
-    match &mut schema {
-        Value::Object(object) => {
-            for unsupported in ["maxItems", "maxLength", "maximum", "pattern", "uniqueItems"] {
-                object.remove(unsupported);
-            }
-            for value in object.values_mut() {
-                *value = structural_schema_for_lightweight_validator(value.take());
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                *value = structural_schema_for_lightweight_validator(value.take());
-            }
-        }
-        _ => {}
-    }
-    schema
-}
-
-fn inline_local_refs(schema: &Value, root: &Value) -> Value {
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        let name = reference
-            .strip_prefix("#/$defs/")
-            .expect("qualification schemas use only local definitions");
-        return inline_local_refs(
-            root.get("$defs")
-                .and_then(|definitions| definitions.get(name))
-                .expect("referenced local definition exists"),
-            root,
-        );
-    }
-    match schema {
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .filter(|(key, _)| key.as_str() != "$defs")
-                .map(|(key, value)| (key.clone(), inline_local_refs(value, root)))
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(
-            values
-                .iter()
-                .map(|value| inline_local_refs(value, root))
-                .collect(),
-        ),
-        _ => schema.clone(),
-    }
-}
-
 fn validate_structural_schema(schema: &Value, instance: &Value) -> Result<(), String> {
-    opc_schema_validate::validate(
-        &structural_schema_for_lightweight_validator(inline_local_refs(schema, schema)),
-        instance,
-    )
+    opc_schema_validate::validate(schema, instance)
 }
 
 #[test]
@@ -143,7 +90,7 @@ fn v4_profile_is_an_additive_frozen_candidate_contract() {
         .expect("v4 profile satisfies its closed schema");
 
     let profile = SessionHaCandidateQualificationProfileV4::from_json(
-        SESSION_HA_CANDIDATE_PROFILE_V4_JSON.as_bytes(),
+        &serde_json::to_vec(&profile_value).expect("canonical v4 profile"),
     )
     .expect("strict typed v4 profile");
     assert_eq!(
@@ -190,7 +137,19 @@ fn v4_profile_is_an_additive_frozen_candidate_contract() {
     let encoded = serde_json::to_vec(&drifted).expect("encode drifted profile");
     assert_eq!(
         SessionHaCandidateQualificationProfileV4::from_json(&encoded),
-        Err(QualificationCandidateContractError::InvalidProfile)
+        Err(QualificationCandidateContractError::InvalidDocument)
+    );
+
+    let mut retroactive_revision = profile_value.clone();
+    retroactive_revision["protocol"]["application_revision"] = 2.into();
+    assert!(validate_structural_schema(&profile_schema, &retroactive_revision).is_err());
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV4::from_json(
+            &serde_json::to_vec(&retroactive_revision)
+                .expect("encode retroactive v4 application revision")
+        ),
+        Err(QualificationCandidateContractError::InvalidDocument),
+        "the deny-unknown typed decoder rejects a later authority-bearing protocol field before normalization"
     );
 
     let mut unsupported_claim = profile_value;
@@ -208,7 +167,7 @@ fn v5_profile_closes_the_deployed_collector_inventory_without_graduating_it() {
         .expect("v5 profile satisfies its closed schema");
 
     let profile = SessionHaCandidateQualificationProfileV5::from_json(
-        SESSION_HA_CANDIDATE_PROFILE_V5_JSON.as_bytes(),
+        &serde_json::to_vec(&profile_value).expect("canonical v5 profile"),
     )
     .expect("strict typed v5 profile");
     assert_eq!(
@@ -276,7 +235,7 @@ fn v5_profile_closes_the_deployed_collector_inventory_without_graduating_it() {
     let encoded = serde_json::to_vec(&drifted).expect("encode drifted profile");
     assert_eq!(
         SessionHaCandidateQualificationProfileV5::from_json(&encoded),
-        Err(QualificationCandidateContractError::InvalidProfile)
+        Err(QualificationCandidateContractError::InvalidDocument)
     );
 
     let mut unsupported_claim = profile_value;
@@ -285,16 +244,23 @@ fn v5_profile_closes_the_deployed_collector_inventory_without_graduating_it() {
     let encoded = serde_json::to_vec(&unsupported_claim).expect("encode unsupported claim");
     assert_eq!(
         SessionHaCandidateQualificationProfileV5::from_json(&encoded),
-        Err(QualificationCandidateContractError::UnsupportedClaim)
+        Err(QualificationCandidateContractError::InvalidDocument)
     );
 }
 
 #[test]
 fn v5_profile_decoder_is_bounded_and_closed() {
-    let mut exact_limit = SESSION_HA_CANDIDATE_PROFILE_V5_JSON.as_bytes().to_vec();
+    let mut exact_limit = serde_json::to_vec(
+        &serde_json::from_str::<Value>(SESSION_HA_CANDIDATE_PROFILE_V5_JSON)
+            .expect("v5 profile value"),
+    )
+    .expect("canonical v5 profile");
     exact_limit.resize(SESSION_HA_CANDIDATE_PROFILE_V5_MAX_BYTES, b' ');
-    SessionHaCandidateQualificationProfileV5::from_json(&exact_limit)
-        .expect("valid v5 profile at exact document limit");
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV5::from_json(&exact_limit),
+        Err(QualificationCandidateContractError::InvalidDocument),
+        "padded equivalent JSON is not durable evidence"
+    );
 
     exact_limit.push(b' ');
     assert_eq!(
@@ -311,6 +277,17 @@ fn v5_profile_decoder_is_bounded_and_closed() {
         ),
         Err(QualificationCandidateContractError::InvalidDocument)
     );
+
+    let mut retroactive_revision: Value =
+        serde_json::from_str(SESSION_HA_CANDIDATE_PROFILE_V5_JSON).expect("v5 profile value");
+    retroactive_revision["protocol"]["application_revision"] = 2.into();
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV5::from_json(
+            &serde_json::to_vec(&retroactive_revision).expect("encode retroactive revision")
+        ),
+        Err(QualificationCandidateContractError::InvalidDocument),
+        "frozen v5 evidence cannot acquire a later authority-bearing protocol field"
+    );
 }
 
 #[test]
@@ -319,8 +296,10 @@ fn v4_manifest_binds_both_independent_checkers_and_component_bytes() {
         .expect("v4 manifest schema");
     let value = manifest_value();
     validate_structural_schema(&schema, &value).expect("v4 manifest satisfies its closed schema");
-    let manifest = SessionHaCandidateManifestV4::from_json(MANIFEST_FIXTURE.as_bytes())
-        .expect("strict typed v4 manifest");
+    let manifest = SessionHaCandidateManifestV4::from_json(
+        &serde_json::to_vec(&value).expect("canonical manifest"),
+    )
+    .expect("strict typed v4 manifest");
 
     assert_eq!(
         manifest.profile.sha256.as_str(),
@@ -586,7 +565,14 @@ fn v4_manifest_rejects_claim_artifact_campaign_checker_and_gate_tampering() {
         ),
     ];
 
+    let schema: Value = serde_json::from_str(SESSION_HA_CANDIDATE_MANIFEST_V4_SCHEMA_JSON)
+        .expect("manifest schema");
     for (name, value, expected) in cases {
+        let expected = if validate_structural_schema(&schema, &value).is_err() {
+            QualificationCandidateContractError::InvalidDocument
+        } else {
+            expected
+        };
         assert_eq!(decode_manifest(&value), Err(expected), "{name}");
     }
 }

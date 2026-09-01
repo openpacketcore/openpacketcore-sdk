@@ -250,7 +250,7 @@ pub fn decode_ikev2_signature_hash_algorithms_notify(
     }
 
     let mut algorithms = Vec::with_capacity(count);
-    for encoded in notify.notification_data.chunks_exact(2) {
+    for encoded in notify.notification_data.as_chunks::<2>().0 {
         let value = u16::from_be_bytes([encoded[0], encoded[1]]);
         let algorithm = Ikev2SignatureHashAlgorithm::from_wire(value)?;
         if algorithms.contains(&algorithm) {

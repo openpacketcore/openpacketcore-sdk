@@ -92,8 +92,10 @@ impl DurableConsensusTimingProfile {
         Duration::from_millis(match family {
             ConsensusRpcFamily::Vote => self.vote_timeout_millis,
             ConsensusRpcFamily::AppendEntries => self.append_entries_timeout_millis,
+            ConsensusRpcFamily::AppendEntriesRoster => self.append_entries_timeout_millis,
             ConsensusRpcFamily::InstallSnapshot => self.install_snapshot_timeout_millis,
             ConsensusRpcFamily::ForwardMutation => self.forward_mutation_timeout_millis,
+            ConsensusRpcFamily::ForwardRosterMutation => self.forward_mutation_timeout_millis,
             ConsensusRpcFamily::ReadBarrier => self.read_barrier_timeout_millis,
             ConsensusRpcFamily::TopologyAdmissionBarrier => self.read_barrier_timeout_millis,
         })
@@ -112,6 +114,23 @@ impl DurableConsensusTimingProfile {
     /// Return the consensus listener frame-idle ceiling.
     pub const fn server_idle_timeout(self) -> Duration {
         Duration::from_millis(self.server_idle_timeout_millis)
+    }
+
+    /// Return the maximum client-observed idle age allowed for a cached
+    /// consensus connection.
+    ///
+    /// A reconnect has to begin before the listener's fixed frame-idle
+    /// ceiling. Reserving the complete cold-connect allowance gives resolver,
+    /// TCP, mutual-TLS, and bootstrap work a profile-owned reconnection
+    /// margin instead of coupling callers to a deployment-specific timeout.
+    /// It is not a proof about response timing or client/server clock skew:
+    /// the transport records a successful use from an instant captured no
+    /// later than request dispatch.
+    pub const fn client_connection_reuse_limit(self) -> Duration {
+        Duration::from_millis(
+            self.server_idle_timeout_millis
+                .saturating_sub(self.cold_connect_timeout_millis),
+        )
     }
 
     /// Return the consensus listener handler ceiling.
@@ -140,6 +159,14 @@ pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =
 /// consensus adapters.
 pub const DURABLE_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout();
+
+/// Fixed interval between authenticated remote-retirement setup probes for one
+/// exact durable-consensus peer and local authentication epoch.
+///
+/// This is deliberately independent from Openraft election/vote timing and
+/// from generic transport reconnect backoff: it bounds negative admission
+/// probes after a remote peer has authenticated and declined bootstrap.
+pub const DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum number of log entries admitted to one durable AppendEntries batch.
 pub const DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES: usize = 64;
@@ -212,6 +239,7 @@ pub fn validate_durable_consensus_timing_profile(
         || profile.vote_timeout_millis != profile.election_timeout_min_millis
         || profile.forward_mutation_timeout_millis > profile.operation_timeout_millis
         || profile.read_barrier_timeout_millis > profile.operation_timeout_millis
+        || profile.server_idle_timeout_millis <= profile.cold_connect_timeout_millis
         || profile.server_idle_timeout_millis < largest_rpc_timeout
         || profile.server_handler_timeout_millis < largest_rpc_timeout
     {
@@ -307,12 +335,17 @@ mod tests {
             Duration::from_millis(2_000)
         );
         assert_eq!(
+            profile.rpc_timeout(ConsensusRpcFamily::AppendEntriesRoster),
+            Duration::from_millis(2_000)
+        );
+        assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::Vote),
             Duration::from_millis(5_000)
         );
         for family in [
             ConsensusRpcFamily::InstallSnapshot,
             ConsensusRpcFamily::ForwardMutation,
+            ConsensusRpcFamily::ForwardRosterMutation,
             ConsensusRpcFamily::ReadBarrier,
             ConsensusRpcFamily::TopologyAdmissionBarrier,
         ] {
@@ -321,7 +354,16 @@ mod tests {
         assert_eq!(profile.election_timeout_min_millis, 5_000);
         assert_eq!(profile.election_timeout_max_millis, 8_000);
         assert_eq!(profile.operation_timeout(), Duration::from_millis(10_000));
+        assert_eq!(
+            DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
+            Duration::from_secs(5)
+        );
         assert_eq!(profile.server_idle_timeout(), Duration::from_millis(30_000));
+        assert_eq!(
+            profile.client_connection_reuse_limit(),
+            Duration::from_millis(28_500)
+        );
+        assert!(profile.client_connection_reuse_limit() < profile.server_idle_timeout());
         assert_eq!(
             profile.server_handler_timeout(),
             Duration::from_millis(30_000)
@@ -379,6 +421,10 @@ mod tests {
             },
             DurableConsensusTimingProfile {
                 server_idle_timeout_millis: fixed.install_snapshot_timeout_millis - 1,
+                ..fixed
+            },
+            DurableConsensusTimingProfile {
+                server_idle_timeout_millis: fixed.cold_connect_timeout_millis,
                 ..fixed
             },
             DurableConsensusTimingProfile {

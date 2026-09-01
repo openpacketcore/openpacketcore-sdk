@@ -17,17 +17,20 @@ use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use opc_consensus::engine::{EmptyNode, Membership, StoredMembership, Vote};
-use opc_consensus::{decode_bounded, encode_bounded, ConsensusCodecError};
+use opc_consensus::engine::{EmptyNode, EntryPayload, Membership, StoredMembership, Vote};
+use opc_consensus::{
+    decode_bounded, decode_roster_bounded, encode_bounded, encode_roster_bounded,
+    ConsensusCodecError,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
 
 use super::{
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionRaft, SessionRaftTypeConfig,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionRaft, SessionRaftTypeConfig, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
 use crate::readiness::PlacementResiliencePolicy;
@@ -49,6 +52,7 @@ pub(crate) struct FixedQuorumEngineAdmission {
     bindings: BTreeMap<SessionConsensusNodeId, super::SessionTopologyMemberBinding>,
     placement_policy: PlacementResiliencePolicy,
     admitted: Arc<AtomicBool>,
+    operation_timeout: std::time::Duration,
 }
 
 impl FixedQuorumEngineAdmission {
@@ -59,6 +63,7 @@ impl FixedQuorumEngineAdmission {
         bindings: BTreeMap<super::SessionConsensusNodeId, super::SessionTopologyMemberBinding>,
         placement_policy: PlacementResiliencePolicy,
         admitted: Arc<AtomicBool>,
+        operation_timeout: std::time::Duration,
     ) -> Self {
         Self {
             backend,
@@ -67,6 +72,7 @@ impl FixedQuorumEngineAdmission {
             bindings,
             placement_policy,
             admitted,
+            operation_timeout,
         }
     }
 }
@@ -934,6 +940,9 @@ impl fmt::Debug for SessionRaftNetwork {
 }
 
 impl SessionRaftNetwork {
+    // OpenRaft requires this transport error type; boxing it would change the
+    // adapter's prescribed RPC error contract.
+    #[allow(clippy::result_large_err)]
     async fn call<Resp, E>(
         &self,
         family: SessionConsensusRpcFamily,
@@ -988,19 +997,28 @@ impl SessionRaftNetwork {
         result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
     }
 
+    // OpenRaft's append RPC must retain its prescribed transport error type.
+    #[allow(clippy::result_large_err)]
     async fn append(
         &self,
         request: &AppendEntriesRequest<SessionRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<SessionConsensusNodeId>, EngineRpcError> {
         let entry_count = request.entries.len();
-        let payload = match encode_bounded(request) {
+        let roster_append = is_singleton_roster_append(request);
+        let payload = match if roster_append {
+            encode_roster_bounded(request)
+        } else {
+            encode_bounded(request)
+        } {
             Ok(payload) => payload,
             Err(ConsensusCodecError::TooLarge) => {
-                if let Some(entries_hint) = append_entries_split_hint(entry_count) {
-                    return Err(EngineRpcError::PayloadTooLarge(
-                        PayloadTooLarge::new_entries_hint(entries_hint),
-                    ));
+                if !roster_append {
+                    if let Some(entries_hint) = append_entries_split_hint(entry_count) {
+                        return Err(EngineRpcError::PayloadTooLarge(
+                            PayloadTooLarge::new_entries_hint(entries_hint),
+                        ));
+                    }
                 }
                 return Err(EngineRpcError::Unreachable(Unreachable::new(
                     &CodecTransportError(ConsensusCodecError::TooLarge),
@@ -1013,12 +1031,43 @@ impl SessionRaftNetwork {
             }
         };
         self.call(
-            SessionConsensusRpcFamily::AppendEntries,
+            if roster_append {
+                SessionConsensusRpcFamily::AppendEntriesRoster
+            } else {
+                SessionConsensusRpcFamily::AppendEntries
+            },
             opc_consensus::engine::RPCTypes::AppendEntries,
             payload,
             option,
         )
         .await
+    }
+}
+
+/// A roster-sized append envelope may carry exactly one normal protected-
+/// roster application command. Heartbeats and every other batching shape stay
+/// on ordinary AppendEntries so the relaxed payload ceiling is never generic.
+pub(crate) fn is_singleton_roster_append(
+    request: &AppendEntriesRequest<SessionRaftTypeConfig>,
+) -> bool {
+    match request.entries.as_slice() {
+        [entry] => match &entry.payload {
+            EntryPayload::Normal(SessionConsensusCommand { intent, .. }) => {
+                let intent = match intent {
+                    SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+                    intent => intent,
+                };
+                matches!(
+                    intent,
+                    SessionMutationIntent::RosterAdmission(_)
+                        | SessionMutationIntent::RosterTerminal(_)
+                        | SessionMutationIntent::RosterAdmissionV2(_)
+                        | SessionMutationIntent::RosterTerminalV2(_)
+                )
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1128,23 +1177,17 @@ impl SessionRaftRpcHandler {
             fixed_quorum_admission: Some(fixed_quorum_admission),
         }
     }
-}
 
-impl fmt::Debug for SessionRaftRpcHandler {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionRaftRpcHandler")
-            .field("peer_directory", &self.peer_directory)
-            .field("local_node_id", &self.local_node_id)
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait::async_trait]
-impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
-    async fn handle(
+    /// Handle a raw engine RPC using the complete inbound operation deadline.
+    ///
+    /// The durable fixed-quorum authority record is checked at this final
+    /// shared engine boundary. Callers that already own a request deadline
+    /// pass it unchanged so SQLite lock contention consumes no second budget.
+    pub(crate) async fn handle_before(
         &self,
         authenticated_sender: SessionConsensusNodeId,
         request: SessionConsensusWireRequest,
+        deadline: tokio::time::Instant,
     ) -> SessionConsensusWireResponse {
         if let Err(error) = validate_envelope(authenticated_sender, &request) {
             return rejected_response(error);
@@ -1154,17 +1197,20 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
             // every other raw engine entry requires the exact durable fixed
             // authority before it can alter vote, log, commit, or snapshot
             // state. The record check itself distinguishes those states.
-            if !authority
-                .backend
-                .fixed_quorum_authority_record_is_exact(
-                    authority.storage_identity,
-                    &authority.members,
-                    &authority.bindings,
-                    authority.placement_policy,
-                    !authority.admitted.load(Ordering::Acquire),
+            if !matches!(
+                tokio::time::timeout_at(
+                    deadline,
+                    authority.backend.fixed_quorum_authority_record_is_exact(
+                        authority.storage_identity,
+                        &authority.members,
+                        &authority.bindings,
+                        authority.placement_policy,
+                        !authority.admitted.load(Ordering::Acquire),
+                    ),
                 )
-                .await
-            {
+                .await,
+                Ok(true)
+            ) {
                 return rejected_response(SessionConsensusPeerError::ScopeMismatch);
             }
         }
@@ -1192,6 +1238,17 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
                     request.sender,
                 ) {
                     Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.append_entries(rpc).await)
+            }
+            SessionConsensusRpcFamily::AppendEntriesRoster => {
+                let rpc = match decode_roster_and_bind_sender::<
+                    AppendEntriesRequest<SessionRaftTypeConfig>,
+                >(&request.payload, request.sender)
+                {
+                    Ok(rpc) if is_singleton_roster_append(&rpc) => rpc,
+                    Ok(_) => return rejected_response(SessionConsensusPeerError::Protocol),
                     Err(error) => return rejected_response(error),
                 };
                 encode_engine_result(&self.raft.append_entries(rpc).await)
@@ -1229,7 +1286,9 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
                 }
                 encode_engine_result(&self.raft.install_snapshot(rpc).await)
             }
-            SessionConsensusRpcFamily::ForwardMutation | SessionConsensusRpcFamily::ReadBarrier => {
+            SessionConsensusRpcFamily::ForwardMutation
+            | SessionConsensusRpcFamily::ForwardRosterMutation
+            | SessionConsensusRpcFamily::ReadBarrier => {
                 return rejected_response(SessionConsensusPeerError::Rejected);
             }
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
@@ -1245,6 +1304,33 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
             },
             Err(error) => rejected_response(error),
         }
+    }
+}
+
+impl fmt::Debug for SessionRaftRpcHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRaftRpcHandler")
+            .field("peer_directory", &self.peer_directory)
+            .field("local_node_id", &self.local_node_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        let now = tokio::time::Instant::now();
+        let deadline = self
+            .fixed_quorum_admission
+            .as_ref()
+            .and_then(|authority| now.checked_add(authority.operation_timeout))
+            .unwrap_or(now);
+        self.handle_before(authenticated_sender, request, deadline)
+            .await
     }
 }
 
@@ -1266,6 +1352,7 @@ fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
         family,
         SessionConsensusRpcFamily::Vote
             | SessionConsensusRpcFamily::AppendEntries
+            | SessionConsensusRpcFamily::AppendEntriesRoster
             | SessionConsensusRpcFamily::InstallSnapshot
     )
 }
@@ -1306,6 +1393,21 @@ where
     Ok(request)
 }
 
+fn decode_roster_and_bind_sender<T>(
+    payload: &[u8],
+    sender: SessionConsensusNodeId,
+) -> Result<T, SessionConsensusPeerError>
+where
+    T: DeserializeOwned + EngineRequestSender,
+{
+    let request: T =
+        decode_roster_bounded(payload).map_err(|_| SessionConsensusPeerError::Protocol)?;
+    if request.vote().leader_id.voted_for() != Some(sender) {
+        return Err(SessionConsensusPeerError::ScopeMismatch);
+    }
+    Ok(request)
+}
+
 fn encode_engine_result<T, E>(result: &Result<T, E>) -> Result<Vec<u8>, SessionConsensusPeerError>
 where
     T: Serialize,
@@ -1338,10 +1440,12 @@ struct CodecTransportError(#[source] ConsensusCodecError);
 mod tests {
     use std::str::FromStr;
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use opc_consensus::engine::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    use opc_consensus::engine::storage::{
+        RaftLogStorage, RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine,
+    };
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
     use opc_consensus::{durable_openraft_config, DurableOpenraftDomain};
     use opc_types::Timestamp;
@@ -1821,6 +1925,32 @@ mod tests {
             .expect("admit desired voting after joint proof");
     }
 
+    /// A follower that is about to be cut over by a final snapshot may already
+    /// retain that boundary locally, but must not apply it before the snapshot
+    /// replaces its state machine. Keep the test fixture at that honest Raft
+    /// frontier so the strict physical-prune proof has the exact floor row.
+    async fn append_uncommitted_uniform_entry(fixture: &RealFollowerFixture) {
+        let previous = LogId::new(CommittedLeaderId::new(1, fixture.leader), 5);
+        assert_append_success(
+            call_append_handler(
+                fixture,
+                fixture.current,
+                append_request(
+                    fixture,
+                    Some(previous),
+                    vec![membership_entry(
+                        fixture.leader,
+                        6,
+                        vec![fixture.desired_members.clone()],
+                        fixture.desired_members.clone(),
+                    )],
+                    Some(previous),
+                ),
+            )
+            .await,
+        );
+    }
+
     async fn wait_for_membership_writer(directory: &SessionRaftPeerDirectory) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
@@ -1839,6 +1969,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_append_uniform_responds_before_apply_then_fences_predecessor() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let fixture = real_follower_fixture().await;
         apply_through_joint(&fixture).await;
         let final_log_id = LogId::new(CommittedLeaderId::new(1, fixture.leader), 6);
@@ -1911,6 +2042,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_final_snapshot_releases_own_permit_and_fences_predecessor() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let source = real_follower_fixture().await;
         apply_through_joint(&source).await;
         let uniform_log_id = LogId::new(CommittedLeaderId::new(1, source.leader), 6);
@@ -1951,6 +2083,7 @@ mod tests {
 
         let target = real_follower_fixture().await;
         apply_through_joint(&target).await;
+        append_uncommitted_uniform_entry(&target).await;
         let held_predecessor_rpc = target.directory.begin_engine_rpc().await;
         let final_chunk = InstallSnapshotRequest {
             vote: Vote::new_committed(1, target.leader),
@@ -2013,6 +2146,7 @@ mod tests {
 
         let cancelled = real_follower_fixture().await;
         apply_through_joint(&cancelled).await;
+        append_uncommitted_uniform_entry(&cancelled).await;
         let held_cancelled_predecessor = cancelled.directory.begin_engine_rpc().await;
         let cancelled_chunk = InstallSnapshotRequest {
             vote: Vote::new_committed(1, cancelled.leader),
@@ -2170,9 +2304,19 @@ mod tests {
         VoteRequest::new(Vote::new(7, sender), None)
     }
 
-    #[tokio::test]
-    async fn raw_fixed_handler_rejects_vote_before_admission_after_durable_placement_policy_drift()
-    {
+    struct FixedFollowerFixture {
+        _temp: tempfile::TempDir,
+        backend: SqliteSessionBackend,
+        raft: SessionRaft,
+        handler: SessionRaftRpcHandler,
+        scope: SessionConsensusIdentity,
+        leader: SessionConsensusNodeId,
+    }
+
+    async fn fixed_follower_fixture(
+        operation_timeout: Duration,
+        admitted: bool,
+    ) -> FixedFollowerFixture {
         let temp = tempfile::tempdir().expect("follower tempdir");
         let backend = SqliteSessionBackend::open(temp.path().join("sessions.sqlite"))
             .expect("follower backend");
@@ -2189,7 +2333,7 @@ mod tests {
         .expect("fixed follower network");
         let directory = network.peer_directory();
         let bindings = member_bindings(&members);
-        let (log_store, state_machine, storage_identity) =
+        let (mut log_store, mut state_machine, storage_identity) =
             storage::open_fixed_with_member_bindings(
                 &backend,
                 temp.path().join("snapshots"),
@@ -2201,6 +2345,21 @@ mod tests {
             )
             .await
             .expect("fixed follower storage");
+        if admitted {
+            let membership = membership_entry(leader, 0, vec![members.clone()], members.clone());
+            log_store
+                .blocking_append([membership.clone()])
+                .await
+                .expect("append exact fixed membership");
+            log_store
+                .save_committed(Some(membership.log_id))
+                .await
+                .expect("commit exact fixed membership");
+            state_machine
+                .apply([membership])
+                .await
+                .expect("apply exact fixed membership");
+        }
         let raft = SessionRaft::new(
             local,
             Arc::new(
@@ -2213,7 +2372,7 @@ mod tests {
         )
         .await
         .expect("fixed follower Raft");
-        let admitted = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(AtomicBool::new(admitted));
         let handler = SessionRaftRpcHandler::new_fixed_durable_quorum(
             raft.clone(),
             directory,
@@ -2225,9 +2384,69 @@ mod tests {
                 bindings,
                 crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
                 admitted,
+                operation_timeout,
             ),
         );
-        let conn = rusqlite::Connection::open(temp.path().join("sessions.sqlite"))
+        FixedFollowerFixture {
+            _temp: temp,
+            backend,
+            raft,
+            handler,
+            scope,
+            leader,
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family() {
+        let fixture = fixed_follower_fixture(Duration::from_secs(1), true).await;
+        fixture
+            .backend
+            .fixed_quorum_durable_check_count
+            .store(0, Ordering::SeqCst);
+
+        for family in [
+            SessionConsensusRpcFamily::AppendEntries,
+            SessionConsensusRpcFamily::Vote,
+            SessionConsensusRpcFamily::InstallSnapshot,
+        ] {
+            let request = SessionConsensusWireRequest::try_new(
+                fixture.scope,
+                fixture.leader,
+                family,
+                vec![0xA5; 32],
+            )
+            .expect("bounded malformed fixed engine envelope");
+            let before = fixture
+                .backend
+                .fixed_quorum_durable_check_count
+                .load(Ordering::SeqCst);
+            assert_eq!(
+                fixture.handler.handle(fixture.leader, request).await.result,
+                Err(SessionConsensusPeerError::Protocol),
+                "the exact durable authority admits only to the family decoder"
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .fixed_quorum_durable_check_count
+                    .load(Ordering::SeqCst),
+                before + 1,
+                "each admitted {family:?} has exactly one durable SQLite authority check"
+            );
+        }
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+    }
+
+    #[tokio::test]
+    async fn raw_fixed_handler_rejects_vote_before_admission_after_durable_placement_policy_drift()
+    {
+        let fixture = fixed_follower_fixture(Duration::from_secs(1), false).await;
+        let conn = rusqlite::Connection::open(fixture._temp.path().join("sessions.sqlite"))
             .expect("open fixed voter database");
         conn.execute(
             "UPDATE consensus_identity SET fixed_placement_policy = 2 WHERE singleton = 1",
@@ -2236,20 +2455,68 @@ mod tests {
         .expect("persist fixed placement policy drift");
         drop(conn);
 
-        let payload = encode_bounded(&vote_request(leader)).expect("bounded Vote request");
+        let payload = encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request");
         let request = SessionConsensusWireRequest::try_new(
-            scope,
-            leader,
+            fixture.scope,
+            fixture.leader,
             SessionConsensusRpcFamily::Vote,
             payload,
         )
         .expect("valid Vote envelope");
         assert_eq!(
-            handler.handle(leader, request).await.result,
+            fixture.handler.handle(fixture.leader, request).await.result,
             Err(SessionConsensusPeerError::ScopeMismatch),
             "raw engine handler must not persist a Vote after fixed placement policy drift"
         );
-        raft.shutdown().await.expect("shutdown fixed test Raft");
+        assert_eq!(
+            fixture
+                .backend
+                .fixed_quorum_durable_check_count
+                .load(Ordering::SeqCst),
+            1,
+            "a rejected fixed raw engine RPC has one exact durable authority check"
+        );
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+    }
+
+    #[tokio::test]
+    async fn raw_fixed_handler_authority_check_honors_the_complete_operation_deadline() {
+        let operation_timeout = Duration::from_millis(40);
+        let fixture = fixed_follower_fixture(operation_timeout, true).await;
+        let held_sqlite_lock = fixture.backend.lock_connection_for_test().await;
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let started = Instant::now();
+        let response = fixture.handler.handle(fixture.leader, request).await;
+        assert_eq!(
+            response.result,
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "a held durable authority lock fails closed"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "the authority check must wait on the held SQLite lock until its deadline"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "the inner authority check consumes the unchanged operation deadline"
+        );
+        drop(held_sqlite_lock);
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
     }
 
     fn rejecting_peer_map(
@@ -2279,6 +2546,8 @@ mod tests {
             .collect()
     }
 
+    // The test preserves OpenRaft's transport error shape for its assertions.
+    #[allow(clippy::result_large_err)]
     async fn call_test_network(network: &SessionRaftNetwork) -> Result<u64, EngineRpcError> {
         network
             .call::<u64, opc_consensus::engine::error::Infallible>(
@@ -3409,10 +3678,16 @@ mod tests {
             SessionConsensusRpcFamily::AppendEntries
         ));
         assert!(is_engine_rpc_family(
+            SessionConsensusRpcFamily::AppendEntriesRoster
+        ));
+        assert!(is_engine_rpc_family(
             SessionConsensusRpcFamily::InstallSnapshot
         ));
         assert!(!is_engine_rpc_family(
             SessionConsensusRpcFamily::ForwardMutation
+        ));
+        assert!(!is_engine_rpc_family(
+            SessionConsensusRpcFamily::ForwardRosterMutation
         ));
         assert!(!is_engine_rpc_family(
             SessionConsensusRpcFamily::ReadBarrier

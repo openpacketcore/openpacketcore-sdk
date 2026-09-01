@@ -1622,7 +1622,7 @@ impl FaultFleet {
                 outcome,
                 Err(
                     SessionConsensusPeerError::Authentication
-                        | SessionConsensusPeerError::Timeout
+                        | SessionConsensusPeerError::Unavailable
                 )
             ),
             "new-only member trust must reject the removed old issuer: target={target}, outcome={outcome:?}"

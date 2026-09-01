@@ -31,7 +31,8 @@ pub mod types;
 // Public Re-exports
 pub use authority::{
     ConfigAuthorityOperation, ConfigAuthorityOutcome, ConfigAuthorityPort, ConfigLeaderHint,
-    ConfigLeaderHintError, ConfigProjectionHead, MAX_CONFIG_LEADER_HINT_BYTES,
+    ConfigLeaderHintError, ConfigProjectionHead, ConfigProjectionPublication,
+    ConfigProjectionRebuilder, MAX_CONFIG_LEADER_HINT_BYTES,
 };
 pub use authorizer::{
     AllowAllAuthorizer, AuthorizationContext, AuthorizationError, ConfigAuthorizer,

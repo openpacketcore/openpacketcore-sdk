@@ -10,8 +10,8 @@ on:
 permissions:
   contents: read
 
-# This workflow now requests ~24 concurrent jobs per run (19 jobs, one of
-# which expands to a 6-way shard matrix). Without a
+# This workflow now requests 27 concurrent jobs per run (20 job definitions;
+# one expands to a 7-way shard matrix and one to a 2-way matrix). Without a
 # concurrency group a superseded push keeps its whole fleet running and the
 # replacement run queues behind it, which costs far more wall clock than the
 # sharding saves. Runs on main are never cancelled.
@@ -82,6 +82,11 @@ jobs:
           python3 scripts/check-management-plane-policy.py --self-test
           python3 scripts/check-management-plane-policy.py --check
 
+      - name: Test SDK-702 release-attestation wrapper environment
+        run: |
+          python3 ci/test-sdk702-release-attest.py
+          bash -n ci/setup-fsverity-tmp.sh
+
       - name: Run opc-proto-diameter corpus generator self-test
         run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
 
@@ -116,6 +121,9 @@ jobs:
       # exactly once. The shards do not wait on this job -- they run the same
       # check themselves in their precheck step -- so this is the readable
       # place to see a plan failure, not the thing that gates them.
+      - name: Test test-shard manifest audit
+        run: python3 ci/test-test-shards.py
+
       - name: Verify test shard plan
         run: python3 ci/test-shards.py verify
 
@@ -154,7 +162,7 @@ jobs:
         # Keep in step with `python3 ci/test-shards.py ids`; the rust-gates
         # plan check fails the run if the plan itself stops covering
         # everything, and the aggregator below fails if a shard is dropped.
-        shard: [misc, it-0, it-1, it-2, heavy-0, heavy-1]
+        shard: [misc, quiescent-o1, it-0, it-1, it-2, heavy-0, heavy-1]
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -168,15 +176,18 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
       # Each shard builds only its own test targets, so the tree stays far
       # below the former single-job peak that forced `cargo clean` between
       # steps. Debug symbols remain off via CARGO_PROFILE_*_DEBUG above; do
       # not add a `cargo clean` here, since rust-cache saves in a post-step
       # and would archive an empty target directory.
       # Per-shard keys: the legs build different target sets, so one shared
-      # key would make all six race to save the same multi-gigabyte archive
+      # key would make all seven race to save the same multi-gigabyte archive
       # while giving each a worse hit rate than its own. Only main saves:
-      # six archives per pull request would churn the repository's shared
+      # seven archives per pull request would churn the repository's shared
       # 10 GB cache quota and evict the entries the shards restore from.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -357,6 +368,15 @@ jobs:
       - name: Run opc-gtpu-dataplane unit tests on macOS
         run: cargo test --locked -p opc-gtpu-dataplane --lib
 
+      # Dynamic and fixed durable consensus deliberately rely on Linux
+      # descriptor-pinned SQLite snapshot handling. This native lane proves
+      # the public and core constructors fail closed before durable setup.
+      - name: Prove unsupported consensus initialization is side-effect free on macOS
+        run: cargo test --locked -p opc-session-store --all-features unsupported_platform_before_durable_initialization
+
+      - name: Lint opc-session-store on macOS
+        run: cargo clippy --locked -p opc-session-store --all-targets --all-features -- -D warnings
+
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
@@ -467,19 +487,24 @@ jobs:
           fi
           exit "${violated}"
 
-  # The job key and display name are deliberately unchanged: the display name is
-  # what a required-status-check rule matches, and renaming it is an operator
-  # action, not a code change. The name now understates the lane, which also
-  # covers opc-protocol and opc-proto-gtpv2c.
-  session-net-i686:
-    name: opc-session-net i686
+  session-net-i686-tests:
+    name: opc-session-net i686 (${{ matrix.slice }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slice: ordinary
+            cache_key: opc-session-net-i686
+          - slice: contracts
+            cache_key: opc-session-net-i686-contracts
     env:
       CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
       RUSTFLAGS: "-C link-arg=-m32"
       TARGET_CC: gcc
       TARGET_CFLAGS: "-m32"
+      I686_SLICE: ${{ matrix.slice }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -494,20 +519,113 @@ jobs:
         with:
           targets: i686-unknown-linux-gnu
 
+      # The protected-roster snapshot/restart contracts seal their snapshot
+      # artifacts on the dedicated fs-verity filesystem. Build output,
+      # TMPDIR, databases, WALs, sockets, and general process scratch remain
+      # on ordinary storage.
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: opc-session-net-i686
+          shared-key: ${{ matrix.cache_key }}
 
       - name: Run opc-session-net tests on i686
-        run: cargo test --locked -p opc-session-net --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+        # The stateless three-voter consumer proofs retain literal authority,
+        # snapshot, and 100/250 ms caller budgets. Run every test exactly once,
+        # but give each wall-time contract a fresh 32-bit process so completed
+        # fixture runtimes cannot consume a later contract's budget.
+        run: |
+          set -euo pipefail
+          ordinary_timing_contracts=(
+            persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
+            persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
+            persistent_three_voter_first_transition_has_one_leader_activation_proof
+            protected_consumer_chain_after_activation_elides_outer_capability_wire_calls
+          )
+          optimized_roster_contracts=(
+            persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal
+            persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart
+            persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
+            persistent_three_voter_protected_roster_survives_real_os_process_loss
+            persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running
+            persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart
+          )
+          timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_roster_contracts[@]}")
+          case "${I686_SLICE}" in
+            ordinary)
+              skips=()
+              for timing_contract in "${timing_contracts[@]}"; do
+                skips+=(--skip "stateless_quorum_consumer::$timing_contract")
+              done
+              cargo test --locked \
+                -p opc-session-net \
+                --all-features \
+                --target i686-unknown-linux-gnu \
+                --quiet \
+                -- \
+                --test-threads=1 \
+                --exact \
+                "${skips[@]}"
+              ;;
+            contracts)
+              for timing_contract in "${ordinary_timing_contracts[@]}"; do
+                cargo test --locked \
+                  -p opc-session-net \
+                  --all-features \
+                  --target i686-unknown-linux-gnu \
+                  --quiet \
+                  --lib \
+                  -- \
+                  --test-threads=1 \
+                  --exact \
+                  "stateless_quorum_consumer::$timing_contract"
+              done
+              for timing_contract in "${optimized_roster_contracts[@]}"; do
+                env CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
+                  -p opc-session-net \
+                  --all-features \
+                  --target i686-unknown-linux-gnu \
+                  --quiet \
+                  --lib \
+                  -- \
+                  --test-threads=1 \
+                  --exact \
+                  "stateless_quorum_consumer::$timing_contract"
+              done
+              ;;
+            *)
+              echo "Unknown i686 test slice: ${I686_SLICE}" >&2
+              exit 1
+              ;;
+          esac
 
       # Widened beyond opc-session-net: opc-protocol is the shared error type
       # whose layout every protocol crate depends on, and opc-proto-gtpv2c
       # carries the caller-supplied absolute usize base offsets whose checked
       # arithmetic is width-sensitive.
       - name: Run 32-bit portability tests
+        if: matrix.slice == 'ordinary'
         run: cargo test --locked -p opc-protocol -p opc-proto-gtpv2c --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+
+  # Keep the existing required-check job key and display name stable while
+  # requiring every i686 matrix slice to finish successfully.
+  session-net-i686:
+    name: opc-session-net i686
+    if: always()
+    needs: [session-net-i686-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      I686_TESTS_RESULT: ${{ needs.session-net-i686-tests.result }}
+    steps:
+      - name: Require every i686 test slice to succeed
+        run: |
+          if [ "${I686_TESTS_RESULT}" != success ]; then
+            echo "i686 test slices finished with ${I686_TESTS_RESULT}" >&2
+            exit 1
+          fi
 
   feature-powerset:
     name: opc-sdk feature powerset

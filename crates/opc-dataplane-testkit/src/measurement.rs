@@ -459,11 +459,11 @@ fn nonzero_checksum(parts: &[&[u8]]) -> u16 {
 fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum = 0u32;
     for part in parts {
-        let mut chunks = part.chunks_exact(2);
-        for chunk in &mut chunks {
+        let (chunks, remainder) = part.as_chunks::<2>();
+        for chunk in chunks {
             sum = sum.wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));
         }
-        if let Some(last) = chunks.remainder().first() {
+        if let Some(last) = remainder.first() {
             sum = sum.wrapping_add(u32::from(*last) << 8);
         }
     }

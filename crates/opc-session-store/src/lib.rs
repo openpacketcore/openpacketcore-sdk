@@ -6,6 +6,36 @@
 //! stale-owner protections are intended for 5G CNF session-state boundaries;
 //! production suitability remains specific to the selected backend profile.
 //!
+//! # Protected checkpoint consumption
+//!
+//! Prepared CAS and lease checkpoint requests are obtained only from an
+//! SDK-owned [`ProtectedSessionBackend`] wrapper. Protected fenced transitions
+//! use the narrower sealed [`ProtectedFencedTransitionBackend`] marker. It
+//! deliberately exposes neither a [`SessionBackend`] nor a physical request,
+//! so a consumer adapter cannot claim synthetic lease authority or lower a
+//! recovered handle into a replayable mutation. The returned affine request
+//! captures its exact scope, caller request ID, sealed mutation, and deadline
+//! budget; only the net-owned consumer composite can turn it into an execution
+//! handle.
+//! Prepared is local type-state, never a wire or server authorization marker.
+//!
+//! ```compile_fail
+//! use opc_session_store::{
+//!     PreparedCheckpointAuthorityContext, PreparedCheckpointCompletion,
+//!     PreparedCheckpointPort, PreparedCompareAndSetToken, PreparedLeaseAcquireToken,
+//! };
+//! ```
+//!
+//! ```compile_fail
+//! use opc_session_store::{EncryptingSessionBackend, PreparedCompareAndSetRequest};
+//!
+//! let _ = PreparedCompareAndSetRequest::from_consumer_port;
+//!
+//! fn removed_attachment<B: ?Sized, P: ?Sized>(wrapper: EncryptingSessionBackend<B, P>) {
+//!     let _ = wrapper.with_prepared_checkpoint_port(());
+//! }
+//! ```
+//!
 //! # Module map
 //!
 //! | Module | Responsibility |
@@ -26,6 +56,21 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+static CONSENSUS_TIMING_TEST_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Serialize unit tests whose bounded Raft deadlines are themselves the
+/// assertion while the default-parallel library suite performs heavy SQLite
+/// snapshot and recovery work in the same process.
+#[cfg(test)]
+pub(crate) async fn acquire_consensus_timing_test_permit() -> tokio::sync::SemaphorePermit<'static>
+{
+    CONSENSUS_TIMING_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("consensus timing test permit remains open")
+}
+
 pub use opc_types::Timestamp;
 
 pub mod backend;
@@ -35,6 +80,12 @@ pub mod consensus;
 pub mod consumer;
 pub mod error;
 pub mod fake;
+pub mod fenced_mutation_roster;
+mod fenced_mutation_roster_executor;
+mod fenced_mutation_roster_storage;
+pub(crate) mod fenced_mutation_roster_transport;
+pub mod fenced_transition;
+pub mod fenced_transition_journal;
 pub mod handover;
 mod hex;
 pub mod lease;
@@ -55,6 +106,9 @@ pub mod topology;
 pub mod topology_attestation;
 pub mod ttl;
 
+#[cfg(test)]
+mod protected_fenced_transition_tests;
+
 pub use backend::{
     next_replication_sequence, record_expiry_preflights, validate_record_expiry_preflights_at,
     validate_record_expiry_preflights_profile, validate_replication_log_page,
@@ -63,12 +117,18 @@ pub use backend::{
     validate_replication_prefix_owned, validate_session_ops_at, validate_session_ops_profile,
     validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
     BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    ProtectedSelectorLedgerBase, ProtectedSessionBackend, RecordExpiryPreflight,
-    RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange, ReplicationOp,
-    ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SelectorLedgerStorageScope,
-    SessionBackend, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
-    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
+    PreparedCheckpointBudget, PreparedCheckpointBudgetError, PreparedCompareAndSetExecuteError,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
+    PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError,
+    PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
+    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedFencedTransitionBackend,
+    ProtectedRosterEstablishedSuccessor, ProtectedSelectorLedgerBase, ProtectedSessionBackend,
+    RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
+    ReplicationOp, ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor,
+    SelectorLedgerStorageScope, SessionBackend, SessionOp, SessionOpResult,
+    MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
     REPLICATION_TX_ID_CANONICAL_BYTES, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 pub use capability::{
@@ -78,34 +138,167 @@ pub use capability::{
     SessionStoreHaCompatibility, SessionStorePlatformProfile,
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
+/// Non-production signing fixtures for live consensus integration coverage.
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub use consensus::test_support;
+pub use consensus::types::{
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
+    SESSION_CONSENSUS_V2_APPLIED_DIGEST_ENCODING_VERSION,
+    SESSION_CONSENSUS_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR,
+    SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR,
+};
 pub use consensus::{
-    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
-    SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
-    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
-    SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
-    SessionConsensusRpc, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
-    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
-    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
+    validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
+    ProtectedRosterConsensusDiagnosticSnapshot, SessionConsensusClusterId, SessionConsensusCommand,
+    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
+    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
+    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
-    session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
+    session_consumer_batch_result_into_store, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
+    SessionConsumerAuthorizationManifest, SessionConsumerAuthorizationManifestError,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
-    SessionConsumerChangeKind, SessionConsumerIdentity, SessionConsumerIdentityError,
-    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
-    SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
+    SessionConsumerChangeKind, SessionConsumerCompareAndSetReceiptOutcome,
+    SessionConsumerCompareAndSetRequest, SessionConsumerCompareAndSetStatus,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerIdentityError, SessionConsumerLeaseError,
+    SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
+    SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerRoster, SessionConsumerRosterAdmissionCapsule,
+    SessionConsumerRosterAdmissionMutationResponse, SessionConsumerRosterAdmissionReadResponse,
+    SessionConsumerRosterAuthorization, SessionConsumerRosterCapsuleError,
+    SessionConsumerRosterCommitment, SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+    SessionConsumerRosterCurrentPublicationAuthorityReadResponse, SessionConsumerRosterError,
+    SessionConsumerRosterMember, SessionConsumerRosterRejection,
+    SessionConsumerRosterTerminalCapsule, SessionConsumerRosterTerminalMutationResponse,
+    SessionConsumerRosterTerminalReadResponse, SessionConsumerRosterTransportProfile,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
+    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+    SessionConsumerVoterAuthority, SessionQuorumConsumer, SessionQuorumRosterIngress,
+    StatelessSessionConsumer, MAX_SESSION_CONSUMER_AUTHORIZATION_GRANT_TUPLES,
+    MAX_SESSION_CONSUMER_AUTHORIZATION_IDENTITIES,
+    MAX_SESSION_CONSUMER_AUTHORIZATION_SCOPES_PER_IDENTITY, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES,
+    MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES,
+    MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES,
+    MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
     SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
+    SESSION_CONSUMER_ROSTER_ALPN, SESSION_CONSUMER_ROSTER_TRANSPORT_REVISION,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
+pub use fenced_mutation_roster::{
+    profile_digest as fenced_mutation_roster_profile_digest,
+    profile_v1_digest as fenced_mutation_roster_profile_v1_digest,
+    profile_v2_digest as fenced_mutation_roster_profile_v2_digest,
+    roster_executor_evidence_commitment, roster_ingress_capsule_commitment,
+    AdmissionProposal as FencedMutationRosterAdmissionProposal, Error as FencedMutationRosterError,
+    EstablishedMutation as FencedMutationRosterEstablishedMutation,
+    Member as FencedMutationRosterMember,
+    MemberOperationId as FencedMutationRosterMemberOperationId, Phase as FencedMutationRosterPhase,
+    Profile as FencedMutationRosterProfile, RosterAttestationCertificateRoleV1,
+    RosterAttestationLeafCertificatePartsV1, RosterAttestationTrustRootIdentityV1,
+    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenance,
+    RosterCompactAdmissionProvenanceInput, RosterId as FencedMutationRosterId,
+    RosterIngressAttestation, RosterIngressAttestationSigningInputV1,
+    RosterIngressAttestationSigningInputV2, RosterIngressAttestationV1, RosterIngressAttestationV2,
+    RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+    RosterProfileV2CompactAdmissionProvenanceV1, RosterProfileV2CompactTerminalEvidenceV1,
+    RosterProfileV2ExecutorProofBundleV1, CONSUMER_ALPN as FENCED_MUTATION_ROSTER_CONSUMER_ALPN,
+    CONSUMER_ALPN_V2 as FENCED_MUTATION_ROSTER_CONSUMER_ALPN_V2,
+    CONSUMER_REVISION as FENCED_MUTATION_ROSTER_CONSUMER_REVISION,
+    CONSUMER_REVISION_V2 as FENCED_MUTATION_ROSTER_CONSUMER_REVISION_V2,
+    FRESH_ROSTER_MEMBERS as FENCED_MUTATION_ROSTER_FRESH_MEMBERS,
+    INITIAL_GENERATION as FENCED_MUTATION_ROSTER_INITIAL_GENERATION,
+    MAX_CHECKPOINT_BYTES as FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
+    MAX_DESCRIPTOR_BYTES as FENCED_MUTATION_ROSTER_MAX_DESCRIPTOR_BYTES,
+    MAX_HISTORY_EPOCH as FENCED_MUTATION_ROSTER_MAX_HISTORY_EPOCH,
+    MAX_LIVE_ROSTERS as FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
+    MAX_MEMBERS as FENCED_MUTATION_ROSTER_MAX_MEMBERS,
+    MAX_PLAN_BYTES as FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES,
+    MAX_RESERVED_AND_RETAINED as FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+    MAX_RESULT_BYTES as FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
+    MAX_STATUS_BYTES as FENCED_MUTATION_ROSTER_MAX_STATUS_BYTES,
+    MEMBER_OPERATION_ID_BYTES as FENCED_MUTATION_ROSTER_MEMBER_OPERATION_ID_BYTES,
+    OPERATIONAL_TARGET as FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET,
+    RECLAIM_BATCH as FENCED_MUTATION_ROSTER_RECLAIM_BATCH,
+    ROSTER_ID_BYTES as FENCED_MUTATION_ROSTER_ID_BYTES,
+    SCHEMA_V1 as FENCED_MUTATION_ROSTER_SCHEMA_V1, SCHEMA_V2 as FENCED_MUTATION_ROSTER_SCHEMA_V2,
+    TERMINAL_RETENTION as FENCED_MUTATION_ROSTER_TERMINAL_RETENTION,
+};
+/// Profile V2's storage descriptor remains part of activation compatibility.
+/// Compact conflict authority itself uses the common profile-aware retention
+/// tombstone and is never exposed through the public composition surface.
+#[doc(hidden)]
+pub use fenced_mutation_roster_storage::protected_roster_v2_storage_descriptor_digest;
+#[doc(hidden)]
+pub use fenced_mutation_roster_transport::protected_roster_v2_transport_compatibility_descriptor_digest as fenced_mutation_roster_profile_v2_transport_compatibility_descriptor_digest;
+pub use fenced_transition::{
+    fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability,
+    FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
+    FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionError,
+    PreparedFencedTransitionLookup, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_MAX_OUTCOME_BYTES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    FENCED_TRANSITION_MAX_PREPARED_LAYERS, FENCED_TRANSITION_OUTCOME_RETENTION,
+    FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
+    FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES, FENCED_TRANSITION_V2_CALLER_NONCE_BYTES,
+    FENCED_TRANSITION_V2_COMMAND_TRANSPORT_PROFILE_INPUTS,
+    FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_REVISION,
+    FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION, FENCED_TRANSITION_V2_ERROR_STATUS_REVISION,
+    FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH, FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS,
+    FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_HISTORY_EPOCH,
+    FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS,
+    FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES,
+    FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES,
+    FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS,
+    FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION,
+    FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_MAGIC,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_REVISION,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
+    FENCED_TRANSITION_V2_RECORD_ENVELOPE_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_RECORD_ENVELOPE_SCHEMA_REVISION, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
+    FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS, FENCED_TRANSITION_V2_VALIDATION_PROFILE_INPUTS,
+    FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_VALIDATION_SCHEMA_REVISION,
+};
+pub use fenced_transition_journal::{
+    FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
+    FencedTransitionV2PreparedJournalKey, PreparedFencedTransitionJournal,
+    PreparedFencedTransitionJournalKey, FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES,
+    PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES,
+};
 pub use handover::{
     HandoverEnvelope, HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError,
     HandoverManager, HandoverSessionRecord, HANDOVER_ENVELOPE_MAGIC, HANDOVER_ENVELOPE_VERSION,
@@ -166,11 +359,18 @@ pub use restore::{
     RestoreRecordSummary, RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage,
     RestoreScanRequest, RestoreScanScope, RestoreStage, StoredRecordHeaderSummary,
     RESTORE_SCAN_DEFAULT_PAGE_SIZE, RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES,
-    RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
-    RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_PAGE_SIZE,
-    RESTORE_SCAN_MAX_SQLITE_VM_STEPS, RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
+    RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
+    RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES, RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+    RESTORE_SCAN_MAX_PAGE_SIZE, RESTORE_SCAN_MAX_SQLITE_VM_STEPS,
+    RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
 };
 pub use sqlite::SqliteSessionBackend;
+#[cfg(feature = "test-vfs")]
+#[doc(hidden)]
+pub use sqlite::{
+    ProactiveCheckpointIdleWaitForTest, ProactiveCheckpointShutdownJoinForTest,
+    ProactiveCheckpointWorkerObservationForTest,
+};
 pub use store::SessionStore;
 pub use topology::{
     derive_fixed_durable_quorum_consensus_identity, QuorumReplicaDescriptor, QuorumTopologyConfig,

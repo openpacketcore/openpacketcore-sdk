@@ -113,12 +113,14 @@ restore traffic.
 
 ## Protocol transition and rollback
 
-The bounded authority preflight changes the exact compatibility contract to
+The bounded authority preflight originally changed the compatibility contract to
 `opc-session-net/5`, wire-schema revision 6, error-set revision 8, and the
 dedicated consensus contract to `opc-session-consensus/2`, transport/wire
-revision 2, error-set revision 4. Drain and upgrade all clients, servers,
-wrappers, and consensus members together. Mixed versions or revisions fail
-before dispatch; this is not a rolling transition.
+revision 2, error-set revision 4. That historical transition required draining
+and upgrading all clients, servers, wrappers, and consensus members together.
+The current direct v5 contract is wire-schema revision 7, error-set revision 9,
+with a 2,096,128-byte restore wire-payload ceiling; mixed versions or revisions
+fail before dispatch, so its coordinated upgrade is likewise not rolling.
 
 If audit, migration, startup, or verification fails, keep traffic gated and
 restore the complete immutable pre-upgrade checkpoint for the whole authority

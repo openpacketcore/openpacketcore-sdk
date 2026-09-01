@@ -232,6 +232,9 @@ impl FencedUdpSocket {
     /// returned error retains the unreleased guard for conservative expiry
     /// handling. Cancellation during authority release is safe because both
     /// kernel gate and fd are already closed.
+    // RetireFenceError retains the unreleased guard when closure is uncertain;
+    // boxing it would change the internal retirement error contract.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn close_then_release<A>(
         &mut self,
         authority: &A,

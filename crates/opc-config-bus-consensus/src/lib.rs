@@ -35,7 +35,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use opc_config_bus::{
     CommitWrite as BusCommitWrite, CommittedRevisionSource, ConfigAuthorityOperation,
-    ConfigAuthorityOutcome, ConfigAuthorityPort, ConfigLeaderHint, ConfigProjectionHead,
+    ConfigAuthorityOutcome, ConfigAuthorityPort, ConfigBus, ConfigLeaderHint, ConfigProjectionHead,
+    ConfigProjectionPublication, ConfigProjectionRebuilder,
     ConfirmedCommitResolution as BusConfirmedCommitResolution, ManagedDatastore, SealedConfig,
     StoreError, StoredConfig as BusStoredConfig,
 };
@@ -47,7 +48,8 @@ use opc_persist::{
     AttestedConfigCommit, AuditOpType, AuditRecord, CommitRecord, CommitSource,
     ConfigLocalAuthorityOutcome, ConfigStore,
     ConfirmedCommitResolution as PersistConfirmedCommitResolution, ConsensusConfigStore,
-    PersistError, PersistErrorKind, RollbackTarget, CONFIG_ROLLBACK_LABEL_MAX_BYTES,
+    PersistCapabilities, PersistError, PersistErrorKind, RollbackTarget,
+    CONFIG_ROLLBACK_LABEL_MAX_BYTES,
 };
 use opc_types::{ConfigVersion, TxId};
 use serde::de::DeserializeOwned;
@@ -479,6 +481,136 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+enum MutationRoute {
+    ForwardToLeader,
+    LocalLeaderOnly,
+}
+
+#[derive(Clone)]
+struct ConsensusConfigStoreAdapter {
+    inner: Arc<ConsensusConfigStore>,
+    mutation_route: MutationRoute,
+}
+
+impl ConsensusConfigStoreAdapter {
+    fn new(inner: Arc<ConsensusConfigStore>, mutation_route: MutationRoute) -> Self {
+        Self {
+            inner,
+            mutation_route,
+        }
+    }
+
+    fn consensus_store(&self) -> &Arc<ConsensusConfigStore> {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl ConfigStore for ConsensusConfigStoreAdapter {
+    async fn load_latest(&self) -> Result<Option<opc_persist::StoredConfig>, PersistError> {
+        ConfigStore::load_latest(self.inner.as_ref()).await
+    }
+
+    async fn load_committed_latest(
+        &self,
+    ) -> Result<Option<opc_persist::StoredConfig>, PersistError> {
+        ConfigStore::load_committed_latest(self.inner.as_ref()).await
+    }
+
+    async fn load_since(
+        &self,
+        version: ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<opc_persist::StoredConfig>, PersistError> {
+        ConfigStore::load_since(self.inner.as_ref(), version, limit).await
+    }
+
+    async fn wait_for_committed_change(&self, version: ConfigVersion) -> Result<(), PersistError> {
+        ConfigStore::wait_for_committed_change(self.inner.as_ref(), version).await
+    }
+
+    async fn load_rollback(
+        &self,
+        target: RollbackTarget,
+    ) -> Result<opc_persist::StoredConfig, PersistError> {
+        ConfigStore::load_rollback(self.inner.as_ref(), target).await
+    }
+
+    async fn load_by_replay_lookup_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<opc_persist::StoredConfig>, PersistError> {
+        ConfigStore::load_by_replay_lookup_digest(self.inner.as_ref(), digest).await
+    }
+
+    async fn append_commit(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+    ) -> Result<(), PersistError> {
+        ConfigStore::append_commit(self.inner.as_ref(), record, audit).await
+    }
+
+    async fn append_commit_resolving(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        resolution: PersistConfirmedCommitResolution,
+    ) -> Result<(), PersistError> {
+        ConfigStore::append_commit_resolving(self.inner.as_ref(), record, audit, resolution).await
+    }
+
+    async fn append_attested_commit(
+        &self,
+        commit: AttestedConfigCommit,
+    ) -> Result<(), PersistError> {
+        match self.mutation_route {
+            MutationRoute::ForwardToLeader => {
+                ConfigStore::append_attested_commit(self.inner.as_ref(), commit).await
+            }
+            MutationRoute::LocalLeaderOnly => self.inner.append_attested_commit_local(commit).await,
+        }
+    }
+
+    async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), PersistError> {
+        match self.mutation_route {
+            MutationRoute::ForwardToLeader => {
+                ConfigStore::clear_recovery_required(self.inner.as_ref(), tx_id).await
+            }
+            MutationRoute::LocalLeaderOnly => self.inner.clear_recovery_required_local(tx_id).await,
+        }
+    }
+
+    async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), PersistError> {
+        match self.mutation_route {
+            MutationRoute::ForwardToLeader => {
+                ConfigStore::mark_confirmed(self.inner.as_ref(), tx_id).await
+            }
+            MutationRoute::LocalLeaderOnly => self.inner.mark_confirmed_local(tx_id).await,
+        }
+    }
+
+    async fn create_rollback_point(
+        &self,
+        tx_id: TxId,
+        label: Option<String>,
+    ) -> Result<(), PersistError> {
+        match self.mutation_route {
+            MutationRoute::ForwardToLeader => {
+                ConfigStore::create_rollback_point(self.inner.as_ref(), tx_id, label).await
+            }
+            MutationRoute::LocalLeaderOnly => {
+                self.inner.create_rollback_point_local(tx_id, label).await
+            }
+        }
+    }
+
+    async fn preflight(&self) -> Result<PersistCapabilities, PersistError> {
+        ConfigStore::preflight(self.inner.as_ref()).await
+    }
+}
+
 /// Production config-bus datastore backed exclusively by
 /// [`ConsensusConfigStore`].
 ///
@@ -487,9 +619,11 @@ where
 /// `ManagedDatastore<SealedConfig<C>>`, preserving the ciphertext boundary by
 /// construction. Its explicit [`CommittedRevisionSource`] implementation lets
 /// a read-only Shadow bus serve this node's local committed/applied history
-/// without contacting the current writer.
+/// without contacting the current writer. Authoritative config buses must use
+/// [`Self::new_local_authority`] so a mutation cannot forward after the local
+/// authority gate.
 pub struct RaftManagedDatastore<C> {
-    adapter: PersistManagedDatastore<C, ConsensusConfigStore>,
+    adapter: PersistManagedDatastore<C, ConsensusConfigStoreAdapter>,
 }
 
 /// Management authority port backed directly by the config Openraft store.
@@ -563,26 +697,150 @@ impl ConfigAuthorityPort for ConsensusConfigAuthority {
                 .await,
         )
     }
+
+    async fn reconcile_local_projection(
+        &self,
+        rebuild: Box<dyn ConfigProjectionRebuilder>,
+    ) -> Result<ConfigProjectionPublication, ConfigAuthorityOutcome> {
+        let publication = Arc::new(std::sync::Mutex::new(None));
+        let callback_publication = Arc::clone(&publication);
+        let outcome = self
+            .store
+            .open_local_authority_projection(move |tx_id, version| async move {
+                let expected = ConfigProjectionHead::new(tx_id, version);
+                let rebuilt = rebuild.rebuild(expected).await.map_err(|_| ())?;
+                if rebuilt.head() != expected {
+                    return Err(());
+                }
+                let mut slot = match callback_publication.lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *slot = Some(rebuilt);
+                Ok((rebuilt.head().tx_id(), rebuilt.head().version()))
+            })
+            .await;
+        if !matches!(outcome, ConfigLocalAuthorityOutcome::LocalAuthority) {
+            return Err(map_config_authority_outcome(outcome));
+        }
+        let mut slot = match publication.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.take().ok_or(ConfigAuthorityOutcome::Unavailable)
+    }
+}
+
+/// Authoritative config-bus projection composed with one consensus-backed
+/// committed-revision source and its matching authority gate.
+///
+/// This handle adds no consensus, leader tracking, remote watch, or write
+/// forwarding. On leader election, call [`Self::reconcile_and_open`] before
+/// accepting management writes. The existing config-bus worker asks this same
+/// consensus authority to hold proposal admission while it reloads, validates,
+/// publishes, and finally verifies the exact durable head.
+pub struct ConsensusConfigBusProjection<C, S>
+where
+    C: OpcConfig,
+    S: CommittedRevisionSource<C> + Clone + 'static,
+{
+    bus: Arc<ConfigBus<C>>,
+    source: S,
+    authority: ConsensusConfigAuthority,
+}
+
+impl<C, S> ConsensusConfigBusProjection<C, S>
+where
+    C: OpcConfig,
+    S: CommittedRevisionSource<C> + Clone + 'static,
+{
+    /// Binds `bus` to the authority produced from the same
+    /// [`ConsensusConfigStore`] that backs `source`.
+    ///
+    /// The caller constructs `source` by wrapping that store's
+    /// [`RaftManagedDatastore`] (and, for plaintext configs, the existing
+    /// encrypting datastore). Keeping the source and authority in this one
+    /// handle prevents a leader-open caller from accidentally rebuilding one
+    /// bus while checking a different authority port.
+    #[must_use]
+    pub fn new(bus: Arc<ConfigBus<C>>, source: S, authority: ConsensusConfigAuthority) -> Self {
+        bus.set_authority_port(Some(Arc::new(authority.clone())));
+        Self {
+            bus,
+            source,
+            authority,
+        }
+    }
+
+    /// Returns the live bus whose mutations are now authority-gated.
+    pub fn bus(&self) -> &Arc<ConfigBus<C>> {
+        &self.bus
+    }
+
+    /// Returns the sole consensus authority used for the bound bus.
+    pub fn authority(&self) -> &ConsensusConfigAuthority {
+        &self.authority
+    }
+
+    /// Reconciles the existing live projection and opens local writes only
+    /// after the same consensus authority proves the exact durable head.
+    ///
+    /// A lost election, term change, head advance, unavailable source, or
+    /// failed rebuild returns a fail-closed error; callers must not advertise
+    /// the local management writer on error.
+    pub async fn reconcile_and_open(&self) -> Result<ConfigProjectionHead, StoreError> {
+        self.bus.reconcile_from(self.source.clone()).await
+    }
+}
+
+impl<C, S> fmt::Debug for ConsensusConfigBusProjection<C, S>
+where
+    C: OpcConfig,
+    S: CommittedRevisionSource<C> + Clone + 'static,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConsensusConfigBusProjection")
+            .field("authority", &self.authority)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<C> RaftManagedDatastore<C> {
-    /// Wrap the already-open config consensus authority.
+    /// Wrap the already-open config consensus store with forwarding behavior
+    /// retained for compatibility with generic clients.
     pub fn new(store: Arc<ConsensusConfigStore>) -> Self {
         Self {
-            adapter: PersistManagedDatastore::new(store),
+            adapter: PersistManagedDatastore::new(Arc::new(ConsensusConfigStoreAdapter::new(
+                store,
+                MutationRoute::ForwardToLeader,
+            ))),
+        }
+    }
+
+    /// Wrap the already-open store for an authoritative local config bus.
+    ///
+    /// Every durable mutation executes only on this node's Openraft leader and
+    /// fails closed after deposition; none is forwarded to another voter.
+    pub fn new_local_authority(store: Arc<ConsensusConfigStore>) -> Self {
+        Self {
+            adapter: PersistManagedDatastore::new(Arc::new(ConsensusConfigStoreAdapter::new(
+                store,
+                MutationRoute::LocalLeaderOnly,
+            ))),
         }
     }
 
     /// Return the sole underlying config consensus authority for lifecycle,
     /// RPC-handler, status, readiness, snapshot, and shutdown operations.
     pub fn consensus_store(&self) -> &Arc<ConsensusConfigStore> {
-        self.adapter.inner()
+        self.adapter.inner().consensus_store()
     }
 
     /// Builds a management authority port over this adapter's exact consensus
     /// store. The returned port can be shared by gNMI and NETCONF servers.
     pub fn config_authority(&self) -> ConsensusConfigAuthority {
-        ConsensusConfigAuthority::new(Arc::clone(self.adapter.inner()))
+        ConsensusConfigAuthority::new(Arc::clone(self.consensus_store()))
     }
 }
 
