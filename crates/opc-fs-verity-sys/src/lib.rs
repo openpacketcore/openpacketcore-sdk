@@ -41,10 +41,10 @@ pub const PERSISTENT_FILE_HANDLE_MAX_BYTES: usize = 128;
 /// fingerprint.  It normally requires a kernel exposing `FS_IOC_GETFSUUID`
 /// (Linux 6.9 or newer; `AT_HANDLE_FID` itself arrived in Linux 6.5) and a
 /// filesystem which exports both that UUID and a bounded `AT_HANDLE_FID`
-/// handle.  On XFS, older Linux kernels expose the same persistent filesystem
-/// UUID through `XFS_IOC_FSGEOMETRY_V1` and its ordinary export handle includes
-/// the inode generation; that descriptor-only pair is accepted as a narrow
-/// compatibility path.  Callers must fail closed when neither pair is
+/// handle. On XFS and Btrfs, older Linux kernels expose an equivalent
+/// filesystem-specific UUID ioctl and an ordinary export handle which includes
+/// the inode generation; those descriptor-only pairs are accepted as narrow
+/// compatibility paths. Callers must fail closed when neither pair is
 /// available; device numbers, mount IDs and timestamps are not substitutes
 /// across remount or crash recovery.
 #[derive(Clone, PartialEq, Eq)]
@@ -52,6 +52,36 @@ pub struct PersistentFileIdentity {
     filesystem_uuid: [u8; 16],
     handle_type: i32,
     handle: Box<[u8]>,
+}
+
+/// A bounded reason why [`persistent_file_identity`] could not construct an
+/// identity.
+///
+/// This deliberately excludes paths, file-handle bytes, filesystem UUIDs, and
+/// raw errnos so callers can surface it in operational diagnostics without
+/// disclosing filesystem-specific identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistentFileIdentityFailure {
+    /// The filesystem does not implement the generic filesystem UUID ioctl.
+    FilesystemUuidUnsupported,
+    /// The kernel does not implement the `AT_HANDLE_FID` file-handle request.
+    FileHandleFidUnsupported,
+    /// The kernel returned a malformed or unbounded file handle.
+    FileHandleInvalid,
+    /// Identity construction failed for another reason.
+    Other,
+}
+
+impl PersistentFileIdentityFailure {
+    /// Return the stable, non-sensitive diagnostic code for this failure.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FilesystemUuidUnsupported => "filesystem-uuid-unsupported",
+            Self::FileHandleFidUnsupported => "file-handle-fid-unsupported",
+            Self::FileHandleInvalid => "file-handle-invalid",
+            Self::Other => "other",
+        }
+    }
 }
 
 impl fmt::Debug for PersistentFileIdentity {
@@ -130,8 +160,12 @@ pub enum Error {
     ReadFilesystemUuid(io::Error),
     /// The kernel rejected the XFS filesystem UUID query.
     ReadXfsFilesystemUuid(io::Error),
+    /// The kernel rejected the Btrfs filesystem UUID query.
+    ReadBtrfsFilesystemUuid(io::Error),
     /// The kernel rejected the persistent file-handle query.
     ReadFileHandle(io::Error),
+    /// The kernel rejected an older filesystem's legacy export-handle query.
+    ReadLegacyFileHandle(io::Error),
     /// The filesystem returned an invalid or absent externally assigned UUID.
     InvalidFilesystemUuid,
     /// The filesystem returned an invalid opaque file handle.
@@ -182,7 +216,13 @@ impl fmt::Display for Error {
             Self::ReadXfsFilesystemUuid(_) => {
                 formatter.write_str("XFS filesystem UUID query failed")
             }
+            Self::ReadBtrfsFilesystemUuid(_) => {
+                formatter.write_str("Btrfs filesystem UUID query failed")
+            }
             Self::ReadFileHandle(_) => formatter.write_str("persistent file-handle query failed"),
+            Self::ReadLegacyFileHandle(_) => {
+                formatter.write_str("legacy persistent file-handle query failed")
+            }
             Self::InvalidFilesystemUuid => formatter.write_str("filesystem UUID is invalid"),
             Self::InvalidFileHandle => formatter.write_str("persistent file handle is invalid"),
             Self::FileHandleTooLarge { requested } => {
@@ -204,7 +244,9 @@ impl std::error::Error for Error {
             | Self::ReadMetadata(error)
             | Self::ReadFilesystemUuid(error)
             | Self::ReadXfsFilesystemUuid(error)
-            | Self::ReadFileHandle(error) => Some(error),
+            | Self::ReadBtrfsFilesystemUuid(error)
+            | Self::ReadFileHandle(error)
+            | Self::ReadLegacyFileHandle(error) => Some(error),
             Self::UnsupportedProfile { .. }
             | Self::UnsupportedDescriptorProfile { .. }
             | Self::MalformedDescriptor
@@ -215,6 +257,53 @@ impl std::error::Error for Error {
             | Self::InvalidFileHandle
             | Self::FileHandleTooLarge { .. }
             | Self::Unsupported => None,
+        }
+    }
+}
+
+impl Error {
+    /// Classify a failed [`persistent_file_identity`] call without exposing
+    /// a path, filesystem UUID, file-handle bytes, or raw errno.
+    ///
+    /// Callers which need an operational diagnostic should use this bounded
+    /// code instead of formatting the underlying error source.
+    pub fn persistent_file_identity_failure(&self) -> PersistentFileIdentityFailure {
+        match self {
+            Self::ReadFilesystemUuid(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) =>
+            {
+                PersistentFileIdentityFailure::FilesystemUuidUnsupported
+            }
+            Self::ReadFileHandle(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+                ) =>
+            {
+                PersistentFileIdentityFailure::FileHandleFidUnsupported
+            }
+            Self::InvalidFileHandle | Self::FileHandleTooLarge { .. } => {
+                PersistentFileIdentityFailure::FileHandleInvalid
+            }
+            Self::Enable(_)
+            | Self::Measure(_)
+            | Self::ReadMetadata(_)
+            | Self::UnsupportedProfile { .. }
+            | Self::UnsupportedDescriptorProfile { .. }
+            | Self::MalformedDescriptor
+            | Self::UnexpectedMetadataLength { .. }
+            | Self::BuiltInSignature
+            | Self::AbiValueOutOfRange
+            | Self::ReadFilesystemUuid(_)
+            | Self::ReadXfsFilesystemUuid(_)
+            | Self::ReadBtrfsFilesystemUuid(_)
+            | Self::ReadFileHandle(_)
+            | Self::ReadLegacyFileHandle(_)
+            | Self::InvalidFilesystemUuid
+            | Self::Unsupported => PersistentFileIdentityFailure::Other,
         }
     }
 }
@@ -304,7 +393,8 @@ mod platform {
     const FILESYSTEM_UUID_BYTES: usize = 16;
     const AT_EMPTY_PATH: libc::c_int = 0x1000;
     const AT_HANDLE_FID: libc::c_int = 0x0200;
-    const XFS_SUPER_MAGIC: libc::c_long = 0x5846_5342;
+    const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -354,6 +444,28 @@ mod platform {
 
     const XFS_IOC_FSGEOMETRY_V1: libc::Ioctl =
         libc::_IOR::<XfsFilesystemGeometryV1>(b'X' as u32, 100);
+
+    // `BTRFS_IOC_FS_INFO` has been part of the stable Btrfs UAPI since before
+    // Linux 5.14. Its 1024-byte fixed request includes the 128-bit filesystem
+    // UUID, unlike statfs' filesystem-dependent and sometimes shortened fsid.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BtrfsFilesystemInfo {
+        max_id: u64,
+        num_devices: u64,
+        uuid: [u8; FILESYSTEM_UUID_BYTES],
+        node_size: u32,
+        sector_size: u32,
+        clone_alignment: u32,
+        checksum_type: u16,
+        checksum_size: u16,
+        flags: u64,
+        generation: u64,
+        metadata_uuid: [u8; FILESYSTEM_UUID_BYTES],
+        reserved: [u8; 944],
+    }
+
+    const BTRFS_IOC_FS_INFO: libc::Ioctl = libc::_IOR::<BtrfsFilesystemInfo>(b'B' as u32, 31);
 
     impl FilesystemUuid {
         const fn requested() -> Self {
@@ -580,19 +692,19 @@ mod platform {
                     handle_type,
                     handle: handle.into_boxed_slice(),
                 }),
-                Err(error) if permits_xfs_compatibility(&error) => {
-                    xfs_persistent_file_identity(fd, error)
+                Err(error) if permits_legacy_compatibility(&error) => {
+                    legacy_persistent_file_identity(fd, error)
                 }
                 Err(error) => Err(error),
             },
-            Err(error) if permits_xfs_compatibility(&error) => {
-                xfs_persistent_file_identity(fd, error)
+            Err(error) if permits_legacy_compatibility(&error) => {
+                legacy_persistent_file_identity(fd, error)
             }
             Err(error) => Err(error),
         }
     }
 
-    fn permits_xfs_compatibility(error: &Error) -> bool {
+    fn permits_legacy_compatibility(error: &Error) -> bool {
         let errno = match error {
             Error::ReadFilesystemUuid(error) => error.raw_os_error(),
             Error::ReadFileHandle(error) => error.raw_os_error(),
@@ -615,19 +727,24 @@ mod platform {
         }
     }
 
-    fn xfs_persistent_file_identity(
+    fn legacy_persistent_file_identity(
         fd: BorrowedFd<'_>,
         generic_error: Error,
     ) -> Result<PersistentFileIdentity, Error> {
-        if !is_xfs(fd) {
-            return Err(generic_error);
+        match filesystem_type(fd) {
+            Some(XFS_SUPER_MAGIC) => xfs_persistent_file_identity(fd),
+            Some(BTRFS_SUPER_MAGIC) => btrfs_persistent_file_identity(fd),
+            _ => Err(generic_error),
         }
+    }
+
+    fn xfs_persistent_file_identity(fd: BorrowedFd<'_>) -> Result<PersistentFileIdentity, Error> {
         let filesystem_uuid = xfs_filesystem_uuid(fd)?;
         // Do not use the mount ID returned by name_to_handle_at: it is tied to
         // one mount instance and may change at remount. XFS export handles
         // encode the inode generation, so this ordinary handle rejects inode
         // number reuse while the geometry UUID keeps its namespace persistent.
-        let (handle_type, handle) = file_handle(fd, AT_EMPTY_PATH)?;
+        let (handle_type, handle) = legacy_file_handle(fd)?;
         Ok(PersistentFileIdentity {
             filesystem_uuid,
             handle_type,
@@ -635,14 +752,37 @@ mod platform {
         })
     }
 
+    fn btrfs_persistent_file_identity(fd: BorrowedFd<'_>) -> Result<PersistentFileIdentity, Error> {
+        let filesystem_uuid = btrfs_filesystem_uuid(fd)?;
+        // Btrfs export handles carry an inode generation and the Btrfs kernel
+        // export decoder rejects a mismatched generation with ESTALE. Like the
+        // XFS path, retain the handle for comparison only and never reopen it.
+        let (handle_type, handle) = legacy_file_handle(fd)?;
+        Ok(PersistentFileIdentity {
+            filesystem_uuid,
+            handle_type,
+            handle: handle.into_boxed_slice(),
+        })
+    }
+
+    #[cfg(test)]
     fn is_xfs(fd: BorrowedFd<'_>) -> bool {
+        filesystem_type(fd) == Some(XFS_SUPER_MAGIC)
+    }
+
+    #[cfg(test)]
+    fn is_btrfs(fd: BorrowedFd<'_>) -> bool {
+        filesystem_type(fd) == Some(BTRFS_SUPER_MAGIC)
+    }
+
+    fn filesystem_type(fd: BorrowedFd<'_>) -> Option<u64> {
         // SAFETY: `stat` is a fully initialized C-compatible output buffer and
         // `fd` remains borrowed and valid for the duration of fstatfs.
         let mut stat = unsafe { std::mem::zeroed::<libc::statfs>() };
         // SAFETY: `stat` points to writable C-compatible output storage and
         // `fd` remains borrowed and valid for the duration of fstatfs.
         let result = unsafe { libc::fstatfs(fd.as_raw_fd(), std::ptr::addr_of_mut!(stat)) };
-        result == 0 && stat.f_type == XFS_SUPER_MAGIC
+        (result == 0).then_some(stat.f_type as u64)
     }
 
     fn xfs_filesystem_uuid(fd: BorrowedFd<'_>) -> Result<[u8; FILESYSTEM_UUID_BYTES], Error> {
@@ -668,6 +808,32 @@ mod platform {
             return Err(Error::InvalidFilesystemUuid);
         }
         Ok(geometry.uuid)
+    }
+
+    fn btrfs_filesystem_uuid(fd: BorrowedFd<'_>) -> Result<[u8; FILESYSTEM_UUID_BYTES], Error> {
+        // SAFETY: this UAPI structure contains only integer and byte fields,
+        // so an all-zero representation is valid. Zeroing reserved input bytes
+        // also prevents them from selecting a future optional Btrfs request.
+        let mut info = unsafe { std::mem::zeroed::<BtrfsFilesystemInfo>() };
+        // SAFETY: `info` has the exact target-C representation of
+        // `struct btrfs_ioctl_fs_info_args` and stays writable throughout the
+        // ioctl; `fd` is borrowed for the duration of the call.
+        let result = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                BTRFS_IOC_FS_INFO,
+                std::ptr::addr_of_mut!(info),
+            )
+        };
+        if result == -1 {
+            return Err(Error::ReadBtrfsFilesystemUuid(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if info.uuid.iter().all(|byte| *byte == 0) {
+            return Err(Error::InvalidFilesystemUuid);
+        }
+        Ok(info.uuid)
     }
 
     fn filesystem_uuid(fd: BorrowedFd<'_>) -> Result<[u8; FILESYSTEM_UUID_BYTES], Error> {
@@ -769,6 +935,13 @@ mod platform {
             return Err(Error::ReadFileHandle(error));
         }
         Err(Error::InvalidFileHandle)
+    }
+
+    fn legacy_file_handle(fd: BorrowedFd<'_>) -> Result<(i32, Vec<u8>), Error> {
+        file_handle(fd, AT_EMPTY_PATH).map_err(|error| match error {
+            Error::ReadFileHandle(error) => Error::ReadLegacyFileHandle(error),
+            error => error,
+        })
     }
 
     fn read_metadata(
@@ -925,20 +1098,32 @@ mod platform {
         }
 
         #[test]
+        fn btrfs_filesystem_info_ioctl_uses_the_target_uapi_encoding() {
+            assert_eq!(size_of::<BtrfsFilesystemInfo>(), 1024);
+            assert_eq!(offset_of!(BtrfsFilesystemInfo, uuid), 16);
+            assert_eq!(offset_of!(BtrfsFilesystemInfo, metadata_uuid), 64);
+            assert_eq!(
+                BTRFS_IOC_FS_INFO,
+                libc::_IOR::<BtrfsFilesystemInfo>(b'B' as u32, 31),
+                "the Btrfs compatibility request must follow the target C ABI"
+            );
+        }
+
+        #[test]
         fn xfs_compatibility_accepts_uuid_enotty_and_rejects_replacement_generation() {
             // RED: RHEL9's 5.14 kernel reports ENOTTY for the newer generic
             // FS_IOC_GETFSUUID. GREEN: only that unavailable operation permits
             // the XFS UUID + export-handle compatibility pair.
             let generic_unavailable =
                 Error::ReadFilesystemUuid(std::io::Error::from_raw_os_error(libc::ENOTTY));
-            assert!(permits_xfs_compatibility(&generic_unavailable));
-            assert!(!permits_xfs_compatibility(&Error::ReadFilesystemUuid(
+            assert!(permits_legacy_compatibility(&generic_unavailable));
+            assert!(!permits_legacy_compatibility(&Error::ReadFilesystemUuid(
                 std::io::Error::from_raw_os_error(libc::EPERM),
             )));
-            assert!(!permits_xfs_compatibility(&Error::ReadFilesystemUuid(
+            assert!(!permits_legacy_compatibility(&Error::ReadFilesystemUuid(
                 std::io::Error::from_raw_os_error(libc::EINVAL),
             )));
-            assert!(permits_xfs_compatibility(&Error::ReadFileHandle(
+            assert!(permits_legacy_compatibility(&Error::ReadFileHandle(
                 std::io::Error::from_raw_os_error(libc::EINVAL),
             )));
 
@@ -962,17 +1147,60 @@ mod platform {
         }
 
         #[test]
+        fn persistent_identity_failure_codes_are_bounded_and_contextual() {
+            assert_eq!(
+                Error::ReadFilesystemUuid(std::io::Error::from_raw_os_error(libc::ENOTTY))
+                    .persistent_file_identity_failure()
+                    .as_str(),
+                "filesystem-uuid-unsupported"
+            );
+            assert_eq!(
+                Error::ReadFileHandle(std::io::Error::from_raw_os_error(libc::EINVAL))
+                    .persistent_file_identity_failure()
+                    .as_str(),
+                "file-handle-fid-unsupported"
+            );
+            assert_eq!(
+                Error::InvalidFileHandle
+                    .persistent_file_identity_failure()
+                    .as_str(),
+                "file-handle-invalid"
+            );
+            // A compatibility-path failure must not be misreported as an
+            // unavailable AT_HANDLE_FID request: that request was already
+            // known unavailable before the legacy handle was attempted.
+            assert_eq!(
+                Error::ReadLegacyFileHandle(std::io::Error::from_raw_os_error(libc::EIO))
+                    .persistent_file_identity_failure()
+                    .as_str(),
+                "other"
+            );
+        }
+
+        #[test]
         fn xfs_legacy_uuid_and_export_handle_are_usable_when_available() {
             let temporary = tempfile::NamedTempFile::new().expect("create XFS compatibility file");
             let file = temporary.as_file();
             if !is_xfs(file.as_fd()) {
                 return;
             }
-            let identity = xfs_persistent_file_identity(
-                file.as_fd(),
-                Error::ReadFilesystemUuid(std::io::Error::from_raw_os_error(libc::ENOTTY)),
-            )
-            .expect("read XFS compatibility identity after generic UUID ENOTTY");
+            let identity = xfs_persistent_file_identity(file.as_fd())
+                .expect("read XFS compatibility identity after generic UUID ENOTTY");
+            assert_ne!(identity.filesystem_uuid(), &[0; FILESYSTEM_UUID_BYTES]);
+            assert_ne!(identity.handle_type(), 0);
+            assert!(!identity.handle_bytes().is_empty());
+        }
+
+        #[test]
+        fn btrfs_legacy_uuid_and_export_handle_are_usable_when_available() {
+            let temporary =
+                tempfile::NamedTempFile::new().expect("create Btrfs compatibility file");
+            let file = temporary.as_file();
+            if !is_btrfs(file.as_fd()) {
+                return;
+            }
+            let identity = btrfs_persistent_file_identity(file.as_fd())
+                .expect("read Btrfs compatibility identity after generic UUID ENOTTY");
             assert_ne!(identity.filesystem_uuid(), &[0; FILESYSTEM_UUID_BYTES]);
             assert_ne!(identity.handle_type(), 0);
             assert!(!identity.handle_bytes().is_empty());

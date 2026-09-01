@@ -1190,12 +1190,60 @@ fn read_operator_recovery_latch_record_from_file(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
+thread_local! {
+    static FORCED_PERSISTENT_IDENTITY_FAILURE: std::cell::Cell<Option<opc_fs_verity_sys::PersistentFileIdentityFailure>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+fn force_persistent_identity_failure_for_test(
+    failure: Option<opc_fs_verity_sys::PersistentFileIdentityFailure>,
+) {
+    FORCED_PERSISTENT_IDENTITY_FAILURE.with(|forced| forced.set(failure));
+}
+
+#[cfg(target_os = "linux")]
 fn operator_recovery_file_incarnation(file: &File) -> io::Result<OperatorRecoveryFileIncarnation> {
     use std::os::fd::AsFd as _;
 
-    let persistent = opc_fs_verity_sys::persistent_file_identity(file.as_fd()).map_err(|_| {
-        invalid_data("session operator recovery database incarnation is unavailable")
-    })?;
+    #[cfg(test)]
+    if let Some(failure) = FORCED_PERSISTENT_IDENTITY_FAILURE.with(|forced| forced.get()) {
+        let message = match failure {
+            opc_fs_verity_sys::PersistentFileIdentityFailure::FilesystemUuidUnsupported => {
+                "session operator recovery database incarnation is unavailable (filesystem-uuid-unsupported)"
+            }
+            opc_fs_verity_sys::PersistentFileIdentityFailure::FileHandleFidUnsupported => {
+                "session operator recovery database incarnation is unavailable (file-handle-fid-unsupported)"
+            }
+            opc_fs_verity_sys::PersistentFileIdentityFailure::FileHandleInvalid => {
+                "session operator recovery database incarnation is unavailable (file-handle-invalid)"
+            }
+            opc_fs_verity_sys::PersistentFileIdentityFailure::Other => {
+                "session operator recovery database incarnation is unavailable (other)"
+            }
+        };
+        return Err(invalid_data(message));
+    }
+
+    let persistent =
+        opc_fs_verity_sys::persistent_file_identity(file.as_fd()).map_err(|error| {
+            let message = match error.persistent_file_identity_failure() {
+                opc_fs_verity_sys::PersistentFileIdentityFailure::FilesystemUuidUnsupported => {
+                    "session operator recovery database incarnation is unavailable (filesystem-uuid-unsupported)"
+                }
+                opc_fs_verity_sys::PersistentFileIdentityFailure::FileHandleFidUnsupported => {
+                    "session operator recovery database incarnation is unavailable (file-handle-fid-unsupported)"
+                }
+                opc_fs_verity_sys::PersistentFileIdentityFailure::FileHandleInvalid => {
+                    "session operator recovery database incarnation is unavailable (file-handle-invalid)"
+                }
+                opc_fs_verity_sys::PersistentFileIdentityFailure::Other => {
+                    "session operator recovery database incarnation is unavailable (other)"
+                }
+            };
+            invalid_data(message)
+        })?;
     let handle_length = persistent.handle_bytes().len();
     if handle_length == 0 || handle_length > opc_fs_verity_sys::PERSISTENT_FILE_HANDLE_MAX_BYTES {
         return Err(invalid_data(
@@ -1449,6 +1497,15 @@ pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
         }
         let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
             .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
+
+        // Retain the descriptor across the final sidecar and database fences.
+        // The terminal branches intentionally stop here: their snapshot
+        // binding is proved only by the full retained-namespace path.
+        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
+        if pinned_sidecar.is_none() {
+            revalidate_absent_operator_recovery_latch(database, connection, &database_file)?;
+            return Ok(LiveTerminalRecoveryHandoffProbe::Clear);
+        }
         let incarnation = operator_recovery_file_incarnation(&database_file)?;
         let path_file = open_nofollow_read(database)?;
         if !path_file.metadata()?.is_file()
@@ -1458,11 +1515,6 @@ pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
                 "session operator recovery pathname does not match SQLite descriptor",
             ));
         }
-
-        // Retain the descriptor across the final sidecar and database fences.
-        // The terminal branches intentionally stop here: their snapshot
-        // binding is proved only by the full retained-namespace path.
-        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
         let probe = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
             Some(OperatorRecoveryLatchRecord::Active(latch)) => {
                 active_latch_is_coherent_with_admitted_connection(connection, *latch)?;
@@ -1471,10 +1523,7 @@ pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
             Some(OperatorRecoveryLatchRecord::Terminal(_)) => {
                 LiveTerminalRecoveryHandoffProbe::TerminalNeedsSnapshot
             }
-            None => {
-                ensure_absent_operator_recovery_latch_is_ready(connection)?;
-                LiveTerminalRecoveryHandoffProbe::Clear
-            }
+            None => unreachable!("absent sidecar returned before persistent identity"),
         };
 
         // Preserve the classifier's final descriptor/path/sidecar fence for
@@ -1538,6 +1587,19 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
         }
         let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
             .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
+        let mut terminal_handoff = None;
+        let mut consumed_terminal = None;
+        // Keep the sidecar descriptor through every semantic check below.
+        // It is only moved into a pending handoff after the final path fence.
+        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
+        if pinned_sidecar.is_none() {
+            revalidate_absent_operator_recovery_latch(database, connection, &database_file)?;
+            return Ok(OperatorRecoveryLatchClassification {
+                latch: None,
+                terminal_handoff: None,
+                consumed_terminal: None,
+            });
+        }
         let incarnation = operator_recovery_file_incarnation(&database_file)?;
         let path_file = open_nofollow_read(database)?;
         if !path_file.metadata()?.is_file()
@@ -1547,11 +1609,6 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
                 "session operator recovery pathname does not match SQLite descriptor",
             ));
         }
-        let mut terminal_handoff = None;
-        let mut consumed_terminal = None;
-        // Keep the sidecar descriptor through every semantic check below.
-        // It is only moved into a pending handoff after the final path fence.
-        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
         let latch = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
             Some(OperatorRecoveryLatchRecord::Active(latch)) => {
                 active_latch_is_coherent_with_connection(connection, *latch)?;
@@ -1604,10 +1661,7 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
                     }
                 }
             }
-            None => {
-                ensure_absent_operator_recovery_latch_is_ready(connection)?;
-                None
-            }
+            None => unreachable!("absent sidecar returned before persistent identity"),
         };
         // `main_file_has_moved` validates SQLite's VFS object and the fresh
         // nofollow descriptor validates the public pathname.  Both must
@@ -2571,6 +2625,64 @@ fn revalidate_terminal_database_path_binding(
         ));
     }
     Ok(database_file)
+}
+
+/// Fence an ordinary, sidecar-free observation to the SQLite VFS descriptor.
+///
+/// This comparison is intentionally limited to one live process and must
+/// never be used for a durable recovery record: `(st_dev, st_ino)` alone can
+/// be reused after a crash. It is sufficient only after two no-follow reads
+/// have both proved that no recovery sidecar exists, because that state has no
+/// recovery artifact which could be replayed across a restart.
+#[cfg(target_os = "linux")]
+fn revalidate_clear_database_path_binding(database: &Path, database_file: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let descriptor_metadata = database_file.metadata()?;
+    let path_file = open_nofollow_read(database)?;
+    let path_metadata = path_file.metadata()?;
+    if !descriptor_metadata.is_file()
+        || !path_metadata.is_file()
+        || descriptor_metadata.dev() != path_metadata.dev()
+        || descriptor_metadata.ino() != path_metadata.ino()
+    {
+        return Err(invalid_data(
+            "session operator recovery pathname does not match SQLite descriptor",
+        ));
+    }
+    Ok(())
+}
+
+/// Prove a fresh recovery observation without asking the filesystem for a
+/// crash-persistent file identity. Once a sidecar exists, callers take the
+/// persistent-identity path instead and failures remain fail-closed.
+#[cfg(target_os = "linux")]
+fn revalidate_absent_operator_recovery_latch(
+    database: &Path,
+    connection: &Connection,
+    database_file: &File,
+) -> io::Result<()> {
+    ensure_absent_operator_recovery_latch_is_ready(connection)?;
+    revalidate_clear_database_path_binding(database, database_file)?;
+    if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+    {
+        return Err(invalid_data("session operator recovery descriptor moved"));
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
+    if read_operator_recovery_latch_record_pinned(database)?.is_some() {
+        return Err(invalid_data(
+            "session operator recovery latch appeared during classification",
+        ));
+    }
+    revalidate_clear_database_path_binding(database, database_file)?;
+    if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+    {
+        return Err(invalid_data("session operator recovery descriptor moved"));
+    }
+    Ok(())
 }
 
 /// Consume a pending snapshot-bound terminal latch after the first normal
@@ -41561,6 +41673,91 @@ mod tests {
         writer
             .execute_batch("ROLLBACK")
             .expect("release primary writer transaction");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fresh_recovery_admission_does_not_require_persistent_identity_but_sidecars_do() {
+        let directory = tempfile::tempdir().expect("fresh recovery compatibility directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend =
+            SqliteSessionBackend::open(&database).expect("open fresh compatibility backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize fresh compatibility core");
+        drop(core);
+        drop(backend);
+        let connection = Connection::open(&database).expect("open fresh compatibility connection");
+
+        // RED: a 5.14 filesystem can reject both generic persistent identity
+        // facilities. GREEN: with no sidecar to replay across a crash, fresh
+        // admission and the periodic Clear probe use only live descriptor/path
+        // fencing and remain available.
+        for failure in [
+            opc_fs_verity_sys::PersistentFileIdentityFailure::FilesystemUuidUnsupported,
+            opc_fs_verity_sys::PersistentFileIdentityFailure::FileHandleFidUnsupported,
+        ] {
+            force_persistent_identity_failure_for_test(Some(failure));
+            assert!(
+                classify_operator_recovery_latch_with_connection_sync(&database, &connection)
+                    .expect("fresh classifier must not require persistent identity")
+                    .latch()
+                    .is_none()
+            );
+            assert_eq!(
+                LiveTerminalRecoveryHandoffProbe::Clear,
+                probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                    .expect("fresh periodic probe must not require persistent identity"),
+            );
+            force_persistent_identity_failure_for_test(None);
+        }
+
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xA6; 32],
+            audit_pending: false,
+        };
+        if ensure_operator_recovery_latch_sync(&database, latch).is_err() {
+            // The active-sidecar half requires a qualifying real filesystem to
+            // create its durable self-incarnation. The fresh half above is
+            // deliberately independent of that capability.
+            return;
+        }
+        force_persistent_identity_failure_for_test(Some(
+            opc_fs_verity_sys::PersistentFileIdentityFailure::FilesystemUuidUnsupported,
+        ));
+        let classifier_error =
+            match classify_operator_recovery_latch_with_connection_sync(&database, &connection) {
+                Ok(_) => panic!("durable recovery sidecar must remain fail-closed"),
+                Err(error) => error,
+            };
+        assert!(
+            classifier_error
+                .to_string()
+                .contains("filesystem-uuid-unsupported"),
+            "recovery-capable path must expose only the bounded category: {classifier_error}"
+        );
+        let probe_error =
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect_err("periodic recovery probe must remain fail-closed for a sidecar");
+        assert!(
+            probe_error
+                .to_string()
+                .contains("filesystem-uuid-unsupported"),
+            "periodic recovery path must expose only the bounded category: {probe_error}"
+        );
+        force_persistent_identity_failure_for_test(None);
     }
 
     #[cfg(target_os = "linux")]
