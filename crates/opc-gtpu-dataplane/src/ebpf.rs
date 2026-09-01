@@ -1743,6 +1743,19 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         Ok(None)
     }
 
+    /// Migrate a conclusively empty predecessor authority leaf to the current
+    /// exclusion marker. Implementations must leave every other shape alone.
+    #[cfg(any(target_os = "linux", test))]
+    fn migrate_empty_historical_25_legacy_authority_to_ordinary_exclusion(
+        &self,
+        _pin_dir: &Path,
+        _ifindex: u32,
+        _tc_priority: u16,
+        _writer_proof: crate::CurrentEbpfGraphWriterProof,
+    ) -> Result<bool, GtpuError> {
+        Ok(false)
+    }
+
     /// Read an uplink FAR entry.
     fn far_get(
         &self,
@@ -3280,7 +3293,8 @@ struct BlockingWorkerStartPause {
 
 /// Affine, supervised completion handle for one cleanup-only acquisition.
 ///
-/// Produced by [`EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery`].
+/// Produced by [`EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery`] or
+/// [`EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion`].
 /// Awaiting it drives the bounded acquisition on an owned blocking worker. The
 /// handle is not `Clone`, so safe Rust cannot start the same acquisition twice
 /// from one handle; dropping the observing future does not cancel the worker,
@@ -3291,6 +3305,7 @@ struct BlockingWorkerStartPause {
 pub struct RetainedGraphCleanupAcquisition {
     backend: EbpfGtpuDataplaneBackend,
     request: RetainedGraphCleanupRequest,
+    normalize_graph_absent_legacy: bool,
     shared: Arc<Mutex<CleanupAcquisitionShared>>,
 }
 
@@ -3325,6 +3340,7 @@ impl Future for RetainedGraphCleanupAcquisition {
                 let shared = Arc::clone(&self.shared);
                 let backend = self.backend.clone();
                 let request = self.request.clone();
+                let normalize_graph_absent_legacy = self.normalize_graph_absent_legacy;
                 // The worker is owned by the runtime, not by this future:
                 // dropping the observer cannot cancel the bounded mutation,
                 // which converges the graph state and records the terminal
@@ -3335,7 +3351,11 @@ impl Future for RetainedGraphCleanupAcquisition {
                 // exact retry converges even after a mid-segment panic.
                 tokio::task::spawn_blocking(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        backend.acquire_cleanup_only_recovery_sync(request)
+                        if normalize_graph_absent_legacy {
+                            backend.acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion_sync(request)
+                        } else {
+                            backend.acquire_cleanup_only_recovery_sync(request)
+                        }
                     }));
                     let result = match outcome {
                         Ok(result) => result,
@@ -3741,6 +3761,42 @@ impl EbpfGtpuDataplaneBackend {
         RetainedGraphCleanupAcquisition {
             backend: self.clone(),
             request,
+            normalize_graph_absent_legacy: false,
+            shared: Arc::new(Mutex::new(CleanupAcquisitionShared {
+                state: CleanupAcquisitionState::NotStarted,
+                waker: None,
+            })),
+        }
+    }
+
+    /// Explicitly normalize an exact, stopped predecessor empty authority
+    /// leaf before acquiring ordinary cleanup-only recovery.
+    ///
+    /// This is the opt-in compatibility bridge for a same-node reinstall
+    /// after a pre-current SDK release retained its deterministic authority
+    /// leaf without a graph. It accepts only a direct child of the bpffs mount
+    /// whose complete predecessor hierarchy names this one exact empty leaf.
+    /// Under nonblocking root, control-root, and leaf locks, it tightens those
+    /// same three directories to `0700`, then publishes the current exclusion
+    /// marker. It re-proves graph, current-authority, and SDK-hook absence
+    /// before every effect. A proof-bearing, locked, malformed, foreign, or
+    /// nonempty hierarchy is never adopted or deleted; the ordinary structural
+    /// refusal is returned. Its only mutations are `fchmod`/`fsync` on those
+    /// three authenticated target descriptors and `mkdir`/`fsync` of their
+    /// marker: it never unpins, deletes, detaches, or changes a foreign bpffs
+    /// object or hook. An occupied SDK slot fails closed; unrelated hooks
+    /// outside the SDK-owned slots are not changed. A stop after any mode
+    /// transition remains an exact predecessor empty layout, and a stop after
+    /// `mkdir` converges through the ordinary absent path on retry.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(
+        &self,
+        request: RetainedGraphCleanupRequest,
+    ) -> RetainedGraphCleanupAcquisition {
+        RetainedGraphCleanupAcquisition {
+            backend: self.clone(),
+            request,
+            normalize_graph_absent_legacy: true,
             shared: Arc::new(Mutex::new(CleanupAcquisitionShared {
                 state: CleanupAcquisitionState::NotStarted,
                 waker: None,
@@ -9897,6 +9953,60 @@ impl EbpfGtpuDataplaneBackend {
         request: RetainedGraphCleanupRequest,
     ) -> Result<RetainedGraphCleanupClassification, GtpuError> {
         let _operation = self.operation_guard()?;
+        self.acquire_cleanup_only_recovery_sync_locked(request)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion_sync(
+        &self,
+        request: RetainedGraphCleanupRequest,
+    ) -> Result<RetainedGraphCleanupClassification, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let device = request.device();
+        validate_interface_name(&device.name)?;
+        if device.ifindex == 0 {
+            return Err(GtpuError::invalid_config(
+                "device.ifindex",
+                "interface index must be nonzero",
+            ));
+        }
+        if request.local_endpoint().is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "request.local_endpoint",
+                "local endpoint must not be unspecified",
+            ));
+        }
+        let ifindex = match self.inner.runtime.ifindex_by_name(&device.name) {
+            Ok(ifindex) if ifindex == device.ifindex => ifindex,
+            Ok(_) | Err(GtpuError::NotFound) => {
+                return Ok(RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::InterfaceIdentityChanged,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        match self
+            .inner
+            .runtime
+            .migrate_empty_historical_25_legacy_authority_to_ordinary_exclusion(
+                &self.pin_dir(&device.name),
+                ifindex,
+                self.inner.config.tc_priority,
+                request.writer_proof(),
+            ) {
+            Ok(_) => self.acquire_cleanup_only_recovery_sync_locked(request),
+            Err(GtpuError::AlreadyExists) => Ok(RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::ActiveOwner,
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn acquire_cleanup_only_recovery_sync_locked(
+        &self,
+        request: RetainedGraphCleanupRequest,
+    ) -> Result<RetainedGraphCleanupClassification, GtpuError> {
         let device = request.device();
         validate_interface_name(&device.name)?;
         if device.ifindex == 0 {
@@ -9964,10 +10074,10 @@ impl EbpfGtpuDataplaneBackend {
                 ))
             };
         }
-        // Ordinary cleanup-only recovery remains non-destructive.  This
-        // read-only qualification turns a known historical graph or legacy
-        // authority into a bounded structural refusal instead of attempting
-        // current ownership acquisition against an incompatible layout.
+        // Ordinary cleanup-only recovery is observation-only. Qualification
+        // turns a known historical graph or legacy authority into a structural
+        // refusal instead of attempting current ownership acquisition against
+        // an incompatible layout.
         if let Some(refusal) = self
             .inner
             .runtime
@@ -16260,6 +16370,16 @@ mod aya_runtime {
             const { std::cell::Cell::new(false) };
         static HISTORICAL_25_TEST_CRASH_BEFORE_ORDINARY_EXCLUSION_RENAME: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        static HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_ROOT_CHMOD: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_CONTROL_CHMOD: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_LEAF_CHMOD: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_MARKER_MKDIR: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static HISTORICAL_25_TEST_EMPTY_NORMALIZATION_PRE_MARKER_FOREIGN_ENTRY: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(test)]
@@ -16315,6 +16435,35 @@ mod aya_runtime {
         {
             panic!("test crash after durable ordinary exclusion staging");
         }
+    }
+
+    #[cfg(test)]
+    fn historical_25_test_crash_after_empty_normalization(cut: &'static str) {
+        let armed = match cut {
+            "root_chmod" => HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_ROOT_CHMOD
+                .with(|armed| armed.replace(false)),
+            "control_chmod" => HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_CONTROL_CHMOD
+                .with(|armed| armed.replace(false)),
+            "leaf_chmod" => HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_LEAF_CHMOD
+                .with(|armed| armed.replace(false)),
+            "marker_mkdir" => HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_MARKER_MKDIR
+                .with(|armed| armed.replace(false)),
+            _ => unreachable!(),
+        };
+        if armed {
+            panic!("test crash after empty legacy normalization {cut}");
+        }
+    }
+
+    #[cfg(test)]
+    fn historical_25_test_inject_empty_normalization_pre_marker_foreign_entry() {
+        HISTORICAL_25_TEST_EMPTY_NORMALIZATION_PRE_MARKER_FOREIGN_ENTRY.with(|path| {
+            let Some(path) = path.borrow_mut().take() else {
+                return;
+            };
+            fs::create_dir(path.join("foreign-pre-marker"))
+                .expect("inject foreign target-leaf directory before marker publication");
+        });
     }
 
     #[cfg(test)]
@@ -23535,6 +23684,26 @@ mod aya_runtime {
             configured_root: &Path,
             operation: &'static str,
         ) -> Result<(File, std::fs::Metadata), GtpuError> {
+            Self::open_historical_25_bpffs_namespace_root_inner(configured_root, operation, false)
+        }
+
+        /// Open only a configured root that is the direct child of whichever
+        /// bpffs mount the descriptor traversal first enters. This is used by
+        /// the explicit empty-hierarchy normalizer: it changes no ancestor,
+        /// so a nested configured root would otherwise leave a predecessor
+        /// mode on a parent which normal current ownership must reject.
+        fn open_direct_historical_25_bpffs_namespace_root(
+            configured_root: &Path,
+            operation: &'static str,
+        ) -> Result<(File, std::fs::Metadata), GtpuError> {
+            Self::open_historical_25_bpffs_namespace_root_inner(configured_root, operation, true)
+        }
+
+        fn open_historical_25_bpffs_namespace_root_inner(
+            configured_root: &Path,
+            operation: &'static str,
+            require_direct_bpffs_child: bool,
+        ) -> Result<(File, std::fs::Metadata), GtpuError> {
             if !configured_root.is_absolute()
                 || configured_root.components().any(|component| {
                     !matches!(component, Component::RootDir | Component::Normal(_))
@@ -23557,6 +23726,7 @@ mod aya_runtime {
             .map_err(|error| GtpuError::io(operation, error.into()))?;
             let mut inside_bpffs = false;
             let mut namespace_component_seen = false;
+            let mut namespace_component_count = 0_u8;
             for component in configured_root.components() {
                 let Component::Normal(leaf) = component else {
                     continue;
@@ -23579,12 +23749,18 @@ mod aya_runtime {
                     }
                     Self::historical_25_verify_control_root(&child, None, operation)?;
                     namespace_component_seen = true;
+                    namespace_component_count = namespace_component_count
+                        .checked_add(1)
+                        .ok_or_else(|| state_indeterminate(operation))?;
                 } else if child_is_bpffs {
                     inside_bpffs = true;
                 }
                 mounted_root = child;
             }
-            if !inside_bpffs || !namespace_component_seen {
+            if !inside_bpffs
+                || !namespace_component_seen
+                || require_direct_bpffs_child && namespace_component_count != 1
+            {
                 return Err(state_indeterminate(operation));
             }
             let metadata = Self::historical_25_verify_control_root(&mounted_root, None, operation)?;
@@ -41436,19 +41612,438 @@ mod aya_runtime {
             }
         }
 
+        /// Convert only the exact empty predecessor authority leaf into the
+        /// already-supported current ordinary-exclusion grammar.  This is a
+        /// narrow availability bridge, not historical recovery: a proof leaf,
+        /// graph, hook, current authority, unknown inode, or held lease is
+        /// retained and never repaired here.
+        fn migrate_empty_historical_25_legacy_authority_to_ordinary_exclusion(
+            &self,
+            pin_dir: &Path,
+            ifindex: u32,
+            tc_priority: u16,
+            _writer_proof: crate::CurrentEbpfGraphWriterProof,
+        ) -> Result<bool, GtpuError> {
+            const OPERATION: &str = "ebpf_historical_25_empty_leaf_migration";
+            match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(OPERATION, error)),
+            }
+            let configured_root = pin_dir.parent().ok_or_else(|| {
+                GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
+            })?;
+            let leaf = pin_dir
+                .file_name()
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let (root, root_metadata) = match Self::open_direct_historical_25_bpffs_namespace_root(
+                configured_root,
+                OPERATION,
+            ) {
+                Ok(root) => root,
+                Err(GtpuError::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            match rustix::fs::flock(&root, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+            }
+            let control_root = match rustix::fs::openat(
+                &root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => File::from(descriptor),
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+            };
+            let control_metadata =
+                Self::historical_25_verify_control_root(&control_root, None, OPERATION)?;
+            match rustix::fs::flock(
+                &control_root,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+            }
+            let legacy_name = Self::historical_25_legacy_leaf_name(leaf)?;
+            let legacy_dir = match rustix::fs::openat(
+                &control_root,
+                legacy_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => File::from(descriptor),
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+            };
+            let (mut legacy_metadata, marker) =
+                Self::historical_25_classify_legacy_authority_directory(
+                    &legacy_dir,
+                    None,
+                    None,
+                    OPERATION,
+                )?;
+            if marker.is_some()
+                || !Self::historical_25_legacy_entries(&legacy_dir, OPERATION)?.is_empty()
+            {
+                return Ok(false);
+            }
+            match rustix::fs::flock(
+                &legacy_dir,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+            }
+
+            // Re-descend both locked inodes before the one permitted effect;
+            // an unlinked descriptor never authorizes a replacement path.
+            let (current_root, current_root_metadata) =
+                Self::open_direct_historical_25_bpffs_namespace_root(configured_root, OPERATION)?;
+            if (current_root_metadata.dev(), current_root_metadata.ino())
+                != (root_metadata.dev(), root_metadata.ino())
+            {
+                return Err(state_indeterminate(OPERATION));
+            }
+            let current_control = rustix::fs::openat(
+                &current_root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+            Self::historical_25_verify_control_root(
+                &current_control,
+                Some((control_metadata.dev(), control_metadata.ino())),
+                OPERATION,
+            )?;
+            if Self::historical_25_control_root_entries(&current_root, OPERATION)?
+                != vec![RECONCILER_CONTROL_DIRECTORY.to_owned()]
+                || Self::historical_25_control_root_entries(&current_control, OPERATION)?
+                    != vec![legacy_name.clone()]
+            {
+                return Ok(false);
+            }
+            let current_legacy = rustix::fs::openat(
+                &current_control,
+                legacy_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+            let (rechecked_legacy, rechecked_marker) =
+                Self::historical_25_classify_legacy_authority_directory(
+                    &current_legacy,
+                    Some((legacy_metadata.dev(), legacy_metadata.ino())),
+                    None,
+                    OPERATION,
+                )?;
+            let (held_legacy, held_marker) =
+                Self::historical_25_classify_legacy_authority_directory(
+                    &legacy_dir,
+                    Some((legacy_metadata.dev(), legacy_metadata.ino())),
+                    None,
+                    OPERATION,
+                )?;
+            match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(OPERATION, error)),
+            }
+            if rechecked_marker.is_some()
+                || held_marker.is_some()
+                || !Self::historical_25_legacy_entries(&current_legacy, OPERATION)?.is_empty()
+                || !Self::historical_25_legacy_entries(&legacy_dir, OPERATION)?.is_empty()
+                || (held_legacy.dev(), held_legacy.ino())
+                    != (rechecked_legacy.dev(), rechecked_legacy.ino())
+                || self.current_recovery_authority_is_present(pin_dir)?
+                || !Self::cleanup_only_absence_proven(ifindex, tc_priority)?
+            {
+                return Ok(false);
+            }
+            // Normal startup requires private current-format namespace and
+            // control roots. This explicit bridge may tighten them only once
+            // their inventories prove they name this one empty target leaf.
+            // Each durable mode transition keeps the old empty grammar valid,
+            // so a crash before the marker is published resumes exactly.
+            if !selector_control_directory_mode_is_exact(root_metadata.mode()) {
+                rustix::fs::fchmod(&root, rustix::fs::Mode::from_bits_truncate(0o700))
+                    .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                Self::sync_control_directory(&root, OPERATION)?;
+                let (normalized_root, normalized_root_metadata) =
+                    Self::open_direct_historical_25_bpffs_namespace_root(
+                        configured_root,
+                        OPERATION,
+                    )?;
+                if (
+                    normalized_root_metadata.dev(),
+                    normalized_root_metadata.ino(),
+                ) != (root_metadata.dev(), root_metadata.ino())
+                    || Self::historical_25_control_root_entries(&normalized_root, OPERATION)?
+                        != vec![RECONCILER_CONTROL_DIRECTORY.to_owned()]
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                #[cfg(test)]
+                historical_25_test_crash_after_empty_normalization("root_chmod");
+            }
+            // The transition is deliberately a sequence of separately
+            // durable effects. Re-prove serving absence immediately before
+            // each later chmod; a predecessor writer may not honour these
+            // newer hierarchy locks.
+            match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(OPERATION, error)),
+            }
+            if self.current_recovery_authority_is_present(pin_dir)?
+                || !Self::cleanup_only_absence_proven(ifindex, tc_priority)?
+            {
+                return Ok(false);
+            }
+            if !selector_control_directory_mode_is_exact(control_metadata.mode()) {
+                rustix::fs::fchmod(&control_root, rustix::fs::Mode::from_bits_truncate(0o700))
+                    .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                Self::sync_control_directory(&control_root, OPERATION)?;
+                let normalized_control = rustix::fs::openat(
+                    &root,
+                    RECONCILER_CONTROL_DIRECTORY,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                Self::verify_control_directory(
+                    &normalized_control,
+                    Some((control_metadata.dev(), control_metadata.ino())),
+                    OPERATION,
+                )?;
+                if Self::historical_25_control_root_entries(&normalized_control, OPERATION)?
+                    != vec![legacy_name.clone()]
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                #[cfg(test)]
+                historical_25_test_crash_after_empty_normalization("control_chmod");
+            }
+            match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(OPERATION, error)),
+            }
+            if self.current_recovery_authority_is_present(pin_dir)?
+                || !Self::cleanup_only_absence_proven(ifindex, tc_priority)?
+            {
+                return Ok(false);
+            }
+            // The predecessor used umask-derived modes (including 0755),
+            // while the published current marker grammar requires a private
+            // 0700 parent. Change only the already-authenticated, locked
+            // empty inode. A stop after this chmod is resumable: 0700 remains
+            // accepted as an exact predecessor empty leaf on the next pass.
+            if !selector_control_directory_mode_is_exact(legacy_metadata.mode()) {
+                rustix::fs::fchmod(&legacy_dir, rustix::fs::Mode::from_bits_truncate(0o700))
+                    .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+                Self::sync_control_directory(&legacy_dir, OPERATION)?;
+                let (normalized_metadata, normalized_marker) =
+                    Self::historical_25_classify_legacy_authority_directory(
+                        &legacy_dir,
+                        Some((legacy_metadata.dev(), legacy_metadata.ino())),
+                        None,
+                        OPERATION,
+                    )?;
+                if normalized_marker.is_some()
+                    || !selector_control_directory_mode_is_exact(normalized_metadata.mode())
+                    || !Self::historical_25_legacy_entries(&legacy_dir, OPERATION)?.is_empty()
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                legacy_metadata = normalized_metadata;
+                #[cfg(test)]
+                historical_25_test_crash_after_empty_normalization("leaf_chmod");
+            }
+            match fs::symlink_metadata(pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(GtpuError::io(OPERATION, error)),
+            }
+            if self.current_recovery_authority_is_present(pin_dir)?
+                || !Self::cleanup_only_absence_proven(ifindex, tc_priority)?
+            {
+                return Ok(false);
+            }
+            // A shipped writer did not participate in the newer hierarchy
+            // locks. Re-descend every path component and classify the held
+            // target leaf immediately before publication, so a replacement,
+            // sibling, marker, or foreign leaf entry observed before this
+            // commit point cannot be carried into a supposedly single-owner
+            // transition.
+            #[cfg(test)]
+            historical_25_test_inject_empty_normalization_pre_marker_foreign_entry();
+            let (pre_marker_root, pre_marker_root_metadata) =
+                Self::open_direct_historical_25_bpffs_namespace_root(configured_root, OPERATION)?;
+            if (
+                pre_marker_root_metadata.dev(),
+                pre_marker_root_metadata.ino(),
+            ) != (root_metadata.dev(), root_metadata.ino())
+                || Self::historical_25_control_root_entries(&pre_marker_root, OPERATION)?
+                    != vec![RECONCILER_CONTROL_DIRECTORY.to_owned()]
+            {
+                return Ok(false);
+            }
+            let pre_marker_control = rustix::fs::openat(
+                &pre_marker_root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+            let pre_marker_control_metadata = Self::verify_control_directory(
+                &pre_marker_control,
+                Some((control_metadata.dev(), control_metadata.ino())),
+                OPERATION,
+            )?;
+            if (
+                pre_marker_control_metadata.dev(),
+                pre_marker_control_metadata.ino(),
+            ) != (control_metadata.dev(), control_metadata.ino())
+                || Self::historical_25_control_root_entries(&pre_marker_control, OPERATION)?
+                    != vec![legacy_name.clone()]
+            {
+                return Ok(false);
+            }
+            let pre_marker_legacy = rustix::fs::openat(
+                &pre_marker_control,
+                legacy_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+            let (pre_marker_legacy_metadata, pre_marker_legacy_marker) =
+                Self::historical_25_classify_legacy_authority_directory(
+                    &pre_marker_legacy,
+                    Some((legacy_metadata.dev(), legacy_metadata.ino())),
+                    None,
+                    OPERATION,
+                )?;
+            if (
+                pre_marker_legacy_metadata.dev(),
+                pre_marker_legacy_metadata.ino(),
+            ) != (legacy_metadata.dev(), legacy_metadata.ino())
+                || pre_marker_legacy_marker.is_some()
+                || !Self::historical_25_legacy_entries(&pre_marker_legacy, OPERATION)?.is_empty()
+            {
+                return Ok(false);
+            }
+            rustix::fs::mkdirat(
+                &legacy_dir,
+                HISTORICAL_25_ORDINARY_EXCLUSION_MARKER,
+                rustix::fs::Mode::from_bits_truncate(0o700),
+            )
+            .map_err(|error| GtpuError::io(OPERATION, error.into()))?;
+            #[cfg(test)]
+            historical_25_test_crash_after_empty_normalization("marker_mkdir");
+            let (_, marker) = Self::verify_historical_25_ordinary_exclusion_directory(
+                &legacy_dir,
+                Some((legacy_metadata.dev(), legacy_metadata.ino())),
+                None,
+                OPERATION,
+            )?;
+            Self::sync_control_directory(&legacy_dir, OPERATION)?;
+            Self::verify_historical_25_ordinary_exclusion_directory(
+                &legacy_dir,
+                Some((legacy_metadata.dev(), legacy_metadata.ino())),
+                Some((marker.dev(), marker.ino())),
+                OPERATION,
+            )?;
+            Ok(true)
+        }
+
         fn historical_cleanup_only_refusal(
             &self,
             pin_dir: &Path,
         ) -> Result<Option<RetainedGraphCleanupRefusal>, GtpuError> {
-            // This preflight intentionally does not acquire either authority
-            // lease.  It only recognises the complete sealed historical ABI,
-            // keeping ordinary startup/recovery detection-only and
-            // non-destructive.
+            // This preflight never creates or mutates authority. For a
+            // graph-absent deterministic predecessor leaf it temporarily
+            // takes that existing leaf's nonblocking flock solely to
+            // authenticate its exact shape; ordinary startup/recovery remains
+            // detection-only and non-destructive.
             let graph_identity = match fs::symlink_metadata(pin_dir) {
                 Ok(metadata)
                     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
                 {
                     (metadata.dev(), metadata.ino())
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // The shipped predecessor addressed authority by
+                    // SHA-256(pin-leaf), independently from the graph path.
+                    // If that exact leaf survived after the graph disappeared,
+                    // ordinary cleanup must not create current authority next
+                    // to it.  Taking its nonblocking flock is observation
+                    // only; every accepted inode is re-descended and
+                    // revalidated by the legacy acquisition helper.
+                    return match Self::acquire_historical_25_legacy_ownership(pin_dir) {
+                        Ok(Some(legacy)) if legacy.ordinary_exclusion_marker.is_none() => {
+                            // An empty or authenticated proof-only old leaf
+                            // is maintenance authority, never ordinary
+                            // cleanup authority.  Authenticate a present
+                            // proof before classifying the retained layout.
+                            let _ = Self::historical_25_read_proof(&legacy)?;
+                            Ok(Some(RetainedGraphCleanupRefusal::LegacyAuthorityLayout))
+                        }
+                        // The one-marker exclusion is current-writer state;
+                        // it is not the predecessor residue this classifier
+                        // owns, so the normal pristine-absence path remains
+                        // authoritative.
+                        Ok(Some(_)) | Ok(None) => Ok(None),
+                        // A stable, authenticated predecessor leaf held by
+                        // another process remains a live-owner refusal.
+                        Err(GtpuError::AlreadyExists) => {
+                            Ok(Some(RetainedGraphCleanupRefusal::ActiveOwner))
+                        }
+                        // A missing compatibility hierarchy is ordinary
+                        // pristine absence. Any other malformed or foreign
+                        // residue stays fail-closed through its concrete
+                        // pre-effect error rather than being inferred here.
+                        Err(GtpuError::Io {
+                            kind: io::ErrorKind::NotFound,
+                            ..
+                        }) => Ok(None),
+                        Err(error) => Err(error),
+                    };
                 }
                 Ok(_) | Err(_) => return Ok(None),
             };
@@ -47124,6 +47719,438 @@ mod aya_runtime {
             // still prints "1 passed", so the gate could go green having
             // loaded nothing.
             println!("OPC_GTPU_LOAD_CAPABILITY_PROVEN");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, an uncontended loopback tc view, and a fresh netns"]
+        async fn empty_historical_25_hierarchy_normalizes_then_allows_ordinary_create() {
+            use std::net::{IpAddr, Ipv4Addr};
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            use crate::{
+                CreateGtpDeviceRequest, GtpDevice, GtpuDataplaneBackend,
+                RetainedGraphCleanupClassification, RetainedGraphCleanupRequest,
+            };
+
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let ifindex = sys::ifindex_by_name("lo").expect("fresh netns loopback identity");
+            if let Err(error) = tc::qdisc_add_clsact("lo") {
+                assert!(
+                    is_qdisc_already_present(&error),
+                    "create loopback clsact qdisc: {error}"
+                );
+            }
+            let sequence = CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let bpffs_mount = std::env::var_os("OPC_GTPU_TEST_BPFFS_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/sys/fs/bpf"));
+            let pin_root = bpffs_mount.join(format!(
+                "opc-gtpu-empty-legacy-normalization-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&pin_root).expect("create direct bpffs-child test root");
+            struct Cleanup(PathBuf);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = Cleanup(pin_root.clone());
+            let foreign_root = bpffs_mount.join(format!(
+                "opc-gtpu-empty-legacy-foreign-sentinel-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&foreign_root).expect("create distinct foreign bpffs root");
+            let _foreign_cleanup = Cleanup(foreign_root.clone());
+            fs::set_permissions(&foreign_root, fs::Permissions::from_mode(0o755))
+                .expect("seed foreign root mode");
+            let foreign_entry = foreign_root.join("foreign-workload-state");
+            fs::create_dir(&foreign_entry).expect("seed foreign workload directory");
+            fs::set_permissions(&foreign_entry, fs::Permissions::from_mode(0o755))
+                .expect("seed foreign workload mode");
+            let foreign_identity = {
+                let metadata = fs::metadata(&foreign_root).expect("capture foreign root identity");
+                (metadata.dev(), metadata.ino(), metadata.mode() & 0o7777)
+            };
+            fs::set_permissions(&pin_root, fs::Permissions::from_mode(0o755))
+                .expect("seed shipped namespace-root mode");
+            let pin_dir = pin_root.join("lo");
+            let control_root = pin_root.join(RECONCILER_CONTROL_DIRECTORY);
+            fs::create_dir(&control_root).expect("seed shipped control root");
+            fs::set_permissions(&control_root, fs::Permissions::from_mode(0o755))
+                .expect("seed shipped control-root mode");
+            let legacy_leaf = control_root.join(
+                AyaGtpuRuntime::historical_25_legacy_leaf_name(
+                    pin_dir.file_name().expect("canonical pin leaf"),
+                )
+                .expect("derive shipped deterministic authority leaf"),
+            );
+            fs::create_dir(&legacy_leaf).expect("seed exact empty predecessor leaf");
+            fs::set_permissions(&legacy_leaf, fs::Permissions::from_mode(0o755))
+                .expect("seed shipped leaf mode");
+            let identity = |path: &Path| {
+                let metadata = fs::metadata(path).expect("capture bpffs inode identity");
+                (metadata.dev(), metadata.ino())
+            };
+            let identities = [
+                identity(&pin_root),
+                identity(&control_root),
+                identity(&legacy_leaf),
+            ];
+            let backend = super::super::EbpfGtpuDataplaneBackend::with_config(
+                super::super::EbpfGtpuDataplaneBackendConfig {
+                    bpffs_pin_root: pin_root.clone(),
+                    tc_priority: 50,
+                },
+            );
+            let cleanup_request = RetainedGraphCleanupRequest::new(
+                GtpDevice {
+                    name: "lo".to_string(),
+                    ifindex,
+                },
+                Ipv4Addr::new(192, 0, 2, 1),
+                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            );
+            assert_eq!(
+                backend
+                    .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(
+                        cleanup_request,
+                    )
+                    .await
+                    .expect("normalize the exact empty predecessor hierarchy"),
+                RetainedGraphCleanupClassification::AlreadyAbsent
+            );
+            assert_eq!(
+                [
+                    identity(&pin_root),
+                    identity(&control_root),
+                    identity(&legacy_leaf),
+                ],
+                identities,
+                "normalization must retain every predecessor hierarchy inode"
+            );
+            for directory in [&pin_root, &control_root, &legacy_leaf] {
+                assert_eq!(
+                    fs::metadata(directory)
+                        .expect("read normalized mode")
+                        .mode()
+                        & 0o7777,
+                    0o700,
+                    "normalize every hierarchy directory to current private mode"
+                );
+            }
+            let entries = fs::read_dir(&legacy_leaf)
+                .expect("read normalized leaf")
+                .map(|entry| entry.expect("read normalized leaf entry").file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entries,
+                vec![std::ffi::OsString::from(
+                    HISTORICAL_25_ORDINARY_EXCLUSION_MARKER
+                )]
+            );
+
+            let mut create = CreateGtpDeviceRequest::new("lo");
+            create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            let created = backend
+                .create_device(create)
+                .await
+                .expect("current ordinary create must follow normalization");
+            assert_eq!(backend.resolve_device("lo").await.unwrap(), created);
+            assert!(matches!(
+                AyaGtpuRuntime::acquire_historical_25_legacy_ownership(&pin_dir),
+                Err(GtpuError::AlreadyExists)
+            ));
+            let foreign_metadata = fs::metadata(&foreign_root).expect("foreign root survives");
+            assert_eq!(
+                (
+                    foreign_metadata.dev(),
+                    foreign_metadata.ino(),
+                    foreign_metadata.mode() & 0o7777,
+                ),
+                foreign_identity,
+                "normalization must not change an unrelated bpffs root"
+            );
+            assert_eq!(
+                fs::metadata(&foreign_entry)
+                    .expect("foreign workload state survives")
+                    .mode()
+                    & 0o7777,
+                0o755
+            );
+            backend
+                .remove_device(&created)
+                .await
+                .expect("remove only the current test-owned device and hooks");
+            drop(backend);
+            fs::remove_dir_all(&pin_root).expect("remove only the unique test-owned bpffs root");
+            assert!(
+                !pin_root.exists(),
+                "sentinel requires no residual test-owned bpffs hierarchy"
+            );
+            println!("OPC_GTPU_EMPTY_LEGACY_NORMALIZATION_PROVEN");
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, and a fresh netns"]
+        fn empty_historical_25_hierarchy_normalization_crash_cuts_converge() {
+            use std::net::Ipv4Addr;
+            use std::os::unix::fs::PermissionsExt;
+
+            use crate::{
+                GtpDevice, RetainedGraphCleanupClassification, RetainedGraphCleanupRequest,
+            };
+
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let ifindex = sys::ifindex_by_name("lo").expect("fresh netns loopback identity");
+            for cut in [
+                "root_chmod",
+                "control_chmod",
+                "leaf_chmod",
+                "marker_mkdir",
+                "foreign_pre_marker",
+            ] {
+                let sequence = CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let pin_root = PathBuf::from(format!(
+                    "/sys/fs/bpf/opc-gtpu-empty-legacy-normalization-cut-{cut}-{}-{sequence}",
+                    std::process::id()
+                ));
+                fs::create_dir(&pin_root).expect("create direct bpffs-child crash-cut root");
+                struct Cleanup(PathBuf);
+                impl Drop for Cleanup {
+                    fn drop(&mut self) {
+                        let _ = fs::remove_dir_all(&self.0);
+                    }
+                }
+                let _cleanup = Cleanup(pin_root.clone());
+                fs::set_permissions(&pin_root, fs::Permissions::from_mode(0o755))
+                    .expect("seed shipped namespace-root mode");
+                let pin_dir = pin_root.join("lo");
+                let control_root = pin_root.join(RECONCILER_CONTROL_DIRECTORY);
+                fs::create_dir(&control_root).expect("seed shipped control root");
+                fs::set_permissions(&control_root, fs::Permissions::from_mode(0o755))
+                    .expect("seed shipped control-root mode");
+                let legacy_leaf = control_root.join(
+                    AyaGtpuRuntime::historical_25_legacy_leaf_name(
+                        pin_dir.file_name().expect("canonical pin leaf"),
+                    )
+                    .expect("derive shipped deterministic authority leaf"),
+                );
+                fs::create_dir(&legacy_leaf).expect("seed exact empty predecessor leaf");
+                fs::set_permissions(&legacy_leaf, fs::Permissions::from_mode(0o755))
+                    .expect("seed shipped leaf mode");
+                let backend = super::super::EbpfGtpuDataplaneBackend::with_config(
+                    super::super::EbpfGtpuDataplaneBackendConfig {
+                        bpffs_pin_root: pin_root.clone(),
+                        tc_priority: 50,
+                    },
+                );
+                let request = RetainedGraphCleanupRequest::new(
+                    GtpDevice {
+                        name: "lo".to_owned(),
+                        ifindex,
+                    },
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+                );
+                match cut {
+                    "root_chmod" => {
+                        HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_ROOT_CHMOD
+                            .with(|armed| armed.set(true));
+                    }
+                    "control_chmod" => {
+                        HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_CONTROL_CHMOD
+                            .with(|armed| armed.set(true));
+                    }
+                    "leaf_chmod" => {
+                        HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_LEAF_CHMOD
+                            .with(|armed| armed.set(true));
+                    }
+                    "marker_mkdir" => {
+                        HISTORICAL_25_TEST_CRASH_AFTER_EMPTY_NORMALIZATION_MARKER_MKDIR
+                            .with(|armed| armed.set(true));
+                    }
+                    "foreign_pre_marker" => {
+                        HISTORICAL_25_TEST_EMPTY_NORMALIZATION_PRE_MARKER_FOREIGN_ENTRY
+                            .with(|path| path.replace(Some(legacy_leaf.clone())));
+                    }
+                    _ => unreachable!(),
+                }
+                let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    backend.acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion_sync(
+                        request.clone(),
+                    )
+                }));
+                if cut == "foreign_pre_marker" {
+                    assert!(matches!(
+                        interrupted,
+                        Ok(Err(GtpuError::StateIndeterminate { .. }))
+                    ));
+                    assert_eq!(
+                        fs::read_dir(&legacy_leaf)
+                            .expect("inventory injected foreign leaf")
+                            .map(|entry| entry.expect("read injected foreign entry").file_name())
+                            .collect::<Vec<_>>(),
+                        [std::ffi::OsString::from("foreign-pre-marker")],
+                        "the final leaf recheck must refuse before publishing our marker"
+                    );
+                    continue;
+                }
+                assert!(interrupted.is_err(), "must exercise {cut}");
+
+                // A cut models process death. Reconstruct the backend so its
+                // in-process operation mutex is not the deliberately-poisoned
+                // mutex from the interrupted process.
+                drop(backend);
+                let backend = super::super::EbpfGtpuDataplaneBackend::with_config(
+                    super::super::EbpfGtpuDataplaneBackendConfig {
+                        bpffs_pin_root: pin_root.clone(),
+                        tc_priority: 50,
+                    },
+                );
+
+                let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+                let expected = match cut {
+                    "root_chmod" => [0o700, 0o755, 0o755],
+                    "control_chmod" => [0o700, 0o700, 0o755],
+                    "leaf_chmod" | "marker_mkdir" => [0o700, 0o700, 0o700],
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    [mode(&pin_root), mode(&control_root), mode(&legacy_leaf)],
+                    expected,
+                    "{cut} keeps the same exact hierarchy resumable"
+                );
+                let entries = fs::read_dir(&legacy_leaf)
+                    .expect("inventory crash-cut leaf")
+                    .map(|entry| entry.expect("read crash-cut leaf entry").file_name())
+                    .collect::<Vec<_>>();
+                if cut == "marker_mkdir" {
+                    assert_eq!(
+                        entries,
+                        [std::ffi::OsString::from(
+                            HISTORICAL_25_ORDINARY_EXCLUSION_MARKER
+                        )]
+                    );
+                    assert_eq!(
+                        backend
+                            .acquire_cleanup_only_recovery_sync(request)
+                            .expect("ordinary retry recognizes the same marker inode"),
+                        RetainedGraphCleanupClassification::AlreadyAbsent
+                    );
+                } else {
+                    assert!(entries.is_empty(), "{cut}");
+                    assert_eq!(
+                        backend
+                            .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion_sync(
+                                request,
+                            )
+                            .expect("explicit retry resumes the exact empty hierarchy"),
+                        RetainedGraphCleanupClassification::AlreadyAbsent
+                    );
+                }
+                assert_eq!(
+                    fs::read_dir(&legacy_leaf)
+                        .expect("inventory converged leaf")
+                        .map(|entry| entry.expect("read converged marker").file_name())
+                        .collect::<Vec<_>>(),
+                    [std::ffi::OsString::from(
+                        HISTORICAL_25_ORDINARY_EXCLUSION_MARKER
+                    )]
+                );
+            }
+            println!("OPC_GTPU_EMPTY_LEGACY_NORMALIZATION_CRASH_CUTS_PROVEN");
+        }
+
+        #[test]
+        #[ignore = "requires writable bpffs and a fresh mount namespace"]
+        fn empty_historical_25_normalization_refuses_nested_configured_root_pre_effect() {
+            use std::net::Ipv4Addr;
+            use std::os::unix::fs::PermissionsExt;
+
+            use crate::{GtpDevice, RetainedGraphCleanupRequest};
+
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let ifindex = sys::ifindex_by_name("lo").expect("fresh netns loopback identity");
+            let sequence = CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let bpffs_mount = std::env::var_os("OPC_GTPU_TEST_BPFFS_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/sys/fs/bpf"));
+            let outer_root = bpffs_mount.join(format!(
+                "opc-gtpu-empty-legacy-nested-parent-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&outer_root).expect("create direct bpffs parent");
+            struct Cleanup(PathBuf);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = Cleanup(outer_root.clone());
+            let configured_root = outer_root.join("nested");
+            fs::create_dir(&configured_root).expect("create nested configured root");
+            let control_root = configured_root.join(RECONCILER_CONTROL_DIRECTORY);
+            fs::create_dir(&control_root).expect("create nested control root");
+            let pin_dir = configured_root.join("lo");
+            let legacy_leaf = control_root.join(
+                AyaGtpuRuntime::historical_25_legacy_leaf_name(
+                    pin_dir.file_name().expect("canonical pin leaf"),
+                )
+                .expect("derive nested predecessor leaf"),
+            );
+            fs::create_dir(&legacy_leaf).expect("create nested predecessor leaf");
+            for path in [&outer_root, &configured_root, &control_root, &legacy_leaf] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                    .expect("seed predecessor-compatible nested mode");
+            }
+            let modes = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            let before = [
+                modes(&outer_root),
+                modes(&configured_root),
+                modes(&control_root),
+                modes(&legacy_leaf),
+            ];
+            let backend = super::super::EbpfGtpuDataplaneBackend::with_config(
+                super::super::EbpfGtpuDataplaneBackendConfig {
+                    bpffs_pin_root: configured_root.clone(),
+                    tc_priority: 50,
+                },
+            );
+            assert!(matches!(
+                backend.acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion_sync(
+                    RetainedGraphCleanupRequest::new(
+                        GtpDevice {
+                            name: "lo".to_owned(),
+                            ifindex,
+                        },
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+                    )
+                ),
+                Err(GtpuError::StateIndeterminate { .. })
+            ));
+            assert_eq!(
+                [
+                    modes(&outer_root),
+                    modes(&configured_root),
+                    modes(&control_root),
+                    modes(&legacy_leaf),
+                ],
+                before,
+                "nested roots are refused before changing any configured or ancestor inode"
+            );
+            assert!(fs::read_dir(&legacy_leaf)
+                .expect("inventory untouched nested leaf")
+                .next()
+                .is_none());
+            println!("OPC_GTPU_EMPTY_LEGACY_NESTED_ROOT_REFUSAL_PROVEN");
         }
 
         /// The predecessor and current writers address the same pin leaf but
@@ -52885,6 +53912,26 @@ mod tests {
         historical_25_staging: HashMap<PathBuf, FakeHistorical25Receipt>,
         historical_25_receipt_leaf_state: FakeHistorical25PinLeafState,
         historical_25_legacy_leaves: HashSet<PathBuf>,
+        // The current-format absence marker remains on the same predecessor
+        // leaf inode after explicit normalization; it is not deletion.
+        historical_25_ordinary_exclusion_leaves: HashSet<PathBuf>,
+        // A separately held predecessor leaf is a live owner. Keeping this
+        // distinct from the leaf inventory lets tests assert that ordinary
+        // cleanup never steals a compatible authority lease.
+        historical_25_legacy_leaf_busy: HashSet<PathBuf>,
+        // A foreign or malformed inode at the deterministic predecessor path
+        // is deliberately not classified as an empty authority leaf.
+        historical_25_legacy_leaf_malformed: HashSet<PathBuf>,
+        // Exact predecessor leaves may retain their umask-derived 0755 mode.
+        // The explicit bridge tightens that same inode before publishing the
+        // current marker; the cut sets model crashes on either side of mkdir.
+        historical_25_legacy_leaf_modes: HashMap<PathBuf, u32>,
+        historical_25_legacy_normalization_cut_after_chmod: HashSet<PathBuf>,
+        historical_25_legacy_normalization_cut_after_marker: HashSet<PathBuf>,
+        historical_25_legacy_root_busy: HashSet<PathBuf>,
+        historical_25_legacy_other_root_entries: HashSet<PathBuf>,
+        historical_25_legacy_other_control_leaves: HashSet<PathBuf>,
+        historical_25_namespace_root_mode: FakeHistorical25ControlRootMode,
         historical_25_operation_markers: HashSet<PathBuf>,
         // The current runtime rejects a predecessor shared authority root
         // until the authenticated maintenance hand-off publishes its exact
@@ -53511,6 +54558,24 @@ mod tests {
             if state.historical_25_graphs.contains_key(pin_dir)
                 || state.historical_25_staging.contains_key(pin_dir)
                 || state.historical_25_legacy_leaves.contains(pin_dir)
+            {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "fake_historical_25_ordinary_preflight",
+                });
+            }
+            // A marker alone is not authority to treat a predecessor-shaped
+            // hierarchy as current absence. The normal reader must still
+            // reject its 0755 parents before it can create native authority.
+            if state
+                .historical_25_ordinary_exclusion_leaves
+                .contains(pin_dir)
+                && (!matches!(
+                    state.historical_25_namespace_root_mode,
+                    FakeHistorical25ControlRootMode::CurrentPrivate0700
+                ) || !matches!(
+                    state.historical_25_control_root_mode,
+                    FakeHistorical25ControlRootMode::CurrentPrivate0700
+                ))
             {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "fake_historical_25_ordinary_preflight",
@@ -56018,6 +57083,11 @@ mod tests {
         ) -> Result<Option<RetainedGraphCleanupRefusal>, GtpuError> {
             let mut state = self.state();
             state.operations.push("historical_cleanup_only_refusal");
+            if !state.historical_25_graphs.contains_key(pin_dir)
+                && state.historical_25_legacy_leaves.contains(pin_dir)
+            {
+                return Ok(Some(RetainedGraphCleanupRefusal::LegacyAuthorityLayout));
+            }
             Ok(state
                 .historical_25_graphs
                 .get(pin_dir)
@@ -56030,6 +57100,93 @@ mod tests {
                         && graph.pins_remaining == HISTORICAL_25_PIN_COUNT
                 })
                 .then_some(RetainedGraphCleanupRefusal::HistoricalGeneration))
+        }
+
+        fn migrate_empty_historical_25_legacy_authority_to_ordinary_exclusion(
+            &self,
+            pin_dir: &Path,
+            ifindex: u32,
+            _tc_priority: u16,
+            _writer_proof: crate::CurrentEbpfGraphWriterProof,
+        ) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            let hooks_absent = !state.uplink_filter_ready.contains(&ifindex)
+                && !state.downlink_filter_ready.contains(&ifindex)
+                && !state.off_slot_sdk_hooks.contains(&ifindex);
+            if state.historical_25_legacy_leaves.contains(pin_dir)
+                && (state.historical_25_legacy_leaf_busy.contains(pin_dir)
+                    || state.historical_25_legacy_root_busy.contains(pin_dir))
+            {
+                return Err(GtpuError::AlreadyExists);
+            }
+            if state.historical_25_legacy_leaves.contains(pin_dir)
+                && state.historical_25_legacy_leaf_malformed.contains(pin_dir)
+            {
+                return Err(state_indeterminate(
+                    "fake_historical_25_empty_leaf_migration",
+                ));
+            }
+            if !state.historical_25_graphs.contains_key(pin_dir)
+                && state.historical_25_legacy_leaves.contains(pin_dir)
+                && !state.historical_25_receipts.contains_key(pin_dir)
+                && !state.current_recovery_authority_leaves.contains(pin_dir)
+                && !state
+                    .historical_25_legacy_other_root_entries
+                    .contains(pin_dir)
+                && !state
+                    .historical_25_legacy_other_control_leaves
+                    .contains(pin_dir)
+                && hooks_absent
+            {
+                if matches!(
+                    state.historical_25_namespace_root_mode,
+                    FakeHistorical25ControlRootMode::Invalid
+                ) || matches!(
+                    state.historical_25_control_root_mode,
+                    FakeHistorical25ControlRootMode::Invalid
+                ) {
+                    return Err(state_indeterminate(
+                        "fake_historical_25_empty_leaf_migration",
+                    ));
+                }
+                state.historical_25_namespace_root_mode =
+                    FakeHistorical25ControlRootMode::CurrentPrivate0700;
+                state.historical_25_control_root_mode =
+                    FakeHistorical25ControlRootMode::CurrentPrivate0700;
+                let mode = state
+                    .historical_25_legacy_leaf_modes
+                    .entry(pin_dir.to_path_buf())
+                    .or_insert(0o755);
+                if *mode != 0o700 {
+                    *mode = 0o700;
+                    state.operations.push("historical_25_empty_leaf_chmod");
+                }
+                if state
+                    .historical_25_legacy_normalization_cut_after_chmod
+                    .remove(pin_dir)
+                {
+                    return Err(state_indeterminate(
+                        "fake_historical_25_empty_leaf_after_chmod",
+                    ));
+                }
+                // Publishing current absence changes the grammar on the
+                // retained predecessor leaf; it never removes that inode.
+                state.historical_25_legacy_leaves.remove(pin_dir);
+                state
+                    .historical_25_ordinary_exclusion_leaves
+                    .insert(pin_dir.to_path_buf());
+                state.operations.push("historical_25_empty_leaf_migration");
+                if state
+                    .historical_25_legacy_normalization_cut_after_marker
+                    .remove(pin_dir)
+                {
+                    return Err(state_indeterminate(
+                        "fake_historical_25_empty_leaf_after_marker",
+                    ));
+                }
+                return Ok(true);
+            }
+            Ok(false)
         }
 
         fn historical_recovery_terminal_snapshot(
@@ -76288,6 +77445,427 @@ mod tests {
         assert!(state.uplink_filter_ready.contains(&S2BU_IFINDEX));
         assert!(state.downlink_filter_ready.contains(&S2BU_IFINDEX));
         assert!(!state.cleanup_only.contains(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_keeps_empty_graph_absent_legacy_authority_observation_only() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = backend.pin_dir("s2bu");
+        runtime
+            .state()
+            .historical_25_legacy_leaves
+            .insert(pin_dir.clone());
+        let classification = backend
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            classification,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::LegacyAuthorityLayout
+            )
+        );
+        assert!(runtime
+            .state()
+            .historical_25_legacy_leaves
+            .contains(&pin_dir));
+        assert!(!runtime
+            .state()
+            .operations
+            .contains(&"historical_25_empty_leaf_migration"));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_marker_under_predecessor_parents_remains_fail_closed() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = backend.pin_dir("s2bu");
+        {
+            let mut state = runtime.state();
+            // This models a crash or foreign writer that published only the
+            // leaf marker while the surrounding predecessor hierarchy still
+            // has its shipped umask-derived modes.
+            state
+                .historical_25_ordinary_exclusion_leaves
+                .insert(pin_dir.clone());
+            state.historical_25_namespace_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+            state.historical_25_control_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+        }
+
+        assert_eq!(
+            backend
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::IndeterminateState
+            )
+        );
+        let state = runtime.state();
+        assert!(state
+            .historical_25_ordinary_exclusion_leaves
+            .contains(&pin_dir));
+        assert!(!state.attached.contains_key(&S2BU_IFINDEX));
+        assert!(
+            !state.operations.contains(&"adopt_cleanup_only"),
+            "the marker must not launder predecessor parents into native authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_legacy_normalization_migrates_empty_graph_absent_authority_to_absence() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = backend.pin_dir("s2bu");
+        runtime
+            .state()
+            .historical_25_legacy_leaves
+            .insert(pin_dir.clone());
+        runtime
+            .state()
+            .historical_25_legacy_leaf_modes
+            .insert(pin_dir.clone(), 0o755);
+
+        assert_eq!(
+            backend
+                .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::AlreadyAbsent
+        );
+        assert!(!runtime
+            .state()
+            .historical_25_legacy_leaves
+            .contains(&pin_dir));
+        assert!(runtime
+            .state()
+            .historical_25_ordinary_exclusion_leaves
+            .contains(&pin_dir));
+        assert_eq!(
+            runtime
+                .state()
+                .historical_25_legacy_leaf_modes
+                .get(&pin_dir),
+            Some(&0o700)
+        );
+        assert!(runtime
+            .state()
+            .operations
+            .contains(&"historical_25_empty_leaf_migration"));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+
+        // A retry after the durable marker publication observes the current
+        // absence grammar and performs no second compatibility transition.
+        assert_eq!(
+            backend
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::AlreadyAbsent
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .operations
+                .iter()
+                .filter(|operation| **operation == "historical_25_empty_leaf_migration")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_legacy_normalization_converges_after_mode_or_marker_cut() {
+        for cut in ["chmod", "marker"] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = backend.pin_dir("s2bu");
+            {
+                let mut state = runtime.state();
+                state.historical_25_legacy_leaves.insert(pin_dir.clone());
+                state
+                    .historical_25_legacy_leaf_modes
+                    .insert(pin_dir.clone(), 0o755);
+                match cut {
+                    "chmod" => {
+                        state
+                            .historical_25_legacy_normalization_cut_after_chmod
+                            .insert(pin_dir.clone());
+                    }
+                    "marker" => {
+                        state
+                            .historical_25_legacy_normalization_cut_after_marker
+                            .insert(pin_dir.clone());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            assert!(matches!(
+                backend
+                    .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(
+                        cleanup_request(Ipv4Addr::new(192, 0, 2, 1), S2BU_IFINDEX),
+                    )
+                    .await,
+                Err(GtpuError::StateIndeterminate { .. })
+            ));
+            {
+                let state = runtime.state();
+                assert_eq!(
+                    state.historical_25_legacy_leaf_modes.get(&pin_dir),
+                    Some(&0o700),
+                    "{cut}"
+                );
+            }
+
+            // After chmod the old empty grammar is still exact and resumes;
+            // after mkdir the ordinary reader recognizes the current marker.
+            let retry = if cut == "chmod" {
+                backend
+                    .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(
+                        cleanup_request(Ipv4Addr::new(192, 0, 2, 1), S2BU_IFINDEX),
+                    )
+                    .await
+            } else {
+                backend
+                    .acquire_cleanup_only_recovery(cleanup_request(
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        S2BU_IFINDEX,
+                    ))
+                    .await
+            };
+            assert_eq!(
+                retry.unwrap(),
+                RetainedGraphCleanupClassification::AlreadyAbsent,
+                "{cut}"
+            );
+            assert!(runtime
+                .state()
+                .historical_25_ordinary_exclusion_leaves
+                .contains(&pin_dir));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_legacy_normalization_unblocks_ordinary_create_and_resolve() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = backend.pin_dir("s2bu");
+        {
+            let mut state = runtime.state();
+            state.historical_25_legacy_leaves.insert(pin_dir.clone());
+            state
+                .historical_25_legacy_leaf_modes
+                .insert(pin_dir.clone(), 0o755);
+            state.historical_25_namespace_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+            state.historical_25_control_root_mode =
+                FakeHistorical25ControlRootMode::Predecessor0755;
+        }
+
+        assert_eq!(
+            backend
+                .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::AlreadyAbsent
+        );
+        assert_eq!(
+            runtime.state().historical_25_namespace_root_mode,
+            FakeHistorical25ControlRootMode::CurrentPrivate0700
+        );
+        assert_eq!(
+            runtime.state().historical_25_control_root_mode,
+            FakeHistorical25ControlRootMode::CurrentPrivate0700
+        );
+
+        let created = backend.create_device(create_request()).await.unwrap();
+        assert_eq!(created.name, "s2bu");
+        assert_eq!(backend.resolve_device("s2bu").await.unwrap(), created);
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_legacy_normalization_preserves_ambiguous_hierarchy_and_live_state() {
+        for case in ["other-root", "other-control", "hook", "current-authority"] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = backend.pin_dir("s2bu");
+            {
+                let mut state = runtime.state();
+                state.historical_25_legacy_leaves.insert(pin_dir.clone());
+                match case {
+                    "other-root" => {
+                        state
+                            .historical_25_legacy_other_root_entries
+                            .insert(pin_dir.clone());
+                    }
+                    "other-control" => {
+                        state
+                            .historical_25_legacy_other_control_leaves
+                            .insert(pin_dir.clone());
+                    }
+                    "hook" => {
+                        state.off_slot_sdk_hooks.insert(S2BU_IFINDEX);
+                    }
+                    "current-authority" => {
+                        state
+                            .current_recovery_authority_leaves
+                            .insert(pin_dir.clone());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_eq!(
+                backend
+                    .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(
+                        cleanup_request(Ipv4Addr::new(192, 0, 2, 1), S2BU_IFINDEX),
+                    )
+                    .await
+                    .unwrap(),
+                RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::LegacyAuthorityLayout
+                ),
+                "{case}"
+            );
+            let state = runtime.state();
+            assert!(
+                state.historical_25_legacy_leaves.contains(&pin_dir),
+                "{case}"
+            );
+            assert!(
+                !state
+                    .historical_25_ordinary_exclusion_leaves
+                    .contains(&pin_dir),
+                "{case}"
+            );
+            assert!(
+                !state
+                    .operations
+                    .contains(&"historical_25_empty_leaf_migration"),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_legacy_normalization_refuses_graph_absent_proof_only_authority() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = backend.pin_dir("s2bu");
+        {
+            let mut state = runtime.state();
+            state.historical_25_legacy_leaves.insert(pin_dir.clone());
+            state
+                .historical_25_receipts
+                .insert(pin_dir.clone(), FakeHistorical25Receipt::qualified("s2bu"));
+        }
+
+        assert_eq!(
+            backend
+                .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::LegacyAuthorityLayout
+            )
+        );
+        assert!(runtime
+            .state()
+            .historical_25_legacy_leaves
+            .contains(&pin_dir));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_legacy_normalization_refuses_held_graph_absent_authority() {
+        for held in ["root", "leaf"] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = backend.pin_dir("s2bu");
+            {
+                let mut state = runtime.state();
+                state.historical_25_legacy_leaves.insert(pin_dir.clone());
+                match held {
+                    "root" => {
+                        state.historical_25_legacy_root_busy.insert(pin_dir.clone());
+                    }
+                    "leaf" => {
+                        state.historical_25_legacy_leaf_busy.insert(pin_dir.clone());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_eq!(
+                backend
+                    .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(
+                        cleanup_request(Ipv4Addr::new(192, 0, 2, 1), S2BU_IFINDEX),
+                    )
+                    .await
+                    .unwrap(),
+                RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::ActiveOwner
+                ),
+                "{held}"
+            );
+            let state = runtime.state();
+            assert!(
+                state.historical_25_legacy_leaves.contains(&pin_dir),
+                "{held}"
+            );
+            assert!(!state.attached.contains_key(&S2BU_IFINDEX), "{held}");
+            assert!(
+                !state
+                    .operations
+                    .contains(&"historical_25_empty_leaf_migration"),
+                "{held}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_legacy_normalization_refuses_malformed_authority_without_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = backend.pin_dir("s2bu");
+        {
+            let mut state = runtime.state();
+            state.historical_25_legacy_leaves.insert(pin_dir.clone());
+            state
+                .historical_25_legacy_leaf_malformed
+                .insert(pin_dir.clone());
+        }
+
+        assert!(matches!(
+            backend
+                .acquire_cleanup_only_recovery_with_graph_absent_legacy_exclusion(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await,
+            Err(GtpuError::StateIndeterminate { .. })
+        ));
+        let state = runtime.state();
+        assert!(state.historical_25_legacy_leaves.contains(&pin_dir));
+        assert!(state.historical_25_legacy_leaf_malformed.contains(&pin_dir));
+        assert!(!state
+            .operations
+            .contains(&"historical_25_empty_leaf_migration"));
+        assert!(!state.attached.contains_key(&S2BU_IFINDEX));
     }
 
     #[tokio::test]
