@@ -442,7 +442,8 @@ pub fn derive_child_sa_xfrm_keys(
 /// must pass the same policy to the parent IKE SA through
 /// [`opc_proto_ikev2::derive_ike_sa_init_key_material_with_nonce_policy`].
 /// [`derive_child_sa_xfrm_keys`] intentionally remains strict for
-/// CREATE_CHILD_SA and Child-SA rekey.
+/// CREATE_CHILD_SA and Child-SA rekey. This helper always derives without a
+/// new DH secret, so it cannot be used for PFS or replacement Child SAs.
 ///
 /// # Errors
 ///
@@ -453,7 +454,6 @@ pub fn derive_initial_child_sa_xfrm_keys(
     sk_d: &[u8],
     initiator_nonce: &[u8],
     responder_nonce: &[u8],
-    new_dh_shared_secret: Option<&[u8]>,
     nonce_policy: Ikev2InitialExchangeNoncePolicy,
 ) -> Result<Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError> {
     let key_material = derive_initial_child_sa_key_material(
@@ -461,7 +461,6 @@ pub fn derive_initial_child_sa_xfrm_keys(
         sk_d,
         initiator_nonce,
         responder_nonce,
-        new_dh_shared_secret,
         nonce_policy,
     )?;
 
@@ -1716,8 +1715,6 @@ mod tests {
         );
         let initiator_nonce: Vec<u8> = (0x00..0x10).collect();
         let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
-        let initial_child_dh_shared_secret = [0x73; 256]; // MODP-2048 width.
-
         // The existing generic helper remains the strict CREATE_CHILD_SA
         // boundary even though the initial-only helper below is opted in.
         assert!(matches!(
@@ -1726,7 +1723,7 @@ mod tests {
                 &[0x1e; 64],
                 &initiator_nonce,
                 &responder_nonce,
-                Some(&initial_child_dh_shared_secret),
+                None,
             ),
             Err(Ikev2ChildSaKeyMaterialError::KeyDerivation(
                 Ikev2SaInitCryptoErrorCode::InvalidNonceLength
@@ -1741,7 +1738,6 @@ mod tests {
             )),
             &initiator_nonce,
             &responder_nonce,
-            Some(&initial_child_dh_shared_secret),
             Ikev2InitialExchangeNoncePolicy::allow_legacy_initiator_prf_hmac_sha2_512_minimum(),
         ) {
             Ok(keys) => keys,
@@ -1759,15 +1755,15 @@ mod tests {
         assert_eq!(inbound_crypt.0.name, XFRM_ENCR_CBC_AES);
         assert_eq!(
             inbound_crypt.1.as_bytes(),
-            hex_to_bytes("f515d2922e309f3f74fe496779b65c14d05c714b1c2937fdecc2c4e47424b847")
+            hex_to_bytes("4d740e1db137915e68ea082b99e3d1b6996d0d7da0bfd0682c6cbbdb6258607c")
         );
         assert_eq!(inbound_auth.0.name, XFRM_AUTH_HMAC_SHA512);
         assert_eq!(inbound_auth.0.truncation_len_bits, 256);
         assert_eq!(
             inbound_auth.1.as_bytes(),
             hex_to_bytes(concat!(
-                "a2d8a1820e41ccfec135959c6538891a450d4f3d338bc057ffd4b830757fdedb",
-                "8e8838c2013da09a476f8046be728f642b59eeba19ace67a34ada81853584a94"
+                "5c45e4c12662604a992424739ae81bd143600f3d62104b7d909aaf3b3793ca37",
+                "94c94740556904506d1320963b0f648488feef91fb98407e32cbc429e576ab1e"
             ))
         );
 
@@ -1781,13 +1777,13 @@ mod tests {
         };
         assert_eq!(
             outbound_crypt.1.as_bytes(),
-            hex_to_bytes("4056a3c5a657900db0ffbff65f363d84949e648ab3c0a8eb43801390b0cd1030")
+            hex_to_bytes("0bef5979d45be05b04fdbf034468ff57269b80f33bd9cdf038fe236d2b9bca89")
         );
         assert_eq!(
             outbound_auth.1.as_bytes(),
             hex_to_bytes(concat!(
-                "05cadbdbfbc86f17ed91309d4c3d800279f1f3c86e512acc6e126fa1020ac576",
-                "3fd79e62f3640138f8a6f60cf1d0af036ec91836ec54b9aaceae033631e2d7ec"
+                "099fa3b7301c0f7b69a331b46e54b7b5510cdbeeee25147a9d5ef62dccb248b7",
+                "921732cc9b92f9dcd38229c144da2ada94897f14a5ad3be02ecb8c0458991ecd"
             ))
         );
     }
