@@ -9,10 +9,10 @@
 use std::{error::Error, fmt};
 
 use opc_proto_ikev2::{
-    derive_child_sa_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation,
-    Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError,
-    Ikev2SaInitCryptoErrorCode, Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE,
-    IKEV2_TS_IPV6_ADDR_RANGE,
+    derive_child_sa_key_material, derive_initial_child_sa_key_material, Ikev2ChildSaCryptoProfile,
+    Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm, Ikev2InitialExchangeNoncePolicy,
+    Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
 use crate::{
@@ -419,6 +419,49 @@ pub fn derive_child_sa_xfrm_keys(
         initiator_nonce,
         responder_nonce,
         new_dh_shared_secret,
+    )?;
+
+    let inbound = child_sa_xfrm_keys_from_direction(
+        profile,
+        key_material.initiator_to_responder_encryption(),
+        key_material.initiator_to_responder_integrity(),
+    )?;
+    let outbound = child_sa_xfrm_keys_from_direction(
+        profile,
+        key_material.responder_to_initiator_encryption(),
+        key_material.responder_to_initiator_integrity(),
+    )?;
+
+    Ok(Ikev2ChildSaDirectionalXfrmKeys { inbound, outbound })
+}
+
+/// Derive the mandatory initial Child SA KEYMAT and map it into XFRM keys.
+///
+/// This is the only XFRM helper that accepts
+/// [`Ikev2InitialExchangeNoncePolicy`]. Callers opting into its legacy variant
+/// must pass the same policy to the parent IKE SA through
+/// [`opc_proto_ikev2::derive_ike_sa_init_key_material_with_nonce_policy`].
+/// [`derive_child_sa_xfrm_keys`] intentionally remains strict for
+/// CREATE_CHILD_SA and Child-SA rekey. This helper always derives without a
+/// new DH secret, so it cannot be used for PFS or replacement Child SAs.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ChildSaKeyMaterialError`] when initial-exchange KEYMAT
+/// derivation fails or the selected profile has no SDK XFRM mapping.
+pub fn derive_initial_child_sa_xfrm_keys(
+    profile: Ikev2ChildSaCryptoProfile,
+    sk_d: &[u8],
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+    nonce_policy: Ikev2InitialExchangeNoncePolicy,
+) -> Result<Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError> {
+    let key_material = derive_initial_child_sa_key_material(
+        profile,
+        sk_d,
+        initiator_nonce,
+        responder_nonce,
+        nonce_policy,
     )?;
 
     let inbound = child_sa_xfrm_keys_from_direction(
@@ -909,8 +952,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES,
-        XFRM_ENCR_NULL,
+        XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256,
+        XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
     };
     use opc_crypto_provider::ProviderPolicy;
     use opc_proto_ikev2::{
@@ -1659,6 +1702,89 @@ mod tests {
         assert_eq!(
             outbound_crypt.1.as_bytes(),
             hex_to_bytes("8c2afd17eeff3e2a77f1c49d07cb5a9456546102f02fe52ee641dd4e3bc207ce")
+        );
+    }
+
+    #[test]
+    fn initial_exchange_legacy_sha512_nonce_policy_maps_only_initial_child_keys() {
+        ensure_ike_crypto();
+        let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+            Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+        );
+        let initiator_nonce: Vec<u8> = (0x00..0x10).collect();
+        let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
+        // The existing generic helper remains the strict CREATE_CHILD_SA
+        // boundary even though the initial-only helper below is opted in.
+        assert!(matches!(
+            derive_child_sa_xfrm_keys(
+                profile,
+                &[0x1e; 64],
+                &initiator_nonce,
+                &responder_nonce,
+                None,
+            ),
+            Err(Ikev2ChildSaKeyMaterialError::KeyDerivation(
+                Ikev2SaInitCryptoErrorCode::InvalidNonceLength
+            ))
+        ));
+
+        let keys = match derive_initial_child_sa_xfrm_keys(
+            profile,
+            &hex_to_bytes(concat!(
+                "1ef8043115a66058857ef6e5d2f006c1ef36e5dc6bcb72410b0a9159c13fd120",
+                "e721057c8a270edda2eb41fafbe12747eea208a146d915e81a3258edc5324b4e"
+            )),
+            &initiator_nonce,
+            &responder_nonce,
+            Ikev2InitialExchangeNoncePolicy::allow_legacy_initiator_prf_hmac_sha2_512_minimum(),
+        ) {
+            Ok(keys) => keys,
+            Err(error) => panic!("initial Child SA XFRM derivation failed: {error:?}"),
+        };
+
+        let inbound_crypt = match &keys.inbound.crypt {
+            Some(value) => value,
+            None => panic!("missing inbound AES-CBC key"),
+        };
+        let inbound_auth = match &keys.inbound.auth {
+            Some(value) => value,
+            None => panic!("missing inbound HMAC key"),
+        };
+        assert_eq!(inbound_crypt.0.name, XFRM_ENCR_CBC_AES);
+        assert_eq!(
+            inbound_crypt.1.as_bytes(),
+            hex_to_bytes("4d740e1db137915e68ea082b99e3d1b6996d0d7da0bfd0682c6cbbdb6258607c")
+        );
+        assert_eq!(inbound_auth.0.name, XFRM_AUTH_HMAC_SHA512);
+        assert_eq!(inbound_auth.0.truncation_len_bits, 256);
+        assert_eq!(
+            inbound_auth.1.as_bytes(),
+            hex_to_bytes(concat!(
+                "5c45e4c12662604a992424739ae81bd143600f3d62104b7d909aaf3b3793ca37",
+                "94c94740556904506d1320963b0f648488feef91fb98407e32cbc429e576ab1e"
+            ))
+        );
+
+        let outbound_crypt = match &keys.outbound.crypt {
+            Some(value) => value,
+            None => panic!("missing outbound AES-CBC key"),
+        };
+        let outbound_auth = match &keys.outbound.auth {
+            Some(value) => value,
+            None => panic!("missing outbound HMAC key"),
+        };
+        assert_eq!(
+            outbound_crypt.1.as_bytes(),
+            hex_to_bytes("0bef5979d45be05b04fdbf034468ff57269b80f33bd9cdf038fe236d2b9bca89")
+        );
+        assert_eq!(
+            outbound_auth.1.as_bytes(),
+            hex_to_bytes(concat!(
+                "099fa3b7301c0f7b69a331b46e54b7b5510cdbeeee25147a9d5ef62dccb248b7",
+                "921732cc9b92f9dcd38229c144da2ada94897f14a5ad3be02ecb8c0458991ecd"
+            ))
         );
     }
 

@@ -317,9 +317,10 @@ pub use sa_init::{
 };
 pub use sa_init_crypto::{
     derive_child_sa_key_material, derive_ike_sa_init_key_material,
-    derive_ike_sa_rekey_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaKeyMaterial,
-    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IntegrityAlgorithm,
-    Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    derive_ike_sa_init_key_material_with_nonce_policy, derive_ike_sa_rekey_key_material,
+    derive_initial_child_sa_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaKeyMaterial,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2InitialExchangeNoncePolicy,
+    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
 };
 pub use sa_init_negotiation::{
