@@ -652,6 +652,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Modelling grouped-IE flag bits remains deferred.
 
 ### Changed
+- **Strict-default IKEv2 nonce validation with initial-exchange compatibility — `opc-proto-ikev2`, `opc-ipsec-xfrm` (breaking):**
+  parent IKE-SA and IKE-SA-rekey KDFs now reject nonce inputs below the selected
+  PRF half-key floor by default. The explicit `Ikev2InitialExchangeNoncePolicy`
+  opt-in and paired `derive_ike_sa_init_key_material_with_nonce_policy`,
+  `derive_initial_child_sa_key_material`, and
+  `derive_initial_child_sa_xfrm_keys` APIs support only a 16-octet initiator
+  nonce with PRF-HMAC-SHA2-512 for the coupled initial IKE SA and mandatory
+  initial Child SA. The initial-Child helpers take no new-DH input, so they
+  cannot derive PFS or replacement Child SAs; generic `CREATE_CHILD_SA` and
+  IKE-SA-rekey derivation remain strict. The SDK's 16..=256-octet nonce cap is
+  a bounded-input policy; RFC 7296 section 2.10 supplies the protocol nonce
+  requirements. The policy, errors, and diagnostics do not retain or render
+  nonce or key bytes.
 - **Prepared protected atomic transitions — `opc-session-store` (breaking):**
   `SessionBackend` now separates `prepare_fenced_transition` from execution and
   status and adds typed `NotTransmitted`/`OutcomeUnknown` execution errors.

@@ -91,9 +91,11 @@ const MODP_PRIVATE_REJECTION_LIMIT: usize = 64;
 
 /// Nonce-length policy for the coupled initial IKE SA and initial Child SA.
 ///
-/// The default is strict: both nonces must be at least half the selected PRF
-/// output length, in addition to the RFC 7296 16-to-256-octet bounds. The
-/// legacy variant is deliberately narrow and may be used only with the
+/// The SDK bounds each nonce input to 16..=256 octets as a bounded-input
+/// policy. RFC 7296 section 2.10 supplies the 128-bit minimum and half-PRF-key
+/// nonce requirements. The default is strict: both nonces must meet the
+/// selected PRF's half-key floor. The legacy variant is deliberately narrow
+/// and may be used only with the
 /// `derive_*initial*` APIs: it accepts a 16-octet *initiator* nonce for
 /// PRF-HMAC-SHA2-512 when the responder nonce still meets the normal 32-octet
 /// floor. It never relaxes CREATE_CHILD_SA or IKE-SA rekey derivation.
@@ -1475,7 +1477,8 @@ pub enum Ikev2SaInitCryptoErrorCode {
     KeyGenerationFailed,
     /// Key agreement failed.
     KeyAgreementFailed,
-    /// Nonce length was outside the RFC 7296 range.
+    /// Nonce length violated the RFC 7296 floor, strict PRF floor, or SDK
+    /// bounded-input policy.
     InvalidNonceLength,
     /// Key input length was invalid.
     InvalidKeyLength,
@@ -1582,7 +1585,8 @@ pub enum Ikev2SaInitCryptoError {
         /// Negotiated DH group.
         group: Ikev2DhGroup,
     },
-    /// Nonce length was outside the RFC 7296 range.
+    /// Nonce length violated the RFC 7296 floor, strict PRF floor, or SDK
+    /// bounded-input policy.
     InvalidNonceLength {
         /// Redaction-safe role label.
         role: &'static str,
@@ -1911,8 +1915,9 @@ pub fn derive_ike_sa_rekey_key_material(
 /// # Errors
 ///
 /// Returns [`Ikev2SaInitCryptoError`] when profile/key lengths are
-/// inconsistent, nonce lengths are outside RFC 7296 limits, the optional new DH
-/// shared secret is empty, or PRF+ cannot produce the requested amount.
+/// inconsistent, nonce lengths violate the RFC 7296 or strict PRF floors or the
+/// SDK bounded-input policy, the optional new DH shared secret is empty, or
+/// PRF+ cannot produce the requested amount.
 pub fn derive_child_sa_key_material(
     profile: Ikev2ChildSaCryptoProfile,
     sk_d: &[u8],
