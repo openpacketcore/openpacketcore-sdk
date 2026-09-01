@@ -639,14 +639,17 @@ mod platform {
         // SAFETY: `stat` is a fully initialized C-compatible output buffer and
         // `fd` remains borrowed and valid for the duration of fstatfs.
         let mut stat = unsafe { std::mem::zeroed::<libc::statfs>() };
+        // SAFETY: `stat` points to writable C-compatible output storage and
+        // `fd` remains borrowed and valid for the duration of fstatfs.
         let result = unsafe { libc::fstatfs(fd.as_raw_fd(), std::ptr::addr_of_mut!(stat)) };
         result == 0 && stat.f_type == XFS_SUPER_MAGIC
     }
 
     fn xfs_filesystem_uuid(fd: BorrowedFd<'_>) -> Result<[u8; FILESYSTEM_UUID_BYTES], Error> {
-        // The geometry request writes every member of this output-only UAPI
-        // structure. Zero initialization also prevents an older kernel that
-        // copied a shorter compatible prefix from ever contributing padding.
+        // SAFETY: this UAPI structure contains only integer and byte fields,
+        // so an all-zero representation is valid. The geometry request writes
+        // every member; zeroing also prevents an older kernel that copied a
+        // shorter compatible prefix from ever contributing padding.
         let mut geometry = unsafe { std::mem::zeroed::<XfsFilesystemGeometryV1>() };
         // SAFETY: `geometry` has the exact target-C representation of
         // `struct xfs_fsop_geom_v1` and remains writable during the ioctl;
