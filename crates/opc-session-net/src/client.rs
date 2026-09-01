@@ -43,8 +43,9 @@ use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
     compare_and_set_result_matches_key, conservative_payload_budget, get_result_matches_key,
     read_frame, read_response_frame, session_op_results_match_expectations,
-    validate_request_payload_limit, validate_request_profile, write_frame_bounded_until,
-    BootstrapHello, BootstrapRequest, BootstrapResponse, ContractProfile, Request, Response,
+    validate_request_payload_limit, validate_request_profile,
+    validate_restore_scan_wire_payload_bytes, write_frame_bounded_until, BootstrapHello,
+    BootstrapRequest, BootstrapResponse, ContractProfile, Request, Response,
     RestoreScanWireRequest, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
     MAX_HANDSHAKE_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
     MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
@@ -2324,6 +2325,16 @@ impl SessionBackend for RemoteSessionBackend {
                         "legacy_remote_restore_scan".to_string(),
                     ));
                 }
+                if let Err(error) = validate_restore_scan_wire_payload_bytes(&page.records) {
+                    self.discard_connection().await;
+                    self.clear_cached_capabilities();
+                    tracing::warn!(
+                        target = %self.target,
+                        failure = store_error_kind(&error),
+                        "remote restore scan response exceeded the wire payload limit"
+                    );
+                    return Err(error);
+                }
                 if let Err(error) = page.validate_for_request(&request) {
                     self.discard_connection().await;
                     self.clear_cached_capabilities();
@@ -3084,6 +3095,18 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CasConflict => "cas_conflict",
         StoreError::CasIdempotencyConflict => "cas_idempotency_conflict",
         StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
+        StoreError::FencedTransitionRequestConflict => "fenced_transition_request_conflict",
+        StoreError::FencedTransitionOutcomeUnknown => "fenced_transition_outcome_unknown",
+        StoreError::FencedTransitionRequestExpired => "fenced_transition_request_expired",
+        StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
+        StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
+        StoreError::FencedTransitionStorageExhausted => "fenced_transition_storage_exhausted",
+        StoreError::FencedTransitionHistoryEpochRetired => {
+            "fenced_transition_history_epoch_retired"
+        }
+        StoreError::FencedTransitionHistoryEpochNotActive => {
+            "fenced_transition_history_epoch_not_active"
+        }
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
@@ -3109,6 +3132,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::RestoreScanCursorStale => "restore_scan_cursor_stale",
         StoreError::RestoreScanWorkBudgetExceeded => "restore_scan_work_budget_exceeded",
         StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
+        StoreError::SessionRecordReserved => "session_record_reserved",
     }
 }
 
@@ -3159,6 +3183,38 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn fenced_transition_errors_have_distinct_redaction_safe_kinds() {
+        for (error, kind) in [
+            (
+                StoreError::FencedTransitionRequestConflict,
+                "fenced_transition_request_conflict",
+            ),
+            (
+                StoreError::FencedTransitionOutcomeUnknown,
+                "fenced_transition_outcome_unknown",
+            ),
+            (
+                StoreError::FencedTransitionRequestExpired,
+                "fenced_transition_request_expired",
+            ),
+            (
+                StoreError::FencedTransitionHistoryFull,
+                "fenced_transition_history_full",
+            ),
+            (
+                StoreError::FencedTransitionRetentionExhausted,
+                "fenced_transition_retention_exhausted",
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                "fenced_transition_storage_exhausted",
+            ),
+        ] {
+            assert_eq!(store_error_kind(&error), kind);
+        }
+    }
 
     fn successful_hello_ack(hello: &Request) -> Response {
         let requested = match hello {

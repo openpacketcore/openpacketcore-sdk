@@ -1,12 +1,15 @@
 #![cfg(target_os = "linux")]
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::os::fd::AsFd;
+use std::num::NonZeroUsize;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,46 +25,91 @@ use opc_identity::{
     build_identity_state, parse_certs_pem, parse_key_pem, IdentityState, TrustBundle,
     TrustBundleSet, TrustDomain,
 };
+use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_session_net::{
-    ConnectionLifecyclePolicy, RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
-    SessionConfigurationEpoch, SessionConfigurationGeneration, SessionConsumerLeaseMutationError,
-    SessionReplicationManifest, StatelessSessionConsumerClient, DEFAULT_MAX_AUTHENTICATION_AGE,
+    ConnectionLifecyclePolicy, FencedMutationRosterAdmissionInput,
+    FencedMutationRosterAdmissionOutcome, FencedMutationRosterAdmissionProposal,
+    FencedMutationRosterAttestationTrustRootV1, FencedMutationRosterClient,
+    FencedMutationRosterCompactTerminalMemberSigningInputV2,
+    FencedMutationRosterEstablishedMutation, FencedMutationRosterExecutorAttestor,
+    FencedMutationRosterExecutorCertificatePartsV1, FencedMutationRosterExecutorError,
+    FencedMutationRosterId, FencedMutationRosterMember, FencedMutationRosterMemberCall,
+    FencedMutationRosterMemberOperationId, FencedMutationRosterMemberProvider,
+    FencedMutationRosterProfile, FencedMutationRosterProviderCallOutcome,
+    FencedMutationRosterRecoveryInput, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerExecuteError,
+    PersistentSessionConsumerV2Diagnostics, PersistentSessionConsumerV2ExecuteError,
+    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationEpoch,
+    SessionConfigurationGeneration, SessionConsumerClientError, SessionConsumerLeaseMutationError,
+    SessionReplicationManifest, StatelessSessionConsumerClient,
+    CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, DEFAULT_MAX_AUTHENTICATION_AGE,
     DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
-    DEFAULT_ROTATION_JITTER,
+    DEFAULT_ROTATION_JITTER, SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+};
+use opc_session_store::fenced_mutation_roster::{
+    RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+    RosterAttestationLeafCertificateV1,
 };
 use opc_session_store::{
-    OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusWireRequest,
-    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionKey, SessionKeyType,
+    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, EncryptedSessionPayload,
+    FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
+    FencedTransitionRequestId, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2RequestId,
+    Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    SessionConsensusIdentity, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcFamily, SessionConsensusWireRequest, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
+    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
 use opc_session_testkit::qualification::{
-    qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
-    qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
-    session_mtls_candidate_schedule_sha256, write_json_line,
-    QualificationConnectionLifecycleConfig, QualificationConnectionLifecycleMetrics,
-    QualificationConsensusRpcAvailability, QualificationMember, QualificationNodeCommand,
-    QualificationNodeCommandKind, QualificationNodeConfig, QualificationNodeErrorCode,
-    QualificationNodeReply, QualificationPeerRouting, QualificationProjectedMtlsConfig,
-    QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
-    QualificationProjectedSvidStatus, QualificationReadinessCode,
+    qualification_owner_sha256, qualification_roster_attestation_trust_root,
+    qualification_traffic_schedule_sha256, qualification_traffic_seed, qualification_traffic_value,
+    qualification_value_sha256, read_bounded_json_line,
+    session_mtls_batch_release_gate_achieved_rate_milli,
+    session_mtls_batch_release_gate_schedule_sha256, session_mtls_candidate_schedule_sha256,
+    write_json_line, QualificationConnectionLifecycleConfig,
+    QualificationConnectionLifecycleMetrics, QualificationConsensusRpcAvailability,
+    QualificationMember, QualificationNodeCommand, QualificationNodeCommandKind,
+    QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
+    QualificationPeerRouting, QualificationPersistentConsumerAuthorityV9,
+    QualificationPersistentConsumerBindingsV9, QualificationPersistentConsumerInvocationV9,
+    QualificationPersistentConsumerLaneV9, QualificationPersistentConsumerProcessLedgerV9,
+    QualificationPersistentConsumerProvenanceV9, QualificationPersistentConsumerReleaseGateV9,
+    QualificationProjectedMtlsConfig, QualificationProjectedSvidAvailability,
+    QualificationProjectedSvidReason, QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
-    QualificationTrafficStatus, QualificationTransportConfig, SessionMtlsCandidateCampaign,
+    QualificationTrafficStatus, QualificationTransportConfig,
+    SessionHaPersistentConsumerHeadEvidenceV9, SessionHaPersistentConsumerHeadEvidenceV9Error,
+    SessionMtlsBatchReleaseGateBindingsV1, SessionMtlsBatchReleaseGateEvidenceV1,
+    SessionMtlsBatchReleaseGatePoolEvidenceV1, SessionMtlsBatchReleaseGatePoolRoleV1,
+    SessionMtlsBatchReleaseGateResourceGenerationV1,
+    SessionMtlsBatchReleaseGateServerQueueDepthScopeV1, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
-    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
-    QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
-    QUALIFICATION_FAULT_PATH_REFRESH_MILLIS, QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
-    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
-    QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, QUALIFICATION_NODE_SCHEMA_VERSION,
-    QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS,
-    QUALIFICATION_RESOLVER_PROOF_MILLIS, QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
-    QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE, QUALIFICATION_RESOURCE_SAMPLE_MILLIS,
-    QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB, QUALIFICATION_RESOURCE_SETTLE_MILLIS,
-    QUALIFICATION_RESOURCE_STABLE_SAMPLES, QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE,
-    QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB, QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS,
+    QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER, QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
+    QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
+    QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
+    QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
+    QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS, QUALIFICATION_RESOLVER_PROOF_MILLIS,
+    QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE, QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
+    QUALIFICATION_RESOURCE_SAMPLE_MILLIS, QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
+    QUALIFICATION_RESOURCE_SETTLE_MILLIS, QUALIFICATION_RESOURCE_STABLE_SAMPLES,
+    QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE, QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB,
+    QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
@@ -86,17 +134,34 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
+    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES,
+    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON,
+    SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI,
+    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS,
+    SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS,
     SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
-use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+use p256::ecdsa::signature::hazmat::PrehashSigner;
+use p256::ecdsa::SigningKey;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rustix::fs::{
     fchmod, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, FileType, Mode,
     OFlags, RenameFlags,
 };
+use rustix::io::{fcntl_setfd, FdFlags};
+use rustix::process::umask;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use opc_tls::TlsConfigBuilder;
 
@@ -104,6 +169,10 @@ const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
 );
+/// An inherited, close-on-exec-cleared descriptor is the only capability a
+/// V9 child may use for its external snapshot leaf.  The JSON remains closed:
+/// this process-local transport carries no new configuration surface.
+const V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV: &str = "OPC_QUALIFICATION_V9_SNAPSHOT_DIRECTORY_FD";
 // Functional recovery bound for the stateless-consumer fault detector. This
 // is deliberately not the profile's 30-second production-evidence threshold:
 // the pinned engine may retain one leader lease, defer one smaller-log
@@ -117,6 +186,14 @@ const STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT: Duration = Duration::from_mill
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
 );
 const CHILD_TIMEOUT: Duration = Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
+/// This is intentionally shorter than the qualification child's fixed
+/// post-commit response delay. It exercises the real response deadline rather
+/// than creating a synthetic application outcome.
+const DELAYED_CONSUMER_CLIENT_DEADLINE: Duration = Duration::from_millis(250);
+// The protected roster is exercised across multiple bounded election,
+// process-restart, and second-voter-loss windows. Its authority transitions
+// are explicit releases and higher fences, never incidental wall-clock expiry.
+const PROTECTED_ROSTER_LEASE_TTL: Duration = Duration::from_secs(60 * 60);
 const CANARY_TTL_MILLIS: u64 = 60 * 60 * 1_000;
 const CANARY_STABLE_ID: &str = "rotation-core-canary";
 const CANARY_LEASE_HANDLE: &str = "rotation-core-lease";
@@ -128,6 +205,8 @@ const PLAINTEXT_CANARY_PREFIXES: [&[u8]; 2] = [
     TRAFFIC_PLAINTEXT_CANARY_PREFIX,
 ];
 const EVIDENCE_OUTPUT_DIRECTORY_ENV: &str = "OPC_SESSION_HA_EVIDENCE_DIR";
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
 const MAX_CANDIDATE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CANDIDATE_EVIDENCE_BYTES: u64 = 256 * 1024;
 const MAX_CANDIDATE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -163,42 +242,108 @@ struct ProcessResourceSnapshot {
 
 #[derive(Debug, Clone, Copy)]
 struct ProcessResourceHighWater {
+    process_id: u32,
     samples: u64,
     file_descriptors: usize,
     threads: usize,
+    vm_rss_kib: u64,
     vm_hwm_kib: u64,
 }
 
 struct ResourceSampler {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<io::Result<Vec<ProcessResourceHighWater>>>,
+    process_ids: Arc<Mutex<Vec<Option<u32>>>>,
+    handle: JoinHandle<io::Result<Vec<Vec<ProcessResourceHighWater>>>>,
+}
+
+fn record_resource_generation_sample(
+    high_water: &mut [Vec<ProcessResourceHighWater>],
+    observed_process_ids: &mut [Option<u32>],
+    node_index: usize,
+    process_id: u32,
+    snapshot: ProcessResourceSnapshot,
+) {
+    if observed_process_ids[node_index] != Some(process_id) {
+        if observed_process_ids[node_index].is_some() {
+            high_water[node_index].push(ProcessResourceHighWater {
+                process_id,
+                samples: 0,
+                file_descriptors: 0,
+                threads: 0,
+                vm_rss_kib: 0,
+                vm_hwm_kib: 0,
+            });
+        }
+        observed_process_ids[node_index] = Some(process_id);
+    }
+    let current = high_water[node_index]
+        .last_mut()
+        .expect("logical voter has one resource generation");
+    current.samples = current.samples.saturating_add(1);
+    current.file_descriptors = current.file_descriptors.max(snapshot.file_descriptors);
+    current.threads = current.threads.max(snapshot.threads);
+    current.vm_rss_kib = current.vm_rss_kib.max(snapshot.vm_rss_kib);
+    current.vm_hwm_kib = current.vm_hwm_kib.max(snapshot.vm_hwm_kib);
 }
 
 impl ResourceSampler {
     fn start(process_ids: Vec<u32>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
+        let process_ids = Arc::new(Mutex::new(
+            process_ids.into_iter().map(Some).collect::<Vec<_>>(),
+        ));
+        let process_ids_for_thread = Arc::clone(&process_ids);
         let handle = thread::Builder::new()
             .name("qualification-resource-sampler".to_owned())
             .spawn(move || {
-                let mut high_water = vec![
-                    ProcessResourceHighWater {
-                        samples: 0,
-                        file_descriptors: 0,
-                        threads: 0,
-                        vm_hwm_kib: 0,
-                    };
-                    process_ids.len()
-                ];
+                let initial_process_ids = process_ids_for_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let mut high_water = initial_process_ids
+                    .iter()
+                    .map(|process_id| {
+                        vec![ProcessResourceHighWater {
+                            process_id: process_id.expect("initial sampler PID is present"),
+                            samples: 0,
+                            file_descriptors: 0,
+                            threads: 0,
+                            vm_rss_kib: 0,
+                            vm_hwm_kib: 0,
+                        }]
+                    })
+                    .collect::<Vec<_>>();
+                let mut observed_process_ids = vec![None; high_water.len()];
                 loop {
-                    for (index, process_id) in process_ids.iter().copied().enumerate() {
-                        let snapshot = read_process_resources(process_id, false)?;
-                        let current = &mut high_water[index];
-                        current.samples = current.samples.saturating_add(1);
-                        current.file_descriptors =
-                            current.file_descriptors.max(snapshot.file_descriptors);
-                        current.threads = current.threads.max(snapshot.threads);
-                        current.vm_hwm_kib = current.vm_hwm_kib.max(snapshot.vm_hwm_kib);
+                    let current_process_ids = process_ids_for_thread
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    for (index, process_id) in current_process_ids.into_iter().enumerate() {
+                        let Some(process_id) = process_id else {
+                            continue;
+                        };
+                        let snapshot = match read_process_resources(process_id, false) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                let current = process_ids_for_thread
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)[index];
+                                if current != Some(process_id) {
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        record_resource_generation_sample(
+                            &mut high_water,
+                            &mut observed_process_ids,
+                            index,
+                            process_id,
+                            snapshot,
+                        );
                     }
                     if stop_for_thread.load(Ordering::Acquire) {
                         break;
@@ -208,16 +353,430 @@ impl ResourceSampler {
                 Ok(high_water)
             })
             .expect("start qualification resource sampler");
-        Self { stop, handle }
+        Self {
+            stop,
+            process_ids,
+            handle,
+        }
     }
 
-    fn finish(self) -> Vec<ProcessResourceHighWater> {
+    fn mark_offline(&self, node_index: usize) {
+        self.process_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index] = None;
+    }
+
+    fn install_restarted_process(&self, node_index: usize, process_id: u32) {
+        self.process_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index] = Some(process_id);
+    }
+
+    fn finish(self) -> Vec<Vec<ProcessResourceHighWater>> {
         self.stop.store(true, Ordering::Release);
         self.handle
             .join()
             .expect("join qualification resource sampler")
             .expect("sample live qualification processes")
     }
+}
+
+fn merge_resource_generation_high_water(
+    generations: &[Vec<ProcessResourceHighWater>],
+) -> Vec<ProcessResourceHighWater> {
+    generations
+        .iter()
+        .map(|voter_generations| {
+            voter_generations.iter().copied().fold(
+                ProcessResourceHighWater {
+                    process_id: 0,
+                    samples: 0,
+                    file_descriptors: 0,
+                    threads: 0,
+                    vm_rss_kib: 0,
+                    vm_hwm_kib: 0,
+                },
+                |mut merged, generation| {
+                    merged.samples = merged.samples.saturating_add(generation.samples);
+                    merged.file_descriptors =
+                        merged.file_descriptors.max(generation.file_descriptors);
+                    merged.threads = merged.threads.max(generation.threads);
+                    merged.vm_rss_kib = merged.vm_rss_kib.max(generation.vm_rss_kib);
+                    merged.vm_hwm_kib = merged.vm_hwm_kib.max(generation.vm_hwm_kib);
+                    merged
+                },
+            )
+        })
+        .collect()
+}
+
+fn cumulative_replaced_v2_diagnostics(
+    released_before_shutdown: PersistentSessionConsumerV2Diagnostics,
+    restored_current: PersistentSessionConsumerV2Diagnostics,
+) -> PersistentSessionConsumerV2Diagnostics {
+    PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: released_before_shutdown
+            .setup_attempts
+            .saturating_add(restored_current.setup_attempts),
+        setup_failures: released_before_shutdown
+            .setup_failures
+            .saturating_add(restored_current.setup_failures),
+        setup_successes: released_before_shutdown
+            .setup_successes
+            .saturating_add(restored_current.setup_successes),
+        reused: released_before_shutdown
+            .reused
+            .saturating_add(restored_current.reused),
+        reconnects: released_before_shutdown
+            .reconnects
+            .saturating_add(restored_current.reconnects),
+        active: restored_current.active,
+        idle: restored_current.idle,
+        pool_wait_current: restored_current.pool_wait_current,
+        pool_wait_max: released_before_shutdown
+            .pool_wait_max
+            .max(restored_current.pool_wait_max),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetupAccounting {
+    attempts: u64,
+    failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MtlsSetupAccounting {
+    original_and_restored: SetupAccounting,
+    supplemental: SetupAccounting,
+}
+
+impl MtlsSetupAccounting {
+    fn total(self) -> SetupAccounting {
+        SetupAccounting {
+            attempts: self
+                .original_and_restored
+                .attempts
+                .saturating_add(self.supplemental.attempts),
+            failures: self
+                .original_and_restored
+                .failures
+                .saturating_add(self.supplemental.failures),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MtlsSetupCeilings {
+    original_and_restored: SetupAccounting,
+    supplemental: SetupAccounting,
+    total: SetupAccounting,
+}
+
+fn v2_batch_release_gate_setup_ceilings() -> MtlsSetupCeilings {
+    let original_and_restored = SetupAccounting {
+        attempts: SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+        failures: SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+    };
+    let supplemental = SetupAccounting {
+        attempts: SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING
+            .saturating_mul(2)
+            .saturating_add(SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING),
+        failures: SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING
+            .saturating_mul(2)
+            .saturating_add(SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING),
+    };
+    MtlsSetupCeilings {
+        original_and_restored,
+        supplemental,
+        total: SetupAccounting {
+            attempts: SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
+            failures: SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
+        },
+    }
+}
+
+fn verify_mtls_setup_accounting(
+    observed: MtlsSetupAccounting,
+    ceilings: MtlsSetupCeilings,
+) -> Result<(), String> {
+    let total = observed.total();
+    for (scope, observed, ceiling) in [
+        (
+            "original_and_restored",
+            observed.original_and_restored,
+            ceilings.original_and_restored,
+        ),
+        ("supplemental", observed.supplemental, ceilings.supplemental),
+        ("total", total, ceilings.total),
+    ] {
+        if observed.attempts > ceiling.attempts {
+            return Err(format!(
+                "mTLS setup attempt ceiling exceeded: scope={scope}, observed_attempts={}, bound_attempts={}, observed_failures={}, bound_failures={}",
+                observed.attempts, ceiling.attempts, observed.failures, ceiling.failures
+            ));
+        }
+        if observed.failures > ceiling.failures {
+            return Err(format!(
+                "mTLS setup failure ceiling exceeded: scope={scope}, observed_attempts={}, bound_attempts={}, observed_failures={}, bound_failures={}",
+                observed.attempts, ceiling.attempts, observed.failures, ceiling.failures
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_fault_v2_setup_delta(
+    window: &str,
+    before: &[PersistentSessionConsumerV2Diagnostics],
+    after: &[PersistentSessionConsumerV2Diagnostics],
+) {
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "mTLS {window} diagnostic snapshot cardinality is stable"
+    );
+    for (client_index, (after, before)) in after.iter().zip(before).enumerate() {
+        let attempts = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_attempts",
+            before.setup_attempts,
+            after.setup_attempts,
+        );
+        let failures = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_failures",
+            before.setup_failures,
+            after.setup_failures,
+        );
+        let successes = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_successes",
+            before.setup_successes,
+            after.setup_successes,
+        );
+        assert_eq!(
+            attempts, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0, observed_setup_successes={successes}, bound_setup_successes=0"
+        );
+        assert_eq!(
+            failures, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0, observed_setup_successes={successes}, bound_setup_successes=0"
+        );
+        assert_eq!(
+            successes, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0, observed_setup_successes={successes}, bound_setup_successes=0"
+        );
+    }
+}
+
+fn verify_v2_prewarm_restoration(
+    client_index: usize,
+    ready_request_connections: usize,
+    initial: PersistentSessionConsumerV2Diagnostics,
+    before: PersistentSessionConsumerV2Diagnostics,
+    after: PersistentSessionConsumerV2Diagnostics,
+) -> Result<u64, String> {
+    let missing_lanes = V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+        .checked_sub(ready_request_connections)
+        .ok_or_else(|| {
+            format!(
+                "ready preload capacity exceeds configured width: client_index={client_index}, ready={ready_request_connections}, configured={V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT}"
+            )
+        })?;
+    let missing_lanes = u64::try_from(missing_lanes)
+        .map_err(|_| "fixed preload restoration width does not fit u64".to_owned())?;
+    if client_index == 0 && missing_lanes != 0 {
+        return Err(format!(
+            "the preload-bearing pool lost warm capacity: missing_lanes={missing_lanes}"
+        ));
+    }
+    let delta = |counter: &str, before: u64, after: u64| {
+        after.checked_sub(before).ok_or_else(|| {
+            format!(
+                "preload restoration counter regressed: client_index={client_index}, counter={counter}, before={before}, after={after}"
+            )
+        })
+    };
+    for (counter, observed, expected) in [
+        (
+            "setup_attempts",
+            delta(
+                "setup_attempts",
+                before.setup_attempts,
+                after.setup_attempts,
+            )?,
+            missing_lanes,
+        ),
+        (
+            "setup_successes",
+            delta(
+                "setup_successes",
+                before.setup_successes,
+                after.setup_successes,
+            )?,
+            missing_lanes,
+        ),
+        (
+            "setup_failures",
+            delta(
+                "setup_failures",
+                before.setup_failures,
+                after.setup_failures,
+            )?,
+            0,
+        ),
+        (
+            "reconnects_from_initial",
+            delta("reconnects", initial.reconnects, after.reconnects)?,
+            missing_lanes,
+        ),
+    ] {
+        if observed != expected {
+            return Err(format!(
+                "preload restoration is not exact: client_index={client_index}, counter={counter}, observed={observed}, expected={expected}"
+            ));
+        }
+    }
+    if after.reused != before.reused {
+        return Err(format!(
+            "prewarm consumed a logical request: client_index={client_index}, before_reused={}, after_reused={}",
+            before.reused, after.reused
+        ));
+    }
+    let fixed_width = V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64;
+    if after.active != fixed_width || after.idle != fixed_width {
+        return Err(format!(
+            "preload restoration did not settle at fixed width: client_index={client_index}, active={}, idle={}, expected={fixed_width}",
+            after.active, after.idle
+        ));
+    }
+    if after.setup_attempts != after.setup_successes.saturating_add(after.setup_failures) {
+        return Err(format!(
+            "preload restoration setup accounting is not conserved: client_index={client_index}, diagnostics={after:?}"
+        ));
+    }
+    Ok(missing_lanes)
+}
+
+#[test]
+fn v2_batch_preload_accounting_separates_idle_restoration_from_operations() {
+    let initial = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 4,
+        setup_successes: 4,
+        active: 4,
+        idle: 4,
+        ..PersistentSessionConsumerV2Diagnostics::default()
+    };
+    let hot_after_operations = PersistentSessionConsumerV2Diagnostics {
+        reused: 196,
+        ..initial
+    };
+    assert_no_fault_v2_setup_delta(
+        "modeled hot-client preload",
+        &[initial],
+        &[hot_after_operations],
+    );
+    assert_eq!(
+        verify_v2_prewarm_restoration(
+            0,
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            initial,
+            hot_after_operations,
+            hot_after_operations,
+        )
+        .expect("the hot pool requires no restoration"),
+        0
+    );
+
+    let post_operations = PersistentSessionConsumerV2Diagnostics {
+        active: 0,
+        idle: 0,
+        reconnects: 4,
+        ..initial
+    };
+    assert_no_fault_v2_setup_delta("modeled 50k preload", &[initial], &[post_operations]);
+
+    let restored = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 8,
+        setup_successes: 8,
+        active: 4,
+        idle: 4,
+        ..post_operations
+    };
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_no_fault_v2_setup_delta(
+                "invalid initial-to-restored window",
+                &[initial],
+                &[restored],
+            );
+        })
+        .is_err(),
+        "the old comparison must reject explicit restoration as part of an operation window"
+    );
+    assert_eq!(
+        verify_v2_prewarm_restoration(1, 0, initial, post_operations, restored)
+            .expect("the measured four-lane deficit restores exactly"),
+        4
+    );
+    assert_eq!(restored.setup_attempts, 8, "cumulative setups are retained");
+    assert_eq!(restored.reconnects, 4, "cumulative reaping is retained");
+}
+
+fn checked_no_fault_setup_delta(
+    window: &str,
+    client_index: usize,
+    counter: &str,
+    before: u64,
+    after: u64,
+) -> u64 {
+    after.checked_sub(before).unwrap_or_else(|| {
+        panic!(
+            "mTLS {window} diagnostic counter regressed: client_index={client_index}, counter={counter}, before={before}, after={after}"
+        )
+    })
+}
+
+fn select_v2_batch_scheduler_client(
+    preferred_client_index: usize,
+    in_flight_per_client: &[usize],
+    lanes_per_client: usize,
+) -> Option<usize> {
+    (0..in_flight_per_client.len())
+        .map(|offset| (preferred_client_index + offset) % in_flight_per_client.len())
+        .find(|client_index| in_flight_per_client[*client_index] < lanes_per_client)
+}
+
+#[test]
+fn no_fault_setup_delta_rejects_per_client_counter_regression() {
+    assert_eq!(
+        checked_no_fault_setup_delta("pure-regression", 3, "setup_attempts", 7, 7),
+        0
+    );
+    assert!(std::panic::catch_unwind(|| {
+        checked_no_fault_setup_delta("pure-regression", 3, "setup_attempts", 7, 6)
+    })
+    .is_err());
+}
+
+#[test]
+fn v2_batch_scheduler_no_eligible_boundary_requires_a_completed_admission() {
+    let mut in_flight = vec![V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT; V2_BATCH_RELEASE_GATE_CLIENTS];
+    assert_eq!(
+        select_v2_batch_scheduler_client(0, &in_flight, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,),
+        None,
+        "a full four-lane client set cannot accept another scheduler admission"
+    );
+    in_flight[7] -= 1;
+    assert_eq!(
+        select_v2_batch_scheduler_client(0, &in_flight, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,),
+        Some(7),
+        "draining one completed alternate admission restores a deterministic slot"
+    );
 }
 
 fn read_process_resources(
@@ -493,6 +1052,7 @@ fn traffic_mutator_counters_advanced(
         && after.last_generation > before.last_generation
         && after.last_record_fence > before.last_record_fence
         && (after.mutation_resume_generation != 0 || after.availability_interruptions >= 1)
+        && after.availability_interruption_episodes >= before.availability_interruption_episodes
         && after.availability_interruptions >= before.availability_interruptions
         && after.availability_recoveries >= before.availability_recoveries
         && after.max_consecutive_availability_interruptions
@@ -529,12 +1089,19 @@ fn traffic_live_mutator_counters_are_consistent(status: &QualificationTrafficSta
             .all(|stages| stages[0] >= stages[1])
         && status.availability_interruptions
             <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        && status.availability_interruption_episodes <= status.availability_interruptions
         && status.availability_recoveries <= status.availability_interruptions
         && status.max_consecutive_availability_interruptions <= status.availability_interruptions
         && ((status.availability_interruptions == 0
+            && status.availability_interruption_episodes == 0
             && status.max_consecutive_availability_interruptions == 0)
             || (status.availability_interruptions > 0
+                && status.availability_interruption_episodes > 0
                 && status.max_consecutive_availability_interruptions > 0))
+        && status
+            .availability_interruption_episodes
+            .checked_mul(status.max_consecutive_availability_interruptions)
+            .is_some_and(|capacity| capacity >= status.availability_interruptions)
         && traffic_failure_fields_are_coherent(status)
 }
 
@@ -595,6 +1162,49 @@ fn member_incident_directed_paths(member_count: usize, member: usize) -> Vec<(us
         .collect()
 }
 
+fn member_recovery_directed_paths(member_count: usize, member: usize) -> Vec<(usize, usize)> {
+    assert!(member < member_count);
+    // Recover every survivor's outbound lane before exercising the recovered
+    // member's outbound lanes. Live survivor traffic shares those exact
+    // consensus pools, so leaving a later survivor behind the recovered
+    // member's unrelated paths can consume the bounded availability budget
+    // while its remote-retirement probe remains intentionally gated.
+    (0..member_count)
+        .filter(|source| *source != member)
+        .map(|source| (source, member))
+        .chain(
+            (0..member_count)
+                .filter(|target| *target != member)
+                .map(|target| (member, target)),
+        )
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCommandWaveStage {
+    Dispatch,
+    Collect,
+}
+
+/// Perform the dispatch half of a pending-command wave before collecting any
+/// reply. This prevents one early command's retry or follow-on workload check
+/// from delaying the first command to another independent child process.
+fn for_each_pending_command_in_wave(
+    pending: &[bool],
+    mut visit: impl FnMut(usize, PendingCommandWaveStage),
+) {
+    for (node_index, pending) in pending.iter().enumerate() {
+        if *pending {
+            visit(node_index, PendingCommandWaveStage::Dispatch);
+        }
+    }
+    for (node_index, pending) in pending.iter().enumerate() {
+        if *pending {
+            visit(node_index, PendingCommandWaveStage::Collect);
+        }
+    }
+}
+
 fn unrelated_survivor_reauthentication_retirements_are_unchanged(
     before: &[QualificationConnectionLifecycleMetrics],
     after: &[QualificationConnectionLifecycleMetrics],
@@ -648,6 +1258,7 @@ fn traffic_nonmutator_counters_unchanged(
         && after.mutation_resume_record_fence == before.mutation_resume_record_fence
         && after.last_generation == before.last_generation
         && after.last_record_fence == before.last_record_fence
+        && after.availability_interruption_episodes == before.availability_interruption_episodes
         && after.availability_interruptions == before.availability_interruptions
         && after.availability_recoveries == before.availability_recoveries
         && after.max_consecutive_availability_interruptions
@@ -668,6 +1279,12 @@ fn subset_traffic_availability_within_recovery_budget(
             let Some(after) = indexed_traffic_status(after, *node_index) else {
                 return false;
             };
+            if !traffic_live_mutator_counters_are_consistent(before)
+                || !traffic_live_mutator_counters_are_consistent(after)
+                || !traffic_availability_recovery_is_resolved(before)
+            {
+                return false;
+            }
             let Some(interruptions) = after
                 .availability_interruptions
                 .checked_sub(before.availability_interruptions)
@@ -680,13 +1297,22 @@ fn subset_traffic_availability_within_recovery_budget(
             else {
                 return false;
             };
+            let Some(episodes) = after
+                .availability_interruption_episodes
+                .checked_sub(before.availability_interruption_episodes)
+            else {
+                return false;
+            };
             let expected_maximum = if interruptions == 0 {
                 before.max_consecutive_availability_interruptions
             } else {
-                before.max_consecutive_availability_interruptions.max(1)
+                before
+                    .max_consecutive_availability_interruptions
+                    .max(interruptions)
             };
-            interruptions
+            episodes
                 <= QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+                && (episodes == 0) == (interruptions == 0)
                 && recoveries <= interruptions
                 && after.max_consecutive_availability_interruptions == expected_maximum
         })
@@ -717,7 +1343,9 @@ fn subset_traffic_availability_counters_equal(
             indexed_traffic_status(before, *node_index)
                 .zip(indexed_traffic_status(after, *node_index))
                 .is_some_and(|(before, after)| {
-                    after.availability_interruptions == before.availability_interruptions
+                    after.availability_interruption_episodes
+                        == before.availability_interruption_episodes
+                        && after.availability_interruptions == before.availability_interruptions
                         && after.availability_recoveries == before.availability_recoveries
                         && after.max_consecutive_availability_interruptions
                             == before.max_consecutive_availability_interruptions
@@ -763,6 +1391,7 @@ fn recovery_traffic_status_is_monotonic(
         && traffic_failure_fields_are_coherent(after)
         && traffic_availability_recovery_is_resolved(after)
         && after.seed == before.seed
+        && after.availability_interruption_episodes >= before.availability_interruption_episodes
         && after.availability_interruptions >= before.availability_interruptions
         && after.availability_recoveries >= before.availability_recoveries
         && after.max_consecutive_availability_interruptions
@@ -912,6 +1541,9 @@ fn assert_completed_traffic_cycles(status: &QualificationTrafficStatus) {
     assert_eq!(status.lease_reacquisitions, status.mutation_cycles);
     assert!(traffic_availability_recovery_is_resolved(status));
     assert!(status.mutation_resume_generation != 0 || status.availability_interruptions >= 1);
+    assert!(
+        status.mutation_resume_generation != 0 || status.availability_interruption_episodes >= 1
+    );
     assert!(
         status.availability_interruptions
             <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
@@ -1245,6 +1877,74 @@ fn connection_attempt_settlement_ledger(
     }
 }
 
+/// Emits only fixed-dimension lifecycle counters, so expiry/replacement
+/// intervals can be attributed without exposing peer, subscriber, or process
+/// identities in qualification diagnostics.
+fn emit_fixed_lifecycle_connection_snapshot(
+    phase: &str,
+    metrics: &[QualificationConnectionLifecycleMetrics],
+) {
+    let ledger = metrics.iter().fold(
+        ConnectionAttemptSettlementLedger {
+            attempts: 0,
+            successes: 0,
+            transport_failures: 0,
+            authentication_failures: 0,
+            timeout_failures: 0,
+            superseded: 0,
+            abandoned: 0,
+            protocol_failures: 0,
+            backend_failures: 0,
+            reconnect_attempts: 0,
+            reconnect_failures: 0,
+        },
+        |mut aggregate, metric| {
+            let current = connection_attempt_settlement_ledger(metric);
+            aggregate.attempts = aggregate.attempts.saturating_add(current.attempts);
+            aggregate.successes = aggregate.successes.saturating_add(current.successes);
+            aggregate.transport_failures = aggregate
+                .transport_failures
+                .saturating_add(current.transport_failures);
+            aggregate.authentication_failures = aggregate
+                .authentication_failures
+                .saturating_add(current.authentication_failures);
+            aggregate.timeout_failures = aggregate
+                .timeout_failures
+                .saturating_add(current.timeout_failures);
+            aggregate.superseded = aggregate.superseded.saturating_add(current.superseded);
+            aggregate.abandoned = aggregate.abandoned.saturating_add(current.abandoned);
+            aggregate.protocol_failures = aggregate
+                .protocol_failures
+                .saturating_add(current.protocol_failures);
+            aggregate.backend_failures = aggregate
+                .backend_failures
+                .saturating_add(current.backend_failures);
+            aggregate.reconnect_attempts = aggregate
+                .reconnect_attempts
+                .saturating_add(current.reconnect_attempts);
+            aggregate.reconnect_failures = aggregate
+                .reconnect_failures
+                .saturating_add(current.reconnect_failures);
+            aggregate
+        },
+    );
+    println!(
+        "MTLS_FIXED_LIFECYCLE_SNAPSHOT phase={phase} members={} connection_attempts={} connection_successes={} connection_failure_transport={} connection_failure_authentication={} connection_failure_timeout={} connection_superseded={} connection_abandoned={} connection_failure_protocol={} connection_failure_backend={} reconnect_attempts={} reconnect_failures={}",
+        metrics.len(),
+        ledger.attempts,
+        ledger.successes,
+        ledger.transport_failures,
+        ledger.authentication_failures,
+        ledger.timeout_failures,
+        ledger.superseded,
+        ledger.abandoned,
+        ledger.protocol_failures,
+        ledger.backend_failures,
+        ledger.reconnect_attempts,
+        ledger.reconnect_failures,
+    );
+}
+
 fn connection_attempt_settlement_ledgers(
     metrics: &[QualificationConnectionLifecycleMetrics],
 ) -> Vec<ConnectionAttemptSettlementLedger> {
@@ -1367,7 +2067,7 @@ fn assert_recovery_fault_flush_bounds(
         );
         assert!(
             terminal <= terminal_bound,
-            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}"
+            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}, attempts={attempts}, reconnect_attempts={reconnect_attempts}, reconnect_failures={reconnect_failures}, before={before:?}, after={after:?}"
         );
         for (counter, observed) in [
             ("connection_attempts", attempts),
@@ -1425,11 +2125,50 @@ fn deadline_allows_completion(now: Instant, deadline: Instant) -> bool {
     now <= deadline
 }
 
+/// Sleep for at most one retry period without crossing the caller's absolute
+/// deadline.  Callers use the `false` result to fail before issuing another
+/// command, rather than allowing a fixed retry sleep to consume unbounded
+/// observation time after the operation budget has expired.
+fn sleep_until_deadline(deadline: Instant, retry_period: Duration) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    thread::sleep(remaining.min(retry_period));
+    !deadline.saturating_duration_since(Instant::now()).is_zero()
+}
+
 fn deadline_admits_complete_operation(now: Instant, deadline: Instant) -> bool {
     now.checked_add(Duration::from_millis(
         QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     ))
     .is_some_and(|operation_deadline| operation_deadline <= deadline)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryTrafficCommandPlan {
+    RefreshProgress,
+    DispatchBy(Instant),
+}
+
+// Reserve the fixed concurrent-control delivery bound for the passive traffic
+// observation that follows a command. The command itself must still fit its
+// existing full operation timeout, so it cannot consume a rolling checkpoint
+// and leave no time to observe the survivor traffic it perturbed.
+fn recovery_traffic_command_plan(
+    now: Instant,
+    rolling_deadline: Instant,
+) -> RecoveryTrafficCommandPlan {
+    let observation_headroom =
+        Duration::from_millis(QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS);
+    let Some(command_deadline) = rolling_deadline.checked_sub(observation_headroom) else {
+        return RecoveryTrafficCommandPlan::RefreshProgress;
+    };
+    if deadline_admits_complete_operation(now, command_deadline) {
+        RecoveryTrafficCommandPlan::DispatchBy(command_deadline)
+    } else {
+        RecoveryTrafficCommandPlan::RefreshProgress
+    }
 }
 
 fn deadline_admits_complete_restart_readiness_round(now: Instant, deadline: Instant) -> bool {
@@ -1673,6 +2412,12 @@ fn assert_process_resource_bounds(
             warmed.vm_hwm_kib
         );
         assert!(
+            high_water.vm_rss_kib <= high_water.vm_hwm_kib,
+            "VmRSS high-water exceeds VmHWM: node={node_index}, rss_kib={}, hwm_kib={}",
+            high_water.vm_rss_kib,
+            high_water.vm_hwm_kib
+        );
+        assert!(
             settled.vm_rss_kib
                 <= warmed
                     .vm_rss_kib
@@ -1776,11 +2521,17 @@ enum TrustGeneration {
     Overlap,
     NewOnly,
 }
+#[derive(Clone, Copy)]
+enum ConsumerCredentialGeneration {
+    OldRoot,
+    NewRoot,
+}
 
 struct TestPki {
     old_root_pem: String,
     new_root_pem: String,
     old_intermediate: Issuer,
+    new_intermediate: Issuer,
     members: Vec<MemberCredentials>,
 }
 
@@ -1809,6 +2560,7 @@ impl TestPki {
             old_root_pem: old_root.certified.pem(),
             new_root_pem: new_root.certified.pem(),
             old_intermediate,
+            new_intermediate,
             members,
         }
     }
@@ -1881,13 +2633,43 @@ impl TestPki {
     }
 
     fn consumer_identity_state(&self, identity: &str) -> IdentityState {
-        let credential = self.old_intermediate.issue_workload(identity);
+        self.consumer_identity_state_with_trust(identity, TrustGeneration::OldOnly)
+    }
+
+    fn consumer_identity_state_with_trust(
+        &self,
+        identity: &str,
+        trust_generation: TrustGeneration,
+    ) -> IdentityState {
+        let credential_generation = match trust_generation {
+            TrustGeneration::OldOnly | TrustGeneration::Overlap => {
+                ConsumerCredentialGeneration::OldRoot
+            }
+            TrustGeneration::NewOnly => ConsumerCredentialGeneration::NewRoot,
+        };
+        self.consumer_identity_state_with_generations(
+            identity,
+            credential_generation,
+            trust_generation,
+        )
+    }
+
+    fn consumer_identity_state_with_generations(
+        &self,
+        identity: &str,
+        credential_generation: ConsumerCredentialGeneration,
+        trust_generation: TrustGeneration,
+    ) -> IdentityState {
+        let credential = match credential_generation {
+            ConsumerCredentialGeneration::OldRoot => self.old_intermediate.issue_workload(identity),
+            ConsumerCredentialGeneration::NewRoot => self.new_intermediate.issue_workload(identity),
+        };
         let trust_domain =
             TrustDomain::new("qualification.invalid").expect("qualification trust domain is valid");
         let mut trust_bundles = TrustBundleSet::new();
         trust_bundles.insert(TrustBundle {
             trust_domain,
-            certificates: parse_certs_pem(&self.old_root_pem)
+            certificates: parse_certs_pem(&self.trust_bundle(trust_generation))
                 .expect("parse qualification consumer trust bundle"),
         });
         build_identity_state(
@@ -1964,6 +2746,17 @@ enum ChildStderrDiagnostic {
     Redacted,
 }
 
+/// Receive one child reply using the supplied absolute deadline.  Keeping the
+/// deadline conversion at this one boundary makes the directed-handshake and
+/// status/lifecycle callers testable without a wall-clock race: a withheld
+/// reply with an expired deadline has a zero receive budget.
+fn receive_qualification_reply_until<T>(
+    replies: &Receiver<T>,
+    deadline: Instant,
+) -> Result<T, RecvTimeoutError> {
+    replies.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+}
+
 struct ChildNode {
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
@@ -1976,12 +2769,18 @@ struct ChildNode {
 }
 
 impl ChildNode {
-    fn spawn(config: &Path, node_index: usize, stderr: &Path) -> (Self, SocketAddr) {
+    fn spawn(
+        config: &Path,
+        node_index: usize,
+        stderr: &Path,
+        snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
+    ) -> (Self, SocketAddr) {
         Self::spawn_bound(
             config,
             node_index,
             stderr,
             "127.0.0.1:0".parse().expect("loopback qualification bind"),
+            snapshot_leaf,
         )
     }
 
@@ -1990,6 +2789,7 @@ impl ChildNode {
         node_index: usize,
         stderr_path: &Path,
         bind_addr: SocketAddr,
+        snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
     ) -> (Self, SocketAddr) {
         Self::spawn_bound_until(
             config,
@@ -1997,6 +2797,7 @@ impl ChildNode {
             stderr_path,
             bind_addr,
             Instant::now() + CHILD_TIMEOUT,
+            snapshot_leaf,
         )
     }
 
@@ -2006,6 +2807,7 @@ impl ChildNode {
         stderr_path: &Path,
         bind_addr: SocketAddr,
         deadline: Instant,
+        snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
     ) -> (Self, SocketAddr) {
         let stderr = OpenOptions::new()
             .create(true)
@@ -2013,7 +2815,8 @@ impl ChildNode {
             .mode(0o600)
             .open(stderr_path)
             .expect("open qualification stderr");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"));
+        command
             .arg("--config")
             .arg(config)
             .arg("--node-index")
@@ -2022,9 +2825,25 @@ impl ChildNode {
             .arg(bind_addr.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn mTLS qualification node");
+            .stderr(Stdio::from(stderr));
+        if let Some(leaf) = snapshot_leaf {
+            // Only this one descriptor loses CLOEXEC while this exact child
+            // is spawned.  The parent immediately restores CLOEXEC, keeps
+            // the owned descriptor for restart, and never exports a pathname
+            // capability to the child.
+            fcntl_setfd(leaf.inherited_descriptor(), FdFlags::empty())
+                .expect("make V9 snapshot leaf descriptor inheritable");
+            command.env(
+                V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV,
+                leaf.inherited_descriptor().as_raw_fd().to_string(),
+            );
+        }
+        let child_result = command.spawn();
+        if let Some(leaf) = snapshot_leaf {
+            fcntl_setfd(leaf.inherited_descriptor(), FdFlags::CLOEXEC)
+                .expect("restore V9 snapshot leaf descriptor close-on-exec");
+        }
+        let mut child = child_result.expect("spawn mTLS qualification node");
         let stdin = child.stdin.take().expect("qualification child stdin");
         let stdout = child.stdout.take().expect("qualification child stdout");
         let (sender, replies) = mpsc::sync_channel(32);
@@ -2099,14 +2918,21 @@ impl ChildNode {
     }
 
     fn receive_until(&mut self, deadline: Instant) -> QualificationNodeReply {
-        self.receive_with_timeout(deadline.saturating_duration_since(Instant::now()))
+        self.receive_result(receive_qualification_reply_until(&self.replies, deadline))
     }
 
     fn receive_with_timeout(&mut self, timeout: Duration) -> QualificationNodeReply {
+        self.receive_result(self.replies.recv_timeout(timeout))
+    }
+
+    fn receive_result(
+        &mut self,
+        result: Result<ReaderMessage, RecvTimeoutError>,
+    ) -> QualificationNodeReply {
         let pending = self
             .pending
             .expect("qualification child response requested without a pending command");
-        match self.replies.recv_timeout(timeout) {
+        match result {
             Ok(ReaderMessage::Reply(reply)) => {
                 self.pending = None;
                 *reply
@@ -2310,6 +3136,68 @@ struct CandidateEvidenceInputs {
     configuration_sha256: String,
 }
 
+/// Release-only source and command binding. This accepts only a wholly clean
+/// exact-head worktree, including untracked files and submodules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseGateProvenance {
+    source_revision: String,
+    source_tree: String,
+    source_worktree_sha256: String,
+    cargo_lock_sha256: String,
+    cargo_target_directory: String,
+    cargo_target_directory_sha256: String,
+    evidence_root_directory: String,
+    evidence_root_directory_sha256: String,
+    fs_verity_snapshot_root_directory: String,
+    fs_verity_snapshot_root_directory_sha256: String,
+    fs_verity_snapshot_root_device: u64,
+    fs_verity_snapshot_root_inode: u64,
+    pair_directory: String,
+    pair_directory_sha256: String,
+    command_argv_sha256: String,
+    cargo_executable_alias: String,
+    cargo_executable: String,
+    cargo_executable_sha256: String,
+    cargo_executable_mode: u16,
+    canonical_cargo_argv: Vec<String>,
+    cargo_profile: String,
+    opt_level: String,
+}
+
+const RELEASE_GATE_EXPECTED_CARGO_ARGV: &[&str] = &[
+    "cargo",
+    "test",
+    "--locked",
+    "--release",
+    "-p",
+    "opc-session-testkit",
+    "--test",
+    "qualification_mtls_multiprocess",
+    "--no-default-features",
+    "three_process_projected_mtls_persistent_v2_batch_release_gate",
+    "--",
+    "--ignored",
+    "--exact",
+    "--test-threads=1",
+    "--nocapture",
+];
+
+impl ReleaseGateProvenance {
+    fn capture() -> io::Result<Self> {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        release_gate_provenance_at(&repository)
+    }
+
+    fn verify_unchanged(&self) -> io::Result<()> {
+        if Self::capture()? != *self {
+            return Err(io::Error::other(
+                "release-gate source or canonical command binding changed during the campaign",
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct CandidatePublicMaterialManifest {
     hasher: Sha256,
     publication_count: u64,
@@ -2410,6 +3298,13 @@ struct Fleet {
     nodes: Vec<ChildNode>,
     // Keep the workspace alive until every child has been killed on panic.
     workspace: TempDir,
+    // The immutable snapshot namespace has a distinct lifecycle from mutable
+    // workspace files, but must survive until every child has stopped.
+    _snapshot_namespace: Option<PinnedV9SnapshotNamespace>,
+    // One descriptor-pinned snapshot leaf per logical voter.  A replacement
+    // process inherits only its own leaf descriptor, so restart cannot turn a
+    // prior pathname validation into authority over a same-UID replacement.
+    _snapshot_leaves: Vec<PinnedV9SnapshotLeaf>,
     config_paths: Vec<PathBuf>,
     stderr_paths: Vec<PathBuf>,
     projected_roots: Vec<PathBuf>,
@@ -2421,25 +3316,393 @@ struct Fleet {
     canary_values: Vec<String>,
     candidate_evidence_inputs: CandidateEvidenceInputs,
     candidate_public_material_manifest: CandidatePublicMaterialManifest,
+    readiness_probe_commands: usize,
+}
+
+/// Retain no-follow descriptors for both the configured fs-verity base and
+/// the fresh campaign child. The child configs carry the child identity, so
+/// the node cannot accept a substituted namespace merely because its path and
+/// inherited environment still look plausible.
+struct PinnedV9SnapshotNamespace {
+    // Kept rather than recursively removed on Drop: after a failed identity
+    // check, pathname cleanup could otherwise delete a same-UID replacement.
+    namespace: PathBuf,
+    base: PathBuf,
+    base_descriptor: OwnedFd,
+    base_device: u64,
+    base_inode: u64,
+    descriptor: OwnedFd,
+    device: u64,
+    inode: u64,
+}
+
+impl PinnedV9SnapshotNamespace {
+    fn path(&self) -> &Path {
+        &self.namespace
+    }
+
+    fn device(&self) -> u64 {
+        self.device
+    }
+
+    fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        let base = fstat(&self.base_descriptor)?;
+        let namespace = fstat(&self.descriptor)?;
+        let base_metadata = fs::symlink_metadata(&self.base)?;
+        let namespace_metadata = fs::symlink_metadata(self.path())?;
+        let private_directory = |metadata: &fs::Metadata| {
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.permissions().mode() & 0o7777 == 0o700
+        };
+        if !private_directory(&base_metadata)
+            || !private_directory(&namespace_metadata)
+            || base.st_dev as u64 != self.base_device
+            || base.st_ino as u64 != self.base_inode
+            || base_metadata.dev() != self.base_device
+            || base_metadata.ino() != self.base_inode
+            || namespace.st_dev as u64 != self.device
+            || namespace.st_ino as u64 != self.inode
+            || namespace_metadata.dev() != self.device
+            || namespace_metadata.ino() != self.inode
+            || fs::canonicalize(&self.base)? != self.base
+            || fs::canonicalize(self.path())? != self.path()
+            || self.path().parent() != Some(self.base.as_path())
+        {
+            return Err(io::Error::other(
+                "V9 fs-verity snapshot namespace identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_leaf(&self, node_index: usize) -> io::Result<PinnedV9SnapshotLeaf> {
+        self.verify()?;
+        let name = format!("node-{node_index}");
+        mkdirat(&self.descriptor, name.as_str(), Mode::from_raw_mode(0o700))?;
+        let descriptor = openat(
+            &self.descriptor,
+            name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let metadata = fstat(&descriptor)?;
+        if !FileType::from_raw_mode(metadata.st_mode).is_dir()
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+            || Mode::from_raw_mode(metadata.st_mode).bits() & 0o7777 != 0o700
+        {
+            return Err(io::Error::other(
+                "V9 fs-verity snapshot leaf was not created owner-private",
+            ));
+        }
+        let leaf = PinnedV9SnapshotLeaf {
+            path: self.path().join(name),
+            descriptor,
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+        };
+        leaf.verify(self)?;
+        Ok(leaf)
+    }
+}
+
+/// One fixed V9 snapshot leaf. The parent retains this descriptor for the
+/// whole campaign and lends it to the corresponding child only across exec.
+/// All later child store admission starts from `/proc/self/fd/<n>/`, never
+/// from the JSON pathname. The trailing separator preserves store-side
+/// O_NOFOLLOW while traversing the pinned descriptor as an intermediate
+/// component, including after the store normalizes the absolute spelling.
+struct PinnedV9SnapshotLeaf {
+    path: PathBuf,
+    descriptor: OwnedFd,
+    device: u64,
+    inode: u64,
+}
+
+impl PinnedV9SnapshotLeaf {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn verify(&self, namespace: &PinnedV9SnapshotNamespace) -> io::Result<()> {
+        namespace.verify()?;
+        let descriptor = fstat(&self.descriptor)?;
+        let metadata = fs::symlink_metadata(self.path())?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o7777 != 0o700
+            || descriptor.st_dev as u64 != self.device
+            || descriptor.st_ino as u64 != self.inode
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || fs::canonicalize(self.path())? != self.path
+            || self.path.parent() != Some(namespace.path())
+        {
+            return Err(io::Error::other(
+                "V9 fs-verity snapshot leaf identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn inherited_descriptor(&self) -> &OwnedFd {
+        &self.descriptor
+    }
+}
+
+fn create_v9_snapshot_campaign_directory(
+    base_descriptor: &OwnedFd,
+) -> io::Result<(String, OwnedFd)> {
+    for _ in 0..32 {
+        let mut entropy = [0_u8; 16];
+        File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+        let sequence = CANDIDATE_STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "opc-v9-snapshots-{:032x}-{}-{sequence}",
+            u128::from_be_bytes(entropy),
+            std::process::id(),
+        );
+        match mkdirat(base_descriptor, name.as_str(), Mode::from_raw_mode(0o700)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+        let descriptor = openat(
+            base_descriptor,
+            name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let metadata = fstat(&descriptor)?;
+        if FileType::from_raw_mode(metadata.st_mode).is_dir()
+            && metadata.st_uid == rustix::process::geteuid().as_raw()
+            && Mode::from_raw_mode(metadata.st_mode).bits() & 0o7777 == 0o700
+        {
+            return Ok((name, descriptor));
+        }
+        // This object was created by our descriptor-relative mkdirat call,
+        // but it may have been renamed or replaced before inspection.  Do not
+        // clean through a pathname that could now name an attacker object.
+        return Err(io::Error::other(
+            "V9 fs-verity snapshot campaign was not created owner-private",
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "V9 fs-verity snapshot campaign namespace is exhausted",
+    ))
+}
+
+fn stateless_consumer_voter_topology_for_configuration(
+    members: &[QualificationMember],
+    configuration_generation: &str,
+    configuration_epoch: u64,
+) -> ValidatedQuorumTopology {
+    let descriptors = members
+        .iter()
+        .map(|member| {
+            QuorumReplicaDescriptor::new(
+                ReplicaId::new(member.replica_id.clone())
+                    .expect("qualification consumer replica ID"),
+                ReplicaEndpoint::new(member.endpoint_host.clone(), member.endpoint_port)
+                    .expect("qualification consumer endpoint"),
+                ReplicaTlsIdentity::new(member.tls_identity.clone())
+                    .expect("qualification consumer TLS identity"),
+                ReplicaFailureDomain::new(member.failure_domain.clone())
+                    .expect("qualification consumer failure domain"),
+                ReplicaBackingIdentity::new(member.backing_identity.clone())
+                    .expect("qualification consumer backing identity"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let roster_attestation_root = qualification_roster_attestation_trust_root();
+    let manifest = SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
+        SessionClusterId::new(format!("qualification-mtls-{}-cluster", members.len()))
+            .expect("qualification consumer cluster ID"),
+        SessionConfigurationGeneration::new(configuration_generation)
+            .expect("qualification consumer configuration generation"),
+        SessionConfigurationEpoch::new(configuration_epoch)
+            .expect("qualification consumer configuration epoch"),
+        descriptors.clone(),
+        Some(roster_attestation_root.clone()),
+    )
+    .expect("qualification consumer replication manifest");
+    let local_replica = descriptors
+        .first()
+        .expect("qualification consumer local replica")
+        .replica_id()
+        .clone();
+    ValidatedQuorumTopology::try_from_fixed_durable_quorum(
+        QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
+            local_replica,
+            descriptors,
+            manifest.fixed_durable_quorum_consensus_identity(),
+            roster_attestation_root,
+        ),
+    )
+    .expect("qualification consumer validated fixed topology")
+}
+
+#[test]
+fn stateless_consumer_voter_topology_binds_fixed_root_and_epoch_scope() {
+    let members = (0..3)
+        .map(|node_index| QualificationMember {
+            node_index,
+            replica_id: format!("node-{node_index}"),
+            endpoint_host: format!("node-{node_index}.qualification.invalid"),
+            endpoint_port: 41_000 + u16::try_from(node_index).expect("qualification node index"),
+            dial_addr: None,
+            tls_identity: spiffe_id(node_index),
+            failure_domain: format!("zone-{node_index}"),
+            backing_identity: format!("disk-{node_index}"),
+        })
+        .collect::<Vec<_>>();
+    let topology = stateless_consumer_voter_topology_for_configuration(&members, "v1", 1);
+    let expected_root = qualification_roster_attestation_trust_root();
+    assert_eq!(
+        topology
+            .roster_attestation_trust_root()
+            .map(opc_session_store::RosterAttestationTrustRootV1::identity),
+        Some(expected_root.identity())
+    );
+    let roster = topology
+        .session_consumer_roster()
+        .expect("fixed qualification consumer roster");
+    assert_eq!(
+        topology.consensus_identity(),
+        Some(roster.scope().consensus_identity())
+    );
+    for member in &members {
+        let replica_id =
+            ReplicaId::new(member.replica_id.clone()).expect("qualification consumer replica ID");
+        let node_id = topology
+            .consensus_node_id(&replica_id)
+            .expect("qualification consumer consensus node ID");
+        let authority = roster
+            .voter(node_id)
+            .expect("qualification consumer voter authority");
+        assert_eq!(authority.scope(), roster.scope());
+        assert_eq!(authority.tls_identity(), member.tls_identity);
+        assert_eq!(authority.voter_count(), members.len());
+    }
+
+    let epoch_two = stateless_consumer_voter_topology_for_configuration(&members, "v1-negative", 2)
+        .session_consumer_roster()
+        .expect("epoch-two qualification consumer roster");
+    assert_ne!(roster.scope(), epoch_two.scope());
 }
 
 impl Fleet {
+    fn fs_verity_snapshot_campaign_namespace(
+        release_provenance: Option<&ReleaseGateProvenance>,
+    ) -> Option<PinnedV9SnapshotNamespace> {
+        let root = match env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV) {
+            Some(root) => root,
+            None => {
+                assert_ne!(
+                    env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref(),
+                    Some(std::ffi::OsStr::new("required")),
+                    "required fs-verity qualification needs {FS_VERITY_SNAPSHOT_ROOT_ENV}"
+                );
+                return None;
+            }
+        };
+        assert_eq!(
+            env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref(),
+            Some(std::ffi::OsStr::new("required")),
+            "{FS_VERITY_SNAPSHOT_ROOT_ENV} is accepted only for required fs-verity qualification"
+        );
+        let root = v9_canonical_fs_verity_snapshot_root_directory(Some(root))
+            .expect("canonical private fs-verity snapshot root");
+        if let Some(provenance) = release_provenance {
+            assert!(
+                root.directory.to_str()
+                    == Some(provenance.fs_verity_snapshot_root_directory.as_str())
+                    && root.device == provenance.fs_verity_snapshot_root_device
+                    && root.inode == provenance.fs_verity_snapshot_root_inode,
+                "V9 fs-verity snapshot root differs from captured release provenance"
+            );
+        }
+        let base_descriptor = v9_open_private_external_root(&root.directory)
+            .expect("open canonical private fs-verity snapshot root");
+        let base_metadata = fstat(&base_descriptor).expect("fstat fs-verity snapshot root");
+        assert_eq!(base_metadata.st_dev as u64, root.device);
+        assert_eq!(base_metadata.st_ino as u64, root.inode);
+        // Create the campaign through the pinned configured-root descriptor.
+        // `mkdirat(..., 0700)` avoids tempfile's path reopen and its former
+        // transient umask mode; opening the direct child with NOFOLLOW binds
+        // the descriptor before it is ever named in child configuration.
+        let (namespace_name, descriptor) = create_v9_snapshot_campaign_directory(&base_descriptor)
+            .expect("create descriptor-pinned private V9 fs-verity snapshot namespace");
+        let descriptor_metadata =
+            fstat(&descriptor).expect("fstat V9 fs-verity snapshot namespace");
+        let namespace = root.directory.join(namespace_name);
+        let metadata =
+            fs::symlink_metadata(&namespace).expect("stat private V9 fs-verity snapshot namespace");
+        assert!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.permissions().mode() & 0o7777 == 0o700
+                && fs::canonicalize(&namespace)
+                    .expect("canonical private V9 fs-verity snapshot namespace")
+                    .starts_with(&root.directory),
+            "V9 fs-verity snapshot namespace must remain private below its configured root"
+        );
+        let pinned = PinnedV9SnapshotNamespace {
+            namespace,
+            base: root.directory,
+            base_descriptor,
+            base_device: base_metadata.st_dev as u64,
+            base_inode: base_metadata.st_ino as u64,
+            descriptor,
+            device: descriptor_metadata.st_dev as u64,
+            inode: descriptor_metadata.st_ino as u64,
+        };
+        pinned
+            .verify()
+            .expect("pin V9 fs-verity snapshot namespace identity");
+        Some(pinned)
+    }
+
     fn start(member_count: usize) -> Self {
         let schedule = session_mtls_candidate_schedule_sha256(
             SessionMtlsCandidateCampaign::RotationCore,
             member_count,
         )
         .expect("supported rotation-core candidate topology");
-        Self::start_with_schedule(member_count, schedule)
+        Self::start_with_schedule(member_count, schedule, None)
     }
 
     fn start_traffic(member_count: usize) -> Self {
         let schedule = qualification_traffic_schedule_sha256(member_count)
             .expect("supported traffic qualification topology");
-        Self::start_with_schedule(member_count, schedule)
+        Self::start_with_schedule(member_count, schedule, None)
     }
 
-    fn start_with_schedule(member_count: usize, workload_schedule_sha256: String) -> Self {
+    fn start_with_release_provenance(
+        member_count: usize,
+        release_provenance: &ReleaseGateProvenance,
+    ) -> Self {
+        let schedule = session_mtls_candidate_schedule_sha256(
+            SessionMtlsCandidateCampaign::RotationCore,
+            member_count,
+        )
+        .expect("supported rotation-core candidate topology");
+        Self::start_with_schedule(member_count, schedule, Some(release_provenance))
+    }
+
+    fn start_with_schedule(
+        member_count: usize,
+        workload_schedule_sha256: String,
+        release_provenance: Option<&ReleaseGateProvenance>,
+    ) -> Self {
         assert!(matches!(member_count, 3 | 5));
         let (source_revision, source_tree_status, source_worktree_sha256) =
             candidate_source_provenance().expect("capture candidate source provenance");
@@ -2452,6 +3715,30 @@ impl Fleet {
         let harness_sha256 = candidate_sha256_file(&harness_path, MAX_CANDIDATE_ARTIFACT_BYTES)
             .expect("hash candidate harness before execution");
         let workspace = tempfile::tempdir().expect("create mTLS qualification workspace");
+        let snapshot_namespace = Self::fs_verity_snapshot_campaign_namespace(release_provenance);
+        if let Some(namespace) = &snapshot_namespace {
+            assert_ne!(
+                fs::metadata(workspace.path())
+                    .expect("stat ordinary V9 qualification workspace")
+                    .dev(),
+                fs::metadata(namespace.path())
+                    .expect("stat V9 fs-verity snapshot namespace")
+                    .dev(),
+                "V9 mutable workspace must not share the fs-verity snapshot filesystem"
+            );
+            namespace
+                .verify()
+                .expect("revalidate V9 fs-verity snapshot namespace before child configuration");
+        }
+        let snapshot_leaves = snapshot_namespace
+            .as_ref()
+            .map(|namespace| {
+                (0..member_count)
+                    .map(|node_index| namespace.create_leaf(node_index))
+                    .collect::<io::Result<Vec<_>>>()
+                    .expect("create descriptor-pinned private V9 fs-verity snapshot leaves")
+            })
+            .unwrap_or_default();
         let root = workspace.path();
         let mut configs = Vec::with_capacity(member_count);
         let mut nodes = Vec::with_capacity(member_count);
@@ -2462,7 +3749,12 @@ impl Fleet {
             fs::create_dir(&node_root).expect("create qualification node directory");
             let config = node_root.join("config.json");
             let stderr = node_root.join("stderr.log");
-            let (node, address) = ChildNode::spawn(&config, node_index, &stderr);
+            let (node, address) = ChildNode::spawn(
+                &config,
+                node_index,
+                &stderr,
+                snapshot_leaves.get(node_index),
+            );
             configs.push(config);
             nodes.push(node);
             addresses.push(address);
@@ -2491,10 +3783,19 @@ impl Fleet {
         for (node_index, config_path) in configs.iter().enumerate() {
             let node_root = root.join(format!("node-{node_index}"));
             let projected_root = node_root.join("projected");
-            let snapshots = node_root.join("snapshots");
+            let snapshots = snapshot_leaves
+                .get(node_index)
+                .map(|leaf| leaf.path().to_path_buf())
+                .unwrap_or_else(|| node_root.join("snapshots"));
             let database_path = node_root.join("session.sqlite");
             fs::create_dir(&projected_root).expect("create projected root");
-            fs::create_dir(&snapshots).expect("create snapshots root");
+            if let Some(namespace) = &snapshot_namespace {
+                snapshot_leaves[node_index]
+                    .verify(namespace)
+                    .expect("revalidate descriptor-pinned V9 fs-verity snapshot leaf");
+            } else {
+                fs::create_dir(&snapshots).expect("create snapshots root");
+            }
             let initial_credential = pki.credential(node_index, CredentialGeneration::Initial);
             let initial_trust = pki.trust_bundle(TrustGeneration::OldOnly);
             candidate_public_material_manifest
@@ -2524,6 +3825,15 @@ impl Fleet {
                 workspace_directory: root.to_path_buf(),
                 database_path: database_path.clone(),
                 snapshot_directory: snapshots,
+                snapshot_root_directory: snapshot_namespace
+                    .as_ref()
+                    .map(|namespace| namespace.path().to_path_buf()),
+                snapshot_root_device: snapshot_namespace
+                    .as_ref()
+                    .map(PinnedV9SnapshotNamespace::device),
+                snapshot_root_inode: snapshot_namespace
+                    .as_ref()
+                    .map(PinnedV9SnapshotNamespace::inode),
                 operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
                 transport: QualificationTransportConfig::ProjectedMtls(
                     QualificationProjectedMtlsConfig {
@@ -2555,6 +3865,15 @@ impl Fleet {
             configuration_sha256: candidate_configuration_sha256(&configs)
                 .expect("hash candidate configurations before execution"),
         };
+        if let Some(namespace) = &snapshot_namespace {
+            namespace
+                .verify()
+                .expect("revalidate V9 fs-verity snapshot namespace before child startup");
+            for leaf in &snapshot_leaves {
+                leaf.verify(namespace)
+                    .expect("revalidate V9 fs-verity snapshot leaf before child startup");
+            }
+        }
 
         // Bound the process-heavy store/transport startup to one child at a
         // time. All listeners are already bound and all immutable
@@ -2587,6 +3906,8 @@ impl Fleet {
         let mut fleet = Self {
             nodes,
             workspace,
+            _snapshot_namespace: snapshot_namespace,
+            _snapshot_leaves: snapshot_leaves,
             config_paths: configs,
             stderr_paths,
             projected_roots,
@@ -2598,9 +3919,11 @@ impl Fleet {
             canary_values: Vec::new(),
             candidate_evidence_inputs,
             candidate_public_material_manifest,
+            readiness_probe_commands: 0,
         };
         fleet.wait_ready();
         fleet.assert_all_material_ready();
+        fleet.verify_snapshot_namespace();
         assert!(matches!(
             fleet.nodes[0].invoke(&QualificationNodeCommand::DirectedHandshake {
                 remote_node_index: 1,
@@ -2612,6 +3935,28 @@ impl Fleet {
         fleet.acquire_canary_lease();
         fleet.advance_canary("initial-old-chain");
         fleet
+    }
+
+    fn verify_snapshot_namespace(&self) {
+        if let Some(namespace) = &self._snapshot_namespace {
+            namespace
+                .verify()
+                .expect("V9 fs-verity snapshot namespace changed during campaign");
+            assert_eq!(
+                self._snapshot_leaves.len(),
+                self.nodes.len(),
+                "V9 campaign must retain one pinned snapshot leaf per child"
+            );
+            for leaf in &self._snapshot_leaves {
+                leaf.verify(namespace)
+                    .expect("V9 fs-verity snapshot leaf changed during campaign");
+            }
+        } else {
+            assert!(
+                self._snapshot_leaves.is_empty(),
+                "ordinary qualification must not retain V9 snapshot descriptors"
+            );
+        }
     }
 
     fn member_count(&self) -> usize {
@@ -2640,13 +3985,191 @@ impl Fleet {
         }
     }
 
-    fn arm_stateless_consumer_outcome_unknown(&mut self, node_index: usize) {
+    fn arm_stateless_consumer_delayed_response(&mut self, node_index: usize) {
         match self.nodes[node_index]
-            .invoke(&QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown)
+            .invoke(&QualificationNodeCommand::ArmStatelessConsumerDelayedResponse)
         {
-            QualificationNodeReply::StatelessConsumerOutcomeUnknownArmed => {}
+            QualificationNodeReply::StatelessConsumerDelayedResponseArmed => {}
             reply => panic!(
-                "stateless consumer outcome-unknown simulation did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                "stateless consumer delayed-response simulation did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    /// Derive the exact server authority from the same validated immutable
+    /// qualification topology used by every child. This preserves the node,
+    /// SPIFFE identity, voter count, and roster commitment together rather
+    /// than rebuilding client authority from identity text or consumer scope.
+    fn stateless_consumer_voter_authorities(&self) -> Vec<SessionConsumerVoterAuthority> {
+        self.stateless_consumer_voter_authorities_for_configuration("v1", 1)
+    }
+
+    /// Mint a separately validated authority for an intentionally distinct
+    /// configuration scope.  This is used only as a negative Hello control:
+    /// its TLS identities still name these real voters, but its committed
+    /// cluster/configuration/epoch scope cannot authorize this listener.
+    fn stateless_consumer_voter_authorities_for_configuration(
+        &self,
+        configuration_generation: &str,
+        configuration_epoch: u64,
+    ) -> Vec<SessionConsumerVoterAuthority> {
+        let topology = stateless_consumer_voter_topology_for_configuration(
+            &self.members,
+            configuration_generation,
+            configuration_epoch,
+        );
+        let roster = topology
+            .session_consumer_roster()
+            .expect("qualification consumer roster");
+
+        self.members
+            .iter()
+            .map(|member| {
+                let replica_id = ReplicaId::new(member.replica_id.clone())
+                    .expect("qualification consumer replica ID");
+                let node_id = topology
+                    .consensus_node_id(&replica_id)
+                    .expect("qualification consumer consensus node ID");
+                let authority = roster
+                    .voter(node_id)
+                    .expect("qualification consumer voter authority");
+                assert_eq!(authority.tls_identity(), member.tls_identity);
+                assert_eq!(authority.voter_count(), self.member_count());
+                authority
+            })
+            .collect()
+    }
+
+    fn arm_stateless_consumer_response_holds(&mut self, node_index: usize) {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ArmStatelessConsumerResponseHolds)
+        {
+            QualificationNodeReply::StatelessConsumerResponseHoldsArmed { responses: 4 } => {}
+            reply => panic!(
+                "stateless consumer four-response hold gate did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn stateless_consumer_response_hold_status(&mut self, node_index: usize) -> (usize, usize) {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::StatelessConsumerResponseHoldStatus)
+        {
+            QualificationNodeReply::StatelessConsumerResponseHoldStatus {
+                armed_responses,
+                held_responses,
+            } => (armed_responses, held_responses),
+            reply => panic!(
+                "stateless consumer four-response hold status unavailable: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn release_stateless_consumer_response_holds(&mut self, node_index: usize) {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds)
+        {
+            QualificationNodeReply::StatelessConsumerResponseHoldsReleased { responses: 4 } => {}
+            reply => panic!(
+                "stateless consumer four-response hold gate did not release: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn arm_stateless_consumer_ambiguity_witness_hold(&mut self, node_index: usize) {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ArmStatelessConsumerAmbiguityWitnessHold)
+        {
+            QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldArmed => {}
+            reply => panic!(
+                "stateless consumer causal witness hold gate did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn stateless_consumer_ambiguity_witness_hold_status(
+        &mut self,
+        node_index: usize,
+    ) -> (usize, usize) {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::StatelessConsumerAmbiguityWitnessHoldStatus)
+        {
+            QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldStatus {
+                armed_responses,
+                held_responses,
+            } => (armed_responses, held_responses),
+            reply => panic!(
+                "stateless consumer causal witness hold status unavailable: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn release_stateless_consumer_ambiguity_witness_hold(&mut self, node_index: usize) {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ReleaseStatelessConsumerAmbiguityWitnessHold)
+        {
+            QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldReleased => {}
+            reply => panic!(
+                "stateless consumer causal witness hold gate did not release: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn consumer_tls_peer_credential_rejections(&mut self, node_index: usize) -> u64 {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ConsumerTlsPeerCredentialRejections)
+        {
+            QualificationNodeReply::ConsumerTlsPeerCredentialRejections { rejections } => {
+                rejections
+            }
+            reply => panic!(
+                "unexpected consumer TLS peer-credential rejection response: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn stateless_consumer_admission_status(
+        &mut self,
+        node_index: usize,
+    ) -> opc_session_testkit::qualification::SessionMtlsBatchReleaseGateServerAdmissionV1 {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::StatelessConsumerAdmissionStatus)
+        {
+            QualificationNodeReply::StatelessConsumerAdmissionStatus {
+                admission_limit,
+                active_connections,
+                high_water_connections,
+                admission_waits,
+                admission_rejections,
+                samples,
+                listener_available,
+            } => opc_session_testkit::qualification::SessionMtlsBatchReleaseGateServerAdmissionV1 {
+                logical_voter_index: node_index,
+                admission_limit,
+                expected_peak_connections: 16,
+                active_connections,
+                high_water_connections,
+                normal_headroom_high_water_connections: 0,
+                capacity_probe_high_water_connections: 0,
+                capacity_probe_exercised: false,
+                capacity_probe_admission_waits: 0,
+                capacity_probe_admission_rejections: 0,
+                capacity_probe_typed_rejection: false,
+                admission_waits,
+                admission_rejections,
+                samples,
+                listener_available,
+            },
+            reply => panic!(
+                "process-local stateless consumer admission status unavailable: node={node_index}, reply={reply:?}, stderr={}",
                 self.node_stderr(node_index)
             ),
         }
@@ -2661,6 +4184,10 @@ impl Fleet {
         node_indices: &[usize],
         deadline: Instant,
     ) -> Vec<FleetReadiness> {
+        self.readiness_probe_commands = self
+            .readiness_probe_commands
+            .checked_add(node_indices.len())
+            .expect("readiness probe command count overflow");
         for node_index in node_indices {
             self.nodes[*node_index].send(&QualificationNodeCommand::Probe);
         }
@@ -2787,12 +4314,14 @@ impl Fleet {
         previous_process_id: u32,
         deadline: Instant,
     ) {
+        self.verify_snapshot_namespace();
         let (node, actual_address) = ChildNode::spawn_bound_until(
             &self.config_paths[node_index],
             node_index,
             &self.stderr_paths[node_index],
             expected_address,
             deadline,
+            self._snapshot_leaves.get(node_index),
         );
         assert_eq!(actual_address, expected_address);
         self.nodes[node_index] = node;
@@ -3106,11 +4635,12 @@ impl Fleet {
         );
         assert_eq!(
             (
+                resumed_node.availability_interruption_episodes,
                 resumed_node.availability_interruptions,
                 resumed_node.availability_recoveries,
                 resumed_node.max_consecutive_availability_interruptions,
             ),
-            (0, 0, 0),
+            (0, 0, 0, 0),
             "a recovered committed generation rearmed the once-per-mutator synthetic response-loss fault"
         );
         assert!(
@@ -3215,7 +4745,8 @@ impl Fleet {
             let metrics = self.security_metrics(node_index);
             assert_security_metrics_unsaturated(node_index, &metrics);
             assert_eq!(
-                controller, controller_before,
+                controller,
+                controller_before,
                 "malformed projected trust must never replace or perturb the active TLS epoch: node={node_index}, source={source:?}, metrics={metrics:?}, stderr={}",
                 self.node_stderr(node_index)
             );
@@ -3500,11 +5031,31 @@ impl Fleet {
         self.all_lifecycle_metrics_by(Instant::now() + CHILD_TIMEOUT)
     }
 
+    fn all_consensus_diagnostics(
+        &mut self,
+    ) -> Vec<opc_session_store::ConsensusStoreDiagnosticSnapshot> {
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        for node in &mut self.nodes {
+            node.send(&QualificationNodeCommand::ConsensusDiagnostics);
+        }
+        self.nodes
+            .iter_mut()
+            .map(|node| match node.receive_until(deadline) {
+                QualificationNodeReply::ConsensusDiagnostics { metrics } => metrics,
+                reply => panic!("unexpected consensus diagnostics response: {reply:?}"),
+            })
+            .collect()
+    }
+
     fn all_lifecycle_metrics_by(
         &mut self,
         deadline: Instant,
     ) -> Vec<QualificationConnectionLifecycleMetrics> {
         for node in &mut self.nodes {
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "lifecycle metrics command would start after its absolute deadline"
+            );
             node.send(&QualificationNodeCommand::LifecycleMetrics);
         }
         self.nodes
@@ -3564,8 +5115,12 @@ impl Fleet {
         let observed_at = Instant::now();
         let mut stable_since = observed_at;
         let mut server_tail_entered = observed_at >= server_tail_deadline;
-        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
 
+        // The caller has just established all-voter readiness, and the next
+        // recovered-member phase establishes it again after this clean
+        // baseline. Do not issue readiness probes inside this interval: a
+        // probe uses the same authenticated consensus lanes whose terminal
+        // outcomes this loop is required to account for.
         loop {
             let traffic = self.traffic_status_snapshots_on_by(
                 &participants.observers,
@@ -3631,9 +5186,7 @@ impl Fleet {
             );
             assert!(
                 traffic_observed_at.duration_since(traffic_progress.coverage_observed_at)
-                    <= Duration::from_millis(
-                        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
-                    ),
+                    <= Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,),
                 "survivor traffic snapshot crossed its all-active-key coverage deadline during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
                 traffic_observed_at.duration_since(traffic_progress.coverage_observed_at),
                 self.stderr_diagnostics()
@@ -3644,29 +5197,6 @@ impl Fleet {
             if traffic_coverage_progressed {
                 traffic_progress.record_coverage(traffic.clone(), traffic_observed_at);
             }
-
-            let member_count = self.member_count();
-            let required_quorum = self.required_quorum();
-            let readiness_deadline = self.recovery_readiness_probe_deadline(
-                traffic_before,
-                &mut traffic_progress,
-                participants,
-                phase,
-                deadline,
-            );
-            let readiness = self.readiness_reports_by(&node_indices, readiness_deadline);
-            assert!(
-                readiness.iter().all(|report| {
-                    report.ready
-                        && report.reason_code == QualificationReadinessCode::Ready
-                        && report.configured_voters == member_count
-                        && report.fresh_reachable_voters == required_quorum
-                        && report.agreeing_voters == required_quorum
-                        && report.required_quorum == required_quorum
-                }),
-                "fleet readiness regressed while flushing fault-era connection outcomes: phase={phase}, readiness={readiness:?}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
 
             lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
             for (node_index, (fault_before, current)) in before.iter().zip(&lifecycle).enumerate() {
@@ -3711,9 +5241,7 @@ impl Fleet {
             );
             assert!(
                 now.duration_since(traffic_progress.coverage_observed_at)
-                    <= Duration::from_millis(
-                        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
-                    ),
+                    <= Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,),
                 "survivor traffic stopped covering every active key during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
                 now.duration_since(traffic_progress.coverage_observed_at),
                 self.stderr_diagnostics()
@@ -3744,7 +5272,7 @@ impl Fleet {
             }
             assert!(
                 deadline_allows_completion(now, deadline),
-                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, readiness={readiness:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
                 now.duration_since(started),
                 self.stderr_diagnostics()
             );
@@ -3860,6 +5388,10 @@ impl Fleet {
         )
         .expect("valid bounded traffic status participants");
         for node_index in node_indices {
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "traffic status command would start after its absolute deadline: node={node_index}"
+            );
             self.nodes[*node_index].send(&QualificationNodeCommand::TrafficStatus);
         }
         node_indices
@@ -3882,10 +5414,6 @@ impl Fleet {
                 }
             })
             .collect()
-    }
-
-    fn traffic_status_snapshots_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
-        self.traffic_status_snapshots_on_by(node_indices, Instant::now() + CHILD_TIMEOUT)
     }
 
     fn traffic_status_snapshots_on_by(
@@ -4073,10 +5601,11 @@ impl Fleet {
             availability_baseline,
             participants,
         ));
-        assert!(subset_traffic_availability_is_settled(
-            availability_baseline,
-            participants,
-        ));
+        assert!(
+            subset_traffic_availability_is_settled(availability_baseline, participants),
+            "recovered-member continuity requires a settled availability baseline: phase={phase}, baseline={availability_baseline:?}, stderr={:?}",
+            self.stderr_diagnostics()
+        );
         assert!(traffic_status_snapshot_matches(
             &progress.pulse_checkpoint,
             participants,
@@ -4086,10 +5615,17 @@ impl Fleet {
             participants,
         ));
         loop {
-            let traffic = self.traffic_status_snapshots_on_by(
-                &participants.observers,
-                progress.next_deadline(absolute_deadline),
+            let observation_deadline = progress.next_deadline(absolute_deadline);
+            let observation_started = Instant::now();
+            assert!(
+                observation_started < observation_deadline,
+                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                progress.pulse_checkpoint,
+                progress.coverage_checkpoint,
+                self.stderr_diagnostics()
             );
+            let traffic =
+                self.traffic_status_snapshots_on_by(&participants.observers, observation_deadline);
             let traffic_observed_at = Instant::now();
             for indexed in &traffic {
                 assert_ne!(
@@ -4215,6 +5751,42 @@ impl Fleet {
         }
     }
 
+    fn recovery_traffic_command_deadline(
+        &mut self,
+        availability_baseline: &[IndexedTrafficStatus],
+        progress: &mut RecoveryTrafficProgressTracker,
+        participants: &TrafficParticipants,
+        phase: &str,
+        absolute_deadline: Instant,
+    ) -> Instant {
+        loop {
+            let now = Instant::now();
+            assert!(
+                deadline_admits_complete_operation(now, absolute_deadline),
+                "recovered-member command exhausted its absolute operation budget: phase={phase}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            match recovery_traffic_command_plan(now, progress.next_deadline(absolute_deadline)) {
+                RecoveryTrafficCommandPlan::DispatchBy(command_deadline) => {
+                    return command_deadline;
+                }
+                RecoveryTrafficCommandPlan::RefreshProgress => {
+                    // This is one common passive observation for the entire
+                    // survivor-origin wave. It refreshes both rolling
+                    // checkpoints before any command can consume the status
+                    // observation headroom reserved above.
+                    self.wait_for_recovery_traffic_progress(
+                        availability_baseline,
+                        progress,
+                        participants,
+                        phase,
+                        absolute_deadline,
+                    );
+                }
+            }
+        }
+    }
+
     fn wait_for_recovery_readiness(
         &mut self,
         availability_baseline: &[IndexedTrafficStatus],
@@ -4335,12 +5907,12 @@ impl Fleet {
             participants,
         ));
         loop {
-            let traffic = self.traffic_statuses_on(&participants.observers);
+            let traffic = self.traffic_statuses_on_by(&participants.observers, deadline);
             // TrafficStatus performs a protected backend observation and may
             // exercise consensus transport. Sample lifecycle only after those
             // calls so a drain or classified failure they trigger cannot be
             // hidden behind a stale pre-status snapshot.
-            let lifecycle = self.all_lifecycle_metrics();
+            let lifecycle = self.all_lifecycle_metrics_by(deadline);
             for indexed in &traffic {
                 assert_ne!(
                     indexed.status.state,
@@ -4392,7 +5964,11 @@ impl Fleet {
                 "recovered-member lifecycle or survivor availability remained unsettled: phase={phase}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
-            thread::sleep(Duration::from_millis(20));
+            assert!(
+                sleep_until_deadline(deadline, Duration::from_millis(20)),
+                "recovered-member lifecycle retry exhausted its absolute deadline: phase={phase}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
         }
     }
 
@@ -5142,16 +6718,98 @@ impl Fleet {
         absolute_deadline: Instant,
     ) {
         assert!(member < self.member_count());
-        let generations_before = self
-            .all_reauthentication_generations_by(traffic_progress.next_deadline(absolute_deadline));
-        let paths = member_incident_directed_paths(self.member_count(), member);
+        let generation_deadline = self.recovery_traffic_command_deadline(
+            availability_baseline,
+            traffic_progress,
+            participants,
+            "existing-generation-before-survivor-origin-wave",
+            absolute_deadline,
+        );
+        let generations_before = self.all_reauthentication_generations_by(generation_deadline);
+        let paths = member_recovery_directed_paths(self.member_count(), member);
         assert_eq!(paths.len(), 2 * (self.member_count() - 1));
-        for (source, target) in paths {
-            let progress_deadline = traffic_progress.next_deadline(absolute_deadline);
+        let mut survivor_pending = (0..self.member_count())
+            .map(|source| source != member)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            survivor_pending.iter().filter(|pending| **pending).count(),
+            self.member_count() - 1,
+            "the survivor-origin recovery wave has one distinct pending command per survivor"
+        );
+        while survivor_pending.iter().any(|pending| *pending) {
+            let wave_deadline = self.recovery_traffic_command_deadline(
+                availability_baseline,
+                traffic_progress,
+                participants,
+                "existing-generation-survivor-origin-wave",
+                absolute_deadline,
+            );
+            let mut replies =
+                Vec::with_capacity(survivor_pending.iter().filter(|pending| **pending).count());
+            for_each_pending_command_in_wave(&survivor_pending, |source, stage| match stage {
+                PendingCommandWaveStage::Dispatch => {
+                    self.nodes[source].send(&QualificationNodeCommand::DirectedHandshake {
+                        remote_node_index: member,
+                    });
+                }
+                PendingCommandWaveStage::Collect => {
+                    replies.push((source, self.nodes[source].receive_until(wave_deadline)));
+                }
+            });
+            for (source, reply) in replies {
+                match reply {
+                    QualificationNodeReply::DirectedHandshake {
+                        remote_node_index,
+                        reauthentication_generation,
+                    } => {
+                        assert_eq!(remote_node_index, member);
+                        assert_eq!(reauthentication_generation, generations_before[source]);
+                        survivor_pending[source] = false;
+                    }
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
+                    } if deadline_allows_completion(Instant::now(), wave_deadline) => {}
+                    reply => panic!(
+                        "survivor-origin existing-generation handshake {source}->{member} failed: {reply:?}, source_stderr={}, target_stderr={}",
+                        self.node_stderr(source),
+                        self.node_stderr(member)
+                    ),
+                }
+            }
+            if survivor_pending.iter().any(|pending| *pending) {
+                assert!(
+                    deadline_allows_completion(Instant::now(), wave_deadline),
+                    "survivor-origin recovery wave crossed its operation boundary: member={member}, pending={survivor_pending:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // The survivor-origin commands all run in one bounded pending-command
+        // wave before this common passive workload pulse. In particular, no
+        // early survivor retry or pulse can head-of-line block another
+        // survivor's first command while its remote-retirement gate is live.
+        self.wait_for_recovery_traffic_progress(
+            availability_baseline,
+            traffic_progress,
+            participants,
+            "existing-generation-survivor-origin-wave",
+            absolute_deadline,
+        );
+        // Recovered-origin paths use the recovered process's one command lane
+        // and remain sequential, with their existing bounded passive pulses.
+        for target in (0..self.member_count()).filter(|target| *target != member) {
+            let progress_deadline = self.recovery_traffic_command_deadline(
+                availability_baseline,
+                traffic_progress,
+                participants,
+                "existing-generation-incident-path",
+                absolute_deadline,
+            );
             self.wait_for_directed_handshake_by(
-                source,
+                member,
                 target,
-                generations_before[source],
+                generations_before[member],
                 progress_deadline,
             );
             self.wait_for_recovery_traffic_progress(
@@ -5162,8 +6820,14 @@ impl Fleet {
                 absolute_deadline,
             );
         }
-        let generations_after = self
-            .all_reauthentication_generations_by(traffic_progress.next_deadline(absolute_deadline));
+        let generation_deadline = self.recovery_traffic_command_deadline(
+            availability_baseline,
+            traffic_progress,
+            participants,
+            "existing-generation-after-survivor-origin-wave",
+            absolute_deadline,
+        );
+        let generations_after = self.all_reauthentication_generations_by(generation_deadline);
         assert_eq!(
             generations_after, generations_before,
             "fault-boundary path proof advanced an explicit reauthentication generation"
@@ -5194,7 +6858,7 @@ impl Fleet {
             "recovered-member reauthentication generation did not advance exactly once"
         );
 
-        for (source, target) in member_incident_directed_paths(self.member_count(), member) {
+        for (source, target) in member_recovery_directed_paths(self.member_count(), member) {
             let expected_generation = if source == member {
                 member_generation
             } else {
@@ -5235,13 +6899,6 @@ impl Fleet {
         } = context;
         assert!(!participants.observers.contains(&member));
         self.assert_all_material_ready_by(traffic_progress.next_deadline(recovery_deadline));
-        self.wait_for_recovery_traffic_progress(
-            traffic_availability_baseline,
-            &mut traffic_progress,
-            participants,
-            "replacement-material-ready",
-            recovery_deadline,
-        );
         self.prove_recovered_member_paths_at_current_generation(
             member,
             traffic_availability_baseline,
@@ -5271,6 +6928,7 @@ impl Fleet {
             "replacement-canary-verification",
             recovery_deadline,
         );
+        let readiness_probe_commands_before_settlement = self.readiness_probe_commands;
         let (lifecycle_before, clean_traffic_baseline) = self
             .wait_for_recovery_fault_outcomes_to_settle(RecoveryFaultSettlementContext {
                 before: fault_lifecycle_before,
@@ -5281,6 +6939,10 @@ impl Fleet {
                 traffic_before: traffic_availability_baseline,
                 traffic_progress,
             });
+        assert_eq!(
+            self.readiness_probe_commands, readiness_probe_commands_before_settlement,
+            "fault-outcome settlement must not issue readiness commands through the lanes whose outcomes it measures"
+        );
         let started = Instant::now();
         let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
         self.reauthenticate_recovered_member_and_prove_paths(member);
@@ -5382,9 +7044,16 @@ impl Fleet {
         deadline: Instant,
     ) {
         loop {
-            match self.nodes[source].invoke(&QualificationNodeCommand::DirectedHandshake {
-                remote_node_index: target,
-            }) {
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "directed current-generation handshake {source}->{target} would start after its absolute deadline"
+            );
+            match self.nodes[source].invoke_until(
+                &QualificationNodeCommand::DirectedHandshake {
+                    remote_node_index: target,
+                },
+                deadline,
+            ) {
                 QualificationNodeReply::DirectedHandshake {
                     remote_node_index,
                     reauthentication_generation,
@@ -5400,7 +7069,10 @@ impl Fleet {
                 QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
                 } if deadline_allows_completion(Instant::now(), deadline) => {
-                    thread::sleep(Duration::from_millis(20));
+                    assert!(
+                        sleep_until_deadline(deadline, Duration::from_millis(20)),
+                        "directed current-generation handshake {source}->{target} retry exhausted its absolute deadline"
+                    );
                 }
                 reply => panic!(
                     "directed current-generation handshake {source}->{target} failed: {reply:?}, source_stderr={}, target_stderr={}",
@@ -5656,10 +7328,8 @@ impl Fleet {
             assert!(
                 matches!(
                     outcome,
-                    Err(
-                        SessionConsensusPeerError::Authentication
-                            | SessionConsensusPeerError::Timeout
-                    )
+                    Err(SessionConsensusPeerError::Authentication
+                        | SessionConsensusPeerError::Unavailable)
                 ),
                 "new-only server trust must reject removed old-root client chain: source={source}, target={target}, outcome={outcome:?}"
             );
@@ -5935,9 +7605,11 @@ impl Fleet {
     }
 
     fn shutdown(&mut self) {
+        self.verify_snapshot_namespace();
         for node in &mut self.nodes {
             node.shutdown();
         }
+        self.verify_snapshot_namespace();
     }
 
     fn assert_plaintext_canaries_absent_from_sqlite(&self) {
@@ -6346,89 +8018,358 @@ fn candidate_git_output(
     arguments: &[&str],
     maximum_bytes: u64,
 ) -> io::Result<Vec<u8>> {
-    let mut child = Command::new("git")
+    // Qualification provenance never resolves a caller-controlled `git` from
+    // PATH or inherits Git configuration/environment overrides.
+    let mut command = Command::new("/usr/bin/git");
+    command
         .args(arguments)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/nonexistent")
+        .env("XDG_CONFIG_HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
-        .current_dir(repository)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("candidate source stdout is unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("candidate source stderr is unavailable"))?;
-    let stderr_reader = match thread::Builder::new()
-        .name("candidate-git-stderr".to_owned())
-        .spawn(move || drain_candidate_git_stderr(stderr))
-    {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    let stdout_result = read_bounded_stream(stdout, maximum_bytes);
-    if stdout_result.is_err() {
-        let _ = child.kill();
-    }
-    let status = match child.wait() {
-        Ok(status) => Ok(status),
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(error)
-        }
-    };
-    let stderr_clean = stderr_reader
-        .join()
-        .map_err(|_| io::Error::other("candidate source stderr reader panicked"))??;
-    let status = status?;
-    let stdout = stdout_result?;
-    if !status.success() || !stderr_clean {
+        .current_dir(repository);
+    let output = bounded_candidate_git_command_output(&mut command, maximum_bytes)?;
+    if !output.status.success() || !output.stderr.is_empty() {
         return Err(io::Error::other("candidate source state is unavailable"));
     }
-    Ok(stdout)
+    Ok(output.stdout)
 }
 
-fn read_bounded_stream<R: Read>(mut reader: R, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+const CANDIDATE_GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CANDIDATE_GIT_TERMINATE_GRACE: Duration = Duration::from_millis(250);
+const CANDIDATE_GIT_PIPE_POLL: Duration = Duration::from_millis(5);
+const MAX_CANDIDATE_GIT_STDERR_BYTES: u64 = 8 * 1024;
+const LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR: i32 = 26;
+
+struct BoundedCandidateGitOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+struct CandidateGitPipeReader {
+    reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
+}
+
+impl CandidateGitPipeReader {
+    fn is_finished(&self) -> bool {
+        self.reader.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    fn join_finished(&mut self) -> io::Result<Vec<u8>> {
+        let reader = self
+            .reader
+            .take()
+            .ok_or_else(|| io::Error::other("candidate Git pipe reader is unavailable"))?;
+        reader
+            .join()
+            .map_err(|_| io::Error::other("candidate Git pipe reader panicked"))?
+    }
+}
+
+fn bounded_candidate_git_command_output(
+    command: &mut Command,
+    maximum_stdout_bytes: u64,
+) -> io::Result<BoundedCandidateGitOutput> {
+    let deadline = Instant::now() + CANDIDATE_GIT_COMMAND_TIMEOUT;
+    // This creates a fresh process group before exec whose PGID is exactly
+    // the child PID; only that freshly-created group is ever signalled below.
+    command.process_group(0);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.raw_os_error() == Some(LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR)
+                    && Instant::now() < deadline =>
+            {
+                // GitHub-hosted storage can transiently retain an external
+                // writable reference to a newly published executable. Retry
+                // only Linux ETXTBSY and charge every retry to the existing
+                // complete command budget; every other spawn error remains
+                // immediately fail-closed.
+                thread::sleep(
+                    CANDIDATE_GIT_PIPE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let process_group = rustix::process::Pid::from_child(&child);
+    let stop_readers = Arc::new(AtomicBool::new(false));
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_candidate_git_process_group(
+                &mut child,
+                process_group,
+                &stop_readers,
+                &mut [],
+            )
+            .map_err(|_| io::Error::other("candidate Git fail-closed cleanup failed"))?;
+            return Err(io::Error::other("candidate Git stdout is unavailable"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_candidate_git_process_group(
+                &mut child,
+                process_group,
+                &stop_readers,
+                &mut [],
+            )
+            .map_err(|_| io::Error::other("candidate Git fail-closed cleanup failed"))?;
+            return Err(io::Error::other("candidate Git stderr is unavailable"));
+        }
+    };
+    if let Err(error) = configure_candidate_git_pipe_nonblocking(&stdout)
+        .and_then(|()| configure_candidate_git_pipe_nonblocking(&stderr))
+    {
+        terminate_candidate_git_process_group(&mut child, process_group, &stop_readers, &mut [])
+            .map_err(|_| io::Error::other("candidate Git fail-closed cleanup failed"))?;
+        return Err(error);
+    }
+    let mut readers = match (
+        spawn_bounded_candidate_git_pipe_reader(
+            "candidate-git-stdout",
+            stdout,
+            maximum_stdout_bytes,
+            Arc::clone(&stop_readers),
+        ),
+        spawn_bounded_candidate_git_pipe_reader(
+            "candidate-git-stderr",
+            stderr,
+            MAX_CANDIDATE_GIT_STDERR_BYTES,
+            Arc::clone(&stop_readers),
+        ),
+    ) {
+        (Ok(stdout), Ok(stderr)) => [stdout, stderr],
+        (stdout, stderr) => {
+            let mut started = [stdout.ok(), stderr.ok()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            terminate_candidate_git_process_group(
+                &mut child,
+                process_group,
+                &stop_readers,
+                &mut started,
+            )
+            .map_err(|_| io::Error::other("candidate Git fail-closed cleanup failed"))?;
+            return Err(io::Error::other("start bounded candidate Git pipe reader"));
+        }
+    };
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        if status.is_none() {
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    return candidate_git_fail_closed(
+                        &mut child,
+                        process_group,
+                        &stop_readers,
+                        &mut readers,
+                        "poll candidate Git command",
+                    );
+                }
+            };
+        }
+        if stdout.is_none() && readers[0].is_finished() {
+            stdout = match readers[0].join_finished() {
+                Ok(stdout) => Some(stdout),
+                Err(_) => {
+                    return candidate_git_fail_closed(
+                        &mut child,
+                        process_group,
+                        &stop_readers,
+                        &mut readers,
+                        "read bounded candidate Git stdout",
+                    );
+                }
+            };
+        }
+        if stderr.is_none() && readers[1].is_finished() {
+            stderr = match readers[1].join_finished() {
+                Ok(stderr) => Some(stderr),
+                Err(_) => {
+                    return candidate_git_fail_closed(
+                        &mut child,
+                        process_group,
+                        &stop_readers,
+                        &mut readers,
+                        "read bounded candidate Git stderr",
+                    );
+                }
+            };
+        }
+        // Do not take an early-completed pipe value while the other pipe or
+        // the leader is still pending: doing so would discard valid output
+        // and turn an ordinary asymmetric close into a deadline failure.
+        if let (Some(status), Some(stdout), Some(stderr)) = (&status, &stdout, &stderr) {
+            return Ok(BoundedCandidateGitOutput {
+                status: *status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            });
+        }
+        if Instant::now() >= deadline {
+            return candidate_git_fail_closed(
+                &mut child,
+                process_group,
+                &stop_readers,
+                &mut readers,
+                "candidate Git command exceeded fixed runtime",
+            );
+        }
+        thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+    }
+}
+
+fn candidate_git_fail_closed(
+    child: &mut Child,
+    process_group: rustix::process::Pid,
+    stop_readers: &AtomicBool,
+    readers: &mut [CandidateGitPipeReader],
+    failure: &'static str,
+) -> io::Result<BoundedCandidateGitOutput> {
+    terminate_candidate_git_process_group(child, process_group, stop_readers, readers)
+        .map_err(|_| io::Error::other("candidate Git fail-closed cleanup failed"))?;
+    Err(io::Error::other(failure))
+}
+
+fn configure_candidate_git_pipe_nonblocking<R: AsFd>(pipe: &R) -> io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe)?;
+    Ok(rustix::fs::fcntl_setfl(
+        pipe,
+        flags | rustix::fs::OFlags::NONBLOCK,
+    )?)
+}
+
+fn spawn_bounded_candidate_git_pipe_reader<R>(
+    name: &str,
+    reader: R,
+    maximum_bytes: u64,
+    stop: Arc<AtomicBool>,
+) -> io::Result<CandidateGitPipeReader>
+where
+    R: Read + Send + 'static,
+{
+    let reader = thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || read_bounded_candidate_git_pipe(reader, maximum_bytes, stop))?;
+    Ok(CandidateGitPipeReader {
+        reader: Some(reader),
+    })
+}
+
+fn read_bounded_candidate_git_pipe<R: Read>(
+    mut reader: R,
+    maximum_bytes: u64,
+    stop: Arc<AtomicBool>,
+) -> io::Result<Vec<u8>> {
     let initial_capacity = usize::try_from(maximum_bytes.min(64 * 1024))
-        .map_err(|_| io::Error::other("candidate source size overflow"))?;
+        .map_err(|_| io::Error::other("candidate Git pipe size overflow"))?;
     let mut encoded = Vec::with_capacity(initial_capacity);
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(encoded);
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(encoded),
+            Ok(read) => {
+                total = total
+                    .checked_add(
+                        u64::try_from(read)
+                            .map_err(|_| io::Error::other("candidate Git pipe size overflow"))?,
+                    )
+                    .ok_or_else(|| io::Error::other("candidate Git pipe size overflow"))?;
+                if total > maximum_bytes {
+                    return Err(io::Error::other("candidate Git pipe exceeds its bound"));
+                }
+                encoded.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    return Err(io::Error::other(
+                        "candidate Git pipe remained open after termination",
+                    ));
+                }
+                thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+            }
+            Err(error) => return Err(error),
         }
-        total = total
-            .checked_add(
-                u64::try_from(read)
-                    .map_err(|_| io::Error::other("candidate source size overflow"))?,
-            )
-            .ok_or_else(|| io::Error::other("candidate source size overflow"))?;
-        if total > maximum_bytes {
-            return Err(io::Error::other("candidate source exceeds its bound"));
-        }
-        encoded.extend_from_slice(&buffer[..read]);
     }
 }
 
-fn drain_candidate_git_stderr<R: Read>(mut reader: R) -> io::Result<bool> {
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut empty = true;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(empty);
-        }
-        empty = false;
+fn signal_owned_candidate_git_process_group(
+    process_group: rustix::process::Pid,
+    signal: rustix::process::Signal,
+) -> io::Result<()> {
+    match rustix::process::kill_process_group(process_group, signal) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == 3 => Ok(()), // ESRCH: no owned survivor.
+        Err(error) => Err(error.into()),
     }
+}
+
+fn terminate_candidate_git_process_group(
+    child: &mut Child,
+    process_group: rustix::process::Pid,
+    stop_readers: &AtomicBool,
+    readers: &mut [CandidateGitPipeReader],
+) -> io::Result<()> {
+    signal_owned_candidate_git_process_group(process_group, rustix::process::Signal::TERM)?;
+    let terminate_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
+    while Instant::now() < terminate_deadline {
+        let _ = child.try_wait()?;
+        thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+    }
+    // Do not key the KILL decision on the leader: a leader may already have
+    // exited while a descendant still owns either pipe.
+    signal_owned_candidate_git_process_group(process_group, rustix::process::Signal::KILL)?;
+    let reap_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
+    while Instant::now() < reap_deadline {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+    }
+    if child.try_wait()?.is_none() {
+        return Err(io::Error::other(
+            "candidate Git leader did not reap after owned-group SIGKILL",
+        ));
+    }
+    stop_readers.store(true, Ordering::Release);
+    let readers_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
+    for reader in readers {
+        // A completed reader may already have been joined while reporting an
+        // overflow/error to the caller; there is nothing left to wait for.
+        if reader.reader.is_none() {
+            continue;
+        }
+        while !reader.is_finished() && Instant::now() < readers_deadline {
+            thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+        }
+        if !reader.is_finished() {
+            return Err(io::Error::other(
+                "candidate Git pipe reader did not finish after owned-group termination",
+            ));
+        }
+        let _ = reader.join_finished()?;
+    }
+    Ok(())
 }
 
 fn hash_candidate_source_part(hasher: &mut Sha256, label: &[u8], encoded: &[u8]) -> io::Result<()> {
@@ -6447,6 +8388,675 @@ fn candidate_source_provenance(
 ) -> io::Result<(String, SessionMtlsCandidateSourceTreeStatus, String)> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     candidate_source_provenance_at(&repository)
+}
+
+fn release_gate_provenance_at(repository: &Path) -> io::Result<ReleaseGateProvenance> {
+    let source_revision = candidate_git_text(repository, &["rev-parse", "HEAD"])?;
+    let source_tree = candidate_git_text(repository, &["rev-parse", "HEAD^{tree}"])?;
+    if source_revision.len() != 40
+        || source_tree.len() != 40
+        || !source_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !source_tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::other(
+            "release-gate source is not a committed Git head",
+        ));
+    }
+    release_gate_require_clean_source_at(repository)?;
+    let index_stages = candidate_git_output(
+        repository,
+        &["ls-files", "--cached", "--stage", "-z", "--"],
+        MAX_CANDIDATE_SOURCE_BYTES,
+    )?;
+    let mut source_hasher = Sha256::new();
+    source_hasher.update(b"opc-session-mtls-release-gate-source/v3\0");
+    source_hasher.update(source_revision.as_bytes());
+    source_hasher.update(b"\0");
+    source_hasher.update(source_tree.as_bytes());
+    source_hasher.update(b"\0");
+    source_hasher.update(index_stages);
+    let observed_cargo = release_gate_observed_cargo_argv()?;
+    if !release_gate_argv_is_canonical(&observed_cargo.argv) {
+        return Err(io::Error::other(
+            "release-gate Cargo invocation does not exactly match the canonical command",
+        ));
+    }
+    let mut command_hasher = Sha256::new();
+    command_hasher.update(b"opc-session-mtls-release-gate-observed-argv/v2\0");
+    hash_candidate_source_part(
+        &mut command_hasher,
+        b"cargo-executable",
+        observed_cargo.backing.as_os_str().as_encoded_bytes(),
+    )?;
+    hash_candidate_source_part(
+        &mut command_hasher,
+        b"cargo-executable-alias",
+        observed_cargo.alias.as_os_str().as_encoded_bytes(),
+    )?;
+    hash_candidate_source_part(
+        &mut command_hasher,
+        b"cargo-executable-sha256",
+        observed_cargo.backing_sha256.as_bytes(),
+    )?;
+    hash_candidate_source_part(
+        &mut command_hasher,
+        b"cargo-executable-mode",
+        &observed_cargo.backing_mode.to_be_bytes(),
+    )?;
+    for argument in &observed_cargo.argv {
+        hash_candidate_source_part(&mut command_hasher, b"argv", argument.as_bytes())?;
+    }
+    let cargo_lock =
+        read_bounded_candidate_file(&repository.join("Cargo.lock"), MAX_CANDIDATE_SOURCE_BYTES)?;
+    let mut cargo_lock_hasher = Sha256::new();
+    cargo_lock_hasher.update(b"opc-session-mtls-release-gate-cargo-lock/v1\0");
+    cargo_lock_hasher.update(cargo_lock);
+    let external_namespaces = v9_external_namespace_bindings()?;
+    Ok(ReleaseGateProvenance {
+        source_revision,
+        source_tree,
+        source_worktree_sha256: format!("sha256:{:x}", source_hasher.finalize()),
+        cargo_lock_sha256: format!("sha256:{:x}", cargo_lock_hasher.finalize()),
+        cargo_target_directory: external_namespaces.cargo_target_directory,
+        cargo_target_directory_sha256: external_namespaces.cargo_target_directory_sha256,
+        evidence_root_directory: external_namespaces.evidence_root_directory,
+        evidence_root_directory_sha256: external_namespaces.evidence_root_directory_sha256,
+        fs_verity_snapshot_root_directory: external_namespaces.fs_verity_snapshot_root_directory,
+        fs_verity_snapshot_root_directory_sha256: external_namespaces
+            .fs_verity_snapshot_root_directory_sha256,
+        fs_verity_snapshot_root_device: external_namespaces.fs_verity_snapshot_root_device,
+        fs_verity_snapshot_root_inode: external_namespaces.fs_verity_snapshot_root_inode,
+        pair_directory: external_namespaces.pair_directory,
+        pair_directory_sha256: external_namespaces.pair_directory_sha256,
+        command_argv_sha256: format!("sha256:{:x}", command_hasher.finalize()),
+        cargo_executable_alias: v9_canonical_path_string(
+            &observed_cargo.alias,
+            "release-gate Cargo executable alias",
+        )?,
+        cargo_executable: v9_canonical_path_string(
+            &observed_cargo.backing,
+            "release-gate Cargo executable backing",
+        )?,
+        cargo_executable_sha256: observed_cargo.backing_sha256,
+        cargo_executable_mode: observed_cargo.backing_mode,
+        canonical_cargo_argv: observed_cargo.argv,
+        cargo_profile: env!("OPC_SESSION_TESTKIT_CARGO_PROFILE_FAMILY").to_owned(),
+        opt_level: env!("OPC_SESSION_TESTKIT_CARGO_OPT_LEVEL").to_owned(),
+    })
+}
+
+fn release_gate_argv_is_canonical(observed_argv: &[String]) -> bool {
+    observed_argv
+        .iter()
+        .map(String::as_str)
+        .eq(RELEASE_GATE_EXPECTED_CARGO_ARGV.iter().copied())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseGateObservedCargo {
+    argv: Vec<String>,
+    /// Normalized absolute alias used as Cargo's `argv[0]`, retained for replay.
+    alias: PathBuf,
+    /// Canonical `/proc/<pid>/exe`, proved equal to the alias backing file.
+    backing: PathBuf,
+    backing_sha256: String,
+    backing_mode: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseGateCargoExecutableBinding {
+    alias: PathBuf,
+    backing: PathBuf,
+    backing_sha256: String,
+    backing_mode: u16,
+    backing_identity: ReleaseGateCargoBackingIdentity,
+}
+
+/// Identity and bounded attributes observed through the one nofollow Cargo
+/// backing descriptor.  These values are intentionally not evidence fields:
+/// they make pathname replacement during capture a hard failure rather than
+/// allowing a mode from one file to combine with bytes from another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReleaseGateCargoBackingIdentity {
+    device: u64,
+    inode: u64,
+    mode: u16,
+    size: u64,
+}
+
+fn release_gate_cargo_executable_matches(observed: &Path, backing: &Path) -> bool {
+    fs::canonicalize(observed).ok() == fs::canonicalize(backing).ok()
+}
+
+fn release_gate_cargo_backing_identity<Fd: AsFd>(
+    descriptor: Fd,
+) -> io::Result<ReleaseGateCargoBackingIdentity> {
+    let metadata = fstat(descriptor)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() {
+        return Err(io::Error::other(
+            "release-gate Cargo backing descriptor is not a regular file",
+        ));
+    }
+    let size = u64::try_from(metadata.st_size)
+        .map_err(|_| io::Error::other("release-gate Cargo backing size is invalid"))?;
+    if size > MAX_CANDIDATE_ARTIFACT_BYTES {
+        return Err(io::Error::other(
+            "release-gate Cargo backing exceeds the artifact bound",
+        ));
+    }
+    let mode = u16::try_from(Mode::from_raw_mode(metadata.st_mode).bits() & 0o7777)
+        .map_err(|_| io::Error::other("release-gate Cargo backing mode is out of range"))?;
+    if mode & 0o111 == 0 {
+        return Err(io::Error::other(
+            "release-gate Cargo backing is not executable",
+        ));
+    }
+    Ok(ReleaseGateCargoBackingIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino as u64,
+        mode,
+        size,
+    })
+}
+
+fn release_gate_cargo_path_matches_backing_descriptor(
+    path: &Path,
+    identity: ReleaseGateCargoBackingIdentity,
+    label: &str,
+) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.dev() != identity.device
+        || metadata.ino() != identity.inode
+    {
+        return Err(io::Error::other(format!(
+            "release-gate Cargo {label} no longer identifies the opened backing descriptor"
+        )));
+    }
+    Ok(())
+}
+
+fn release_gate_cargo_backing_sha256_from_descriptor(
+    file: &mut File,
+    identity: ReleaseGateCargoBackingIdentity,
+) -> io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut encoded = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut encoded)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(|_| io::Error::other("read overflow"))?)
+            .ok_or_else(|| io::Error::other("release-gate Cargo backing size overflow"))?;
+        if total > identity.size || total > MAX_CANDIDATE_ARTIFACT_BYTES {
+            return Err(io::Error::other(
+                "release-gate Cargo backing changed or exceeds its artifact bound",
+            ));
+        }
+        hasher.update(&encoded[..read]);
+    }
+    if total != identity.size {
+        return Err(io::Error::other(
+            "release-gate Cargo backing changed while its descriptor was hashed",
+        ));
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn release_gate_cargo_executable_binding_at(
+    alias: &Path,
+) -> io::Result<ReleaseGateCargoExecutableBinding> {
+    release_gate_cargo_executable_binding_at_with_before_hash(alias, |_| Ok(()))
+}
+
+/// The test-only seam proves that a pathname replacement after the descriptor
+/// is opened cannot combine an executable backing's mode with a replacement
+/// file's content digest. Production capture supplies a no-op hook.
+fn release_gate_cargo_executable_binding_at_with_before_hash<BeforeHash>(
+    alias: &Path,
+    before_hash: BeforeHash,
+) -> io::Result<ReleaseGateCargoExecutableBinding>
+where
+    BeforeHash: FnOnce(&Path) -> io::Result<()>,
+{
+    let alias = v9_canonical_path_string(alias, "release-gate Cargo executable alias")
+        .map(PathBuf::from)?;
+    let alias_metadata = fs::symlink_metadata(&alias)?;
+    if !alias_metadata.file_type().is_file() && !alias_metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "release-gate Cargo executable alias is not a file or symlink",
+        ));
+    }
+    let backing = fs::canonicalize(&alias)?;
+    let backing = v9_canonical_path_string(&backing, "release-gate Cargo executable backing")
+        .map(PathBuf::from)?;
+    let descriptor = open(
+        &backing,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let backing_identity = release_gate_cargo_backing_identity(&descriptor)?;
+    release_gate_cargo_path_matches_backing_descriptor(&alias, backing_identity, "alias")?;
+    release_gate_cargo_path_matches_backing_descriptor(&backing, backing_identity, "backing")?;
+    before_hash(&backing)?;
+    let mut file = File::from(descriptor);
+    let backing_sha256 =
+        release_gate_cargo_backing_sha256_from_descriptor(&mut file, backing_identity)?;
+    if release_gate_cargo_backing_identity(&file)? != backing_identity {
+        return Err(io::Error::other(
+            "release-gate Cargo backing descriptor changed while it was hashed",
+        ));
+    }
+    release_gate_cargo_path_matches_backing_descriptor(&alias, backing_identity, "alias")?;
+    release_gate_cargo_path_matches_backing_descriptor(&backing, backing_identity, "backing")?;
+    Ok(ReleaseGateCargoExecutableBinding {
+        alias,
+        backing,
+        backing_sha256,
+        backing_mode: backing_identity.mode,
+        backing_identity,
+    })
+}
+
+/// Resolve Cargo without erasing a symlink alias. The alias is the executable
+/// spelling that must be replayed; its canonical backing file is separately
+/// pinned so a rustup proxy cannot silently turn into a direct `rustup test`.
+fn release_gate_resolved_cargo_executable() -> io::Result<ReleaseGateCargoExecutableBinding> {
+    let configured = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let configured = PathBuf::from(configured);
+    let candidate = if configured.is_absolute() || configured.components().count() > 1 {
+        configured
+    } else {
+        env::var_os("PATH")
+            .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+            .into_iter()
+            .flatten()
+            .map(|directory| directory.join(&configured))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| io::Error::other("resolved Cargo executable is unavailable"))?
+    };
+    release_gate_cargo_executable_binding_at(&candidate)
+}
+
+#[test]
+fn release_gate_argv_requires_the_exact_observed_cargo_tail() {
+    let canonical = RELEASE_GATE_EXPECTED_CARGO_ARGV
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        RELEASE_GATE_EXPECTED_CARGO_ARGV,
+        opc_session_testkit::qualification::
+            SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_CARGO_ARGV,
+        "the V9 disclosure and producer's observed Cargo argv must remain one exact command"
+    );
+    assert!(release_gate_argv_is_canonical(&canonical));
+    let mut reordered = canonical.clone();
+    reordered.swap(1, 2);
+    assert!(!release_gate_argv_is_canonical(&reordered));
+    let mut missing = canonical.clone();
+    missing.pop();
+    assert!(!release_gate_argv_is_canonical(&missing));
+    let mut direct_binary = canonical;
+    direct_binary[0] = "qualification_mtls_multiprocess".to_owned();
+    assert!(!release_gate_argv_is_canonical(&direct_binary));
+}
+
+#[test]
+fn v9_reproduction_recipe_is_env_prefixed_shell_safe_and_exact() {
+    let recipe = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+            "/var/lib/opc testkit/target",
+            "/var/lib/opc testkit/evidence",
+            "/var/lib/opc testkit/fs-verity-snapshots",
+            "/usr/local/bin/cargo",
+        )
+        .expect("render canonical V9 reproduction command");
+    assert_eq!(
+        recipe,
+        "CARGO='/usr/local/bin/cargo' CARGO_TARGET_DIR='/var/lib/opc testkit/target' OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY='/var/lib/opc testkit/evidence' OPC_FS_VERITY_QUALIFICATION='required' OPC_FS_VERITY_SNAPSHOT_ROOT='/var/lib/opc testkit/fs-verity-snapshots' '/usr/local/bin/cargo' 'test' '--locked' '--release' '-p' 'opc-session-testkit' '--test' 'qualification_mtls_multiprocess' '--no-default-features' 'three_process_projected_mtls_persistent_v2_batch_release_gate' '--' '--ignored' '--exact' '--test-threads=1' '--nocapture'"
+    );
+    assert!(opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+            "/var/lib/opc/../target",
+            "/var/lib/opc/evidence",
+            "/var/lib/opc/fs-verity-snapshots",
+            "/usr/local/bin/cargo",
+        )
+        .is_none());
+    assert!(opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+            "/var/lib/opc\ntarget",
+            "/var/lib/opc/evidence",
+            "/var/lib/opc/fs-verity-snapshots",
+            "/usr/local/bin/cargo",
+        )
+        .is_none());
+}
+
+#[test]
+fn v9_reproduction_recipe_shell_round_trips_quoted_alias_and_namespaces() {
+    let workspace = tempfile::tempdir().expect("create shell-recipe workspace");
+    let marker = workspace.path().join("must-not-exist");
+    let injection = "'$(touch $RECIPE_MARKER);semicolon";
+    let target = workspace.path().join(format!("target{injection}"));
+    let root = workspace.path().join(format!("evidence{injection}"));
+    let snapshot_root = workspace.path().join(format!("snapshots{injection}"));
+    let backing = workspace.path().join("rustup-backing");
+    let alias = workspace.path().join(format!("cargo{injection}"));
+    let recorded = workspace.path().join("recorded-arguments");
+    fs::create_dir(&target).expect("create quoted target path");
+    fs::create_dir(&root).expect("create quoted evidence root");
+    fs::create_dir(&snapshot_root).expect("create quoted snapshot root");
+    fs::write(
+        &backing,
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$CARGO\" \"$CARGO_TARGET_DIR\" \"$OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY\" \"$OPC_FS_VERITY_QUALIFICATION\" \"$OPC_FS_VERITY_SNAPSHOT_ROOT\" \"$@\" > \"$RECIPE_RECORD\"\n",
+    )
+    .expect("write quoted Cargo backing script");
+    fs::set_permissions(&backing, Permissions::from_mode(0o700))
+        .expect("make quoted Cargo backing executable");
+    symlink(&backing, &alias).expect("create quoted Cargo alias symlink");
+
+    let alias = alias.to_str().expect("quoted alias UTF-8");
+    let target = target.to_str().expect("quoted target UTF-8");
+    let root = root.to_str().expect("quoted evidence root UTF-8");
+    let snapshot_root = snapshot_root.to_str().expect("quoted snapshot root UTF-8");
+    let recipe = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_reproduction_command(target, root, snapshot_root, alias)
+            .expect("render quoted V9 reproduction command");
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&recipe)
+        .env("RECIPE_MARKER", &marker)
+        .env("RECIPE_RECORD", &recorded)
+        .status()
+        .expect("execute V9 reproduction command through /bin/sh");
+    assert!(
+        status.success(),
+        "quoted V9 recipe must execute the alias once"
+    );
+    assert!(
+        !marker.exists(),
+        "the apostrophe/semicolon/command-substitution-like alias and paths must not execute a side effect"
+    );
+    let observed = String::from_utf8(fs::read(&recorded).expect("read shell argument record"))
+        .expect("shell record is UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let expected = std::iter::once(alias.to_owned())
+        .chain([
+            alias.to_owned(),
+            target.to_owned(),
+            root.to_owned(),
+            "required".to_owned(),
+            snapshot_root.to_owned(),
+        ])
+        .chain(
+            opc_session_testkit::qualification::
+                SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_CARGO_ARGV
+                .iter()
+                .skip(1)
+                .map(|argument| (*argument).to_owned()),
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed, expected,
+        "the recipe must execute the alias (not its backing) and round-trip argv[0], CARGO, all external namespace variables, and every Cargo argument exactly once"
+    );
+}
+
+#[test]
+fn release_gate_cargo_executable_rejects_a_fake_cargo_basename() {
+    let temporary = tempfile::tempdir().expect("temporary executable directory");
+    let actual = temporary.path().join("actual-cargo");
+    let fake_directory = temporary.path().join("fake");
+    fs::create_dir(&fake_directory).expect("fake executable directory");
+    let fake = fake_directory.join("cargo");
+    fs::write(&actual, b"actual cargo").expect("write actual executable");
+    fs::write(&fake, b"fake cargo").expect("write fake basename");
+    assert!(release_gate_cargo_executable_matches(&actual, &actual));
+    assert!(
+        !release_gate_cargo_executable_matches(&fake, &actual),
+        "a process merely named cargo cannot impersonate Cargo's resolved executable"
+    );
+}
+
+#[test]
+fn release_gate_cargo_alias_binds_spelling_backing_and_content() {
+    let temporary = tempfile::tempdir().expect("temporary Cargo alias directory");
+    let backing = temporary.path().join("rustup-backing");
+    let alias = temporary.path().join("cargo");
+    let fake_backing = temporary.path().join("fake-rustup-backing");
+    let fake_alias = temporary.path().join("fake-cargo");
+    fs::write(&backing, b"same Cargo proxy content").expect("write Cargo backing");
+    fs::set_permissions(&backing, Permissions::from_mode(0o755))
+        .expect("make Cargo backing executable");
+    symlink(&backing, &alias).expect("create Cargo alias symlink");
+    fs::write(&fake_backing, b"same Cargo proxy content").expect("write fake Cargo backing");
+    fs::set_permissions(&fake_backing, Permissions::from_mode(0o755))
+        .expect("make fake Cargo backing executable");
+    symlink(&fake_backing, &fake_alias).expect("create fake Cargo alias symlink");
+
+    let binding =
+        release_gate_cargo_executable_binding_at(&alias).expect("capture real Cargo alias binding");
+    let fake = release_gate_cargo_executable_binding_at(&fake_alias)
+        .expect("capture fake Cargo alias binding");
+    assert_eq!(
+        binding.alias, alias,
+        "the replay field retains the alias spelling instead of canonicalizing it away"
+    );
+    assert_eq!(
+        binding.backing,
+        fs::canonicalize(&backing).expect("canonical Cargo backing"),
+        "the alias's backing path is separately pinned"
+    );
+    assert_eq!(
+        binding.backing_sha256,
+        candidate_sha256_file(&binding.backing, MAX_CANDIDATE_ARTIFACT_BYTES)
+            .expect("hash canonical Cargo backing"),
+        "the backing content commitment is exact"
+    );
+    assert_eq!(binding.backing_mode, 0o755);
+    let backing_metadata = fs::metadata(&binding.backing).expect("read canonical Cargo backing");
+    assert_eq!(binding.backing_identity.device, backing_metadata.dev());
+    assert_eq!(binding.backing_identity.inode, backing_metadata.ino());
+    assert_eq!(binding.backing_identity.mode, 0o755);
+    assert_eq!(
+        binding.backing_identity.size,
+        u64::try_from(b"same Cargo proxy content".len()).expect("bounded Cargo fixture size")
+    );
+    assert_eq!(
+        binding.backing_sha256, fake.backing_sha256,
+        "the replacement regression also covers a same-content fake backing"
+    );
+    assert_ne!(binding.alias, fake.alias);
+    assert_ne!(binding.backing, fake.backing);
+    assert!(
+        !release_gate_cargo_executable_matches(&fake.backing, &binding.backing),
+        "a fake alias/backing pair cannot satisfy the captured Cargo identity"
+    );
+    fs::set_permissions(&backing, Permissions::from_mode(0o644))
+        .expect("remove execute bit from canonical Cargo backing");
+    assert!(
+        release_gate_cargo_executable_binding_at(&alias).is_err(),
+        "the canonical Cargo backing must retain an execute bit through evidence capture"
+    );
+}
+
+#[test]
+fn release_gate_cargo_binding_rejects_backing_replacement_between_mode_and_hash() {
+    let temporary = tempfile::tempdir().expect("temporary Cargo race directory");
+    let backing = temporary.path().join("rustup-backing");
+    let alias = temporary.path().join("cargo");
+    let non_executable_replacement = temporary.path().join("rustup-backing-replacement");
+    fs::write(&backing, b"executable Cargo backing A").expect("write executable Cargo backing");
+    fs::set_permissions(&backing, Permissions::from_mode(0o755))
+        .expect("make backing A executable");
+    fs::write(
+        &non_executable_replacement,
+        b"non-executable replacement backing B",
+    )
+    .expect("write non-executable replacement backing");
+    fs::set_permissions(&non_executable_replacement, Permissions::from_mode(0o644))
+        .expect("make backing B non-executable");
+    symlink(&backing, &alias).expect("create Cargo alias symlink");
+
+    let replacement_digest =
+        candidate_sha256_file(&non_executable_replacement, MAX_CANDIDATE_ARTIFACT_BYTES)
+            .expect("hash replacement backing B");
+    assert!(
+        release_gate_cargo_executable_binding_at_with_before_hash(&alias, |opened_backing| {
+            assert_eq!(opened_backing, backing.as_path());
+            fs::rename(&non_executable_replacement, opened_backing)
+        })
+        .is_err(),
+        "the opened executable backing A must never be recorded with replacement B's content or mode"
+    );
+    assert_eq!(
+        candidate_sha256_file(&backing, MAX_CANDIDATE_ARTIFACT_BYTES)
+            .expect("hash installed replacement backing B"),
+        replacement_digest,
+        "the deterministic race did replace the backing pathname after descriptor capture"
+    );
+    assert!(
+        release_gate_cargo_executable_binding_at(&alias).is_err(),
+        "a subsequent capture rejects the installed non-executable backing B"
+    );
+}
+
+/// Exact release-only cleanliness rule. This intentionally treats every
+/// untracked path (even ignored paths) and every dirty submodule as evidence
+/// poison; release runners must use a separately clean exact-HEAD worktree.
+fn release_gate_require_clean_source_at(repository: &Path) -> io::Result<()> {
+    let source_status = candidate_git_output(
+        repository,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+        ],
+        MAX_CANDIDATE_SOURCE_BYTES,
+    )?;
+    if !source_status.is_empty() {
+        return Err(io::Error::other(
+            "release-gate source tree is dirty; refuse evidence emission",
+        ));
+    }
+    let mut merge_head_command = Command::new("/usr/bin/git");
+    merge_head_command
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/nonexistent")
+        .env("XDG_CONFIG_HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .current_dir(repository);
+    let merge_head = bounded_candidate_git_command_output(&mut merge_head_command, 64)?;
+    if merge_head.status.code() != Some(1)
+        || !merge_head.stdout.is_empty()
+        || !merge_head.stderr.is_empty()
+    {
+        return Err(io::Error::other(
+            "release-gate source has an active or unreadable merge state",
+        ));
+    }
+    let submodules = candidate_git_output(
+        repository,
+        &["submodule", "status", "--recursive"],
+        MAX_CANDIDATE_SOURCE_BYTES,
+    )?;
+    if submodules
+        .split(|byte| *byte == b'\n')
+        .any(|line| matches!(line.first(), Some(b'-' | b'+' | b'U')))
+    {
+        return Err(io::Error::other(
+            "release-gate source has an absent, dirty, or conflicted submodule",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn release_gate_observed_cargo_argv() -> io::Result<ReleaseGateObservedCargo> {
+    let resolved_cargo = release_gate_resolved_cargo_executable()?;
+    let mut process_id = std::process::id();
+    for _ in 0..8 {
+        let proc_root = PathBuf::from(format!("/proc/{process_id}"));
+        let command = read_bounded_candidate_file(&proc_root.join("cmdline"), 16 * 1024)?;
+        let argv = command
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| {
+                std::str::from_utf8(argument)
+                    .map(str::to_owned)
+                    .map_err(|_| io::Error::other("release-gate observed argv is not UTF-8"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if argv.first().is_some_and(|program| {
+            Path::new(program)
+                .file_name()
+                .is_some_and(|name| name == "cargo")
+        }) {
+            let backing = fs::canonicalize(proc_root.join("exe"))?;
+            if !release_gate_cargo_executable_matches(&backing, &resolved_cargo.backing) {
+                return Err(io::Error::other(
+                    "release-gate Cargo parent executable does not match the resolved alias backing",
+                ));
+            }
+            if fs::canonicalize(&resolved_cargo.alias)? != resolved_cargo.backing {
+                return Err(io::Error::other(
+                    "release-gate Cargo alias no longer resolves to its captured backing",
+                ));
+            }
+            let mut normalized = argv;
+            normalized[0] = "cargo".to_owned();
+            return Ok(ReleaseGateObservedCargo {
+                argv: normalized,
+                alias: resolved_cargo.alias,
+                backing,
+                backing_sha256: resolved_cargo.backing_sha256,
+                backing_mode: resolved_cargo.backing_mode,
+            });
+        }
+        let status = read_bounded_candidate_file(&proc_root.join("status"), 16 * 1024)?;
+        let status = std::str::from_utf8(&status)
+            .map_err(|_| io::Error::other("release-gate proc status is not UTF-8"))?;
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:\t"))
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|parent| *parent != 0)
+            .ok_or_else(|| io::Error::other("release-gate Cargo parent is unavailable"))?;
+        process_id = parent;
+    }
+    Err(io::Error::other(
+        "release gate must be launched by the canonical Cargo command",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_gate_observed_cargo_argv() -> io::Result<ReleaseGateObservedCargo> {
+    Err(io::Error::other(
+        "release-gate Cargo argv observation is supported only on Linux",
+    ))
+}
+
+fn candidate_git_text(repository: &Path, arguments: &[&str]) -> io::Result<String> {
+    let output = candidate_git_output(repository, arguments, 128)?;
+    let value = std::str::from_utf8(&output)
+        .map_err(|_| io::Error::other("release-gate Git output is not UTF-8"))?
+        .trim_end();
+    Ok(value.to_owned())
 }
 
 fn write_private_candidate_file(path: &Path, encoded: &[u8]) -> io::Result<()> {
@@ -6639,6 +9249,844 @@ fn write_private_candidate_file_at<Fd: AsFd>(
     file.sync_all()
 }
 
+const V9_EXTERNAL_TEST_ID: &str = "three_process_projected_mtls_persistent_v2_batch_release_gate";
+
+fn v9_sha256(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// Recompute the opaque run identity from both canonical artifacts' shared
+/// release provenance. Keeping the V1 digest in this input makes a valid V9
+/// document non-transferable to another V1 release-gate result. The V4
+/// domain additionally binds a canonical V9 claims preimage, with the
+/// run-ID field replaced by a fixed digest placeholder to keep the contract
+/// noncircular.
+fn v9_pair_run_id(
+    v1: &SessionMtlsBatchReleaseGateEvidenceV1,
+    v1_canonical: &[u8],
+    provenance: &ReleaseGateProvenance,
+    v9: &SessionHaPersistentConsumerHeadEvidenceV9,
+) -> io::Result<String> {
+    let bindings = &v1.bindings;
+    let v9_schema_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_schema_sha256();
+    v9_pair_run_id_material(
+        provenance,
+        &[
+            bindings.evidence_schema_sha256.as_str(),
+            bindings.configuration_sha256.as_str(),
+            bindings.public_material_manifest_sha256.as_str(),
+            bindings.workload_schedule_sha256.as_str(),
+            bindings.child_sha256.as_str(),
+            bindings.harness_sha256.as_str(),
+        ],
+        &v9_schema_sha256,
+        &v9.invocation.argv_sha256,
+        v1_canonical,
+        &v9_pair_claims_preimage(v9)?,
+    )
+}
+
+/// Fixed valid digest used only in the run-ID preimage. Replacing the actual
+/// run ID before canonical encoding makes the V9 campaign claims themselves
+/// a strict input without hashing a value that is defined by the same hash.
+const V9_PAIR_RUN_ID_PREIMAGE_PLACEHOLDER: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+fn v9_pair_claims_preimage(v9: &SessionHaPersistentConsumerHeadEvidenceV9) -> io::Result<Vec<u8>> {
+    let mut preimage = v9.clone();
+    preimage.invocation.run_id_sha256 = V9_PAIR_RUN_ID_PREIMAGE_PLACEHOLDER.to_owned();
+    preimage
+        .to_canonical_json()
+        .map_err(|_| io::Error::other("V9 run identity claims preimage is invalid"))
+}
+
+/// Shared with focused regression tests so every run-ID input, including the
+/// disclosed external namespaces and runnable command, is independently
+/// exercised without manufacturing a long-running release-gate V1 artifact.
+fn v9_pair_run_id_material(
+    provenance: &ReleaseGateProvenance,
+    v1_binding_values: &[&str],
+    v9_schema_sha256: &str,
+    argv_sha256: &str,
+    v1_canonical: &[u8],
+    v9_claims_preimage: &[u8],
+) -> io::Result<String> {
+    if v1_binding_values.len() != 6 {
+        return Err(io::Error::other(
+            "V9 run identity requires the complete six-field V1 binding set",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc-session-ha-persistent-consumer-v9-pair-run/v4\0");
+    let fs_verity_snapshot_root_device = provenance.fs_verity_snapshot_root_device.to_string();
+    let fs_verity_snapshot_root_inode = provenance.fs_verity_snapshot_root_inode.to_string();
+    for value in [
+        provenance.source_revision.as_str(),
+        provenance.source_tree.as_str(),
+        provenance.source_worktree_sha256.as_str(),
+        provenance.cargo_lock_sha256.as_str(),
+        provenance.cargo_target_directory.as_str(),
+        provenance.cargo_target_directory_sha256.as_str(),
+        provenance.evidence_root_directory.as_str(),
+        provenance.evidence_root_directory_sha256.as_str(),
+        provenance.fs_verity_snapshot_root_directory.as_str(),
+        provenance.fs_verity_snapshot_root_directory_sha256.as_str(),
+        fs_verity_snapshot_root_device.as_str(),
+        fs_verity_snapshot_root_inode.as_str(),
+        provenance.pair_directory.as_str(),
+        provenance.pair_directory_sha256.as_str(),
+        provenance.command_argv_sha256.as_str(),
+        provenance.cargo_executable_alias.as_str(),
+        provenance.cargo_executable.as_str(),
+        provenance.cargo_executable_sha256.as_str(),
+        provenance.cargo_profile.as_str(),
+        provenance.opt_level.as_str(),
+    ] {
+        hash_candidate_source_part(&mut hasher, b"binding", value.as_bytes())?;
+    }
+    hash_candidate_source_part(
+        &mut hasher,
+        b"cargo-executable-mode",
+        &provenance.cargo_executable_mode.to_be_bytes(),
+    )?;
+    for value in v1_binding_values {
+        hash_candidate_source_part(&mut hasher, b"binding", value.as_bytes())?;
+    }
+    for value in [v9_schema_sha256, V9_EXTERNAL_TEST_ID, argv_sha256] {
+        hash_candidate_source_part(&mut hasher, b"binding", value.as_bytes())?;
+    }
+    for argument in &provenance.canonical_cargo_argv {
+        hash_candidate_source_part(&mut hasher, b"canonical-cargo-argv", argument.as_bytes())?;
+    }
+    let reproduction_command = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+            &provenance.cargo_target_directory,
+            &provenance.evidence_root_directory,
+            &provenance.fs_verity_snapshot_root_directory,
+            &provenance.cargo_executable_alias,
+        )
+        .ok_or_else(|| io::Error::other("V9 canonical reproduction command is invalid"))?;
+    hash_candidate_source_part(
+        &mut hasher,
+        b"reproduction-command",
+        reproduction_command.as_bytes(),
+    )?;
+    hash_candidate_source_part(&mut hasher, b"v1-canonical", v1_canonical)?;
+    hash_candidate_source_part(&mut hasher, b"v9-claims-preimage", v9_claims_preimage)?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn v1_v9_release_gate_process_generations_agree(
+    v1_resource_generation_count: usize,
+    v9_release_gate_process_generations: u8,
+) -> io::Result<()> {
+    let expected = u8::try_from(v1_resource_generation_count)
+        .map_err(|_| io::Error::other("V1 resource-generation count overflows V9"))?;
+    if v9_release_gate_process_generations != expected {
+        return Err(io::Error::other(
+            "V1/V9 release-gate process-generation count is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v1_v9_pair(
+    v1_canonical: &[u8],
+    v9_canonical: &[u8],
+    provenance: &ReleaseGateProvenance,
+) -> io::Result<()> {
+    let v1 = SessionMtlsBatchReleaseGateEvidenceV1::from_json(v1_canonical)
+        .map_err(|_| io::Error::other("V9 pair V1 artifact is not canonical"))?;
+    let v9 = SessionHaPersistentConsumerHeadEvidenceV9::from_json(v9_canonical)
+        .map_err(|_| io::Error::other("V9 pair artifact is not canonical"))?;
+    v1_v9_release_gate_process_generations_agree(
+        v1.resource_generations.len(),
+        v9.process_ledger.release_gate_process_generations,
+    )?;
+    let bindings = &v1.bindings;
+    if bindings.source_revision != provenance.source_revision
+        || bindings.source_tree != provenance.source_tree
+        || bindings.source_worktree_sha256 != provenance.source_worktree_sha256
+        || bindings.cargo_lock_sha256 != provenance.cargo_lock_sha256
+        || bindings.command_argv_sha256 != provenance.command_argv_sha256
+        || v1.cargo_profile != provenance.cargo_profile
+        || v1.opt_level != provenance.opt_level
+        || v9.provenance.source_revision != provenance.source_revision
+        || v9.provenance.source_tree != provenance.source_tree
+        || v9.provenance.source_worktree_sha256 != provenance.source_worktree_sha256
+        || !v9.qualification_complete
+        || v9.bindings.child_sha256 != bindings.child_sha256
+        || v9.bindings.harness_sha256 != bindings.harness_sha256
+        // This test executable is both the harness and the evidence-emitting
+        // executable; reject a V9 that tries to bind a different file.
+        || v9.bindings.executable_sha256 != bindings.harness_sha256
+        || v9.bindings.v9_schema_sha256
+            != opc_session_testkit::qualification::session_ha_persistent_consumer_head_evidence_v9_schema_sha256()
+        || v9.bindings.v1_canonical_sha256 != v9_sha256(v1_canonical)
+        || v9.bindings.cargo_target_directory != provenance.cargo_target_directory
+        || v9.bindings.cargo_target_directory_sha256 != provenance.cargo_target_directory_sha256
+        || v9.bindings.evidence_root_directory != provenance.evidence_root_directory
+        || v9.bindings.evidence_root_directory_sha256 != provenance.evidence_root_directory_sha256
+        || v9.bindings.fs_verity_snapshot_root_directory
+            != provenance.fs_verity_snapshot_root_directory
+        || v9.bindings.fs_verity_snapshot_root_directory_sha256
+            != provenance.fs_verity_snapshot_root_directory_sha256
+        || v9.bindings.fs_verity_snapshot_root_device
+            != provenance.fs_verity_snapshot_root_device
+        || v9.bindings.fs_verity_snapshot_root_inode
+            != provenance.fs_verity_snapshot_root_inode
+        || v9.bindings.pair_directory != provenance.pair_directory
+        || v9.bindings.pair_directory_sha256 != provenance.pair_directory_sha256
+        || v9.invocation.cargo_executable_alias != provenance.cargo_executable_alias
+        || v9.invocation.cargo_executable != provenance.cargo_executable
+        || v9.invocation.cargo_executable_sha256 != provenance.cargo_executable_sha256
+        || v9.invocation.cargo_executable_mode != provenance.cargo_executable_mode
+        || v9.invocation.canonical_cargo_argv != provenance.canonical_cargo_argv
+        || v9.invocation.reproduction_command
+            != opc_session_testkit::qualification::session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+                &provenance.cargo_target_directory,
+                &provenance.evidence_root_directory,
+                &provenance.fs_verity_snapshot_root_directory,
+                &provenance.cargo_executable_alias,
+            )
+            .ok_or_else(|| io::Error::other("V9 canonical reproduction command is invalid"))?
+    {
+        return Err(io::Error::other("V1/V9 release pair binding is inconsistent"));
+    }
+    let expected_run_id = v9_pair_run_id(&v1, v1_canonical, provenance, &v9)?;
+    if v9.invocation.run_id_sha256 != expected_run_id {
+        return Err(io::Error::other(
+            "V1/V9 release pair run identity is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn v9_require_runtime_digest(label: &str, expected: &str, actual: &str) -> io::Result<()> {
+    if expected != actual {
+        return Err(io::Error::other(format!(
+            "V9 {label} changed between campaign and publication"
+        )));
+    }
+    Ok(())
+}
+
+/// Re-read every mutable process-local binding immediately before evidence is
+/// made durable. This cannot eliminate a same-UID actor replacing a binary
+/// after this check and before `renameat`; nofollow descriptors, create-new,
+/// and the final source recheck reduce that residual to the caller's own UID.
+fn v9_verify_prepublication_bindings(
+    v1_canonical: &[u8],
+    v9_canonical: &[u8],
+    provenance: &ReleaseGateProvenance,
+) -> io::Result<()> {
+    let current_provenance = ReleaseGateProvenance::capture()?;
+    if &current_provenance != provenance {
+        return Err(io::Error::other(
+            "V9 release provenance changed before publication",
+        ));
+    }
+    validate_v1_v9_pair(v1_canonical, v9_canonical, &current_provenance)?;
+    let v1 = SessionMtlsBatchReleaseGateEvidenceV1::from_json(v1_canonical)
+        .map_err(|_| io::Error::other("V9 prepublication V1 artifact is not canonical"))?;
+    let v9 = SessionHaPersistentConsumerHeadEvidenceV9::from_json(v9_canonical)
+        .map_err(|_| io::Error::other("V9 prepublication artifact is not canonical"))?;
+    let child_sha256 = candidate_sha256_file(
+        Path::new(env!("CARGO_BIN_EXE_opc-session-quorum-node")),
+        MAX_CANDIDATE_ARTIFACT_BYTES,
+    )?;
+    let executable = env::current_exe()?;
+    let executable_sha256 = candidate_sha256_file(&executable, MAX_CANDIDATE_ARTIFACT_BYTES)?;
+    let argv_sha256 = v9_sha256(&fs::read("/proc/self/cmdline")?);
+    v9_require_runtime_digest("V1 child digest", &v1.bindings.child_sha256, &child_sha256)?;
+    v9_require_runtime_digest(
+        "V1 harness digest",
+        &v1.bindings.harness_sha256,
+        &executable_sha256,
+    )?;
+    v9_require_runtime_digest("V9 child digest", &v9.bindings.child_sha256, &child_sha256)?;
+    v9_require_runtime_digest(
+        "V9 harness digest",
+        &v9.bindings.harness_sha256,
+        &executable_sha256,
+    )?;
+    v9_require_runtime_digest(
+        "V9 executable digest",
+        &v9.bindings.executable_sha256,
+        &executable_sha256,
+    )?;
+    v9_require_runtime_digest("V9 argv digest", &v9.invocation.argv_sha256, &argv_sha256)?;
+    // `validate_v1_v9_pair` above recomputes both the canonical V1 digest and
+    // the V9 run identity from these just-recaptured bindings.
+    Ok(())
+}
+
+fn build_v9_external_evidence(
+    measurements: &PersistentConsumerRunMeasurements,
+    gate: &BatchReleaseGateRunFacts,
+) -> io::Result<(Vec<u8>, SessionHaPersistentConsumerHeadEvidenceV9)> {
+    let argv = fs::read("/proc/self/cmdline")?;
+    if !argv
+        .split(|byte| *byte == 0)
+        .any(|argument| argument == V9_EXTERNAL_TEST_ID.as_bytes())
+    {
+        return Err(io::Error::other(
+            "V9 requires the exact release-gate test invocation",
+        ));
+    }
+    if measurements.release_provenance.as_ref() != Some(&gate.release_provenance) {
+        return Err(io::Error::other(
+            "V9 requires one identical release provenance across both campaigns",
+        ));
+    }
+    gate.release_provenance.verify_unchanged()?;
+    let v1 = SessionMtlsBatchReleaseGateEvidenceV1::from_json(&gate.canonical_v1)
+        .map_err(|_| io::Error::other("V9 requires exact canonical V1 evidence"))?;
+    let source_revision = gate.release_provenance.source_revision.clone();
+    let source_tree = gate.release_provenance.source_tree.clone();
+    let source_worktree_sha256 = gate.release_provenance.source_worktree_sha256.clone();
+    let child = candidate_sha256_file(
+        Path::new(env!("CARGO_BIN_EXE_opc-session-quorum-node")),
+        MAX_CANDIDATE_ARTIFACT_BYTES,
+    )?;
+    let executable = env::current_exe()?;
+    let executable_sha256 = candidate_sha256_file(&executable, MAX_CANDIDATE_ARTIFACT_BYTES)?;
+    let harness_sha256 = executable_sha256.clone();
+    let lane = |name: &str,
+                transport_revision: u16,
+                consumer_alpn: &str,
+                observed: PersistentConsumerLaneMeasurements| {
+        QualificationPersistentConsumerLaneV9 {
+            lane: name.to_owned(),
+            transport_revision,
+            application_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.application_revision,
+            sdk_protocol_revision: 5,
+            consumer_alpn: consumer_alpn.to_owned(),
+            executed: observed.admission_operations > 0 && observed.status_operations > 0,
+            admission_operations: observed.admission_operations,
+            status_operations: observed.status_operations,
+            before_leader_loss_operations: observed.before_leader_loss_operations,
+            after_leader_loss_operations: observed.after_leader_loss_operations,
+            after_restart_operations: observed.after_restart_operations,
+            after_voter_loss_operations: observed.after_voter_loss_operations,
+            tenant_authority: QualificationPersistentConsumerAuthorityV9 {
+                positive_observations: observed.tenant_positive_observations,
+                negative_boundary_rejections: observed.tenant_negative_boundary_rejections,
+            },
+            scope_authority: QualificationPersistentConsumerAuthorityV9 {
+                positive_observations: observed.scope_positive_observations,
+                negative_boundary_rejections: observed.scope_negative_boundary_rejections,
+            },
+            fence_authority: QualificationPersistentConsumerAuthorityV9 {
+                positive_observations: observed.fence_positive_observations,
+                negative_boundary_rejections: observed.fence_negative_boundary_rejections,
+            },
+        }
+    };
+    let argv_sha256 = v9_sha256(&argv);
+    let mut evidence = SessionHaPersistentConsumerHeadEvidenceV9 {
+        schema_version: "opc-session-ha-persistent-consumer-head-evidence/v9".to_owned(),
+        evidence_kind: "persistent-consumer-executed-lanes".to_owned(),
+        experimental: true,
+        // Reached only after the combined ignored release gate has returned
+        // every process, authority, rotation, capacity, and V1 causal fact.
+        qualification_complete: true,
+        provenance: QualificationPersistentConsumerProvenanceV9 {
+            source_revision: source_revision.clone(),
+            source_tree,
+            source_tree_status: "clean".to_owned(),
+            source_worktree_sha256: source_worktree_sha256.clone(),
+        },
+        invocation: QualificationPersistentConsumerInvocationV9 {
+            test_id: V9_EXTERNAL_TEST_ID.to_owned(),
+            argv_sha256: argv_sha256.clone(),
+            run_id_sha256: V9_PAIR_RUN_ID_PREIMAGE_PLACEHOLDER.to_owned(),
+            cargo_executable_alias: gate.release_provenance.cargo_executable_alias.clone(),
+            cargo_executable: gate.release_provenance.cargo_executable.clone(),
+            cargo_executable_sha256: gate.release_provenance.cargo_executable_sha256.clone(),
+            cargo_executable_mode: gate.release_provenance.cargo_executable_mode,
+            canonical_cargo_argv: gate.release_provenance.canonical_cargo_argv.clone(),
+            reproduction_command: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+                    &gate.release_provenance.cargo_target_directory,
+                    &gate.release_provenance.evidence_root_directory,
+                    &gate.release_provenance.fs_verity_snapshot_root_directory,
+                    &gate.release_provenance.cargo_executable_alias,
+                )
+                .ok_or_else(|| io::Error::other("V9 canonical reproduction command is invalid"))?,
+        },
+        bindings: QualificationPersistentConsumerBindingsV9 {
+            v9_schema_sha256: opc_session_testkit::qualification::session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            harness_sha256,
+            child_sha256: child,
+            executable_sha256,
+            v1_canonical_sha256: v9_sha256(&gate.canonical_v1),
+            cargo_target_directory: gate.release_provenance.cargo_target_directory.clone(),
+            cargo_target_directory_sha256: gate
+                .release_provenance
+                .cargo_target_directory_sha256
+                .clone(),
+            evidence_root_directory: gate.release_provenance.evidence_root_directory.clone(),
+            evidence_root_directory_sha256: gate
+                .release_provenance
+                .evidence_root_directory_sha256
+                .clone(),
+            fs_verity_snapshot_root_directory: gate
+                .release_provenance
+                .fs_verity_snapshot_root_directory
+                .clone(),
+            fs_verity_snapshot_root_directory_sha256: gate
+                .release_provenance
+                .fs_verity_snapshot_root_directory_sha256
+                .clone(),
+            fs_verity_snapshot_root_device: gate
+                .release_provenance
+                .fs_verity_snapshot_root_device,
+            fs_verity_snapshot_root_inode: gate
+                .release_provenance
+                .fs_verity_snapshot_root_inode,
+            pair_directory: gate.release_provenance.pair_directory.clone(),
+            pair_directory_sha256: gate.release_provenance.pair_directory_sha256.clone(),
+        },
+        process_ledger: QualificationPersistentConsumerProcessLedgerV9 {
+            initial_processes: measurements.initial_processes,
+            unclean_process_losses: measurements.unclean_process_losses,
+            restarted_processes: measurements.restarted_processes,
+            observed_process_generations: measurements.observed_process_generations,
+            release_gate_process_generations: u8::try_from(gate.process_generations)
+                .map_err(|_| io::Error::other("V9 release process ledger overflow"))?,
+        },
+        release_gate: QualificationPersistentConsumerReleaseGateV9 {
+            credential_rotation_executed: gate.old_credential_rejected && gate.new_credential_rejected,
+            old_credential_rejected: gate.old_credential_rejected,
+            new_credential_rejected: gate.new_credential_rejected,
+            fixed_capacity_reclaimed: gate.capacity_reclaimed,
+            durable_status_cardinality: u8::try_from(gate.durable_status_cardinality)
+                .map_err(|_| io::Error::other("V9 durable-status cardinality overflow"))?,
+            post_outcome_unknown_mutation_dispatches: u8::try_from(
+                gate.post_outcome_unknown_mutation_dispatches,
+            )
+            .map_err(|_| io::Error::other("V9 mutation ledger overflow"))?,
+        },
+        lanes: [
+            lane(
+                "general",
+                SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                "opc-session-consumer/1",
+                measurements.general_lane,
+            ),
+            lane(
+                "protected_roster",
+                SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+                "opc-session-consumer/3",
+                measurements.protected_roster_lane,
+            ),
+        ],
+        members: 3,
+        authenticated_setup_successes: measurements.authenticated_setup_successes,
+        warm_reused_calls: measurements.warm_reused_calls,
+        fixed_labels_only: true,
+        identifying_values_recorded: false,
+    };
+    evidence.invocation.run_id_sha256 =
+        v9_pair_run_id(&v1, &gate.canonical_v1, &gate.release_provenance, &evidence)?;
+    let canonical = evidence
+        .to_canonical_json()
+        .map_err(|_| io::Error::other("V9 semantic validation failed"))?;
+    v9_verify_prepublication_bindings(&gate.canonical_v1, &canonical, &gate.release_provenance)?;
+    Ok((canonical, evidence))
+}
+
+fn v9_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn v9_open_private_external_root(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    if !root.is_absolute() {
+        return Err(io::Error::other(
+            "V9 external evidence root is not absolute",
+        ));
+    }
+    let mut directory = open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    for component in root.components() {
+        let Component::Normal(component) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(io::Error::other(
+                "V9 external evidence root is not normalized",
+            ));
+        };
+        directory = openat(
+            &directory,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+    }
+    let metadata = fstat(&directory)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_dir()
+        || Mode::from_raw_mode(metadata.st_mode).bits() & 0o7777 != 0o700
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(io::Error::other(
+            "V9 external evidence root is not an owner-private directory",
+        ));
+    }
+    Ok(directory)
+}
+
+fn v9_git_directory(repository: &Path, argument: &str) -> io::Result<PathBuf> {
+    let value = candidate_git_text(repository, &["rev-parse", argument])?;
+    let value = PathBuf::from(value);
+    let value = if value.is_absolute() {
+        value
+    } else {
+        repository.join(value)
+    };
+    fs::canonicalize(value)
+}
+
+/// Release evidence never infers Cargo's target directory from a repository
+/// default or Cargo configuration. The caller must name an existing canonical
+/// absolute target namespace so it can be fingerprinted and kept disjoint.
+fn v9_canonical_cargo_target_directory(value: Option<OsString>) -> io::Result<PathBuf> {
+    let target = value.ok_or_else(|| {
+        io::Error::other("V9 evidence requires an explicit absolute CARGO_TARGET_DIR")
+    })?;
+    let target = PathBuf::from(target);
+    if !target.is_absolute() {
+        return Err(io::Error::other("CARGO_TARGET_DIR is not absolute"));
+    }
+    fs::canonicalize(target)
+}
+
+fn v9_canonical_path_string(path: &Path, label: &str) -> io::Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| io::Error::other(format!("{label} is not UTF-8")))?
+        .to_owned();
+    if value.len() > 4096
+        || value.as_bytes().contains(&0)
+        || value.as_bytes().iter().any(u8::is_ascii_control)
+        || !Path::new(&value).is_absolute()
+        || Path::new(&value).as_os_str().as_encoded_bytes() != value.as_bytes()
+        || value.contains("//")
+        || (value != "/" && value.ends_with('/'))
+        || value
+            .split('/')
+            .skip(1)
+            .any(|component| matches!(component, "." | ".."))
+        || Path::new(&value)
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(io::Error::other(format!(
+            "{label} is not a canonical absolute path"
+        )));
+    }
+    Ok(value)
+}
+
+fn v9_canonical_evidence_root_directory(value: Option<OsString>) -> io::Result<PathBuf> {
+    let root = value.ok_or_else(|| {
+        io::Error::other("V9 evidence requires OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY")
+    })?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err(io::Error::other(
+            "OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY is not absolute",
+        ));
+    }
+    let root_fd = v9_open_private_external_root(&root)?;
+    let canonical = fs::canonicalize(format!("/proc/self/fd/{}", root_fd.as_raw_fd()))?;
+    if canonical != root {
+        return Err(io::Error::other(
+            "OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY is not canonical",
+        ));
+    }
+    v9_canonical_path_string(&canonical, "V9 external evidence root")?;
+    Ok(canonical)
+}
+
+struct V9FsVeritySnapshotRoot {
+    directory: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+fn v9_require_distinct_snapshot_filesystem(
+    target: &Path,
+    snapshot_root: &V9FsVeritySnapshotRoot,
+) -> io::Result<()> {
+    if fs::metadata(target)?.dev() == snapshot_root.device {
+        return Err(io::Error::other(
+            "V9 Cargo target must not share the fs-verity snapshot filesystem",
+        ));
+    }
+    Ok(())
+}
+
+fn v9_canonical_fs_verity_snapshot_root_directory(
+    value: Option<OsString>,
+) -> io::Result<V9FsVeritySnapshotRoot> {
+    if env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref() != Some(std::ffi::OsStr::new("required"))
+    {
+        return Err(io::Error::other(
+            "V9 fs-verity snapshots require the fixed qualification marker",
+        ));
+    }
+    let root = value
+        .ok_or_else(|| io::Error::other("V9 evidence requires OPC_FS_VERITY_SNAPSHOT_ROOT"))?;
+    let root_bytes = root.as_encoded_bytes().to_vec();
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err(io::Error::other(
+            "OPC_FS_VERITY_SNAPSHOT_ROOT is not absolute",
+        ));
+    }
+    let root_fd = v9_open_private_external_root(&root)?;
+    let identity = fstat(&root_fd)?;
+    let canonical = fs::canonicalize(format!("/proc/self/fd/{}", root_fd.as_raw_fd()))?;
+    if root_bytes != canonical.as_os_str().as_encoded_bytes() {
+        return Err(io::Error::other(
+            "OPC_FS_VERITY_SNAPSHOT_ROOT is not canonical",
+        ));
+    }
+    v9_canonical_path_string(&canonical, "V9 fs-verity snapshot root")?;
+    Ok(V9FsVeritySnapshotRoot {
+        directory: canonical,
+        device: identity.st_dev as u64,
+        inode: identity.st_ino as u64,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V9ExternalNamespaceBindings {
+    cargo_target_directory: String,
+    cargo_target_directory_sha256: String,
+    evidence_root_directory: String,
+    evidence_root_directory_sha256: String,
+    fs_verity_snapshot_root_directory: String,
+    fs_verity_snapshot_root_directory_sha256: String,
+    fs_verity_snapshot_root_device: u64,
+    fs_verity_snapshot_root_inode: u64,
+    pair_directory: String,
+    pair_directory_sha256: String,
+}
+
+/// Capture both operator-provisioned external namespaces before either
+/// campaign starts. The V9 envelope and its run identity carry these exact
+/// canonical strings, path commitments, and the snapshot-base device/inode,
+/// so a separate store consumer can distinguish a same-path replacement.
+fn v9_external_namespace_bindings() -> io::Result<V9ExternalNamespaceBindings> {
+    let repository = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+    let gitdir = v9_git_directory(&repository, "--absolute-git-dir")?;
+    let common_gitdir = v9_git_directory(&repository, "--git-common-dir")?;
+    let target = v9_canonical_cargo_target_directory(env::var_os("CARGO_TARGET_DIR"))?;
+    let root = v9_canonical_evidence_root_directory(env::var_os(
+        "OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY",
+    ))?;
+    let snapshot_root =
+        v9_canonical_fs_verity_snapshot_root_directory(env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV))?;
+    v9_require_distinct_snapshot_filesystem(&target, &snapshot_root)?;
+    v9_require_external_disjointness(
+        &target,
+        &[repository.clone(), gitdir.clone(), common_gitdir.clone()],
+    )?;
+    v9_require_external_disjointness(
+        &root,
+        &[
+            repository.clone(),
+            gitdir.clone(),
+            common_gitdir.clone(),
+            target.clone(),
+        ],
+    )?;
+    v9_require_external_disjointness(
+        &snapshot_root.directory,
+        &[
+            repository,
+            gitdir,
+            common_gitdir,
+            target.clone(),
+            root.clone(),
+        ],
+    )?;
+
+    let cargo_target_directory = v9_canonical_path_string(&target, "CARGO_TARGET_DIR")?;
+    let evidence_root_directory = v9_canonical_path_string(&root, "V9 external evidence root")?;
+    let fs_verity_snapshot_root_directory =
+        v9_canonical_path_string(&snapshot_root.directory, "V9 fs-verity snapshot root")?;
+    let pair_directory = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory(&evidence_root_directory)
+        .ok_or_else(|| io::Error::other("V9 pair directory cannot be derived from evidence root"))?;
+    let cargo_target_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_cargo_target_directory_sha256(
+            &cargo_target_directory,
+        )
+        .ok_or_else(|| io::Error::other("V9 Cargo target directory commitment is invalid"))?;
+    let evidence_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_evidence_root_directory_sha256(
+            &evidence_root_directory,
+        )
+        .ok_or_else(|| io::Error::other("V9 evidence root commitment is invalid"))?;
+    let fs_verity_snapshot_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+            &fs_verity_snapshot_root_directory,
+        )
+        .ok_or_else(|| io::Error::other("V9 fs-verity snapshot root commitment is invalid"))?;
+    let pair_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(&pair_directory)
+        .ok_or_else(|| io::Error::other("V9 pair directory commitment is invalid"))?;
+    Ok(V9ExternalNamespaceBindings {
+        cargo_target_directory,
+        cargo_target_directory_sha256,
+        evidence_root_directory,
+        evidence_root_directory_sha256,
+        fs_verity_snapshot_root_directory,
+        fs_verity_snapshot_root_directory_sha256,
+        fs_verity_snapshot_root_device: snapshot_root.device,
+        fs_verity_snapshot_root_inode: snapshot_root.inode,
+        pair_directory,
+        pair_directory_sha256,
+    })
+}
+
+fn v9_require_external_disjointness(root: &Path, protected: &[PathBuf]) -> io::Result<()> {
+    if protected
+        .iter()
+        .any(|protected| v9_paths_overlap(root, protected))
+    {
+        return Err(io::Error::other(
+            "V9 external evidence root overlaps source, git metadata, or Cargo target",
+        ));
+    }
+    Ok(())
+}
+
+/// Publish already-validated canonical pair bytes into one opened private
+/// namespace.  This seam lets the no-clobber/durability mechanics be tested
+/// without manufacturing a release-qualified source invocation.
+fn publish_v9_pair_files_at<Fd: AsFd>(root_fd: Fd, v1: &[u8], v9: &[u8]) -> io::Result<()> {
+    publish_v9_pair_files_at_with_directory_sync(root_fd, v1, v9, |directory| {
+        fsync(directory).map_err(Into::into)
+    })
+}
+
+fn publish_v9_pair_files_at_with_directory_sync<Fd: AsFd, SyncDirectory>(
+    root_fd: Fd,
+    v1: &[u8],
+    v9: &[u8],
+    sync_directory: SyncDirectory,
+) -> io::Result<()>
+where
+    SyncDirectory: FnOnce(&Fd) -> io::Result<()>,
+{
+    publish_v9_pair_files_at_with_pre_rename(root_fd, v1, v9, sync_directory, || Ok(()))
+}
+
+fn publish_v9_pair_files_at_with_pre_rename<Fd: AsFd, SyncDirectory, BeforeRename>(
+    root_fd: Fd,
+    v1: &[u8],
+    v9: &[u8],
+    sync_directory: SyncDirectory,
+    before_rename: BeforeRename,
+) -> io::Result<()>
+where
+    SyncDirectory: FnOnce(&Fd) -> io::Result<()>,
+    BeforeRename: FnOnce() -> io::Result<()>,
+{
+    let staging = create_candidate_staging_directory(&root_fd)?;
+    let staging_fd = match openat(
+        &root_fd,
+        staging.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let _ = unlinkat(&root_fd, staging.as_str(), AtFlags::REMOVEDIR);
+            return Err(error.into());
+        }
+    };
+    let mut renamed = false;
+    let result: io::Result<()> = (|| {
+        // Persist the parent entry for the private staging directory before
+        // any artifact bytes are written. A failure here is pre-rename and
+        // therefore safely cleaned up below.
+        fsync(&root_fd)?;
+        write_private_candidate_file_at(&staging_fd, "batch-release-gate-v1.json", v1)?;
+        write_private_candidate_file_at(&staging_fd, "persistent-consumer-v9.json", v9)?;
+        fsync(&staging_fd)?;
+        // This is the last point before the atomic visibility transition. A
+        // same-UID writer can still race after this check; the immutable
+        // no-replace rename and retained post-rename recovery artifact make
+        // that residual explicit rather than claiming it is impossible.
+        before_rename()?;
+        renameat_with(
+            &root_fd,
+            staging.as_str(),
+            &root_fd,
+            "session-ha-persistent-consumer-v9",
+            RenameFlags::NOREPLACE,
+        )?;
+        renamed = true;
+        // If this fails the complete create-new artifact remains visible for
+        // explicit operator recovery; deleting it would turn a durability
+        // unknown into silent data loss.
+        sync_directory(&root_fd).map_err(|_| {
+            io::Error::other("V9 evidence published but directory durability is unknown")
+        })?;
+        Ok(())
+    })();
+    if result.is_err() && !renamed {
+        let _ = unlinkat(&staging_fd, "batch-release-gate-v1.json", AtFlags::empty());
+        let _ = unlinkat(&staging_fd, "persistent-consumer-v9.json", AtFlags::empty());
+        let _ = unlinkat(&root_fd, staging.as_str(), AtFlags::REMOVEDIR);
+    }
+    result
+}
+
+fn publish_v9_external_evidence_at(root: &Path, v1: &[u8], v9: &[u8]) -> io::Result<()> {
+    let provenance = ReleaseGateProvenance::capture()?;
+    v9_verify_prepublication_bindings(v1, v9, &provenance)?;
+    // The caller must provision this dedicated namespace. In particular, do
+    // not recursively create or chmod an ancestor that might be shared.
+    let root_fd = v9_open_private_external_root(root)?;
+    let root = fs::canonicalize(format!("/proc/self/fd/{}", root_fd.as_raw_fd()))?;
+    let canonical_root = v9_canonical_path_string(&root, "V9 publication root")?;
+    if canonical_root != provenance.evidence_root_directory {
+        return Err(io::Error::other(
+            "V9 publication root differs from the root bound into the release provenance",
+        ));
+    }
+    v9_verify_prepublication_bindings(v1, v9, &provenance)?;
+    publish_v9_pair_files_at_with_pre_rename(
+        &root_fd,
+        v1,
+        v9,
+        |directory| fsync(directory).map_err(Into::into),
+        || v9_verify_prepublication_bindings(v1, v9, &provenance),
+    )?;
+    let published_pair = fs::canonicalize(root.join(
+        opc_session_testkit::qualification::SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_PAIR_DIRECTORY,
+    ))?;
+    if v9_canonical_path_string(&published_pair, "V9 published pair root")?
+        != provenance.pair_directory
+    {
+        return Err(io::Error::other(
+            "V9 published pair root differs from the root bound into the release provenance",
+        ));
+    }
+    Ok(())
+}
+
 fn cleanup_candidate_staging_directory<RootFd: AsFd, StagingFd: AsFd>(
     root_descriptor: RootFd,
     staging_descriptor: StagingFd,
@@ -6654,6 +10102,15 @@ fn ensure_candidate_evidence_feature_profile() -> io::Result<()> {
     if cfg!(feature = "foundation-insecure") {
         return Err(io::Error::other(
             "candidate evidence is disabled when foundation-insecure is compiled",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_v2_batch_release_feature_profile() -> io::Result<()> {
+    if cfg!(feature = "foundation-insecure") {
+        return Err(io::Error::other(
+            "V2 batch release evidence is disabled when foundation-insecure is compiled",
         ));
     }
     Ok(())
@@ -7017,7 +10474,15 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         stopped_expiring_mutation[0].status.last_generation
     );
     let stopped_expiring_status = stopped_expiring_watch[0].status.clone();
-    fleet.wait_for_expiry_soft_retirement(expiring_node_index, &lifecycle_before_expiry, not_after);
+    let lifecycle_after_soft_retirement = fleet.wait_for_expiry_soft_retirement(
+        expiring_node_index,
+        &lifecycle_before_expiry,
+        not_after,
+    );
+    emit_fixed_lifecycle_connection_snapshot(
+        "soft_authenticated_retirement",
+        &lifecycle_after_soft_retirement,
+    );
     assert!(
         time::OffsetDateTime::now_utc() < not_after,
         "soft retirement was not observed strictly before hard expiry"
@@ -7043,10 +10508,11 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         not_after,
     );
     fleet.wait_for_isolated_member_and_survivors(expiring_node_index);
+    emit_fixed_lifecycle_connection_snapshot("hard_expiry", &fleet.all_lifecycle_metrics());
     let traffic_after_hard_expiry_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
     let hard_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     fleet.advance_canary_for_survivors(expiring_node_index, "short-lived-svid-expired");
-    fleet.wait_for_subset_traffic_progress(
+    let traffic_after_hard_expiry = fleet.wait_for_subset_traffic_progress(
         &traffic_after_hard_expiry_boundary,
         &expiry_survivor_traffic,
         "survivor-traffic-through-hard-expiry",
@@ -7073,20 +10539,27 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         }
     ));
 
+    // The directed survivor-to-expired negative above traverses the same
+    // authenticated consensus lanes as live traffic. It can therefore open a
+    // recoverable availability episode while the remote-retirement probe gate
+    // is pending. Prove that episode resolved, and that traffic advanced, under
+    // the already-started hard-expiry deadline before defining the clean
+    // replacement baseline.
+    let replacement_traffic_baseline = fleet.wait_for_subset_traffic_progress(
+        &traffic_after_hard_expiry,
+        &expiry_survivor_traffic,
+        "survivor-traffic-after-expired-path-negatives",
+        hard_traffic_deadline,
+    );
     let replacement_source_before = fleet.projected_status(expiring_node_index);
     let replacement_controller_before = fleet.material_status(expiring_node_index);
-    let replacement_traffic_baseline =
-        fleet.traffic_status_snapshots_on(&expiry_survivor_traffic.observers);
-    let mut replacement_traffic_progress =
+    let replacement_traffic_progress =
         RecoveryTrafficProgressTracker::new(replacement_traffic_baseline.clone(), Instant::now());
-    let prepublication_progress_deadline = replacement_traffic_progress.pulse_deadline();
-    fleet.wait_for_recovery_traffic_progress(
-        &replacement_traffic_baseline,
-        &mut replacement_traffic_progress,
-        &expiry_survivor_traffic,
-        "replacement-prepublication-progress",
-        prepublication_progress_deadline,
-    );
+    // `wait_for_subset_traffic_progress` above already proved the stronger
+    // every-key/every-observer pulse with healthy tasks and settled
+    // availability after the directed negatives. Carry that exact clean
+    // checkpoint into replacement publication instead of discarding it and
+    // demanding an unrelated second prepublication pulse.
     let publication_stage_deadline =
         replacement_traffic_progress.next_deadline(replacement_traffic_progress.pulse_deadline());
     let replacement_recovery_started = fleet.publish_known_projected_generation(
@@ -7107,12 +10580,9 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         replacement_controller_before.epoch,
         replacement_traffic_progress.next_deadline(replacement_recovery_deadline),
     );
-    fleet.wait_for_recovery_traffic_progress(
-        &replacement_traffic_baseline,
-        &mut replacement_traffic_progress,
-        &expiry_survivor_traffic,
-        "replacement-publication",
-        replacement_recovery_deadline,
+    emit_fixed_lifecycle_connection_snapshot(
+        "replacement_publication",
+        &fleet.all_lifecycle_metrics(),
     );
     assert_eq!(
         fleet.nodes[expiring_node_index].process_id(),
@@ -7130,6 +10600,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
             recovery_started: replacement_recovery_started,
             recovery_deadline: replacement_recovery_deadline,
         });
+    emit_fixed_lifecycle_connection_snapshot("settled_recovery", &fleet.all_lifecycle_metrics());
     let replacement_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     let replacement_phase = format!(
         "survivor-traffic-through-material-replacement/active-restart-{active_restart_node_index}/expiring-{expiring_node_index}"
@@ -7702,7 +11173,8 @@ fn run_projected_mtls_traffic_resources(member_count: usize) {
     let (settled, settled_lifecycle) = fleet.wait_for_resources_to_settle(&process_ids, &warmed);
     assert_lifecycle_delta_bounds(member_count, &lifecycle_checkpoint, &settled_lifecycle, 0);
     lifecycle_checkpoint = settled_lifecycle;
-    let high_water = sampler.finish();
+    let high_water_generations = sampler.finish();
+    let high_water = merge_resource_generation_high_water(&high_water_generations);
     assert_process_resource_bounds(member_count, &warmed, &high_water, &settled);
 
     let final_ledger_deadline =
@@ -7773,6 +11245,12 @@ fn candidate_configuration_digest_is_order_content_and_bound_sensitive() {
 #[test]
 fn candidate_evidence_feature_gate_matches_the_compiled_transport_profile() {
     let result = ensure_candidate_evidence_feature_profile();
+    assert_eq!(result.is_err(), cfg!(feature = "foundation-insecure"));
+}
+
+#[test]
+fn batch_release_evidence_feature_gate_matches_the_compiled_transport_profile() {
+    let result = ensure_v2_batch_release_feature_profile();
     assert_eq!(result.is_err(), cfg!(feature = "foundation-insecure"));
 }
 
@@ -7925,6 +11403,1070 @@ fn candidate_source_provenance_marks_nonignored_untracked_inputs_dirty() {
         64,
     )
     .is_err());
+}
+
+fn write_candidate_git_helper_script(path: &Path, body: &[u8]) {
+    fs::write(path, body).expect("write candidate Git helper script");
+    fs::set_permissions(path, Permissions::from_mode(0o700))
+        .expect("make candidate Git helper script executable");
+}
+
+fn candidate_git_process_is_gone(process_id: u32) -> bool {
+    let Some(process_id) = i32::try_from(process_id)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    match rustix::process::test_kill_process(process_id) {
+        Ok(()) => false,
+        Err(error) if error.raw_os_error() == 3 => true, // ESRCH
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn bounded_candidate_git_runner_returns_success_and_rejects_output_overflow() {
+    let workspace = tempfile::tempdir().expect("create bounded Git helper workspace");
+    let helper = workspace.path().join("fake-git");
+    write_candidate_git_helper_script(&helper, b"#!/bin/sh\nprintf 'clean-output'\n");
+    let output = bounded_candidate_git_command_output(&mut Command::new(&helper), 64)
+        .expect("bounded Git helper succeeds");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"clean-output");
+    assert!(output.stderr.is_empty());
+
+    write_candidate_git_helper_script(&helper, b"#!/bin/sh\nprintf 'overflow-output'\n");
+    assert!(
+        bounded_candidate_git_command_output(&mut Command::new(&helper), 3).is_err(),
+        "the bounded Git runner must fail closed when stdout exceeds its exact bound"
+    );
+}
+
+#[test]
+fn bounded_candidate_git_runner_retries_transient_linux_executable_busy_inside_fixed_budget() {
+    let workspace = tempfile::tempdir().expect("create executable-busy Git helper workspace");
+    let helper = workspace.path().join("fake-git");
+    write_candidate_git_helper_script(&helper, b"#!/bin/sh\nprintf 'retry-output'\n");
+    let writable_helper = OpenOptions::new()
+        .write(true)
+        .open(&helper)
+        .expect("hold Git helper executable open for writing");
+    let first_spawn = Command::new(&helper)
+        .status()
+        .expect_err("a writable executable inode must reject execve with ETXTBSY");
+    assert_eq!(
+        first_spawn.raw_os_error(),
+        Some(LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR)
+    );
+    let release_writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(25));
+        drop(writable_helper);
+    });
+
+    let started = Instant::now();
+    let output = bounded_candidate_git_command_output(&mut Command::new(&helper), 64)
+        .expect("bounded Git runner retries transient ETXTBSY");
+    release_writer.join().expect("release executable writer");
+    assert!(
+        started.elapsed() < CANDIDATE_GIT_COMMAND_TIMEOUT,
+        "ETXTBSY retries must consume rather than extend the fixed command budget"
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"retry-output");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn bounded_candidate_git_runner_retains_early_stdout_until_late_stderr_and_exit() {
+    let workspace = tempfile::tempdir().expect("create asymmetric Git helper workspace");
+    let helper = workspace.path().join("fake-git");
+    write_candidate_git_helper_script(
+        &helper,
+        b"#!/bin/sh\nprintf 'early-output'\nexec 1>&-\nsleep 0.15\nprintf 'late-diagnostic' >&2\n",
+    );
+
+    let started = Instant::now();
+    let output = bounded_candidate_git_command_output(&mut Command::new(&helper), 64)
+        .expect("early stdout close with late stderr and exit remains successful");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "retaining early stdout is weakening-sensitive: discarding it waits for the five-second deadline"
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"early-output");
+    assert_eq!(output.stderr, b"late-diagnostic");
+}
+
+#[test]
+fn bounded_candidate_git_runner_kills_pipe_holding_term_resistant_descendant() {
+    let workspace = tempfile::tempdir().expect("create descendant helper workspace");
+    let helper = workspace.path().join("fake-git");
+    let descendant_pid = workspace.path().join("descendant.pid");
+    let leader_pid = workspace.path().join("leader.pid");
+    write_candidate_git_helper_script(
+        &helper,
+        b"#!/bin/sh\nprintf '%s' \"$$\" > \"$2\"\n(\n  trap '' TERM\n  while :; do sleep 1; done\n) &\ndescendant=$!\nprintf '%s' \"$descendant\" > \"$1\"\nexit 0\n",
+    );
+
+    let started = Instant::now();
+    let result = bounded_candidate_git_command_output(
+        Command::new(&helper).arg(&descendant_pid).arg(&leader_pid),
+        64,
+    );
+    assert!(
+        result.is_err(),
+        "a descendant-held pipe must hit the deadline"
+    );
+    assert!(
+        started.elapsed()
+            < CANDIDATE_GIT_COMMAND_TIMEOUT
+                + CANDIDATE_GIT_TERMINATE_GRACE
+                + CANDIDATE_GIT_TERMINATE_GRACE
+                + Duration::from_secs(1),
+        "the leader-exit pipe attack cannot turn the trusted Git helper into an unbounded wait"
+    );
+    let observed_leader_pid = fs::read_to_string(&leader_pid)
+        .expect("leader reported its pid")
+        .trim()
+        .parse::<u32>()
+        .expect("leader pid is numeric");
+    let observed_descendant_pid = fs::read_to_string(&descendant_pid)
+        .expect("parent recorded background descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("background descendant pid is numeric");
+    assert_ne!(
+        observed_leader_pid, observed_descendant_pid,
+        "the parent-recorded $! must name a distinct background descendant"
+    );
+    let gone_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
+    while !candidate_git_process_is_gone(observed_descendant_pid) && Instant::now() < gone_deadline
+    {
+        thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+    }
+    assert!(
+        candidate_git_process_is_gone(observed_descendant_pid),
+        "owned process-group SIGKILL leaves the exact parent-recorded descendant PID gone after its leader exits"
+    );
+}
+
+#[test]
+fn v9_external_namespace_is_owner_private_nofollow_and_no_clobber() {
+    let workspace = tempfile::tempdir().expect("create V9 publication workspace");
+    let root = workspace.path().join("evidence");
+    fs::create_dir(&root).expect("create dedicated external evidence root");
+    fs::set_permissions(&root, Permissions::from_mode(0o700))
+        .expect("make external evidence root owner private");
+    let root_fd = v9_open_private_external_root(&root).expect("open private root without links");
+    publish_v9_pair_files_at(&root_fd, b"canonical-v1", b"canonical-v9")
+        .expect("first pair publication is create-new");
+    assert!(
+        publish_v9_pair_files_at(&root_fd, b"other-v1", b"other-v9").is_err(),
+        "a complete prior pair must not be replaced"
+    );
+    let published = root.join("session-ha-persistent-consumer-v9");
+    assert_eq!(
+        fs::read(published.join("batch-release-gate-v1.json")).expect("read retained V1"),
+        b"canonical-v1"
+    );
+    assert_eq!(
+        fs::read(published.join("persistent-consumer-v9.json")).expect("read retained V9"),
+        b"canonical-v9"
+    );
+    assert_eq!(
+        fs::read_dir(&root).expect("inspect private root").count(),
+        1,
+        "the pre-rename no-clobber failure removes its staging directory"
+    );
+
+    let link = workspace.path().join("linked-evidence");
+    symlink(&root, &link).expect("create hostile evidence-root symlink");
+    assert!(v9_open_private_external_root(&link).is_err());
+}
+
+#[test]
+fn v9_snapshot_campaign_and_leaf_are_private_and_descriptor_pinned_across_replacement() {
+    let _fleet = FLEET_TEST_LOCK
+        .lock()
+        .expect("serialize V9 snapshot namespace creation");
+    let workspace = tempfile::tempdir().expect("create V9 snapshot workspace");
+    let root = workspace.path().join("fs-verity-root");
+    fs::create_dir(&root).expect("create V9 snapshot root");
+    fs::set_permissions(&root, Permissions::from_mode(0o700))
+        .expect("make V9 snapshot root owner-private");
+    let base = fs::canonicalize(&root).expect("canonical V9 snapshot root");
+    let base_descriptor = v9_open_private_external_root(&base).expect("open V9 snapshot root");
+    let base_metadata = fstat(&base_descriptor).expect("fstat V9 snapshot root");
+
+    // This precise umask witnesses that mkdirat(..., 0700), unlike the old
+    // tempfile/pathwise leaf setup, never exposes a transient 0755 campaign
+    // or leaf under the common runner default.
+    let previous_umask = umask(Mode::from_raw_mode(0o022));
+    let campaign = create_v9_snapshot_campaign_directory(&base_descriptor);
+    umask(previous_umask);
+    let (campaign_name, descriptor) = campaign.expect("mkdirat private V9 campaign");
+    let campaign_metadata = fstat(&descriptor).expect("fstat private V9 campaign");
+    assert_eq!(
+        Mode::from_raw_mode(campaign_metadata.st_mode).bits() & 0o7777,
+        0o700,
+        "mkdirat campaign creation is exactly owner-private under umask 0022"
+    );
+    let namespace = PinnedV9SnapshotNamespace {
+        namespace: base.join(campaign_name),
+        base,
+        base_descriptor,
+        base_device: base_metadata.st_dev as u64,
+        base_inode: base_metadata.st_ino as u64,
+        descriptor,
+        device: campaign_metadata.st_dev as u64,
+        inode: campaign_metadata.st_ino as u64,
+    };
+    namespace.verify().expect("pin V9 campaign namespace");
+    let previous_umask = umask(Mode::from_raw_mode(0o022));
+    let leaf = namespace.create_leaf(0);
+    umask(previous_umask);
+    let leaf = leaf.expect("mkdirat private V9 leaf");
+    let leaf_metadata = fstat(leaf.inherited_descriptor()).expect("fstat private V9 leaf");
+    assert_eq!(
+        Mode::from_raw_mode(leaf_metadata.st_mode).bits() & 0o7777,
+        0o700,
+        "mkdirat leaf creation is exactly owner-private under umask 0022"
+    );
+    leaf.verify(&namespace)
+        .expect("initial V9 snapshot leaf identity is pinned");
+
+    let detached = namespace.path().join("node-0-detached");
+    fs::rename(leaf.path(), &detached).expect("detach validated V9 snapshot leaf");
+    mkdirat(&namespace.descriptor, "node-0", Mode::from_raw_mode(0o700))
+        .expect("create same-name V9 snapshot replacement");
+    assert!(
+        leaf.verify(&namespace).is_err(),
+        "same-UID replacement between pathname validation and use must fail closed"
+    );
+    let restarted = open(
+        PathBuf::from(format!(
+            "/proc/self/fd/{}/",
+            leaf.inherited_descriptor().as_raw_fd()
+        )),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("store-style no-follow restart reopens exact inherited V9 leaf");
+    let restarted_metadata = fstat(&restarted).expect("fstat restarted V9 snapshot leaf");
+    assert_eq!(
+        (restarted_metadata.st_dev, restarted_metadata.st_ino),
+        (leaf_metadata.st_dev, leaf_metadata.st_ino),
+        "restart retains the original pinned V9 leaf instead of the same-name replacement"
+    );
+}
+
+#[test]
+fn v9_external_path_overlap_is_symmetric() {
+    assert!(v9_paths_overlap(
+        Path::new("/external/evidence"),
+        Path::new("/external")
+    ));
+    assert!(v9_paths_overlap(
+        Path::new("/external"),
+        Path::new("/external/evidence")
+    ));
+    assert!(!v9_paths_overlap(
+        Path::new("/external/evidence"),
+        Path::new("/other")
+    ));
+}
+
+#[test]
+fn v9_external_root_rejects_linked_git_common_git_and_target_descendants() {
+    let repository = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .expect("canonical SDK repository");
+    let gitdir = v9_git_directory(&repository, "--absolute-git-dir")
+        .expect("resolve linked-worktree git directory");
+    let common_gitdir =
+        v9_git_directory(&repository, "--git-common-dir").expect("resolve common git directory");
+    let target = repository.join("target");
+    let protected = vec![
+        repository,
+        gitdir.clone(),
+        common_gitdir.clone(),
+        target.clone(),
+    ];
+
+    assert!(v9_require_external_disjointness(&gitdir, &protected).is_err());
+    assert!(v9_require_external_disjointness(&common_gitdir, &protected).is_err());
+    assert!(v9_require_external_disjointness(&target.join("v9-evidence"), &protected).is_err());
+}
+
+#[test]
+fn v9_requires_explicit_canonical_cargo_target_directory() {
+    let workspace = tempfile::tempdir().expect("create target-directory workspace");
+    let configured_target = workspace.path().join("configured-target");
+    fs::create_dir(&configured_target).expect("create explicit target directory");
+    assert!(v9_canonical_cargo_target_directory(None).is_err());
+    assert!(v9_canonical_cargo_target_directory(Some(OsString::from("relative-target"))).is_err());
+    assert_eq!(
+        v9_canonical_cargo_target_directory(Some(configured_target.clone().into_os_string()))
+            .expect("canonical explicit target directory"),
+        fs::canonicalize(&configured_target).expect("canonical configured target"),
+        "a caller-selected target directory must not be replaced by repository/target"
+    );
+}
+
+#[test]
+fn v9_canonical_path_parser_rejects_snapshot_root_aliases() {
+    assert!(v9_canonical_path_string(
+        Path::new("/external/fs-verity-snapshots/."),
+        "V9 fs-verity snapshot root"
+    )
+    .is_err());
+    assert!(v9_canonical_path_string(
+        Path::new("/external//fs-verity-snapshots"),
+        "V9 fs-verity snapshot root"
+    )
+    .is_err());
+    assert!(v9_canonical_path_string(
+        Path::new("/external/fs-verity-snapshots"),
+        "V9 fs-verity snapshot root"
+    )
+    .is_ok());
+}
+
+#[test]
+fn v9_target_rejects_snapshot_root_on_the_same_filesystem() {
+    let workspace = tempfile::tempdir().expect("same-device V9 workspace");
+    let target = workspace.path().join("target");
+    let snapshot_root = workspace.path().join("fs-verity-snapshots");
+    fs::create_dir(&target).expect("create same-device V9 target");
+    fs::create_dir(&snapshot_root).expect("create same-device V9 snapshot root");
+    let snapshot_metadata = fs::metadata(&snapshot_root).expect("stat V9 snapshot root");
+    let binding = V9FsVeritySnapshotRoot {
+        directory: snapshot_root,
+        device: snapshot_metadata.dev(),
+        inode: snapshot_metadata.ino(),
+    };
+    assert_eq!(
+        fs::metadata(&target).expect("stat V9 target").dev(),
+        binding.device
+    );
+    assert_eq!(
+        v9_require_distinct_snapshot_filesystem(&target, &binding)
+            .expect_err("same-device V9 target must fail closed")
+            .to_string(),
+        "V9 Cargo target must not share the fs-verity snapshot filesystem"
+    );
+}
+
+fn v9_test_release_provenance() -> ReleaseGateProvenance {
+    let cargo_target_directory = "/var/lib/opc-testkit/target".to_owned();
+    let evidence_root_directory = "/var/lib/opc-testkit/evidence".to_owned();
+    let fs_verity_snapshot_root_directory = "/var/lib/opc-testkit/fs-verity-snapshots".to_owned();
+    let pair_directory = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory(&evidence_root_directory)
+        .expect("derive fixed V9 pair root");
+    ReleaseGateProvenance {
+        source_revision: "a".repeat(40),
+        source_tree: "b".repeat(40),
+        source_worktree_sha256: format!("sha256:{}", "c".repeat(64)),
+        cargo_lock_sha256: format!("sha256:{}", "d".repeat(64)),
+        cargo_target_directory_sha256: opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_cargo_target_directory_sha256(
+                &cargo_target_directory,
+            )
+            .expect("commit test target"),
+        cargo_target_directory,
+        evidence_root_directory_sha256: opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_evidence_root_directory_sha256(
+                &evidence_root_directory,
+            )
+            .expect("commit test evidence root"),
+        evidence_root_directory,
+        fs_verity_snapshot_root_directory_sha256: opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+                &fs_verity_snapshot_root_directory,
+            )
+            .expect("commit test fs-verity snapshot root"),
+        fs_verity_snapshot_root_device: 17,
+        fs_verity_snapshot_root_inode: 19,
+        fs_verity_snapshot_root_directory,
+        pair_directory_sha256: opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(&pair_directory)
+                .expect("commit test pair root"),
+        pair_directory,
+        command_argv_sha256: format!("sha256:{}", "e".repeat(64)),
+        cargo_executable_alias: "/var/lib/opc-testkit/cargo".to_owned(),
+        cargo_executable: "/var/lib/opc-testkit/rustup".to_owned(),
+        cargo_executable_sha256: format!("sha256:{}", "f".repeat(64)),
+        cargo_executable_mode: 0o755,
+        canonical_cargo_argv: opc_session_testkit::qualification::
+            SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_CARGO_ARGV
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
+        cargo_profile: "release".to_owned(),
+        opt_level: "3".to_owned(),
+    }
+}
+
+fn v9_test_claims(provenance: &ReleaseGateProvenance) -> SessionHaPersistentConsumerHeadEvidenceV9 {
+    let lane = |name: &str,
+                transport_revision: u16,
+                consumer_alpn: &str,
+                tenant_negative_boundary_rejections: u8| {
+        QualificationPersistentConsumerLaneV9 {
+            lane: name.to_owned(),
+            transport_revision,
+            application_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.application_revision,
+            sdk_protocol_revision: 5,
+            consumer_alpn: consumer_alpn.to_owned(),
+            executed: true,
+            admission_operations: 1,
+            status_operations: 1,
+            before_leader_loss_operations: 1,
+            after_leader_loss_operations: 1,
+            after_restart_operations: 1,
+            after_voter_loss_operations: 1,
+            tenant_authority: QualificationPersistentConsumerAuthorityV9 {
+                positive_observations: 1,
+                negative_boundary_rejections: tenant_negative_boundary_rejections,
+            },
+            scope_authority: QualificationPersistentConsumerAuthorityV9 {
+                positive_observations: 1,
+                negative_boundary_rejections: 1,
+            },
+            fence_authority: QualificationPersistentConsumerAuthorityV9 {
+                positive_observations: 1,
+                negative_boundary_rejections: 1,
+            },
+        }
+    };
+    SessionHaPersistentConsumerHeadEvidenceV9 {
+        schema_version: "opc-session-ha-persistent-consumer-head-evidence/v9".to_owned(),
+        evidence_kind: "persistent-consumer-executed-lanes".to_owned(),
+        experimental: true,
+        qualification_complete: true,
+        provenance: QualificationPersistentConsumerProvenanceV9 {
+            source_revision: provenance.source_revision.clone(),
+            source_tree: provenance.source_tree.clone(),
+            source_tree_status: "clean".to_owned(),
+            source_worktree_sha256: provenance.source_worktree_sha256.clone(),
+        },
+        invocation: QualificationPersistentConsumerInvocationV9 {
+            test_id: V9_EXTERNAL_TEST_ID.to_owned(),
+            argv_sha256: format!("sha256:{}", "7".repeat(64)),
+            run_id_sha256: V9_PAIR_RUN_ID_PREIMAGE_PLACEHOLDER.to_owned(),
+            cargo_executable_alias: provenance.cargo_executable_alias.clone(),
+            cargo_executable: provenance.cargo_executable.clone(),
+            cargo_executable_sha256: provenance.cargo_executable_sha256.clone(),
+            cargo_executable_mode: provenance.cargo_executable_mode,
+            canonical_cargo_argv: provenance.canonical_cargo_argv.clone(),
+            reproduction_command: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
+                    &provenance.cargo_target_directory,
+                    &provenance.evidence_root_directory,
+                    &provenance.fs_verity_snapshot_root_directory,
+                    &provenance.cargo_executable_alias,
+                )
+                .expect("render V9 test recipe"),
+        },
+        bindings: QualificationPersistentConsumerBindingsV9 {
+            v9_schema_sha256: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            harness_sha256: format!("sha256:{}", "8".repeat(64)),
+            child_sha256: format!("sha256:{}", "9".repeat(64)),
+            executable_sha256: format!("sha256:{}", "8".repeat(64)),
+            v1_canonical_sha256: v9_sha256(b"canonical-v1"),
+            cargo_target_directory: provenance.cargo_target_directory.clone(),
+            cargo_target_directory_sha256: provenance.cargo_target_directory_sha256.clone(),
+            evidence_root_directory: provenance.evidence_root_directory.clone(),
+            evidence_root_directory_sha256: provenance.evidence_root_directory_sha256.clone(),
+            fs_verity_snapshot_root_directory: provenance.fs_verity_snapshot_root_directory.clone(),
+            fs_verity_snapshot_root_directory_sha256: provenance
+                .fs_verity_snapshot_root_directory_sha256
+                .clone(),
+            fs_verity_snapshot_root_device: provenance.fs_verity_snapshot_root_device,
+            fs_verity_snapshot_root_inode: provenance.fs_verity_snapshot_root_inode,
+            pair_directory: provenance.pair_directory.clone(),
+            pair_directory_sha256: provenance.pair_directory_sha256.clone(),
+        },
+        process_ledger: QualificationPersistentConsumerProcessLedgerV9 {
+            initial_processes: 3,
+            unclean_process_losses: 2,
+            restarted_processes: 1,
+            observed_process_generations: 4,
+            release_gate_process_generations: 4,
+        },
+        release_gate: QualificationPersistentConsumerReleaseGateV9 {
+            credential_rotation_executed: true,
+            old_credential_rejected: true,
+            new_credential_rejected: true,
+            fixed_capacity_reclaimed: true,
+            durable_status_cardinality: 12,
+            post_outcome_unknown_mutation_dispatches: 0,
+        },
+        lanes: [
+            lane(
+                "general",
+                SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                "opc-session-consumer/1",
+                1,
+            ),
+            lane(
+                "protected_roster",
+                SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+                "opc-session-consumer/3",
+                3,
+            ),
+        ],
+        members: 3,
+        authenticated_setup_successes: 48,
+        warm_reused_calls: 1_000,
+        fixed_labels_only: true,
+        identifying_values_recorded: false,
+    }
+}
+
+#[test]
+fn v9_backslash_heavy_paths_fit_the_mirrored_closed_document_envelope() {
+    let escaped_path = |label: &str| format!("/{label}{}", "\\".repeat(2_990));
+    let mut provenance = v9_test_release_provenance();
+    provenance.cargo_target_directory = escaped_path("target");
+    provenance.cargo_target_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_cargo_target_directory_sha256(
+            &provenance.cargo_target_directory,
+        )
+        .expect("commit escaped target path");
+    provenance.evidence_root_directory = escaped_path("evidence");
+    provenance.evidence_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_evidence_root_directory_sha256(
+            &provenance.evidence_root_directory,
+        )
+        .expect("commit escaped evidence root");
+    provenance.fs_verity_snapshot_root_directory = escaped_path("snapshots");
+    provenance.fs_verity_snapshot_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+            &provenance.fs_verity_snapshot_root_directory,
+        )
+        .expect("commit escaped fs-verity root");
+    provenance.pair_directory = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory(
+            &provenance.evidence_root_directory,
+        )
+        .expect("derive escaped pair directory");
+    provenance.pair_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(
+            &provenance.pair_directory,
+        )
+        .expect("commit escaped pair directory");
+    provenance.cargo_executable_alias = escaped_path("cargo");
+    provenance.cargo_executable = escaped_path("rustup");
+
+    let mut evidence = v9_test_claims(&provenance);
+    evidence.invocation.run_id_sha256 = v9_test_run_id(&provenance, &evidence);
+    assert!(
+        evidence.invocation.reproduction_command.chars().count() <= 16 * 1024,
+        "the exact regenerated recipe stays within its closed schema bound"
+    );
+    let canonical = evidence
+        .to_canonical_json()
+        .expect("escaped real-path evidence fits the producer bound");
+    assert!(
+        canonical.len() > 64 * 1024,
+        "the fixture causally exceeds the retired late-failure boundary"
+    );
+    assert!(canonical.len() <= SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES);
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(&canonical),
+        Ok(evidence),
+        "the producer and consumer must share one exact escaped-path envelope"
+    );
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(&vec![
+            b' ';
+            SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES
+                + 1
+        ]),
+        Err(SessionHaPersistentConsumerHeadEvidenceV9Error::DocumentTooLarge)
+    );
+}
+
+fn v9_test_run_id(
+    provenance: &ReleaseGateProvenance,
+    claims: &SessionHaPersistentConsumerHeadEvidenceV9,
+) -> String {
+    let v1_bindings = [
+        format!("sha256:{}", "1".repeat(64)),
+        format!("sha256:{}", "2".repeat(64)),
+        format!("sha256:{}", "3".repeat(64)),
+        format!("sha256:{}", "4".repeat(64)),
+        format!("sha256:{}", "5".repeat(64)),
+        format!("sha256:{}", "6".repeat(64)),
+    ];
+    let v1_binding_refs = v1_bindings.iter().map(String::as_str).collect::<Vec<_>>();
+    v9_pair_run_id_material(
+        provenance,
+        &v1_binding_refs,
+        &opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+        &claims.invocation.argv_sha256,
+        b"canonical-v1",
+        &v9_pair_claims_preimage(claims).expect("canonical V9 claims preimage"),
+    )
+    .expect("construct V9 run identity from canonical claims")
+}
+
+#[test]
+fn v9_run_identity_binds_reconstructible_external_namespaces_and_recipe() {
+    let provenance = v9_test_release_provenance();
+    let v1_bindings = [
+        format!("sha256:{}", "1".repeat(64)),
+        format!("sha256:{}", "2".repeat(64)),
+        format!("sha256:{}", "3".repeat(64)),
+        format!("sha256:{}", "4".repeat(64)),
+        format!("sha256:{}", "5".repeat(64)),
+        format!("sha256:{}", "6".repeat(64)),
+    ];
+    let v1_binding_refs = v1_bindings.iter().map(String::as_str).collect::<Vec<_>>();
+    let run_id = v9_pair_run_id_material(
+        &provenance,
+        &v1_binding_refs,
+        &opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+        &format!("sha256:{}", "7".repeat(64)),
+        b"canonical-v1",
+        b"canonical-v9-claims",
+    )
+    .expect("construct baseline V9 run identity");
+
+    let mut target_replacement = provenance.clone();
+    target_replacement.cargo_target_directory = "/var/lib/opc-testkit/replaced-target".to_owned();
+    target_replacement.cargo_target_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_cargo_target_directory_sha256(
+            &target_replacement.cargo_target_directory,
+        )
+        .expect("commit replaced target");
+    assert_ne!(
+        v9_pair_run_id_material(
+            &target_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replaced-target V9 run identity"),
+        run_id,
+        "a syntactically valid replacement target must not inherit the original V1/V9 run ID"
+    );
+
+    let mut cross_bound_root = provenance.clone();
+    cross_bound_root.evidence_root_directory = "/var/lib/opc-testkit/other-evidence".to_owned();
+    cross_bound_root.evidence_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_evidence_root_directory_sha256(
+            &cross_bound_root.evidence_root_directory,
+        )
+        .expect("commit replacement evidence root");
+    cross_bound_root.pair_directory = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory(
+            &cross_bound_root.evidence_root_directory,
+        )
+        .expect("derive replacement pair root");
+    cross_bound_root.pair_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(
+            &cross_bound_root.pair_directory,
+        )
+        .expect("commit replacement pair root");
+    assert_ne!(
+        v9_pair_run_id_material(
+            &cross_bound_root,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct cross-root V9 run identity"),
+        run_id,
+        "a complete replacement root/pair cannot cross-bind to the original V1 artifact"
+    );
+
+    let mut snapshot_root_replacement = provenance.clone();
+    snapshot_root_replacement.fs_verity_snapshot_root_directory =
+        "/var/lib/opc-testkit/other-fs-verity-snapshots".to_owned();
+    snapshot_root_replacement.fs_verity_snapshot_root_directory_sha256 =
+        opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+                &snapshot_root_replacement.fs_verity_snapshot_root_directory,
+            )
+            .expect("commit replacement fs-verity snapshot root");
+    assert_ne!(
+        v9_pair_run_id_material(
+            &snapshot_root_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replacement-snapshot-root V9 run identity"),
+        run_id,
+        "a replacement fs-verity snapshot root cannot inherit the original V1/V9 run ID"
+    );
+
+    let mut snapshot_root_identity_replacement = provenance.clone();
+    snapshot_root_identity_replacement.fs_verity_snapshot_root_inode += 1;
+    assert_ne!(
+        v9_pair_run_id_material(
+            &snapshot_root_identity_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replaced-snapshot-identity V9 run identity"),
+        run_id,
+        "a same-path fs-verity snapshot-root inode replacement cannot inherit the original V1/V9 run ID"
+    );
+
+    let mut alias_replacement = provenance.clone();
+    alias_replacement.cargo_executable_alias = "/var/lib/opc-testkit/replaced-cargo".to_owned();
+    assert_ne!(
+        v9_pair_run_id_material(
+            &alias_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replacement-alias V9 run identity"),
+        run_id,
+        "a replacement Cargo alias cannot inherit the original V1/V9 run ID"
+    );
+
+    let mut backing_replacement = provenance.clone();
+    backing_replacement.cargo_executable = "/var/lib/opc-testkit/replaced-rustup".to_owned();
+    assert_ne!(
+        v9_pair_run_id_material(
+            &backing_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replacement-backing V9 run identity"),
+        run_id,
+        "a replacement Cargo backing cannot inherit the original V1/V9 run ID"
+    );
+
+    let mut content_replacement = provenance;
+    content_replacement.cargo_executable_sha256 = format!("sha256:{}", "8".repeat(64));
+    assert_ne!(
+        v9_pair_run_id_material(
+            &content_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replacement-Cargo-content V9 run identity"),
+        run_id,
+        "a replacement Cargo backing content digest cannot inherit the original V1/V9 run ID"
+    );
+
+    let mut mode_replacement = content_replacement;
+    mode_replacement.cargo_executable_mode = 0o700;
+    assert_ne!(
+        v9_pair_run_id_material(
+            &mode_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replacement-mode V9 run identity"),
+        run_id,
+        "a changed canonical Cargo execute mode cannot inherit the original V1/V9 run ID"
+    );
+}
+
+#[test]
+fn v9_run_identity_binds_every_mutable_campaign_claim() {
+    let provenance = v9_test_release_provenance();
+    let baseline = v9_test_claims(&provenance);
+    let baseline_run_id = v9_test_run_id(&provenance, &baseline);
+
+    let mut process_generation = baseline.clone();
+    process_generation
+        .process_ledger
+        .release_gate_process_generations += 1;
+    let mut lane = baseline.clone();
+    lane.lanes[0].after_voter_loss_operations += 1;
+    let mut authority = baseline.clone();
+    authority.lanes[1].scope_authority.positive_observations += 1;
+    let mut setup = baseline.clone();
+    setup.authenticated_setup_successes += 1;
+    let mut warm_call = baseline.clone();
+    warm_call.warm_reused_calls += 1;
+    let mut flexible_binding = baseline.clone();
+    flexible_binding.bindings.child_sha256 = format!("sha256:{}", "a".repeat(64));
+    let mut invocation = baseline.clone();
+    invocation.invocation.argv_sha256 = format!("sha256:{}", "b".repeat(64));
+
+    for (claim, changed) in [
+        ("process-generation", process_generation),
+        ("lane lifecycle", lane),
+        ("authority observation", authority),
+        ("authenticated setup", setup),
+        ("warm call", warm_call),
+        ("flexible binding", flexible_binding),
+        ("invocation", invocation),
+    ] {
+        let changed_run_id = v9_test_run_id(&provenance, &changed);
+        assert_ne!(
+            changed_run_id, baseline_run_id,
+            "mutating the V9 {claim} claim must change the noncircular pair run ID"
+        );
+        let mut forged = changed;
+        forged.invocation.run_id_sha256 = baseline_run_id.clone();
+        assert_ne!(
+            v9_test_run_id(&provenance, &forged),
+            forged.invocation.run_id_sha256,
+            "a changed V9 {claim} claim cannot retain a previously issued run ID"
+        );
+    }
+}
+
+#[test]
+fn v1_v9_generation_cross_equality_rejects_a_recomputed_v4_contradiction() {
+    let provenance = v9_test_release_provenance();
+    let mut v9 = v9_test_claims(&provenance);
+    v9.invocation.run_id_sha256 = v9_test_run_id(&provenance, &v9);
+    assert!(
+        v9.to_canonical_json().is_ok(),
+        "the baseline V9 process-generation claim is independently valid"
+    );
+    v1_v9_release_gate_process_generations_agree(
+        4,
+        v9.process_ledger.release_gate_process_generations,
+    )
+    .expect("the matching V1 resource-generation cardinality is accepted");
+
+    let mut contradictory = v9.clone();
+    contradictory
+        .process_ledger
+        .release_gate_process_generations = 5;
+    contradictory.invocation.run_id_sha256 = v9_test_run_id(&provenance, &contradictory);
+    assert!(
+        contradictory.to_canonical_json().is_ok(),
+        "the changed V9 generation count remains structurally and semantically valid"
+    );
+    assert_ne!(
+        contradictory.invocation.run_id_sha256, v9.invocation.run_id_sha256,
+        "the V4 claims preimage correctly changes the pair run ID"
+    );
+    assert!(
+        v1_v9_release_gate_process_generations_agree(
+            4,
+            contradictory.process_ledger.release_gate_process_generations,
+        )
+        .is_err(),
+        "the pair validator rejects a run-ID-recomputed V9 count that contradicts V1 resource_generations"
+    );
+}
+
+#[test]
+fn v9_runtime_digest_binding_rejects_sha_shaped_mirrors_and_replacements() {
+    let expected = format!("sha256:{}", "a".repeat(64));
+    let mirrored = format!("sha256:{}", "b".repeat(64));
+    assert!(v9_require_runtime_digest("child", &expected, &mirrored).is_err());
+
+    let workspace = tempfile::tempdir().expect("create artifact replacement workspace");
+    let child = workspace.path().join("quorum-node");
+    let harness = workspace.path().join("qualification-harness");
+    fs::write(&child, b"child-before").expect("write child before replacement");
+    fs::write(&harness, b"harness-before").expect("write harness before replacement");
+    let child_before = candidate_sha256_file(&child, 1024).expect("hash child before replacement");
+    let harness_before =
+        candidate_sha256_file(&harness, 1024).expect("hash harness before replacement");
+    fs::write(&child, b"child-after").expect("replace child before publication");
+    fs::write(&harness, b"harness-after").expect("replace harness before publication");
+    let child_after = candidate_sha256_file(&child, 1024).expect("hash child after replacement");
+    let harness_after =
+        candidate_sha256_file(&harness, 1024).expect("hash harness after replacement");
+    assert!(v9_require_runtime_digest("child", &child_before, &child_after).is_err());
+    assert!(v9_require_runtime_digest("harness", &harness_before, &harness_after).is_err());
+}
+
+#[test]
+fn v9_postrename_directory_sync_failure_retains_the_complete_pair() {
+    let workspace = tempfile::tempdir().expect("create V9 post-rename workspace");
+    let root = workspace.path().join("evidence");
+    fs::create_dir(&root).expect("create dedicated external evidence root");
+    fs::set_permissions(&root, Permissions::from_mode(0o700))
+        .expect("make external evidence root owner private");
+    let root_fd = v9_open_private_external_root(&root).expect("open private root without links");
+    let result = publish_v9_pair_files_at_with_directory_sync(
+        &root_fd,
+        b"canonical-v1",
+        b"canonical-v9",
+        |_| Err(io::Error::other("injected directory sync failure")),
+    );
+    assert!(result.is_err());
+    let published = root.join("session-ha-persistent-consumer-v9");
+    assert_eq!(
+        fs::read(published.join("batch-release-gate-v1.json")).expect("retain V1 after rename"),
+        b"canonical-v1"
+    );
+    assert_eq!(
+        fs::read(published.join("persistent-consumer-v9.json")).expect("retain V9 after rename"),
+        b"canonical-v9"
+    );
+}
+
+#[test]
+fn v9_prerename_revalidation_failure_removes_the_staged_pair() {
+    let workspace = tempfile::tempdir().expect("create V9 pre-rename workspace");
+    let root = workspace.path().join("evidence");
+    fs::create_dir(&root).expect("create dedicated external evidence root");
+    fs::set_permissions(&root, Permissions::from_mode(0o700))
+        .expect("make external evidence root owner private");
+    let root_fd = v9_open_private_external_root(&root).expect("open private root without links");
+    let result = publish_v9_pair_files_at_with_pre_rename(
+        &root_fd,
+        b"canonical-v1",
+        b"canonical-v9",
+        |directory| fsync(directory).map_err(Into::into),
+        || Err(io::Error::other("injected final binding replacement")),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read_dir(&root).expect("inspect private root").count(),
+        0,
+        "a final pre-rename binding failure must not leave a partial artifact"
+    );
+}
+
+#[test]
+fn release_gate_porcelain_cleanliness_rejects_staged_untracked_ignored_and_submodule_dirt() {
+    let repository = tempfile::tempdir().expect("create release provenance repository");
+    let run_git = |directory: &Path, arguments: &[&str]| {
+        let status = Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .status()
+            .expect("run release provenance git command");
+        assert!(status.success(), "release provenance git command failed");
+    };
+    run_git(repository.path(), &["init", "--quiet"]);
+    fs::write(repository.path().join("tracked.txt"), b"tracked\n")
+        .expect("write tracked release input");
+    fs::write(repository.path().join(".gitignore"), b"ignored-artifact\n")
+        .expect("write release ignore fixture");
+    run_git(repository.path(), &["add", "."]);
+    run_git(
+        repository.path(),
+        &[
+            "-c",
+            "user.name=Qualification Test",
+            "-c",
+            "user.email=qualification@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "test fixture",
+        ],
+    );
+    assert!(release_gate_require_clean_source_at(repository.path()).is_ok());
+
+    fs::write(repository.path().join("tracked.txt"), b"staged\n")
+        .expect("write staged release input");
+    run_git(repository.path(), &["add", "tracked.txt"]);
+    assert!(release_gate_require_clean_source_at(repository.path()).is_err());
+    fs::write(repository.path().join("tracked.txt"), b"tracked\n")
+        .expect("restore staged release input");
+    run_git(repository.path(), &["add", "tracked.txt"]);
+
+    fs::write(repository.path().join("tracked.txt"), b"unstaged\n")
+        .expect("write unstaged release input");
+    assert!(
+        release_gate_require_clean_source_at(repository.path()).is_err(),
+        "porcelain -z must reject unstaged tracked modifications too"
+    );
+    fs::write(repository.path().join("tracked.txt"), b"tracked\n")
+        .expect("restore unstaged release input");
+
+    fs::write(repository.path().join("untracked-artifact"), b"untracked\n")
+        .expect("write untracked release artifact");
+    assert!(release_gate_require_clean_source_at(repository.path()).is_err());
+    fs::remove_file(repository.path().join("untracked-artifact"))
+        .expect("remove test-only untracked release artifact");
+    fs::write(repository.path().join("ignored-artifact"), b"ignored\n")
+        .expect("write ignored release artifact");
+    assert!(release_gate_require_clean_source_at(repository.path()).is_err());
+    fs::remove_file(repository.path().join("ignored-artifact"))
+        .expect("remove test-only ignored release artifact");
+
+    let submodule = tempfile::tempdir().expect("create submodule repository");
+    run_git(submodule.path(), &["init", "--quiet"]);
+    fs::write(submodule.path().join("child.txt"), b"child\n").expect("write submodule input");
+    run_git(submodule.path(), &["add", "child.txt"]);
+    run_git(
+        submodule.path(),
+        &[
+            "-c",
+            "user.name=Qualification Test",
+            "-c",
+            "user.email=qualification@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "submodule fixture",
+        ],
+    );
+    let submodule_path = submodule.path().to_str().expect("UTF-8 submodule path");
+    run_git(
+        repository.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            submodule_path,
+            "nested",
+        ],
+    );
+    run_git(repository.path(), &["add", ".gitmodules", "nested"]);
+    run_git(
+        repository.path(),
+        &[
+            "-c",
+            "user.name=Qualification Test",
+            "-c",
+            "user.email=qualification@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "add submodule",
+        ],
+    );
+    assert!(release_gate_require_clean_source_at(repository.path()).is_ok());
+    fs::write(repository.path().join("nested/child.txt"), b"dirty child\n")
+        .expect("dirty nested submodule");
+    assert!(release_gate_require_clean_source_at(repository.path()).is_err());
 }
 
 #[test]
@@ -8125,6 +12667,13 @@ fn stateless_consumer_identity(index: usize) -> String {
     )
 }
 
+/// A real projected-mTLS workload identity in a different tenant namespace.
+/// It is intentionally absent from the listener's authorization grants.
+fn protected_foreign_tenant_identity() -> String {
+    "spiffe://qualification.invalid/tenant/foreign/ns/test/sa/session-consumer/nf/test/instance/0"
+        .to_owned()
+}
+
 fn stateless_consumer_key(index: usize) -> SessionKey {
     SessionKey {
         tenant: TenantId::new("qualification-consumer").expect("qualification consumer tenant"),
@@ -8136,8 +12685,2310 @@ fn stateless_consumer_key(index: usize) -> SessionKey {
     }
 }
 
-fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
-    let mut fleet = Fleet::start(member_count);
+fn qualification_fenced_transition_key(index: usize) -> SessionKey {
+    SessionKey {
+        tenant: TenantId::new("session-ha-qualification")
+            .expect("qualification fenced-transition tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from(format!("opaque-fenced-transition-{index}"))
+            .try_into()
+            .expect("bounded opaque fenced-transition key"),
+    }
+}
+
+async fn qualification_fenced_transition_record(
+    member_count: usize,
+    key: SessionKey,
+    owner: OwnerId,
+    fence: FenceToken,
+    payload: &'static [u8],
+) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner,
+        fence,
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("qualification-fenced-transition"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(payload),
+    };
+    seal_qualification_consensus_record(member_count, &mut record).await;
+    record
+}
+
+async fn seal_qualification_consensus_record(
+    member_count: usize,
+    record: &mut StoredSessionRecord,
+) {
+    let provider = MemoryKeyProvider::new();
+    provider
+        .insert_active_key(
+            KeyId::new("session-ha-qualification-key-v1").expect("qualification consensus key ID"),
+            KeyPurpose::Session,
+            record.key.tenant.clone(),
+            Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("install qualification consensus key");
+    record.payload = EncryptedSessionPayload::encrypt(
+        &provider,
+        record,
+        &format!("qualification-mtls-{member_count}-cluster"),
+    )
+    .await
+    .expect("seal opaque qualification consensus payload");
+}
+
+async fn qualification_fenced_transition_v2_request(
+    member_count: usize,
+    index: usize,
+) -> FencedTransitionV2Request {
+    let key = qualification_fenced_transition_key(index);
+    let owner = OwnerId::new(format!("qualification-v2-owner-{index}"))
+        .expect("qualification V2 transition owner");
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        FenceToken::new(0),
+        Duration::from_secs(30),
+    )
+    .expect("build qualification V2 acquire action");
+    let record = qualification_fenced_transition_record(
+        member_count,
+        key,
+        owner,
+        lease
+            .committed_fence()
+            .expect("derive qualification V2 committed fence"),
+        match index {
+            0 => b"opaque-qualification-v2-transition-one",
+            1 => b"opaque-qualification-v2-transition-two",
+            _ => b"opaque-qualification-v2-transition-three",
+        },
+    )
+    .await;
+    FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("initial qualification V2 epoch"),
+        FencedTransitionV2CallerNonce::from_bytes((index as u128).to_be_bytes()),
+        lease,
+        FencedTransitionMutation::create(record),
+    )
+    .expect("build self-authenticating qualification V2 request")
+}
+
+const V2_BATCH_RELEASE_GATE_CLIENTS: usize = 12;
+const V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT: usize = 4;
+const V2_BATCH_RELEASE_GATE_PENDING_CALLS: usize = 64;
+const V2_BATCH_RELEASE_GATE_OVER_CAPACITY_CALLS: usize =
+    V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT + V2_BATCH_RELEASE_GATE_PENDING_CALLS + 1;
+const V2_BATCH_RELEASE_GATE_PRELOAD_BATCH_SIZE: usize = 256;
+const V2_BATCH_RELEASE_GATE_PRELOAD_CONCURRENCY: usize = 1;
+const V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE: usize = 12;
+
+/// Causal facts emitted by the full release-gate run.  The canonical V1 bytes
+/// are retained verbatim so a later envelope binds the exact durable artifact,
+/// rather than reconstructing claims from a lossy JSON value.
+struct BatchReleaseGateRunFacts {
+    canonical_v1: Vec<u8>,
+    release_provenance: ReleaseGateProvenance,
+    capacity_reclaimed: bool,
+    old_credential_rejected: bool,
+    new_credential_rejected: bool,
+    process_generations: usize,
+    durable_status_cardinality: usize,
+    post_outcome_unknown_mutation_dispatches: usize,
+}
+const V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY: usize =
+    V2_BATCH_RELEASE_GATE_CLIENTS * V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT;
+const V2_BATCH_RELEASE_GATE_PRELOAD_CREATES: usize = 50_000;
+const V2_BATCH_RELEASE_GATE_PACED_MUTATIONS: usize = 60_000;
+const V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND: usize = 1_000;
+const V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES: usize = 1_008;
+/// Qualification ceiling, not a production identity. The node-local worker
+/// may freeze more than one cohort for a concurrent wave because arrivals on
+/// distinct authenticated lanes are scheduler ordered. Requiring no more
+/// than two still rejects a singleton-cohort attempt storm without pretending
+/// every run has exactly one scheduler-independent cohort.
+const V2_BATCH_RELEASE_GATE_MAX_STATUS_COHORTS_PER_VOTER_WAVE: u64 = 2;
+/// Qualification ceiling for leader-side fragmentation. Every accepted
+/// proposal must cover at least this many voter representatives on average;
+/// the exact cohort cardinality remains scheduler dependent.
+const V2_BATCH_RELEASE_GATE_MIN_STATUS_REPRESENTATIVES_PER_PROPOSAL: u64 = 2;
+const V2_BATCH_RELEASE_GATE_P99: Duration = Duration::from_millis(25);
+const V2_BATCH_RELEASE_GATE_P999: Duration = Duration::from_millis(100);
+const V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// All status-only reads for one ambiguous batch share this finite budget.
+/// This prevents a fast NotFound/Unavailable peer from spinning until an
+/// inner transport deadline happens to expire.
+const V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_ATTEMPT_LIMIT: usize = 64;
+const V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+const V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT: usize = 16;
+const V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deliberately shorter than the normal ten-second client operation bound.
+/// It is used only to causally expire one response after server durability;
+/// the immutable family deadline remains the existing 30-second bound.
+const V2_BATCH_RELEASE_GATE_CAUSAL_AMBIGUITY_OPERATION_TIMEOUT: Duration =
+    Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct V2StatusCohortAccountingDelta {
+    local: u64,
+    ingress: u64,
+    representatives: u64,
+    leader: u64,
+    proposals: u64,
+}
+
+fn verify_v2_status_cohort_accounting(
+    expected_local_per_voter: u64,
+    wave_count: u64,
+    maximum_cohorts_per_voter_wave: u64,
+    minimum_representatives_per_proposal: u64,
+    per_voter: &[V2StatusCohortAccountingDelta],
+) -> Result<(), String> {
+    if per_voter.is_empty()
+        || wave_count == 0
+        || maximum_cohorts_per_voter_wave == 0
+        || minimum_representatives_per_proposal == 0
+    {
+        return Err("V2 status cohort accounting profile is empty".to_owned());
+    }
+    let maximum_cohorts_per_voter = wave_count
+        .checked_mul(maximum_cohorts_per_voter_wave)
+        .ok_or_else(|| "V2 status cohort ceiling overflowed".to_owned())?;
+    let mut local = 0_u64;
+    let mut ingress = 0_u64;
+    let mut representatives = 0_u64;
+    let mut leader = 0_u64;
+    let mut proposals = 0_u64;
+    for (voter_index, delta) in per_voter.iter().enumerate() {
+        if delta.local != expected_local_per_voter {
+            return Err(format!(
+                "V2 status local dispatch is not exact: voter_index={voter_index}, observed={}, expected={expected_local_per_voter}",
+                delta.local
+            ));
+        }
+        if !(wave_count..=maximum_cohorts_per_voter).contains(&delta.ingress) {
+            return Err(format!(
+                "V2 status node-local cohort bound failed: voter_index={voter_index}, observed={}, minimum={wave_count}, maximum={maximum_cohorts_per_voter}",
+                delta.ingress
+            ));
+        }
+        if delta.representatives != delta.ingress {
+            return Err(format!(
+                "V2 status node-local representative accounting is not conserved: voter_index={voter_index}, ingress={}, representatives={}",
+                delta.ingress, delta.representatives
+            ));
+        }
+        local = local
+            .checked_add(delta.local)
+            .ok_or_else(|| "V2 status local accounting overflowed".to_owned())?;
+        ingress = ingress
+            .checked_add(delta.ingress)
+            .ok_or_else(|| "V2 status ingress accounting overflowed".to_owned())?;
+        representatives = representatives
+            .checked_add(delta.representatives)
+            .ok_or_else(|| "V2 status representative accounting overflowed".to_owned())?;
+        leader = leader
+            .checked_add(delta.leader)
+            .ok_or_else(|| "V2 status leader accounting overflowed".to_owned())?;
+        proposals = proposals
+            .checked_add(delta.proposals)
+            .ok_or_else(|| "V2 status proposal accounting overflowed".to_owned())?;
+    }
+    if ingress > local {
+        return Err(format!(
+            "V2 status ingress amplified local dispatch: local={local}, ingress={ingress}"
+        ));
+    }
+    if representatives != ingress || leader != representatives {
+        return Err(format!(
+            "V2 status voter-to-leader accounting is not conserved: ingress={ingress}, representatives={representatives}, leader={leader}"
+        ));
+    }
+    if proposals > leader {
+        return Err(format!(
+            "V2 status proposals amplified leader arrivals: leader={leader}, proposals={proposals}"
+        ));
+    }
+    let voter_count = u64::try_from(per_voter.len())
+        .map_err(|_| "V2 status voter count does not fit u64".to_owned())?;
+    let minimum_proposals = leader.div_ceil(voter_count);
+    if proposals < minimum_proposals {
+        return Err(format!(
+            "V2 status proposal accounting is incomplete: leader={leader}, voters={voter_count}, proposals={proposals}, minimum={minimum_proposals}"
+        ));
+    }
+    let proposal_storm_ceiling = leader / minimum_representatives_per_proposal;
+    if proposals > proposal_storm_ceiling {
+        return Err(format!(
+            "V2 status proposal storm ceiling exceeded: leader={leader}, proposals={proposals}, maximum={proposal_storm_ceiling}, minimum_representatives_per_proposal={minimum_representatives_per_proposal}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn v2_status_cohort_accounting_accepts_fragmentation_and_rejects_attempt_storms() {
+    let qualified = [
+        V2StatusCohortAccountingDelta {
+            local: 336,
+            ingress: 42,
+            representatives: 42,
+            leader: 126,
+            proposals: 44,
+        },
+        V2StatusCohortAccountingDelta {
+            local: 336,
+            ingress: 42,
+            representatives: 42,
+            leader: 0,
+            proposals: 0,
+        },
+        V2StatusCohortAccountingDelta {
+            local: 336,
+            ingress: 42,
+            representatives: 42,
+            leader: 0,
+            proposals: 0,
+        },
+    ];
+    verify_v2_status_cohort_accounting(336, 21, 2, 2, &qualified)
+        .expect("scheduler-fragmented but bounded status cohorts qualify");
+
+    for (failure, mutate) in [
+        (
+            "local dispatch mismatch",
+            (|deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[1].local -= 1)
+                as fn(&mut [V2StatusCohortAccountingDelta; 3]),
+        ),
+        (
+            "node-local singleton storm",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| {
+                deltas[1].ingress = 43;
+                deltas[1].representatives = 43;
+                deltas[0].leader = 127;
+            },
+        ),
+        (
+            "representative amplification",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| {
+                deltas[1].representatives += 1;
+                deltas[0].leader += 1;
+            },
+        ),
+        (
+            "leader amplification",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[0].leader += 1,
+        ),
+        (
+            "proposal amplification",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[0].proposals = 127,
+        ),
+        (
+            "proposal singleton storm",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[0].proposals = 64,
+        ),
+    ] {
+        let mut invalid = qualified;
+        mutate(&mut invalid);
+        assert!(
+            verify_v2_status_cohort_accounting(336, 21, 2, 2, &invalid).is_err(),
+            "status cohort verifier accepted {failure}"
+        );
+    }
+}
+
+fn assert_v2_batch_release_profile() {
+    let cargo_profile = env!("OPC_SESSION_TESTKIT_CARGO_PROFILE_FAMILY");
+    let opt_level = env!("OPC_SESSION_TESTKIT_CARGO_OPT_LEVEL");
+    ensure_v2_batch_release_feature_profile()
+        .expect("the V2 batch release gate requires a production feature profile");
+    println!(
+        "V2_BATCH_RELEASE_GATE_PROFILE profile={cargo_profile:?} opt_level={opt_level:?} debug_assertions={} foundation_insecure={}",
+        cfg!(debug_assertions),
+        cfg!(feature = "foundation-insecure"),
+    );
+    assert_eq!(
+        cargo_profile, "release",
+        "the V2 batch release gate requires Cargo's release profile"
+    );
+    assert_eq!(
+        opt_level, "3",
+        "the V2 batch release gate requires Cargo release opt-level 3"
+    );
+    assert!(
+        !std::hint::black_box(cfg!(debug_assertions)),
+        "the V2 batch release gate requires debug assertions disabled"
+    );
+}
+
+fn qualification_v2_batch_percentile(
+    samples: &mut [Duration],
+    numerator: usize,
+    denominator: usize,
+) -> Duration {
+    assert!(!samples.is_empty(), "latency sample set is nonempty");
+    assert!(numerator > 0 && numerator <= denominator);
+    samples.sort_unstable();
+    let rank = samples
+        .len()
+        .saturating_mul(numerator)
+        .div_ceil(denominator)
+        .saturating_sub(1);
+    samples[rank]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualificationV2BatchSampleFailure {
+    InvalidSuccessResponse,
+    TypedStoreError,
+    TypedOutcomeUnknown,
+    UnexpectedTypedError,
+    MismatchedResponse,
+    NotTransmittedRetryExhausted,
+    UnexpectedTransportError,
+}
+
+fn qualification_checked_elapsed(
+    completed_at: Instant,
+    scheduled_at: Instant,
+) -> Result<Duration, QualificationV2BatchSampleFailure> {
+    completed_at
+        .checked_duration_since(scheduled_at)
+        .ok_or(QualificationV2BatchSampleFailure::UnexpectedTransportError)
+}
+
+#[test]
+fn v2_batch_elapsed_rejects_causal_clock_inversion() {
+    let completed = Instant::now();
+    let scheduled = completed
+        .checked_add(Duration::from_millis(1))
+        .expect("fixed inversion offset is representable");
+    assert_eq!(
+        qualification_checked_elapsed(completed, scheduled),
+        Err(QualificationV2BatchSampleFailure::UnexpectedTransportError)
+    );
+}
+
+fn qualification_assert_v2_batch_response(
+    requests: &[FencedTransitionV2Request],
+    response: SessionConsumerV2Response,
+) -> Result<(), QualificationV2BatchSampleFailure> {
+    match response {
+        SessionConsumerV2Response::FencedTransitionV2Batch(Ok(results)) => {
+            if results.len() != requests.len() {
+                return Err(QualificationV2BatchSampleFailure::InvalidSuccessResponse);
+            }
+            let encoded =
+                opc_consensus::encode_bounded(&results).map_err(|_| QualificationV2BatchSampleFailure::InvalidSuccessResponse)?;
+            if encoded.len() > MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES {
+                return Err(QualificationV2BatchSampleFailure::InvalidSuccessResponse);
+            }
+            for (request, result) in requests.iter().zip(results) {
+                if result.request_id() != request.request_id()
+                    || !result
+                        .result()
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.matches_v2_request(request))
+                {
+                    return Err(QualificationV2BatchSampleFailure::InvalidSuccessResponse);
+                }
+            }
+            Ok(())
+        }
+        SessionConsumerV2Response::FencedTransitionV2Batch(Err(error)) => match error {
+            opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError::Store(
+                _,
+            ) => Err(QualificationV2BatchSampleFailure::TypedStoreError),
+            opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError::OutcomeUnknown {
+                ..
+            } => Err(QualificationV2BatchSampleFailure::TypedOutcomeUnknown),
+            _ => Err(QualificationV2BatchSampleFailure::UnexpectedTypedError),
+        },
+        _ => Err(QualificationV2BatchSampleFailure::MismatchedResponse),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2BatchMutationResolution {
+    Recorded,
+    NotTransmitted(SessionConsumerClientError),
+    OutcomeUnknown,
+}
+
+/// A redispatch is permitted only when the exact pre-write cause is the
+/// backend-unavailable classification.  All other typed failures remain
+/// terminal evidence for this bounded qualification dispatcher.
+const fn qualification_v2_batch_retryable_prewrite_cause(
+    cause: SessionConsumerClientError,
+) -> bool {
+    matches!(cause, SessionConsumerClientError::Unavailable)
+}
+
+/// Full qualification batch policy with injected transport seams. Production
+/// and the paused causal regression both use this exact dispatcher, so the
+/// test proves the dispatch-to-status boundary rather than a disconnected
+/// counter model.
+async fn qualification_execute_v2_batch_sample_with<M, MF, S, SF>(
+    request_count: usize,
+    scheduled_at: Instant,
+    deadline: tokio::time::Instant,
+    mut mutation: M,
+    status: S,
+) -> Result<(Duration, bool, usize, V2BatchStatusRetryCounts), QualificationV2BatchSampleFailure>
+where
+    M: FnMut() -> MF,
+    MF: std::future::Future<
+        Output = Result<V2BatchMutationResolution, QualificationV2BatchSampleFailure>,
+    >,
+    S: FnMut(usize) -> SF,
+    SF: std::future::Future<
+        Output = Result<V2BatchStatusResolution, QualificationV2BatchSampleFailure>,
+    >,
+{
+    assert!(
+        (1..=MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS).contains(&request_count),
+        "release-gate batch remains within the protocol operation bound"
+    );
+    let mut not_transmitted_retries = 0usize;
+    let recovered_unknown = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted);
+        }
+        let outcome = tokio::time::timeout_at(deadline, mutation())
+            .await
+            .map_err(|_| QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted)?;
+        match outcome {
+            Ok(V2BatchMutationResolution::Recorded) => break false,
+            Ok(V2BatchMutationResolution::NotTransmitted(cause))
+                if qualification_v2_batch_retryable_prewrite_cause(cause) =>
+            {
+                if not_transmitted_retries >= V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT {
+                    return Err(QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted);
+                }
+                not_transmitted_retries += 1;
+                tokio::time::sleep_until(
+                    tokio::time::Instant::now()
+                        .checked_add(V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_RETRY_BACKOFF)
+                        .expect("fixed mutation retry backoff is representable")
+                        .min(deadline),
+                )
+                .await;
+            }
+            Ok(V2BatchMutationResolution::NotTransmitted(_)) => {
+                return Err(QualificationV2BatchSampleFailure::UnexpectedTransportError);
+            }
+            Ok(V2BatchMutationResolution::OutcomeUnknown) => break true,
+            Err(error) => return Err(error),
+        }
+    };
+    let status_retries = if recovered_unknown {
+        qualification_resolve_v2_batch_outcome_unknown_with(request_count, deadline, status, None)
+            .await?
+    } else {
+        V2BatchStatusRetryCounts::default()
+    };
+    let completed_at = Instant::now();
+    // A status sample whose completion precedes its scheduling point is a
+    // causal inversion, not a zero-duration success.  Reuse the same
+    // fail-closed conversion covered by the regression below.
+    let elapsed = qualification_checked_elapsed(completed_at, scheduled_at)?;
+    Ok((
+        elapsed,
+        recovered_unknown,
+        not_transmitted_retries,
+        status_retries,
+    ))
+}
+
+async fn qualification_execute_v2_batch_sample(
+    client: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    requests: Vec<FencedTransitionV2Request>,
+    scheduled_at: Instant,
+) -> Result<(Duration, bool, usize, V2BatchStatusRetryCounts), QualificationV2BatchSampleFailure> {
+    let encoded = opc_consensus::encode_bounded(&requests).expect("bounded V2 batch encodes");
+    assert!(
+        encoded.len() <= MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+        "V2 batch stays below its fixed consumer/consensus request cap"
+    );
+    let deadline = tokio::time::Instant::now() + V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT;
+    let mutation_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: requests.clone(),
+        },
+    );
+    qualification_execute_v2_batch_sample_with(
+        requests.len(),
+        scheduled_at,
+        deadline,
+        {
+            let client = client.clone();
+            let requests = requests.clone();
+            move || {
+                let client = client.clone();
+                let request = mutation_request.clone();
+                let requests = requests.clone();
+                async move {
+                    match client.execute_v2(&request).await {
+                        Ok(response) => {
+                            qualification_assert_v2_batch_response(&requests, response)?;
+                            Ok(V2BatchMutationResolution::Recorded)
+                        }
+                        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }) => {
+                            Ok(V2BatchMutationResolution::NotTransmitted(cause))
+                        }
+                        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch {
+                            request_ids,
+                        }) if request_ids
+                            == requests
+                                .iter()
+                                .map(FencedTransitionV2Request::request_id)
+                                .collect::<Vec<_>>() =>
+                        {
+                            Ok(V2BatchMutationResolution::OutcomeUnknown)
+                        }
+                        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch {
+                            ..
+                        }) => Err(QualificationV2BatchSampleFailure::UnexpectedTransportError),
+                        Err(_) => Err(QualificationV2BatchSampleFailure::UnexpectedTransportError),
+                    }
+                }
+            }
+        },
+        {
+            let client = client.clone();
+            let requests = requests.clone();
+            move |index| {
+                let client = client.clone();
+                let transition = requests[index].clone();
+                async move {
+                    let status_request = SessionConsumerV2Request::new(
+                        scope,
+                        SessionConsumerV2Operation::FencedTransitionV2Status {
+                            request: Box::new(transition.clone()),
+                        },
+                    );
+                    match client.execute_v2(&status_request).await {
+                        Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                            SessionConsumerV2FencedTransitionStatus::Recorded(result),
+                        ))) if result
+                            .as_ref()
+                            .as_ref()
+                            .is_ok_and(|outcome| outcome.matches_v2_request(&transition)) =>
+                        {
+                            Ok(V2BatchStatusResolution::Terminal)
+                        }
+                        Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                            SessionConsumerV2FencedTransitionStatus::NotFound,
+                        ))) => Ok(V2BatchStatusResolution::Retry(
+                            V2BatchStatusRetryCause::NotFound,
+                        )),
+                        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                            cause: SessionConsumerClientError::Unavailable,
+                        }) => Ok(V2BatchStatusResolution::Retry(
+                            V2BatchStatusRetryCause::NotTransmitted,
+                        )),
+                        Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+                            cause: SessionConsumerClientError::Unavailable,
+                        }) => Ok(V2BatchStatusResolution::Retry(
+                            V2BatchStatusRetryCause::ReadUnavailable,
+                        )),
+                        Ok(response)
+                            if qualification_v2_batch_status_is_retryable_unavailable(
+                                &response,
+                            ) =>
+                        {
+                            Ok(V2BatchStatusResolution::Retry(
+                                V2BatchStatusRetryCause::TypedUnavailable,
+                            ))
+                        }
+                        _ => Err(QualificationV2BatchSampleFailure::UnexpectedTransportError),
+                    }
+                }
+            }
+        },
+    )
+    .await
+}
+
+/// Bounded, status-only ambiguity retry accounting.  The total is retained
+/// alongside each independently observable retry cause so evidence cannot
+/// relabel status recovery as a client transport queue measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct V2BatchStatusRetryCounts {
+    attempts_total: usize,
+    terminal_attempts: usize,
+    total: usize,
+    not_found: usize,
+    not_transmitted: usize,
+    read_unavailable: usize,
+    typed_unavailable: usize,
+}
+
+impl V2BatchStatusRetryCounts {
+    fn record_attempt(&mut self) {
+        self.attempts_total = self
+            .attempts_total
+            .checked_add(1)
+            .expect("bounded status attempt counter fits usize");
+    }
+
+    fn record_terminal(&mut self) {
+        self.terminal_attempts = self
+            .terminal_attempts
+            .checked_add(1)
+            .expect("bounded terminal status counter fits usize");
+    }
+
+    fn record(&mut self, cause: V2BatchStatusRetryCause) {
+        self.total = self
+            .total
+            .checked_add(1)
+            .expect("bounded status retry counter fits usize");
+        match cause {
+            V2BatchStatusRetryCause::NotFound => {
+                self.not_found = self
+                    .not_found
+                    .checked_add(1)
+                    .expect("bounded not-found status counter fits usize")
+            }
+            V2BatchStatusRetryCause::NotTransmitted => {
+                self.not_transmitted = self
+                    .not_transmitted
+                    .checked_add(1)
+                    .expect("bounded not-transmitted status counter fits usize")
+            }
+            V2BatchStatusRetryCause::ReadUnavailable => {
+                self.read_unavailable = self
+                    .read_unavailable
+                    .checked_add(1)
+                    .expect("bounded unavailable-read status counter fits usize")
+            }
+            V2BatchStatusRetryCause::TypedUnavailable => {
+                self.typed_unavailable = self
+                    .typed_unavailable
+                    .checked_add(1)
+                    .expect("bounded typed-unavailable status counter fits usize")
+            }
+        }
+    }
+
+    fn accumulate(&mut self, other: Self) {
+        self.attempts_total = self
+            .attempts_total
+            .checked_add(other.attempts_total)
+            .expect("bounded aggregate status attempts fit usize");
+        self.terminal_attempts = self
+            .terminal_attempts
+            .checked_add(other.terminal_attempts)
+            .expect("bounded aggregate terminal status attempts fit usize");
+        self.total = self
+            .total
+            .checked_add(other.total)
+            .expect("bounded aggregate status retries fit usize");
+        self.not_found = self
+            .not_found
+            .checked_add(other.not_found)
+            .expect("bounded aggregate not-found status retries fit usize");
+        self.not_transmitted = self
+            .not_transmitted
+            .checked_add(other.not_transmitted)
+            .expect("bounded aggregate not-transmitted status retries fit usize");
+        self.read_unavailable = self
+            .read_unavailable
+            .checked_add(other.read_unavailable)
+            .expect("bounded aggregate unavailable-read status retries fit usize");
+        self.typed_unavailable = self
+            .typed_unavailable
+            .checked_add(other.typed_unavailable)
+            .expect("bounded aggregate typed-unavailable status retries fit usize");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2BatchStatusRetryCause {
+    NotFound,
+    NotTransmitted,
+    ReadUnavailable,
+    TypedUnavailable,
+}
+
+/// The release gate retains its caller-owned IDs through every effect boundary.
+/// This deliberately records per-ID attempts rather than inferring retries from
+/// an aggregate pool counter: an OutcomeUnknown ID may only be read afterward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2BatchMutationTerminal {
+    NotTransmitted(SessionConsumerClientError),
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone)]
+struct V2BatchAttemptLedgerEntry {
+    request_id: FencedTransitionV2RequestId,
+    mutation_attempts: usize,
+    effect_accepted: bool,
+    mutation_terminal: Option<V2BatchMutationTerminal>,
+    status_attempts: usize,
+    status_terminal: bool,
+}
+
+/// Bounded exactly by the wire batch cardinality. A caller can neither add an
+/// unobserved ID nor silently replay an ambiguous one.
+#[derive(Debug, Clone)]
+struct V2BatchAttemptLedger {
+    entries: Vec<V2BatchAttemptLedgerEntry>,
+}
+
+impl V2BatchAttemptLedger {
+    fn new(requests: &[FencedTransitionV2Request]) -> Self {
+        assert!(
+            (1..=MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS).contains(&requests.len()),
+            "the per-ID ledger is bounded by one protocol batch"
+        );
+        let entries = requests
+            .iter()
+            .map(|request| V2BatchAttemptLedgerEntry {
+                request_id: request.request_id(),
+                mutation_attempts: 0,
+                effect_accepted: false,
+                mutation_terminal: None,
+                status_attempts: 0,
+                status_terminal: false,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            entries
+                .iter()
+                .enumerate()
+                .all(|(index, entry)| entries[..index]
+                    .iter()
+                    .all(|previous| previous.request_id != entry.request_id)),
+            "a batch ledger rejects duplicate caller-owned IDs"
+        );
+        Self { entries }
+    }
+
+    fn record_mutation_dispatch(&mut self) {
+        for entry in &mut self.entries {
+            assert!(
+                !matches!(
+                    entry.mutation_terminal,
+                    Some(V2BatchMutationTerminal::OutcomeUnknown)
+                ),
+                "an OutcomeUnknown ID is status-only and can never redispatch"
+            );
+            entry.mutation_attempts = entry
+                .mutation_attempts
+                .checked_add(1)
+                .expect("bounded per-ID mutation attempts fit usize");
+        }
+    }
+
+    fn record_mutation_terminal(&mut self, terminal: V2BatchMutationTerminal) {
+        for entry in &mut self.entries {
+            assert!(
+                entry.mutation_attempts > 0,
+                "a terminal effect has a dispatch"
+            );
+            assert!(
+                entry.mutation_terminal.is_none(),
+                "one terminal classification per ID"
+            );
+            assert!(
+                !matches!(terminal, V2BatchMutationTerminal::OutcomeUnknown)
+                    || entry.effect_accepted,
+                "OutcomeUnknown follows the observed durable effect boundary"
+            );
+            entry.mutation_terminal = Some(terminal);
+        }
+    }
+
+    fn record_durable_acceptance(&mut self) {
+        for entry in &mut self.entries {
+            assert!(
+                entry.mutation_attempts > 0,
+                "a durable acceptance has a dispatch"
+            );
+            assert!(
+                entry.mutation_terminal.is_none(),
+                "acceptance precedes terminal classification"
+            );
+            entry.effect_accepted = true;
+        }
+    }
+
+    fn record_status_attempt(&mut self, request_index: usize) {
+        let entry = self
+            .entries
+            .get_mut(request_index)
+            .expect("status index is retained");
+        assert!(
+            matches!(
+                entry.mutation_terminal,
+                Some(V2BatchMutationTerminal::OutcomeUnknown)
+            ),
+            "only OutcomeUnknown IDs enter the status-only recovery seam"
+        );
+        entry.status_attempts = entry
+            .status_attempts
+            .checked_add(1)
+            .expect("bounded per-ID status attempts fit usize");
+    }
+
+    fn record_status_terminal(&mut self, request_index: usize) {
+        let entry = self
+            .entries
+            .get_mut(request_index)
+            .expect("status index is retained");
+        assert!(
+            entry.status_attempts > 0,
+            "terminal status follows a retained-ID read"
+        );
+        entry.status_terminal = true;
+    }
+
+    fn outcome_unknown_cardinality(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.mutation_terminal,
+                    Some(V2BatchMutationTerminal::OutcomeUnknown)
+                )
+            })
+            .count()
+    }
+
+    fn post_outcome_unknown_mutation_dispatches(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.mutation_terminal,
+                    Some(V2BatchMutationTerminal::OutcomeUnknown)
+                ) && entry.mutation_attempts > 1
+            })
+            .count()
+    }
+
+    fn recovered_outcome_unknown_families(&self) -> usize {
+        usize::from(
+            self.outcome_unknown_cardinality() > 0
+                && self
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.mutation_terminal,
+                            Some(V2BatchMutationTerminal::OutcomeUnknown)
+                        )
+                    })
+                    .all(|entry| entry.status_terminal),
+        )
+    }
+
+    fn actual_redispatches(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .mutation_attempts
+                    .checked_sub(1)
+                    .expect("a ledger terminal always follows an initial dispatch")
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+#[tokio::test]
+async fn v2_batch_attempt_ledger_conserves_twelve_ambiguous_ids_and_rejects_replay() {
+    let requests = futures_util::future::join_all(
+        (0..V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE)
+            .map(|index| qualification_fenced_transition_v2_request(3, index)),
+    )
+    .await;
+    let mut ambiguous = V2BatchAttemptLedger::new(&requests);
+    ambiguous.record_mutation_dispatch();
+    ambiguous.record_durable_acceptance();
+    ambiguous.record_mutation_terminal(V2BatchMutationTerminal::OutcomeUnknown);
+    let deadline = tokio::time::Instant::now() + V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT;
+    let status_counts = qualification_resolve_v2_batch_outcome_unknown_with(
+        requests.len(),
+        deadline,
+        |_| async { Ok(V2BatchStatusResolution::Terminal) },
+        Some(&mut ambiguous),
+    )
+    .await
+    .expect("the retained IDs resolve through the real status-only seam");
+    assert_eq!(status_counts.attempts_total, 12);
+    assert_eq!(status_counts.terminal_attempts, 12);
+    assert_eq!(ambiguous.outcome_unknown_cardinality(), 12);
+    assert_eq!(ambiguous.post_outcome_unknown_mutation_dispatches(), 0);
+    assert_eq!(ambiguous.recovered_outcome_unknown_families(), 1);
+    assert_eq!(ambiguous.actual_redispatches(), 0);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ambiguous.record_mutation_dispatch();
+        }))
+        .is_err(),
+        "an ambiguous retained ID must never re-enter the mutation dispatcher"
+    );
+
+    let mut overload = V2BatchAttemptLedger::new(&requests);
+    overload.record_mutation_dispatch();
+    overload.record_mutation_terminal(V2BatchMutationTerminal::NotTransmitted(
+        SessionConsumerClientError::Overloaded,
+    ));
+    assert_eq!(overload.actual_redispatches(), 0);
+    assert!(overload
+        .entries
+        .iter()
+        .all(|entry| entry.mutation_attempts == 1));
+}
+
+/// One immutable recovery family shared by the initial mutation dispatch,
+/// every proven-not-transmitted retry, and all status-only recovery work.
+/// The status cap is deliberately aggregate rather than per retained ID.
+#[derive(Debug, Clone, Copy)]
+struct V2BatchAmbiguityBudget {
+    deadline: tokio::time::Instant,
+    status_attempts: usize,
+}
+
+impl V2BatchAmbiguityBudget {
+    fn new(deadline: tokio::time::Instant) -> Self {
+        Self {
+            deadline,
+            status_attempts: 0,
+        }
+    }
+
+    fn take_status_attempt(&mut self) -> bool {
+        if self.status_attempts >= V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_ATTEMPT_LIMIT {
+            return false;
+        }
+        self.status_attempts += 1;
+        true
+    }
+
+    fn clipped_retry_at(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+            .checked_add(V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_RETRY_BACKOFF)
+            .expect("fixed status retry backoff is representable")
+            .min(self.deadline)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn v2_batch_ambiguity_recovery_uses_one_real_aggregate_budget_and_deadline() {
+    use std::sync::atomic::AtomicUsize;
+
+    let deadline = tokio::time::Instant::now() + V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT;
+    // Model the one allowed proven-not-transmitted replay before the transport
+    // reports OutcomeUnknownBatch. The injected status seam below is the same
+    // helper production uses; it must never dispatch another mutation.
+    let mutation_dispatches = Arc::new(AtomicUsize::new(1));
+    tokio::time::sleep_until(
+        tokio::time::Instant::now()
+            .checked_add(V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_RETRY_BACKOFF)
+            .expect("fixed retry backoff is representable")
+            .min(deadline),
+    )
+    .await;
+    mutation_dispatches.fetch_add(1, Ordering::SeqCst);
+    let status_calls = Arc::new(AtomicUsize::new(0));
+    let calls_per_id = Arc::new(Mutex::new(vec![0usize; 12]));
+    let causes = [
+        V2BatchStatusRetryCause::NotFound,
+        V2BatchStatusRetryCause::NotTransmitted,
+        V2BatchStatusRetryCause::ReadUnavailable,
+        V2BatchStatusRetryCause::TypedUnavailable,
+    ];
+    let counts = qualification_resolve_v2_batch_outcome_unknown_with(
+        12,
+        deadline,
+        {
+            let status_calls = Arc::clone(&status_calls);
+            let calls_per_id = Arc::clone(&calls_per_id);
+            move |request_index| {
+                let status_calls = Arc::clone(&status_calls);
+                let calls_per_id = Arc::clone(&calls_per_id);
+                async move {
+                    status_calls.fetch_add(1, Ordering::SeqCst);
+                    let attempt = {
+                        let mut attempts = calls_per_id.lock().expect("script lock");
+                        let attempt = attempts[request_index];
+                        attempts[request_index] = attempt.saturating_add(1);
+                        attempt
+                    };
+                    // Four IDs consume five retry causes and the other eight four;
+                    // together with twelve terminal reads this is exactly 64.
+                    let retries_before_terminal = if request_index < 4 { 5 } else { 4 };
+                    Ok(if attempt < retries_before_terminal {
+                        V2BatchStatusResolution::Retry(
+                            causes[(request_index + attempt) % causes.len()],
+                        )
+                    } else {
+                        V2BatchStatusResolution::Terminal
+                    })
+                }
+            }
+        },
+        None,
+    )
+    .await
+    .expect("scripted terminal receipt reads fit the one aggregate budget");
+    assert_eq!(
+        counts.attempts_total,
+        V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_ATTEMPT_LIMIT
+    );
+    assert_eq!(
+        counts.total + counts.terminal_attempts,
+        counts.attempts_total
+    );
+    assert_eq!(counts.terminal_attempts, 12);
+    assert_eq!(
+        counts.not_found
+            + counts.not_transmitted
+            + counts.read_unavailable
+            + counts.typed_unavailable,
+        counts.total
+    );
+    assert!(counts.not_found > 0 && counts.not_transmitted > 0);
+    assert!(counts.read_unavailable > 0 && counts.typed_unavailable > 0);
+    assert_eq!(status_calls.load(Ordering::SeqCst), 64);
+    assert_eq!(
+        mutation_dispatches.load(Ordering::SeqCst),
+        2,
+        "after OutcomeUnknownBatch, recovery is status-only and cannot redispatch"
+    );
+    assert!(tokio::time::Instant::now() <= deadline);
+
+    let expiry = tokio::time::Instant::now() + V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_RETRY_BACKOFF;
+    let expiry_calls = Arc::new(AtomicUsize::new(0));
+    let expired = qualification_resolve_v2_batch_outcome_unknown_with(
+        12,
+        expiry,
+        {
+            let expiry_calls = Arc::clone(&expiry_calls);
+            move |_| {
+                let expiry_calls = Arc::clone(&expiry_calls);
+                async move {
+                    expiry_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(V2BatchStatusResolution::Retry(
+                        V2BatchStatusRetryCause::NotFound,
+                    ))
+                }
+            }
+        },
+        None,
+    )
+    .await;
+    assert_eq!(
+        expired,
+        Err(QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted)
+    );
+    assert_eq!(expiry_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tokio::time::Instant::now(), expiry);
+}
+
+#[tokio::test(start_paused = true)]
+async fn v2_batch_sample_causally_recovers_one_expired_durable_response_without_redispatch() {
+    use std::sync::atomic::AtomicUsize;
+
+    let family_deadline =
+        tokio::time::Instant::now() + V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT;
+    let trace = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let mutation_dispatches = Arc::new(AtomicUsize::new(0));
+    let status_calls = Arc::new(AtomicUsize::new(0));
+    let outcome = qualification_execute_v2_batch_sample_with(
+        12,
+        Instant::now(),
+        family_deadline,
+        {
+            let trace = Arc::clone(&trace);
+            let mutation_dispatches = Arc::clone(&mutation_dispatches);
+            move || {
+                let trace = Arc::clone(&trace);
+                let mutation_dispatches = Arc::clone(&mutation_dispatches);
+                async move {
+                    assert_eq!(mutation_dispatches.fetch_add(1, Ordering::SeqCst), 0);
+                    trace.lock().expect("trace lock").push("dispatch");
+                    // The server has durably accepted this exact batch, but
+                    // its held response outlives the caller operation window.
+                    trace.lock().expect("trace lock").push("durable-accept");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    trace.lock().expect("trace lock").push("response-deadline");
+                    Ok(V2BatchMutationResolution::OutcomeUnknown)
+                }
+            }
+        },
+        {
+            let trace = Arc::clone(&trace);
+            let status_calls = Arc::clone(&status_calls);
+            move |_| {
+                let trace = Arc::clone(&trace);
+                let status_calls = Arc::clone(&status_calls);
+                async move {
+                    status_calls.fetch_add(1, Ordering::SeqCst);
+                    trace.lock().expect("trace lock").push("terminal-status");
+                    Ok(V2BatchStatusResolution::Terminal)
+                }
+            }
+        },
+    )
+    .await
+    .expect("one durable ambiguous family is classified before its retained deadline");
+    assert!(
+        outcome.1,
+        "the caller receives OutcomeUnknown after its deadline"
+    );
+    assert_eq!(outcome.2, 0, "no proven-not-transmitted replay was needed");
+    assert_eq!(outcome.3.attempts_total, 12);
+    assert_eq!(outcome.3.terminal_attempts, 12);
+    assert_eq!(status_calls.load(Ordering::SeqCst), 12);
+    assert_eq!(mutation_dispatches.load(Ordering::SeqCst), 1);
+    assert!(tokio::time::Instant::now() < family_deadline);
+    let trace = trace.lock().expect("trace lock");
+    assert_eq!(
+        &trace[..3],
+        ["dispatch", "durable-accept", "response-deadline"]
+    );
+    assert!(trace[3..].iter().all(|event| *event == "terminal-status"));
+}
+
+/// A confirmed status response can still report a retryable service outage.
+/// It is safe to retry because this operation only reads one caller-retained
+/// V2 receipt; all other status outcomes remain exact terminal evidence.
+fn qualification_v2_batch_status_is_retryable_unavailable(
+    response: &SessionConsumerV2Response,
+) -> bool {
+    matches!(
+        response,
+        SessionConsumerV2Response::FencedTransitionV2Status(Err(
+            SessionConsumerStoreError::Unavailable
+        )) | SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+    )
+}
+
+#[test]
+fn v2_batch_prewrite_retry_cause_matrix_is_exactly_backend_unavailable() {
+    assert!(qualification_v2_batch_retryable_prewrite_cause(
+        SessionConsumerClientError::Unavailable
+    ));
+    for cause in [
+        SessionConsumerClientError::Authentication,
+        SessionConsumerClientError::Scope,
+        SessionConsumerClientError::Protocol,
+        SessionConsumerClientError::Unsupported,
+        SessionConsumerClientError::Deadline,
+        SessionConsumerClientError::Overloaded,
+        SessionConsumerClientError::ShuttingDown,
+    ] {
+        assert!(
+            !qualification_v2_batch_retryable_prewrite_cause(cause),
+            "only a causal backend unavailable may redispatch: {cause:?}"
+        );
+    }
+}
+
+#[test]
+fn v2_batch_ambiguity_status_retries_only_confirmed_unavailable() {
+    for transient in [
+        SessionConsumerV2Response::FencedTransitionV2Status(Err(
+            SessionConsumerStoreError::Unavailable,
+        )),
+        SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable),
+    ] {
+        assert!(
+            qualification_v2_batch_status_is_retryable_unavailable(&transient),
+            "a confirmed V2 status outage is safe to retry without replaying the batch"
+        );
+    }
+
+    for terminal in [
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::RequestConflict,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Expired,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Retired,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::HistoryFull,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::EpochNotActive,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::RetentionExhausted,
+        )),
+        SessionConsumerV2Response::Rejected(SessionConsumerRejection::ScopeMismatch),
+    ] {
+        assert!(
+            !qualification_v2_batch_status_is_retryable_unavailable(&terminal),
+            "only confirmed service unavailability is retryable; exact terminal evidence remains fatal"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2BatchStatusResolution {
+    Terminal,
+    Retry(V2BatchStatusRetryCause),
+}
+
+/// Execute the production status-only recovery policy against an injected
+/// status operation. The callback is deliberately the only seam: all timing,
+/// aggregate accounting, and backoff remain shared with the real transport
+/// recovery below.
+async fn qualification_resolve_v2_batch_outcome_unknown_with<F, Fut>(
+    request_count: usize,
+    deadline: tokio::time::Instant,
+    mut status: F,
+    mut ledger: Option<&mut V2BatchAttemptLedger>,
+) -> Result<V2BatchStatusRetryCounts, QualificationV2BatchSampleFailure>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<V2BatchStatusResolution, QualificationV2BatchSampleFailure>,
+    >,
+{
+    let mut status_retries = V2BatchStatusRetryCounts::default();
+    let mut budget = V2BatchAmbiguityBudget::new(deadline);
+    for request_index in 0..request_count {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted);
+            }
+            if !budget.take_status_attempt() {
+                return Err(QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted);
+            }
+            if let Some(ledger) = ledger.as_deref_mut() {
+                ledger.record_status_attempt(request_index);
+            }
+            let resolution = tokio::time::timeout_at(deadline, status(request_index))
+                .await
+                .map_err(|_| QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted)??;
+            status_retries.record_attempt();
+            match resolution {
+                V2BatchStatusResolution::Terminal => {
+                    status_retries.record_terminal();
+                    if let Some(ledger) = ledger.as_deref_mut() {
+                        ledger.record_status_terminal(request_index);
+                    }
+                    break;
+                }
+                V2BatchStatusResolution::Retry(retry_cause) => {
+                    status_retries.record(retry_cause);
+                    tokio::time::sleep_until(budget.clipped_retry_at()).await;
+                }
+            }
+        }
+    }
+    Ok(status_retries)
+}
+
+async fn qualification_resolve_v2_batch_outcome_unknown(
+    client: &PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    requests: &[FencedTransitionV2Request],
+    deadline: tokio::time::Instant,
+    ledger: &mut V2BatchAttemptLedger,
+) -> V2BatchStatusRetryCounts {
+    let requests = requests.to_vec();
+    let client = client.clone();
+    qualification_resolve_v2_batch_outcome_unknown_with(
+        requests.len(),
+        deadline,
+        move |index| {
+            let client = client.clone();
+            let transition = requests[index].clone();
+            async move {
+                let status_request = SessionConsumerV2Request::new(
+                    scope,
+                    SessionConsumerV2Operation::FencedTransitionV2Status {
+                        request: Box::new(transition.clone()),
+                    },
+                );
+                match client.execute_v2(&status_request).await {
+                    Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                        SessionConsumerV2FencedTransitionStatus::Recorded(result),
+                    ))) if result
+                        .as_ref()
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.matches_v2_request(&transition)) =>
+                    {
+                        Ok(V2BatchStatusResolution::Terminal)
+                    }
+                    Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                        SessionConsumerV2FencedTransitionStatus::NotFound,
+                    ))) => Ok(V2BatchStatusResolution::Retry(
+                        V2BatchStatusRetryCause::NotFound,
+                    )),
+                    Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                        cause: SessionConsumerClientError::Unavailable,
+                    }) => Ok(V2BatchStatusResolution::Retry(
+                        V2BatchStatusRetryCause::NotTransmitted,
+                    )),
+                    Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+                        cause: SessionConsumerClientError::Unavailable,
+                    }) => Ok(V2BatchStatusResolution::Retry(
+                        V2BatchStatusRetryCause::ReadUnavailable,
+                    )),
+                    Ok(response)
+                        if qualification_v2_batch_status_is_retryable_unavailable(&response) =>
+                    {
+                        Ok(V2BatchStatusResolution::Retry(
+                            V2BatchStatusRetryCause::TypedUnavailable,
+                        ))
+                    }
+                    Ok(_) | Err(_) => {
+                        Err(QualificationV2BatchSampleFailure::UnexpectedTransportError)
+                    }
+                }
+            }
+        },
+        Some(ledger),
+    )
+    .await
+    .expect("ambiguous V2 batch status recovery stays within its immutable aggregate budget")
+}
+
+async fn qualification_execute_v2_status_sample(
+    client: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    transition: FencedTransitionV2Request,
+    scheduled_at: Instant,
+) -> Duration {
+    let response = client
+        .execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2Status {
+                request: Box::new(transition.clone()),
+            },
+        ))
+        .await
+        .expect("warm V2 status read has a typed response");
+    let completed_at = Instant::now();
+    assert!(matches!(
+        response,
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(result)
+        )) if result.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_v2_request(&transition))
+    ));
+    completed_at
+        .checked_duration_since(scheduled_at)
+        .expect("status sample completion cannot precede its scheduled boundary")
+}
+
+fn qualification_persistent_v2_client(
+    endpoints: Arc<Mutex<Vec<SocketAddr>>>,
+    node_index: usize,
+    voter_authority: SessionConsumerVoterAuthority,
+    identity: IdentityState,
+    pool_config: PersistentSessionConsumerConfig,
+    operation_timeout: Option<Duration>,
+) -> (
+    watch::Sender<Option<IdentityState>>,
+    PersistentSessionConsumerClient,
+) {
+    let (identity_sender, identity_receiver) = watch::channel(Some(identity));
+    let tls = TlsConfigBuilder::new(identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("bounded V2 seam client mTLS configuration");
+    let initial_endpoint = endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+    let resolved_endpoints = Arc::clone(&endpoints);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let endpoint = resolved_endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+        Box::pin(async move { Ok(endpoint) })
+    });
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
+        voter_authority,
+        tls,
+    );
+    let stateless = match operation_timeout {
+        Some(timeout) => stateless.with_operation_timeout(timeout),
+        None => stateless,
+    };
+    (
+        identity_sender,
+        PersistentSessionConsumerClient::try_from_stateless(stateless, pool_config)
+            .expect("bounded persistent V2 seam client"),
+    )
+}
+
+async fn qualification_assert_v2_active_history(
+    client: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    expected_entries: usize,
+) {
+    let response = client
+        .execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2HistoryState,
+        ))
+        .await
+        .expect("V2 active history response");
+    assert!(matches!(
+        response,
+        SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(state))
+            if state.active_epoch() == Some(FencedTransitionV2HistoryEpoch::new(1).expect("epoch one"))
+                && state.bound_entries() == expected_entries
+    ));
+}
+
+async fn qualification_build_v2_batches(
+    member_count: usize,
+    first_index: usize,
+    operation_count: usize,
+    batch_size: usize,
+) -> Vec<Vec<FencedTransitionV2Request>> {
+    assert!((1..=MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS).contains(&batch_size));
+    let mut batches = Vec::with_capacity(operation_count.div_ceil(batch_size));
+    let mut batch = Vec::with_capacity(batch_size);
+    for index in first_index..first_index.saturating_add(operation_count) {
+        batch.push(qualification_fenced_transition_v2_request(member_count, index).await);
+        if batch.len() == batch_size {
+            batches.push(std::mem::take(&mut batch));
+            batch = Vec::with_capacity(batch_size);
+        }
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+#[derive(Clone, Copy)]
+enum ConsumerQualificationMode {
+    Stateless,
+    Persistent,
+}
+
+impl ConsumerQualificationMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stateless => "stateless",
+            Self::Persistent => "persistent",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum QualificationConsumerClient {
+    Stateless(Box<StatelessSessionConsumerClient>),
+    Persistent(PersistentSessionConsumerClient),
+}
+
+#[derive(Debug)]
+enum QualificationConsumerExecuteError {
+    Stateless(SessionConsumerClientError),
+    Persistent(PersistentSessionConsumerExecuteError),
+}
+
+impl QualificationConsumerClient {
+    async fn execute(
+        &self,
+        request: SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, QualificationConsumerExecuteError> {
+        match self {
+            Self::Stateless(client) => client
+                .execute(request)
+                .await
+                .map_err(QualificationConsumerExecuteError::Stateless),
+            Self::Persistent(client) => client
+                .execute(&request)
+                .await
+                .map_err(QualificationConsumerExecuteError::Persistent),
+        }
+    }
+
+    async fn capabilities(&self) -> Result<BackendCapabilities, SessionConsumerClientError> {
+        match self {
+            Self::Stateless(client) => client.capabilities().await,
+            Self::Persistent(client) => client.capabilities().await,
+        }
+    }
+
+    async fn acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, SessionConsumerLeaseMutationError> {
+        match self {
+            Self::Stateless(client) => client.acquire_with_id(request_id, key, owner, ttl).await,
+            Self::Persistent(client) => client.acquire_with_id(request_id, &key, &owner, ttl).await,
+        }
+    }
+
+    async fn lease_mutation_status(
+        &self,
+        request: &SessionConsumerLeaseMutationRequest,
+    ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+        match self {
+            Self::Stateless(client) => client.lease_mutation_status(request).await,
+            Self::Persistent(client) => client.lease_mutation_status(request).await,
+        }
+    }
+
+    async fn prewarm(&self) -> Result<bool, SessionConsumerClientError> {
+        match self {
+            Self::Stateless(_) => Ok(true),
+            Self::Persistent(client) => Ok(client.prewarm().await?.ready),
+        }
+    }
+
+    async fn persistent_setup_and_reuse(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Stateless(_) => None,
+            Self::Persistent(client) => {
+                let diagnostics = client.diagnostics().await;
+                Some((diagnostics.setup_successes, diagnostics.reused))
+            }
+        }
+    }
+
+    async fn shutdown(&self) {
+        if let Self::Persistent(client) = self {
+            let report = client.shutdown().await;
+            assert_eq!(report.forced_calls, 0);
+            assert_eq!(report.forced_watches, 0);
+        }
+    }
+}
+
+struct PersistentConsumerRunMeasurements {
+    /// The one release-only source binding captured before the first `/1` and
+    /// `/3` campaign. Lightweight runs deliberately carry no such binding.
+    release_provenance: Option<ReleaseGateProvenance>,
+    authenticated_setup_successes: u64,
+    warm_reused_calls: u64,
+    protected_roster_setup_successes: u64,
+    tenant_positive_observations: u8,
+    tenant_negative_boundary_rejections: u8,
+    scope_positive_observations: u8,
+    scope_negative_boundary_rejections: u8,
+    fence_positive_observations: u8,
+    fence_negative_boundary_rejections: u8,
+    initial_processes: u8,
+    unclean_process_losses: u8,
+    restarted_processes: u8,
+    observed_process_generations: u8,
+    general_lane: PersistentConsumerLaneMeasurements,
+    protected_roster_lane: PersistentConsumerLaneMeasurements,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PersistentConsumerLaneMeasurements {
+    admission_operations: u8,
+    status_operations: u8,
+    before_leader_loss_operations: u8,
+    after_leader_loss_operations: u8,
+    after_restart_operations: u8,
+    after_voter_loss_operations: u8,
+    tenant_positive_observations: u8,
+    tenant_negative_boundary_rejections: u8,
+    scope_positive_observations: u8,
+    scope_negative_boundary_rejections: u8,
+    fence_positive_observations: u8,
+    fence_negative_boundary_rejections: u8,
+}
+
+/// Count the protected foreign-tenant boundary only when the ingress returns
+/// its deliberate non-oracular result. An ungranted projected-root identity
+/// is closed before Hello as `Unavailable`, so callers cannot distinguish
+/// tenant membership from any other denied role.
+fn protected_tenant_boundary_observation(
+    result: &Result<
+        opc_session_net::PersistentSessionConsumerReadiness,
+        SessionConsumerClientError,
+    >,
+) -> u8 {
+    u8::from(matches!(
+        result,
+        Err(SessionConsumerClientError::Unavailable)
+    ))
+}
+
+/// Only the two observations that can still be ambiguous after a confirmed
+/// outcome-unknown mutation may consume the bounded receipt-recovery retry.
+/// Every typed rejection, authorization/scope/protocol failure, or durable
+/// negative receipt is terminal for this retained request body.
+fn lease_receipt_recovery_is_retryable(
+    result: &Result<SessionConsumerLeaseMutationStatus, StoreError>,
+) -> bool {
+    matches!(
+        result,
+        Ok(SessionConsumerLeaseMutationStatus::NotFound) | Err(StoreError::BackendUnavailable(_))
+    )
+}
+
+/// The tenant negative is a deliberately non-oracular `Unavailable`, so its
+/// surrounding same-voter controls must prove that the retained protected
+/// capsule is still *admitted*. A terminal or compacted read is a successful
+/// transport call, but cannot credit that availability/authority bracket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtectedRosterStatusClass {
+    Admitted,
+    Terminal,
+    Compacted,
+}
+
+fn protected_roster_status_class(
+    outcome: &opc_session_net::FencedMutationRosterRecoveryOutcome,
+) -> ProtectedRosterStatusClass {
+    match outcome {
+        opc_session_net::FencedMutationRosterRecoveryOutcome::Admitted(_) => {
+            ProtectedRosterStatusClass::Admitted
+        }
+        opc_session_net::FencedMutationRosterRecoveryOutcome::Terminal(_) => {
+            ProtectedRosterStatusClass::Terminal
+        }
+        opc_session_net::FencedMutationRosterRecoveryOutcome::Compacted => {
+            ProtectedRosterStatusClass::Compacted
+        }
+    }
+}
+
+fn protected_roster_admitted_status_observation(status: ProtectedRosterStatusClass) -> u8 {
+    u8::from(matches!(status, ProtectedRosterStatusClass::Admitted))
+}
+
+fn require_protected_roster_admitted_status_class(phase: &str, status: ProtectedRosterStatusClass) {
+    assert_eq!(
+        protected_roster_admitted_status_observation(status),
+        1,
+        "{phase}: the same-voter protected `/3` status control must be \
+         RecoveryOutcome::Admitted; terminal or compacted status cannot bracket \
+         the non-oracular tenant boundary"
+    );
+}
+
+fn require_protected_roster_admitted_status(
+    outcome: opc_session_net::FencedMutationRosterRecoveryOutcome,
+    phase: &str,
+) {
+    require_protected_roster_admitted_status_class(phase, protected_roster_status_class(&outcome));
+}
+
+fn protected_scope_boundary_observation(
+    result: &Result<
+        opc_session_net::PersistentSessionConsumerReadiness,
+        SessionConsumerClientError,
+    >,
+) -> u8 {
+    u8::from(matches!(result, Err(SessionConsumerClientError::Scope)))
+}
+
+fn protected_fence_boundary_observation(
+    result: &Result<
+        opc_session_net::FencedMutationRosterRecoveryOutcome,
+        opc_session_net::FencedMutationRosterClientError,
+    >,
+) -> u8 {
+    u8::from(matches!(
+        result,
+        Err(opc_session_net::FencedMutationRosterClientError::AuthorityRejected)
+    ))
+}
+
+/// Select only a voter whose current readiness report proves that it is the
+/// live quorum leader.  A `/3` pool is endpoint-pinned, so retaining a pool
+/// whose voter was deliberately killed would turn the post-loss status proof
+/// into a transport accident instead of an authenticated roster recovery.
+fn protected_roster_proven_live_voter(reports: &[FleetReadiness]) -> usize {
+    reports
+        .iter()
+        .find(|report| {
+            report.ready
+                && report.reason_code == QualificationReadinessCode::Ready
+                && report.leader_id == Some(report.node_id)
+                && report.configured_voters >= report.required_quorum
+                && report.fresh_reachable_voters >= report.required_quorum
+                && report.agreeing_voters >= report.required_quorum
+        })
+        .map(|report| report.node_index)
+        .expect("protected /3 recovery requires a readiness-proven live voter")
+}
+
+/// The process facts in current-head evidence are derived from the exact PIDs
+/// observed at the fault seam.  Keeping this local ledger prevents a test
+/// narrative ("two losses and one restart") from becoming an unbound claim.
+#[derive(Default)]
+struct PersistentConsumerProcessLedger {
+    generations: std::collections::BTreeMap<usize, Vec<u32>>,
+    lost: std::collections::BTreeSet<u32>,
+}
+
+/// Testkit-local, deterministic provider/executor identity for the public
+/// `/3` adapter.  The root key intentionally matches the projected ingress
+/// trust root installed in the separately running quorum-node binary; this is
+/// not a synthetic in-process transport path.
+struct QualificationRosterIssuer {
+    executor_key: SigningKey,
+    executor_root: FencedMutationRosterAttestationTrustRootV1,
+    executor_certificate: FencedMutationRosterExecutorCertificatePartsV1,
+}
+
+impl QualificationRosterIssuer {
+    fn new(scope: SessionConsumerScope) -> Arc<Self> {
+        let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).expect("fixed roster root");
+        let executor_key =
+            SigningKey::from_bytes((&[0x33; 32]).into()).expect("fixed roster executor");
+        let root = qualification_roster_attestation_trust_root();
+        let root_public = root.compressed_public_key();
+        let now = Timestamp::now_utc();
+        let not_before = now.add_seconds(-60).expect("roster leaf lower bound");
+        let not_after = now.add_seconds(3_600).expect("roster leaf upper bound");
+        let scope_commitment =
+            opc_session_store::consumer::session_consumer_roster_scope_commitment(scope);
+        let certificate = |role, subject_identity_commitment, key_id, key: &SigningKey| {
+            let public_key: [u8; 33] = key
+                .verifying_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .expect("P-256 compressed leaf key");
+            let mut certificate = RosterAttestationLeafCertificatePartsV1 {
+                root_id: root.root_id(),
+                role,
+                configuration_identity: scope.consensus_identity(),
+                scope: scope_commitment,
+                subject_identity_commitment,
+                leaf_epoch: 1,
+                key_id,
+                not_before,
+                not_after,
+                public_key,
+                root_signature: [0; 64],
+            };
+            certificate.root_signature = Self::sign(
+                &root_key,
+                RosterAttestationLeafCertificateV1::signing_digest(&certificate)
+                    .expect("canonical roster certificate"),
+            );
+            certificate
+        };
+        let executor_leaf = certificate(
+            RosterAttestationCertificateRoleV1::Executor,
+            [0x42; 32],
+            [0x52; 32],
+            &executor_key,
+        );
+        let executor_root =
+            FencedMutationRosterAttestationTrustRootV1::new(root.root_id(), root_public)
+                .expect("public executor trust root");
+        let executor_certificate = FencedMutationRosterExecutorCertificatePartsV1::new(
+            executor_leaf.root_id,
+            executor_leaf.configuration_identity,
+            executor_leaf.subject_identity_commitment,
+            executor_leaf.leaf_epoch,
+            executor_leaf.key_id,
+            executor_leaf.not_before,
+            executor_leaf.not_after,
+            executor_leaf.public_key,
+            executor_leaf.root_signature,
+        )
+        .expect("public executor certificate");
+        Arc::new(Self {
+            executor_key,
+            executor_root,
+            executor_certificate,
+        })
+    }
+
+    fn sign(key: &SigningKey, digest: [u8; 32]) -> [u8; 64] {
+        let signature: p256::ecdsa::Signature = key.sign_prehash(&digest).expect("fixed signing");
+        signature.normalize_s().to_bytes().into()
+    }
+}
+
+#[async_trait::async_trait]
+impl FencedMutationRosterExecutorAttestor for QualificationRosterIssuer {
+    fn trust_root(&self) -> FencedMutationRosterAttestationTrustRootV1 {
+        self.executor_root.clone()
+    }
+
+    fn executor_certificate(
+        &self,
+    ) -> Result<FencedMutationRosterExecutorCertificatePartsV1, FencedMutationRosterExecutorError>
+    {
+        Ok(self.executor_certificate.clone())
+    }
+
+    async fn sign_terminal(
+        &self,
+        input: &opc_session_net::FencedMutationRosterTerminalAttestationSigningInputV1<'_>,
+    ) -> Result<[u8; 64], FencedMutationRosterExecutorError> {
+        Ok(Self::sign(&self.executor_key, input.signing_digest()?))
+    }
+
+    async fn sign_compact_terminal(
+        &self,
+        input: &FencedMutationRosterCompactTerminalMemberSigningInputV2<'_>,
+    ) -> Result<[u8; 64], FencedMutationRosterExecutorError> {
+        Ok(Self::sign(&self.executor_key, input.signing_digest()?))
+    }
+}
+
+struct QualificationRosterProvider;
+
+#[async_trait::async_trait]
+impl FencedMutationRosterMemberProvider for QualificationRosterProvider {
+    type Error = ();
+
+    async fn prepare(
+        &self,
+        _call: &FencedMutationRosterMemberCall<'_>,
+    ) -> Result<FencedMutationRosterProviderCallOutcome, Self::Error> {
+        Ok(FencedMutationRosterProviderCallOutcome::prepared_not_run())
+    }
+
+    async fn execute(
+        &self,
+        _call: &FencedMutationRosterMemberCall<'_>,
+    ) -> Result<FencedMutationRosterProviderCallOutcome, Self::Error> {
+        Ok(FencedMutationRosterProviderCallOutcome::outcome_unknown())
+    }
+
+    async fn status(
+        &self,
+        _call: &FencedMutationRosterMemberCall<'_>,
+    ) -> Result<FencedMutationRosterProviderCallOutcome, Self::Error> {
+        Ok(FencedMutationRosterProviderCallOutcome::not_found())
+    }
+
+    async fn adopt(
+        &self,
+        _call: &FencedMutationRosterMemberCall<'_>,
+    ) -> Result<FencedMutationRosterProviderCallOutcome, Self::Error> {
+        Ok(FencedMutationRosterProviderCallOutcome::outcome_unknown())
+    }
+}
+
+/// One real public protected-roster admission retained for read-only recovery
+/// across the process faults in the three-member qualifier.  The only mutable
+/// capability is consumed by `admit`; every subsequent call is status/recover.
+struct QualificationProtectedRosterRun {
+    client: FencedMutationRosterClient,
+    transport: PersistentSessionConsumerClient,
+    voter_index: usize,
+    admission: FencedMutationRosterAdmissionInput,
+    lease: LeaseGuard,
+    current_recovery: Option<FencedMutationRosterRecoveryInput>,
+}
+
+fn qualification_fenced_mutation_roster_client(
+    protected: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+) -> FencedMutationRosterClient {
+    protected
+        .into_fenced_mutation_roster_client(
+            Arc::new(QualificationRosterProvider),
+            QualificationRosterIssuer::new(scope) as Arc<dyn FencedMutationRosterExecutorAttestor>,
+            NonZeroUsize::new(6).expect("fixed public roster concurrency"),
+        )
+        .expect("compose the real protected-roster client")
+}
+
+fn qualification_single_lane_persistent_config() -> PersistentSessionConsumerConfig {
+    let defaults = PersistentSessionConsumerConfig::default();
+    PersistentSessionConsumerConfig::try_new(
+        1,
+        defaults.pending_calls(),
+        defaults.pool_wait_timeout(),
+        defaults.watch_connections(),
+        defaults.setup_timeout(),
+        defaults.connect_attempts(),
+        defaults.reconnect_jitter(),
+        defaults.shutdown_drain(),
+    )
+    .expect("one-lane auxiliary qualification pool stays within public bounds")
+}
+
+impl QualificationProtectedRosterRun {
+    async fn prepare(
+        member_count: usize,
+        general: &QualificationConsumerClient,
+        protected: PersistentSessionConsumerClient,
+        voter_index: usize,
+        scope: SessionConsumerScope,
+    ) -> Self {
+        let key = SessionKey {
+            tenant: TenantId::new("session-ha-qualification").expect("bounded roster tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"qualification-roster-session")
+                .try_into()
+                .expect("bounded roster stable ID"),
+        };
+        let owner = OwnerId::new("qualification-roster-owner").expect("bounded roster owner");
+        let lease = general
+            .acquire_with_id(
+                SessionConsumerRequestId::from_bytes([0x71; 16]),
+                key.clone(),
+                owner.clone(),
+                PROTECTED_ROSTER_LEASE_TTL,
+            )
+            .await
+            .expect("general lane obtains the real protected-roster lease");
+        let mut record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner,
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("qualification-roster-admission"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        seal_qualification_consensus_record(member_count, &mut record).await;
+        let created = general
+            .execute(SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes([0x72; 16]),
+                SessionConsumerOperation::CompareAndSet {
+                    op: Box::new(CompareAndSet {
+                        key,
+                        lease: lease.clone(),
+                        expected_generation: None,
+                        new_record: record,
+                    }),
+                },
+            ))
+            .await
+            .expect("general lane creates the admission record");
+        assert!(matches!(
+            created,
+            SessionConsumerResponse::CompareAndSet(Ok(
+                opc_session_store::CompareAndSetResult::Success
+            ))
+        ));
+
+        let client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
+        let members = (0_u8..6)
+            .map(|ordinal| {
+                FencedMutationRosterMember::new(
+                    ordinal,
+                    FencedMutationRosterMemberOperationId::from_bytes([ordinal + 1; 16])
+                        .expect("fixed roster operation identity"),
+                    vec![0xd0, ordinal],
+                    u64::from(ordinal) + 1,
+                )
+                .expect("fixed public roster member")
+            })
+            .collect();
+        let proposal = FencedMutationRosterAdmissionProposal::new(
+            FencedMutationRosterProfile::v1(),
+            FencedMutationRosterId::from_bytes([0x73; 16]).expect("fixed roster ID"),
+            members,
+            FencedMutationRosterEstablishedMutation::no_op(),
+            vec![0x74],
+            vec![0x75],
+            vec![0x76],
+        )
+        .expect("bounded no-op protected roster proposal");
+        let admission = client
+            .prepare(lease.clone(), Generation::new(1), proposal)
+            .expect("real leased roster admission body");
+        Self {
+            client,
+            transport: protected,
+            voter_index,
+            admission,
+            lease,
+            current_recovery: None,
+        }
+    }
+
+    async fn admit_outcome_unknown(&mut self) {
+        assert!(matches!(
+            self.client
+                .admit(&mut self.admission)
+                .await
+                .expect("real /3 PollAdmit"),
+            FencedMutationRosterAdmissionOutcome::OutcomeUnknown(_)
+        ));
+    }
+
+    async fn status(&self) -> opc_session_net::FencedMutationRosterRecoveryOutcome {
+        match self.current_recovery.as_ref() {
+            Some(recovery) => self
+                .client
+                .recover(recovery)
+                .await
+                .expect("real /3 successor recovery status"),
+            None => self
+                .client
+                .admission_status(&self.admission)
+                .await
+                .expect("real /3 ambiguous-admission status"),
+        }
+    }
+
+    fn voter_index(&self) -> usize {
+        self.voter_index
+    }
+
+    /// Replace the deliberately short-deadline pool at the same voter without
+    /// opening its normal-deadline successor first. The caller proves the
+    /// effectful server task released its listener permit before prewarming.
+    async fn retire_short_deadline_transport(
+        &mut self,
+        protected: PersistentSessionConsumerClient,
+        voter_index: usize,
+        scope: SessionConsumerScope,
+    ) {
+        assert_eq!(
+            voter_index, self.voter_index,
+            "the short-deadline transport profile changes at the same voter"
+        );
+        let next_client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
+        let old_client = std::mem::replace(&mut self.client, next_client);
+        let old_transport = std::mem::replace(&mut self.transport, protected);
+        drop(old_client);
+        old_transport.shutdown().await;
+    }
+
+    /// Reconstruct the same authenticated roster admission on a different
+    /// live `/3` transport. The replacement is proven warm before the old
+    /// endpoint-local pool is retired. The admission, tenant/scope
+    /// commitments, and retained fence remain byte-for-byte unchanged.
+    async fn rebind_live_voter(
+        &mut self,
+        protected: PersistentSessionConsumerClient,
+        voter_index: usize,
+        scope: SessionConsumerScope,
+    ) {
+        assert_ne!(
+            voter_index, self.voter_index,
+            "a same-voter protected-roster status must reuse its bounded pool"
+        );
+        protected
+            .prewarm()
+            .await
+            .expect("replacement-voter protected-roster mTLS prewarm");
+        let next_client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
+        let old_client = std::mem::replace(&mut self.client, next_client);
+        let old_transport = std::mem::replace(&mut self.transport, protected);
+        self.voter_index = voter_index;
+        drop(old_client);
+        old_transport.shutdown().await;
+    }
+
+    async fn recover(
+        &mut self,
+        general: &QualificationConsumerClient,
+        scope: SessionConsumerScope,
+    ) -> u8 {
+        let released = general
+            .execute(SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes([0x77; 16]),
+                SessionConsumerOperation::ReleaseLease {
+                    lease: self.lease.clone(),
+                },
+            ))
+            .await
+            .expect("general lane releases the original roster lease");
+        assert!(matches!(
+            released,
+            SessionConsumerResponse::ReleaseLease(Ok(()))
+        ));
+        let successor = general
+            .acquire_with_id(
+                SessionConsumerRequestId::from_bytes([0x78; 16]),
+                self.lease.key().clone(),
+                self.lease.owner().clone(),
+                PROTECTED_ROSTER_LEASE_TTL,
+            )
+            .await
+            .expect("general lane obtains a higher-fence roster recovery lease");
+        assert!(
+            successor.fence() > self.lease.fence(),
+            "protected recovery requires the actual higher-fence successor"
+        );
+        let retained_recovery = self
+            .admission
+            .recovery(successor.clone(), Generation::new(1))
+            .expect("same real roster identity builds recovery input");
+        let recovered = self
+            .client
+            .recover(&retained_recovery)
+            .await
+            .expect("real /3 admission recovery");
+        require_protected_roster_admitted_status(
+            recovered,
+            "current-fence protected-roster recovery",
+        );
+        let released_successor = general
+            .execute(SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes([0x79; 16]),
+                SessionConsumerOperation::ReleaseLease {
+                    lease: successor.clone(),
+                },
+            ))
+            .await
+            .expect("general lane releases the recovered roster lease");
+        assert!(matches!(
+            released_successor,
+            SessionConsumerResponse::ReleaseLease(Ok(()))
+        ));
+        let current = general
+            .acquire_with_id(
+                SessionConsumerRequestId::from_bytes([0x7a; 16]),
+                successor.key().clone(),
+                successor.owner().clone(),
+                PROTECTED_ROSTER_LEASE_TTL,
+            )
+            .await
+            .expect("general lane obtains the current recovery lease");
+        assert!(
+            current.fence() > successor.fence(),
+            "fence negative requires a retained, now-stale recovery guard"
+        );
+        // `retained_recovery` was a valid current `/3` recovery capsule. Once
+        // a later lease has been durably acquired it becomes stale, so submit
+        // that exact retained capsule through the public adapter and require
+        // the typed rejection. This remains read-only and cannot replay the
+        // original admission mutation.
+        let stale_result = self.client.recover(&retained_recovery).await;
+        let stale_rejected = protected_fence_boundary_observation(&stale_result);
+        assert_eq!(
+            stale_rejected, 1,
+            "the retained old-fence protected recovery must receive the typed authority rejection"
+        );
+        let recovery = self
+            .admission
+            .recovery(current.clone(), Generation::new(1))
+            .expect("current roster lease builds recovery input");
+        let recovered = self
+            .client
+            .recover(&recovery)
+            .await
+            .expect("real /3 recovery under the current lease");
+        require_protected_roster_admitted_status(
+            recovered,
+            "successor-fence protected-roster recovery",
+        );
+        self.lease = current;
+        self.current_recovery = Some(recovery);
+        stale_rejected
+    }
+}
+
+impl PersistentConsumerProcessLedger {
+    fn record_initial(&mut self, node_index: usize, process_id: u32) {
+        assert!(
+            self.generations
+                .insert(node_index, vec![process_id])
+                .is_none(),
+            "each quorum node has one initial process generation"
+        );
+    }
+
+    fn record_unclean_loss(&mut self, node_index: usize, process_id: u32) {
+        let generations = self
+            .generations
+            .get(&node_index)
+            .expect("loss belongs to an observed quorum node");
+        assert_eq!(
+            generations.last().copied(),
+            Some(process_id),
+            "unclean loss must name the current node generation"
+        );
+        assert!(
+            self.lost.insert(process_id),
+            "one process generation can be lost only once"
+        );
+    }
+
+    fn record_restart(&mut self, node_index: usize, previous: u32, replacement: u32) {
+        assert_ne!(previous, replacement, "restart must mint a new process ID");
+        let generations = self
+            .generations
+            .get_mut(&node_index)
+            .expect("restart belongs to an observed quorum node");
+        assert_eq!(
+            generations.last().copied(),
+            Some(previous),
+            "restart must follow the recorded current generation"
+        );
+        assert!(
+            self.lost.contains(&previous),
+            "restart follows an unclean loss"
+        );
+        generations.push(replacement);
+    }
+
+    fn initial_processes(&self) -> u8 {
+        u8::try_from(self.generations.len()).expect("bounded quorum size")
+    }
+
+    fn unclean_process_losses(&self) -> u8 {
+        u8::try_from(self.lost.len()).expect("bounded process-loss ledger")
+    }
+
+    fn restarted_processes(&self) -> u8 {
+        u8::try_from(
+            self.generations
+                .values()
+                .map(|generations| generations.len().saturating_sub(1))
+                .sum::<usize>(),
+        )
+        .expect("bounded process-restart ledger")
+    }
+
+    fn observed_process_generations(&self) -> u8 {
+        u8::try_from(self.generations.values().map(Vec::len).sum::<usize>())
+            .expect("bounded process-generation ledger")
+    }
+}
+
+fn run_consumer_multiprocess_qualification(
+    member_count: usize,
+    mode: ConsumerQualificationMode,
+    release_provenance: Option<ReleaseGateProvenance>,
+) -> Option<PersistentConsumerRunMeasurements> {
+    if release_provenance.is_some() {
+        assert_eq!(
+            member_count, 3,
+            "the frozen V9 protected-roster authority bracket has exactly three endpoint/authority pairs"
+        );
+    }
+    if let Some(provenance) = release_provenance.as_ref() {
+        provenance
+            .verify_unchanged()
+            .expect("release provenance is clean before the first dual-lane campaign");
+    }
+    let mut fleet = match release_provenance.as_ref() {
+        Some(provenance) => Fleet::start_with_release_provenance(member_count, provenance),
+        None => Fleet::start(member_count),
+    };
+    let mut process_ledger = PersistentConsumerProcessLedger::default();
+    for (node_index, node) in fleet.nodes.iter().enumerate() {
+        process_ledger.record_initial(node_index, node.process_id());
+    }
+    let initial_processes = process_ledger.initial_processes();
+    assert_eq!(usize::from(initial_processes), member_count);
     let consumer_identities = (0..12).map(stateless_consumer_identity).collect::<Vec<_>>();
     let mut endpoints = Vec::with_capacity(member_count);
     let mut scope = None;
@@ -8145,8 +14996,8 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         let (address, node_scope) =
             fleet.start_stateless_consumer(node_index, consumer_identities.clone());
         if let Some(expected) = scope {
-            assert_eq!(
-                node_scope, expected,
+            assert!(
+                node_scope == expected,
                 "consumer scope differs between voters"
             );
         } else {
@@ -8155,6 +15006,10 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         endpoints.push(address);
     }
     let scope = scope.expect("one consumer scope per qualification fleet");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8172,27 +15027,203 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
                 .allow_any_trusted_peer()
                 .build_authenticated_client_config()
                 .expect("stateless consumer client mTLS configuration");
-            StatelessSessionConsumerClient::new(
+            let stateless = StatelessSessionConsumerClient::new(
                 endpoints[node_index],
                 rustls_pki_types::ServerName::IpAddress(endpoints[node_index].ip().into()),
-                SpiffeId::new(spiffe_id(node_index))
-                    .expect("qualification consumer server identity"),
-                scope,
+                voter_authorities[node_index].clone(),
                 tls,
-            )
+            );
+            match mode {
+                ConsumerQualificationMode::Stateless => {
+                    QualificationConsumerClient::Stateless(Box::new(stateless))
+                }
+                ConsumerQualificationMode::Persistent => QualificationConsumerClient::Persistent(
+                    PersistentSessionConsumerClient::try_from_stateless(
+                        stateless,
+                        PersistentSessionConsumerConfig::default(),
+                    )
+                    .expect("fixed persistent consumer configuration"),
+                ),
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(clients.len(), 12);
+    // `/3` is not a relabelled capability request: establish an independently
+    // constructed revision-five roster pool against the same real projected
+    // mTLS listener before recording this run as dual-lane evidence.
+    let (roster_identity_source, _roster_identity_receiver) = watch::channel(Some(
+        fleet.pki.consumer_identity_state(&consumer_identities[0]),
+    ));
+    let protected_roster_client_for_voter =
+        |node_index: usize, operation_timeout: Option<Duration>| {
+            let roster_tls = TlsConfigBuilder::new(roster_identity_source.subscribe())
+                .allow_any_trusted_peer()
+                .build_authenticated_client_config()
+                .expect("protected-roster persistent mTLS configuration");
+            let stateless = StatelessSessionConsumerClient::new(
+                endpoints[node_index],
+                rustls_pki_types::ServerName::IpAddress(endpoints[node_index].ip().into()),
+                voter_authorities[node_index].clone(),
+                roster_tls,
+            );
+            let stateless = match operation_timeout {
+                Some(timeout) => stateless.with_operation_timeout(timeout),
+                None => stateless,
+            };
+            PersistentSessionConsumerClient::try_from_fenced_mutation_roster_stateless(
+                stateless,
+                qualification_single_lane_persistent_config(),
+            )
+            .expect("fixed protected-roster persistent configuration")
+        };
+    // The pre-loss run establishes node 0 deliberately. Every post-loss `/3`
+    // operation below replaces this endpoint-pinned pool with the same
+    // authenticated identity on a readiness-proven live voter.
+    let protected_roster_client =
+        protected_roster_client_for_voter(0, Some(DELAYED_CONSUMER_CLIENT_DEADLINE));
+    assert!(protected_roster_client.fenced_mutation_roster_transport_enabled());
+    runtime
+        .block_on(protected_roster_client.prewarm())
+        .expect("real protected-roster mTLS prewarm");
+    let protected_roster_setup_successes = runtime
+        .block_on(protected_roster_client.diagnostics())
+        .setup_successes;
+    assert!(
+        protected_roster_setup_successes > 0,
+        "protected-roster lane must complete an authenticated setup"
+    );
+    // The scope control retains the admitted identity but presents a separately
+    // validated configuration authority. It must fail during Hello before a
+    // protected application operation is accepted.
+    let protected_scope_negative = if matches!(mode, ConsumerQualificationMode::Persistent) {
+        let foreign_authority = fleet
+            .stateless_consumer_voter_authorities_for_configuration("v1-negative", 2)
+            .into_iter()
+            .next()
+            .expect("separately validated scope-control authority");
+        assert_ne!(
+            foreign_authority.scope(),
+            scope,
+            "scope negative must not reuse the listener authority"
+        );
+        let (scope_source, scope_receiver) = watch::channel(Some(
+            fleet.pki.consumer_identity_state(&consumer_identities[0]),
+        ));
+        let scope_tls = TlsConfigBuilder::new(scope_receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("scope-control protected mTLS configuration");
+        let scope_pool =
+            PersistentSessionConsumerClient::try_from_fenced_mutation_roster_stateless(
+                StatelessSessionConsumerClient::new(
+                    endpoints[0],
+                    rustls_pki_types::ServerName::IpAddress(endpoints[0].ip().into()),
+                    foreign_authority,
+                    scope_tls,
+                ),
+                qualification_single_lane_persistent_config(),
+            )
+            .expect("scope-control protected persistent configuration");
+        let scope_result = runtime.block_on(scope_pool.prewarm());
+        let scope_observation = protected_scope_boundary_observation(&scope_result);
+        assert_eq!(
+            scope_observation, 1,
+            "the wrong-scope `/3` pool must be rejected by Hello before admission"
+        );
+        runtime.block_on(scope_pool.shutdown());
+        drop(scope_source);
+        scope_observation
+    } else {
+        0
+    };
+    if matches!(mode, ConsumerQualificationMode::Persistent) {
+        assert!(runtime.block_on(async {
+            futures_util::future::join_all(clients.iter().map(QualificationConsumerClient::prewarm))
+                .await
+                .into_iter()
+                .all(|result| result.is_ok_and(|ready| ready))
+        }));
+    }
     assert!(runtime.block_on(async {
         futures_util::future::join_all(
             clients
                 .iter()
-                .map(StatelessSessionConsumerClient::capabilities),
+                .map(QualificationConsumerClient::capabilities),
         )
         .await
         .into_iter()
         .all(|result| result.is_ok())
     }));
+    let mut persistent_measurements = if matches!(mode, ConsumerQualificationMode::Persistent) {
+        let before = runtime.block_on(async {
+            futures_util::future::join_all(
+                clients
+                    .iter()
+                    .map(QualificationConsumerClient::persistent_setup_and_reuse),
+            )
+            .await
+        });
+        let setup_successes = before
+            .iter()
+            .flatten()
+            .map(|(setup, _)| *setup)
+            .sum::<u64>();
+        let reused_before = before
+            .iter()
+            .flatten()
+            .map(|(_, reused)| *reused)
+            .sum::<u64>();
+        assert!(
+            setup_successes >= 48,
+            "twelve persistent clients prewarm four authenticated lanes each"
+        );
+
+        for sample in 0..QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7 {
+            runtime
+                .block_on(clients[sample % clients.len()].capabilities())
+                .expect("warm persistent capability call");
+        }
+        let after = runtime.block_on(async {
+            futures_util::future::join_all(
+                clients
+                    .iter()
+                    .map(QualificationConsumerClient::persistent_setup_and_reuse),
+            )
+            .await
+        });
+        let reused_after = after
+            .iter()
+            .flatten()
+            .map(|(_, reused)| *reused)
+            .sum::<u64>();
+        let warm_reused_calls = reused_after
+            .checked_sub(reused_before)
+            .expect("persistent reuse counter is monotonic");
+        assert_eq!(
+            warm_reused_calls, QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7 as u64,
+            "every measured warm call reuses authenticated capacity"
+        );
+        Some(PersistentConsumerRunMeasurements {
+            release_provenance: release_provenance.clone(),
+            authenticated_setup_successes: setup_successes,
+            warm_reused_calls,
+            protected_roster_setup_successes,
+            tenant_positive_observations: 0,
+            tenant_negative_boundary_rejections: 0,
+            scope_positive_observations: 0,
+            scope_negative_boundary_rejections: 0,
+            fence_positive_observations: 0,
+            fence_negative_boundary_rejections: 0,
+            initial_processes,
+            unclean_process_losses: 0,
+            restarted_processes: 0,
+            observed_process_generations: initial_processes,
+            general_lane: PersistentConsumerLaneMeasurements::default(),
+            protected_roster_lane: PersistentConsumerLaneMeasurements::default(),
+        })
+    } else {
+        None
+    };
     for client in &clients {
         let diagnostic = format!("{client:?}");
         for forbidden in [
@@ -8209,29 +15240,414 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         }
     }
 
+    // The replacement-leader receipt query below must retain the identity
+    // that submitted this mutation. A consumer receipt namespace is bound to
+    // the authenticated client, not to the particular endpoint that first
+    // accepted the Call.
+    let known_request_id = SessionConsumerRequestId::from_bytes([0x41; 16]);
+    let known_key = stateless_consumer_key(0);
+    let known_owner = OwnerId::new("qualification-consumer-owner").expect("consumer owner");
+    let known_ttl = Duration::from_secs(30);
     let known_request = SessionConsumerRequest::new(
         scope,
-        SessionConsumerRequestId::from_bytes([0x41; 16]),
+        known_request_id,
         SessionConsumerOperation::AcquireLease {
-            key: stateless_consumer_key(0),
-            owner: OwnerId::new("qualification-consumer-owner").expect("consumer owner"),
-            ttl: Duration::from_secs(30),
+            key: known_key.clone(),
+            owner: known_owner.clone(),
+            ttl: known_ttl,
         },
     );
     let known_response = runtime
-        .block_on(clients[0].execute(known_request.clone()))
+        .block_on(clients[1].execute(known_request.clone()))
         .expect("known consumer mutation response");
-    assert!(matches!(
-        known_response,
-        SessionConsumerResponse::AcquireLease(Ok(_))
-    ));
-    assert_eq!(
-        runtime
-            .block_on(clients[0].execute(known_request))
-            .expect("exact known consumer mutation retry"),
-        known_response,
+    let known_lease = match &known_response {
+        SessionConsumerResponse::AcquireLease(Ok(lease)) => lease.clone(),
+        _ => panic!("known consumer mutation must return an acquired lease"),
+    };
+    let recovered_known_response = runtime
+        .block_on(clients[1].execute(known_request))
+        .expect("exact known consumer mutation retry");
+    assert!(
+        recovered_known_response == known_response,
         "a known durable consumer success must be recoverable by its retained request ID"
     );
+    let known_lease_status = SessionConsumerLeaseMutationRequest::new(
+        known_request_id,
+        SessionConsumerLeaseMutationOperation::Acquire {
+            key: known_key,
+            owner: known_owner,
+            ttl: known_ttl,
+        },
+    );
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.general_lane.admission_operations = 1;
+        measurements.general_lane.before_leader_loss_operations = 1;
+    }
+    let mut protected_roster_run = if matches!(mode, ConsumerQualificationMode::Persistent) {
+        let mut run = runtime.block_on(QualificationProtectedRosterRun::prepare(
+            member_count,
+            &clients[0],
+            protected_roster_client,
+            0,
+            scope,
+        ));
+        // Preparation has completed every general-lane mutation. Arm the
+        // one-response acknowledgement gate immediately before the already-
+        // warm `/3` PollAdmit. The child enters it only after the admission is
+        // durably Recorded, while this client's shorter deadline classifies
+        // the lost reply as OutcomeUnknown without replaying the mutation.
+        fleet.arm_stateless_consumer_ambiguity_witness_hold(0);
+        runtime.block_on(run.admit_outcome_unknown());
+        let roster_hold_ack_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+        loop {
+            let (armed_responses, held_responses) =
+                fleet.stateless_consumer_ambiguity_witness_hold_status(0);
+            if armed_responses == 0 && held_responses == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < roster_hold_ack_deadline,
+                "protected-roster admission did not acknowledge its durable held response: armed={armed_responses}, held={held_responses}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fleet.release_stateless_consumer_ambiguity_witness_hold(0);
+        let roster_hold_release_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+        loop {
+            let (armed_responses, held_responses) =
+                fleet.stateless_consumer_ambiguity_witness_hold_status(0);
+            if armed_responses == 0 && held_responses == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < roster_hold_release_deadline,
+                "protected-roster durable response hold did not release: armed={armed_responses}, held={held_responses}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let status_client = protected_roster_client_for_voter(0, None);
+        runtime.block_on(run.retire_short_deadline_transport(status_client, 0, scope));
+        runtime
+            .block_on(run.transport.prewarm())
+            .expect("normal-deadline protected-roster status mTLS prewarm");
+        require_protected_roster_admitted_status(
+            runtime.block_on(run.status()),
+            "before protected-roster lane accounting",
+        );
+        if let Some(measurements) = persistent_measurements.as_mut() {
+            measurements.protected_roster_lane.admission_operations = 1;
+            measurements.protected_roster_lane.status_operations = 1;
+            measurements
+                .protected_roster_lane
+                .before_leader_loss_operations = 1;
+            // The accepted `/3` admission binds the current tenant/scope/fence
+            // authority in the authenticated ingress capsule. Tenant and
+            // scope negatives above came from separate rejected `/3` Hello
+            // controls; fence is filled only from the later stale-capsule
+            // response at the actual recovery seam.
+            measurements
+                .protected_roster_lane
+                .tenant_positive_observations = 1;
+            measurements
+                .protected_roster_lane
+                .tenant_negative_boundary_rejections = 0;
+            measurements
+                .protected_roster_lane
+                .scope_positive_observations = 1;
+            measurements
+                .protected_roster_lane
+                .scope_negative_boundary_rejections = protected_scope_negative;
+            measurements
+                .protected_roster_lane
+                .fence_positive_observations = 1;
+        }
+        Some(run)
+    } else {
+        None
+    };
+    // The tenant negative is deliberately bracketed by the admitted `/3`
+    // capsule's status control on this same voter. This distinguishes the
+    // anti-oracle `Unavailable` boundary from a node outage without asking the
+    // server to reveal a tenant or role decision.
+    let protected_tenant_negative = if matches!(mode, ConsumerQualificationMode::Persistent) {
+        let protected = protected_roster_run
+            .as_ref()
+            .expect("persistent qualification retains the admitted `/3` run");
+        let initial_nodes = (0..member_count).collect::<Vec<_>>();
+        require_protected_roster_admitted_status(
+            runtime.block_on(protected.status()),
+            "before the non-oracular tenant control",
+        );
+        assert!(
+            fleet
+                .readiness_reports(&initial_nodes)
+                .iter()
+                .all(|report| report.ready),
+            "all same-fleet voters are healthy before the non-oracular tenant control"
+        );
+        let foreign_identity = protected_foreign_tenant_identity();
+        let (foreign_source, _foreign_receiver) =
+            watch::channel(Some(fleet.pki.consumer_identity_state(&foreign_identity)));
+        let mut tenant_observation = 0_u8;
+        for node_index in 0..member_count {
+            let foreign_tls = TlsConfigBuilder::new(foreign_source.subscribe())
+                .allow_any_trusted_peer()
+                .build_authenticated_client_config()
+                .expect("foreign-tenant protected mTLS configuration");
+            let foreign_pool =
+                PersistentSessionConsumerClient::try_from_fenced_mutation_roster_stateless(
+                    StatelessSessionConsumerClient::new(
+                        endpoints[node_index],
+                        rustls_pki_types::ServerName::IpAddress(endpoints[node_index].ip().into()),
+                        voter_authorities[node_index].clone(),
+                        foreign_tls,
+                    ),
+                    qualification_single_lane_persistent_config(),
+                )
+                .expect("foreign-tenant protected persistent configuration");
+            let admission_before = fleet.stateless_consumer_admission_status(node_index);
+            let foreign_result = runtime.block_on(foreign_pool.prewarm());
+            let admission_after = fleet.stateless_consumer_admission_status(node_index);
+            assert_eq!(
+                protected_tenant_boundary_observation(&foreign_result),
+                1,
+                "every endpoint/authority foreign-tenant `/3` pair must close as non-oracular Unavailable (voter {node_index})"
+            );
+            assert_eq!(
+                admission_after.admission_rejections, admission_before.admission_rejections,
+                "the foreign-tenant `/3` boundary must be admitted by listener capacity before its non-oracular credential rejection (voter {node_index})"
+            );
+            tenant_observation = tenant_observation
+                .checked_add(1)
+                .expect("bounded foreign-tenant probe count");
+            runtime.block_on(foreign_pool.shutdown());
+        }
+        assert_eq!(
+            tenant_observation,
+            u8::try_from(member_count).expect("bounded foreign-tenant probe count"),
+            "the tenant control records every endpoint/authority pair exactly once"
+        );
+        if release_provenance.is_some() {
+            assert_eq!(
+                tenant_observation, 3,
+                "the frozen V9 foreign-tenant bracket requires exact Unavailable from all three voters"
+            );
+        }
+        drop(foreign_source);
+        require_protected_roster_admitted_status(
+            runtime.block_on(protected.status()),
+            "after the non-oracular tenant control",
+        );
+        assert!(
+            fleet
+                .readiness_reports(&initial_nodes)
+                .iter()
+                .all(|report| report.ready),
+            "all same-fleet voters remain healthy after the non-oracular tenant control"
+        );
+        tenant_observation
+    } else {
+        0
+    };
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements
+            .protected_roster_lane
+            .tenant_negative_boundary_rejections = protected_tenant_negative;
+    }
+    let foreign_tenant_key = SessionKey {
+        tenant: TenantId::new("qualification-foreign-tenant")
+            .expect("bounded foreign tenant fixture"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"opaque-foreign-tenant-session")
+            .try_into()
+            .expect("bounded foreign tenant stable ID"),
+    };
+    let tenant_negative_boundary_rejections = u8::from(matches!(
+        runtime.block_on(clients[0].execute(SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::from_bytes([0x42; 16]),
+            SessionConsumerOperation::Get {
+                key: foreign_tenant_key,
+            },
+        ))),
+        Ok(SessionConsumerResponse::Rejected(
+            SessionConsumerRejection::Unauthorized
+        ))
+    ));
+    assert_eq!(tenant_negative_boundary_rejections, 1);
+    let scope_identity = scope.consensus_identity();
+    let foreign_scope = SessionConsumerScope::new(SessionConsensusIdentity::new(
+        scope_identity.cluster_id(),
+        scope_identity.configuration_id(),
+        SessionConfigurationEpoch::new(scope_identity.configuration_epoch().get() + 1)
+            .expect("bounded foreign scope epoch"),
+    ));
+    // Both public clients enforce their topology scope before a Call frame can
+    // cross the wire. Preserve and assert that exact typed pre-transmission
+    // boundary instead of expecting the server's unreachable ScopeMismatch.
+    let scope_negative_boundary_rejections = u8::from(matches!(
+        runtime.block_on(clients[0].execute(SessionConsumerRequest::new(
+            foreign_scope,
+            SessionConsumerRequestId::from_bytes([0x43; 16]),
+            SessionConsumerOperation::Capabilities,
+        ))),
+        Err(QualificationConsumerExecuteError::Stateless(
+            SessionConsumerClientError::Scope
+        )) | Err(QualificationConsumerExecuteError::Persistent(
+            PersistentSessionConsumerExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Scope
+            }
+        ))
+    ));
+    assert_eq!(scope_negative_boundary_rejections, 1);
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.tenant_positive_observations = 1;
+        measurements.tenant_negative_boundary_rejections = tenant_negative_boundary_rejections;
+        measurements.scope_positive_observations = 1;
+        measurements.scope_negative_boundary_rejections = scope_negative_boundary_rejections;
+        measurements.general_lane.tenant_positive_observations = 1;
+        measurements
+            .general_lane
+            .tenant_negative_boundary_rejections = tenant_negative_boundary_rejections;
+        measurements.general_lane.scope_positive_observations = 1;
+        measurements.general_lane.scope_negative_boundary_rejections =
+            scope_negative_boundary_rejections;
+    }
+
+    let first_atomic_key = qualification_fenced_transition_key(0);
+    let first_atomic_capability = runtime
+        .block_on(clients[1].execute(SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::from_bytes([0x60; 16]),
+            SessionConsumerOperation::FencedTransitionCapability,
+        )))
+        .expect("atomic transition capability response");
+    assert_eq!(
+        first_atomic_capability,
+        SessionConsumerResponse::FencedTransitionCapability(Ok(
+            AtomicFencedTransitionCapability::V1
+        )),
+        "all admitted voters must prove the exact V1 transition capability"
+    );
+    let first_atomic_observation = runtime
+        .block_on(clients[1].execute(SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::from_bytes([0x61; 16]),
+            SessionConsumerOperation::ObserveFencedTransition {
+                key: first_atomic_key.clone(),
+            },
+        )))
+        .expect("fresh atomic transition observation response");
+    let first_atomic_fence = match first_atomic_observation {
+        SessionConsumerResponse::ObserveFencedTransition(Ok(observation)) => {
+            assert!(
+                observation.record().is_none(),
+                "a fresh atomic transition key must have no record"
+            );
+            assert_eq!(
+                observation.current_fence(),
+                FenceToken::new(0),
+                "a fresh atomic transition key must expose its zero fence floor"
+            );
+            observation.current_fence()
+        }
+        _ => panic!("fresh atomic transition observation must be typed and successful"),
+    };
+    let first_atomic_id_bytes = [0x62; 16];
+    let first_atomic_id = FencedTransitionRequestId::from_bytes(first_atomic_id_bytes);
+    let first_atomic_owner =
+        OwnerId::new("qualification-atomic-owner").expect("atomic transition owner");
+    let first_atomic_lease = FencedTransitionLease::acquire(
+        first_atomic_key.clone(),
+        first_atomic_owner.clone(),
+        first_atomic_fence,
+        Duration::from_secs(30),
+    )
+    .expect("build first atomic acquire action");
+    let first_atomic_record = runtime.block_on(qualification_fenced_transition_record(
+        member_count,
+        first_atomic_key.clone(),
+        first_atomic_owner.clone(),
+        first_atomic_lease
+            .committed_fence()
+            .expect("derive first committed fence"),
+        b"opaque-qualification-fenced-transition-one",
+    ));
+    assert_eq!(first_atomic_record.generation, Generation::new(1));
+    assert_eq!(
+        first_atomic_record.fence,
+        FenceToken::new(first_atomic_fence.get() + 1),
+        "the first atomic record must bind the observed fence successor"
+    );
+    let first_atomic_transition = FencedTransitionRequest::new(
+        first_atomic_id,
+        first_atomic_lease,
+        FencedTransitionMutation::create(first_atomic_record.clone()),
+    )
+    .expect("build first atomic create transition");
+    assert_eq!(
+        first_atomic_transition.request_id().as_bytes(),
+        &first_atomic_id_bytes,
+        "the nested atomic transition ID must retain the caller bytes"
+    );
+    let first_atomic_request = SessionConsumerRequest::new(
+        scope,
+        SessionConsumerRequestId::from_bytes(first_atomic_id_bytes),
+        SessionConsumerOperation::FencedTransition {
+            request: Box::new(first_atomic_transition.clone()),
+        },
+    );
+    assert_eq!(
+        first_atomic_request.request_id().as_bytes(),
+        first_atomic_transition.request_id().as_bytes(),
+        "the public and nested atomic transition IDs must be byte-identical"
+    );
+    // PR #745 moved V1 transition dispatch and receipt recovery behind the
+    // opaque, activated-roster facade. A public one-voter client may retain
+    // the capability/observation reads above, but it must never lower a raw
+    // V1 request into an application Call. Keep this qualifier at the public
+    // boundary and assert the typed pre-write failure for both client forms.
+    assert!(
+        matches!(
+            runtime.block_on(clients[1].execute(first_atomic_request.clone())),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "the public consumer route must reject a V1 transition before any Call byte"
+    );
+    let first_atomic_status_request = SessionConsumerRequest::new(
+        scope,
+        SessionConsumerRequestId::from_bytes(first_atomic_id_bytes),
+        SessionConsumerOperation::FencedTransitionStatus {
+            request: Box::new(first_atomic_transition.clone()),
+        },
+    );
+    assert!(
+        matches!(
+            runtime.block_on(clients[1].execute(first_atomic_status_request.clone())),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "the public consumer route must reject V1 receipt recovery before any Call byte"
+    );
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.fence_positive_observations = 1;
+        measurements.fence_negative_boundary_rejections = 1;
+        measurements.general_lane.status_operations = 1;
+        measurements.general_lane.fence_positive_observations = 1;
+        measurements.general_lane.fence_negative_boundary_rejections = 1;
+    }
 
     // Keep the consumer outcome proof and the leader-loss proof distinct. A
     // known quorum result does not imply that every follower has already
@@ -8270,7 +15686,8 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         previous_converged = signature;
         assert!(
             Instant::now() < convergence_deadline,
-            "stateless consumer quorum did not reach a stable all-voter log head before leader loss: reports={reports:?}"
+            "{} consumer quorum did not reach a stable all-voter log head before leader loss",
+            mode.name(),
         );
         let observation_interval = if wait_for_heartbeat {
             Duration::from_millis(
@@ -8297,6 +15714,7 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         })
         .expect("stable qualification leader");
     let (leader_address, leader_process_id) = fleet.kill_node_unclean(leader_node_index);
+    process_ledger.record_unclean_loss(leader_node_index, leader_process_id);
     let leader_survivors = all_nodes
         .iter()
         .copied()
@@ -8304,7 +15722,7 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         .collect::<Vec<_>>();
     let leader_loss_deadline = Instant::now() + STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT;
     let mut previous_replacement = None;
-    loop {
+    let replacement_reports = loop {
         let reports = fleet.readiness_reports(&leader_survivors);
         let replacement = reports.first().and_then(|report| report.leader_id);
         let coherent_replacement = replacement.is_some_and(|leader| leader != old_leader_id)
@@ -8319,21 +15737,185 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
             });
         let replacement_signature = coherent_replacement.then_some((replacement, reports[0].term));
         if replacement_signature.is_some() && replacement_signature == previous_replacement {
-            break;
+            break reports;
         }
         previous_replacement = replacement_signature;
         assert!(
             Instant::now() < leader_loss_deadline,
-            "stateless consumer quorum exceeded its bounded functional leader-recovery path: reports={reports:?}"
+            "{} consumer quorum exceeded its bounded functional leader-recovery path",
+            mode.name(),
         );
         thread::sleep(Duration::from_millis(50));
-    }
-    let leader_survivor_client = clients
+    };
+    let replacement_leader_node_index = replacement_reports
         .iter()
-        .enumerate()
-        .find(|(index, _)| index % member_count != leader_node_index)
-        .map(|(_, client)| client)
-        .expect("consumer client on a surviving voter");
+        .find_map(|report| {
+            report
+                .leader_id
+                .filter(|leader| *leader == report.node_id)
+                .map(|_| report.node_index)
+        })
+        .expect("coherent replacement leader");
+    // Receipt identities are deliberately namespaced by the authenticated
+    // consumer, independently of the server endpoint. Build a fresh transport
+    // to the replacement leader with the same identity that submitted the
+    // retained lease; using an arbitrary endpoint-local client here would
+    // correctly query a different receipt namespace and return NotFound.
+    let (replacement_identity_source, replacement_identity_receiver) = watch::channel(Some(
+        fleet.pki.consumer_identity_state(&consumer_identities[1]),
+    ));
+    let replacement_tls = TlsConfigBuilder::new(replacement_identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("replacement-leader consumer mTLS configuration");
+    let replacement_stateless = StatelessSessionConsumerClient::new(
+        endpoints[replacement_leader_node_index],
+        rustls_pki_types::ServerName::IpAddress(
+            endpoints[replacement_leader_node_index].ip().into(),
+        ),
+        voter_authorities[replacement_leader_node_index].clone(),
+        replacement_tls,
+    );
+    let leader_survivor_client = match mode {
+        ConsumerQualificationMode::Stateless => {
+            QualificationConsumerClient::Stateless(Box::new(replacement_stateless))
+        }
+        ConsumerQualificationMode::Persistent => QualificationConsumerClient::Persistent(
+            PersistentSessionConsumerClient::try_from_stateless(
+                replacement_stateless,
+                qualification_single_lane_persistent_config(),
+            )
+            .expect("replacement-leader persistent consumer configuration"),
+        ),
+    };
+    assert!(
+        runtime
+            .block_on(leader_survivor_client.prewarm())
+            .is_ok_and(|ready| ready),
+        "the same authenticated consumer must establish replacement-leader transport"
+    );
+    assert_eq!(
+        runtime.block_on(leader_survivor_client.lease_mutation_status(&known_lease_status)),
+        Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(Ok(
+            SessionConsumerLeaseMutationResult::Acquire(known_lease.clone())
+        )))),
+        "the replacement leader must recover the exact prior lease outcome"
+    );
+    assert!(
+        matches!(
+            runtime.block_on(leader_survivor_client.execute(first_atomic_status_request)),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "leader replacement must retain the public V1 receipt-recovery boundary"
+    );
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.general_lane.after_leader_loss_operations = 1;
+    }
+    if let Some(protected) = protected_roster_run.as_mut() {
+        let protected_voter = protected_roster_proven_live_voter(&replacement_reports);
+        assert_ne!(
+            protected_voter, leader_node_index,
+            "the protected `/3` client must not retain the deliberately lost leader endpoint"
+        );
+        if protected.voter_index() != protected_voter {
+            let rebound = protected_roster_client_for_voter(protected_voter, None);
+            runtime.block_on(protected.rebind_live_voter(rebound, protected_voter, scope));
+        }
+        require_protected_roster_admitted_status(
+            runtime.block_on(protected.status()),
+            "after protected-roster leader loss",
+        );
+        if let Some(measurements) = persistent_measurements.as_mut() {
+            measurements.protected_roster_lane.status_operations += 1;
+            measurements
+                .protected_roster_lane
+                .after_leader_loss_operations = 1;
+        }
+    }
+    // The public V1 route remains unavailable after leader replacement.
+    let second_atomic_key = qualification_fenced_transition_key(1);
+    let second_atomic_fence = match runtime
+        .block_on(leader_survivor_client.execute(SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::from_bytes([0x64; 16]),
+            SessionConsumerOperation::ObserveFencedTransition {
+                key: second_atomic_key.clone(),
+            },
+        )))
+        .expect("second fresh atomic observation response")
+    {
+        SessionConsumerResponse::ObserveFencedTransition(Ok(observation)) => {
+            assert!(
+                observation.record().is_none() && observation.current_fence() == FenceToken::new(0),
+                "the replacement leader must observe a fresh atomic key"
+            );
+            observation.current_fence()
+        }
+        _ => panic!("second fresh atomic observation must be typed and successful"),
+    };
+    let second_atomic_id_bytes = [0x65; 16];
+    let second_atomic_id = FencedTransitionRequestId::from_bytes(second_atomic_id_bytes);
+    let second_atomic_owner =
+        OwnerId::new("qualification-atomic-failover-owner").expect("failover atomic owner");
+    let second_atomic_lease = FencedTransitionLease::acquire(
+        second_atomic_key.clone(),
+        second_atomic_owner.clone(),
+        second_atomic_fence,
+        Duration::from_secs(30),
+    )
+    .expect("build second atomic acquire action");
+    let second_atomic_record = runtime.block_on(qualification_fenced_transition_record(
+        member_count,
+        second_atomic_key.clone(),
+        second_atomic_owner,
+        second_atomic_lease
+            .committed_fence()
+            .expect("derive second committed fence"),
+        b"opaque-qualification-fenced-transition-two",
+    ));
+    assert_eq!(second_atomic_record.generation, Generation::new(1));
+    assert_eq!(
+        second_atomic_record.fence,
+        FenceToken::new(second_atomic_fence.get() + 1),
+        "the failover atomic record must bind the observed fence successor"
+    );
+    let second_atomic_transition = FencedTransitionRequest::new(
+        second_atomic_id,
+        second_atomic_lease,
+        FencedTransitionMutation::create(second_atomic_record),
+    )
+    .expect("build second atomic create transition");
+    let second_atomic_request = SessionConsumerRequest::new(
+        scope,
+        SessionConsumerRequestId::from_bytes(second_atomic_id_bytes),
+        SessionConsumerOperation::FencedTransition {
+            request: Box::new(second_atomic_transition.clone()),
+        },
+    );
+    assert_eq!(
+        second_atomic_request.request_id().as_bytes(),
+        second_atomic_transition.request_id().as_bytes(),
+        "the failover public and nested transition IDs must be byte-identical"
+    );
+    assert!(
+        matches!(
+            runtime.block_on(leader_survivor_client.execute(second_atomic_request.clone())),
+            Err(QualificationConsumerExecuteError::Stateless(
+                SessionConsumerClientError::Protocol
+            )) | Err(QualificationConsumerExecuteError::Persistent(
+                PersistentSessionConsumerExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol
+                }
+            ))
+        ),
+        "the replacement leader must retain the public V1 transition boundary"
+    );
     let leader_failover_request_id = SessionConsumerRequestId::from_bytes([0x51; 16]);
     let leader_failover_key = stateless_consumer_key(2);
     let leader_failover_owner = OwnerId::new("qualification-leader-failover-owner")
@@ -8346,20 +15928,23 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
             Duration::from_secs(30),
         ))
         .expect("consumer mutation must commit through the replacement leader");
-    assert_eq!(
-        runtime
-            .block_on(leader_survivor_client.acquire_with_id(
-                leader_failover_request_id,
-                leader_failover_key,
-                leader_failover_owner,
-                Duration::from_secs(30),
-            ))
-            .expect("replacement leader must recover the durable mutation outcome"),
-        leader_failover_lease,
+    let recovered_leader_failover_lease = runtime
+        .block_on(leader_survivor_client.acquire_with_id(
+            leader_failover_request_id,
+            leader_failover_key,
+            leader_failover_owner,
+            Duration::from_secs(30),
+        ))
+        .expect("replacement leader must recover the durable mutation outcome");
+    assert!(
+        recovered_leader_failover_lease == leader_failover_lease,
         "the replacement leader must return the exact committed consumer outcome"
     );
 
     fleet.spawn_node_at_manifest_address(leader_node_index, leader_address, leader_process_id);
+    let restarted_process_id = fleet.nodes[leader_node_index].process_id();
+    assert_ne!(restarted_process_id, leader_process_id);
+    process_ledger.record_restart(leader_node_index, leader_process_id, restarted_process_id);
     let restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     loop {
         let reports = fleet.readiness_reports(&all_nodes);
@@ -8374,9 +15959,41 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
     }
     let (_, restarted_scope) =
         fleet.start_stateless_consumer(leader_node_index, consumer_identities.clone());
-    assert_eq!(restarted_scope, scope);
-
+    assert!(
+        restarted_scope == scope,
+        "restarted listener retains its scope"
+    );
+    assert!(
+        runtime
+            .block_on(leader_survivor_client.capabilities())
+            .is_ok(),
+        "the surviving general lane remains operational after the lost leader restarts"
+    );
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.general_lane.after_restart_operations = 1;
+    }
     let recovered_reports = fleet.readiness_reports(&all_nodes);
+    if let Some(protected) = protected_roster_run.as_mut() {
+        let protected_voter = protected_roster_proven_live_voter(&recovered_reports);
+        if protected.voter_index() != protected_voter {
+            let rebound = protected_roster_client_for_voter(protected_voter, None);
+            runtime.block_on(protected.rebind_live_voter(rebound, protected_voter, scope));
+        }
+        let stale_fence_rejection =
+            runtime.block_on(protected.recover(&leader_survivor_client, scope));
+        require_protected_roster_admitted_status(
+            runtime.block_on(protected.status()),
+            "after protected-roster recovery",
+        );
+        if let Some(measurements) = persistent_measurements.as_mut() {
+            measurements.protected_roster_lane.status_operations += 1;
+            measurements.protected_roster_lane.after_restart_operations = 1;
+            measurements
+                .protected_roster_lane
+                .fence_negative_boundary_rejections = stale_fence_rejection;
+        }
+    }
+
     let recovered_leader = recovered_reports
         .iter()
         .find_map(|report| {
@@ -8391,7 +16008,9 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         .copied()
         .find(|node_index| *node_index != recovered_leader)
         .expect("nonleader voter for loss qualification");
-    let (_voter_address, _voter_process_id) = fleet.kill_node_unclean(voter_loss_node);
+    let (_voter_address, voter_process_id) = fleet.kill_node_unclean(voter_loss_node);
+    assert_ne!(voter_process_id, leader_process_id);
+    process_ledger.record_unclean_loss(voter_loss_node, voter_process_id);
     let voter_survivors = all_nodes
         .iter()
         .copied()
@@ -8410,42 +16029,188 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         }
         assert!(
             Instant::now() < voter_loss_deadline,
-            "stateless consumer quorum did not recover one voter loss: reports={reports:?}"
+            "{} consumer quorum did not recover one voter loss",
+            mode.name(),
         );
         thread::sleep(Duration::from_millis(50));
     }
-    let (healthy_node_index, healthy_client) = clients
+    let survivor_reports = fleet.readiness_reports(&voter_survivors);
+    let current_leader = survivor_reports
         .iter()
-        .enumerate()
-        .find(|(index, _)| index % member_count != voter_loss_node)
-        .map(|(index, client)| (index % member_count, client))
-        .expect("consumer client on a live voter endpoint");
-    fleet.arm_stateless_consumer_outcome_unknown(healthy_node_index);
+        .find_map(|report| {
+            report
+                .leader_id
+                .filter(|leader| *leader == report.node_id)
+                .map(|_| report.node_index)
+        })
+        .expect("leader after voter loss");
+    let follower_node_index = survivor_reports
+        .iter()
+        .find(|report| report.node_index != current_leader)
+        .map(|report| {
+            assert_eq!(
+                report.leader_id,
+                Some(
+                    survivor_reports
+                        .iter()
+                        .find(|candidate| candidate.node_index == current_leader)
+                        .expect("current leader report")
+                        .node_id
+                )
+            );
+            report.node_index
+        })
+        .expect("live follower after voter loss");
+    let before_delayed_log_index = survivor_reports[0]
+        .applied_index
+        .expect("stable applied index before delayed acquire");
+    assert!(survivor_reports.iter().all(|report| {
+        report.committed_index == Some(before_delayed_log_index)
+            && report.applied_index == Some(before_delayed_log_index)
+    }));
+    let healthy_client = &clients[follower_node_index];
+    let (delayed_identity_source, delayed_identity_receiver) = watch::channel(Some(
+        fleet
+            .pki
+            .consumer_identity_state(&consumer_identities[follower_node_index]),
+    ));
+    let delayed_tls = TlsConfigBuilder::new(delayed_identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("delayed-response consumer mTLS configuration");
+    let delayed_stateless = StatelessSessionConsumerClient::new(
+        endpoints[follower_node_index],
+        rustls_pki_types::ServerName::IpAddress(endpoints[follower_node_index].ip().into()),
+        voter_authorities[follower_node_index].clone(),
+        delayed_tls,
+    )
+    .with_operation_timeout(DELAYED_CONSUMER_CLIENT_DEADLINE);
+    let delayed_client = match mode {
+        ConsumerQualificationMode::Stateless => {
+            QualificationConsumerClient::Stateless(Box::new(delayed_stateless))
+        }
+        ConsumerQualificationMode::Persistent => QualificationConsumerClient::Persistent(
+            PersistentSessionConsumerClient::try_from_stateless(
+                delayed_stateless,
+                PersistentSessionConsumerConfig::default(),
+            )
+            .expect("bounded delayed persistent consumer configuration"),
+        ),
+    };
+    fleet.arm_stateless_consumer_delayed_response(follower_node_index);
     let ambiguous_request_id = SessionConsumerRequestId::from_bytes([0x52; 16]);
     let ambiguous_key = stateless_consumer_key(1);
     let ambiguous_owner =
         OwnerId::new("qualification-ambiguous-owner").expect("ambiguous consumer owner");
+    let ambiguous_ttl = Duration::from_secs(30);
     assert!(matches!(
-        runtime.block_on(healthy_client.acquire_with_id(
+        runtime.block_on(delayed_client.acquire_with_id(
             ambiguous_request_id,
             ambiguous_key.clone(),
             ambiguous_owner.clone(),
-            Duration::from_secs(30),
+            ambiguous_ttl,
         )),
         Err(SessionConsumerLeaseMutationError::OutcomeUnknown { request_id }) if request_id == ambiguous_request_id
     ));
-    assert!(
-        runtime
-            .block_on(healthy_client.acquire_with_id(
-                ambiguous_request_id,
-                ambiguous_key,
-                ambiguous_owner,
-                Duration::from_secs(30),
-            ))
-            .is_ok(),
-        "only the caller's retained request ID may recover a durable ambiguous mutation"
+    drop(delayed_client);
+    let retained = SessionConsumerLeaseMutationRequest::new(
+        ambiguous_request_id,
+        SessionConsumerLeaseMutationOperation::Acquire {
+            key: ambiguous_key.clone(),
+            owner: ambiguous_owner.clone(),
+            ttl: ambiguous_ttl,
+        },
     );
+    let status_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    let recovered = loop {
+        let receipt_status = runtime.block_on(healthy_client.lease_mutation_status(&retained));
+        match receipt_status {
+            Ok(SessionConsumerLeaseMutationStatus::Recorded(result)) => match *result {
+                Ok(SessionConsumerLeaseMutationResult::Acquire(guard)) => break guard,
+                _ => panic!("lease receipt returned an unexpected recorded result"),
+            },
+            // Receipt absence and the explicitly classified transient
+            // transport status are both deliberately ambiguous after an
+            // outcome-unknown mutation. A bounded status-only retry can
+            // reconcile them; it never submits a second mutation. Do not
+            // widen this to every StoreError: authority/scope/protocol and
+            // permanent errors must fail at their first observation.
+            status if lease_receipt_recovery_is_retryable(&status) => {
+                assert!(
+                    Instant::now() < status_deadline,
+                    "read-only receipt did not converge after the delayed acquire"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(status) => {
+                panic!("lease receipt recovery returned a non-retryable status: {status:?}")
+            }
+            Err(error) => {
+                panic!("lease receipt recovery returned a non-retryable error: {error:?}")
+            }
+        }
+    };
+    assert_eq!(recovered.key(), &ambiguous_key);
+    assert_eq!(recovered.owner(), &ambiguous_owner);
+    assert!(
+        recovered.expires_at() > recovered.acquired_at(),
+        "receipt recovery returns the persisted guard, not a fresh acquisition"
+    );
+    assert_eq!(
+        runtime.block_on(healthy_client.lease_mutation_status(&retained)),
+        Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(Ok(
+            SessionConsumerLeaseMutationResult::Acquire(recovered.clone())
+        )))),
+        "a second read-only status lookup must preserve the exact guard, TTL, fence, and credential"
+    );
+    // An ordinary retained consumer mutation has exactly two consensus
+    // entries: its body-binding marker and the inner Acquire. The status
+    // barrier/read never proposes an entry, so this exact delta proves one
+    // Acquire and no replay or status-induced logical-time/fence/TTL change.
+    const DELAYED_ACQUIRE_CONSENSUS_ENTRIES: u64 = 2;
+    let delayed_settlement_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    loop {
+        let reports = fleet.readiness_reports(&voter_survivors);
+        if reports.iter().all(|report| {
+            report.committed_index
+                == Some(before_delayed_log_index + DELAYED_ACQUIRE_CONSENSUS_ENTRIES)
+                && report.applied_index
+                    == Some(before_delayed_log_index + DELAYED_ACQUIRE_CONSENSUS_ENTRIES)
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < delayed_settlement_deadline,
+            "the delayed acquire must consume only its binding and one Acquire log position"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(runtime.block_on(healthy_client.capabilities()).is_ok());
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.general_lane.after_voter_loss_operations = 1;
+    }
+    if let Some(protected) = protected_roster_run.as_mut() {
+        let protected_voter =
+            protected_roster_proven_live_voter(&fleet.readiness_reports(&voter_survivors));
+        assert_ne!(
+            protected_voter, voter_loss_node,
+            "the protected `/3` client must not retain the deliberately lost second voter endpoint"
+        );
+        if protected.voter_index() != protected_voter {
+            let rebound = protected_roster_client_for_voter(protected_voter, None);
+            runtime.block_on(protected.rebind_live_voter(rebound, protected_voter, scope));
+        }
+        require_protected_roster_admitted_status(
+            runtime.block_on(protected.status()),
+            "after protected-roster second-voter loss",
+        );
+        if let Some(measurements) = persistent_measurements.as_mut() {
+            measurements.protected_roster_lane.status_operations += 1;
+            measurements
+                .protected_roster_lane
+                .after_voter_loss_operations = 1;
+        }
+    }
 
     let voter_ids_before = before_fault
         .iter()
@@ -8460,8 +16225,3169 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         voter_ids_after,
         vec![member_count; voter_ids_before.len() - 1]
     );
+    if matches!(mode, ConsumerQualificationMode::Persistent) {
+        runtime.block_on(async {
+            for client in &clients {
+                client.shutdown().await;
+            }
+            leader_survivor_client.shutdown().await;
+            if let Some(protected) = protected_roster_run.as_ref() {
+                protected.transport.shutdown().await;
+            }
+        });
+    }
+    drop(replacement_identity_source);
+    drop(delayed_identity_source);
     drop(identity_sources);
+    drop(roster_identity_source);
     fleet.shutdown();
+    if let Some(measurements) = persistent_measurements.as_mut() {
+        measurements.initial_processes = process_ledger.initial_processes();
+        measurements.unclean_process_losses = process_ledger.unclean_process_losses();
+        measurements.restarted_processes = process_ledger.restarted_processes();
+        measurements.observed_process_generations = process_ledger.observed_process_generations();
+    }
+    if let Some(provenance) = release_provenance.as_ref() {
+        provenance
+            .verify_unchanged()
+            .expect("release provenance remains clean through the dual-lane campaign");
+    }
+    persistent_measurements
+}
+
+fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
+    assert!(run_consumer_multiprocess_qualification(
+        member_count,
+        ConsumerQualificationMode::Stateless,
+        None,
+    )
+    .is_none());
+}
+
+fn assert_current_persistent_consumer_head_evidence_binding() {
+    let evidence_schema: serde_json::Value =
+        serde_json::from_str(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON)
+            .expect("v9 current-head persistent-consumer evidence schema");
+    assert_eq!(
+        evidence_schema["$defs"]["general_lane"]["allOf"][1]["properties"]["transport_revision"]
+            ["const"],
+        serde_json::json!(SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION),
+        "the general lane schema must bind the compiled consumer wire revision"
+    );
+    assert_eq!(
+        evidence_schema["$defs"]["protected_roster_lane"]["allOf"][1]["properties"]
+            ["transport_revision"]["const"],
+        serde_json::json!(SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION),
+        "the protected-roster lane schema must bind its isolated transport revision"
+    );
+}
+
+fn run_persistent_consumer_multiprocess_qualification(
+    member_count: usize,
+    release_provenance: Option<ReleaseGateProvenance>,
+) -> PersistentConsumerRunMeasurements {
+    assert_current_persistent_consumer_head_evidence_binding();
+    run_consumer_multiprocess_qualification(
+        member_count,
+        ConsumerQualificationMode::Persistent,
+        release_provenance,
+    )
+    .expect("persistent run emits bounded measurements")
+}
+
+// The revision-5 lane deliberately uses its own ALPN and request envelope.
+// This is a compact real-network recovery qualification, not a synthetic
+// backend exercise: every operation crosses projected-SVID mTLS into an
+// independently running OpenRaft/SQLite voter.
+fn run_persistent_consumer_v2_multiprocess_qualification() {
+    const MEMBER_COUNT: usize = 3;
+    let mut fleet = Fleet::start(MEMBER_COUNT);
+    // The server-side authorization manifest deliberately admits the same
+    // fixed pool used by the V1 qualification. Keep this bounded and shared
+    // across voters; the V2 client itself uses only the first identity.
+    let consumer_identities = (0..12).map(stateless_consumer_identity).collect::<Vec<_>>();
+    let consumer_identity = consumer_identities[0].clone();
+    let mut endpoints = Vec::with_capacity(MEMBER_COUNT);
+    let mut scope = None;
+    for node_index in 0..MEMBER_COUNT {
+        let (endpoint, node_scope) =
+            fleet.start_stateless_consumer(node_index, consumer_identities.clone());
+        if let Some(expected) = scope {
+            assert_eq!(
+                node_scope, expected,
+                "V2 consumer scope differs between voters"
+            );
+        } else {
+            scope = Some(node_scope);
+        }
+        endpoints.push(endpoint);
+    }
+    let scope = scope.expect("one V2 consumer scope per qualification fleet");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
+    let endpoints = Arc::new(Mutex::new(endpoints));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("V2 consumer qualification runtime");
+    let consumer_identity_state = fleet.pki.consumer_identity_state(&consumer_identity);
+    let client_for = |node_index: usize, operation_timeout: Option<Duration>| {
+        let (_identity_source, identity_receiver) =
+            watch::channel(Some(consumer_identity_state.clone()));
+        let tls = TlsConfigBuilder::new(identity_receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("V2 consumer client mTLS configuration");
+        let initial_endpoint = endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+        let resolved_endpoints = Arc::clone(&endpoints);
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let endpoint = resolved_endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+            Box::pin(async move { Ok(endpoint) })
+        });
+        let stateless = StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
+            voter_authorities[node_index].clone(),
+            tls,
+        );
+        let stateless = match operation_timeout {
+            Some(timeout) => stateless.with_operation_timeout(timeout),
+            None => stateless,
+        };
+        PersistentSessionConsumerClient::try_from_stateless(
+            stateless,
+            PersistentSessionConsumerConfig::default(),
+        )
+        .expect("fixed persistent V2 consumer configuration")
+    };
+    let client = client_for(0, None);
+    runtime
+        .block_on(client.prewarm_v2())
+        .expect("prewarm fixed V2 pool");
+    let v2_before = client.v2_diagnostics();
+    assert_eq!(
+        v2_before.setup_successes, 4,
+        "V2 prewarm opens four fixed lanes"
+    );
+    assert_eq!(
+        v2_before.idle, 4,
+        "V2 prewarm retains four fixed idle lanes"
+    );
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&SessionConsumerV2Request::new(
+                scope,
+                SessionConsumerV2Operation::FencedTransitionV2Capability,
+            )))
+            .expect("V2 capability response"),
+        SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2
+        )),
+        "the real V2 ALPN lane must admit precisely the generic V2 contract"
+    );
+
+    let first = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 0));
+    let first_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(first.clone()),
+        },
+    );
+    let first_outcome = match runtime
+        .block_on(client.execute_v2(&first_request))
+        .expect("first V2 transition response")
+    {
+        SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)) => {
+            assert!(outcome.matches_v2_request(&first));
+            outcome
+        }
+        response => panic!("first V2 transition must return its typed outcome: {response:?}"),
+    };
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&first_request))
+            .expect("exact V2 replay response"),
+        SessionConsumerV2Response::FencedTransitionV2(Ok(first_outcome.clone())),
+        "the full self-authenticating V2 ID replays its exact durable outcome"
+    );
+    let first_status = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Status {
+            request: Box::new(first.clone()),
+        },
+    );
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&first_status))
+            .expect("V2 status response"),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Ok(first_outcome.clone())))
+        )),
+        "status returns the same exact V2 receipt"
+    );
+
+    // A structural body substitution retains the original complete ID in
+    // both envelope locations. It must be a typed conflict, not a second
+    // transition or malformed transport frame.
+    let altered = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 1));
+    let altered_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(altered),
+        },
+    );
+    let original_id = serde_json::to_value(first_request.request_id()).expect("V2 ID encodes");
+    let mut conflicted_value = serde_json::to_value(altered_request).expect("V2 envelope encodes");
+    let serde_json::Value::Object(fields) = &mut conflicted_value else {
+        panic!("V2 envelope is an object");
+    };
+    fields.insert("request_id".to_owned(), original_id.clone());
+    fields
+        .get_mut("operation")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|operation| operation.get_mut("request"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("V2 request body")
+        .insert("request_id".to_owned(), original_id);
+    let conflicted: SessionConsumerV2Request =
+        serde_json::from_value(conflicted_value).expect("structural V2 conflict decodes");
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&conflicted))
+            .expect("V2 conflict response"),
+        SessionConsumerV2Response::FencedTransitionV2(Err(
+            SessionConsumerV2FencedTransitionError::RequestConflict
+        ))
+    );
+    let v2_pre_fault = client.v2_diagnostics();
+    assert_eq!(
+        v2_pre_fault.reconnects, 0,
+        "the steady pre-fault V2 pool does not discard an authenticated lane: {v2_pre_fault:?}"
+    );
+
+    let all_nodes = (0..MEMBER_COUNT).collect::<Vec<_>>();
+    let before_fault = fleet.readiness_reports(&all_nodes);
+    let old_leader_id = before_fault
+        .iter()
+        .find_map(|report| report.leader_id)
+        .expect("V2 qualification leader");
+    let old_term = before_fault[0].term;
+    let leader_node_index = before_fault
+        .iter()
+        .find_map(|report| (report.node_id == old_leader_id).then_some(report.node_index))
+        .expect("V2 qualification leader node");
+    let (leader_address, leader_process_id) = fleet.kill_node_unclean(leader_node_index);
+    let survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != leader_node_index)
+        .collect::<Vec<_>>();
+    let recovery_deadline = Instant::now() + STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT;
+    let replacement = loop {
+        let reports = fleet.readiness_reports(&survivors);
+        if let Some(report) = reports.iter().find(|report| {
+            report.ready
+                && report
+                    .leader_id
+                    .is_some_and(|leader| leader != old_leader_id)
+                && report.term > old_term
+                && report.node_id == report.leader_id.expect("leader is present")
+        }) {
+            break report.node_index;
+        }
+        assert!(
+            Instant::now() < recovery_deadline,
+            "V2 consumer quorum did not elect a replacement leader"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let replacement_client = client_for(replacement, None);
+    assert_eq!(
+        runtime
+            .block_on(replacement_client.execute_v2(&first_status))
+            .expect("V2 status after leader loss"),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Ok(first_outcome.clone())))
+        )),
+        "a re-elected leader returns the original V2 receipt"
+    );
+
+    fleet.spawn_node_at_manifest_address(leader_node_index, leader_address, leader_process_id);
+    let restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&all_nodes)
+        .iter()
+        .all(|report| report.ready)
+    {
+        assert!(
+            Instant::now() < restart_deadline,
+            "restarted V2 leader did not regain readiness"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (restarted_leader_endpoint, _) =
+        fleet.start_stateless_consumer(leader_node_index, consumer_identities.clone());
+    endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[leader_node_index] =
+        restarted_leader_endpoint;
+
+    let voter_loss_node = all_nodes
+        .iter()
+        .copied()
+        .find(|node_index| *node_index != replacement)
+        .expect("V2 nonleader voter");
+    let (voter_address, voter_process_id) = fleet.kill_node_unclean(voter_loss_node);
+    let voter_survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != voter_loss_node)
+        .collect::<Vec<_>>();
+    let voter_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&voter_survivors)
+        .iter()
+        .all(|report| report.ready && report.required_quorum == fleet.required_quorum())
+    {
+        assert!(
+            Instant::now() < voter_deadline,
+            "V2 quorum did not survive voter loss"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let delayed_client = client_for(replacement, Some(DELAYED_CONSUMER_CLIENT_DEADLINE));
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("prewarm the bounded delayed-response V2 client");
+    fleet.arm_stateless_consumer_delayed_response(replacement);
+    let ambiguous = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 2));
+    let ambiguous_execute = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(ambiguous.clone()),
+        },
+    );
+    assert_eq!(
+        runtime
+            .block_on(delayed_client.execute_v2(&ambiguous_execute))
+            .expect_err("post-commit V2 response-loss must be ambiguous"),
+        PersistentSessionConsumerV2ExecuteError::OutcomeUnknown {
+            request_id: ambiguous.request_id(),
+        },
+        "the post-commit response-loss seam returns the exact caller-retained V2 ID"
+    );
+    drop(delayed_client);
+    let ambiguous_status = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Status {
+            request: Box::new(ambiguous.clone()),
+        },
+    );
+    assert!(matches!(
+        runtime
+            .block_on(replacement_client.execute_v2(&ambiguous_status))
+            .expect("ambiguous V2 status readback"),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(result)
+        )) if result.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_v2_request(&ambiguous))
+    ));
+
+    let successor = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 3));
+    assert!(matches!(
+        runtime
+            .block_on(replacement_client.execute_v2(&SessionConsumerV2Request::new(
+                scope,
+                SessionConsumerV2Operation::FencedTransitionV2 {
+                    request: Box::new(successor.clone()),
+                },
+            )))
+            .expect("fresh V2 successor response"),
+        SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)) if outcome.matches_v2_request(&successor)
+    ));
+
+    fleet.spawn_node_at_manifest_address(voter_loss_node, voter_address, voter_process_id);
+    let voter_restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&all_nodes)
+        .iter()
+        .all(|report| report.ready)
+    {
+        assert!(
+            Instant::now() < voter_restart_deadline,
+            "restarted V2 voter did not regain readiness"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (restarted_voter_endpoint, _) =
+        fleet.start_stateless_consumer(voter_loss_node, consumer_identities);
+    endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[voter_loss_node] =
+        restarted_voter_endpoint;
+    let v2_after = client.v2_diagnostics();
+    assert!(
+        v2_after.reused >= 4,
+        "steady V2 calls reuse fixed authenticated lanes without a reconnect storm: {v2_after:?}"
+    );
+    assert!(
+        v2_after.reconnects <= 4,
+        "endpoint loss or bounded lifecycle expiry discards at most the fixed four-lane pool once: {v2_after:?}"
+    );
+    runtime
+        .block_on(client.prewarm_v2())
+        .expect("re-establish the exact fixed V2 width after endpoint recovery");
+    let v2_reestablished = client.v2_diagnostics();
+    let v2_readiness = runtime.block_on(client.v2_readiness());
+    assert!(v2_readiness.ready, "re-established V2 pool is ready");
+    assert_eq!(v2_readiness.configured_request_connections, 4);
+    assert_eq!(v2_readiness.ready_request_connections, 4);
+    assert_eq!(v2_reestablished.active, 4);
+    assert_eq!(v2_reestablished.idle, 4);
+    assert!(
+        v2_reestablished.setup_successes <= 8,
+        "one recovered fixed pool cannot create an unbounded setup storm: {v2_reestablished:?}"
+    );
+    runtime.block_on(async {
+        client.shutdown().await;
+        replacement_client.shutdown().await;
+    });
+    fleet.shutdown();
+}
+
+// This ignored gate is intentionally a same-host, three-child-process
+// qualification. It exercises the production persistent V2 pool over TCP,
+// projected-SVID mTLS, exact SPIFFE peer verification, V2 ALPN, and Hello;
+// it is not a cross-host production-capacity claim.
+fn run_persistent_consumer_v2_batch_release_gate(
+    release_provenance: ReleaseGateProvenance,
+) -> BatchReleaseGateRunFacts {
+    release_provenance
+        .verify_unchanged()
+        .expect("release gate source remains clean before its V1 campaign");
+    const MEMBER_COUNT: usize = 3;
+    assert_v2_batch_release_profile();
+    let observed_profile = env!("OPC_SESSION_TESTKIT_CARGO_PROFILE_FAMILY");
+    let observed_opt_level = env!("OPC_SESSION_TESTKIT_CARGO_OPT_LEVEL");
+    assert_eq!(V2_BATCH_RELEASE_GATE_CLIENTS, 12);
+    assert_eq!(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT, 4);
+    assert_eq!(V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY, 48);
+    assert_eq!(
+        V2_BATCH_RELEASE_GATE_CLIENTS / MEMBER_COUNT * V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+        16,
+        "each voter receives exactly its normal sixteen-connection workload envelope below the bounded listener admission limit"
+    );
+    assert_eq!(V2_BATCH_RELEASE_GATE_PRELOAD_CREATES, 50_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_PACED_MUTATIONS, 60_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND, 1_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES, 1_008);
+    let mut fleet = Fleet::start_with_schedule(
+        MEMBER_COUNT,
+        session_mtls_batch_release_gate_schedule_sha256(),
+        Some(&release_provenance),
+    );
+    let consumer_identities = (0..V2_BATCH_RELEASE_GATE_CLIENTS)
+        .map(stateless_consumer_identity)
+        .collect::<Vec<_>>();
+    let mut endpoints = Vec::with_capacity(MEMBER_COUNT);
+    let mut scope = None;
+    for node_index in 0..MEMBER_COUNT {
+        let (endpoint, node_scope) =
+            fleet.start_stateless_consumer(node_index, consumer_identities.clone());
+        if let Some(expected) = scope {
+            assert_eq!(
+                node_scope, expected,
+                "V2 batch scope differs between voters"
+            );
+        } else {
+            scope = Some(node_scope);
+        }
+        endpoints.push(endpoint);
+    }
+    let scope = scope.expect("three V2 batch consumer scopes");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
+    let endpoints = Arc::new(Mutex::new(endpoints));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("V2 batch release-gate runtime");
+    let pool_config = PersistentSessionConsumerConfig::try_new(
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+        V2_BATCH_RELEASE_GATE_PENDING_CALLS,
+        Duration::from_millis(250),
+        2,
+        Duration::from_millis(1_500),
+        2,
+        Duration::from_millis(25),
+        Duration::from_secs(5),
+    )
+    .expect("fixed V2 batch pool and queue configuration");
+    assert_eq!(
+        pool_config.connect_attempts(),
+        2,
+        "mTLS setup accounting is derived from the fixed two-attempt connection policy"
+    );
+    let credential_negative_pool_config = PersistentSessionConsumerConfig::try_new(
+        1,
+        0,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        1,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("single-attempt credential-negative pool configuration");
+    let mut identity_senders = Vec::with_capacity(V2_BATCH_RELEASE_GATE_CLIENTS);
+    let mut clients = Vec::with_capacity(V2_BATCH_RELEASE_GATE_CLIENTS);
+    for (consumer_index, consumer_identity) in consumer_identities.iter().enumerate() {
+        let node_index = consumer_index % MEMBER_COUNT;
+        let (identity_sender, identity_receiver) =
+            watch::channel(Some(fleet.pki.consumer_identity_state(consumer_identity)));
+        let tls = TlsConfigBuilder::new(identity_receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("V2 batch client mTLS configuration");
+        let initial_endpoint = endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+        let resolved_endpoints = Arc::clone(&endpoints);
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let endpoint = resolved_endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+            Box::pin(async move { Ok(endpoint) })
+        });
+        let stateless = StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
+            voter_authorities[node_index].clone(),
+            tls,
+        );
+        identity_senders.push(identity_sender);
+        clients.push(
+            PersistentSessionConsumerClient::try_from_stateless(stateless, pool_config)
+                .expect("fixed persistent V2 batch client"),
+        );
+    }
+    assert_eq!(clients.len(), V2_BATCH_RELEASE_GATE_CLIENTS);
+
+    // Establish the overlap generation on every server before creating the
+    // stable 48-lane baseline. `transition_member` advances the fleet-wide
+    // reauthentication generation; prewarming first would deliberately
+    // retire those lanes while this current-thread runtime is not being
+    // driven to observe their remote EOFs.
+    for node_index in 0..MEMBER_COUNT {
+        fleet.transition_member(
+            node_index,
+            CredentialGeneration::Initial,
+            TrustGeneration::Overlap,
+            &format!("v2-batch-initial-overlap-node-{node_index}"),
+        );
+    }
+
+    runtime.block_on(async {
+        let readiness = futures_util::future::join_all(clients.iter().map(|client| async {
+            client.prewarm_v2().await.expect("prewarm fixed V2 lanes");
+            client.v2_readiness().await
+        }))
+        .await;
+        assert!(readiness.iter().all(|ready| {
+            ready.ready
+                && ready.configured_request_connections == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+                && ready.ready_request_connections == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+        }));
+    });
+    // Snapshot immediately after the exact 48-lane initial prewarm. Later
+    // load-window accounting is relative to this stable physical baseline.
+    let initial_prewarm_diagnostics = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    let prewarmed = initial_prewarm_diagnostics.clone();
+    assert!(prewarmed.iter().all(|diagnostics| {
+        diagnostics.setup_attempts == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.setup_failures == 0
+            && diagnostics.setup_successes == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.active == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.idle == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.pool_wait_current == 0
+            && diagnostics.pool_wait_max == 0
+            && diagnostics.reconnects == 0
+    }));
+
+    let capability_before = clients[0].v2_diagnostics();
+    let capability_response = runtime
+        .block_on(clients[0].execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        )))
+        .expect("V2 batch capability response");
+    let capability_after = clients[0].v2_diagnostics();
+    assert_eq!(
+        capability_response,
+        SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2
+        )),
+        "the release gate uses the V2 ALPN/Hello contract, not the V1 listener"
+    );
+    assert_eq!(
+        capability_after.setup_attempts, capability_before.setup_attempts,
+        "the first overlap-generation capability read reuses a prewarmed lane"
+    );
+    assert_eq!(
+        capability_after.setup_failures, capability_before.setup_failures,
+        "the first overlap-generation capability read has no hidden failed setup"
+    );
+    assert_eq!(
+        capability_after.setup_successes, capability_before.setup_successes,
+        "the first overlap-generation capability read opens no replacement lane"
+    );
+    assert_eq!(
+        capability_after.reconnects, capability_before.reconnects,
+        "the first overlap-generation capability read retires no lane"
+    );
+    assert_eq!(
+        capability_after.reused,
+        capability_before
+            .reused
+            .checked_add(1)
+            .expect("bounded capability reuse counter fits u64"),
+        "the first overlap-generation capability read uses exactly one warm lane"
+    );
+    assert_eq!(
+        (capability_after.active, capability_after.idle),
+        (
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        ),
+        "the capability read returns the lane to the exact fixed-width idle pool"
+    );
+
+    let first = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 0));
+    let first_response = runtime
+        .block_on(clients[0].execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(first.clone()),
+            },
+        )))
+        .expect("singleton first V2 activation response");
+    assert!(matches!(
+        first_response,
+        SessionConsumerV2Response::FencedTransitionV2(Ok(outcome))
+            if outcome.matches_v2_request(&first)
+    ));
+
+    let process_ids = fleet
+        .nodes
+        .iter()
+        .map(ChildNode::process_id)
+        .collect::<Vec<_>>();
+    // The sampler observes only the three child voters. The harness process
+    // and any server queue high-water are downstream diagnostics, not
+    // acceptance evidence for this client-pool qualification.
+    let warmed_resources = process_ids
+        .iter()
+        .copied()
+        .map(read_classified_process_resources)
+        .collect::<Vec<_>>();
+    let resource_sampler = ResourceSampler::start(process_ids.clone());
+
+    let preload_batches = runtime.block_on(qualification_build_v2_batches(
+        MEMBER_COUNT,
+        1,
+        V2_BATCH_RELEASE_GATE_PRELOAD_CREATES,
+        V2_BATCH_RELEASE_GATE_PRELOAD_BATCH_SIZE,
+    ));
+    assert_eq!(
+        preload_batches.iter().map(Vec::len).sum::<usize>(),
+        V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
+    );
+    let retained_preload_requests = preload_batches
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained_preload_requests.len(),
+        V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
+    );
+    let preload_operation_before = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "preload preparation",
+        &initial_prewarm_diagnostics,
+        &preload_operation_before,
+    );
+    let (
+        preload_recovered_unknown,
+        preload_not_transmitted_retries,
+        preload_not_transmitted_retry_high_water,
+        preload_status_retries,
+    ) = runtime.block_on(async {
+        let mut recovered_unknown = 0usize;
+        let mut not_transmitted_retries = 0usize;
+        let mut not_transmitted_retry_high_water = 0usize;
+        let mut status_retries = V2BatchStatusRetryCounts::default();
+        for batches in preload_batches.chunks(V2_BATCH_RELEASE_GATE_PRELOAD_CONCURRENCY) {
+            let measurements = futures_util::future::join_all(batches.iter().map(|requests| {
+                qualification_execute_v2_batch_sample(
+                    clients[0].clone(),
+                    scope,
+                    requests.clone(),
+                    Instant::now(),
+                )
+            }))
+            .await;
+            let measurements = measurements
+                .into_iter()
+                .map(|measurement| measurement.expect("preload V2 batch sample succeeds"))
+                .collect::<Vec<_>>();
+            assert_eq!(measurements.len(), batches.len());
+            recovered_unknown = recovered_unknown
+                .checked_add(
+                    measurements
+                        .iter()
+                        .filter(|(_, recovered, _, _)| *recovered)
+                        .count(),
+                )
+                .expect("bounded preload recovery count fits usize");
+            not_transmitted_retries = not_transmitted_retries
+                .checked_add(
+                    measurements
+                        .iter()
+                        .map(|(_, _, retries, _)| retries)
+                        .sum::<usize>(),
+                )
+                .expect("bounded preload retry count fits usize");
+            not_transmitted_retry_high_water = not_transmitted_retry_high_water.max(
+                measurements
+                    .iter()
+                    .map(|(_, _, retries, _)| *retries)
+                    .max()
+                    .unwrap_or(0),
+            );
+            for (_, _, _, retries) in measurements {
+                status_retries.accumulate(retries);
+            }
+        }
+        (
+            recovered_unknown,
+            not_transmitted_retries,
+            not_transmitted_retry_high_water,
+            status_retries,
+        )
+    });
+    assert_eq!(
+        preload_batches.len(),
+        196,
+        "50k preload has the exact 256-operation batch schedule"
+    );
+    assert_eq!(
+        preload_recovered_unknown, 0,
+        "a 256-operation preload family cannot truthfully claim recovery under the fixed 64-status-attempt cap"
+    );
+    assert_eq!(
+        preload_status_retries.attempts_total,
+        preload_status_retries
+            .terminal_attempts
+            .checked_add(preload_status_retries.total)
+            .expect("preload status-attempt conservation fits usize"),
+        "preload status attempts are conserved between terminal reads and retries"
+    );
+    assert_eq!(
+        preload_status_retries.total,
+        preload_status_retries
+            .not_found
+            .checked_add(preload_status_retries.not_transmitted)
+            .and_then(|total| total.checked_add(preload_status_retries.read_unavailable))
+            .and_then(|total| total.checked_add(preload_status_retries.typed_unavailable))
+            .expect("preload status retry-cause conservation fits usize"),
+        "preload status retries are conserved across their named causes"
+    );
+    assert_eq!(
+        preload_status_retries,
+        V2BatchStatusRetryCounts::default(),
+        "preload status recovery is conserved as an explicit zero rather than discarded"
+    );
+    assert!(
+        preload_not_transmitted_retry_high_water
+            <= V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT,
+        "every retained preload mutation replay obeys the fixed per-batch bound"
+    );
+    // Close the preload measurement before constructing the later paced
+    // schedule or explicitly restoring idle capacity. The other eleven
+    // pools are intentionally unused during this window and may reap idle
+    // lanes, but neither that retirement nor 50k operations may dial a
+    // replacement connection.
+    let post_preload_diagnostics = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "50k preload",
+        &preload_operation_before,
+        &post_preload_diagnostics,
+    );
+
+    let mutation_batches = runtime.block_on(qualification_build_v2_batches(
+        MEMBER_COUNT,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES,
+        V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+    ));
+    let mutation_batch_count = mutation_batches.len();
+    assert_eq!(
+        mutation_batches.iter().map(Vec::len).sum::<usize>(),
+        V2_BATCH_RELEASE_GATE_PACED_MUTATIONS
+    );
+
+    // Long unpaced batches deliberately keep one client hot. Restore and
+    // freeze the complete fixed-width pool immediately before latency
+    // measurement so setup work is excluded and every measured call is warm.
+    // The explicit restoration is accounted separately from the causally
+    // closed zero-setup preload window above; its counters remain cumulative
+    // in the release evidence.
+    let preload_restoration = runtime.block_on(async {
+        futures_util::future::join_all(clients.iter().map(|client| async {
+            let readiness_before = client.v2_readiness().await;
+            let diagnostics_before = client.v2_diagnostics();
+            client
+                .prewarm_v2()
+                .await
+                .expect("restore fixed V2 width before measured work");
+            let ready = client.v2_readiness().await;
+            assert!(ready.ready);
+            assert_eq!(
+                ready.ready_request_connections,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+            );
+            let diagnostics = client.v2_diagnostics();
+            assert_eq!(
+                diagnostics.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "each measured V2 client retains its declared fixed lane width"
+            );
+            assert_eq!(
+                diagnostics.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "each measured V2 client is fully idle immediately before warm work"
+            );
+            (readiness_before, diagnostics_before, diagnostics)
+        }))
+        .await
+    });
+    for (client_index, (readiness_before, before, after)) in preload_restoration.iter().enumerate()
+    {
+        assert_eq!(
+            readiness_before.configured_request_connections, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            "preload restoration retains the configured pool width: client_index={client_index}"
+        );
+        verify_v2_prewarm_restoration(
+            client_index,
+            readiness_before.ready_request_connections,
+            initial_prewarm_diagnostics[client_index],
+            *before,
+            *after,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+    let post_preload_restore_diagnostics = preload_restoration
+        .iter()
+        .map(|(_, _, diagnostics)| *diagnostics)
+        .collect::<Vec<_>>();
+    let measurement_baseline = post_preload_restore_diagnostics.clone();
+    let consensus_diagnostics_before_warm_reads = fleet.all_consensus_diagnostics();
+
+    const WARM_STATUS_REQUEST_STRIDE: usize = 53;
+    let (mut warm_read_samples, mut warm_status_request_indices) = runtime.block_on(async {
+        let mut samples = Vec::with_capacity(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES);
+        let mut request_indices = Vec::with_capacity(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES);
+        let retained_request_count = V2_BATCH_RELEASE_GATE_PRELOAD_CREATES;
+        let mut sample_index = 0usize;
+        for _ in
+            0..(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY)
+        {
+            let scheduled_at = Instant::now();
+            let mut reads = Vec::with_capacity(V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY);
+            for client in &clients {
+                for _ in 0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                    let request_index = 1usize
+                        .checked_add(
+                            sample_index
+                                .checked_mul(WARM_STATUS_REQUEST_STRIDE)
+                                .expect("bounded warm status index multiplication fits usize")
+                                % retained_request_count,
+                        )
+                        .expect("bounded warm status request index fits usize");
+                    sample_index = sample_index
+                        .checked_add(1)
+                        .expect("bounded warm status sample count fits usize");
+                    request_indices.push(request_index);
+                    let retained_request = retained_preload_requests
+                        .get(
+                            request_index
+                                .checked_sub(1)
+                                .expect("one-based warm status request index is nonzero"),
+                        )
+                        .expect("warm status index selects retained preload request")
+                        .clone();
+                    reads.push(qualification_execute_v2_status_sample(
+                        client.clone(),
+                        scope,
+                        retained_request,
+                        scheduled_at,
+                    ));
+                }
+            }
+            let wave = futures_util::future::join_all(reads).await;
+            samples.extend(wave);
+        }
+        (samples, request_indices)
+    });
+    assert_eq!(
+        warm_read_samples.len(),
+        V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
+        "warm-read sample collection is exact and bounded"
+    );
+    warm_status_request_indices.sort_unstable();
+    warm_status_request_indices.dedup();
+    assert_eq!(
+        warm_status_request_indices.len(),
+        V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
+        "warm status reads cover an exact deterministic non-hot retained-request spread"
+    );
+    let warm_status_request_min = *warm_status_request_indices
+        .first()
+        .expect("warm status request spread is nonempty");
+    let warm_status_request_max = *warm_status_request_indices
+        .last()
+        .expect("warm status request spread is nonempty");
+    let consensus_diagnostics_after_warm_reads = fleet.all_consensus_diagnostics();
+    assert_eq!(
+        consensus_diagnostics_after_warm_reads.len(),
+        consensus_diagnostics_before_warm_reads.len(),
+        "warm-read consensus diagnostic cardinality is stable"
+    );
+    assert_eq!(
+        consensus_diagnostics_after_warm_reads.len(),
+        MEMBER_COUNT,
+        "warm-read consensus diagnostics cover every fixed voter"
+    );
+    let status_accounting = consensus_diagnostics_after_warm_reads
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .enumerate()
+        .map(|(voter_index, (after, before))| {
+            let delta = |counter: &str, before: u64, after: u64| {
+                after.checked_sub(before).unwrap_or_else(|| {
+                    panic!(
+                        "warm-read consensus diagnostic regressed: voter_index={voter_index}, counter={counter}, before={before}, after={after}"
+                    )
+                })
+            };
+            V2StatusCohortAccountingDelta {
+                local: delta(
+                    "status_local_requests",
+                    before.status_local_requests,
+                    after.status_local_requests,
+                ),
+                ingress: delta(
+                    "status_ingress_requests",
+                    before.status_ingress_requests,
+                    after.status_ingress_requests,
+                ),
+                representatives: delta(
+                    "status_representatives",
+                    before.status_representatives,
+                    after.status_representatives,
+                ),
+                leader: delta(
+                    "status_leader_cohort_requests",
+                    before.status_leader_cohort_requests,
+                    after.status_leader_cohort_requests,
+                ),
+                proposals: delta(
+                    "status_proposals",
+                    before.status_proposals,
+                    after.status_proposals,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let status_local_delta = status_accounting
+        .iter()
+        .map(|delta| delta.local)
+        .sum::<u64>();
+    let status_ingress_delta = status_accounting
+        .iter()
+        .map(|delta| delta.ingress)
+        .sum::<u64>();
+    let status_representative_delta = status_accounting
+        .iter()
+        .map(|delta| delta.representatives)
+        .sum::<u64>();
+    let status_leader_delta = status_accounting
+        .iter()
+        .map(|delta| delta.leader)
+        .sum::<u64>();
+    let status_proposal_delta = status_accounting
+        .iter()
+        .map(|delta| delta.proposals)
+        .sum::<u64>();
+    let status_wave_count = u64::try_from(
+        V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
+    )
+    .expect("bounded warm-read wave count");
+    let expected_local_per_voter =
+        u64::try_from(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / MEMBER_COUNT)
+            .expect("bounded per-voter warm-read count");
+    println!(
+        "V2_BATCH_RELEASE_GATE_STATUS_COHORTS local={status_local_delta} ingress={status_ingress_delta} representatives={status_representative_delta} leader={status_leader_delta} proposals={status_proposal_delta} per_voter={status_accounting:?}",
+    );
+    verify_v2_status_cohort_accounting(
+        expected_local_per_voter,
+        status_wave_count,
+        V2_BATCH_RELEASE_GATE_MAX_STATUS_COHORTS_PER_VOTER_WAVE,
+        V2_BATCH_RELEASE_GATE_MIN_STATUS_REPRESENTATIVES_PER_PROPOSAL,
+        &status_accounting,
+    )
+    .unwrap_or_else(|error| panic!("V2 warm-status consensus attempt bound failed: {error}"));
+
+    // Take a public capacity snapshot immediately before the paced phase.
+    // The scheduler below supplies the complementary caller-side bound: no
+    // client can have more than this many submitted V2 calls at once.
+    runtime.block_on(async {
+        let readiness = futures_util::future::join_all(
+            clients
+                .iter()
+                .map(PersistentSessionConsumerClient::v2_readiness),
+        )
+        .await;
+        for (client_index, ready) in readiness.iter().enumerate() {
+            assert!(
+                ready.ready
+                    && ready.configured_request_connections
+                        == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+                    && ready.ready_request_connections == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+                "V2 client {client_index} is fully ready immediately before paced work: {ready:?}"
+            );
+            let diagnostics = clients[client_index].v2_diagnostics();
+            assert_eq!(
+                diagnostics.active,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "V2 client {client_index} has its declared active lane width immediately before paced work: {diagnostics:?}"
+            );
+            assert_eq!(
+                diagnostics.idle,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "V2 client {client_index} has no checked-out lanes immediately before paced work: {diagnostics:?}"
+            );
+        }
+    });
+
+    let (
+        mut mutation_samples,
+        mutation_recovered_unknown,
+        mutation_not_transmitted_retries,
+        mutation_status_retries,
+        mutation_not_transmitted_retry_high_water,
+        mutation_status_retries_high_water,
+        mutation_status_attempts_high_water,
+        mutation_phase_elapsed,
+        mutation_scheduled_batches_per_client,
+        mutation_completed_batches_per_client,
+        mutation_slow_lane_other_completions,
+        mutation_saturated_client_skips,
+        mutation_max_in_flight_per_client,
+        mutation_max_global_in_flight,
+    ) = runtime.block_on(async {
+        let phase_started = Instant::now();
+        let interval_nanos = 1_000_000_000_u64
+            .checked_mul(u64::try_from(V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE).expect("fixed batch size fits u64"))
+            .expect("fixed pacing interval fits u64")
+            / u64::try_from(V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND)
+                .expect("fixed mutation rate fits u64");
+        let mut pending = futures_util::stream::FuturesUnordered::<
+            tokio::task::JoinHandle<(
+                usize,
+                usize,
+                Result<(Duration, bool, usize, V2BatchStatusRetryCounts), QualificationV2BatchSampleFailure>,
+            )>,
+        >::new();
+        let mut samples = Vec::with_capacity(mutation_batches.len());
+        let mut recovered_unknown = 0usize;
+        let mut not_transmitted_retries = 0usize;
+        let mut status_retries = V2BatchStatusRetryCounts::default();
+        let mut not_transmitted_retry_high_water = 0usize;
+        let mut status_retries_high_water = 0usize;
+        let mut status_attempts_high_water = 0usize;
+        let mut scheduled_batches_per_client = vec![0usize; clients.len()];
+        let mut completed_batches_per_client = vec![0usize; clients.len()];
+        let mut saturated_client_skips = 0usize;
+        // The first four paced admissions occupy the complete declared
+        // scheduler width of one client. That client is skipped until another
+        // fixed producer completes, proving that a slow producer cannot
+        // create global HOL or leave a capacity-hole deadlock.
+        let slow_lane_client_index = 0usize;
+        let (mut slow_lane_release_senders, mut slow_lane_release_receivers): (Vec<_>, Vec<_>) =
+            (0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT)
+                .map(|_| oneshot::channel::<()>())
+                .unzip();
+        let mut slow_lane_other_completions = 0usize;
+        let mut in_flight_per_client = vec![0usize; clients.len()];
+        let mut max_in_flight_per_client = vec![0usize; clients.len()];
+        let mut max_global_in_flight = 0usize;
+        for (batch_index, requests) in mutation_batches.into_iter().enumerate() {
+            let scheduled_at = phase_started
+                + Duration::from_nanos(
+                    interval_nanos
+                        .checked_mul(u64::try_from(batch_index).expect("bounded batch index fits u64"))
+                        .expect("bounded scheduled batch offset fits u64"),
+                );
+            tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_at)).await;
+            // Drain global capacity only. A saturated preferred client is
+            // skipped below, so one slow four-lane pool cannot induce global
+            // head-of-line blocking for other ready producers.
+            while pending.len() >= V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY {
+                use futures_util::StreamExt;
+                let (completed_batch_index, completed_client_index, result) = pending
+                    .next()
+                    .await
+                    .expect("bounded batch driver has a task")
+                    .expect("bounded batch sample task completes");
+                let (sample, recovered, retries, status_retry_counts) = result.unwrap_or_else(|failure| {
+                    let node_index = completed_client_index % MEMBER_COUNT;
+                    let diagnostics = fleet.all_consensus_diagnostics();
+                    panic!(
+                        "V2 batch release gate paced failure: batch_index={completed_batch_index}, client_index={completed_client_index}, node_index={node_index}, failure={failure:?}, diagnostics_by_node={diagnostics:?}"
+                    )
+                });
+                assert!(
+                    in_flight_per_client[completed_client_index] > 0,
+                    "completed V2 batch has a matching scheduler admission"
+                );
+                in_flight_per_client[completed_client_index] -= 1;
+                completed_batches_per_client[completed_client_index] += 1;
+                if completed_client_index != slow_lane_client_index
+                    && !slow_lane_release_senders.is_empty()
+                {
+                    slow_lane_other_completions += 1;
+                    for sender in slow_lane_release_senders.drain(..) {
+                        sender
+                            .send(())
+                            .expect("the bounded slow lanes remain scheduled");
+                    }
+                }
+                samples.push(sample);
+                recovered_unknown += usize::from(recovered);
+                not_transmitted_retries += retries;
+                status_retries.accumulate(status_retry_counts);
+                not_transmitted_retry_high_water = not_transmitted_retry_high_water.max(retries);
+                status_retries_high_water = status_retries_high_water.max(status_retry_counts.total);
+                status_attempts_high_water =
+                    status_attempts_high_water.max(status_retry_counts.attempts_total);
+            }
+            let preferred_client_index = if batch_index < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                slow_lane_client_index
+            } else {
+                batch_index % clients.len()
+            };
+            let client_index = select_v2_batch_scheduler_client(
+                preferred_client_index,
+                &in_flight_per_client,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            )
+                .expect("global capacity implies one V2 producer has a free lane");
+            saturated_client_skips += usize::from(client_index != preferred_client_index);
+            scheduled_batches_per_client[client_index] += 1;
+            assert!(
+                pending.len() < V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
+                "the global V2 scheduler bound leaves capacity for one admitted call"
+            );
+            assert!(
+                in_flight_per_client[client_index] < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+                "the per-client V2 scheduler bound leaves capacity for one admitted call"
+            );
+            in_flight_per_client[client_index] += 1;
+            max_in_flight_per_client[client_index] =
+                max_in_flight_per_client[client_index].max(in_flight_per_client[client_index]);
+            max_global_in_flight = max_global_in_flight.max(pending.len() + 1);
+            let client = clients[client_index].clone();
+            let slow_lane_wait = if batch_index < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                Some(
+                    slow_lane_release_receivers.remove(0),
+                )
+            } else {
+                None
+            };
+            pending.push(tokio::spawn(async move {
+                if let Some(slow_lane_wait) = slow_lane_wait {
+                    slow_lane_wait
+                        .await
+                        .expect("the bounded slow lane is released after alternate progress");
+                }
+                (
+                    batch_index,
+                    client_index,
+                    qualification_execute_v2_batch_sample(client, scope, requests, scheduled_at)
+                        .await,
+                )
+            }));
+        }
+        use futures_util::StreamExt;
+        while let Some(result) = pending.next().await {
+            let (completed_batch_index, completed_client_index, result) =
+                result.expect("bounded batch sample task completes");
+            let (sample, recovered, retries, status_retry_counts) = result.unwrap_or_else(|failure| {
+                let node_index = completed_client_index % MEMBER_COUNT;
+                let diagnostics = fleet.all_consensus_diagnostics();
+                panic!(
+                    "V2 batch release gate paced failure: batch_index={completed_batch_index}, client_index={completed_client_index}, node_index={node_index}, failure={failure:?}, diagnostics_by_node={diagnostics:?}"
+                )
+            });
+            assert!(
+                in_flight_per_client[completed_client_index] > 0,
+                "completed V2 batch has a matching scheduler admission"
+            );
+            in_flight_per_client[completed_client_index] -= 1;
+            completed_batches_per_client[completed_client_index] += 1;
+            if completed_client_index != slow_lane_client_index
+                && !slow_lane_release_senders.is_empty()
+            {
+                slow_lane_other_completions += 1;
+                for sender in slow_lane_release_senders.drain(..) {
+                    sender
+                        .send(())
+                        .expect("the bounded slow lanes remain scheduled");
+                }
+            }
+            samples.push(sample);
+            recovered_unknown += usize::from(recovered);
+            not_transmitted_retries += retries;
+            status_retries.accumulate(status_retry_counts);
+            not_transmitted_retry_high_water = not_transmitted_retry_high_water.max(retries);
+            status_retries_high_water = status_retries_high_water.max(status_retry_counts.total);
+            status_attempts_high_water =
+                status_attempts_high_water.max(status_retry_counts.attempts_total);
+        }
+        assert!(
+            in_flight_per_client.iter().all(|in_flight| *in_flight == 0),
+            "every caller-side V2 scheduler admission completes"
+        );
+        (
+            samples,
+            recovered_unknown,
+            not_transmitted_retries,
+            status_retries,
+            not_transmitted_retry_high_water,
+            status_retries_high_water,
+            status_attempts_high_water,
+            phase_started.elapsed(),
+            scheduled_batches_per_client,
+            completed_batches_per_client,
+            slow_lane_other_completions,
+            saturated_client_skips,
+            max_in_flight_per_client,
+            max_global_in_flight,
+        )
+    });
+    let consensus_diagnostics_after_measured_work = fleet.all_consensus_diagnostics();
+    for (node_index, (after, before)) in consensus_diagnostics_after_measured_work
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .enumerate()
+    {
+        assert_eq!(
+            after.sqlite_connection_lock_deadline, before.sqlite_connection_lock_deadline,
+            "node {node_index} measured work cannot wait through a SQLite connection-lock deadline",
+        );
+        assert_eq!(
+            after.sqlite_worker_permit_deadline, before.sqlite_worker_permit_deadline,
+            "node {node_index} measured work cannot exhaust a fixed SQLite worker permit",
+        );
+        assert_eq!(
+            after.sqlite_execution_deadline, before.sqlite_execution_deadline,
+            "node {node_index} measured work cannot exceed the bounded SQLite execution deadline",
+        );
+    }
+    assert_eq!(
+        mutation_samples.len(),
+        V2_BATCH_RELEASE_GATE_PACED_MUTATIONS / V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+        "all open-loop mutation batches returned exactly one typed response"
+    );
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
+    let paced_elapsed_nanos = u64::try_from(mutation_phase_elapsed.as_nanos())
+        .expect("paced elapsed time fits evidence nanoseconds");
+    let achieved_logical_operations_per_second_milli =
+        session_mtls_batch_release_gate_achieved_rate_milli(
+            V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+            paced_elapsed_nanos,
+        )
+        .expect("paced elapsed time is nonzero and rate fits evidence");
+    assert!(
+        achieved_logical_operations_per_second_milli
+            >= SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI,
+        "V2 batch release gate achieved less than 99.9% of its offered operation rate: achieved_milli={achieved_logical_operations_per_second_milli}"
+    );
+    assert!(
+        mutation_scheduled_batches_per_client
+            .iter()
+            .all(|scheduled| *scheduled > 0),
+        "saturated-client skipping retains bounded slow-lane progress for every V2 client: {mutation_scheduled_batches_per_client:?}"
+    );
+    let min_completed_batches = mutation_completed_batches_per_client
+        .iter()
+        .copied()
+        .min()
+        .expect("fixed V2 client set is nonempty");
+    assert!(
+        min_completed_batches > 0,
+        "every fixed V2 producer retains one bounded slow-lane completion: {mutation_completed_batches_per_client:?}"
+    );
+    assert!(
+        mutation_saturated_client_skips > 0 && mutation_slow_lane_other_completions > 0,
+        "one bounded slow client is skipped while another fixed client completes, avoiding global HOL: skips={mutation_saturated_client_skips}, other_completions={mutation_slow_lane_other_completions}"
+    );
+    assert!(
+        mutation_max_in_flight_per_client
+            .iter()
+            .all(|max_in_flight| *max_in_flight <= V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT),
+        "each V2 client remains at or below its four declared active calls: {mutation_max_in_flight_per_client:?}"
+    );
+    assert!(
+        mutation_max_global_in_flight <= V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
+        "the V2 scheduler remains at or below its 48-call global bound: max={mutation_max_global_in_flight}"
+    );
+    assert!(
+        mutation_not_transmitted_retry_high_water
+            <= V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT,
+        "no V2 call exceeds its fixed not-transmitted retry bound"
+    );
+    // The raw samples include scheduled-submission delay and bounded pool
+    // queue dwell through receipt validation; no percentile histogram drops
+    // or compresses individual observations.
+    let warm_p99 = qualification_v2_batch_percentile(&mut warm_read_samples, 99, 100);
+    let warm_p999 = qualification_v2_batch_percentile(&mut warm_read_samples, 999, 1_000);
+    let mutation_p99 = qualification_v2_batch_percentile(&mut mutation_samples, 99, 100);
+    let mutation_p999 = qualification_v2_batch_percentile(&mut mutation_samples, 999, 1_000);
+    assert!(warm_p99 <= V2_BATCH_RELEASE_GATE_P99);
+    assert!(warm_p999 <= V2_BATCH_RELEASE_GATE_P999);
+    assert!(mutation_p99 <= V2_BATCH_RELEASE_GATE_P99);
+    assert!(mutation_p999 <= V2_BATCH_RELEASE_GATE_P999);
+    let warm_read_p99_millis =
+        u64::try_from(warm_p99.as_millis()).expect("warm p99 fits evidence milliseconds");
+    let warm_read_p999_millis =
+        u64::try_from(warm_p999.as_millis()).expect("warm p99.9 fits evidence milliseconds");
+    let mutation_p99_millis =
+        u64::try_from(mutation_p99.as_millis()).expect("mutation p99 fits evidence milliseconds");
+    let mutation_p999_millis = u64::try_from(mutation_p999.as_millis())
+        .expect("mutation p99.9 fits evidence milliseconds");
+    assert!(warm_read_p99_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS);
+    assert!(warm_read_p999_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS);
+    assert!(mutation_p99_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS);
+    assert!(mutation_p999_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS);
+
+    // Snapshot after the exact 60k paced mutations plus 1,008 distributed
+    // warm reads, before any fault or credential seam is introduced.
+    let post_measured_load_diagnostics = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "60k paced mutations plus 1008 warm reads",
+        &post_preload_restore_diagnostics,
+        &post_measured_load_diagnostics,
+    );
+    let measured_diagnostics = post_measured_load_diagnostics;
+    let configured_connections =
+        (V2_BATCH_RELEASE_GATE_CLIENTS * V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT) as u64;
+    assert_eq!(
+        measured_diagnostics
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum::<u64>(),
+        configured_connections,
+        "authenticated V2 connection cardinality is fixed independently of operations or subscribers"
+    );
+    assert_eq!(
+        measured_diagnostics
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum::<u64>(),
+        configured_connections,
+        "every fixed V2 lane returns idle after measured work"
+    );
+    let recovered_lanes = u64::try_from(
+        mutation_recovered_unknown
+            .checked_add(mutation_not_transmitted_retries)
+            .expect("bounded measured recovery count fits usize"),
+    )
+    .expect("bounded measured recovery count fits u64");
+    let setup_delta = measured_diagnostics
+        .iter()
+        .zip(&measurement_baseline)
+        .map(|(after, before)| {
+            after
+                .setup_successes
+                .checked_sub(before.setup_successes)
+                .expect("measured setup-success counter is monotonic")
+        })
+        .sum::<u64>();
+    let reconnect_delta = measured_diagnostics
+        .iter()
+        .zip(&measurement_baseline)
+        .map(|(after, before)| {
+            after
+                .reconnects
+                .checked_sub(before.reconnects)
+                .expect("measured reconnect counter is monotonic")
+        })
+        .sum::<u64>();
+    let reused_delta = measured_diagnostics
+        .iter()
+        .zip(&measurement_baseline)
+        .map(|(after, before)| {
+            after
+                .reused
+                .checked_sub(before.reused)
+                .expect("measured reuse counter is monotonic")
+        })
+        .sum::<u64>();
+    assert!(
+        setup_delta <= recovered_lanes,
+        "only an exact typed safe/ambiguous boundary may re-establish a lane during measured work"
+    );
+    assert!(
+        reconnect_delta <= recovered_lanes,
+        "typed safe/ambiguous recovery cannot create a reconnect storm"
+    );
+    assert!(
+        reused_delta
+            >= u64::try_from(
+                mutation_batch_count
+                    .checked_add(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES)
+                    .expect("bounded measured call count fits usize"),
+            )
+            .expect("bounded call count fits u64"),
+        "typed measured work reuses the prewarmed V2 pools"
+    );
+    assert!(measured_diagnostics.iter().all(|diagnostics| {
+        diagnostics.setup_attempts == diagnostics.setup_successes + diagnostics.setup_failures
+            && diagnostics.pool_wait_current == 0
+            && diagnostics.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+    }));
+
+    let all_nodes = (0..MEMBER_COUNT).collect::<Vec<_>>();
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
+    let reports_before_loss = fleet.readiness_reports(&all_nodes);
+    let old_leader_id = reports_before_loss
+        .iter()
+        .find_map(|report| report.leader_id)
+        .expect("release-gate leader");
+    let old_term = reports_before_loss[0].term;
+    let leader_node_index = reports_before_loss
+        .iter()
+        .find_map(|report| (report.node_id == old_leader_id).then_some(report.node_index))
+        .expect("leader endpoint index");
+    let killed_endpoint_client_index = (0..clients.len())
+        .find(|client_index| client_index % MEMBER_COUNT == leader_node_index)
+        .expect("one original client is pinned to the killed endpoint");
+    let killed_endpoint_before = clients[killed_endpoint_client_index].v2_diagnostics();
+    resource_sampler.mark_offline(leader_node_index);
+    let (leader_address, leader_process_id) = fleet.kill_node_unclean(leader_node_index);
+    let survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != leader_node_index)
+        .collect::<Vec<_>>();
+    let recovery_deadline = Instant::now() + STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT;
+    let replacement = loop {
+        let reports = fleet.readiness_reports(&survivors);
+        if let Some(report) = reports.iter().find(|report| {
+            report.ready
+                && report
+                    .leader_id
+                    .is_some_and(|leader| leader != old_leader_id)
+                && report.term > old_term
+        }) {
+            break report.node_index;
+        }
+        assert!(
+            Instant::now() < recovery_deadline,
+            "release-gate quorum did not elect a replacement leader"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let status_after_loss = runtime.block_on(qualification_execute_v2_status_sample(
+        clients
+            .iter()
+            .enumerate()
+            .find_map(|(index, client)| (index % MEMBER_COUNT == replacement).then_some(client))
+            .expect("client routed to replacement endpoint")
+            .clone(),
+        scope,
+        first.clone(),
+        Instant::now(),
+    ));
+    assert!(status_after_loss <= V2_BATCH_RELEASE_GATE_P999);
+    fleet.spawn_node_at_manifest_address(leader_node_index, leader_address, leader_process_id);
+    let restarted_process_id = fleet.nodes[leader_node_index].process_id();
+    assert_ne!(
+        restarted_process_id, leader_process_id,
+        "restarted logical voter must install a distinct child PID"
+    );
+    resource_sampler.install_restarted_process(leader_node_index, restarted_process_id);
+    let restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&all_nodes)
+        .iter()
+        .all(|report| report.ready)
+    {
+        assert!(
+            Instant::now() < restart_deadline,
+            "restarted release-gate leader did not regain readiness"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (restarted_endpoint, _) =
+        fleet.start_stateless_consumer(leader_node_index, consumer_identities.clone());
+    endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[leader_node_index] = restarted_endpoint;
+    runtime.block_on(qualification_execute_v2_status_sample(
+        clients[killed_endpoint_client_index].clone(),
+        scope,
+        first.clone(),
+        Instant::now(),
+    ));
+    let killed_endpoint_after = clients[killed_endpoint_client_index].v2_diagnostics();
+    assert_eq!(
+        killed_endpoint_after.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        "the client pinned to the killed endpoint restores all four active lanes"
+    );
+    assert_eq!(
+        killed_endpoint_after.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        "the client pinned to the killed endpoint restores all four idle lanes"
+    );
+    let killed_endpoint_reconnect_delta = killed_endpoint_after
+        .reconnects
+        .checked_sub(killed_endpoint_before.reconnects)
+        .expect("killed-endpoint reconnect counter is monotonic");
+    assert!(
+        (1..=V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64)
+            .contains(&killed_endpoint_reconnect_delta),
+        "the client pinned to the killed endpoint reconnects each lost lane at most once"
+    );
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
+
+    // The replacement alone receives a new-root leaf while every member has
+    // already published old+new trust. Exactly the four clients pinned to
+    // that member move to new-root-only trust; the other eight stay
+    // old-root-only and continue to use their old-root server leaves.
+    fleet.transition_member(
+        replacement,
+        CredentialGeneration::NewRoot,
+        TrustGeneration::Overlap,
+        "v2-batch-replacement-new-root-overlap",
+    );
+    let new_only_client_indices = (0..clients.len())
+        .filter(|client_index| client_index % MEMBER_COUNT == replacement)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_only_client_indices.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS / MEMBER_COUNT,
+        "exactly four fixed V2 clients are routed to the replacement member"
+    );
+    let rotation_before = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for (client_index, ((sender, identity), client)) in identity_senders
+        .iter()
+        .zip(&consumer_identities)
+        .zip(&clients)
+        .enumerate()
+    {
+        let trust_generation = if client_index % MEMBER_COUNT == replacement {
+            TrustGeneration::NewOnly
+        } else {
+            TrustGeneration::OldOnly
+        };
+        sender
+            .send(Some(fleet.pki.consumer_identity_state_with_trust(
+                identity,
+                trust_generation,
+            )))
+            .expect("live V2 client identity source remains subscribed");
+        client
+            .request_reauthentication()
+            .expect("request fixed V2 pool credential drain");
+    }
+    let refreshed_status_samples = runtime.block_on(async {
+        futures_util::future::join_all(clients.iter().map(|client| async {
+            client
+                .prewarm_v2()
+                .await
+                .expect("re-establish fixed V2 pool after SVID rotation");
+            qualification_execute_v2_status_sample(
+                client.clone(),
+                scope,
+                first.clone(),
+                Instant::now(),
+            )
+            .await
+        }))
+        .await
+    });
+    assert_eq!(
+        refreshed_status_samples.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS,
+        "every original fixed V2 client completed an exact post-rotation status request"
+    );
+    assert_eq!(
+        new_only_client_indices.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS / MEMBER_COUNT,
+        "the exact NewOnly status validation is server-observed for each replacement-routed client"
+    );
+    let rotation_refreshed = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for client_index in &new_only_client_indices {
+        let before = rotation_before[*client_index];
+        let after = rotation_refreshed[*client_index];
+        assert!(
+            after.setup_successes
+                >= before
+                    .setup_successes
+                    .checked_add(
+                        u64::try_from(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT)
+                            .expect("fixed lane count fits u64"),
+                    )
+                    .expect("new-only setup-success lower bound fits u64"),
+            "each replacement-routed new-only client must authenticate four fresh new-root credential lanes"
+        );
+        assert_eq!(after.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64);
+        assert_eq!(after.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64);
+    }
+
+    // Release exactly one original replacement-routed four-lane pool. The
+    // replacement listener therefore has 12 admitted original lanes and four
+    // explicitly bounded seam slots; neither negative nor delayed work can
+    // be mistaken for a capacity rejection or raise the fleet above 48.
+    let seam_client_index = *new_only_client_indices
+        .first()
+        .expect("one replacement-routed original V2 client");
+    let released_original_before_shutdown = clients[seam_client_index].v2_diagnostics();
+    runtime.block_on(clients[seam_client_index].shutdown());
+    let original_lanes_after_release = clients
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != seam_client_index)
+        .filter(|(index, _)| index % MEMBER_COUNT == replacement)
+        .map(|(_, client)| client.v2_diagnostics().active)
+        .sum::<u64>();
+    assert_eq!(
+        original_lanes_after_release, 12,
+        "releasing one original replacement-routed pool leaves exactly four normal lanes below the twenty-connection listener admission limit"
+    );
+
+    // All consensus-bearing work is complete.  Make this listener genuinely
+    // new-root-only before exercising the old-credential seam: publishing it
+    // directly preserves the already-established cluster peer channels while
+    // changing the listener's independently selected trust generation.
+    let replacement_source_before = fleet.projected_status(replacement);
+    let replacement_controller_before = fleet.material_status(replacement);
+    fleet.publish_known_projected_generation(
+        replacement,
+        CredentialGeneration::NewRoot,
+        TrustGeneration::NewOnly,
+        "v2-batch-replacement-new-only-credential-negative",
+    );
+    fleet.wait_for_member_publication(
+        replacement,
+        replacement_source_before.generation,
+        replacement_controller_before.epoch,
+    );
+    let old_credential_new_only_server_rejections_before =
+        fleet.consumer_tls_peer_credential_rejections(replacement);
+    let (_old_leaf_identity_source, old_leaf_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        replacement,
+        voter_authorities[replacement].clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &consumer_identities[seam_client_index],
+            ConsumerCredentialGeneration::OldRoot,
+            // The client retains overlap trust so it verifies the new server
+            // leaf; only its presented credential is intentionally old.
+            TrustGeneration::Overlap,
+        ),
+        credential_negative_pool_config,
+        None,
+    );
+    let old_credential_new_only_server_result = runtime.block_on(old_leaf_client.prewarm_v2());
+    assert!(
+        matches!(
+            old_credential_new_only_server_result,
+            Err(SessionConsumerClientError::Authentication
+                | SessionConsumerClientError::Unavailable)
+        ),
+        "old credential/new-only server negative must expose only typed authentication or unavailable"
+    );
+    runtime.block_on(old_leaf_client.shutdown());
+    let old_leaf_diagnostics = old_leaf_client.v2_diagnostics();
+    assert_eq!(old_leaf_diagnostics.setup_attempts, 1);
+    assert_eq!(old_leaf_diagnostics.setup_failures, 1);
+    assert_eq!(old_leaf_diagnostics.setup_successes, 0);
+    assert_eq!(old_leaf_diagnostics.active, 0);
+    assert_eq!(old_leaf_diagnostics.idle, 0);
+    assert_eq!(old_leaf_diagnostics.pool_wait_current, 0);
+    let old_credential_new_only_server_tls_peer_credential_rejected = fleet
+        .consumer_tls_peer_credential_rejections(replacement)
+        == old_credential_new_only_server_rejections_before
+            .checked_add(1)
+            .expect("release-gate peer-credential rejection counter remains below u64 maximum");
+    assert!(
+        old_credential_new_only_server_tls_peer_credential_rejected,
+        "old credential/new-only server negative produces exactly one local TLS peer-credential rejection"
+    );
+
+    let (_delayed_identity_source, delayed_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        replacement,
+        voter_authorities[replacement].clone(),
+        fleet.pki.consumer_identity_state_with_trust(
+            &consumer_identities[seam_client_index],
+            TrustGeneration::NewOnly,
+        ),
+        pool_config,
+        None,
+    );
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("prewarm the released-slot delayed-response V2 client");
+    let delayed_prewarmed_diagnostics = delayed_client.v2_diagnostics();
+    assert_eq!(delayed_prewarmed_diagnostics.active, 4);
+    assert_eq!(
+        original_lanes_after_release + delayed_prewarmed_diagnostics.active,
+        16,
+        "the replacement listener returns to its fixed sixteen normal connections before the bounded headroom probe"
+    );
+    let ambiguous_requests = runtime.block_on(qualification_build_v2_batches(
+        MEMBER_COUNT,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+    ));
+    let ambiguous_requests = ambiguous_requests
+        .into_iter()
+        .next()
+        .expect("one bounded ambiguity batch");
+    let pressure_requests = runtime.block_on(qualification_build_v2_batches(
+        MEMBER_COUNT,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
+            + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS
+            + ambiguous_requests.len(),
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+    ));
+    let pressure_requests = pressure_requests
+        .into_iter()
+        .next()
+        .expect("one fresh bounded pressure batch");
+    let ambiguous_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: ambiguous_requests.clone(),
+        },
+    );
+    let pressure_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: pressure_requests.clone(),
+        },
+    );
+    let ambiguous_request_ids = ambiguous_requests
+        .iter()
+        .map(FencedTransitionV2Request::request_id)
+        .collect::<Vec<_>>();
+    let mut causal_attempt_ledger = V2BatchAttemptLedger::new(&ambiguous_requests);
+    // This one-lane client is the causal ambiguity witness. Its caller
+    // deadline is intentionally shorter than the normal default; it is not a
+    // load knob and cannot increase any release timeout.
+    let (causal_identity_source, causal_ambiguity_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        replacement,
+        voter_authorities[replacement].clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &consumer_identities[seam_client_index],
+            ConsumerCredentialGeneration::NewRoot,
+            TrustGeneration::NewOnly,
+        ),
+        credential_negative_pool_config,
+        Some(V2_BATCH_RELEASE_GATE_CAUSAL_AMBIGUITY_OPERATION_TIMEOUT),
+    );
+    runtime
+        .block_on(causal_ambiguity_client.prewarm_v2())
+        .expect("prewarm the one-lane causal ambiguity witness");
+    let pressure_family_deadline =
+        tokio::time::Instant::now() + V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT;
+    // The separately keyed causal witness is held only after its durable
+    // mutation completes. It has its own one-lane pool and must not consume
+    // any of the four fixed pressure lanes below.
+    fleet.arm_stateless_consumer_ambiguity_witness_hold(replacement);
+    let causal_ambiguous_request = ambiguous_request.clone();
+    causal_attempt_ledger.record_mutation_dispatch();
+    let causal_pressure_holder = runtime.spawn({
+        let client = causal_ambiguity_client.clone();
+        async move { client.execute_v2(&causal_ambiguous_request).await }
+    });
+    let causal_hold_ack_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+    runtime.block_on(async {
+        loop {
+            let (armed_responses, held_responses) =
+                fleet.stateless_consumer_ambiguity_witness_hold_status(replacement);
+            if armed_responses == 0 && held_responses == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < causal_hold_ack_deadline,
+                "causal witness did not acknowledge its one durable held response: armed={armed_responses}, held={held_responses}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let causal_pressure_outcome = runtime
+        .block_on(causal_pressure_holder)
+        .expect("causal ambiguity witness task joins");
+    assert!(
+        matches!(
+            causal_pressure_outcome,
+            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch { ref request_ids })
+                if *request_ids == ambiguous_request_ids
+        ),
+        "the acknowledged post-durability witness hold must expire the designated caller into OutcomeUnknown"
+    );
+    causal_attempt_ledger.record_durable_acceptance();
+    causal_attempt_ledger.record_mutation_terminal(V2BatchMutationTerminal::OutcomeUnknown);
+    assert!(
+        tokio::time::Instant::now() < pressure_family_deadline,
+        "status classification retains the deadline captured before designated mutation dispatch"
+    );
+    fleet.release_stateless_consumer_ambiguity_witness_hold(replacement);
+    let non_slow_client_index = (seam_client_index + 1) % clients.len();
+    // The designated twelve IDs are now durable and OutcomeUnknown. Resolve
+    // them immediately, exactly once, through the read-only status surface;
+    // every later pressure mutation uses the fresh family below.
+    let ambiguity_status_retries =
+        runtime.block_on(qualification_resolve_v2_batch_outcome_unknown(
+            &clients[non_slow_client_index],
+            scope,
+            &ambiguous_requests,
+            pressure_family_deadline,
+            &mut causal_attempt_ledger,
+        ));
+    assert_eq!(
+        ambiguity_status_retries.terminal_attempts,
+        ambiguous_requests.len(),
+        "one terminal read-only receipt is recorded for each designated ambiguous ID"
+    );
+    assert_eq!(
+        causal_attempt_ledger.outcome_unknown_cardinality(),
+        ambiguous_requests.len(),
+        "every retained ambiguous ID is accounted for by the actual mutation seam"
+    );
+    assert!(
+        causal_attempt_ledger
+            .entries
+            .iter()
+            .all(|entry| entry.mutation_attempts == 1
+                && entry.status_attempts >= 1
+                && entry.status_terminal),
+        "the exact ambiguous IDs are mutation-dispatched once and then status-only"
+    );
+    assert_eq!(
+        causal_attempt_ledger.post_outcome_unknown_mutation_dispatches(),
+        0,
+        "no OutcomeUnknown ID is ever mutation-replayed"
+    );
+
+    // Four delayed in-flight calls occupy the exact fixed request-lane
+    // width. The next 64 calls then occupy the fixed caller queue, and the
+    // 69th admission must fail immediately with typed backpressure. These
+    // are logical callers only: the prewarmed four-lane pool opens no extra
+    // physical connections and server queue depth remains unmeasured.
+    assert_eq!(
+        V2_BATCH_RELEASE_GATE_OVER_CAPACITY_CALLS,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT + V2_BATCH_RELEASE_GATE_PENDING_CALLS + 1
+    );
+    let delayed_setup_before_pressure = delayed_client.v2_diagnostics();
+    fleet.arm_stateless_consumer_response_holds(replacement);
+    let mut pressure_holders = Vec::with_capacity(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT);
+    for _ in 0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+        let client = delayed_client.clone();
+        let request = pressure_request.clone();
+        pressure_holders.push(runtime.spawn(async move { client.execute_v2(&request).await }));
+    }
+    // Enqueue every bounded pressure caller before yielding for any held
+    // response acknowledgement. This prevents the pressure phase from
+    // submitting copies after a server has accepted the shared request IDs:
+    // only the first four lane admissions may reach the listener, while the
+    // remaining callers are already bounded in the client queue.
+    let mut queued_pressure_calls = Vec::with_capacity(V2_BATCH_RELEASE_GATE_PENDING_CALLS);
+    for _ in 0..V2_BATCH_RELEASE_GATE_PENDING_CALLS {
+        let client = delayed_client.clone();
+        let request = pressure_request.clone();
+        queued_pressure_calls.push(runtime.spawn(async move { client.execute_v2(&request).await }));
+    }
+    let queued_caller_count = queued_pressure_calls.len();
+    let hold_ack_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+    let held_response_count = runtime.block_on(async {
+        loop {
+            let (armed_responses, held_responses) =
+                fleet.stateless_consumer_response_hold_status(replacement);
+            if armed_responses == 0 && held_responses == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                break held_responses;
+            }
+            assert!(
+                Instant::now() < hold_ack_deadline,
+                "cross-process response-hold acknowledgement did not observe all four durable V2 executions: armed={armed_responses}, held={held_responses}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    runtime.block_on(qualification_execute_v2_status_sample(
+        clients[non_slow_client_index].clone(),
+        scope,
+        pressure_requests[0].clone(),
+        Instant::now(),
+    ));
+    let cross_client_fair_progress = 1;
+    let queue_pressure_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+    let pressure_queued = runtime.block_on(async {
+        loop {
+            let diagnostics = delayed_client.v2_diagnostics();
+            if diagnostics.pool_wait_current == V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+                && diagnostics.pool_wait_max == V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+            {
+                break diagnostics;
+            }
+            assert!(
+                Instant::now() < queue_pressure_deadline,
+                "bounded four-lane hold did not fill the exact 64-caller queue: diagnostics={diagnostics:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    assert_eq!(
+        pressure_queued.pool_wait_current, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the deliberate over-capacity probe fills exactly the fixed per-pool caller queue"
+    );
+    assert_eq!(
+        pressure_queued.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the deliberate over-capacity probe records the exact fixed queue high-water"
+    );
+    assert_eq!(
+        delayed_client.v2_diagnostics().pool_wait_current,
+        V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "an independent client progresses while the slow pool's four real lanes remain saturated"
+    );
+    let mut overload_attempt_ledger = V2BatchAttemptLedger::new(&pressure_requests);
+    overload_attempt_ledger.record_mutation_dispatch();
+    let over_capacity_result = runtime.block_on(delayed_client.execute_v2(&pressure_request));
+    assert!(
+        matches!(
+            over_capacity_result,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Overloaded,
+            })
+        ),
+        "the 69th fixed-pool caller is rejected as typed not-transmitted overload"
+    );
+    overload_attempt_ledger.record_mutation_terminal(V2BatchMutationTerminal::NotTransmitted(
+        SessionConsumerClientError::Overloaded,
+    ));
+    assert_eq!(
+        overload_attempt_ledger.actual_redispatches(),
+        0,
+        "typed overload remains its one existing backpressure event, never a retry"
+    );
+    assert_eq!(
+        pressure_holders.len(),
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+    );
+    assert_eq!(queued_caller_count, V2_BATCH_RELEASE_GATE_PENDING_CALLS);
+    assert_eq!(
+        pressure_holders.len() + queued_caller_count + 1,
+        V2_BATCH_RELEASE_GATE_OVER_CAPACITY_CALLS,
+        "four held lanes plus 64 queued callers make the next call exactly the 69th admission"
+    );
+    fleet.release_stateless_consumer_response_holds(replacement);
+    let released_response_count = held_response_count
+        .checked_add(1)
+        .expect("causal plus pressure held-response accounting fits usize");
+    let recovered_queued_caller_count = queued_pressure_calls.len();
+    let pressure_results = runtime.block_on(async {
+        let holders = futures_util::future::join_all(pressure_holders).await;
+        let queued = futures_util::future::join_all(queued_pressure_calls).await;
+        holders.into_iter().chain(queued).collect::<Vec<_>>()
+    });
+    let mut admitted_pressure_responses = 0usize;
+    for result in pressure_results {
+        let outcome = result.expect("every held or queued V2 caller task joins without panic");
+        match outcome {
+            Ok(response) => {
+                qualification_assert_v2_batch_response(&pressure_requests, response).expect(
+                    "every admitted released pressure caller returns its exact durable response",
+                );
+                admitted_pressure_responses = admitted_pressure_responses
+                    .checked_add(1)
+                    .expect("bounded admitted pressure responses fit usize");
+            }
+            Err(error) => {
+                panic!("admitted pressure caller returned a non-recorded outcome: {error:?}")
+            }
+        }
+    }
+    assert_eq!(
+        admitted_pressure_responses,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT + V2_BATCH_RELEASE_GATE_PENDING_CALLS,
+        "every admitted pressure caller joins before it is counted and records the exact response"
+    );
+    let exact_active_history_entries = 1usize
+        .checked_add(V2_BATCH_RELEASE_GATE_PRELOAD_CREATES)
+        .and_then(|total| total.checked_add(V2_BATCH_RELEASE_GATE_PACED_MUTATIONS))
+        .and_then(|total| total.checked_add(ambiguous_requests.len()))
+        .and_then(|total| total.checked_add(pressure_requests.len()))
+        .expect("fixed unique request history fits usize");
+    assert_eq!(exact_active_history_entries, 110_025);
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[non_slow_client_index].clone(),
+        scope,
+        exact_active_history_entries,
+    ));
+    let durable_status_cardinality = causal_attempt_ledger.outcome_unknown_cardinality();
+    let pressure_settled = delayed_client.v2_diagnostics();
+    assert_eq!(pressure_settled.pool_wait_current, 0);
+    assert_eq!(
+        pressure_settled.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "pressure recovery retains, rather than erases, the exact queue high-water"
+    );
+    assert_eq!(
+        pressure_settled.setup_attempts, delayed_setup_before_pressure.setup_attempts,
+        "typed caller backpressure does not create a resolve, TCP, TLS, or Hello attempt"
+    );
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("the fixed delayed pool recovers after typed overload");
+    runtime.block_on(qualification_execute_v2_status_sample(
+        delayed_client.clone(),
+        scope,
+        pressure_requests[0].clone(),
+        Instant::now(),
+    ));
+    let pressure_recovered = delayed_client.v2_diagnostics();
+    assert_eq!(
+        pressure_recovered.setup_attempts, delayed_setup_before_pressure.setup_attempts,
+        "the recovered fixed pool retains its four prewarmed physical lanes"
+    );
+    assert_eq!(
+        pressure_recovered.active,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+    );
+    assert_eq!(
+        pressure_recovered.idle,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+    );
+    runtime.block_on(delayed_client.shutdown());
+    let delayed_after_ambiguity = delayed_client.v2_diagnostics();
+    assert_eq!(
+        delayed_after_ambiguity.setup_attempts,
+        delayed_after_ambiguity.setup_successes + delayed_after_ambiguity.setup_failures,
+        "the supplemental delayed probe accounts for every physical lane setup"
+    );
+    assert_eq!(delayed_after_ambiguity.active, 0);
+    assert_eq!(delayed_after_ambiguity.idle, 0);
+    assert_eq!(delayed_after_ambiguity.pool_wait_current, 0);
+    assert_eq!(
+        delayed_after_ambiguity.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the post-shutdown delayed-pool diagnostic serializes the exact fixed overload high-water"
+    );
+    runtime.block_on(causal_ambiguity_client.shutdown());
+    drop(causal_identity_source);
+    let causal_after_ambiguity = causal_ambiguity_client.v2_diagnostics();
+    assert_eq!(causal_after_ambiguity.active, 0);
+    assert_eq!(causal_after_ambiguity.idle, 0);
+    assert_eq!(causal_after_ambiguity.pool_wait_current, 0);
+    // The delayed-response supplemental ledger includes the designated
+    // one-lane causal witness, so every listener-admission setup remains in
+    // the closed release evidence rather than becoming an untracked probe.
+    let mut delayed_after_ambiguity = delayed_after_ambiguity;
+    delayed_after_ambiguity.setup_attempts = delayed_after_ambiguity
+        .setup_attempts
+        .checked_add(causal_after_ambiguity.setup_attempts)
+        .expect("causal setup-attempt accounting fits u64");
+    delayed_after_ambiguity.setup_failures = delayed_after_ambiguity
+        .setup_failures
+        .checked_add(causal_after_ambiguity.setup_failures)
+        .expect("causal setup-failure accounting fits u64");
+    delayed_after_ambiguity.setup_successes = delayed_after_ambiguity
+        .setup_successes
+        .checked_add(causal_after_ambiguity.setup_successes)
+        .expect("causal setup-success accounting fits u64");
+    delayed_after_ambiguity.reused = delayed_after_ambiguity
+        .reused
+        .checked_add(causal_after_ambiguity.reused)
+        .expect("causal reuse accounting fits u64");
+    delayed_after_ambiguity.reconnects = delayed_after_ambiguity
+        .reconnects
+        .checked_add(causal_after_ambiguity.reconnects)
+        .expect("causal reconnect accounting fits u64");
+    let (restored_identity_source, restored_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        replacement,
+        voter_authorities[replacement].clone(),
+        fleet.pki.consumer_identity_state_with_trust(
+            &consumer_identities[seam_client_index],
+            TrustGeneration::NewOnly,
+        ),
+        pool_config,
+        None,
+    );
+    runtime
+        .block_on(restored_client.prewarm_v2())
+        .expect("restore the released original four-lane replacement pool");
+    clients[seam_client_index] = restored_client;
+    drop(restored_identity_source);
+    let old_root_server = (replacement + 1) % MEMBER_COUNT;
+    let old_root_seam_client_index = (0..clients.len())
+        .find(|client_index| client_index % MEMBER_COUNT == old_root_server)
+        .expect("old-root client pool");
+    let released_old_root_before_shutdown = clients[old_root_seam_client_index].v2_diagnostics();
+    runtime.block_on(clients[old_root_seam_client_index].shutdown());
+    let old_root_lanes_after_release = clients
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != old_root_seam_client_index)
+        .filter(|(index, _)| index % MEMBER_COUNT == old_root_server)
+        .map(|(_, client)| client.v2_diagnostics().active)
+        .sum::<u64>();
+    assert_eq!(
+        old_root_lanes_after_release, 12,
+        "releasing one old-root pool leaves exactly four normal lanes below the twenty-connection listener admission limit for the credential negative"
+    );
+    // Likewise select OldOnly at the second listener only after all quorum
+    // activity has ended.  Its retained old-root clients continue to trust its
+    // old server leaf, while the supplemental client presents only new-root.
+    let old_root_source_before = fleet.projected_status(old_root_server);
+    let old_root_controller_before = fleet.material_status(old_root_server);
+    fleet.publish_known_projected_generation(
+        old_root_server,
+        CredentialGeneration::Initial,
+        TrustGeneration::OldOnly,
+        "v2-batch-old-root-server-credential-negative",
+    );
+    fleet.wait_for_member_publication(
+        old_root_server,
+        old_root_source_before.generation,
+        old_root_controller_before.epoch,
+    );
+    let new_credential_old_root_server_rejections_before =
+        fleet.consumer_tls_peer_credential_rejections(old_root_server);
+    let (_new_only_identity_source, new_only_old_root_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        old_root_server,
+        voter_authorities[old_root_server].clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &consumer_identities[old_root_seam_client_index],
+            ConsumerCredentialGeneration::NewRoot,
+            TrustGeneration::Overlap,
+        ),
+        credential_negative_pool_config,
+        None,
+    );
+    let new_credential_old_root_server_result =
+        runtime.block_on(new_only_old_root_client.prewarm_v2());
+    assert!(
+        matches!(
+            new_credential_old_root_server_result,
+            Err(SessionConsumerClientError::Authentication
+                | SessionConsumerClientError::Unavailable)
+        ),
+        "new credential/old-root server negative must expose only typed authentication or unavailable"
+    );
+    runtime.block_on(new_only_old_root_client.shutdown());
+    let new_only_old_root_diagnostics = new_only_old_root_client.v2_diagnostics();
+    assert_eq!(new_only_old_root_diagnostics.setup_attempts, 1);
+    assert_eq!(new_only_old_root_diagnostics.setup_failures, 1);
+    assert_eq!(new_only_old_root_diagnostics.setup_successes, 0);
+    assert_eq!(new_only_old_root_diagnostics.active, 0);
+    assert_eq!(new_only_old_root_diagnostics.idle, 0);
+    assert_eq!(new_only_old_root_diagnostics.pool_wait_current, 0);
+    let new_credential_old_root_server_tls_peer_credential_rejected = fleet
+        .consumer_tls_peer_credential_rejections(old_root_server)
+        == new_credential_old_root_server_rejections_before
+            .checked_add(1)
+            .expect("release-gate peer-credential rejection counter remains below u64 maximum");
+    assert!(
+        new_credential_old_root_server_tls_peer_credential_rejected,
+        "new credential/old-root server negative produces exactly one local TLS peer-credential rejection"
+    );
+    let (restored_old_root_identity_source, restored_old_root_client) =
+        qualification_persistent_v2_client(
+            Arc::clone(&endpoints),
+            old_root_server,
+            voter_authorities[old_root_server].clone(),
+            fleet.pki.consumer_identity_state_with_trust(
+                &consumer_identities[old_root_seam_client_index],
+                TrustGeneration::OldOnly,
+            ),
+            pool_config,
+            None,
+        );
+    runtime
+        .block_on(restored_old_root_client.prewarm_v2())
+        .expect("restore old-root pool");
+    clients[old_root_seam_client_index] = restored_old_root_client;
+    drop(restored_old_root_identity_source);
+
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        exact_active_history_entries,
+    ));
+
+    let restored_seam_current = clients[seam_client_index].v2_diagnostics();
+    let restored_old_root_current = clients[old_root_seam_client_index].v2_diagnostics();
+    // This post-recovery/seam snapshot folds retired generations into the two
+    // restored original pools, so neither their reconnect/setup counters nor
+    // their queue high-water marks disappear at replacement.
+    let mut after_recovery = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    after_recovery[seam_client_index] = cumulative_replaced_v2_diagnostics(
+        released_original_before_shutdown,
+        restored_seam_current,
+    );
+    after_recovery[old_root_seam_client_index] = cumulative_replaced_v2_diagnostics(
+        released_old_root_before_shutdown,
+        restored_old_root_current,
+    );
+    assert_eq!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum::<u64>(),
+        configured_connections,
+        "recovery retains the fixed authenticated V2 connection cardinality"
+    );
+    assert_eq!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum::<u64>(),
+        configured_connections,
+        "recovery drains back to the fixed idle V2 width"
+    );
+    for (client_index, (before, after)) in prewarmed.iter().zip(&after_recovery).enumerate() {
+        assert!(
+            after.setup_attempts >= before.setup_attempts
+                && after.setup_failures >= before.setup_failures
+                && after.setup_successes >= before.setup_successes
+                && after.reused >= before.reused
+                && after.reconnects >= before.reconnects,
+            "settled V2 counters are monotonic: client_index={client_index}"
+        );
+        assert_eq!(
+            after.setup_attempts,
+            after.setup_successes + after.setup_failures,
+            "settled V2 setup attempts are accounted exactly: client_index={client_index}"
+        );
+        assert_eq!(
+            after.pool_wait_current, 0,
+            "settled V2 pool has no queued callers: client_index={client_index}"
+        );
+        assert!(
+            after.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+            "V2 pool queue high-water remains within its configured bound: client_index={client_index}"
+        );
+    }
+    assert!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.setup_successes)
+            .sum::<u64>()
+            <= configured_connections
+                .checked_mul(3)
+                .expect("fixed setup-storm ceiling fits u64"),
+        "one endpoint loss and one SVID rotation cannot create an unbounded setup storm"
+    );
+    assert!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.reconnects)
+            .sum::<u64>()
+            <= configured_connections,
+        "one bounded recovery cannot discard more than the fixed V2 lanes"
+    );
+    // Evidence carries cumulative client lifecycle counters, including the
+    // initial 48-lane prewarm; it does not subtract the baseline away.
+    let original_setup_attempts = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.setup_attempts)
+        .sum::<u64>();
+    let original_setup_failures = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.setup_failures)
+        .sum::<u64>();
+    let original_setup_successes = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.setup_successes)
+        .sum::<u64>();
+    let supplemental_setup_attempt_delta = delayed_after_ambiguity
+        .setup_attempts
+        .checked_add(old_leaf_diagnostics.setup_attempts)
+        .and_then(|total| total.checked_add(new_only_old_root_diagnostics.setup_attempts))
+        .expect("supplemental setup-attempt accounting fits u64");
+    let supplemental_setup_failure_delta = delayed_after_ambiguity
+        .setup_failures
+        .checked_add(old_leaf_diagnostics.setup_failures)
+        .and_then(|total| total.checked_add(new_only_old_root_diagnostics.setup_failures))
+        .expect("supplemental setup-failure accounting fits u64");
+    let supplemental_setup_success_delta = delayed_after_ambiguity
+        .setup_successes
+        .checked_add(old_leaf_diagnostics.setup_successes)
+        .and_then(|total| total.checked_add(new_only_old_root_diagnostics.setup_successes))
+        .expect("supplemental setup-success accounting fits u64");
+    let setup_attempts = original_setup_attempts
+        .checked_add(supplemental_setup_attempt_delta)
+        .expect("total setup-attempt accounting fits u64");
+    let setup_failures = original_setup_failures
+        .checked_add(supplemental_setup_failure_delta)
+        .expect("total setup-failure accounting fits u64");
+    let setup_successes = original_setup_successes
+        .checked_add(supplemental_setup_success_delta)
+        .expect("total setup-success accounting fits u64");
+    let observed_setup_accounting = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: original_setup_attempts,
+            failures: original_setup_failures,
+        },
+        supplemental: SetupAccounting {
+            attempts: supplemental_setup_attempt_delta,
+            failures: supplemental_setup_failure_delta,
+        },
+    };
+    let setup_ceilings = v2_batch_release_gate_setup_ceilings();
+    let total_setup_accounting = observed_setup_accounting.total();
+    println!(
+        "V2_BATCH_RELEASE_GATE_MTLS_SETUP_ACCOUNTING original_and_restored_attempts={} original_and_restored_attempt_bound={} original_and_restored_failures={} original_and_restored_failure_bound={} supplemental_attempts={} supplemental_attempt_bound={} supplemental_failures={} supplemental_failure_bound={} total_attempts={} total_attempt_bound={} total_failures={} total_failure_bound={}",
+        observed_setup_accounting.original_and_restored.attempts,
+        setup_ceilings.original_and_restored.attempts,
+        observed_setup_accounting.original_and_restored.failures,
+        setup_ceilings.original_and_restored.failures,
+        observed_setup_accounting.supplemental.attempts,
+        setup_ceilings.supplemental.attempts,
+        observed_setup_accounting.supplemental.failures,
+        setup_ceilings.supplemental.failures,
+        total_setup_accounting.attempts,
+        setup_ceilings.total.attempts,
+        total_setup_accounting.failures,
+        setup_ceilings.total.failures,
+    );
+    verify_mtls_setup_accounting(observed_setup_accounting, setup_ceilings)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        setup_attempts,
+        setup_successes + setup_failures,
+        "release-gate setup deltas conserve every physical V2 lane attempt"
+    );
+    // The normal fleet deliberately holds exactly sixteen persistent lanes at
+    // each listener.  Open one independent projected-mTLS/Hello status lane
+    // per node, while those normal lanes remain live, so the process-local
+    // listener counter proves a positive (but still bounded) server margin.
+    // This is admission evidence, not a client-pool inference.
+    let headroom_pool_config = PersistentSessionConsumerConfig::try_new(
+        1,
+        0,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        1,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("one-lane server-headroom probe has fixed bounded setup");
+    let mut headroom_probes = Vec::with_capacity(MEMBER_COUNT);
+    let mut normal_headroom_high_water_connections = [0usize; MEMBER_COUNT];
+    // Capacity is exercised at the logical voter that was actually killed
+    // and restarted, not merely at the survivor elected as temporary leader.
+    // This binds the 16→17→20→typed-unavailable21→16 sequence to the only
+    // doubled process-generation record.
+    let capacity_probe_node = leader_node_index;
+    let normal_before_capacity = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for node_index in 0..MEMBER_COUNT {
+        let (credential_generation, trust_generation) = if node_index == replacement {
+            (
+                ConsumerCredentialGeneration::NewRoot,
+                TrustGeneration::NewOnly,
+            )
+        } else if node_index == old_root_server {
+            (
+                ConsumerCredentialGeneration::OldRoot,
+                TrustGeneration::OldOnly,
+            )
+        } else {
+            (
+                ConsumerCredentialGeneration::OldRoot,
+                TrustGeneration::Overlap,
+            )
+        };
+        let (identity_source, probe) = qualification_persistent_v2_client(
+            Arc::clone(&endpoints),
+            node_index,
+            voter_authorities[node_index].clone(),
+            fleet.pki.consumer_identity_state_with_generations(
+                &consumer_identities[node_index],
+                credential_generation,
+                trust_generation,
+            ),
+            headroom_pool_config,
+            None,
+        );
+        runtime
+            .block_on(probe.prewarm_v2())
+            .expect("the seventeenth listener connection is admitted");
+        runtime.block_on(qualification_execute_v2_status_sample(
+            probe.clone(),
+            scope,
+            first.clone(),
+            Instant::now(),
+        ));
+        let admitted = fleet.stateless_consumer_admission_status(node_index);
+        assert_eq!(admitted.active_connections, 17);
+        assert_eq!(admitted.high_water_connections, 17);
+        assert_eq!(admitted.admission_limit, 20);
+        assert_eq!(admitted.admission_rejections, 0);
+        normal_headroom_high_water_connections[node_index] = admitted.high_water_connections;
+        headroom_probes.push((identity_source, probe));
+    }
+    // Keep the seventeenth connection at one chosen listener and fill only
+    // its remaining three permits.  The next projected-mTLS/Hello setup must
+    // be rejected by the listener without evicting any of the sixteen normal
+    // lanes.  The monotonic process counter records this deliberate capacity
+    // phase separately from the normal-headroom phase below.
+    let capacity_before = fleet.stateless_consumer_admission_status(capacity_probe_node);
+    let (capacity_credential_generation, capacity_trust_generation) =
+        if capacity_probe_node == replacement {
+            (
+                ConsumerCredentialGeneration::NewRoot,
+                TrustGeneration::NewOnly,
+            )
+        } else {
+            (
+                ConsumerCredentialGeneration::OldRoot,
+                TrustGeneration::Overlap,
+            )
+        };
+    let mut capacity_probes = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let (identity_source, probe) = qualification_persistent_v2_client(
+            Arc::clone(&endpoints),
+            capacity_probe_node,
+            voter_authorities[capacity_probe_node].clone(),
+            fleet.pki.consumer_identity_state_with_generations(
+                &consumer_identities[capacity_probe_node],
+                capacity_credential_generation,
+                capacity_trust_generation,
+            ),
+            headroom_pool_config,
+            None,
+        );
+        runtime
+            .block_on(probe.prewarm_v2())
+            .expect("the bounded listener capacity probe admits connections 18 through 20");
+        runtime.block_on(qualification_execute_v2_status_sample(
+            probe.clone(),
+            scope,
+            first.clone(),
+            Instant::now(),
+        ));
+        capacity_probes.push((identity_source, probe));
+    }
+    let capacity_full = fleet.stateless_consumer_admission_status(capacity_probe_node);
+    assert_eq!(capacity_full.active_connections, 20);
+    assert_eq!(capacity_full.high_water_connections, 20);
+    let (_rejected_identity_source, rejected_probe) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        capacity_probe_node,
+        voter_authorities[capacity_probe_node].clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &consumer_identities[capacity_probe_node],
+            capacity_credential_generation,
+            capacity_trust_generation,
+        ),
+        headroom_pool_config,
+        None,
+    );
+    let capacity_probe_typed_rejection = matches!(
+        runtime.block_on(rejected_probe.prewarm_v2()),
+        Err(SessionConsumerClientError::Unavailable)
+    );
+    assert!(
+        capacity_probe_typed_rejection,
+        "the twenty-first listener admission is rejected without retrying or evicting normal lanes"
+    );
+    runtime.block_on(rejected_probe.shutdown());
+    let capacity_rejected = fleet.stateless_consumer_admission_status(capacity_probe_node);
+    assert_eq!(capacity_rejected.active_connections, 20);
+    assert_eq!(capacity_rejected.high_water_connections, 20);
+    let capacity_probe_high_water_connections = capacity_rejected.high_water_connections;
+    let capacity_probe_admission_waits = capacity_rejected
+        .admission_waits
+        .checked_sub(capacity_before.admission_waits)
+        .expect("listener admission waits are monotonic across the capacity phase");
+    let capacity_probe_admission_rejections = capacity_rejected
+        .admission_rejections
+        .checked_sub(capacity_before.admission_rejections)
+        .expect("listener admission rejections are monotonic across the capacity phase");
+    assert_eq!(capacity_probe_admission_waits, 0);
+    assert_eq!(capacity_probe_admission_rejections, 1);
+    for (_, probe) in &capacity_probes {
+        runtime.block_on(probe.shutdown());
+    }
+    for (_, probe) in &headroom_probes {
+        runtime.block_on(probe.shutdown());
+    }
+    for node_index in 0..MEMBER_COUNT {
+        let settle_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let settled = fleet.stateless_consumer_admission_status(node_index);
+            if settled.active_connections == 16 {
+                assert_eq!(
+                    settled.high_water_connections,
+                    if node_index == capacity_probe_node {
+                        20
+                    } else {
+                        17
+                    }
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "headroom probe failed to reclaim its one listener admission: node={node_index}, status={settled:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    runtime.block_on(async {
+        for client in &clients {
+            let reads = (0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT).map(|_| {
+                qualification_execute_v2_status_sample(
+                    client.clone(),
+                    scope,
+                    first.clone(),
+                    Instant::now(),
+                )
+            });
+            futures_util::future::join_all(reads).await;
+        }
+    });
+    let normal_after_capacity = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for (before, after) in normal_before_capacity.iter().zip(&normal_after_capacity) {
+        assert_eq!(after.setup_attempts, before.setup_attempts);
+        assert_eq!(after.reconnects, before.reconnects);
+        assert_eq!(after.active, before.active);
+        assert_eq!(after.idle, before.idle);
+    }
+    drop(capacity_probes);
+    drop(headroom_probes);
+    let current_process_ids = fleet
+        .nodes
+        .iter()
+        .map(ChildNode::process_id)
+        .collect::<Vec<_>>();
+    let (settled_resources, _) =
+        fleet.wait_for_resources_to_settle(&current_process_ids, &warmed_resources);
+    let resource_high_water_generations = resource_sampler.finish();
+    for (node_index, generations) in resource_high_water_generations.iter().enumerate() {
+        let expected_generations = if node_index == leader_node_index {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            generations.len(),
+            expected_generations,
+            "resource sampler retains a bounded logical-voter generation ledger"
+        );
+        assert!(
+            generations.iter().all(|generation| generation.samples >= 1),
+            "each sampled logical-voter generation has at least one resource observation"
+        );
+    }
+    let resource_high_water =
+        merge_resource_generation_high_water(&resource_high_water_generations);
+    assert_process_resource_bounds(
+        MEMBER_COUNT,
+        &warmed_resources,
+        &resource_high_water,
+        &settled_resources,
+    );
+    let resource_observations = warmed_resources
+        .iter()
+        .zip(&resource_high_water)
+        .zip(&settled_resources)
+        .enumerate()
+        .map(|(logical_voter_index, ((warmed, high_water), settled))| {
+            opc_session_testkit::qualification::SessionMtlsBatchReleaseGateResourceObservationV1 {
+                logical_voter_index,
+                warmed_file_descriptors: warmed.file_descriptors,
+                warmed_socket_file_descriptors: warmed.socket_file_descriptors,
+                warmed_nontransport_file_descriptors: warmed.nontransport_file_descriptors,
+                warmed_threads: warmed.threads,
+                warmed_vm_rss_kib: warmed.vm_rss_kib,
+                warmed_vm_hwm_kib: warmed.vm_hwm_kib,
+                high_water_file_descriptors: high_water.file_descriptors,
+                high_water_threads: high_water.threads,
+                high_water_vm_rss_kib: high_water.vm_rss_kib,
+                high_water_vm_hwm_kib: high_water.vm_hwm_kib,
+                settled_file_descriptors: settled.file_descriptors,
+                settled_socket_file_descriptors: settled.socket_file_descriptors,
+                settled_threads: settled.threads,
+                settled_vm_rss_kib: settled.vm_rss_kib,
+                settled_vm_hwm_kib: settled.vm_hwm_kib,
+                high_water_file_descriptor_ceiling: process_file_descriptor_high_water_bound(
+                    MEMBER_COUNT,
+                    warmed.nontransport_file_descriptors,
+                ),
+                settled_file_descriptor_ceiling: warmed
+                    .file_descriptors
+                    .checked_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE)
+                    .expect("settled file-descriptor ceiling fits usize"),
+                settled_socket_file_descriptor_ceiling: warmed
+                    .socket_file_descriptors
+                    .checked_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE)
+                    .expect("settled socket-file-descriptor ceiling fits usize"),
+                high_water_thread_ceiling: warmed
+                    .threads
+                    .checked_add(QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE)
+                    .expect("high-water thread ceiling fits usize"),
+                high_water_vm_hwm_ceiling_kib: warmed
+                    .vm_hwm_kib
+                    .checked_add(QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB)
+                    .expect("high-water vm-hwm ceiling fits u64"),
+                settled_vm_rss_ceiling_kib: warmed
+                    .vm_rss_kib
+                    .checked_add(QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB)
+                    .expect("settled vm-rss ceiling fits u64"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let server_admissions = (0..MEMBER_COUNT)
+        .map(|node_index| {
+            let mut admission = fleet.stateless_consumer_admission_status(node_index);
+            admission.normal_headroom_high_water_connections =
+                normal_headroom_high_water_connections[node_index];
+            admission.capacity_probe_exercised = node_index == capacity_probe_node;
+            if admission.capacity_probe_exercised {
+                admission.capacity_probe_high_water_connections =
+                    capacity_probe_high_water_connections;
+                admission.capacity_probe_admission_waits = capacity_probe_admission_waits;
+                admission.capacity_probe_admission_rejections = capacity_probe_admission_rejections;
+                admission.capacity_probe_typed_rejection = capacity_probe_typed_rejection;
+            }
+            admission
+        })
+        .collect::<Vec<_>>();
+    for admission in &server_admissions {
+        assert_eq!(admission.admission_limit, 20);
+        assert_eq!(admission.expected_peak_connections, 16);
+        assert!(admission.listener_available && admission.samples > 0);
+        assert!(
+            admission.high_water_connections > admission.expected_peak_connections,
+            "a real supplemental listener admission must prove positive server headroom"
+        );
+        assert_eq!(admission.active_connections, 16);
+        if admission.logical_voter_index == capacity_probe_node {
+            assert_eq!(admission.high_water_connections, 20);
+            assert_eq!(admission.capacity_probe_high_water_connections, 20);
+            assert_eq!(admission.capacity_probe_admission_waits, 0);
+            assert_eq!(admission.capacity_probe_admission_rejections, 1);
+            assert!(admission.capacity_probe_typed_rejection);
+        } else {
+            assert_eq!(admission.high_water_connections, 17);
+            assert_eq!(admission.capacity_probe_high_water_connections, 0);
+        }
+    }
+    let mut resource_generations = resource_high_water_generations
+        .iter()
+        .enumerate()
+        .flat_map(|(logical_voter_index, generations)| {
+            generations
+                .iter()
+                .enumerate()
+                .map(move |(generation_ordinal, generation)| {
+                    SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                        logical_voter_index,
+                        generation_ordinal: u8::try_from(generation_ordinal)
+                            .expect("bounded restarted voter has a portable generation ordinal"),
+                        process_id: generation.process_id,
+                        samples: generation.samples,
+                    }
+                })
+        })
+        .collect::<Vec<_>>();
+    resource_generations.sort_by_key(|generation| {
+        (
+            generation.logical_voter_index,
+            generation.generation_ordinal,
+        )
+    });
+    let distinct_resource_processes = resource_generations
+        .iter()
+        .map(|generation| generation.process_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct_resource_processes.len(),
+        resource_generations.len(),
+        "each logical-voter generation has a distinct nonzero process ID"
+    );
+    assert_eq!(
+        resource_generations
+            .iter()
+            .filter(|generation| generation.logical_voter_index == leader_node_index)
+            .map(|generation| generation.generation_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the killed voter records old then replacement process generations"
+    );
+    let replacement_seam_pool_wait_max = released_original_before_shutdown
+        .pool_wait_max
+        .max(restored_seam_current.pool_wait_max);
+    let old_root_seam_pool_wait_max = released_old_root_before_shutdown
+        .pool_wait_max
+        .max(restored_old_root_current.pool_wait_max);
+    assert_eq!(
+        after_recovery[seam_client_index].pool_wait_max, replacement_seam_pool_wait_max,
+        "replacement seam preserves the retired and restored client-pool wait high-water"
+    );
+    assert_eq!(
+        after_recovery[old_root_seam_client_index].pool_wait_max, old_root_seam_pool_wait_max,
+        "old-root seam preserves the retired and restored client-pool wait high-water"
+    );
+    let pool_wait_max = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.pool_wait_max)
+        .max()
+        .expect("fixed V2 client set is nonempty");
+    fleet
+        .candidate_evidence_inputs
+        .verify_unchanged(&fleet.config_paths)
+        .expect("candidate inputs remain unchanged before release-gate evidence output");
+    release_provenance
+        .verify_unchanged()
+        .expect("release gate source remains clean and frozen before evidence output");
+    let original_pool = SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+        role: SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools,
+        setup_attempts: original_setup_attempts,
+        setup_failures: original_setup_failures,
+        setup_successes: original_setup_successes,
+        pool_wait_current: 0,
+        pool_wait_max,
+        configured_lanes: configured_connections,
+        active_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum(),
+        idle_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum(),
+    };
+    let supplemental_pools = [
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer,
+            old_leaf_diagnostics,
+            1,
+        ),
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity,
+            delayed_after_ambiguity,
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        ),
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer,
+            new_only_old_root_diagnostics,
+            1,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(role, diagnostics, configured_lanes)| SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+            role,
+            setup_attempts: diagnostics.setup_attempts,
+            setup_failures: diagnostics.setup_failures,
+            setup_successes: diagnostics.setup_successes,
+            pool_wait_current: diagnostics.pool_wait_current,
+            pool_wait_max: diagnostics.pool_wait_max,
+            configured_lanes,
+            active_lanes: diagnostics.active,
+            idle_lanes: diagnostics.idle,
+        },
+    )
+    .collect::<Vec<_>>();
+    let all_pools = std::iter::once(&original_pool).chain(supplemental_pools.iter());
+    let aggregate_setup_attempts = all_pools.clone().map(|pool| pool.setup_attempts).sum();
+    let aggregate_setup_failures = all_pools.clone().map(|pool| pool.setup_failures).sum();
+    let aggregate_setup_successes = all_pools.clone().map(|pool| pool.setup_successes).sum();
+    let aggregate_pool_wait_max = all_pools
+        .map(|pool| pool.pool_wait_max)
+        .max()
+        .expect("all pools accounted");
+    assert_eq!(
+        aggregate_pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the serialized aggregate wait high-water is the delayed fixed-pool overload evidence"
+    );
+    println!(
+        "V2_BATCH_RELEASE_GATE_POOL_WAIT_SCOPES original_and_restored_max={} replacement_released_and_restored_max={} old_root_released_and_restored_max={} delayed_ambiguity_max={} old_credential_negative_max={} new_credential_old_root_negative_max={} aggregate_max={}",
+        pool_wait_max,
+        replacement_seam_pool_wait_max,
+        old_root_seam_pool_wait_max,
+        delayed_after_ambiguity.pool_wait_max,
+        old_leaf_diagnostics.pool_wait_max,
+        new_only_old_root_diagnostics.pool_wait_max,
+        aggregate_pool_wait_max,
+    );
+    assert_eq!(mutation_recovered_unknown, 0);
+    assert_eq!(mutation_status_retries, V2BatchStatusRetryCounts::default());
+    assert_eq!(mutation_status_retries_high_water, 0);
+    assert_eq!(mutation_status_attempts_high_water, 0);
+    let evidence_status_retries = ambiguity_status_retries;
+    let evidence_status_attempts_high_water = ambiguity_status_retries.attempts_total;
+    let evidence_status_retries_high_water = ambiguity_status_retries.total;
+    assert!(
+        evidence_status_retries.attempts_total
+            <= V2_BATCH_RELEASE_GATE_AMBIGUITY_STATUS_ATTEMPT_LIMIT,
+        "all delayed-response status reads remain within the one 64-attempt evidence budget"
+    );
+    let gate_process_generations = resource_generations.len();
+    let typed_evidence = SessionMtlsBatchReleaseGateEvidenceV1 {
+        schema_version: "opc-session-mtls-batch-release-gate-evidence/v1".to_owned(),
+        experimental: true,
+        qualification_complete: false,
+        cargo_profile: observed_profile.to_owned(),
+        opt_level: observed_opt_level.to_owned(),
+        debug_assertions: cfg!(debug_assertions),
+        foundation_insecure: cfg!(feature = "foundation-insecure"),
+        bindings: SessionMtlsBatchReleaseGateBindingsV1 {
+            evidence_schema_sha256: opc_session_testkit::qualification::session_mtls_batch_release_gate_evidence_v1_schema_sha256(),
+            configuration_sha256: fleet.candidate_evidence_inputs.configuration_sha256.clone(),
+            public_material_manifest_sha256: fleet.candidate_public_material_manifest.sha256().expect("public material manifest"),
+            workload_schedule_sha256: session_mtls_batch_release_gate_schedule_sha256(),
+            source_revision: release_provenance.source_revision.clone(),
+            source_tree: release_provenance.source_tree.clone(),
+            source_tree_status: SessionMtlsCandidateSourceTreeStatus::Clean,
+            source_worktree_sha256: release_provenance.source_worktree_sha256.clone(),
+            cargo_lock_sha256: release_provenance.cargo_lock_sha256.clone(),
+            command_argv_sha256: release_provenance.command_argv_sha256.clone(),
+            child_sha256: fleet.candidate_evidence_inputs.child_sha256.clone(),
+            harness_sha256: fleet.candidate_evidence_inputs.harness_sha256.clone(),
+        },
+        members: MEMBER_COUNT,
+        clients: V2_BATCH_RELEASE_GATE_CLIENTS,
+        lanes_per_client: V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+        // This is the offered logical mutation rate, not an actor-count or
+        // attach-per-second capacity claim.
+        logical_operations_per_second: V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND,
+        warm_status_samples: V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
+        warm_status_request_cardinality: warm_status_request_indices.len(),
+        warm_status_request_index_min: warm_status_request_min,
+        warm_status_request_index_max: warm_status_request_max,
+        warm_status_request_stride: WARM_STATUS_REQUEST_STRIDE,
+        active_history_entries: exact_active_history_entries,
+        normal_configured_lanes: configured_connections,
+        normal_active_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum(),
+        normal_idle_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum(),
+        original_fixed_pools: original_pool,
+        supplemental_pools,
+        aggregate_setup_attempts,
+        aggregate_setup_failures,
+        aggregate_setup_successes,
+        restarted_voter_index: leader_node_index,
+        capacity_probe_voter_index: capacity_probe_node,
+        capacity_probe_overall_admission_waits: capacity_probe_admission_waits,
+        capacity_probe_overall_admission_rejections: capacity_probe_admission_rejections,
+        preload_recovered_unknown,
+        preload_not_transmitted_retries,
+        preload_not_transmitted_retry_high_water,
+        paced_not_transmitted_retries: mutation_not_transmitted_retries,
+        paced_not_transmitted_retry_high_water: mutation_not_transmitted_retry_high_water,
+        // The 69th pressure call is a typed overload observation, not a
+        // proven-unavailable redispatch. The ledger therefore derives zero
+        // retries and zero retry high-water from its single terminal attempt.
+        pressure_not_transmitted_retries: overload_attempt_ledger.actual_redispatches(),
+        pressure_not_transmitted_retry_high_water: overload_attempt_ledger.actual_redispatches(),
+        preload_status_attempts_total: preload_status_retries.attempts_total,
+        preload_status_terminal_attempts: preload_status_retries.terminal_attempts,
+        preload_status_retries_total: preload_status_retries.total,
+        preload_status_not_found_retries: preload_status_retries.not_found,
+        preload_status_not_transmitted_retries: preload_status_retries.not_transmitted,
+        preload_status_read_unavailable_retries: preload_status_retries.read_unavailable,
+        preload_status_typed_unavailable_retries: preload_status_retries.typed_unavailable,
+        status_retries_total: evidence_status_retries.total,
+        status_attempts_total: evidence_status_retries.attempts_total,
+        status_attempts_high_water: evidence_status_attempts_high_water,
+        status_terminal_attempts: evidence_status_retries.terminal_attempts,
+        status_retries_high_water: evidence_status_retries_high_water,
+        status_not_found_retries: evidence_status_retries.not_found,
+        status_not_transmitted_retries: evidence_status_retries.not_transmitted,
+        status_read_unavailable_retries: evidence_status_retries.read_unavailable,
+        status_typed_unavailable_retries: evidence_status_retries.typed_unavailable,
+        aggregate_pool_wait_max,
+        resource_generations,
+        resource_observations,
+        server_admissions,
+        paced_operations: V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        paced_elapsed_nanos,
+        achieved_logical_operations_per_second_milli,
+        mutation_batch_samples: mutation_samples.len(),
+        warm_read_p99_millis,
+        warm_read_p999_millis,
+        mutation_p99_millis,
+        mutation_p999_millis,
+        saturated_client_skips: mutation_saturated_client_skips,
+        slow_lane_completed_batches: min_completed_batches,
+        over_capacity_typed_backpressure_events: 1,
+        held_response_count: held_response_count
+            .checked_add(1)
+            .expect("causal plus pressure held-response accounting fits usize"),
+        causal_held_response_count: 1,
+        queued_caller_count,
+        cross_client_fair_progress,
+        released_response_count,
+        recovered_queued_caller_count,
+        durable_status_cardinality,
+        post_outcome_unknown_mutation_dispatches: causal_attempt_ledger
+            .post_outcome_unknown_mutation_dispatches(),
+        not_transmitted_retries: preload_not_transmitted_retries
+            .checked_add(mutation_not_transmitted_retries)
+            .expect("bounded preload and paced retry accounting fits usize"),
+        recovered_unknown: causal_attempt_ledger.recovered_outcome_unknown_families(),
+        // No server queue depth is sampled by this client-side harness.
+        server_queue_depth_measured: false,
+        server_queue_depth_scope: SessionMtlsBatchReleaseGateServerQueueDepthScopeV1::Downstream,
+        positive_new_credential_new_server_statuses: new_only_client_indices.len(),
+        old_credential_new_only_server_tls_peer_credential_rejected,
+        new_credential_old_root_server_tls_peer_credential_rejected,
+    };
+    typed_evidence
+        .validate()
+        .expect("typed batch evidence validates");
+    let encoded_typed_evidence = typed_evidence
+        .to_canonical_json()
+        .expect("typed batch evidence encodes and schema-validates exact bytes");
+    assert_eq!(
+        SessionMtlsBatchReleaseGateEvidenceV1::from_json(&encoded_typed_evidence)
+            .expect("typed batch evidence round-trips"),
+        typed_evidence
+    );
+    println!(
+        "V2_BATCH_RELEASE_GATE_EVIDENCE {}",
+        String::from_utf8(encoded_typed_evidence.clone()).expect("typed evidence is UTF-8 JSON")
+    );
+    runtime.block_on(async {
+        for client in &clients {
+            client.shutdown().await;
+        }
+    });
+    fleet.shutdown();
+    BatchReleaseGateRunFacts {
+        canonical_v1: encoded_typed_evidence,
+        release_provenance,
+        capacity_reclaimed: pressure_recovered.active
+            == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && pressure_recovered.idle == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        old_credential_rejected: old_credential_new_only_server_tls_peer_credential_rejected,
+        new_credential_rejected: new_credential_old_root_server_tls_peer_credential_rejected,
+        process_generations: gate_process_generations,
+        durable_status_cardinality,
+        post_outcome_unknown_mutation_dispatches: causal_attempt_ledger
+            .post_outcome_unknown_mutation_dispatches(),
+    }
+}
+
+fn assert_batch_credential_negative_handshake(
+    server_credential: CredentialGeneration,
+    server_trust: TrustGeneration,
+    client_credential: ConsumerCredentialGeneration,
+    client_trust: TrustGeneration,
+    phase: &str,
+) {
+    const MEMBER_COUNT: usize = 3;
+    const TARGET: usize = 0;
+    let mut fleet = Fleet::start(MEMBER_COUNT);
+    let consumer_identities = (0..V2_BATCH_RELEASE_GATE_CLIENTS)
+        .map(stateless_consumer_identity)
+        .collect::<Vec<_>>();
+    let identity = consumer_identities[TARGET].clone();
+    let (endpoint, scope) = fleet.start_stateless_consumer(TARGET, consumer_identities);
+    let voter_authority = fleet
+        .stateless_consumer_voter_authorities()
+        .into_iter()
+        .nth(TARGET)
+        .expect("qualification target voter authority");
+    assert_eq!(
+        voter_authority.scope(),
+        scope,
+        "matching credential control must use the listener's exact fixed authority scope"
+    );
+    let source_before = fleet.projected_status(TARGET);
+    let controller_before = fleet.material_status(TARGET);
+    fleet.publish_known_projected_generation(TARGET, server_credential, server_trust, phase);
+    fleet.wait_for_member_publication(TARGET, source_before.generation, controller_before.epoch);
+    let endpoints = Arc::new(Mutex::new(vec![endpoint; MEMBER_COUNT]));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bounded credential-negative runtime");
+    let pool_config = PersistentSessionConsumerConfig::try_new(
+        1,
+        0,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        1,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("single-lane credential-negative pool");
+
+    let positive_credential = match server_trust {
+        TrustGeneration::OldOnly => ConsumerCredentialGeneration::OldRoot,
+        TrustGeneration::NewOnly => ConsumerCredentialGeneration::NewRoot,
+        TrustGeneration::Overlap => panic!("credential-negative server trust must be exclusive"),
+    };
+    let (_positive_identity_source, positive_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        TARGET,
+        voter_authority.clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &identity,
+            positive_credential,
+            server_trust,
+        ),
+        pool_config,
+        None,
+    );
+    runtime
+        .block_on(positive_client.prewarm_v2())
+        .expect("matching credential is a positive mTLS control");
+    let positive_diagnostics = positive_client.v2_diagnostics();
+    assert_eq!(positive_diagnostics.setup_attempts, 1);
+    assert_eq!(positive_diagnostics.setup_successes, 1);
+    runtime.block_on(positive_client.shutdown());
+    assert_eq!(
+        fleet.consumer_tls_peer_credential_rejections(TARGET),
+        0,
+        "matching credential control cannot increment the peer-credential rejection counter: phase={phase}"
+    );
+    let peer_credential_rejections_before = fleet.consumer_tls_peer_credential_rejections(TARGET);
+
+    let (_negative_identity_source, negative_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        TARGET,
+        voter_authority,
+        fleet.pki.consumer_identity_state_with_generations(
+            &identity,
+            client_credential,
+            client_trust,
+        ),
+        pool_config,
+        None,
+    );
+    let negative_result = runtime.block_on(negative_client.prewarm_v2());
+    assert!(
+        matches!(
+            negative_result,
+            Err(SessionConsumerClientError::Authentication
+                | SessionConsumerClientError::Unavailable)
+        ),
+        "actual consumer listener mismatched credential result is typed authentication or unavailable: phase={phase}, result={negative_result:?}"
+    );
+    runtime.block_on(negative_client.shutdown());
+    let negative_diagnostics = negative_client.v2_diagnostics();
+    assert_eq!(negative_diagnostics.setup_attempts, 1);
+    assert_eq!(negative_diagnostics.setup_successes, 0);
+    assert_eq!(negative_diagnostics.setup_failures, 1);
+    assert_eq!(negative_diagnostics.active, 0);
+    assert_eq!(negative_diagnostics.idle, 0);
+    assert_eq!(negative_diagnostics.pool_wait_current, 0);
+    assert_eq!(
+        fleet.consumer_tls_peer_credential_rejections(TARGET),
+        peer_credential_rejections_before
+            .checked_add(1)
+            .expect("bounded peer-credential rejection counter remains below u64 maximum"),
+        "the mismatched credential produces exactly one local TLS peer-credential rejection: phase={phase}"
+    );
+    fleet.shutdown();
+}
+
+#[test]
+fn bounded_batch_credential_negatives_reach_consumer_listener_rejection() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_batch_credential_negative_handshake(
+        CredentialGeneration::NewRoot,
+        TrustGeneration::NewOnly,
+        ConsumerCredentialGeneration::OldRoot,
+        TrustGeneration::Overlap,
+        "batch-negative-new-only-server",
+    );
+    assert_batch_credential_negative_handshake(
+        CredentialGeneration::Initial,
+        TrustGeneration::OldOnly,
+        ConsumerCredentialGeneration::NewRoot,
+        TrustGeneration::Overlap,
+        "batch-negative-old-root-server",
+    );
 }
 
 #[test]
@@ -8478,6 +19404,86 @@ fn five_process_projected_mtls_stateless_quorum_consumers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_stateless_consumer_multiprocess_qualification(5);
+}
+
+#[test]
+fn three_process_projected_mtls_persistent_quorum_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_persistent_consumer_multiprocess_qualification(3, None);
+}
+
+#[test]
+fn three_process_projected_mtls_persistent_v2_fenced_transition_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_persistent_consumer_v2_multiprocess_qualification();
+}
+
+#[test]
+#[ignore = "release-profile attestation sentinel; executes only the profile guard"]
+fn v2_batch_release_gate_profile_attestation_sentinel() {
+    assert_v2_batch_release_profile();
+}
+
+#[test]
+#[ignore = "manual same-host three-process V2 batch release gate (50k preload + 60k paced mutations)"]
+fn three_process_projected_mtls_persistent_v2_batch_release_gate() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let release_provenance = ReleaseGateProvenance::capture()
+        .expect("release gate requires one clean provenance before either dual-lane campaign");
+    let persistent_measurements =
+        run_persistent_consumer_multiprocess_qualification(3, Some(release_provenance.clone()));
+    assert!(
+        persistent_measurements.authenticated_setup_successes >= 48
+            && persistent_measurements.warm_reused_calls
+                >= QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7 as u64
+            && persistent_measurements.protected_roster_setup_successes > 0,
+        "the release-gate invocation must first execute both real persistent lanes"
+    );
+    let v1 = run_persistent_consumer_v2_batch_release_gate(release_provenance);
+    assert!(
+        SessionMtlsBatchReleaseGateEvidenceV1::from_json(&v1.canonical_v1).is_ok(),
+        "the full gate returns its exact canonical V1 artifact for a V9 envelope publisher"
+    );
+    assert!(
+        v1.capacity_reclaimed && v1.old_credential_rejected && v1.new_credential_rejected,
+        "the returned gate facts retain the real capacity and credential boundaries"
+    );
+    assert!(
+        v1.process_generations >= 4
+            && v1.durable_status_cardinality == V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE
+            && v1.post_outcome_unknown_mutation_dispatches == 0,
+        "the returned gate facts retain the process and retained-ID causal ledger"
+    );
+    let (v9_canonical, v9) = build_v9_external_evidence(&persistent_measurements, &v1)
+        .expect("the combined real run builds a closed V9 envelope");
+    assert!(
+        v9.qualification_complete,
+        "only the complete combined ignored release gate may reach V9 publication"
+    );
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(&v9_canonical)
+            .expect("V9 canonical evidence round-trips"),
+        v9
+    );
+    let output_root = env::var_os("OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY")
+        .map(PathBuf::from)
+        .expect("V9 requires an external caller-supplied evidence directory");
+    publish_v9_external_evidence_at(&output_root, &v1.canonical_v1, &v9_canonical)
+        .expect("V9 evidence publication is exclusive and durable");
+}
+
+#[test]
+fn five_process_projected_mtls_persistent_quorum_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_persistent_consumer_multiprocess_qualification(5, None);
 }
 
 #[test]
@@ -8541,6 +19547,7 @@ fn traffic_status_fixture(member_count: usize) -> QualificationTrafficStatus {
         linearizable_reads: 11,
         lease_renewals: 11,
         lease_reacquisitions: 10,
+        availability_interruption_episodes: 1,
         availability_interruptions: 1,
         availability_recoveries: 1,
         max_consecutive_availability_interruptions: 1,
@@ -8642,8 +19649,8 @@ fn traffic_progress_rejects_unresolved_or_incoherent_availability_evidence() {
     }
 
     let mut unresolved = after.clone();
+    unresolved.availability_interruption_episodes += 1;
     unresolved.availability_interruptions += 1;
-    unresolved.max_consecutive_availability_interruptions += 1;
     assert!(traffic_live_mutator_counters_are_consistent(&unresolved));
     assert!(!traffic_availability_recovery_is_resolved(&unresolved));
     assert!(!traffic_status_made_semantic_progress(
@@ -8655,6 +19662,7 @@ fn traffic_progress_rejects_unresolved_or_incoherent_availability_evidence() {
     let mut impossible = after.clone();
     impossible.availability_interruptions = 1;
     impossible.availability_recoveries = 1;
+    impossible.availability_interruption_episodes = 1;
     impossible.max_consecutive_availability_interruptions = 0;
     assert!(!traffic_live_mutator_counters_are_consistent(&impossible));
 
@@ -8702,6 +19710,24 @@ fn member_recovery_scope_preserves_unrelated_survivor_generations_and_retirement
         .iter()
         .any(|(source, target)| *source == 0 && *target == 2));
 
+    assert_eq!(
+        member_recovery_directed_paths(3, member),
+        vec![(0, 1), (2, 1), (1, 0), (1, 2)]
+    );
+    assert_eq!(
+        member_recovery_directed_paths(5, member),
+        vec![
+            (0, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (1, 0),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+        ]
+    );
+
     let before = vec![lifecycle_metrics_fixture(); 5];
     let mut after = before.clone();
     after[member].retirement_explicit += 1;
@@ -8716,6 +19742,94 @@ fn member_recovery_scope_preserves_unrelated_survivor_generations_and_retirement
 }
 
 #[test]
+fn member_recovery_survivor_origin_wave_has_no_cross_survivor_head_of_line_blocking_for_five_voters(
+) {
+    let recovered_member = 1;
+    let pending = (0..5)
+        .map(|node_index| node_index != recovered_member)
+        .collect::<Vec<_>>();
+    let expected_survivors = vec![0, 2, 3, 4];
+    let mut events = Vec::new();
+    let mut dispatched = Vec::new();
+    let mut early_survivor_retry_or_pulse_can_run = false;
+
+    for_each_pending_command_in_wave(&pending, |node_index, stage| {
+        events.push((stage, node_index));
+        match stage {
+            PendingCommandWaveStage::Dispatch => {
+                assert!(
+                    !early_survivor_retry_or_pulse_can_run,
+                    "an early survivor's reply handling must not precede another survivor's first command"
+                );
+                dispatched.push(node_index);
+            }
+            PendingCommandWaveStage::Collect if node_index == expected_survivors[0] => {
+                // This is the earliest point an unavailable reply could cause
+                // a retry and a passive pulse. Every other survivor has
+                // already received its first command, so neither can block
+                // their dispatch behind the five-second remote-retirement
+                // gate of this early survivor.
+                assert_eq!(dispatched, expected_survivors);
+                early_survivor_retry_or_pulse_can_run = true;
+            }
+            PendingCommandWaveStage::Collect => {}
+        }
+    });
+
+    assert!(early_survivor_retry_or_pulse_can_run);
+    assert_eq!(
+        events,
+        vec![
+            (PendingCommandWaveStage::Dispatch, 0),
+            (PendingCommandWaveStage::Dispatch, 2),
+            (PendingCommandWaveStage::Dispatch, 3),
+            (PendingCommandWaveStage::Dispatch, 4),
+            (PendingCommandWaveStage::Collect, 0),
+            (PendingCommandWaveStage::Collect, 2),
+            (PendingCommandWaveStage::Collect, 3),
+            (PendingCommandWaveStage::Collect, 4),
+        ]
+    );
+}
+
+#[test]
+fn member_recovery_near_expiry_checkpoint_refreshes_before_a_wave_and_reserves_observation() {
+    let observed_at = Instant::now();
+    let absolute_deadline =
+        observed_at + Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS);
+    let progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    let rolling_deadline = progress.next_deadline(absolute_deadline);
+    let operation_timeout = Duration::from_millis(QUALIFICATION_OPERATION_TIMEOUT_MILLIS);
+    let observation_headroom =
+        Duration::from_millis(QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS);
+
+    let dispatch_now = observed_at;
+    assert_eq!(
+        recovery_traffic_command_plan(dispatch_now, rolling_deadline),
+        RecoveryTrafficCommandPlan::DispatchBy(rolling_deadline - observation_headroom),
+        "a complete command keeps the fixed common post-wave observation headroom"
+    );
+
+    let exact_unreserved_boundary = rolling_deadline - operation_timeout;
+    assert!(
+        deadline_admits_complete_operation(exact_unreserved_boundary, rolling_deadline),
+        "the existing operation admission alone reaches the rolling boundary"
+    );
+    assert_eq!(
+        recovery_traffic_command_plan(exact_unreserved_boundary, rolling_deadline),
+        RecoveryTrafficCommandPlan::RefreshProgress,
+        "a near-expiry tracker must take the common pre-wave observation instead of dispatching through its post-wave status headroom"
+    );
+    assert!(
+        !deadline_admits_complete_operation(
+            exact_unreserved_boundary,
+            rolling_deadline - observation_headroom,
+        ),
+        "the exact unreserved boundary must reject rather than widen the rolling deadline"
+    );
+}
+
+#[test]
 fn member_recovery_settlement_rejects_an_unresolved_survivor_episode() {
     let (participants, _before, mut settled) = subset_traffic_fixture();
     assert!(subset_traffic_availability_is_settled(
@@ -8723,8 +19837,8 @@ fn member_recovery_settlement_rejects_an_unresolved_survivor_episode() {
         &participants,
     ));
 
+    settled[0].status.availability_interruption_episodes += 1;
     settled[0].status.availability_interruptions += 1;
-    settled[0].status.max_consecutive_availability_interruptions += 1;
     assert!(traffic_live_mutator_counters_are_consistent(
         &settled[0].status
     ));
@@ -8753,6 +19867,7 @@ fn member_recovery_fault_boundary_bounds_and_requires_availability_recovery() {
         &participants,
     ));
 
+    after[0].status.availability_interruption_episodes += 1;
     after[0].status.availability_interruptions += 1;
     assert!(subset_traffic_availability_within_recovery_budget(
         &before,
@@ -8774,7 +19889,19 @@ fn member_recovery_fault_boundary_bounds_and_requires_availability_recovery() {
         &participants,
     ));
 
-    after[0].status.availability_recoveries += 1;
+    after[0].status.availability_interruptions += 2;
+    after[0].status.max_consecutive_availability_interruptions += 2;
+    assert!(subset_traffic_availability_within_recovery_budget(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!subset_traffic_availability_is_settled(
+        &after,
+        &participants,
+    ));
+
+    after[0].status.availability_recoveries += 3;
     assert!(subset_traffic_availability_is_settled(
         &after,
         &participants,
@@ -8785,6 +19912,7 @@ fn member_recovery_fault_boundary_bounds_and_requires_availability_recovery() {
         &participants,
     ));
 
+    after[0].status.availability_interruption_episodes += 1;
     after[0].status.availability_interruptions += 1;
     after[0].status.availability_recoveries += 1;
     assert!(!subset_traffic_availability_within_recovery_budget(
@@ -8833,6 +19961,7 @@ fn subset_traffic_fixture() -> (
             initial.durable_readiness_probes = 0;
             initial.last_generation = 0;
             initial.last_record_fence = 0;
+            initial.availability_interruption_episodes = 0;
             initial.availability_interruptions = 0;
             initial.availability_recoveries = 0;
             initial.max_consecutive_availability_interruptions = 0;
@@ -9017,10 +20146,8 @@ fn recovery_coverage_requires_health_monotonicity_and_inactive_key_stability() {
     ));
 
     let mut unresolved = after.clone();
+    unresolved[0].status.availability_interruption_episodes += 1;
     unresolved[0].status.availability_interruptions += 1;
-    unresolved[0]
-        .status
-        .max_consecutive_availability_interruptions += 1;
     assert!(!recovery_traffic_has_all_key_coverage(
         &before,
         &unresolved,
@@ -9043,6 +20170,7 @@ fn restarted_mutator_counters_are_relative_to_exact_committed_resume_state() {
     resumed.mutation_resume_record_fence = 200;
     resumed.last_generation = 111;
     resumed.last_record_fence = 211;
+    resumed.availability_interruption_episodes = 0;
     resumed.availability_interruptions = 0;
     resumed.availability_recoveries = 0;
     resumed.max_consecutive_availability_interruptions = 0;
@@ -9606,6 +20734,38 @@ fn transition_deadline_never_accepts_a_late_success() {
 }
 
 #[test]
+fn directed_handshake_traffic_and_lifecycle_replies_use_the_supplied_absolute_deadline() {
+    for command in ["DirectedHandshake", "TrafficStatus", "LifecycleMetrics"] {
+        let (sender, replies) = mpsc::sync_channel::<()>(1);
+        // The reply is deliberately withheld while the command's short
+        // absolute deadline expires. This is a causal channel test, not a
+        // wall-clock assertion: the deadline is already in the past when the
+        // receive boundary is entered, so its budget is exactly zero.
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_nanos(1))
+            .expect("monotonic instant supports a one-nanosecond short deadline");
+        assert!(
+            matches!(
+                receive_qualification_reply_until(&replies, deadline),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "withheld {command} reply must not consume the child default timeout"
+        );
+        sender
+            .send(())
+            .expect("late scripted qualification reply remains observable");
+        assert!(
+            replies.try_recv().is_ok(),
+            "late {command} reply was not observed after the absolute-deadline rejection"
+        );
+        assert!(
+            !sleep_until_deadline(deadline, Duration::from_millis(20)),
+            "{command} retry sleep must not extend an exhausted absolute deadline"
+        );
+    }
+}
+
+#[test]
 fn active_restart_reserves_one_final_readiness_round_after_recovery() {
     let started = Instant::now();
     let readiness_round =
@@ -9766,6 +20926,361 @@ fn persistent_connection_attempt_accounting_is_non_overlapping() {
 
     metrics.connection_attempts = 4;
     assert_eq!(connection_attempt_accounting(&metrics), None);
+}
+
+#[test]
+fn replaced_v2_pool_diagnostics_preserve_released_and_restored_counters() {
+    let prewarmed = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 4,
+        setup_failures: 0,
+        setup_successes: 4,
+        reused: 9,
+        reconnects: 0,
+        active: 4,
+        idle: 4,
+        pool_wait_current: 0,
+        pool_wait_max: 0,
+    };
+    let released_before_shutdown = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 8,
+        setup_failures: 1,
+        setup_successes: 7,
+        reused: 15,
+        reconnects: 3,
+        active: 4,
+        idle: 4,
+        pool_wait_current: 0,
+        pool_wait_max: 2,
+    };
+    let restored_current = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 4,
+        setup_failures: 0,
+        setup_successes: 4,
+        reused: 2,
+        reconnects: 0,
+        active: 4,
+        idle: 4,
+        pool_wait_current: 0,
+        pool_wait_max: 1,
+    };
+    let combined = cumulative_replaced_v2_diagnostics(released_before_shutdown, restored_current);
+    assert_eq!(combined.setup_attempts - prewarmed.setup_attempts, 8);
+    assert_eq!(combined.setup_failures - prewarmed.setup_failures, 1);
+    assert_eq!(combined.setup_successes - prewarmed.setup_successes, 7);
+    assert_eq!(combined.reused - prewarmed.reused, 8);
+    assert_eq!(combined.reconnects - prewarmed.reconnects, 3);
+    assert_eq!(combined.active, restored_current.active);
+    assert_eq!(combined.idle, restored_current.idle);
+    assert_eq!(
+        combined.pool_wait_current,
+        restored_current.pool_wait_current
+    );
+    assert_eq!(combined.pool_wait_max, 2);
+}
+
+#[test]
+fn mtls_setup_accounting_rejects_each_attempt_and_failure_ceiling() {
+    let ceilings = v2_batch_release_gate_setup_ceilings();
+    assert_eq!(ceilings.original_and_restored.attempts, 168);
+    assert_eq!(ceilings.original_and_restored.failures, 120);
+    assert_eq!(ceilings.supplemental.attempts, 10);
+    assert_eq!(ceilings.supplemental.failures, 10);
+    assert_eq!(ceilings.total.attempts, 178);
+    assert_eq!(ceilings.total.failures, 130);
+
+    let mut original_attempts = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: ceilings.original_and_restored.attempts + 1,
+            failures: 0,
+        },
+        supplemental: SetupAccounting {
+            attempts: 0,
+            failures: 0,
+        },
+    };
+    let error = verify_mtls_setup_accounting(original_attempts, ceilings)
+        .expect_err("original attempt ceiling must reject overflow");
+    assert!(error.contains("scope=original_and_restored"));
+    assert!(error.contains("attempt ceiling"));
+
+    original_attempts.original_and_restored = SetupAccounting {
+        attempts: 0,
+        failures: ceilings.original_and_restored.failures + 1,
+    };
+    let error = verify_mtls_setup_accounting(original_attempts, ceilings)
+        .expect_err("original failure ceiling must reject overflow");
+    assert!(error.contains("scope=original_and_restored"));
+    assert!(error.contains("failure ceiling"));
+
+    let mut supplemental_attempts = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: 0,
+            failures: 0,
+        },
+        supplemental: SetupAccounting {
+            attempts: ceilings.supplemental.attempts + 1,
+            failures: 0,
+        },
+    };
+    let error = verify_mtls_setup_accounting(supplemental_attempts, ceilings)
+        .expect_err("supplemental attempt ceiling must reject overflow");
+    assert!(error.contains("scope=supplemental"));
+    assert!(error.contains("attempt ceiling"));
+
+    supplemental_attempts.supplemental = SetupAccounting {
+        attempts: 0,
+        failures: ceilings.supplemental.failures + 1,
+    };
+    let error = verify_mtls_setup_accounting(supplemental_attempts, ceilings)
+        .expect_err("supplemental failure ceiling must reject overflow");
+    assert!(error.contains("scope=supplemental"));
+    assert!(error.contains("failure ceiling"));
+
+    let total_observed = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: 1,
+            failures: 1,
+        },
+        supplemental: SetupAccounting {
+            attempts: 1,
+            failures: 1,
+        },
+    };
+    let total_attempt_ceilings = MtlsSetupCeilings {
+        total: SetupAccounting {
+            attempts: 1,
+            failures: ceilings.total.failures,
+        },
+        ..ceilings
+    };
+    let error = verify_mtls_setup_accounting(total_observed, total_attempt_ceilings)
+        .expect_err("total attempt ceiling must reject overflow");
+    assert!(error.contains("scope=total"));
+    assert!(error.contains("attempt ceiling"));
+
+    let total_failure_ceilings = MtlsSetupCeilings {
+        total: SetupAccounting {
+            attempts: ceilings.total.attempts,
+            failures: 1,
+        },
+        ..ceilings
+    };
+    let error = verify_mtls_setup_accounting(total_observed, total_failure_ceilings)
+        .expect_err("total failure ceiling must reject overflow");
+    assert!(error.contains("scope=total"));
+    assert!(error.contains("failure ceiling"));
+}
+
+#[test]
+fn resource_sampler_generation_ledger_keeps_initial_offline_and_restarted_pid() {
+    let initial = ProcessResourceHighWater {
+        process_id: 41,
+        samples: 0,
+        file_descriptors: 0,
+        threads: 0,
+        vm_rss_kib: 0,
+        vm_hwm_kib: 0,
+    };
+    let snapshot = ProcessResourceSnapshot {
+        file_descriptors: 8,
+        socket_file_descriptors: 2,
+        nontransport_file_descriptors: 6,
+        threads: 3,
+        vm_rss_kib: 100,
+        vm_hwm_kib: 120,
+    };
+    let mut generations = vec![vec![initial]];
+    let mut observed_process_ids = vec![None];
+    record_resource_generation_sample(&mut generations, &mut observed_process_ids, 0, 41, snapshot);
+    // Offline is intentionally not sampled. Retaining the old observed PID
+    // makes the next distinct authoritative PID a new logical generation.
+    record_resource_generation_sample(&mut generations, &mut observed_process_ids, 0, 73, snapshot);
+    assert_eq!(generations[0].len(), 2);
+    assert_eq!(generations[0][0].process_id, 41);
+    assert_eq!(generations[0][1].process_id, 73);
+    assert!(generations[0]
+        .iter()
+        .all(|generation| generation.samples >= 1));
+}
+
+#[test]
+fn persistent_consumer_process_ledger_derives_loss_restart_and_generation_counts() {
+    let mut ledger = PersistentConsumerProcessLedger::default();
+    ledger.record_initial(0, 101);
+    ledger.record_initial(1, 102);
+    ledger.record_initial(2, 103);
+    ledger.record_unclean_loss(0, 101);
+    ledger.record_restart(0, 101, 201);
+    ledger.record_unclean_loss(2, 103);
+
+    assert_eq!(ledger.initial_processes(), 3);
+    assert_eq!(ledger.unclean_process_losses(), 2);
+    assert_eq!(ledger.restarted_processes(), 1);
+    assert_eq!(ledger.observed_process_generations(), 4);
+}
+
+#[test]
+fn protected_authority_negative_counters_require_exact_typed_boundaries() {
+    let tenant_rejection = Err(SessionConsumerClientError::Unavailable);
+    let tenant_non_boundary = Err(SessionConsumerClientError::Authentication);
+    assert_eq!(protected_tenant_boundary_observation(&tenant_rejection), 1);
+    assert_eq!(
+        protected_tenant_boundary_observation(&tenant_non_boundary),
+        0,
+        "the foreign-tenant boundary is intentionally non-oracular"
+    );
+
+    let scope_rejection = Err(SessionConsumerClientError::Scope);
+    let scope_non_boundary = Err(SessionConsumerClientError::Protocol);
+    assert_eq!(protected_scope_boundary_observation(&scope_rejection), 1);
+    assert_eq!(protected_scope_boundary_observation(&scope_non_boundary), 0);
+
+    let fence_rejection = Err(opc_session_net::FencedMutationRosterClientError::AuthorityRejected);
+    let fence_non_boundary = Err(opc_session_net::FencedMutationRosterClientError::Unavailable);
+    assert_eq!(protected_fence_boundary_observation(&fence_rejection), 1);
+    assert_eq!(protected_fence_boundary_observation(&fence_non_boundary), 0);
+}
+
+#[test]
+fn protected_roster_failover_resolver_excludes_node_zero_for_both_causal_losses() {
+    let ready = |node_index| FleetReadiness {
+        node_index,
+        ready: true,
+        reason_code: QualificationReadinessCode::Ready,
+        node_id: u64::try_from(node_index + 1).expect("bounded node identifier"),
+        term: 7,
+        leader_id: Some(2),
+        configured_voters: 3,
+        fresh_reachable_voters: 2,
+        agreeing_voters: 2,
+        required_quorum: 2,
+        committed_index: Some(11),
+        applied_index: Some(11),
+    };
+    // First causal fault: the elected leader was node 0, so only nodes 1/2
+    // are available to reconstruct the protected endpoint-pinned client.
+    let after_leader_zero_loss = [ready(1), ready(2)];
+    assert_eq!(
+        protected_roster_proven_live_voter(&after_leader_zero_loss),
+        1
+    );
+
+    // Second causal fault: node 0 had restarted, then was the deliberately
+    // lost voter while node 1 remained leader. The resolver must again reject
+    // the old endpoint rather than silently falling back to endpoints[0].
+    let after_second_zero_loss = [ready(1), ready(2)];
+    assert_eq!(
+        protected_roster_proven_live_voter(&after_second_zero_loss),
+        1
+    );
+}
+
+#[test]
+fn post_voter_loss_receipt_recovery_retries_only_explicit_ambiguities() {
+    assert!(lease_receipt_recovery_is_retryable(&Ok(
+        SessionConsumerLeaseMutationStatus::NotFound
+    )));
+    assert!(lease_receipt_recovery_is_retryable(&Err(
+        StoreError::BackendUnavailable("transient authenticated transport loss".into())
+    )));
+    for result in [
+        Ok(SessionConsumerLeaseMutationStatus::RequestConflict),
+        Err(StoreError::StaleFence),
+        Err(StoreError::TopologyAuthorityRevoked),
+        Err(StoreError::InvalidKey("scope/protocol rejection".into())),
+        Err(StoreError::CapabilityNotSupported(
+            "authentication rejection".into(),
+        )),
+        Err(StoreError::LeaseExpired),
+    ] {
+        assert!(
+            !lease_receipt_recovery_is_retryable(&result),
+            "only NotFound and BackendUnavailable may consume a receipt-recovery retry"
+        );
+    }
+}
+
+#[test]
+fn protected_tenant_bracket_credits_only_an_admitted_roster_status() {
+    require_protected_roster_admitted_status_class(
+        "admitted positive control",
+        ProtectedRosterStatusClass::Admitted,
+    );
+    assert_eq!(
+        protected_roster_admitted_status_observation(ProtectedRosterStatusClass::Admitted),
+        1,
+        "an admitted same-voter `/3` status is the required positive bracket"
+    );
+    assert_eq!(
+        protected_roster_admitted_status_observation(ProtectedRosterStatusClass::Terminal),
+        0,
+        "a successful terminal status must not credit the tenant authority bracket"
+    );
+    assert_eq!(
+        protected_roster_admitted_status_observation(ProtectedRosterStatusClass::Compacted),
+        0,
+        "a successful compacted status must not credit the tenant authority bracket"
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            require_protected_roster_admitted_status_class(
+                "terminal negative control",
+                ProtectedRosterStatusClass::Terminal,
+            );
+        })
+        .is_err(),
+        "a successful terminal status must fail the tenant bracket"
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            require_protected_roster_admitted_status_class(
+                "compacted negative control",
+                ProtectedRosterStatusClass::Compacted,
+            );
+        })
+        .is_err(),
+        "a successful compacted status must fail the tenant bracket"
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            require_protected_roster_admitted_status(
+                opc_session_net::FencedMutationRosterRecoveryOutcome::Compacted,
+                "public compacted recovery outcome",
+            );
+        })
+        .is_err(),
+        "the public compacted recovery outcome must fail before it can bracket authority"
+    );
+    assert_eq!(
+        protected_roster_status_class(
+            &opc_session_net::FencedMutationRosterRecoveryOutcome::Compacted
+        ),
+        ProtectedRosterStatusClass::Compacted,
+        "the public recovery outcome is classified before it can credit the bracket"
+    );
+}
+
+#[test]
+fn protected_roster_recovery_requires_exact_admitted_outcomes() {
+    require_protected_roster_admitted_status_class(
+        "current-fence protected-roster recovery",
+        ProtectedRosterStatusClass::Admitted,
+    );
+    for outcome in [
+        ProtectedRosterStatusClass::Terminal,
+        ProtectedRosterStatusClass::Compacted,
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| {
+                require_protected_roster_admitted_status_class(
+                    "negative protected-roster recovery control",
+                    outcome,
+                );
+            })
+            .is_err(),
+            "a successful-looking non-admitted protected-roster recovery cannot advance the restart ledger"
+        );
+    }
 }
 
 #[test]

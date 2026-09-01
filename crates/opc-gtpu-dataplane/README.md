@@ -43,6 +43,12 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   `CurrentEbpfGraphWriterProof`, `CurrentEbpfGraphDrainProof`,
   `CurrentEbpfGraphRecoveryOutcome`, `CurrentEbpfGraphRecoveryRefusal`, and
   `CurrentEbpfGraphRecoveryProgress`,
+  `HistoricalEbpfGraphGeneration`, `HistoricalEbpfGraphRecoveryRequest`,
+  `HistoricalEbpfGraphRecoveryIntent`, `HistoricalEbpfGraphRecoveryAuthority`,
+  `HistoricalEbpfGraphRecoveryCurrentnessGuard`,
+  `HistoricalEbpfGraphWriterProof`, `HistoricalEbpfGraphDrainProof`,
+  `HistoricalEbpfGraphRecoveryReceipt`, `HistoricalEbpfGraphRecoveryOutcome`, `HistoricalEbpfGraphRecoveryRefusal`,
+  and `HistoricalEbpfGraphRecoveryProgress`,
   `GtpuLocalEndpointSet`, `GtpuSessionAttachmentSelector`,
   `GtpuSessionGroup`, `GtpuSessionGroupReconcileRequest`,
   `GtpuSessionSelectorProvenance`, and `GtpuSessionSelectorReuseProof`,
@@ -1312,13 +1318,15 @@ forwarding state production-ready.
 
 #### Orphaned current-schema graph recovery
 
-`GtpuDataplaneBackend::recover_orphaned_current_ebpf_graph` is the supported
-maintenance boundary for a current-schema graph whose original process and
-interface namespace are gone while its map graph remains in node-persistent
-bpffs. Product code must not unlink those pins directly. The optional
-replacement interface is validated independently and may have a different
-ifindex; neither the old nor replacement ifindex contributes to the persistent
-graph lease identity.
+`GtpuDataplaneBackend::recover_orphaned_current_ebpf_graph_with_authority` is
+the supported maintenance boundary for a current-schema graph whose original
+process and interface namespace are gone while its map graph remains in
+node-persistent bpffs. Product code must not unlink those pins directly. The
+legacy unbound `recover_orphaned_current_ebpf_graph` deliberately returns
+`AuthorityRequired` before observation or mutation. The optional replacement
+interface is validated independently and may have a different ifindex; neither
+the old nor replacement ifindex contributes to the persistent graph lease
+identity.
 
 Before constructing `CurrentEbpfGraphWriterProof`, the caller must establish
 that the prior process cannot write the graph. A graph with retained forwarding
@@ -1330,7 +1338,7 @@ removed, the eBPF backend:
 - acquires a nonblocking exclusive `flock` on a permanent control-directory
   inode keyed only by the validated pin namespace below the canonical shared
   bpffs root;
-- validates the canonical graph directory and the exact current 21-map names,
+- validates the canonical graph directory and the exact current 34-map names,
   ABIs, schema markers, configuration, PMTU state, and kernel map IDs;
 - loads the committed current classifier artifacts against those exact maps
   only after the read-only inventory succeeds, derives their exact program
@@ -1348,36 +1356,50 @@ pin, foreign object, or inconsistent observation fails closed.
 
 ```rust,no_run
 use opc_gtpu_dataplane::{
-    CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryOutcome,
-    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof, GtpDevice,
+    CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryAuthority,
+    CurrentEbpfGraphRecoveryIntent, CurrentEbpfGraphRecoveryOutcome,
+    CurrentEbpfGraphRecoveryRefusal, CurrentEbpfGraphWriterProof, GtpDevice,
     GtpuDataplaneBackend,
 };
 
+# fn acquire_live_authority() -> Result<CurrentEbpfGraphRecoveryAuthority, Box<dyn std::error::Error>> { unimplemented!() }
 # async fn recover(
 #     backend: &dyn GtpuDataplaneBackend,
 #     replacement: GtpDevice,
 #     drained: bool,
 # ) -> Result<(), Box<dyn std::error::Error>> {
-let mut request = CurrentEbpfGraphRecoveryRequest::new(
+let mut intent = CurrentEbpfGraphRecoveryIntent::new(
     "s2bu",
     CurrentEbpfGraphWriterProof::previous_writer_stopped(),
 )
 .with_replacement_device(replacement);
 if drained {
-    request = request.with_drain_proof(
+    intent = intent.with_drain_proof(
         CurrentEbpfGraphDrainProof::sessions_and_traffic_drained(),
     );
 }
 
 loop {
+    // Acquire a fresh external node fence and live async guard for every
+    // attempt. The authority-bearing request is intentionally not Clone.
+    let authority = acquire_live_authority()?;
     match backend
-        .recover_orphaned_current_ebpf_graph(request.clone())
+        .recover_orphaned_current_ebpf_graph_with_authority(
+            intent.clone().into_request_with_authority(authority),
+        )
         .await?
     {
         CurrentEbpfGraphRecoveryOutcome::Removed
         | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent => break,
         CurrentEbpfGraphRecoveryOutcome::Partial(_) => {
-            // Preserve the same attestations and retry this exact namespace.
+            // Preserve the cloneable intent and reacquire authority.
+        }
+        CurrentEbpfGraphRecoveryOutcome::Refused(
+            CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema,
+        ) => {
+            // Only this exact discriminator may start a separate historical
+            // R5 attempt, with a newly acquired historical authority.
+            break;
         }
         CurrentEbpfGraphRecoveryOutcome::Refused(reason) => {
             return Err(std::io::Error::other(format!(
@@ -1393,7 +1415,7 @@ loop {
 ```
 
 The first authorized mutation publishes a checksummed proof map bound to the
-namespace hash, canonical graph device/inode, all 25 exact map IDs, populated
+namespace hash, canonical graph device/inode, all 34 exact map IDs, populated
 state authorization, and the proof map's own kernel ID. Normal create/adopt
 fences on that reserved proof. Every surviving map and the proof remain open by
 FD during cleanup. An ordinary unlink or final directory-removal failure
@@ -1405,9 +1427,26 @@ the proof pinned and an exact retry continues from the recorded map IDs. The
 proof-aware state machine also keeps a disappeared, renamed, reindexed, or
 newly managed replacement retry in typed `Partial` state after publication;
 those changes cannot turn committed cleanup into terminal refusal. The proof
-pin is removed last. A crash in the final
-proof-to-directory window is idempotently classified as an absent empty graph,
-never as a new graph.
+map is promoted to its terminal phase and second-pinned as a checksummed,
+fsynced authority-leaf WAL before the in-graph proof is removed. Only that WAL
+authorizes the final empty-directory removal or a later `AlreadyAbsent`
+classification. A missing graph, empty graph directory, marker, or legacy
+outcome without the exact WAL remains indeterminate and is never treated as
+fresh absence.
+
+The receipt API projects an authenticated terminal WAL into a bounded,
+redaction-safe terminal receipt. If the process loses the response after WAL
+publication, a fresh live target authority may use
+`inspect_current_ebpf_graph_terminal` to authenticate the unchanged terminal
+without creating or deleting state. The returned fixed-width r2 transfer
+record includes the exact prior authority and receipt commitment and can be
+persisted by an external broker. A later transfer authority must carry the
+record's domain-separated predecessor-basis commitment; target equality alone
+is insufficient. Transfer revalidates the graph, hooks, loaded-program
+references, source receipt, locks, canonical paths, and an empty selector
+authority/decommission inventory before and after rewriting the same WAL. A
+wrong target, stale receipt, surviving authority, held lease, malformed source,
+or changed live guard fails closed and leaves the WAL in place.
 
 The permanent control directory is intentionally not deleted, avoiding an
 inode-replacement lease split between cooperating processes. The lock cannot
@@ -1415,6 +1454,120 @@ fence a privileged external actor that ignores the SDK boundary. The
 maintenance window must therefore still exclude out-of-band bpffs and tc
 mutation. Product-owned writer shutdown, session drain, traffic gating,
 finalizer retry policy, and replacement provisioning remain downstream.
+
+#### Maintenance-only shipped-25 graph retirement
+
+`EbpfGtpuDataplaneBackend::recover_orphaned_historical_ebpf_graph` is the sole
+SDK maintenance boundary for the exact
+`PreSessionSelectorStampTrafficObservationV1` generation. That generation is
+sealed by the embedded
+`bpf/opc-gtpu-datapath-pre-selector-stamp-traffic-observation-v1.bpf.o`
+artifact (SHA-256
+`a4f91b08bbd6eed69d46bf9301390e40bd9d713dff9a454ab6d98a1208cc7ac3`),
+its complete 25-map ABI, canonical fixed-array values, exact program tags and
+map references when hooks survive, and its predecessor leaf-hash authority
+layout. The detached form is accepted only when both recorded hook slots and
+all loaded program references are conclusively absent; map shape alone is not
+provenance. An exact historical attached pair is reported as
+`ActiveHistoricalAttachment` and is never detached by this primitive.
+
+The request is intentionally separate from ordinary create, resolve, and
+cleanup-only startup. It requires explicit stopped-writer and drained-traffic
+attestations, an exact replacement name/ifindex, and the named frozen
+generation. It also consumes a non-`Clone` R5
+`HistoricalEbpfGraphRecoveryAuthority`: opaque scope, predecessor-basis,
+host/root/leaf commitments, a nonzero fence epoch, and a nonzero operation ID
+plus an asynchronous live-currentness guard. A caller retains a cloneable
+`HistoricalEbpfGraphRecoveryIntent` and obtains a newly live authority for
+each retry with `into_request_with_authority`; an authority-bearing request is
+not reusable. Those attestations never replace live evidence: the backend takes
+the predecessor and root-bound current flocks in a fixed order, proves exact
+same-owner namespace/graph/authority identities, rejects populated or malformed
+maps, and awaits the guard after both locks, immediately before and after every
+irreversible proof/pin/directory/leaf/terminal-write effect, and before a
+terminal return. Foreign layouts, held leases,
+unknown children, wrong ownership or mode, partial observations, and name or
+ifindex races remain fail-closed.
+
+Caller cancellation has one explicit boundary. If the public future is
+dropped before its blocking worker claims execution, the recovery closure is
+not entered and no graph or authority byte changes. After the worker claims
+execution, recovery is intentionally uncancellable: it completes under the
+same affine authority and operation lock even if the observing task is
+dropped. The exact same authority-bound request can then be reconstructed from
+the retained intent and retried to retrieve the durable terminal receipt. A
+lost observer is never permission to roll back or infer absence.
+
+Recovery publishes one proof map through a deterministic private staging leaf,
+dual-pins it under both authority generations, and atomically installs the
+current leaf before any pin unlink. Phase and identity readback makes every
+published boundary retryable: each recorded pin unlink, graph absence,
+legacy-proof removal, namespace-local handoff marker, legacy-leaf retirement,
+and terminal publication. `Removed` leaves the exact current `Terminal`
+receipt in place. An authenticated terminal `AlreadyAbsent` requires that
+same request-bound detached receipt, the handoff marker, and authoritative
+absence of the graph, legacy leaf, and staging state. A genuinely never-created
+target is separately reported as read-only `PristineAbsence`: it still needs
+live external authority and conclusive target absence, but writes no receipt,
+marker, root, or synthetic graph provenance. Every call returns
+`HistoricalEbpfGraphRecoveryReceipt`, binding the
+R5 authority projection, recovery/artifact/ABI/KAT/codec identities, typed
+outcome, terminal-absence proof, and—on terminal success—the exact persisted
+graph commitment. Unpublished `OPCH25R4` proof records decode only as unbound
+predecessors and refuse without migration or mutation; ownership is never
+inferred from them.
+
+`historical_ebpf_recovery_compatibility_kat(challenge)` is an unprivileged,
+pure build-artifact check. Its typed receipt binds the shipped generation,
+embedded-object SHA-256, exact 25-map ABI digest, program section/tag
+expectations, 25-entry namespace-commitment vector, R5 contract IDs, and a
+domain-separated response to `challenge`. Its
+`compatibility_contract_digest().as_bytes()` is a stable, non-sensitive
+32-byte SHA-256 value for cross-language policy pins: it hashes the literal
+`opc.gtpu.historical-ebpf-recovery-kat\0compatibility-contract\0r5` domain,
+authority/recovery/R5-codec/KAT identities, fixed `GTPU_RECONCILER_LOCKS`
+control-root identity, shipped-generation byte `0x05`, embedded object and ABI
+digests, ordered section/tag expectations, and all 25 ordered namespace
+commitments. For this SDK artifact it is
+`530aef1851738480a3cbea857019fc0d6bdcdf6c7e1cc857f4663994d7d0e718`.
+`verify_challenge_response` verifies SHA-256 over the distinct
+`opc.gtpu.historical-ebpf-recovery-kat\0challenge-response\0r5` domain, that
+contract digest, and the caller's 32-byte challenge. It exposes no object bytes
+and makes no kernel or bpffs claim.
+
+Ordinary entrypoints perform only an exhaustive read-only compatibility
+preflight. Any complete or partial shipped-25 graph, legacy leaf, staging leaf,
+or nonterminal receipt blocks before ordinary authority creation. Only an exact
+terminal handoff can admit the normal current lifecycle, and it authorizes only
+the bound pin namespace under the shared predecessor root. Maintenance code
+must never replace this API with raw bpffs unlinking or broad root cleanup.
+
+The terminal handoff is not itself permission to drop authority before the
+replacement graph is durable. The broker first admits the authenticated
+historical terminal, then the exact typed ordinary-create target publishes and
+seals the complete current map/program/hook/configuration graph while retaining
+that predecessor authority. If the process loses the finalization response,
+`inspect_current_ebpf_graph_successor` reauthenticates the same sealed graph,
+consumed terminal receipt, target kind, configuration, and unchanged authority
+without mutation. Its opaque fixed-width receipt uses
+`CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID`; every byte is
+checksummed and its `Debug` surface is redacted. After the broker durably
+acknowledges that receipt, `admit_current_ebpf_graph_successor` rechecks the
+complete graph and live guard immediately before retiring each exact authority
+leaf. The same process then activates only its exact retained odd traffic-gate
+generation; a response-lost retry returns `AlreadyFinalized` without another
+gate write only when that exact active generation, authentic R5 provenance,
+and twice-stable successor still match. A fresh process instead receives the
+bounded `ebpf_current_successor_typed_create` retry and must re-enter the exact
+ordinary typed-create target, which reloads the retained pins before enabling
+traffic. If an activation error cannot prove the paired even generation, the
+SDK fences only the receipt-bound tc hooks, proves their absence, preserves all
+graph/provenance pins, and requires that same typed-create retry. Partial or
+ambiguous fencing remains indeterminate. Wrong tenant/fence/generation, wrong
+target or configuration, live ownership, a surviving or partial authority
+layout, malformed/populated pins, cancellation, and concurrent replacement
+remain no-effect refusals. The ordinary create/read/mutation surfaces keep the
+successor inaccessible until this sequence has completed.
 
 #### Cleanup-only retained graph recovery authority
 
@@ -1433,14 +1586,15 @@ recovery:
   re-enable forwarding the instant retained entries exist — before the consumer
   has had a chance to remove stale contexts. Cleanup-only acquisition never
   attaches or reattaches the forwarding hooks before cleanup is complete.
-- `recover_orphaned_current_ebpf_graph` deletes the whole graph and requires
-  the old interface namespace to be gone. Cleanup-only acquisition never
-  deletes the graph and requires the interface to still resolve to the expected
-  ifindex.
+- `recover_orphaned_current_ebpf_graph_with_authority` deletes the whole graph
+  only under a freshly live affine external authority and requires the old
+  interface namespace to be gone. The unbound method refuses with
+  `AuthorityRequired`. Cleanup-only acquisition never deletes the graph and
+  requires the interface to still resolve to the expected ifindex.
 
 Before granting authority the backend proves the expected name/ifindex pair,
 then performs a complete read-only inventory and ABI/capacity validation of all
-25 current map pins before binding CONFIG or any other typed map. Only the exact
+34 current map pins before binding CONFIG or any other typed map. Only the exact
 current PMTU-v5 graph is accepted: cleanup acquisition never creates a missing
 pin, migrates an older schema, or advances a schema marker. A canonical nonzero
 endpoint is then compared with the caller's configured local S2b-U address. The
@@ -1785,8 +1939,9 @@ object is embedded from
 retained only for exact historical-generation evidence, the frozen v2 object is
 retained only for the explicit drained teardown identity proof, and the frozen
 pre-redirect object is retained only to derive the program tags described in
-the next section. None of the three legacy objects runs as the current
-datapath.
+the next section. The sealed pre-selector/stamp/traffic-observation object is
+retained only to authenticate the maintenance-only shipped-25 graph. None of
+the four legacy objects runs as the current datapath.
 
 #### Map ABI and program generations across an upgrade
 

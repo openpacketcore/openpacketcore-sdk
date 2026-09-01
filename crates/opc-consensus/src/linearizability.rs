@@ -409,6 +409,33 @@ where
         }
     }
 
+    /// Revalidate one prior local-read admission without starting another
+    /// quorum round.
+    ///
+    /// The admission is opaque and was produced by this barrier.  This only
+    /// rechecks the same local Openraft handle: its state machine must still
+    /// be applied through the admitted read log and this node must still be
+    /// the leader in the admitted term.  It deliberately does not consult the
+    /// supervisor or extend `deadline`.
+    pub async fn revalidate(
+        &self,
+        admit: &LinearizableReadAdmit<C::NodeId>,
+        deadline: Instant,
+    ) -> Result<(), LinearizableReadBarrierError<C::NodeId>> {
+        if Instant::now() >= deadline {
+            return Err(LinearizableReadBarrierError::Unavailable);
+        }
+        if let Some(log_id) = &admit.read_log_id {
+            self.wait_for_applied_index(log_id.index, deadline).await?;
+        }
+        let metrics = self.metrics.borrow().clone();
+        self.require_same_local_leader(&metrics, admit.term)?;
+        if Instant::now() >= deadline {
+            return Err(LinearizableReadBarrierError::Unavailable);
+        }
+        Ok(())
+    }
+
     /// Wait for this node's Openraft state machine to apply a log index.
     ///
     /// This is also used after a read barrier was obtained from a remote
@@ -1172,6 +1199,55 @@ mod tests {
             .expect("local apply admits the read");
         assert_eq!(admitted.read_log_id(), Some(log_id(3, 7, 10)));
         assert_eq!(admitted.term(), 3);
+    }
+
+    #[tokio::test]
+    async fn revalidate_reuses_the_admission_without_a_second_quorum_round() {
+        let (barrier, metrics, mut invocations, probe) =
+            controlled_barrier(LinearizableReadLease::Disabled, Some(log_id(3, 7, 10)));
+        let deadline = Instant::now() + LONG_DEADLINE;
+        let caller = tokio::spawn({
+            let barrier = barrier.clone();
+            async move { barrier.admit(deadline).await }
+        });
+        invocations
+            .recv()
+            .await
+            .expect("the one quorum round starts")
+            .reply
+            .send(ready(10))
+            .expect("complete the one quorum round");
+        let admit = caller
+            .await
+            .expect("admission caller")
+            .expect("local leader admission");
+
+        barrier
+            .revalidate(&admit, deadline)
+            .await
+            .expect("same-term local leader remains valid");
+        assert!(
+            invocations.try_recv().is_err(),
+            "revalidation must not request a second quorum round"
+        );
+        assert_eq!(probe.invocations.load(Ordering::SeqCst), 1);
+
+        metrics.send_modify(|metrics| {
+            metrics.current_term = 4;
+            metrics.vote = Vote::new_committed(4, 7);
+            metrics.last_log_index = Some(10);
+            metrics.last_applied = Some(log_id(4, 7, 10));
+        });
+        assert_eq!(
+            barrier.revalidate(&admit, deadline).await,
+            Err(LinearizableReadBarrierError::Unavailable),
+            "a same-node term change invalidates the carried proof"
+        );
+        assert!(
+            invocations.try_recv().is_err(),
+            "a rejected carried proof must not start a replacement round"
+        );
+        assert_eq!(probe.invocations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

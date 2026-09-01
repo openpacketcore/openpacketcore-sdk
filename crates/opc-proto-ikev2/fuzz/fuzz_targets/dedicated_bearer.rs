@@ -26,14 +26,14 @@ fn decode_hex_seed(value: &[u8]) -> Option<Vec<u8>> {
         .copied()
         .filter(|value| !value.is_ascii_whitespace())
         .collect::<Vec<_>>();
-    let mut chunks = digits.chunks_exact(2);
+    let (chunks, remainder) = digits.as_chunks::<2>();
     let mut decoded = Vec::with_capacity(digits.len() / 2);
-    for pair in &mut chunks {
+    for pair in chunks {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
         decoded.push((high << 4) | low);
     }
-    if chunks.remainder().is_empty() {
+    if remainder.is_empty() {
         Some(decoded)
     } else {
         None

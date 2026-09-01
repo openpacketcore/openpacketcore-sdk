@@ -8,21 +8,38 @@ pub mod network;
 pub(crate) mod raft_adapter;
 pub(crate) mod snapshot;
 pub(crate) mod storage;
-mod store;
+pub(crate) mod store;
 pub mod types;
 
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub use crate::sqlite::test_support::{
+    protected_roster_terminal_apply_timing_test_guard,
+    protected_roster_v2_terminal_status_validation_stages_for_test,
+    reset_protected_roster_v2_terminal_status_validation_stages_for_test,
+    ProtectedRosterV2TerminalStatusValidationStagesForTest,
+};
 pub use network::{
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
-pub(crate) use store::OperatorRecoveryCommitError;
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub use store::test_support;
+#[cfg(any(test, feature = "test-control"))]
+#[doc(hidden)]
+pub use store::ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest;
 pub use store::{
-    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
-    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
+    ProtectedRosterConsensusDiagnosticSnapshot, SessionConsensusStatus,
+    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,
 };
+pub(crate) use store::{OperatorRecoveryCommitError, OperatorRecoveryCommitRequest};
 
 pub use types::{
     SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,

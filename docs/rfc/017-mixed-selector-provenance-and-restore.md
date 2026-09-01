@@ -136,6 +136,14 @@ required only to qualify external adapters against the new canonical boundary;
 it does not authorize a product-local substitute and does not block defining or
 testing the SDK-owned state machine and built-in profile here.
 
+The standalone protected SQLite profile can advertise the §4.4 record ceiling.
+The HA consensus profile remains capped at its smaller existing value limit
+until [#683](https://github.com/openpacketcore/openpacketcore-sdk/issues/683)
+raises and qualifies its command/RPC and consumer-response ceilings together.
+A coordinator must return `Unsupported` when the selected protected backend
+does not advertise the §4.4 minimum; it must not chunk this one-record CAS or
+substitute product-local storage.
+
 ## 3. Terms and Safety Invariants
 
 An *introduced atom* is every atom in the new candidate's canonical desired
@@ -1304,6 +1312,17 @@ above that cap for envelope and framing overhead. It also permits four
 CAS/readback attempts, 64 concurrent supervisor slots per namespace, 256 per process,
 16 marker entries, 512 KiB/256 atoms in one exact backend inspection, and a
 4 KiB diagnostic/evidence record, as in RFC 016.
+
+This is a stored-envelope admission requirement: `max_value_bytes` measures
+the bytes accepted by the protected store after local-AEAD or remote sealing,
+not an equal plaintext promise made by a sealing wrapper. A local restore scan
+must therefore retain and recover one exact 4 MiB + 64 KiB stored record. That
+local recovery budget is distinct from the `opc-session-net` v5 revision-7
+restore-page wire budget of 2,096,128 bytes. That conservative budget reserves
+worst-case JSON expansion and bounded record metadata below the fixed 16 MiB
+frame. The wire contract rejects an oversized complete page during both server
+serialization and client decode; it neither splits a record nor claims the
+local envelope headroom is remotely transportable.
 
 Those count limits are independent ceilings, not permission to combine every
 ceiling in one record. Every v2 state also satisfies a coupled **restore

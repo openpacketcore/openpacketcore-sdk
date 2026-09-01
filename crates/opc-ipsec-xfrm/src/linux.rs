@@ -3472,8 +3472,10 @@ fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
                 ));
             }
             encoded
-                .chunks_exact(XFRM_USER_TEMPLATE_LEN)
-                .map(decode_exact_template)
+                .as_chunks::<XFRM_USER_TEMPLATE_LEN>()
+                .0
+                .iter()
+                .map(|template| decode_exact_template(template))
                 .collect::<Result<Vec<_>, _>>()?
         }
     };

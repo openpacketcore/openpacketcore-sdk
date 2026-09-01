@@ -20,13 +20,13 @@ use thiserror::Error;
 
 use super::*;
 use crate::membership::{
-    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
-    SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
-    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
-    SessionTopologyTransitionLogIndexes, SessionTopologyTransitionOutcome,
-    SessionTopologyTransitionPhase, SessionTopologyTransitionReason,
-    SessionTopologyTransitionRequest, SessionTopologyTransitionStatus,
-    SessionTopologyUniformCommitAdmissionProof,
+    validate_transition_request_roster_attestation_root, SessionTopologyAbortAdmissionProof,
+    SessionTopologyCandidateRetirementProof, SessionTopologyJointCommitAdmissionProof,
+    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyPrePrepareUnstageProof,
+    SessionTopologyTransitionError, SessionTopologyTransitionLogIndexes,
+    SessionTopologyTransitionOutcome, SessionTopologyTransitionPhase,
+    SessionTopologyTransitionReason, SessionTopologyTransitionRequest,
+    SessionTopologyTransitionStatus, SessionTopologyUniformCommitAdmissionProof,
 };
 use crate::sqlite::consensus::{
     MembershipScopeMutationError, MembershipTransitionEvidence, MembershipValidationScope,
@@ -101,6 +101,30 @@ impl SessionTopologyCandidateBootstrap {
                 current_identity,
             ))
             .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        Self::try_new_from_validated_current_topology(
+            storage_anchor,
+            current_topology,
+            request,
+            local_candidate,
+        )
+    }
+
+    /// Validate a joining-candidate manifest against the predecessor topology
+    /// that already carries its immutable roster root. The root remains local
+    /// topology configuration: it is never supplied as a transition field.
+    pub fn try_new_from_validated_current_topology(
+        storage_anchor: SessionConsensusStorageAnchor,
+        current_topology: ValidatedQuorumTopology,
+        request: SessionTopologyTransitionRequest,
+        local_candidate: QuorumReplicaDescriptor,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        let current_identity = current_topology
+            .consensus_identity()
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        validate_transition_request_roster_attestation_root(
+            current_topology.roster_attestation_trust_root(),
+            &request,
+        )?;
         if current_identity.cluster_id() != request.cluster_id()
             || current_identity.configuration_epoch() != request.expected_epoch()
             || storage_anchor.0.cluster_id() != request.cluster_id()
@@ -1052,6 +1076,21 @@ pub(super) struct TopologyAdmissionBarrierRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TopologyAdmissionBarrierAction {
     ConfirmStaged,
+    /// Confirm the exact V2 profile over the already authenticated staged
+    /// candidate-control path before this node is admitted as a learner.
+    ConfirmFencedTransitionV2Profile {
+        profile_digest: [u8; 32],
+    },
+    /// Confirm the independently versioned protected-roster Profile V2
+    /// contract before a format-five predecessor admits this learner. The
+    /// exact schema and consumer revision are carried separately from the
+    /// digest so a peer cannot answer an older `/3` implementation with a
+    /// merely similar profile descriptor.
+    ConfirmProtectedRosterProfileV2 {
+        schema_version: u16,
+        consumer_revision: u16,
+        profile_digest: [u8; 32],
+    },
     AppliedLearnerMarker {
         log_index: u64,
     },
@@ -1178,12 +1217,60 @@ impl ConsensusSessionStore {
     /// RPC handler, bind the topology transport admission adapter, and leave
     /// cluster initialization to the existing voters. Only replicated learner
     /// catch-up followed by committed joint membership can admit voting.
+    /// Non-Linux platforms return the typed dynamic-consensus unsupported
+    /// error before inspecting or creating consensus durable state.
     pub async fn open_membership_candidate(
         bootstrap: SessionTopologyCandidateBootstrap,
         backend: SqliteSessionBackend,
         snapshot_dir: impl Into<PathBuf>,
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_membership_candidate_with_clock_inner(
+            bootstrap,
+            backend,
+            snapshot_dir,
+            desired_peers,
+            Arc::new(SystemClock),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Open a joining learner with an injected logical clock and bounded
+    /// complete operation deadline. This preserves the same candidate,
+    /// topology, peer, and durable-storage admission as
+    /// [`Self::open_membership_candidate`].
+    pub async fn open_membership_candidate_with_clock(
+        bootstrap: SessionTopologyCandidateBootstrap,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        desired_peers: SessionTopologyTransitionPeers,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_membership_candidate_with_clock_inner(
+            bootstrap,
+            backend,
+            snapshot_dir,
+            desired_peers,
+            clock,
+            operation_timeout,
+        )
+        .await
+    }
+
+    async fn open_membership_candidate_with_clock_inner(
+        bootstrap: SessionTopologyCandidateBootstrap,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        desired_peers: SessionTopologyTransitionPeers,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
+        if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
+            return Err(ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration);
+        }
         let SessionTopologyCandidateBootstrap {
             storage_anchor,
             current_topology,
@@ -1206,6 +1293,11 @@ impl ConsensusSessionStore {
         {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
+        crate::membership::validate_transition_request_roster_attestation_root(
+            current_topology.roster_attestation_trust_root(),
+            &request,
+        )
+        .map_err(|_| ConsensusSessionStoreOpenError::InvalidTopology)?;
         let desired_descriptor = request
             .desired_members()
             .iter()
@@ -1214,12 +1306,17 @@ impl ConsensusSessionStore {
         if desired_descriptor != &local_candidate {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
-        let desired_topology =
-            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-                local_candidate.replica_id().clone(),
-                request.desired_members().to_vec(),
-                request.desired_identity(),
-            ))
+        let roster_attestation_trust_root =
+            current_topology.roster_attestation_trust_root().cloned();
+        let mut desired_config = QuorumTopologyConfig::new_consensus(
+            local_candidate.replica_id().clone(),
+            request.desired_members().to_vec(),
+            request.desired_identity(),
+        );
+        if let Some(root) = roster_attestation_trust_root.clone() {
+            desired_config = desired_config.with_roster_attestation_trust_root(root);
+        }
+        let desired_topology = ValidatedQuorumTopology::try_from(desired_config)
             .map_err(|_| ConsensusSessionStoreOpenError::InvalidTopology)?;
         let local_node_id = desired_topology
             .local_consensus_node_id()
@@ -1267,22 +1364,33 @@ impl ConsensusSessionStore {
         let current_bindings = topology_node_bindings(&current_topology);
         let desired_members = request.desired_consensus_node_ids();
         let desired_bindings = request.desired_node_bindings();
-        let (log_store, state_machine, storage_identity) = storage::open_with_pending_membership(
-            &backend,
-            snapshot_dir,
-            storage_anchor.0,
-            current_identity,
-            current_members.clone(),
-            current_bindings.clone(),
-            local_node_id,
-            request.transition_id().as_bytes(),
-            request.request_digest().as_bytes(),
-            request.desired_identity(),
-            &desired_members,
-            &desired_bindings,
-            peer_directory.clone(),
-        )
-        .await?;
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let backend = backend.with_consensus_diagnostics(Arc::clone(&diagnostics));
+        let (log_store, state_machine, storage_identity) =
+            storage::open_with_pending_membership_and_roster_attestation_root(
+                &backend,
+                snapshot_dir,
+                storage_anchor.0,
+                current_identity,
+                current_members.clone(),
+                current_bindings.clone(),
+                local_node_id,
+                request.transition_id().as_bytes(),
+                request.request_digest().as_bytes(),
+                request.desired_identity(),
+                &desired_members,
+                &desired_bindings,
+                peer_directory.clone(),
+                roster_attestation_trust_root.clone(),
+            )
+            .await?;
+        let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
+        let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let terminal_recovery_handoff_consumer =
+            log_store.live_terminal_recovery_handoff_consumer();
+        let storage_shutdown = state_machine
+            .shutdown_observer()
+            .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -1301,7 +1409,17 @@ impl ConsensusSessionStore {
             local_node_id,
             linearizability.clone(),
             raft.metrics(),
+            // Reopened readiness and generic reads still require a fresh
+            // point-in-time quorum proof.
             LinearizableReadLease::Disabled,
+        );
+        let raw_v2_read_barrier = LinearizableReadBarrier::new(
+            local_node_id,
+            linearizability.clone(),
+            raft.metrics(),
+            // Reopened raw V2 admission alone may reuse the bounded,
+            // same-term leader lease.
+            LinearizableReadLease::Enabled,
         );
         let topology_summary = desired_topology.summary().clone();
         let topology_attestation_time_high_water = topology_summary
@@ -1309,31 +1427,74 @@ impl ConsensusSessionStore {
             .production_verified_at()
             .map(TopologyAttestationTime::unix_seconds)
             .unwrap_or(0);
-        let store = Self {
-            inner: Arc::new(ConsensusSessionStoreInner {
-                raft,
-                raft_handler,
-                backend,
-                storage_identity,
-                local_node_id,
-                peer_directory,
-                topology_coordinator,
-                bootstrap_members: current_members,
-                bootstrap_bindings: current_bindings,
-                topology: topology_summary,
-                clock: Arc::new(SystemClock),
-                operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-                admitted: Arc::new(AtomicBool::new(false)),
-                topology_attestation_time_high_water: AtomicU64::new(
-                    topology_attestation_time_high_water,
-                ),
-                linearizability,
-                read_barrier,
-                proposal_admission: Arc::new(tokio::sync::Semaphore::new(
-                    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
-                )),
-            }),
-        };
+        let (logical_read_time, logical_read_time_receiver) = LogicalReadTimeSupervisor::new();
+        let (
+            fenced_transition_v2_status_logical_time_ingress,
+            fenced_transition_v2_status_logical_time_ingress_receiver,
+        ) = FencedTransitionV2StatusLogicalTimeIngressSupervisor::new();
+        let (
+            fenced_transition_v2_status_logical_time,
+            fenced_transition_v2_status_logical_time_receiver,
+        ) = FencedTransitionV2StatusLogicalTimeSupervisor::new();
+        let (fenced_transition_v2_status_batch, fenced_transition_v2_status_batch_receiver) =
+            FencedTransitionV2StatusBatchSupervisor::new();
+        let inner = Arc::new(ConsensusSessionStoreInner {
+            raft,
+            storage_shutdown,
+            terminal_recovery_handoff_consumer,
+            #[cfg(test)]
+            terminal_recovery_gate_checks: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_forward_authority_gate: Arc::new(RemoteForwardAuthorityGate::new()),
+            #[cfg(test)]
+            remote_forward_attempts: AtomicU64::new(0),
+            raft_handler,
+            backend,
+            proactive_checkpoint_lane,
+            consensus_log_prune_lane,
+            storage_identity,
+            local_node_id,
+            peer_directory,
+            topology_coordinator,
+            bootstrap_members: current_members,
+            bootstrap_bindings: current_bindings,
+            topology: topology_summary,
+            roster_attestation_trust_root,
+            clock,
+            operation_timeout,
+            admitted: Arc::new(AtomicBool::new(false)),
+            topology_attestation_time_high_water: AtomicU64::new(
+                topology_attestation_time_high_water,
+            ),
+            linearizability,
+            read_barrier,
+            raw_v2_read_barrier,
+            logical_read_time,
+            fenced_transition_v2_status_logical_time_ingress,
+            fenced_transition_v2_status_logical_time,
+            fenced_transition_v2_status_batch,
+            proposal_admission: Arc::new(tokio::sync::Semaphore::new(
+                DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+            )),
+            diagnostics,
+            shutdown: ConsensusShutdownCoordinator::new(),
+            #[cfg(test)]
+            accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
+        });
+        LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
+        FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(
+            fenced_transition_v2_status_logical_time_ingress_receiver,
+            Arc::downgrade(&inner),
+        );
+        FencedTransitionV2StatusLogicalTimeSupervisor::start(
+            fenced_transition_v2_status_logical_time_receiver,
+            Arc::downgrade(&inner),
+        );
+        FencedTransitionV2StatusBatchSupervisor::start(
+            fenced_transition_v2_status_batch_receiver,
+            Arc::downgrade(&inner),
+        );
+        let store = Self { inner };
         store
             .stage_topology_transition_peers(&request, desired_peers)
             .map_err(|_| ConsensusSessionStoreOpenError::PeerSetMismatch)?;
@@ -1347,6 +1508,53 @@ impl ConsensusSessionStore {
     #[must_use]
     pub fn storage_anchor(&self) -> SessionConsensusStorageAnchor {
         SessionConsensusStorageAnchor(self.inner.storage_identity)
+    }
+
+    /// Construct the next dynamic-membership request from this store's
+    /// already admitted current scope. The optional roster root is copied from
+    /// validated opening topology held by the store; no caller-provided root,
+    /// administrator capability, or raw attestation material is accepted.
+    pub fn new_topology_transition_request(
+        &self,
+        transition_id: crate::membership::SessionTopologyTransitionId,
+        desired_members: Vec<QuorumReplicaDescriptor>,
+        operation_timeout: Duration,
+    ) -> Result<SessionTopologyTransitionRequest, SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
+        let (current_identity, current_members) = self
+            .inner
+            .peer_directory
+            .current_scope()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let descriptors = self
+            .inner
+            .topology_coordinator
+            .current_member_descriptors(current_identity)
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        if descriptors.keys().copied().collect::<BTreeSet<_>>() != current_members {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        let validation_local = descriptors
+            .values()
+            .next()
+            .map(|member| member.replica_id().clone())
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        let mut current_topology = QuorumTopologyConfig::new_consensus(
+            validation_local,
+            descriptors.into_values().collect(),
+            current_identity,
+        );
+        if let Some(root) = self.inner.roster_attestation_trust_root.clone() {
+            current_topology = current_topology.with_roster_attestation_trust_root(root);
+        }
+        let current_topology = ValidatedQuorumTopology::try_from(current_topology)
+            .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        SessionTopologyTransitionRequest::try_new_from_validated_current_topology(
+            &current_topology,
+            transition_id,
+            desired_members,
+            operation_timeout,
+        )
     }
 
     /// Bind the one local transport-admission adapter used by topology changes.
@@ -1376,6 +1584,10 @@ impl ConsensusSessionStore {
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<(), SessionTopologyTransitionError> {
         self.require_dynamic_membership_profile()?;
+        validate_transition_request_roster_attestation_root(
+            self.inner.roster_attestation_trust_root.as_ref(),
+            request,
+        )?;
         let desired_members =
             validate_desired_peer_map(self.inner.local_node_id, request, &desired_peers)?;
         let inserted_bindings = self
@@ -1723,6 +1935,22 @@ impl ConsensusSessionStore {
             .await?;
         let current_members = durable.scope.current_members.clone();
         let desired_members = request.desired_consensus_node_ids();
+        self.require_v2_prospective_learner_capability_before(
+            request,
+            &durable,
+            &current_members,
+            &desired_members,
+            deadline,
+        )
+        .await?;
+        self.require_protected_roster_v2_prospective_learner_capability_before(
+            request,
+            &durable,
+            &current_members,
+            &desired_members,
+            deadline,
+        )
+        .await?;
         for learner in desired_members.difference(&current_members).copied() {
             operation_guard = self
                 .add_learner_before(learner, operation_guard, deadline)
@@ -1766,6 +1994,167 @@ impl ConsensusSessionStore {
         )
         .await?;
         Ok(proof)
+    }
+
+    /// A predecessor with durable V2 history must never add a learner that
+    /// cannot acknowledge the exact same V2 profile. The scope-local V2
+    /// activation certificate is intentionally deleted at cutover, while the
+    /// history remains; therefore this uses the durable layout rather than
+    /// that certificate. The learner is still outside Raft membership here,
+    /// so this probe is the only point at which the predecessor can fail
+    /// closed before replication admits it. V1-only predecessor scopes retain
+    /// the existing mixed-version membership behavior.
+    async fn require_v2_prospective_learner_capability_before(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        durable: &DurableTransitionState,
+        current_members: &BTreeSet<SessionConsensusNodeId>,
+        desired_members: &BTreeSet<SessionConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let history_is_activated = self
+            .inner
+            .backend
+            .consensus_fenced_transition_v2_history_is_activated(self.inner.storage_identity)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        if !history_is_activated {
+            return Ok(());
+        }
+        // The predecessor is itself a V2-history voter.  Do not let an
+        // incompatible local payload/profile implementation carry a staged
+        // membership change merely because every prospective peer happens to
+        // reply with the public digest: it could otherwise admit the change
+        // and subsequently reject the replicated V2 command it certified.
+        if self.local_fenced_transition_v2_capability()
+            != Some(crate::FencedTransitionV2Capability::V2)
+        {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        let profile_digest = crate::fenced_transition::fenced_transition_v2_profile_digest();
+        let peers = self.inner.topology_coordinator.staged_peers(request)?;
+        for learner in desired_members.difference(current_members).copied() {
+            if learner == self.inner.local_node_id {
+                // A current retained leader cannot itself be a prospective
+                // learner. Keep this explicit so a future coordinator shape
+                // cannot accidentally make local capability implicit.
+                if self.local_fenced_transition_v2_capability()
+                    != Some(crate::FencedTransitionV2Capability::V2)
+                {
+                    return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+                }
+                continue;
+            }
+            let peer = peers
+                .get(&learner)
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let payload = encode_bounded(&TopologyAdmissionBarrierRequest {
+                transition_id: request.transition_id().as_bytes(),
+                request_digest: request.request_digest().as_bytes(),
+                action: TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile {
+                    profile_digest,
+                },
+            })
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let wire = SessionConsensusWireRequest::try_new(
+                durable.scope.current_identity,
+                self.inner.local_node_id,
+                SessionConsensusRpcFamily::TopologyAdmissionBarrier,
+                payload,
+            )
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let response = tokio::time::timeout_at(deadline, peer.call(wire))
+                .await
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            response
+                .validate()
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let payload = response
+                .result
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let reply: TopologyAdmissionBarrierReply = decode_bounded(&payload)
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            if !matches!(reply, TopologyAdmissionBarrierReply::Ready) {
+                return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+            }
+        }
+        Ok(())
+    }
+
+    /// Once Profile V2's format-five namespace has been materialized, a
+    /// prospective learner must prove it can decode the exact `/4` profile
+    /// before Raft receives `add_learner`. This is intentionally independent
+    /// of fenced-transition V2 history and of the V2 roster activation
+    /// certificate: the latter is scope-bound and cleared at cutover while
+    /// the namespace and retained V2 replay records persist.
+    async fn require_protected_roster_v2_prospective_learner_capability_before(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        durable: &DurableTransitionState,
+        current_members: &BTreeSet<SessionConsensusNodeId>,
+        desired_members: &BTreeSet<SessionConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let history_is_activated = self
+            .inner
+            .backend
+            .consensus_protected_roster_v2_history_is_activated(self.inner.storage_identity)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        if !history_is_activated {
+            return Ok(());
+        }
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1 {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        let profile = crate::fenced_mutation_roster::Profile::v2();
+        let peers = self.inner.topology_coordinator.staged_peers(request)?;
+        for learner in desired_members.difference(current_members).copied() {
+            if learner == self.inner.local_node_id {
+                if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1
+                {
+                    return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+                }
+                continue;
+            }
+            let peer = peers
+                .get(&learner)
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let payload = encode_bounded(&TopologyAdmissionBarrierRequest {
+                transition_id: request.transition_id().as_bytes(),
+                request_digest: request.request_digest().as_bytes(),
+                action: TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 {
+                    schema_version: profile.schema(),
+                    consumer_revision: profile.consumer_revision(),
+                    profile_digest: profile.digest(),
+                },
+            })
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let wire = SessionConsensusWireRequest::try_new(
+                durable.scope.current_identity,
+                self.inner.local_node_id,
+                SessionConsensusRpcFamily::TopologyAdmissionBarrier,
+                payload,
+            )
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let response = tokio::time::timeout_at(deadline, peer.call(wire))
+                .await
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            response
+                .validate()
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let payload = response
+                .result
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let reply: TopologyAdmissionBarrierReply = decode_bounded(&payload)
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            if !matches!(reply, TopologyAdmissionBarrierReply::Ready) {
+                return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+            }
+        }
+        Ok(())
     }
 
     /// Commit a prepared transition through authority fence, joint consensus,
@@ -2506,7 +2895,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     )) => continue,
                     Ok(Err(_)) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(Ok(response)) => response,
                 };
@@ -2518,7 +2907,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     ) => continue,
                     Err(_) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(payload) => payload,
                 };
@@ -2620,7 +3009,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     )) => continue,
                     Ok(Err(_)) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(Ok(response)) => response,
                 };
@@ -2632,7 +3021,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     ) => continue,
                     Err(_) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(payload) => payload,
                 };
@@ -2739,7 +3128,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     )) => continue,
                     Ok(Err(_)) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(Ok(response)) => response,
                 };
@@ -2751,7 +3140,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     ) => continue,
                     Err(_) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(payload) => payload,
                 };
@@ -2857,7 +3246,12 @@ impl ConsensusSessionStore {
         action: TopologyAdmissionBarrierAction,
         deadline: tokio::time::Instant,
     ) -> Result<(), SessionTopologyTransitionError> {
-        if action == TopologyAdmissionBarrierAction::ConfirmStaged {
+        if matches!(
+            action,
+            TopologyAdmissionBarrierAction::ConfirmStaged
+                | TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. }
+                | TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 { .. }
+        ) {
             self.inner.topology_coordinator.transport()?;
             let _staged_request = self
                 .inner
@@ -2868,6 +3262,8 @@ impl ConsensusSessionStore {
         let durable = self.read_transition_state_before(request, deadline).await?;
         match action {
             TopologyAdmissionBarrierAction::ConfirmStaged => Ok(()),
+            TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. } => Ok(()),
+            TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 { .. } => Ok(()),
             TopologyAdmissionBarrierAction::AppliedLearnerMarker { log_index } => {
                 let observed_marker = durable
                     .evidence
@@ -3069,6 +3465,38 @@ impl ConsensusSessionStore {
                     Err(_) => return TopologyAdmissionBarrierReply::NotReady,
                 }
             }
+            TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { profile_digest } => {
+                match self.inner.peer_directory.current_scope() {
+                    Ok((current_identity, current_members)) => (
+                        current_identity,
+                        current_members.contains(&authenticated_sender)
+                            && self.local_fenced_transition_v2_capability()
+                                == Some(crate::FencedTransitionV2Capability::V2)
+                            && profile_digest
+                                == crate::fenced_transition::fenced_transition_v2_profile_digest(),
+                    ),
+                    Err(_) => return TopologyAdmissionBarrierReply::NotReady,
+                }
+            }
+            TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 {
+                schema_version,
+                consumer_revision,
+                profile_digest,
+            } => {
+                let profile = crate::fenced_mutation_roster::Profile::v2();
+                match self.inner.peer_directory.current_scope() {
+                    Ok((current_identity, current_members)) => (
+                        current_identity,
+                        current_members.contains(&authenticated_sender)
+                            && self.local_fenced_transition_capability()
+                                == AtomicFencedTransitionCapability::V1
+                            && schema_version == profile.schema()
+                            && consumer_revision == profile.consumer_revision()
+                            && profile_digest == profile.digest(),
+                    ),
+                    Err(_) => return TopologyAdmissionBarrierReply::NotReady,
+                }
+            }
             TopologyAdmissionBarrierAction::AppliedLearnerMarker { .. }
             | TopologyAdmissionBarrierAction::AdmitJointVoting => (
                 request.desired_identity(),
@@ -3099,6 +3527,13 @@ impl ConsensusSessionStore {
         let Ok(deadline) = transition_deadline(&request) else {
             return TopologyAdmissionBarrierReply::NotReady;
         };
+        if matches!(
+            barrier.action,
+            TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. }
+                | TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 { .. }
+        ) {
+            return TopologyAdmissionBarrierReply::Ready;
+        }
         if self
             .apply_local_transition_barrier(&request, barrier.action, deadline)
             .await
@@ -3360,17 +3795,28 @@ fn nonquiescent_prior_terminal(
 
 #[cfg(test)]
 mod scope_refresh_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     use super::*;
     use crate::consensus::{SessionConsensusClusterId, SessionConsensusConfigurationId};
     use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
+    use crate::model::{FenceToken, Generation, OwnerId, SessionKey, SessionKeyType};
     use crate::sqlite::consensus::{
         AbortedMembershipCleanup, MembershipPredecessorScope, PendingMembershipScope,
         TerminalMembershipTransition,
     };
+    use crate::sqlite::SqliteSessionBackend;
     use crate::topology::{
         ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-        ReplicaTlsIdentity,
+        ReplicaTlsIdentity, ValidatedQuorumTopology,
     };
+    use crate::{
+        FencedTransitionLease, FencedTransitionMutation, FencedTransitionV2CallerNonce,
+        FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
+    };
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId};
 
     fn identity(epoch: u64, configuration: u8) -> SessionConsensusIdentity {
         SessionConsensusIdentity::new(
@@ -3409,6 +3855,154 @@ mod scope_refresh_tests {
             ReplicaBackingIdentity::new(format!("scope-refresh-disk-{index}"))
                 .expect("backing identity"),
         )
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum StagedV2ProfileReply {
+        V1Only,
+        MismatchedV2,
+        ExactV2,
+    }
+
+    #[derive(Debug)]
+    struct StagedV2ProfilePeer {
+        node_id: SessionConsensusNodeId,
+        scope_identity: SessionConsensusIdentity,
+        request_identity: SessionConsensusIdentity,
+        reply: Mutex<StagedV2ProfileReply>,
+        calls: AtomicUsize,
+    }
+
+    impl StagedV2ProfilePeer {
+        fn new(
+            node_id: SessionConsensusNodeId,
+            scope_identity: SessionConsensusIdentity,
+            request_identity: SessionConsensusIdentity,
+        ) -> Self {
+            Self {
+                node_id,
+                scope_identity,
+                request_identity,
+                reply: Mutex::new(StagedV2ProfileReply::V1Only),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_reply(&self, reply: StagedV2ProfileReply) {
+            *self.reply.lock().expect("staged V2 reply mutex") = reply;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for StagedV2ProfilePeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node_id
+        }
+
+        fn scope_identity(&self) -> Option<SessionConsensusIdentity> {
+            Some(self.scope_identity)
+        }
+
+        async fn call(
+            &self,
+            request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            if request.identity != self.request_identity
+                || request.family != SessionConsensusRpcFamily::TopologyAdmissionBarrier
+            {
+                return Err(SessionConsensusPeerError::ScopeMismatch);
+            }
+            let barrier: TopologyAdmissionBarrierRequest = decode_bounded(&request.payload)
+                .map_err(|_| SessionConsensusPeerError::Protocol)?;
+            let exact_profile = match barrier.action {
+                TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile {
+                    profile_digest,
+                } => {
+                    profile_digest
+                        == crate::fenced_transition::fenced_transition_v2_profile_digest()
+                }
+                TopologyAdmissionBarrierAction::ConfirmProtectedRosterProfileV2 {
+                    schema_version,
+                    consumer_revision,
+                    profile_digest,
+                } => {
+                    let profile = crate::fenced_mutation_roster::Profile::v2();
+                    schema_version == profile.schema()
+                        && consumer_revision == profile.consumer_revision()
+                        && profile_digest == profile.digest()
+                }
+                _ => return Err(SessionConsensusPeerError::Protocol),
+            };
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let reply = match *self.reply.lock().expect("staged V2 reply mutex") {
+                StagedV2ProfileReply::ExactV2 if exact_profile => {
+                    TopologyAdmissionBarrierReply::Ready
+                }
+                // A V1 candidate cannot decode the staged V2 action, while a
+                // V2 candidate with a different profile must fail its exact
+                // digest check. Both are the deliberately fail-closed reply.
+                StagedV2ProfileReply::V1Only | StagedV2ProfileReply::MismatchedV2 => {
+                    TopologyAdmissionBarrierReply::NotReady
+                }
+                _ => TopologyAdmissionBarrierReply::NotReady,
+            };
+            let payload =
+                encode_bounded(&reply).map_err(|_| SessionConsensusPeerError::Protocol)?;
+            Ok(SessionConsensusWireResponse {
+                result: Ok(payload),
+            })
+        }
+    }
+
+    fn gate_descriptor(index: usize) -> QuorumReplicaDescriptor {
+        QuorumReplicaDescriptor::new(
+            ReplicaId::new(format!("v2-history-gate-{index}")).expect("replica ID"),
+            ReplicaEndpoint::new(format!("v2-history-gate-{index}.invalid"), 7443)
+                .expect("replica endpoint"),
+            ReplicaTlsIdentity::new(format!("spiffe://test/session/v2-history-gate/{index}"))
+                .expect("TLS identity"),
+            ReplicaFailureDomain::new(format!("v2-history-gate-zone-{index}"))
+                .expect("failure domain"),
+            ReplicaBackingIdentity::new(format!("v2-history-gate-disk-{index}"))
+                .expect("backing identity"),
+        )
+    }
+
+    fn gate_singleton_topology() -> ValidatedQuorumTopology {
+        let member = gate_descriptor(0);
+        let cluster = SessionConsensusClusterId::new("v2-history-gate-tests").expect("cluster ID");
+        let epoch = SessionConsensusConfigurationEpoch::new(1).expect("current epoch");
+        let configuration = opc_consensus::derive_configuration_id(
+            cluster,
+            epoch,
+            &[member.configuration_fingerprint()],
+        );
+        ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+            member.replica_id().clone(),
+            vec![member],
+            SessionConsensusIdentity::new(cluster, configuration, epoch),
+        )
+        .expect("lab singleton topology")
+    }
+
+    fn v2_gate_request(epoch: u64) -> FencedTransitionV2Request {
+        let key = SessionKey {
+            tenant: TenantId::new("v2-history-gate").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"v2-history-gate")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("v2-history-gate-owner").expect("owner");
+        FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(epoch).expect("epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0xA7; 16]),
+            FencedTransitionLease::acquire(key, owner, FenceToken::new(0), Duration::from_secs(60))
+                .expect("lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("V2 request")
     }
 
     fn transition_fixture() -> (
@@ -3701,5 +4295,158 @@ mod scope_refresh_tests {
         assert!(state.staged.is_none());
         assert!(state.retained_transitions.is_empty());
         assert_eq!(Some(0), state.last_scope_progress_index);
+    }
+
+    #[tokio::test]
+    async fn durable_v2_history_gates_v1_or_mismatched_learners_before_admission() {
+        let directory = tempfile::tempdir().expect("V2 staged-gate directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("V2 staged-gate backend");
+        let store = ConsensusSessionStore::open(
+            gate_singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open V2 staged-gate store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize V2 staged-gate singleton");
+        let _ = store.fenced_transition_v2(v2_gate_request(1)).await;
+        assert!(
+            store
+                .inner
+                .backend
+                .consensus_fenced_transition_v2_history_is_activated(store.inner.storage_identity)
+                .await
+                .expect("read durable V2 layout"),
+            "the prospective-learner gate must depend on durable history, not a scope certificate"
+        );
+
+        let current = [gate_descriptor(0), gate_descriptor(1), gate_descriptor(2)];
+        let desired = vec![gate_descriptor(0), gate_descriptor(1), gate_descriptor(3)];
+        let storage_identity = store.inner.storage_identity;
+        let request = SessionTopologyTransitionRequest::try_new(
+            SessionTopologyTransitionId::from_bytes([0xB1; 16]),
+            storage_identity.cluster_id(),
+            storage_identity.configuration_epoch(),
+            SessionConsensusConfigurationEpoch::new(2).expect("desired epoch"),
+            desired,
+            Duration::from_secs(10),
+        )
+        .expect("sequential topology request");
+        let current_nodes = current
+            .iter()
+            .map(|descriptor| {
+                opc_consensus::derive_node_id(
+                    storage_identity.cluster_id(),
+                    descriptor.replica_id().as_str().as_bytes(),
+                )
+                .expect("derived current node ID")
+            })
+            .collect::<BTreeSet<_>>();
+        let candidate = request
+            .desired_consensus_node_ids()
+            .difference(&current_nodes)
+            .copied()
+            .next()
+            .expect("one prospective learner");
+        {
+            let mut bindings = store
+                .inner
+                .topology_coordinator
+                .bindings
+                .write()
+                .expect("test coordinator bindings");
+            bindings.current_descriptors = current
+                .iter()
+                .map(|descriptor| {
+                    (
+                        opc_consensus::derive_node_id(
+                            storage_identity.cluster_id(),
+                            descriptor.replica_id().as_str().as_bytes(),
+                        )
+                        .expect("derived current node ID"),
+                        descriptor.clone(),
+                    )
+                })
+                .collect();
+        }
+        let candidate_peer = Arc::new(StagedV2ProfilePeer::new(
+            candidate,
+            request.desired_identity(),
+            storage_identity,
+        ));
+        let peers = request
+            .desired_consensus_node_ids()
+            .into_iter()
+            .filter(|node_id| *node_id != store.inner.local_node_id)
+            .map(|node_id| {
+                let peer: Arc<dyn SessionConsensusPeer> = if node_id == candidate {
+                    candidate_peer.clone()
+                } else {
+                    Arc::new(StagedV2ProfilePeer::new(
+                        node_id,
+                        request.desired_identity(),
+                        storage_identity,
+                    ))
+                };
+                (node_id, peer)
+            })
+            .collect::<SessionTopologyTransitionPeers>();
+        store
+            .inner
+            .topology_coordinator
+            .stage_bindings(&request, &peers)
+            .expect("stage exact prospective peers");
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .expect("deadline");
+        let durable = store
+            .read_transition_state_before(&request, deadline)
+            .await
+            .expect("read durable transition state");
+        let desired_nodes = request.desired_consensus_node_ids();
+
+        for reply in [
+            StagedV2ProfileReply::V1Only,
+            StagedV2ProfileReply::MismatchedV2,
+        ] {
+            candidate_peer.set_reply(reply);
+            assert_eq!(
+                store
+                    .require_v2_prospective_learner_capability_before(
+                        &request,
+                        &durable,
+                        &current_nodes,
+                        &desired_nodes,
+                        deadline,
+                    )
+                    .await,
+                Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+                "a non-exact prospective V2 profile must fail before add_learner"
+            );
+        }
+        candidate_peer.set_reply(StagedV2ProfileReply::ExactV2);
+        assert_eq!(
+            store
+                .require_v2_prospective_learner_capability_before(
+                    &request,
+                    &durable,
+                    &current_nodes,
+                    &desired_nodes,
+                    deadline,
+                )
+                .await,
+            Ok(()),
+            "the exact V2 profile is the only staged learner admission answer"
+        );
+        assert_eq!(
+            candidate_peer.calls.load(Ordering::SeqCst),
+            3,
+            "the candidate was probed once for each pre-add admission attempt"
+        );
     }
 }

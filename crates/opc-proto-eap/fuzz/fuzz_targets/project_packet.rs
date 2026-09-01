@@ -19,7 +19,7 @@ fn decode_seed_envelope(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.chunks_exact(2) {
+    for pair in encoded.as_chunks::<2>().0 {
         decoded.push((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?);
     }
     Some(decoded)

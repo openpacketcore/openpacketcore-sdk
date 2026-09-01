@@ -17,7 +17,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 #[cfg(unix)]
@@ -31,28 +31,39 @@ use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_K
 use opc_redaction::metrics::{SecurityMetricsReader, METRICS};
 use opc_session_net::{
     ConnectionLifecyclePolicy, LocalReplicaBinding, RemoteAddrResolver, RemoteSessionConsensusPeer,
-    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
-    SessionConsensusServer, SessionConsensusServerHandle, SessionConsumerAuthorizer,
-    SessionQuorumConsumerServer, SessionQuorumConsumerServerHandle, SessionReauthenticationControl,
-    SessionReplicationManifest,
+    RosterIngressSigner, RosterIngressSignerError, SessionClusterId, SessionConfigurationEpoch,
+    SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
+    SessionConsumerAuthorizer, SessionQuorumConsumerServer, SessionQuorumConsumerServerHandle,
+    SessionReauthenticationControl, SessionReplicationManifest,
+};
+use opc_session_store::fenced_mutation_roster::{
+    RosterAttestationLeafCertificateV1, RosterAttestationTrustRootIdentityV1,
+    RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactAdmissionProvenanceV2,
 };
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
     EncryptingSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId,
-    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationEntry, ReplicationOp,
-    RestoreScanCursorProfile, RestoreScanRequest, RestoreScanScope, SessionBackend,
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend,
-    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    ProtectedRosterEstablishedSuccessor, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    ReplicationEntry, ReplicationOp, RestoreScanCursorProfile, RestoreScanRequest,
+    RestoreScanScope, RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+    RosterAttestationTrustRootV1, RosterIngressAttestationSigningInputV1,
+    RosterIngressAttestationV1, SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
+    SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerResponse, SessionConsumerRosterAdmissionMutationResponse,
+    SessionConsumerRosterAuthorization, SessionConsumerRosterRejection, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerV2Operation,
+    SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
+    SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
-    qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
+    qualification_key_bytes_sha256, qualification_owner_sha256,
+    qualification_roster_attestation_trust_root, qualification_state_type_sha256,
     qualification_traffic_schedule_sha256, qualification_traffic_seed, qualification_traffic_value,
     qualification_value_sha256, read_bounded_json_line, write_json_line,
     QualificationConcurrentBatchOutcome, QualificationConcurrentBatchSlot,
@@ -93,7 +104,10 @@ use opc_session_testkit::qualification_kubernetes::{
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder, TlsMaterialController,
 };
+use opc_types::Timestamp;
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use p256::ecdsa::signature::hazmat::PrehashSigner;
+use p256::ecdsa::SigningKey;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 #[cfg(unix)]
@@ -105,10 +119,14 @@ use rustix::net::sockopt::socket_error;
 #[cfg(unix)]
 use rustix::net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
 const QUALIFICATION_TENANT: &str = "session-ha-qualification";
+/// The only application namespaces exercised by the qualification-only
+/// stateless-consumer scenario. Runtime configuration deliberately carries no
+/// consumer scope input, so this fixed test contract must remain exact.
+const QUALIFICATION_STATELESS_CONSUMER_TENANT: &str = "qualification-consumer";
 const QUALIFICATION_KEY_ID: &str = "session-ha-qualification-key-v1";
 const QUALIFICATION_STATE_TYPE: &str = "session-ha-qualification-state";
 const QUALIFICATION_TRAFFIC_STATE_TYPE: &str = "session-ha-qualification-traffic-state";
@@ -123,8 +141,55 @@ const QUALIFICATION_CONTROL_SOCKET_MODE: u32 = 0o600;
 #[cfg(unix)]
 const QUALIFICATION_CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const QUALIFICATION_RETAINED_RELEASED_LEASE_HANDLES: usize = 4;
+/// The caller-owned test deadline is intentionally shorter than this fixed
+/// post-commit delay, so ambiguity comes from the real response path rather
+/// than a synthetic application response.
+const QUALIFICATION_DELAYED_CONSUMER_RESPONSE: Duration = Duration::from_secs(2);
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
+
+/// The narrow journal/watch surface used by the fixed traffic observer.
+///
+/// Keeping this boundary local lets the recovery state machine exercise its
+/// exact sequence rules against a scripted backend without changing the store
+/// watch contract that production uses.
+#[async_trait::async_trait]
+trait TrafficWatchBackend: Send + Sync {
+    async fn traffic_replication_head(&self) -> Result<u64, StoreError>;
+
+    async fn traffic_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError>;
+
+    async fn open_traffic_watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>;
+}
+
+#[async_trait::async_trait]
+impl TrafficWatchBackend for ProtectedStore {
+    async fn traffic_replication_head(&self) -> Result<u64, StoreError> {
+        SessionBackend::max_replication_sequence(self).await
+    }
+
+    async fn traffic_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        SessionBackend::get_replication_log(self, start, limit).await
+    }
+
+    async fn open_traffic_watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+        SessionBackend::watch(self, start_sequence).await
+    }
+}
 
 struct QualificationLease {
     guard: LeaseGuard,
@@ -249,6 +314,10 @@ impl SessionConsensusPeer for QualificationGatedConsensusPeer {
         self.inner.node_id()
     }
 
+    fn scope_identity(&self) -> Option<SessionConsensusIdentity> {
+        self.inner.scope_identity()
+    }
+
     async fn call(
         &self,
         request: SessionConsensusWireRequest,
@@ -327,7 +396,9 @@ struct QualificationNode {
     server: Option<SessionConsensusServerHandle>,
     consumer_server: Option<SessionQuorumConsumerServerHandle>,
     consumer_transport: Option<QualificationConsumerTransport>,
-    consumer_outcome_unknown: Arc<AtomicBool>,
+    consumer_delayed_response: Arc<AtomicBool>,
+    consumer_response_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
+    consumer_ambiguity_witness_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
     transport: QualificationTransportRuntime,
     leases: HashMap<String, QualificationLease>,
     next_lease_retention_sequence: u64,
@@ -340,6 +411,104 @@ struct QualificationNode {
         HashMap<QualificationConcurrentSubscriptionId, QualificationConcurrentWatchRuntime>,
     empty_vote_dispatches: Arc<AtomicU64>,
     rpc_gate: QualificationConsensusRpcGate,
+    roster_attestation_root: RosterAttestationTrustRootV1,
+    fixed_consensus_identity: SessionConsensusIdentity,
+}
+
+/// Test-harness-only issuer for the protected consumer ingress.  It is
+/// deliberately constructed from the same root and fixed quorum identity
+/// that opened this child process' durable store, so `/3` cannot be enabled
+/// as a synthetic side channel detached from the running quorum.
+struct QualificationRosterIngressSigner {
+    root: RosterAttestationTrustRootV1,
+    ingress_key: SigningKey,
+    ingress_certificate: RosterAttestationLeafCertificatePartsV1,
+}
+
+impl QualificationRosterIngressSigner {
+    fn root() -> Result<RosterAttestationTrustRootV1, NodeFailure> {
+        Ok(qualification_roster_attestation_trust_root())
+    }
+
+    fn new(
+        root: RosterAttestationTrustRootV1,
+        configuration_identity: SessionConsensusIdentity,
+        scope: SessionConsumerScope,
+    ) -> Result<Self, NodeFailure> {
+        let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).map_err(|_| NodeFailure)?;
+        let ingress_key = SigningKey::from_bytes((&[0x32; 32]).into()).map_err(|_| NodeFailure)?;
+        let now = Timestamp::now_utc();
+        let not_before = now.add_seconds(-60).ok_or(NodeFailure)?;
+        let not_after = now.add_seconds(3_600).ok_or(NodeFailure)?;
+        let public_key = ingress_key.verifying_key().to_sec1_point(true);
+        let public_key = public_key.as_bytes().try_into().map_err(|_| NodeFailure)?;
+        let mut ingress_certificate = RosterAttestationLeafCertificatePartsV1 {
+            root_id: root.root_id(),
+            role: RosterAttestationCertificateRoleV1::TransportIngress,
+            configuration_identity,
+            scope: opc_session_store::consumer::session_consumer_roster_scope_commitment(scope),
+            subject_identity_commitment: [0x41; 32],
+            leaf_epoch: 1,
+            key_id: [0x51; 32],
+            not_before,
+            not_after,
+            public_key,
+            root_signature: [0; 64],
+        };
+        ingress_certificate.root_signature = Self::sign(
+            &root_key,
+            RosterAttestationLeafCertificateV1::signing_digest(&ingress_certificate)
+                .map_err(|_| NodeFailure)?,
+        )?;
+        Ok(Self {
+            root,
+            ingress_key,
+            ingress_certificate,
+        })
+    }
+
+    fn sign(key: &SigningKey, digest: [u8; 32]) -> Result<[u8; 64], NodeFailure> {
+        let signature: p256::ecdsa::Signature =
+            key.sign_prehash(&digest).map_err(|_| NodeFailure)?;
+        Ok(signature.normalize_s().to_bytes().into())
+    }
+
+    fn sign_ingress(&self, digest: [u8; 32]) -> Result<[u8; 64], RosterIngressSignerError> {
+        Self::sign(&self.ingress_key, digest).map_err(|_| RosterIngressSignerError)
+    }
+}
+
+#[async_trait::async_trait]
+impl RosterIngressSigner for QualificationRosterIngressSigner {
+    fn trust_root(&self) -> RosterAttestationTrustRootV1 {
+        self.root.clone()
+    }
+
+    async fn attest(
+        &self,
+        input: &RosterIngressAttestationSigningInputV1,
+    ) -> Result<RosterIngressAttestationV1, RosterIngressSignerError> {
+        RosterIngressAttestationV1::issue_from_signed_parts(
+            &self.root,
+            self.ingress_certificate.clone(),
+            input,
+            self.sign_ingress(input.digest().map_err(|_| RosterIngressSignerError)?)?,
+        )
+        .map_err(|_| RosterIngressSignerError)
+    }
+
+    fn compact_admission_certificate(
+        &self,
+    ) -> Result<RosterAttestationLeafCertificatePartsV1, RosterIngressSignerError> {
+        Ok(self.ingress_certificate.clone())
+    }
+
+    async fn sign_compact_admission(
+        &self,
+        input: &RosterCompactAdmissionProvenanceSigningInputV2,
+    ) -> Result<[u8; 64], RosterIngressSignerError> {
+        self.sign_ingress(input.digest().map_err(|_| RosterIngressSignerError)?)
+    }
 }
 
 struct QualificationConcurrentWatchRuntime {
@@ -357,28 +526,128 @@ struct QualificationTrafficRuntime {
     watch_task: Option<JoinHandle<Result<(), QualificationTrafficFailure>>>,
 }
 
-struct QualificationConsumerOutcomeUnknownService {
+struct QualificationConsumerDelayedResponseService {
     inner: Arc<dyn SessionQuorumConsumer>,
+    roster_inner: Arc<dyn SessionQuorumRosterIngress>,
     armed: Arc<AtomicBool>,
+    response_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
+    ambiguity_witness_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
+}
+
+/// Bounded post-execution hold gate for the four-lane persistent-V2 pressure
+/// seam. It is deliberately separate from the legacy one-shot response delay:
+/// the control plane can prove all four durable executions have entered the
+/// hold before it admits pressure, then release exactly those four responses.
+struct QualificationConsumerResponseHoldGate {
+    response_count: usize,
+    armed: AtomicUsize,
+    entered: AtomicUsize,
+    releases: AtomicUsize,
+    released: Notify,
+}
+
+impl QualificationConsumerResponseHoldGate {
+    fn new(response_count: usize) -> Self {
+        assert!(
+            response_count > 0,
+            "qualification response hold count is nonzero"
+        );
+        Self {
+            response_count,
+            armed: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+            released: Notify::new(),
+        }
+    }
+
+    fn arm(&self) -> bool {
+        self.entered.load(Ordering::SeqCst) == 0
+            && self.releases.load(Ordering::SeqCst) == 0
+            && self
+                .armed
+                .compare_exchange(0, self.response_count, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    fn status(&self) -> (usize, usize) {
+        (
+            self.armed.load(Ordering::SeqCst),
+            self.entered.load(Ordering::SeqCst),
+        )
+    }
+
+    fn release(&self) -> bool {
+        if self.armed.load(Ordering::SeqCst) != 0
+            || self.entered.load(Ordering::SeqCst) != self.response_count
+            || self.releases.load(Ordering::SeqCst) != 0
+        {
+            return false;
+        }
+        self.releases.store(self.response_count, Ordering::SeqCst);
+        self.released.notify_waiters();
+        true
+    }
+
+    fn take_armed_response(&self) -> bool {
+        self.armed
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
+                armed.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    async fn hold_response(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            // Poll once before testing the token so a release in the narrow
+            // check-to-await window is retained by Notify rather than lost.
+            futures_util::future::poll_fn(|context| {
+                let _ = std::future::Future::poll(notified.as_mut(), context);
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if self
+                .releases
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |releases| {
+                    releases.checked_sub(1)
+                })
+                .is_ok()
+            {
+                assert!(
+                    self.entered
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |entered| {
+                            entered.checked_sub(1)
+                        })
+                        .is_ok(),
+                    "released qualification response must still be held"
+                );
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
+impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
-        let lease_mutation = matches!(
+        let delayed_mutation = matches!(
             request.operation(),
             SessionConsumerOperation::AcquireLease { .. }
                 | SessionConsumerOperation::RenewLease { .. }
                 | SessionConsumerOperation::ReleaseLease { .. }
         );
-        let response = self.inner.execute(identity, request).await;
-        if lease_mutation
+        let response = self.inner.execute(authorization, request).await;
+        if delayed_mutation
             && matches!(
-                response,
+                &response,
                 SessionConsumerResponse::AcquireLease(Ok(_))
                     | SessionConsumerResponse::RenewLease(Ok(_))
                     | SessionConsumerResponse::ReleaseLease(Ok(()))
@@ -388,21 +657,125 @@ impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
                 .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            return SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Lease);
+            tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
+        }
+        response
+    }
+
+    async fn execute_v2(
+        &self,
+        authorization: &SessionConsumerAuthorization,
+        request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        let mutation = matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2 { .. }
+                | SessionConsumerV2Operation::FencedTransitionV2Batch { .. }
+        );
+        let response = self.inner.execute_v2(authorization, request).await;
+        if mutation
+            && matches!(
+                &response,
+                SessionConsumerV2Response::FencedTransitionV2(Ok(_))
+                    | SessionConsumerV2Response::FencedTransitionV2Batch(Ok(_))
+            )
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Withhold the real successful response beyond the caller's
+            // bounded deadline. The qualification seam never fabricates a
+            // server-side ambiguity result or bypasses durable execution.
+            tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
+        }
+        if mutation && self.ambiguity_witness_hold_gate.take_armed_response() {
+            // This dedicated one-response gate keys the causal witness to a
+            // post-durability acknowledgement without consuming any of the
+            // four fixed pressure lanes.
+            self.ambiguity_witness_hold_gate.hold_response().await;
+        } else if mutation && self.response_hold_gate.take_armed_response() {
+            // The durable operation above has already completed. This hold
+            // only withholds its real response and records entry before the
+            // harness applies client-side queue pressure.
+            self.response_hold_gate.hold_response().await;
         }
         response
     }
 
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
-        scope: SessionConsumerScope,
-        start_sequence: u64,
+        _authorization: &SessionConsumerAuthorization,
+        _scope: SessionConsumerScope,
+        _start_sequence: u64,
     ) -> Result<
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     > {
-        self.inner.watch(identity, scope, start_sequence).await
+        // The qualification stateless-consumer contract exercises request/
+        // response operations only. Do not turn its exact mutation grants
+        // into a subscription grant.
+        Err(SessionConsumerRejection::Unauthorized)
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionQuorumRosterIngress for QualificationConsumerDelayedResponseService {
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        self.roster_inner
+            .expected_roster_attestation_trust_root_identity()
+    }
+
+    fn prepare_compact_admission_provenance_input(
+        &self,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: &SessionConsumerRequest,
+        attestation: &RosterIngressAttestationV1,
+        certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<RosterCompactAdmissionProvenanceSigningInputV2, SessionConsumerRosterRejection>
+    {
+        self.roster_inner
+            .prepare_compact_admission_provenance_input(
+                authorization,
+                request,
+                attestation,
+                certificate_subject_identity_commitment,
+            )
+    }
+
+    async fn execute_roster_ingress(
+        &self,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: SessionConsumerRequest,
+        attestation: RosterIngressAttestationV1,
+        admission_provenance: Option<RosterCompactAdmissionProvenanceV2>,
+    ) -> SessionConsumerResponse {
+        let poll_admit = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+        );
+        let response = self
+            .roster_inner
+            .execute_roster_ingress(authorization, request, attestation, admission_provenance)
+            .await;
+        if poll_admit
+            && matches!(
+                &response,
+                SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                    SessionConsumerRosterAdmissionMutationResponse::Recorded(_)
+                )
+            )
+            && self.ambiguity_witness_hold_gate.take_armed_response()
+        {
+            // The shared one-response ambiguity witness acknowledges only
+            // after the protected admission is durable. The harness releases
+            // this real response after the short-deadline caller has observed
+            // OutcomeUnknown; no mutation is replayed.
+            self.ambiguity_witness_hold_gate.hold_response().await;
+        }
+        response
     }
 }
 
@@ -412,6 +785,11 @@ struct QualificationTrafficObservation {
     linearizable_reads: AtomicU64,
     lease_renewals: AtomicU64,
     lease_reacquisitions: AtomicU64,
+    /// Even values delimit coherent availability snapshots; a writer holds an
+    /// odd value while it advances the related counters. The mutation task is
+    /// the sole writer, while status commands may read concurrently.
+    availability_snapshot_version: AtomicU64,
+    availability_interruption_episodes: AtomicU64,
     availability_interruptions: AtomicU64,
     availability_recoveries: AtomicU64,
     max_consecutive_availability_interruptions: AtomicU64,
@@ -429,6 +807,14 @@ struct QualificationTrafficObservation {
     watch_reconciliations: AtomicU64,
     watch_reconciled_sequence: AtomicU64,
     watch_traffic_generations: Vec<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualificationTrafficAvailabilitySnapshot {
+    interruption_episodes: u64,
+    interruptions: u64,
+    recoveries: u64,
+    max_consecutive_interruptions: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,6 +911,8 @@ impl QualificationTrafficObservation {
             linearizable_reads: AtomicU64::new(0),
             lease_renewals: AtomicU64::new(0),
             lease_reacquisitions: AtomicU64::new(0),
+            availability_snapshot_version: AtomicU64::new(0),
+            availability_interruption_episodes: AtomicU64::new(0),
             availability_interruptions: AtomicU64::new(0),
             availability_recoveries: AtomicU64::new(0),
             max_consecutive_availability_interruptions: AtomicU64::new(0),
@@ -578,27 +966,54 @@ impl QualificationTrafficObservation {
     }
 
     fn record_availability_interruption(&self, consecutive: &mut u64) -> bool {
-        if self
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            0,
+            "availability writer must be exclusive"
+        );
+        let recorded = self
             .availability_interruptions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1).filter(|next| {
                     *next <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
                 })
             })
-            .is_err()
-        {
-            return false;
+            .is_ok();
+        if recorded && *consecutive == 0 {
+            self.availability_interruption_episodes
+                .fetch_add(1, Ordering::AcqRel);
         }
-        *consecutive = consecutive.saturating_add(1);
-        let _ = self
-            .max_consecutive_availability_interruptions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.max(*consecutive))
-            });
-        true
+        if recorded {
+            *consecutive = consecutive.saturating_add(1);
+            let _ = self
+                .max_consecutive_availability_interruptions
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.max(*consecutive))
+                });
+        }
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            1,
+            "availability writer must publish once"
+        );
+        recorded
     }
 
     fn record_availability_recovery(&self, consecutive: &mut u64) {
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            0,
+            "availability writer must be exclusive"
+        );
         let recovered = *consecutive;
         let _ = self.availability_recoveries.fetch_update(
             Ordering::AcqRel,
@@ -606,6 +1021,38 @@ impl QualificationTrafficObservation {
             |value| Some(value.saturating_add(recovered)),
         );
         *consecutive = 0;
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            1,
+            "availability writer must publish once"
+        );
+    }
+
+    fn availability_snapshot(&self) -> QualificationTrafficAvailabilitySnapshot {
+        loop {
+            let before = self.availability_snapshot_version.load(Ordering::Acquire);
+            if !before.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let snapshot = QualificationTrafficAvailabilitySnapshot {
+                interruption_episodes: self
+                    .availability_interruption_episodes
+                    .load(Ordering::Acquire),
+                interruptions: self.availability_interruptions.load(Ordering::Acquire),
+                recoveries: self.availability_recoveries.load(Ordering::Acquire),
+                max_consecutive_interruptions: self
+                    .max_consecutive_availability_interruptions
+                    .load(Ordering::Acquire),
+            };
+            let after = self.availability_snapshot_version.load(Ordering::Acquire);
+            if before == after {
+                return snapshot;
+            }
+        }
     }
 }
 
@@ -758,7 +1205,7 @@ impl QualificationNode {
         config: &QualificationNodeConfig,
         listener: TcpListener,
     ) -> Result<Self, NodeFailure> {
-        secure_qualification_paths(config)?;
+        let snapshot_directory = secure_qualification_paths(config)?;
         config
             .validate_bind_addr(listener.local_addr().map_err(|_| NodeFailure)?)
             .map_err(|_| NodeFailure)?;
@@ -779,21 +1226,23 @@ impl QualificationNode {
                 ))
             })
             .collect::<Result<Vec<_>, NodeFailure>>()?;
+        let roster_attestation_root = QualificationRosterIngressSigner::root()?;
         let manifest = Arc::new(
-            SessionReplicationManifest::try_new_with_epoch(
+            SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
                 SessionConfigurationGeneration::new(config.configuration_generation.clone())
                     .map_err(|_| NodeFailure)?,
                 SessionConfigurationEpoch::new(config.configuration_epoch)
                     .map_err(|_| NodeFailure)?,
                 descriptors.clone(),
+                Some(roster_attestation_root.clone()),
             )
             .map_err(|_| NodeFailure)?,
         );
         let local_replica = ReplicaId::new(config.members[config.node_index].replica_id.clone())
             .map_err(|_| NodeFailure)?;
         let local_binding = manifest
-            .bind_local(local_replica.clone())
+            .bind_fixed_durable_quorum_local(local_replica.clone())
             .map_err(|_| NodeFailure)?;
         let mut configured_voter_ids = config
             .members
@@ -808,17 +1257,21 @@ impl QualificationNode {
             })
             .collect::<Result<Vec<_>, _>>()?;
         configured_voter_ids.sort_unstable();
-        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-            local_replica,
-            descriptors,
-            manifest.consensus_identity(),
-        ))
+        let fixed_consensus_identity = manifest.fixed_durable_quorum_consensus_identity();
+        let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum(
+            QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
+                local_replica,
+                descriptors,
+                fixed_consensus_identity,
+                roster_attestation_root.clone(),
+            ),
+        )
         .map_err(|_| NodeFailure)?;
         let rpc_gate = QualificationConsensusRpcGate::available();
         let (peers, server_transport, transport) = prepare_transport(
             config,
             &local_binding,
-            manifest.consensus_identity(),
+            fixed_consensus_identity,
             rpc_gate.clone(),
         )
         .await
@@ -827,11 +1280,12 @@ impl QualificationNode {
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
         let store = Arc::new(
-            ConsensusSessionStore::open_with_operation_timeout(
+            ConsensusSessionStore::open_fixed_durable_quorum_with_clock(
                 topology,
                 backend,
-                &config.snapshot_directory,
+                &snapshot_directory,
                 peers,
+                Arc::new(SystemClock),
                 Duration::from_millis(config.operation_timeout_millis),
             )
             .await
@@ -900,7 +1354,11 @@ impl QualificationNode {
             server: Some(server),
             consumer_server: None,
             consumer_transport,
-            consumer_outcome_unknown: Arc::new(AtomicBool::new(false)),
+            consumer_delayed_response: Arc::new(AtomicBool::new(false)),
+            consumer_response_hold_gate: Arc::new(QualificationConsumerResponseHoldGate::new(4)),
+            consumer_ambiguity_witness_hold_gate: Arc::new(
+                QualificationConsumerResponseHoldGate::new(1),
+            ),
             transport,
             leases: HashMap::new(),
             next_lease_retention_sequence: 1,
@@ -913,6 +1371,8 @@ impl QualificationNode {
             concurrent_watches: HashMap::new(),
             empty_vote_dispatches,
             rpc_gate,
+            roster_attestation_root,
+            fixed_consensus_identity,
         })
     }
 
@@ -945,6 +1405,11 @@ impl QualificationNode {
                     metrics: lifecycle_metrics(self.empty_vote_dispatches.load(Ordering::SeqCst)),
                 }
             }
+            QualificationNodeCommand::ConsensusDiagnostics => {
+                QualificationNodeReply::ConsensusDiagnostics {
+                    metrics: self.store.diagnostic_snapshot(),
+                }
+            }
             QualificationNodeCommand::SetConsensusRpcAvailability { availability } => {
                 self.rpc_gate.set(availability);
                 QualificationNodeReply::ConsensusRpcAvailability {
@@ -954,14 +1419,92 @@ impl QualificationNode {
             QualificationNodeCommand::StartStatelessConsumer {
                 consumer_identities,
             } => self.start_stateless_consumer(consumer_identities).await,
-            QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown => {
+            QualificationNodeCommand::ArmStatelessConsumerDelayedResponse => {
                 if self.consumer_server.is_none() {
                     QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
                     }
                 } else {
-                    self.consumer_outcome_unknown.store(true, Ordering::SeqCst);
-                    QualificationNodeReply::StatelessConsumerOutcomeUnknownArmed
+                    self.consumer_delayed_response.store(true, Ordering::SeqCst);
+                    QualificationNodeReply::StatelessConsumerDelayedResponseArmed
+                }
+            }
+            QualificationNodeCommand::ArmStatelessConsumerResponseHolds => {
+                if self.consumer_server.is_none() || !self.consumer_response_hold_gate.arm() {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                } else {
+                    QualificationNodeReply::StatelessConsumerResponseHoldsArmed { responses: 4 }
+                }
+            }
+            QualificationNodeCommand::StatelessConsumerResponseHoldStatus => {
+                let (armed_responses, held_responses) = self.consumer_response_hold_gate.status();
+                QualificationNodeReply::StatelessConsumerResponseHoldStatus {
+                    armed_responses,
+                    held_responses,
+                }
+            }
+            QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds => {
+                if self.consumer_response_hold_gate.release() {
+                    QualificationNodeReply::StatelessConsumerResponseHoldsReleased { responses: 4 }
+                } else {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+            }
+            QualificationNodeCommand::ArmStatelessConsumerAmbiguityWitnessHold => {
+                if self.consumer_server.is_none()
+                    || !self.consumer_ambiguity_witness_hold_gate.arm()
+                {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                } else {
+                    QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldArmed
+                }
+            }
+            QualificationNodeCommand::StatelessConsumerAmbiguityWitnessHoldStatus => {
+                let (armed_responses, held_responses) =
+                    self.consumer_ambiguity_witness_hold_gate.status();
+                QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldStatus {
+                    armed_responses,
+                    held_responses,
+                }
+            }
+            QualificationNodeCommand::ReleaseStatelessConsumerAmbiguityWitnessHold => {
+                if self.consumer_ambiguity_witness_hold_gate.release() {
+                    QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldReleased
+                } else {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+            }
+            QualificationNodeCommand::StatelessConsumerAdmissionStatus => {
+                let Some(server) = self.consumer_server.as_ref() else {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    };
+                };
+                let snapshot = server.admission_snapshot();
+                let (Ok(active_connections), Ok(high_water_connections)) = (
+                    usize::try_from(snapshot.active_connections),
+                    usize::try_from(snapshot.high_water_connections),
+                ) else {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    };
+                };
+                QualificationNodeReply::StatelessConsumerAdmissionStatus {
+                    admission_limit: snapshot.admission_limit,
+                    active_connections,
+                    high_water_connections,
+                    admission_waits: snapshot.admission_waits,
+                    admission_rejections: snapshot.admission_rejections,
+                    samples: snapshot.samples,
+                    listener_available: snapshot.listener_available,
                 }
             }
             QualificationNodeCommand::SecurityMetrics => QualificationNodeReply::SecurityMetrics {
@@ -1014,7 +1557,7 @@ impl QualificationNode {
                     Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 let owner = match OwnerId::new(owner) {
@@ -1022,7 +1565,7 @@ impl QualificationNode {
                     Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 match self
@@ -1071,7 +1614,7 @@ impl QualificationNode {
                     Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 let record = StoredSessionRecord {
@@ -1115,7 +1658,7 @@ impl QualificationNode {
                     Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 match self.protected.get(&key).await {
@@ -1166,6 +1709,16 @@ impl QualificationNode {
                 QualificationNodeReply::LeaseHandleForgotten
             }
             QualificationNodeCommand::Shutdown => QualificationNodeReply::ShuttingDown,
+            QualificationNodeCommand::ConsumerTlsPeerCredentialRejections => {
+                match self.consumer_server.as_ref() {
+                    Some(server) => QualificationNodeReply::ConsumerTlsPeerCredentialRejections {
+                        rejections: server.tls_peer_credential_rejections(),
+                    },
+                    None => QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    },
+                }
+            }
         }
     }
 
@@ -1183,15 +1736,6 @@ impl QualificationNode {
                 code: QualificationNodeErrorCode::InvalidRequest,
             };
         };
-        let manifest = match self.store.consumer_authorization_manifest().await {
-            Ok(manifest) => manifest,
-            Err(_) => {
-                return QualificationNodeReply::Error {
-                    code: QualificationNodeErrorCode::BackendUnavailable,
-                }
-            }
-        };
-        let scope = manifest.scope();
         let identities = match consumer_identities
             .into_iter()
             .map(SpiffeId::new)
@@ -1201,26 +1745,77 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
-                }
+                };
             }
         };
-        let authorizer = match SessionConsumerAuthorizer::try_new(manifest, identities) {
+        let grants = match qualification_stateless_consumer_grants(identities) {
+            Ok(grants) => grants,
+            Err(()) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                };
+            }
+        };
+        // The listener advertises the protected `/3` roster lane as well as
+        // the general consumer lanes. Establish its immutable exact-scope
+        // profile before publishing that endpoint, matching the production
+        // deployment-readiness contract.
+        if self
+            .store
+            .activate_protected_roster_profile()
+            .await
+            .is_err()
+        {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::BackendUnavailable,
+            };
+        }
+        let manifest = match self.store.consumer_authorization_manifest(grants).await {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::BackendUnavailable,
+                };
+            }
+        };
+        let scope = manifest.scope();
+        let authorizer = match SessionConsumerAuthorizer::try_new(manifest) {
             Ok(authorizer) => authorizer,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                };
+            }
+        };
+        let roster_signer = match QualificationRosterIngressSigner::new(
+            self.roster_attestation_root.clone(),
+            self.fixed_consensus_identity,
+            scope,
+        ) {
+            Ok(signer) => Arc::new(signer),
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
                 }
             }
         };
+        let delayed_service = Arc::new(QualificationConsumerDelayedResponseService {
+            inner: Arc::new(self.store.consumer_service()),
+            roster_inner: Arc::new(self.store.consumer_service()),
+            armed: Arc::clone(&self.consumer_delayed_response),
+            response_hold_gate: Arc::clone(&self.consumer_response_hold_gate),
+            ambiguity_witness_hold_gate: Arc::clone(&self.consumer_ambiguity_witness_hold_gate),
+        });
         let listener = SessionQuorumConsumerServer::new(
-            Arc::new(QualificationConsumerOutcomeUnknownService {
-                inner: Arc::new(self.store.consumer_service()),
-                armed: Arc::clone(&self.consumer_outcome_unknown),
-            }),
+            delayed_service.clone(),
             transport.server_config.clone(),
             authorizer,
         )
-        .with_max_connections(16)
+        .with_roster_ingress(delayed_service, roster_signer)
+        // The release profile drives sixteen persistent V2 lanes to each
+        // listener. Keep a small, explicit four-slot server margin instead
+        // of treating that expected peak as an admission ceiling.
+        .with_max_connections(20)
         .with_connection_lifecycle(transport.lifecycle)
         .with_reauthentication_control(transport.reauthentication.clone());
         match listener
@@ -1253,7 +1848,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let Some(watch_start) = initial_head.checked_add(1) else {
@@ -1276,9 +1871,12 @@ impl QualificationNode {
         ));
         let (watch_cancel, watch_cancel_rx) = oneshot::channel();
         let watch_task = tokio::spawn(run_traffic_watch_task(
+            self.protected.clone(),
             stream,
             watch_start,
             self.member_count,
+            seed,
+            self.node_index,
             watch_cancel_rx,
             Arc::clone(&observation),
         ));
@@ -1321,7 +1919,7 @@ impl QualificationNode {
             Err(()) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let existing_observation = self
@@ -1329,10 +1927,10 @@ impl QualificationNode {
             .as_ref()
             .map(|traffic| Arc::clone(&traffic.observation));
         let process_restart = existing_observation.is_none();
-        let mut reconciled_sequence = existing_observation.as_ref().map_or(0, |observation| {
+        let reconciled_sequence = existing_observation.as_ref().map_or(0, |observation| {
             observation.watch_sequence.load(Ordering::Acquire)
         });
-        let mut reconciled_generations = existing_observation.as_ref().map_or_else(
+        let reconciled_generations = existing_observation.as_ref().map_or_else(
             || vec![0; self.member_count],
             |observation| {
                 observation
@@ -1347,90 +1945,36 @@ impl QualificationNode {
             reconciled_record_fences[self.node_index] =
                 observation.last_record_fence.load(Ordering::Acquire);
         }
-        let deadline = tokio::time::Instant::now()
+        let recovery_started_at = tokio::time::Instant::now();
+        let deadline = recovery_started_at
             + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
-        let mut reconciled_entries = 0_u64;
-        let (stream, watch_start, reconciled_head) = loop {
-            if tokio::time::Instant::now() >= deadline {
-                return QualificationNodeReply::Error {
-                    code: QualificationNodeErrorCode::TrafficUnavailable,
-                };
-            }
-            let head =
-                match tokio::time::timeout_at(deadline, self.protected.max_replication_sequence())
-                    .await
-                {
-                    Ok(Ok(head)) if head >= reconciled_sequence => head,
-                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        }
-                    }
-                };
-            while reconciled_sequence < head {
-                let Ok(Some((start, limit))) =
-                    traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
-                else {
-                    return QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::TrafficUnavailable,
-                    };
-                };
-                let entries = match tokio::time::timeout_at(
-                    deadline,
-                    self.protected.get_replication_log(start, limit),
-                )
-                .await
-                {
-                    Ok(Ok(entries)) if entries.len() == limit => entries,
-                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        }
-                    }
-                };
-                for entry in entries {
-                    let Some(expected_sequence) = reconciled_sequence.checked_add(1) else {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        };
-                    };
-                    if entry.sequence != expected_sequence
-                        || reconcile_applied_traffic_records(
-                            &entry.op,
-                            &traffic_keys,
-                            &mut reconciled_generations,
-                            &mut reconciled_record_fences,
-                            seed,
-                            self.member_count,
-                        )
-                        .is_err()
-                    {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        };
-                    }
-                    reconciled_sequence = entry.sequence;
-                    reconciled_entries = reconciled_entries.saturating_add(1);
-                }
-            }
-            let Some(watch_start) = head.checked_add(1) else {
-                return QualificationNodeReply::Error {
-                    code: QualificationNodeErrorCode::TrafficUnavailable,
-                };
+        // The command has no cooperative cancellation source, but the shared
+        // reconciler requires one so it can use the same cancellation-aware
+        // waits as the in-task recovery path. Retain the sender for the whole
+        // call: a dropped sender is an explicit cancellation signal.
+        let (_reconciliation_cancel, mut reconciliation_cancel_rx) = oneshot::channel();
+        let Some(reconciliation) = reconcile_traffic_watch_stream(
+            &self.protected,
+            &traffic_keys,
+            seed,
+            self.member_count,
+            reconciled_sequence,
+            reconciled_generations,
+            reconciled_record_fences,
+            recovery_started_at,
+            deadline,
+            &mut reconciliation_cancel_rx,
+        )
+        .await
+        .ok()
+        .flatten() else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
             };
-            match tokio::time::timeout_at(deadline, self.protected.watch(watch_start)).await {
-                Ok(Ok(stream)) => break (stream, watch_start, head),
-                Ok(Err(StoreError::ReplicationWatchCatchUpRequired)) => continue,
-                Ok(Err(_)) | Err(_) => {
-                    return QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::TrafficUnavailable,
-                    }
-                }
-            }
         };
 
-        let resumed_generation = reconciled_generations[self.node_index];
-        let resumed_record_fence = reconciled_record_fences[self.node_index];
+        let resumed_generation = reconciliation.generations[self.node_index];
+        let resumed_record_fence = reconciliation.record_fences[self.node_index];
         if process_restart
             && !restart_traffic_record_is_exact(
                 &self.protected,
@@ -1451,7 +1995,7 @@ impl QualificationNode {
 
         let observation = existing_observation.unwrap_or_else(|| {
             Arc::new(QualificationTrafficObservation::new(
-                reconciled_head,
+                reconciliation.head,
                 self.member_count,
             ))
         });
@@ -1461,24 +2005,27 @@ impl QualificationNode {
         for (generation, reconciled) in observation
             .watch_traffic_generations
             .iter()
-            .zip(reconciled_generations)
+            .zip(&reconciliation.generations)
         {
-            generation.store(reconciled, Ordering::Release);
+            generation.store(*reconciled, Ordering::Release);
         }
         observation
             .watch_sequence
-            .store(reconciled_head, Ordering::Release);
-        observation.record_authoritative_replication_head(reconciled_head);
+            .store(reconciliation.head, Ordering::Release);
+        observation.record_authoritative_replication_head(reconciliation.head);
         observation
             .watch_reconciled_sequence
-            .store(reconciled_head, Ordering::Release);
+            .store(reconciliation.head, Ordering::Release);
         increment(&observation.watch_reconciliations);
 
         let (watch_cancel, watch_cancel_rx) = oneshot::channel();
         let watch_task = tokio::spawn(run_traffic_watch_task(
-            stream,
-            watch_start,
+            self.protected.clone(),
+            reconciliation.stream,
+            reconciliation.watch_start,
             self.member_count,
+            seed,
+            self.node_index,
             watch_cancel_rx,
             Arc::clone(&observation),
         ));
@@ -1541,7 +2088,7 @@ impl QualificationNode {
             Err(()) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let owner = match OwnerId::new(format!("rotation-traffic-owner-{}", self.node_index)) {
@@ -1692,24 +2239,16 @@ impl QualificationNode {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
         };
-        let replication_head = match self.protected.max_replication_sequence().await {
-            Ok(head) => {
-                traffic
-                    .observation
-                    .record_authoritative_replication_head(head);
-                head
-            }
-            Err(error) => {
-                traffic
-                    .observation
-                    .record_failure(QualificationTrafficFailure::store(
-                        QualificationTrafficFailureCode::BackendUnavailable,
-                        QualificationTrafficFailureStage::Watch,
-                        &error,
-                    ));
-                traffic.observation.authoritative_replication_head()
-            }
-        };
+        let recovery_started_at = tokio::time::Instant::now();
+        let deadline = recovery_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+        let replication_head = refresh_traffic_status_authoritative_head(
+            &self.protected,
+            &traffic.observation,
+            recovery_started_at,
+            deadline,
+        )
+        .await;
         self.traffic_status_with_replication_head(replication_head)
     }
 
@@ -1754,6 +2293,7 @@ impl QualificationNode {
         } else {
             QualificationTrafficState::Stopped
         };
+        let availability = traffic.observation.availability_snapshot();
         QualificationNodeReply::TrafficStatus {
             status: QualificationTrafficStatus {
                 state,
@@ -1774,18 +2314,11 @@ impl QualificationNode {
                     .observation
                     .lease_reacquisitions
                     .load(Ordering::Acquire),
-                availability_interruptions: traffic
-                    .observation
-                    .availability_interruptions
-                    .load(Ordering::Acquire),
-                availability_recoveries: traffic
-                    .observation
-                    .availability_recoveries
-                    .load(Ordering::Acquire),
-                max_consecutive_availability_interruptions: traffic
-                    .observation
-                    .max_consecutive_availability_interruptions
-                    .load(Ordering::Acquire),
+                availability_interruption_episodes: availability.interruption_episodes,
+                availability_interruptions: availability.interruptions,
+                availability_recoveries: availability.recoveries,
+                max_consecutive_availability_interruptions: availability
+                    .max_consecutive_interruptions,
                 complete_restore_scans: traffic
                     .observation
                     .complete_restore_scans
@@ -1936,7 +2469,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
-                }
+                };
             }
         };
         let succeeded = match directed.peer.call(request).await {
@@ -2039,7 +2572,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
-                }
+                };
             }
         };
         self.concurrent_watches.insert(
@@ -2087,12 +2620,12 @@ impl QualificationNode {
                 Ok(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
                 Err(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
-                    }
+                    };
                 }
             }
         }
@@ -2112,7 +2645,7 @@ impl QualificationNode {
                     Ok(Some(Ok(_))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
-                        }
+                        };
                     }
                 };
                 if append_concurrent_watch_events(entry, &mut events).is_err() {
@@ -2173,12 +2706,12 @@ impl QualificationNode {
                 Ok(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
                 Err(()) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
             };
             let state_type = match StateType::new(slot.state_type.as_str().to_owned()) {
@@ -2186,7 +2719,7 @@ impl QualificationNode {
                 Err(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
             };
             let attempted = QualificationConcurrentMutationSnapshot {
@@ -2245,7 +2778,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
-                }
+                };
             }
         };
         let scope = match concurrent_restore_scope(state_type_model) {
@@ -2253,7 +2786,7 @@ impl QualificationNode {
             Err(()) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
-                }
+                };
             }
         };
         let mut cursor = None;
@@ -2279,7 +2812,7 @@ impl QualificationNode {
                 Err(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
-                    }
+                    };
                 }
             };
             if page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
@@ -2297,7 +2830,7 @@ impl QualificationNode {
                     Ok(Some(_)) | Ok(None) | Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
-                        }
+                        };
                     }
                 };
                 if records.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
@@ -2510,6 +3043,45 @@ fn append_concurrent_watch_events(
         match operation {
             ReplicationOp::CompareAndSet { new_record, .. } => {
                 let Some(record) = concurrent_record_snapshot(&new_record)? else {
+                    continue;
+                };
+                if events.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
+                    return Err(());
+                }
+                events.push(QualificationConcurrentWatchEvent {
+                    journal_sequence: sequence,
+                    record,
+                });
+            }
+            ReplicationOp::ProtectedRosterEstablished {
+                expected_record,
+                successor,
+                ..
+            } => {
+                let record = match *successor {
+                    ProtectedRosterEstablishedSuccessor::Put { record } => Some(*record),
+                    ProtectedRosterEstablishedSuccessor::NoOp => Some(expected_record),
+                    ProtectedRosterEstablishedSuccessor::Delete => None,
+                };
+                let Some(record) = record else {
+                    continue;
+                };
+                let Some(record) = concurrent_record_snapshot(&record)? else {
+                    continue;
+                };
+                if events.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
+                    return Err(());
+                }
+                events.push(QualificationConcurrentWatchEvent {
+                    journal_sequence: sequence,
+                    record,
+                });
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                if record.key != key {
+                    return Err(());
+                }
+                let Some(record) = concurrent_record_snapshot(&record)? else {
                     continue;
                 };
                 if events.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
@@ -2808,10 +3380,11 @@ async fn reconcile_traffic_known_authority(
                     QualificationTrafficFailureStage::Get,
                     &error,
                 );
-                if !traffic_failure_is_recoverable(failure)
-                    || !observation
-                        .record_availability_interruption(consecutive_availability_interruptions)
-                {
+                let recoverable = traffic_failure_is_recoverable(failure);
+                let recorded = recoverable
+                    && observation
+                        .record_availability_interruption(consecutive_availability_interruptions);
+                if !recorded {
                     return Err(failure);
                 }
                 if !wait_for_traffic_recovery_retry(deadline).await {
@@ -3042,6 +3615,61 @@ async fn wait_for_traffic_recovery_retry(deadline: tokio::time::Instant) -> bool
     tokio::time::Instant::now() < deadline
 }
 
+/// Refreshes the status head without ever presenting a cached value as a new
+/// authoritative observation. Only typed backend unavailability is retried;
+/// every other store error remains terminal for this status response.
+async fn refresh_traffic_status_authoritative_head<B: TrafficWatchBackend + ?Sized>(
+    backend: &B,
+    observation: &QualificationTrafficObservation,
+    recovery_started_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> u64 {
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            observation.record_failure(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::Watch,
+                recovery_started_at,
+            ));
+            return observation.authoritative_replication_head();
+        }
+
+        match tokio::time::timeout_at(deadline, backend.traffic_replication_head()).await {
+            Ok(Ok(head)) if tokio::time::Instant::now() < deadline => {
+                observation.record_authoritative_replication_head(head);
+                return head;
+            }
+            Ok(Ok(_)) | Err(_) => {
+                observation.record_failure(
+                    QualificationTrafficFailure::recovery_deadline_exceeded(
+                        QualificationTrafficFailureStage::Watch,
+                        recovery_started_at,
+                    ),
+                );
+                return observation.authoritative_replication_head();
+            }
+            Ok(Err(StoreError::BackendUnavailable(_))) => {
+                if !wait_for_traffic_recovery_retry(deadline).await {
+                    observation.record_failure(
+                        QualificationTrafficFailure::recovery_deadline_exceeded(
+                            QualificationTrafficFailureStage::Watch,
+                            recovery_started_at,
+                        ),
+                    );
+                    return observation.authoritative_replication_head();
+                }
+            }
+            Ok(Err(error)) => {
+                observation.record_failure(QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    QualificationTrafficFailureStage::Watch,
+                    &error,
+                ));
+                return observation.authoritative_replication_head();
+            }
+        }
+    }
+}
+
 fn traffic_recovery_deadline(
     recovery_started_at: tokio::time::Instant,
     shutdown_deadline: Option<tokio::time::Instant>,
@@ -3205,7 +3833,7 @@ async fn run_traffic_mutation_task_inner(
                 return Err(QualificationTrafficFailure::fixed(
                     QualificationTrafficFailureCode::InvariantViolation,
                     QualificationTrafficFailureStage::CompareAndSet,
-                ))
+                ));
             }
         }
         // Publish the committed record identity immediately. A clean stop or
@@ -3457,10 +4085,262 @@ fn traffic_reconciliation_page_plan(
     Ok(Some((start, limit)))
 }
 
-async fn run_traffic_watch_task(
+struct ReconciledTrafficWatch {
+    stream: BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+    watch_start: u64,
+    head: u64,
+    generations: Vec<u64>,
+    record_fences: Vec<u64>,
+}
+
+enum TrafficWatchRecoveryRetry {
+    Retry,
+    Cancelled,
+    DeadlineExceeded,
+}
+
+async fn wait_for_traffic_watch_reconciliation_retry(
+    cancellation: &mut oneshot::Receiver<()>,
+    deadline: tokio::time::Instant,
+) -> TrafficWatchRecoveryRetry {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return TrafficWatchRecoveryRetry::DeadlineExceeded;
+    }
+    let delay = Duration::from_millis(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS)
+        .min(deadline.saturating_duration_since(now));
+    tokio::select! {
+        biased;
+        _ = &mut *cancellation => TrafficWatchRecoveryRetry::Cancelled,
+        _ = tokio::time::sleep(delay) => {
+            if tokio::time::Instant::now() < deadline {
+                TrafficWatchRecoveryRetry::Retry
+            } else {
+                TrafficWatchRecoveryRetry::DeadlineExceeded
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
+    backend: &B,
+    traffic_keys: &[SessionKey],
+    seed: u64,
+    member_count: usize,
+    mut reconciled_sequence: u64,
+    mut reconciled_generations: Vec<u64>,
+    mut reconciled_record_fences: Vec<u64>,
+    recovery_started_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> Result<Option<ReconciledTrafficWatch>, QualificationTrafficFailure> {
+    if traffic_keys.len() != member_count
+        || reconciled_generations.len() != member_count
+        || reconciled_record_fences.len() != member_count
+    {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Watch,
+        ));
+    }
+
+    let mut reconciled_entries = 0_u64;
+    'coherent_head: loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::Watch,
+                recovery_started_at,
+            ));
+        }
+        let head = tokio::select! {
+            biased;
+            _ = &mut *cancellation => return Ok(None),
+            result = tokio::time::timeout_at(deadline, backend.traffic_replication_head()) => {
+                match result {
+                    Ok(Ok(head)) if head >= reconciled_sequence => head,
+                    Ok(Ok(_)) => {
+                        return Err(QualificationTrafficFailure::fixed(
+                            QualificationTrafficFailureCode::InvariantViolation,
+                            QualificationTrafficFailureStage::Watch,
+                        ));
+                    }
+                    Ok(Err(StoreError::BackendUnavailable(_))) => {
+                        match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
+                            TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
+                            TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
+                            TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                    QualificationTrafficFailureStage::Watch,
+                                    recovery_started_at,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        return Err(QualificationTrafficFailure::store(
+                            QualificationTrafficFailureCode::WatchUnavailable,
+                            QualificationTrafficFailureStage::Watch,
+                            &error,
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                            QualificationTrafficFailureStage::Watch,
+                            recovery_started_at,
+                        ));
+                    }
+                }
+            }
+        };
+
+        while reconciled_sequence < head {
+            let Some((start, limit)) =
+                traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
+                    .map_err(|_| {
+                        QualificationTrafficFailure::fixed(
+                            QualificationTrafficFailureCode::InvariantViolation,
+                            QualificationTrafficFailureStage::Watch,
+                        )
+                    })?
+            else {
+                return Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Watch,
+                ));
+            };
+            let entries = tokio::select! {
+                biased;
+                _ = &mut *cancellation => return Ok(None),
+                result = tokio::time::timeout_at(deadline, backend.traffic_replication_log(start, limit)) => {
+                    match result {
+                        Ok(Ok(entries)) if entries.len() == limit => entries,
+                        Ok(Ok(_)) => {
+                            return Err(QualificationTrafficFailure::fixed(
+                                QualificationTrafficFailureCode::InvariantViolation,
+                                QualificationTrafficFailureStage::Watch,
+                            ));
+                        }
+                        Ok(Err(StoreError::BackendUnavailable(_))) => {
+                            match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
+                                TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
+                                TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
+                                TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                    return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                        QualificationTrafficFailureStage::Watch,
+                                        recovery_started_at,
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            return Err(QualificationTrafficFailure::store(
+                                QualificationTrafficFailureCode::WatchUnavailable,
+                                QualificationTrafficFailureStage::Watch,
+                                &error,
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                QualificationTrafficFailureStage::Watch,
+                                recovery_started_at,
+                            ));
+                        }
+                    }
+                }
+            };
+            for entry in entries {
+                let Some(expected_sequence) = reconciled_sequence.checked_add(1) else {
+                    return Err(QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    ));
+                };
+                if entry.sequence != expected_sequence
+                    || reconcile_applied_traffic_records(
+                        &entry.op,
+                        traffic_keys,
+                        &mut reconciled_generations,
+                        &mut reconciled_record_fences,
+                        seed,
+                        member_count,
+                    )
+                    .is_err()
+                {
+                    return Err(QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    ));
+                }
+                reconciled_sequence = entry.sequence;
+                reconciled_entries = reconciled_entries.checked_add(1).ok_or_else(|| {
+                    QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    )
+                })?;
+            }
+        }
+
+        let Some(watch_start) = head.checked_add(1) else {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Watch,
+            ));
+        };
+        let stream = tokio::select! {
+            biased;
+            _ = &mut *cancellation => return Ok(None),
+            result = tokio::time::timeout_at(deadline, backend.open_traffic_watch(watch_start)) => {
+                match result {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(StoreError::ReplicationWatchCatchUpRequired)) => continue 'coherent_head,
+                    Ok(Err(StoreError::BackendUnavailable(_))) => {
+                        match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
+                            TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
+                            TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
+                            TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                    QualificationTrafficFailureStage::Watch,
+                                    recovery_started_at,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        return Err(QualificationTrafficFailure::store(
+                            QualificationTrafficFailureCode::WatchUnavailable,
+                            QualificationTrafficFailureStage::Watch,
+                            &error,
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                            QualificationTrafficFailureStage::Watch,
+                            recovery_started_at,
+                        ));
+                    }
+                }
+            }
+        };
+        return Ok(Some(ReconciledTrafficWatch {
+            stream,
+            watch_start,
+            head,
+            generations: reconciled_generations,
+            record_fences: reconciled_record_fences,
+        }));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
+    backend: B,
     mut stream: BoxStream<'static, Result<ReplicationEntry, StoreError>>,
     mut expected_sequence: u64,
     member_count: usize,
+    seed: u64,
+    node_index: usize,
     mut cancellation: oneshot::Receiver<()>,
     observation: Arc<QualificationTrafficObservation>,
 ) -> Result<(), QualificationTrafficFailure> {
@@ -3483,17 +4363,79 @@ async fn run_traffic_watch_task(
             biased;
             _ = &mut cancellation => return Ok(()),
             entry = stream.next() => {
-                let Some(entry) = entry else {
-                    let failure = QualificationTrafficFailure::fixed(
-                        QualificationTrafficFailureCode::WatchUnavailable,
-                        QualificationTrafficFailureStage::Watch,
-                    );
-                    observation.record_failure(failure);
-                    return Err(failure);
-                };
                 let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
+                    Some(Ok(entry)) => entry,
+                    None | Some(Err(StoreError::BackendUnavailable(_))) => {
+                        let reconciled_sequence = observation.watch_sequence.load(Ordering::Acquire);
+                        if reconciled_sequence.checked_add(1) != Some(expected_sequence) {
+                            let failure = QualificationTrafficFailure::fixed(
+                                QualificationTrafficFailureCode::InvariantViolation,
+                                QualificationTrafficFailureStage::Watch,
+                            );
+                            observation.record_failure(failure);
+                            return Err(failure);
+                        }
+                        let reconciled_generations = observation
+                            .watch_traffic_generations
+                            .iter()
+                            .map(|generation| generation.load(Ordering::Acquire))
+                            .collect();
+                        let mut reconciled_record_fences = vec![0; member_count];
+                        reconciled_record_fences[node_index] =
+                            observation.last_record_fence.load(Ordering::Acquire);
+                        let recovery_started_at = tokio::time::Instant::now();
+                        let deadline = recovery_started_at
+                            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+                        let reconciliation = reconcile_traffic_watch_stream(
+                            &backend,
+                            &traffic_keys,
+                            seed,
+                            member_count,
+                            reconciled_sequence,
+                            reconciled_generations,
+                            reconciled_record_fences,
+                            recovery_started_at,
+                            deadline,
+                            &mut cancellation,
+                        )
+                        .await;
+                        let Some(reconciliation) = (match reconciliation {
+                            Ok(reconciliation) => reconciliation,
+                            Err(failure) => {
+                                observation.record_failure(failure);
+                                return Err(failure);
+                            }
+                        }) else {
+                            return Ok(());
+                        };
+                        let ReconciledTrafficWatch {
+                            stream: replacement_stream,
+                            watch_start,
+                            head,
+                            generations,
+                            record_fences: _,
+                        } = reconciliation;
+                        // `watch()` has registered the replacement stream
+                        // atomically with its captured backlog. Install that
+                        // stream before publishing the reconciled cursor, so
+                        // observers never see a recovered sequence without a
+                        // live successor source.
+                        stream = replacement_stream;
+                        expected_sequence = watch_start;
+                        for (generation, reconciled) in observation
+                            .watch_traffic_generations
+                            .iter()
+                            .zip(&generations)
+                        {
+                            generation.store(*reconciled, Ordering::Release);
+                        }
+                        observation.watch_sequence.store(head, Ordering::Release);
+                        observation.record_authoritative_replication_head(head);
+                        observation.watch_reconciled_sequence.store(head, Ordering::Release);
+                        increment(&observation.watch_reconciliations);
+                        continue;
+                    }
+                    Some(Err(error)) => {
                         let failure = QualificationTrafficFailure::store(
                             QualificationTrafficFailureCode::WatchUnavailable,
                             QualificationTrafficFailureStage::Watch,
@@ -3578,6 +4520,39 @@ fn observe_applied_records(
                     watch_traffic_generations[node_index].store(generation, Ordering::Release);
                 }
             }
+            ReplicationOp::ProtectedRosterEstablished { key, successor, .. } => {
+                let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor else {
+                    continue;
+                };
+                count = count.saturating_add(1);
+                if let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                {
+                    if record.key != *key {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    let generation = record.generation.get();
+                    let previous = watch_traffic_generations[node_index].load(Ordering::Acquire);
+                    if previous.checked_add(1) != Some(generation) {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    watch_traffic_generations[node_index].store(generation, Ordering::Release);
+                }
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                count = count.saturating_add(1);
+                if let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                {
+                    if record.key != *key {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    let generation = record.generation.get();
+                    let previous = watch_traffic_generations[node_index].load(Ordering::Acquire);
+                    if previous.checked_add(1) != Some(generation) {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    watch_traffic_generations[node_index].store(generation, Ordering::Release);
+                }
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::RefreshTtl { .. }
@@ -3630,6 +4605,56 @@ fn reconcile_applied_traffic_records(
                 }
                 traffic_generations[node_index] = generation;
                 traffic_record_fences[node_index] = new_record.fence.get();
+            }
+            ReplicationOp::ProtectedRosterEstablished { key, successor, .. } => {
+                let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor else {
+                    continue;
+                };
+                let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                else {
+                    continue;
+                };
+                let generation = record.generation.get();
+                let expected_record = expected_traffic_record(
+                    key,
+                    seed,
+                    member_count,
+                    node_index,
+                    generation,
+                    record.fence.get(),
+                )?;
+                if record.fence.get() == 0
+                    || !traffic_record_is_exact(&expected_record, record)
+                    || traffic_generations[node_index].checked_add(1) != Some(generation)
+                {
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                }
+                traffic_generations[node_index] = generation;
+                traffic_record_fences[node_index] = record.fence.get();
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                else {
+                    continue;
+                };
+                let generation = record.generation.get();
+                let expected_record = expected_traffic_record(
+                    key,
+                    seed,
+                    member_count,
+                    node_index,
+                    generation,
+                    record.fence.get(),
+                )?;
+                if record.key != *key
+                    || record.fence.get() == 0
+                    || !traffic_record_is_exact(&expected_record, record)
+                    || traffic_generations[node_index].checked_add(1) != Some(generation)
+                {
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                }
+                traffic_generations[node_index] = generation;
+                traffic_record_fences[node_index] = record.fence.get();
             }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
@@ -4026,6 +5051,37 @@ where
     }
 }
 
+/// Build the exact, qualification-only grants for a validated command identity.
+///
+/// This child process is a test fixture and `QualificationNodeConfig` has no
+/// consumer scope field. The scopes are therefore the two fixed namespaces
+/// exercised by the stateless-consumer qualification workload; they are not
+/// derived from the SPIFFE text or from a request. Watches receive no separate
+/// authority from this helper.
+fn qualification_stateless_consumer_grants(
+    identities: Vec<SpiffeId>,
+) -> Result<Vec<SessionConsumerAuthorizationGrant>, ()> {
+    identities
+        .into_iter()
+        .map(|identity| {
+            SessionConsumerAuthorizationGrant::try_new(
+                identity,
+                [
+                    SessionConsumerTenantNfScope::new(
+                        TenantId::new(QUALIFICATION_STATELESS_CONSUMER_TENANT).map_err(|_| ())?,
+                        NetworkFunctionKind::smf(),
+                    ),
+                    SessionConsumerTenantNfScope::new(
+                        TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
+                        NetworkFunctionKind::smf(),
+                    ),
+                ],
+            )
+            .map_err(|_| ())
+        })
+        .collect()
+}
+
 fn qualification_key(stable_id: &str) -> Result<SessionKey, ()> {
     Ok(SessionKey {
         tenant: TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
@@ -4075,7 +5131,130 @@ fn load_config(path: &Path) -> Result<QualificationNodeConfig, NodeFailure> {
     Ok(config)
 }
 
-fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), NodeFailure> {
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+/// Parent-only descriptor transport for the closed V9 configuration.  This
+/// does not admit a JSON field or a caller-selected store path: the harness
+/// supplies one inherited directory descriptor for this exact node leaf.
+const V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV: &str = "OPC_QUALIFICATION_V9_SNAPSHOT_DIRECTORY_FD";
+
+#[cfg(unix)]
+fn canonical_private_directory(path: &Path) -> Result<PathBuf, NodeFailure> {
+    if !path.is_absolute() {
+        return Err(NodeFailure);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| NodeFailure)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(NodeFailure);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| NodeFailure)?;
+    if canonical != path {
+        return Err(NodeFailure);
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn canonical_private_directory_with_identity(
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<PathBuf, NodeFailure> {
+    let canonical = canonical_private_directory(path)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| NodeFailure)?;
+    if metadata.dev() != expected_device || metadata.ino() != expected_inode {
+        return Err(NodeFailure);
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn pinned_v9_snapshot_leaf_directory(
+    snapshot_directory: &Path,
+    snapshot_root: &Path,
+) -> Result<PathBuf, NodeFailure> {
+    let raw_fd = env::var_os(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV)
+        .and_then(|raw| raw.into_string().ok())
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|fd| *fd >= 0)
+        .ok_or(NodeFailure)?;
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{raw_fd}"));
+    // Opening our own procfs descriptor duplicates the inherited capability;
+    // it does not resolve the configured V9 pathname. The original inherited
+    // descriptor remains open for the process lifetime and pins this object
+    // through store initialization.
+    let descriptor = File::open(&descriptor_path).map_err(|_| NodeFailure)?;
+    let descriptor_metadata = fstat(&descriptor).map_err(|_| NodeFailure)?;
+    if !FileType::from_raw_mode(descriptor_metadata.st_mode).is_dir()
+        || descriptor_metadata.st_uid != rustix::process::geteuid().as_raw()
+        || Mode::from_raw_mode(descriptor_metadata.st_mode).bits() & 0o7777 != 0o700
+    {
+        return Err(NodeFailure);
+    }
+    let canonical = fs::canonicalize(&descriptor_path).map_err(|_| NodeFailure)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| NodeFailure)?;
+    if canonical != snapshot_directory
+        || canonical.parent() != Some(snapshot_root)
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+        || metadata.dev() != descriptor_metadata.st_dev as u64
+        || metadata.ino() != descriptor_metadata.st_ino as u64
+    {
+        return Err(NodeFailure);
+    }
+    // Store admission keeps O_NOFOLLOW. On Linux that rejects the procfs
+    // magic link when it is final, so retain a trailing separator: it makes
+    // the descriptor magic link an intermediate component while preserving
+    // the exact inherited directory object. Unlike a terminal `/.`, this
+    // spelling survives `std::path::absolute` inside full store admission.
+    // Its retained namespace descriptor then remains the sole authority for
+    // every snapshot child operation.
+    Ok(PathBuf::from(format!("/proc/self/fd/{raw_fd}/")))
+}
+
+#[cfg(not(unix))]
+fn pinned_v9_snapshot_leaf_directory(
+    _snapshot_directory: &Path,
+    _snapshot_root: &Path,
+) -> Result<PathBuf, NodeFailure> {
+    Err(NodeFailure)
+}
+
+#[cfg(not(unix))]
+fn canonical_private_directory_with_identity(
+    _path: &Path,
+    _expected_device: u64,
+    _expected_inode: u64,
+) -> Result<PathBuf, NodeFailure> {
+    Err(NodeFailure)
+}
+
+#[cfg(not(unix))]
+fn canonical_private_directory(_path: &Path) -> Result<PathBuf, NodeFailure> {
+    Err(NodeFailure)
+}
+
+fn configured_fs_verity_snapshot_root() -> Result<PathBuf, NodeFailure> {
+    if env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref() != Some(std::ffi::OsStr::new("required"))
+    {
+        return Err(NodeFailure);
+    }
+    let root = env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV).ok_or(NodeFailure)?;
+    let raw = root.as_encoded_bytes().to_vec();
+    let canonical = canonical_private_directory(&PathBuf::from(root))?;
+    if raw != canonical.as_os_str().as_encoded_bytes() {
+        return Err(NodeFailure);
+    }
+    Ok(canonical)
+}
+
+fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<PathBuf, NodeFailure> {
     let workspace = fs::canonicalize(&config.workspace_directory).map_err(|_| NodeFailure)?;
     if workspace.parent().is_none() {
         return Err(NodeFailure);
@@ -4094,11 +5273,53 @@ fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), No
             return Err(NodeFailure);
         }
     }
-    fs::create_dir_all(&config.snapshot_directory).map_err(|_| NodeFailure)?;
-    let snapshots = fs::canonicalize(&config.snapshot_directory).map_err(|_| NodeFailure)?;
-    if !snapshots.starts_with(&workspace) {
-        return Err(NodeFailure);
-    }
+    let snapshot_root = match &config.snapshot_root_directory {
+        Some(campaign_root) => {
+            // Reject lexical escapes before `create_dir_all` can touch the
+            // filesystem. The external namespace is release-only and has one
+            // fixed child per projected-mTLS node.
+            let expected_snapshot_leaf = format!("node-{}", config.node_index);
+            if !matches!(
+                config.transport,
+                QualificationTransportConfig::ProjectedMtls(_)
+            ) || config.snapshot_directory.parent() != Some(campaign_root.as_path())
+                || config
+                    .snapshot_directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(expected_snapshot_leaf.as_str())
+            {
+                return Err(NodeFailure);
+            }
+            let configured_root = configured_fs_verity_snapshot_root()?;
+            let expected_device = config.snapshot_root_device.ok_or(NodeFailure)?;
+            let expected_inode = config.snapshot_root_inode.ok_or(NodeFailure)?;
+            let campaign_root = canonical_private_directory_with_identity(
+                campaign_root,
+                expected_device,
+                expected_inode,
+            )?;
+            if campaign_root.parent() != Some(configured_root.as_path()) {
+                return Err(NodeFailure);
+            }
+            campaign_root
+        }
+        None => workspace.clone(),
+    };
+    let snapshots = if config.snapshot_root_directory.is_some() {
+        // The release harness creates and pins this one leaf before the child
+        // starts.  A pathname-only validation would be TOCTOU: same-UID
+        // rename/swap can replace it before ConsensusSessionStore acquires
+        // its own retained namespace descriptor.
+        pinned_v9_snapshot_leaf_directory(&config.snapshot_directory, &snapshot_root)?
+    } else {
+        fs::create_dir_all(&config.snapshot_directory).map_err(|_| NodeFailure)?;
+        let snapshots = fs::canonicalize(&config.snapshot_directory).map_err(|_| NodeFailure)?;
+        if !snapshots.starts_with(&snapshot_root) || snapshots == snapshot_root {
+            return Err(NodeFailure);
+        }
+        snapshots
+    };
     if let QualificationTransportConfig::ProjectedMtls(projected) = &config.transport {
         let metadata =
             fs::symlink_metadata(&projected.projected_volume_root).map_err(|_| NodeFailure)?;
@@ -4111,7 +5332,7 @@ fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), No
             return Err(NodeFailure);
         }
     }
-    Ok(())
+    Ok(snapshots)
 }
 
 struct NodeArguments {
@@ -4817,7 +6038,30 @@ mod tests {
     #[cfg(unix)]
     use std::io::Cursor;
     #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::sync::{Mutex, OnceLock};
+
+    #[cfg(unix)]
+    fn v9_snapshot_directory_fd_environment_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    struct V9SnapshotDirectoryFdEnvironmentRestore(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl Drop for V9SnapshotDirectoryFdEnvironmentRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => env::set_var(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV, value),
+                None => env::remove_var(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV),
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -4832,6 +6076,66 @@ mod tests {
         ] {
             assert!(!is_control_socket_cli_path(Path::new(rejected)));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_snapshot_leaf_descriptor_rejects_same_uid_swap_and_pins_restart() {
+        let _environment = v9_snapshot_directory_fd_environment_lock()
+            .lock()
+            .expect("serialize V9 snapshot descriptor environment");
+        let workspace = tempfile::tempdir().expect("create snapshot-leaf workspace");
+        let root = workspace.path().join("campaign");
+        fs::create_dir(&root).expect("create campaign root");
+        fs::set_permissions(&root, Permissions::from_mode(0o700))
+            .expect("make campaign root private");
+        let leaf = root.join("node-0");
+        fs::create_dir(&leaf).expect("create snapshot leaf");
+        fs::set_permissions(&leaf, Permissions::from_mode(0o700))
+            .expect("make snapshot leaf private");
+        let leaf_fd = open(
+            &leaf,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open no-follow snapshot leaf descriptor");
+        let original = fstat(&leaf_fd).expect("fstat pinned snapshot leaf");
+        let previous = env::var_os(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV);
+        let _restore = V9SnapshotDirectoryFdEnvironmentRestore(previous);
+        env::set_var(
+            V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV,
+            leaf_fd.as_raw_fd().to_string(),
+        );
+        assert_eq!(
+            pinned_v9_snapshot_leaf_directory(&leaf, &root)
+                .expect("accept descriptor-pinned private direct child"),
+            PathBuf::from(format!("/proc/self/fd/{}/", leaf_fd.as_raw_fd()))
+        );
+
+        // The old descriptor remains live across this same-UID pathname swap;
+        // a restarted child that receives it can only reopen the original
+        // leaf, while validation rejects the new configured pathname.
+        let detached_leaf = root.join("node-0-detached");
+        fs::rename(&leaf, &detached_leaf).expect("detach initially validated leaf");
+        fs::create_dir(&leaf).expect("create same-name replacement leaf");
+        fs::set_permissions(&leaf, Permissions::from_mode(0o700))
+            .expect("make replacement leaf private");
+        assert!(
+            pinned_v9_snapshot_leaf_directory(&leaf, &root).is_err(),
+            "a same-UID leaf replacement between validation and store use must fail closed"
+        );
+        let restarted = open(
+            PathBuf::from(format!("/proc/self/fd/{}/", leaf_fd.as_raw_fd())),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("store-style no-follow admission reopens the inherited original leaf descriptor");
+        let restarted_metadata = fstat(&restarted).expect("fstat restarted snapshot leaf");
+        assert_eq!(
+            (restarted_metadata.st_dev, restarted_metadata.st_ino),
+            (original.st_dev, original.st_ino),
+            "restart must retain the exact original snapshot leaf identity"
+        );
     }
 
     #[cfg(unix)]
@@ -5245,6 +6549,12 @@ mod tests {
         for expected in 1..=QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE {
             assert!(observation.record_availability_interruption(&mut consecutive));
             assert_eq!(consecutive, expected);
+            assert_eq!(
+                observation
+                    .availability_interruption_episodes
+                    .load(Ordering::Acquire),
+                1
+            );
         }
         assert!(!observation.record_availability_interruption(&mut consecutive));
         assert_eq!(
@@ -5264,6 +6574,25 @@ mod tests {
         assert_eq!(
             observation.availability_recoveries.load(Ordering::Acquire),
             QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        );
+
+        let observation = QualificationTrafficObservation::new(0, 3);
+        let mut consecutive = 0;
+        assert!(observation.record_availability_interruption(&mut consecutive));
+        assert!(observation.record_availability_interruption(&mut consecutive));
+        observation.record_availability_recovery(&mut consecutive);
+        assert!(observation.record_availability_interruption(&mut consecutive));
+        assert_eq!(
+            observation
+                .availability_interruption_episodes
+                .load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(
+            observation
+                .availability_interruptions
+                .load(Ordering::Acquire),
+            3
         );
     }
 
@@ -5783,6 +7112,655 @@ mod tests {
         }
     }
 
+    fn reconciliation_roster_put(node_index: usize, generation: u64) -> ReplicationOp {
+        let key = qualification_traffic_key(node_index).expect("traffic key");
+        let previous_generation = generation.checked_sub(1).expect("previous generation");
+        let expected_record = expected_traffic_record(
+            &key,
+            qualification_traffic_seed(3).expect("traffic seed"),
+            3,
+            node_index,
+            previous_generation,
+            previous_generation.saturating_add(1),
+        )
+        .expect("expected traffic record");
+        let ReplicationOp::CompareAndSet { new_record, .. } =
+            reconciliation_cas(node_index, generation)
+        else {
+            unreachable!()
+        };
+        ReplicationOp::ProtectedRosterEstablished {
+            key,
+            expected_record,
+            successor: Box::new(ProtectedRosterEstablishedSuccessor::Put {
+                record: Box::new(new_record.clone()),
+            }),
+            owner: new_record.owner,
+            fence: new_record.fence,
+            credential_id: 1,
+            guard_acquired_at: opc_types::Timestamp::now_utc(),
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedTrafficWatchBackend {
+        state: Arc<tokio::sync::Mutex<ScriptedTrafficWatchState>>,
+    }
+
+    struct ScriptedTrafficWatchState {
+        heads: std::collections::VecDeque<Result<u64, StoreError>>,
+        head_delay: Option<Duration>,
+        head_requests: usize,
+        logs: std::collections::VecDeque<Result<Vec<ReplicationEntry>, StoreError>>,
+        watches: std::collections::VecDeque<
+            Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
+        >,
+        log_requests: Vec<(u64, usize)>,
+        watch_starts: Vec<u64>,
+    }
+
+    impl ScriptedTrafficWatchBackend {
+        fn new(
+            heads: impl IntoIterator<Item = Result<u64, StoreError>>,
+            logs: impl IntoIterator<Item = Result<Vec<ReplicationEntry>, StoreError>>,
+            watches: impl IntoIterator<
+                Item = Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
+            >,
+        ) -> Self {
+            Self::with_head_delay(heads, logs, watches, None)
+        }
+
+        fn with_head_delay(
+            heads: impl IntoIterator<Item = Result<u64, StoreError>>,
+            logs: impl IntoIterator<Item = Result<Vec<ReplicationEntry>, StoreError>>,
+            watches: impl IntoIterator<
+                Item = Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
+            >,
+            head_delay: Option<Duration>,
+        ) -> Self {
+            Self {
+                state: Arc::new(tokio::sync::Mutex::new(ScriptedTrafficWatchState {
+                    heads: heads.into_iter().collect(),
+                    head_delay,
+                    head_requests: 0,
+                    logs: logs.into_iter().collect(),
+                    watches: watches.into_iter().collect(),
+                    log_requests: Vec::new(),
+                    watch_starts: Vec::new(),
+                })),
+            }
+        }
+
+        async fn log_requests(&self) -> Vec<(u64, usize)> {
+            self.state.lock().await.log_requests.clone()
+        }
+
+        async fn head_requests(&self) -> usize {
+            self.state.lock().await.head_requests
+        }
+
+        async fn watch_starts(&self) -> Vec<u64> {
+            self.state.lock().await.watch_starts.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrafficWatchBackend for ScriptedTrafficWatchBackend {
+        async fn traffic_replication_head(&self) -> Result<u64, StoreError> {
+            let head_delay = {
+                let mut state = self.state.lock().await;
+                state.head_requests = state.head_requests.saturating_add(1);
+                state.head_delay
+            };
+            if let Some(delay) = head_delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.state.lock().await.heads.pop_front().unwrap_or(Ok(0))
+        }
+
+        async fn traffic_replication_log(
+            &self,
+            start: u64,
+            limit: usize,
+        ) -> Result<Vec<ReplicationEntry>, StoreError> {
+            let mut state = self.state.lock().await;
+            state.log_requests.push((start, limit));
+            state.logs.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        async fn open_traffic_watch(
+            &self,
+            start_sequence: u64,
+        ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+            let mut state = self.state.lock().await;
+            state.watch_starts.push(start_sequence);
+            state.watches.pop_front().unwrap_or_else(|| {
+                Err(StoreError::CapabilityNotSupported(
+                    "scripted traffic watch exhausted".to_owned(),
+                ))
+            })
+        }
+    }
+
+    fn scripted_live_traffic_watch(
+        entries: Vec<Result<ReplicationEntry, StoreError>>,
+    ) -> BoxStream<'static, Result<ReplicationEntry, StoreError>> {
+        futures_util::stream::iter(entries)
+            .chain(futures_util::stream::pending())
+            .boxed()
+    }
+
+    fn scripted_traffic_replication_entry(sequence: u64, op: ReplicationOp) -> ReplicationEntry {
+        ReplicationEntry {
+            sequence,
+            tx_id: opc_session_store::ReplicationTxId::new(
+                format!("scripted-traffic-{sequence}").as_str(),
+            )
+            .expect("scripted transaction ID"),
+            op,
+            timestamp: Timestamp::now_utc(),
+        }
+    }
+
+    async fn wait_for_traffic_watch_reconciliation(observation: &QualificationTrafficObservation) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while observation.watch_reconciliations.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("traffic watch recovery installs a replacement stream");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_head_refresh_retries_typed_unavailability_and_publishes_success() {
+        let backend = ScriptedTrafficWatchBackend::new(
+            [
+                Err(StoreError::BackendUnavailable(
+                    "scripted transient status failure".to_owned(),
+                )),
+                Ok(47),
+            ],
+            [],
+            [],
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let recovery_started_at = tokio::time::Instant::now();
+        let head = refresh_traffic_status_authoritative_head(
+            &backend,
+            &observation,
+            recovery_started_at,
+            recovery_started_at
+                + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS),
+        )
+        .await;
+
+        assert_eq!(head, 47);
+        assert_eq!(observation.authoritative_replication_head(), 47);
+        assert_eq!(observation.failure(), None);
+        assert_eq!(backend.head_requests().await, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_head_refresh_latches_non_transient_error_without_retry() {
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Err(StoreError::CapabilityNotSupported(
+                "scripted terminal status failure".to_owned(),
+            ))],
+            [],
+            [],
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let recovery_started_at = tokio::time::Instant::now();
+        let head = refresh_traffic_status_authoritative_head(
+            &backend,
+            &observation,
+            recovery_started_at,
+            recovery_started_at
+                + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS),
+        )
+        .await;
+
+        assert_eq!(head, 41);
+        assert_eq!(observation.authoritative_replication_head(), 41);
+        assert_eq!(
+            observation.failure(),
+            Some(QualificationTrafficFailure {
+                code: QualificationTrafficFailureCode::BackendUnavailable,
+                stage: QualificationTrafficFailureStage::Watch,
+                error_class: QualificationTrafficErrorClass::Other,
+                recovery_elapsed_millis: None,
+            })
+        );
+        assert_eq!(backend.head_requests().await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_head_refresh_timeout_preserves_last_proven_head_and_latches_deadline() {
+        let backend = ScriptedTrafficWatchBackend::with_head_delay(
+            [Ok(47)],
+            [],
+            [],
+            Some(Duration::from_millis(100)),
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let recovery_started_at = tokio::time::Instant::now();
+        let deadline = recovery_started_at + Duration::from_millis(25);
+        let head = refresh_traffic_status_authoritative_head(
+            &backend,
+            &observation,
+            recovery_started_at,
+            deadline,
+        )
+        .await;
+
+        assert_eq!(head, 41);
+        assert_eq!(observation.authoritative_replication_head(), 41);
+        assert_eq!(
+            observation.failure(),
+            Some(QualificationTrafficFailure {
+                code: QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded,
+                stage: QualificationTrafficFailureStage::Watch,
+                error_class: QualificationTrafficErrorClass::BackendUnavailable,
+                recovery_elapsed_millis: Some(25),
+            })
+        );
+        assert_eq!(backend.head_requests().await, 1);
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_closure_recovers_to_a_live_stream() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(0)],
+            [],
+            [Ok(scripted_live_traffic_watch(vec![Ok(
+                scripted_traffic_replication_entry(1, reconciliation_cas(0, 1)),
+            )]))],
+        );
+        let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+        let (cancel, cancellation) = oneshot::channel();
+        let task = tokio::spawn(run_traffic_watch_task(
+            backend.clone(),
+            futures_util::stream::empty().boxed(),
+            1,
+            member_count,
+            seed,
+            0,
+            cancellation,
+            Arc::clone(&observation),
+        ));
+
+        wait_for_traffic_watch_reconciliation(&observation).await;
+        assert_eq!(observation.failure(), None);
+        assert_eq!(observation.watch_sequence.load(Ordering::Acquire), 1);
+        assert_eq!(
+            observation.watch_traffic_generations[0].load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(backend.watch_starts().await, vec![1]);
+        assert!(cancel.send(()).is_ok());
+        assert_eq!(task.await.expect("watch task joins"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_backend_unavailable_recovers_to_a_live_stream() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(0)],
+            [],
+            [Ok(scripted_live_traffic_watch(vec![Ok(
+                scripted_traffic_replication_entry(1, reconciliation_cas(0, 1)),
+            )]))],
+        );
+        let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+        let (cancel, cancellation) = oneshot::channel();
+        let task = tokio::spawn(run_traffic_watch_task(
+            backend.clone(),
+            futures_util::stream::iter([Err(StoreError::BackendUnavailable(
+                "scripted closure".to_owned(),
+            ))])
+            .boxed(),
+            1,
+            member_count,
+            seed,
+            0,
+            cancellation,
+            Arc::clone(&observation),
+        ));
+
+        wait_for_traffic_watch_reconciliation(&observation).await;
+        assert_eq!(observation.failure(), None);
+        assert_eq!(observation.watch_sequence.load(Ordering::Acquire), 1);
+        assert_eq!(backend.watch_starts().await, vec![1]);
+        assert!(cancel.send(()).is_ok());
+        assert_eq!(task.await.expect("watch task joins"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_replays_the_exact_prefix_before_consuming_a_live_successor() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let replayed = scripted_traffic_replication_entry(1, reconciliation_cas(0, 1));
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(1)],
+            [Ok(vec![replayed])],
+            [Ok(scripted_live_traffic_watch(vec![Ok(
+                scripted_traffic_replication_entry(2, reconciliation_cas(0, 2)),
+            )]))],
+        );
+        let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+        let (cancel, cancellation) = oneshot::channel();
+        let task = tokio::spawn(run_traffic_watch_task(
+            backend.clone(),
+            futures_util::stream::empty().boxed(),
+            1,
+            member_count,
+            seed,
+            0,
+            cancellation,
+            Arc::clone(&observation),
+        ));
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while observation.watch_sequence.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live successor is observed after exact replay");
+        assert_eq!(observation.failure(), None);
+        assert_eq!(
+            observation
+                .watch_reconciled_sequence
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            observation.watch_traffic_generations[0].load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(backend.log_requests().await, vec![(1, 1)]);
+        assert_eq!(backend.watch_starts().await, vec![2]);
+        assert!(cancel.send(()).is_ok());
+        assert_eq!(task.await.expect("watch task joins"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_recovery_rejects_gap_and_malformed_prefixes() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let mut malformed = reconciliation_cas(0, 1);
+        let ReplicationOp::CompareAndSet { new_record, .. } = &mut malformed else {
+            unreachable!()
+        };
+        new_record.payload = EncryptedSessionPayload::new(b"malformed-traffic-replay");
+
+        for entry in [
+            scripted_traffic_replication_entry(2, reconciliation_cas(0, 1)),
+            scripted_traffic_replication_entry(1, malformed),
+        ] {
+            let backend = ScriptedTrafficWatchBackend::new([Ok(1)], [Ok(vec![entry])], []);
+            let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+            let (_cancel, cancellation) = oneshot::channel();
+            let result = run_traffic_watch_task(
+                backend.clone(),
+                futures_util::stream::empty().boxed(),
+                1,
+                member_count,
+                seed,
+                0,
+                cancellation,
+                Arc::clone(&observation),
+            )
+            .await;
+            assert_eq!(
+                result,
+                Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Watch,
+                ))
+            );
+            assert_eq!(observation.failure(), result.err());
+            assert!(backend.watch_starts().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_reconciliation_deadline_and_entry_bound_fail_closed() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let keys = (0..member_count)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let backend = ScriptedTrafficWatchBackend::new([], [], []);
+        let (_cancel, mut cancellation) = oneshot::channel();
+        let now = tokio::time::Instant::now();
+        let Err(failure) = reconcile_traffic_watch_stream(
+            &backend,
+            &keys,
+            seed,
+            member_count,
+            0,
+            vec![0; member_count],
+            vec![0; member_count],
+            now,
+            now,
+            &mut cancellation,
+        )
+        .await
+        else {
+            panic!("expired reconciliation deadline must fail closed");
+        };
+        assert_eq!(
+            failure.code,
+            QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        );
+        assert_eq!(failure.stage, QualificationTrafficFailureStage::Watch);
+
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(
+                QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES + 1
+            )],
+            [],
+            [],
+        );
+        let (_cancel, mut cancellation) = oneshot::channel();
+        let recovery_started_at = tokio::time::Instant::now();
+        let result = reconcile_traffic_watch_stream(
+            &backend,
+            &keys,
+            seed,
+            member_count,
+            0,
+            vec![0; member_count],
+            vec![0; member_count],
+            recovery_started_at,
+            recovery_started_at + Duration::from_millis(100),
+            &mut cancellation,
+        )
+        .await;
+        let Err(failure) = result else {
+            panic!("over-bound reconciliation prefix must fail closed");
+        };
+        assert_eq!(
+            failure,
+            QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Watch,
+            )
+        );
+        assert!(backend.log_requests().await.is_empty());
+        assert!(backend.watch_starts().await.is_empty());
+    }
+
+    fn reconciliation_roster_create(node_index: usize) -> ReplicationOp {
+        let ReplicationOp::CompareAndSet {
+            key, new_record, ..
+        } = reconciliation_cas(node_index, 1)
+        else {
+            unreachable!()
+        };
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key,
+            owner: new_record.owner.clone(),
+            fence: new_record.fence,
+            record: new_record,
+            credential_id: 1,
+            guard_acquired_at: opc_types::Timestamp::now_utc(),
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+        }
+    }
+
+    fn concurrent_roster_create(stable_id: &str) -> ReplicationOp {
+        let key = qualification_key(stable_id).expect("concurrent key");
+        let state_type =
+            opc_session_testkit::qualification::qualification_concurrent_state_type(stable_id)
+                .expect("history-derived concurrent state type");
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: OwnerId::new("concurrent-owner").expect("concurrent owner"),
+            fence: opc_session_store::FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new(state_type.as_str().to_owned())
+                .expect("validated concurrent state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"concurrent-roster-create"),
+        };
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key,
+            owner: record.owner.clone(),
+            fence: record.fence,
+            record,
+            credential_id: 1,
+            guard_acquired_at: opc_types::Timestamp::now_utc(),
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+        }
+    }
+
+    #[test]
+    fn traffic_watch_and_reconciliation_project_roster_put_only() {
+        let keys = (0..3)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let operation = reconciliation_roster_put(0, 2);
+        let watched = [AtomicU64::new(1), AtomicU64::new(0), AtomicU64::new(0)];
+        assert_eq!(observe_applied_records(&operation, &keys, &watched), Ok(1));
+        assert_eq!(watched[0].load(Ordering::Acquire), 2);
+
+        let seed = qualification_traffic_seed(3).expect("traffic seed");
+        let mut generations = [1, 0, 0];
+        let mut fences = [2, 0, 0];
+        assert!(reconcile_applied_traffic_records(
+            &operation,
+            &keys,
+            &mut generations,
+            &mut fences,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, [2, 0, 0]);
+        assert_eq!(fences, [3, 0, 0]);
+
+        for successor in [
+            ProtectedRosterEstablishedSuccessor::NoOp,
+            ProtectedRosterEstablishedSuccessor::Delete,
+        ] {
+            let mut non_write = operation.clone();
+            let ReplicationOp::ProtectedRosterEstablished {
+                successor: operation_successor,
+                ..
+            } = &mut non_write
+            else {
+                unreachable!()
+            };
+            **operation_successor = successor;
+            assert_eq!(observe_applied_records(&non_write, &keys, &watched), Ok(0));
+        }
+    }
+
+    #[test]
+    fn traffic_watch_and_reconciliation_project_roster_create_direct_and_nested() {
+        let keys = (0..3)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let direct = reconciliation_roster_create(0);
+        let watched = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        assert_eq!(observe_applied_records(&direct, &keys, &watched), Ok(1));
+        assert_eq!(watched[0].load(Ordering::Acquire), 1);
+
+        let seed = qualification_traffic_seed(3).expect("traffic seed");
+        let mut generations = [0, 0, 0];
+        let mut fences = [0, 0, 0];
+        assert!(reconcile_applied_traffic_records(
+            &direct,
+            &keys,
+            &mut generations,
+            &mut fences,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, [1, 0, 0]);
+        assert_eq!(fences, [2, 0, 0]);
+
+        let nested = ReplicationOp::Batch {
+            ops: vec![ReplicationOp::Batch {
+                ops: vec![reconciliation_roster_create(1)],
+            }],
+        };
+        assert_eq!(observe_applied_records(&nested, &keys, &watched), Ok(1));
+        assert_eq!(watched[1].load(Ordering::Acquire), 1);
+        assert!(reconcile_applied_traffic_records(
+            &nested,
+            &keys,
+            &mut generations,
+            &mut fences,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, [1, 1, 0]);
+        assert_eq!(fences, [2, 2, 0]);
+    }
+
+    #[test]
+    fn concurrent_watch_projects_roster_create_direct_and_nested() {
+        let timestamp = opc_types::Timestamp::now_utc();
+        let direct = ReplicationEntry {
+            sequence: 7,
+            tx_id: "concurrent-v2-direct".try_into().expect("transaction ID"),
+            op: concurrent_roster_create("concurrent-v2-direct"),
+            timestamp,
+        };
+        let nested = ReplicationEntry {
+            sequence: 8,
+            tx_id: "concurrent-v2-nested".try_into().expect("transaction ID"),
+            op: ReplicationOp::Batch {
+                ops: vec![ReplicationOp::Batch {
+                    ops: vec![concurrent_roster_create("concurrent-v2-nested")],
+                }],
+            },
+            timestamp,
+        };
+        let mut events = Vec::new();
+
+        append_concurrent_watch_events(direct, &mut events).expect("direct V2 create event");
+        append_concurrent_watch_events(nested, &mut events).expect("nested V2 create event");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].journal_sequence, 7);
+        assert_eq!(events[1].journal_sequence, 8);
+    }
+
     #[test]
     fn traffic_reconciliation_requires_strict_generations_and_exact_records() {
         let keys = (0..3)
@@ -5866,5 +7844,37 @@ mod tests {
         .is_ok());
         assert_eq!(generations, vec![0, 2, 0]);
         assert_eq!(fences, vec![0, 3, 0]);
+    }
+
+    #[tokio::test]
+    async fn delayed_response_hold_gate_release_after_waiter_registration_is_not_lost() {
+        let gate = Arc::new(QualificationConsumerResponseHoldGate::new(1));
+        assert!(gate.arm());
+        assert!(gate.take_armed_response());
+        let waiter_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiter_gate.hold_response().await });
+        while gate.status().1 != 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(gate.release());
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("a release after waiter registration wakes the held response")
+            .expect("held-response task completes");
+        assert_eq!(gate.status(), (0, 0));
+
+        assert!(gate.arm());
+        assert!(gate.take_armed_response());
+        let waiter_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiter_gate.hold_response().await });
+        while gate.status().1 != 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(gate.release());
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("a second release wakes the re-armed response hold")
+            .expect("re-armed held-response task completes");
+        assert_eq!(gate.status(), (0, 0));
     }
 }

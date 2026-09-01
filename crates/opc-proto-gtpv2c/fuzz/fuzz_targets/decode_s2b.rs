@@ -20,7 +20,7 @@ fn decode_hex_seed(data: &[u8]) -> Option<Vec<u8>> {
     }
 
     let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.chunks_exact(2) {
+    for pair in encoded.as_chunks::<2>().0 {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
         decoded.push((high << 4) | low);

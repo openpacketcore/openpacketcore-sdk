@@ -1,3 +1,12 @@
+/// Redaction-safe marker for JSON encoding and decoding failures.
+///
+/// Converting a [`serde_json::Error`] into [`ProtocolError`] deliberately
+/// discards it because serde diagnostics can contain peer-controlled wire
+/// values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("serialization error")]
+pub struct SerializationFailure;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("frame too large: {0} bytes")]
@@ -14,10 +23,16 @@ pub enum ProtocolError {
     UnexpectedResponse,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Serialization(#[from] SerializationFailure),
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
+}
+
+impl From<serde_json::Error> for ProtocolError {
+    fn from(_error: serde_json::Error) -> Self {
+        Self::Serialization(SerializationFailure)
+    }
 }
 
 /// Preserve TLS failure categories when `tokio-rustls` reports through its
@@ -26,7 +41,9 @@ pub enum ProtocolError {
 /// TCP and ordinary socket failures remain transport failures. Certificate,
 /// trust, and peer-authentication failures collapse to the existing
 /// redaction-safe authentication category; every other rustls failure is a TLS
-/// protocol failure.
+/// protocol failure. The protected-roster setup boundary may inspect the
+/// original `io::Error` with [`tls_io_error_is_no_application_protocol`]
+/// before this public classification deliberately collapses the cause.
 pub(crate) fn classify_tls_io_error(error: std::io::Error) -> ProtocolError {
     let Some(rustls_error) = error
         .get_ref()
@@ -39,6 +56,46 @@ pub(crate) fn classify_tls_io_error(error: std::io::Error) -> ProtocolError {
     } else {
         ProtocolError::UnexpectedResponse
     }
+}
+
+/// Return whether a TLS setup error is exactly the redaction-safe ALPN
+/// capability rejection consumed by the private protected-roster boundary.
+pub(crate) fn tls_io_error_is_no_application_protocol(error: &std::io::Error) -> bool {
+    use tokio_rustls::rustls::{AlertDescription, Error};
+
+    matches!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Error>()),
+        Some(
+            Error::NoApplicationProtocol
+                | Error::AlertReceived(AlertDescription::NoApplicationProtocol)
+        )
+    )
+}
+
+/// Return whether a server-side TLS accept failure is a local peer-credential
+/// rejection.
+///
+/// This deliberately recognizes only rustls errors produced while validating
+/// the peer credential locally. In particular, alerts received from the peer,
+/// record decryption failures, generic TLS protocol failures, and ordinary
+/// transport failures are not evidence that this listener rejected a peer
+/// credential.
+pub(crate) fn tls_peer_credential_rejection(error: &std::io::Error) -> bool {
+    use tokio_rustls::rustls::Error;
+
+    matches!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Error>()),
+        Some(
+            Error::InvalidCertificate(_)
+                | Error::InvalidCertRevocationList(_)
+                | Error::NoCertificatesPresented
+                | Error::UnsupportedNameType
+        )
+    )
 }
 
 fn tls_error_is_authentication(error: &tokio_rustls::rustls::Error) -> bool {
@@ -71,7 +128,65 @@ fn tls_error_is_authentication(error: &tokio_rustls::rustls::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use std::sync::Arc;
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    struct PeerWireFields {
+        sequence: u64,
+        enabled: bool,
+        mode: PeerWireMode,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    enum PeerWireMode {
+        Known,
+    }
+
+    #[test]
+    fn serialization_diagnostics_do_not_disclose_hostile_wire_values() {
+        let cases: &[(&[u8], &str)] = &[
+            (
+                br#"{"sequence":"peer-numeric-sensitive-sentinel","enabled":true,"mode":"Known"}"#,
+                "peer-numeric-sensitive-sentinel",
+            ),
+            (
+                br#"{"sequence":1,"enabled":"peer-bool-sensitive-sentinel","mode":"Known"}"#,
+                "peer-bool-sensitive-sentinel",
+            ),
+            (
+                br#"{"sequence":1,"enabled":true,"mode":"peer-enum-sensitive-sentinel"}"#,
+                "peer-enum-sensitive-sentinel",
+            ),
+        ];
+
+        for (payload, sentinel) in cases {
+            let source = serde_json::from_slice::<PeerWireFields>(payload)
+                .expect_err("hostile wire type must be rejected");
+            assert!(
+                source.to_string().contains(sentinel),
+                "fixture must exercise serde_json's value-echoing error shape"
+            );
+
+            let error = ProtocolError::from(source);
+            assert!(matches!(&error, ProtocolError::Serialization(_)));
+            let diagnostics = [error.to_string(), format!("{error:?}")];
+            for diagnostic in diagnostics {
+                assert!(
+                    !diagnostic.contains(sentinel),
+                    "ProtocolError diagnostic leaked peer input: {diagnostic}"
+                );
+            }
+            if let Some(source) = std::error::Error::source(&error) {
+                assert!(
+                    !source.to_string().contains(sentinel),
+                    "ProtocolError source leaked peer input: {source}"
+                );
+            }
+        }
+    }
 
     fn wrapped_rustls_error(error: tokio_rustls::rustls::Error) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::InvalidData, error)
@@ -102,11 +217,21 @@ mod tests {
             Error::General("redacted test failure".to_owned()),
             Error::InvalidMessage(InvalidMessage::MessageTooShort),
             Error::PeerSentOversizedRecord,
-            Error::NoApplicationProtocol,
-            Error::AlertReceived(AlertDescription::NoApplicationProtocol),
         ] {
             assert!(matches!(
                 classify_tls_io_error(wrapped_rustls_error(protocol_error)),
+                ProtocolError::UnexpectedResponse
+            ));
+        }
+
+        for no_application_protocol in [
+            Error::NoApplicationProtocol,
+            Error::AlertReceived(AlertDescription::NoApplicationProtocol),
+        ] {
+            let error = wrapped_rustls_error(no_application_protocol);
+            assert!(tls_io_error_is_no_application_protocol(&error));
+            assert!(matches!(
+                classify_tls_io_error(error),
                 ProtocolError::UnexpectedResponse
             ));
         }
@@ -116,6 +241,158 @@ mod tests {
         assert!(matches!(
             classify_tls_io_error(transport_failure),
             ProtocolError::Io(error) if error.kind() == std::io::ErrorKind::ConnectionReset
+        ));
+    }
+
+    #[test]
+    fn tls_peer_credential_rejection_is_local_and_narrow() {
+        use tokio_rustls::rustls::{
+            AlertDescription, CertRevocationListError, CertificateError, Error, InvalidMessage,
+        };
+
+        for peer_credential_rejection in [
+            Error::InvalidCertificate(CertificateError::UnknownIssuer),
+            Error::InvalidCertRevocationList(CertRevocationListError::ParseError),
+            Error::NoCertificatesPresented,
+            Error::UnsupportedNameType,
+        ] {
+            assert!(tls_peer_credential_rejection(&wrapped_rustls_error(
+                peer_credential_rejection
+            )));
+        }
+
+        for non_local_failure in [
+            Error::AlertReceived(AlertDescription::UnknownCA),
+            Error::AlertReceived(AlertDescription::BadCertificate),
+            Error::DecryptError,
+            Error::InvalidMessage(InvalidMessage::MessageTooShort),
+        ] {
+            assert!(!tls_peer_credential_rejection(&wrapped_rustls_error(
+                non_local_failure
+            )));
+        }
+        assert!(!tls_peer_credential_rejection(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "redacted test failure",
+        )));
+    }
+
+    #[tokio::test]
+    async fn tokio_rustls_client_reads_server_unknown_ca_as_authentication() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
+        use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+        let server_ca_key = KeyPair::generate().expect("generate server CA key");
+        let mut server_ca_parameters = CertificateParams::default();
+        server_ca_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        server_ca_parameters
+            .distinguished_name
+            .push(DnType::CommonName, "TLS classifier server CA");
+        let server_ca = rcgen::CertifiedIssuer::self_signed(server_ca_parameters, server_ca_key)
+            .expect("sign server CA");
+        let server_key = KeyPair::generate().expect("generate server key");
+        let mut server_parameters = CertificateParams::default();
+        server_parameters.subject_alt_names.push(SanType::DnsName(
+            rcgen::string::Ia5String::try_from("localhost").expect("localhost DNS name"),
+        ));
+        let server_certificate = server_parameters
+            .signed_by(&server_key, &server_ca)
+            .expect("sign server certificate");
+
+        let client_ca_key = KeyPair::generate().expect("generate client CA key");
+        let mut client_ca_parameters = CertificateParams::default();
+        client_ca_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        client_ca_parameters
+            .distinguished_name
+            .push(DnType::CommonName, "TLS classifier client CA");
+        let client_ca = rcgen::CertifiedIssuer::self_signed(client_ca_parameters, client_ca_key)
+            .expect("sign client CA");
+        let client_key = KeyPair::generate().expect("generate client key");
+        let client_certificate = CertificateParams::default()
+            .signed_by(&client_key, &client_ca)
+            .expect("sign client certificate");
+
+        let mut server_roots = RootCertStore::empty();
+        server_roots
+            .add(server_ca.der().clone())
+            .expect("add server CA");
+        let client_verifier = tokio_rustls::rustls::server::WebPkiClientVerifier::builder(
+            Arc::new(server_roots.clone()),
+        )
+        .build()
+        .expect("client verifier");
+        let server_config = ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(
+                vec![server_certificate.der().clone(), server_ca.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .expect("server config");
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(server_roots)
+            .with_client_auth_cert(
+                vec![client_certificate.der().clone(), client_ca.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der())),
+            )
+            .expect("client config");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept TCP");
+            tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(tcp)
+                .await
+                .expect_err("server must reject an untrusted client certificate")
+        });
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect TCP");
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)).connect(
+                ServerName::try_from("localhost")
+                    .expect("server name")
+                    .to_owned(),
+                tcp,
+            ),
+        )
+        .await
+        .expect("client TLS handshake must not hang")
+        .expect("client completes TLS 1.3 before server rejects its certificate");
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"hello")
+            .await
+            .expect("client writes the bootstrap byte before reading the alert");
+        let mut byte = [0_u8; 1];
+        let client_error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut client, &mut byte),
+        )
+        .await
+        .expect("client read must receive the server alert")
+        .expect_err("server must reject the untrusted client certificate");
+        assert!(matches!(
+            client_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<tokio_rustls::rustls::Error>()),
+            Some(tokio_rustls::rustls::Error::AlertReceived(
+                tokio_rustls::rustls::AlertDescription::UnknownCA
+            ))
+        ));
+        assert!(matches!(
+            classify_tls_io_error(client_error),
+            ProtocolError::Authentication
+        ));
+        let accept_error = tokio::time::timeout(std::time::Duration::from_secs(2), accept)
+            .await
+            .expect("server rejection must not hang")
+            .expect("join TLS accept");
+        assert!(matches!(
+            classify_tls_io_error(accept_error),
+            ProtocolError::Authentication
         ));
     }
 
