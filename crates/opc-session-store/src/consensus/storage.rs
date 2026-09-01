@@ -193,7 +193,7 @@ fn legacy_fixed_snapshot_reseed_candidate_process_losses(
     LOSSES.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn inject_legacy_fixed_snapshot_reseed_candidate_process_loss(snapshot_directory: PathBuf) {
     legacy_fixed_snapshot_reseed_candidate_process_losses()
         .lock()
