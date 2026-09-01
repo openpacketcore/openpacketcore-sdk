@@ -393,8 +393,11 @@ mod platform {
     const FILESYSTEM_UUID_BYTES: usize = 16;
     const AT_EMPTY_PATH: libc::c_int = 0x1000;
     const AT_HANDLE_FID: libc::c_int = 0x0200;
-    const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
-    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    // Linux filesystem magic numbers are u32 bit patterns.  `statfs::f_type`
+    // is a signed long on some ABIs, so normalize it below before comparison;
+    // in particular BTRFS_SUPER_MAGIC has bit 31 set.
+    const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683e;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -775,14 +778,17 @@ mod platform {
         filesystem_type(fd) == Some(BTRFS_SUPER_MAGIC)
     }
 
-    fn filesystem_type(fd: BorrowedFd<'_>) -> Option<u64> {
+    fn filesystem_type(fd: BorrowedFd<'_>) -> Option<u32> {
         // SAFETY: `stat` is a fully initialized C-compatible output buffer and
         // `fd` remains borrowed and valid for the duration of fstatfs.
         let mut stat = unsafe { std::mem::zeroed::<libc::statfs>() };
         // SAFETY: `stat` points to writable C-compatible output storage and
         // `fd` remains borrowed and valid for the duration of fstatfs.
         let result = unsafe { libc::fstatfs(fd.as_raw_fd(), std::ptr::addr_of_mut!(stat)) };
-        (result == 0).then_some(stat.f_type as u64)
+        // The kernel's `f_type` is a 32-bit filesystem magic even where the
+        // libc field is a signed or 64-bit long.  Casting directly to u64
+        // would sign-extend BTRFS_SUPER_MAGIC on those ABIs.
+        (result == 0).then_some(stat.f_type as u32)
     }
 
     fn xfs_filesystem_uuid(fd: BorrowedFd<'_>) -> Result<[u8; FILESYSTEM_UUID_BYTES], Error> {
@@ -1107,6 +1113,16 @@ mod platform {
                 libc::_IOR::<BtrfsFilesystemInfo>(b'B' as u32, 31),
                 "the Btrfs compatibility request must follow the target C ABI"
             );
+        }
+
+        #[test]
+        fn filesystem_magic_normalization_preserves_btrfs_on_signed_long_abis() {
+            // On a 64-bit ABI whose `statfs::f_type` is a signed long, the
+            // kernel's 32-bit Btrfs magic arrives sign-extended.  The
+            // comparison must use the original UAPI bit pattern, not that
+            // sign-extended representation.
+            let sign_extended = BTRFS_SUPER_MAGIC as i32 as i64;
+            assert_eq!(sign_extended as u32, BTRFS_SUPER_MAGIC);
         }
 
         #[test]
