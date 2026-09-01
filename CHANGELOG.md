@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded reclaim, fixed diagnostics, and a real three-voter 13-cut mTLS
   matrix preserve the two-remote-mutation hot path without exposing raw
   consensus or creating per-subscriber resources.
+- **Finite S2b Create Session Response F-TEID receive policy —
+  `opc-proto-gtpv2c`:**
+  `S2bCreateSessionResponseReceivePolicy` and the one-shot
+  `decode_create_session_response_summary_with_receive_policy` let callers
+  independently add standardized S5/S8 PGW control type 7 and user-plane type
+  5 to the strict default S2b role sets `{32}` and `{33}`. The copied finite
+  policy binds ProcedureAware first-occurrence validation to typed projection;
+  existing decode/projection APIs and canonical builders remain strict, and
+  errors and Debug output remain value-free.
 - **Durable grouped XFRM object roster transaction — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
   and the opt-in migration constructor

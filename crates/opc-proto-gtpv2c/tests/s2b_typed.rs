@@ -1,9 +1,10 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
-    decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
-    PdnTypeValue, S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO,
-    IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS, IE_TYPE_MEI, IE_TYPE_PAA,
+    decode_create_session_response_summary_with_receive_policy, decode_typed_ie_sequence, s2b,
+    CauseValue, FullyQualifiedTeid, Message, MessageType, PdnTypeValue,
+    S2bCreateSessionResponseReceivePolicy, S2bMessage, TbcdDigits, TypedIe, TypedIeValue,
+    IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI,
+    IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS, IE_TYPE_MEI, IE_TYPE_PAA,
     IE_TYPE_PDN_TYPE, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
     INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
@@ -75,7 +76,7 @@ const BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE: &[u8] = &[
     IE_TYPE_F_TEID,
     0x00,
     0x09,
-    0x00,
+    0x04,
     0xa1,
     0x11,
     0x22,
@@ -998,6 +999,53 @@ fn raw_f_teid_ie(
     ie
 }
 
+fn bearer_context_with_f_teids(f_teids: &[Vec<u8>]) -> Vec<u8> {
+    let value_len = EBI_IE.len()
+        + f_teids
+            .iter()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+    let value_len = match u16::try_from(value_len) {
+        Ok(value_len) => value_len,
+        Err(error) => panic!("test Bearer Context value is too long: {error:?}"),
+    };
+    let mut bearer_context = Vec::new();
+    bearer_context.push(IE_TYPE_BEARER_CONTEXT);
+    bearer_context.extend_from_slice(&value_len.to_be_bytes());
+    bearer_context.push(0);
+    bearer_context.extend_from_slice(EBI_IE);
+    for f_teid in f_teids {
+        bearer_context.extend_from_slice(f_teid);
+    }
+    bearer_context
+}
+
+fn create_session_response_with_endpoint_roles(
+    control_interface_type: u8,
+    user_plane_interface_type: u8,
+) -> Vec<u8> {
+    let control = raw_f_teid_ie(
+        1,
+        control_interface_type,
+        0x1020_3040,
+        Some([192, 0, 2, 44]),
+        None,
+    );
+    let user_plane = raw_f_teid_ie(
+        4,
+        user_plane_interface_type,
+        0x5060_7080,
+        Some([198, 51, 100, 55]),
+        None,
+    );
+    let bearer_context = bearer_context_with_f_teids(&[user_plane]);
+    create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, control.as_slice(), bearer_context.as_slice()],
+    )
+}
+
 #[test]
 fn create_session_rejected_response_summary_allows_cause_only() {
     let response = create_session_response_with_projection_ies(
@@ -1377,6 +1425,514 @@ fn public_summary_helper_keeps_first_repeated_pgw_control_endpoint() {
             Err(expected_error)
         );
     }
+}
+
+#[test]
+fn create_session_response_receive_policy_defaults_remain_strict() {
+    let strict = create_session_response_with_endpoint_roles(
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    );
+    assert!(s2b::decode_create_session_response_summary(&strict, procedure_context()).is_ok());
+    assert!(S2bMessage::decode(&strict, procedure_context()).is_ok());
+
+    let s5_s8_control =
+        create_session_response_with_endpoint_roles(7, INTERFACE_TYPE_S2B_U_PGW_GTP_U);
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&s5_s8_control, procedure_context()),
+        Err(
+            s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch
+        )
+    );
+    assert!(S2bMessage::decode(&s5_s8_control, procedure_context()).is_err());
+
+    let s5_s8_user_plane =
+        create_session_response_with_endpoint_roles(INTERFACE_TYPE_S2B_PGW_GTP_C, 5);
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&s5_s8_user_plane, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch)
+    );
+    assert!(S2bMessage::decode(&s5_s8_user_plane, procedure_context()).is_err());
+}
+
+#[test]
+fn create_session_response_receive_policy_requires_instance_four_user_plane_endpoint() {
+    let policy = S2bCreateSessionResponseReceivePolicy::STRICT
+        .allow_s5_s8_pgw_control()
+        .allow_s5_s8_pgw_user_plane();
+    let control = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x1020_3040,
+        Some([192, 0, 2, 44]),
+        None,
+    );
+    let wrong_instance_cases = [
+        (
+            "strict S2b-U role in the instance-0 S1-U slot",
+            raw_f_teid_ie(
+                0,
+                INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                0x5060_7080,
+                Some([198, 51, 100, 55]),
+                None,
+            ),
+        ),
+        (
+            "opted-in S5/S8 role in another table-defined slot",
+            raw_f_teid_ie(2, 5, 0x6070_8090, Some([198, 51, 100, 56]), None),
+        ),
+    ];
+
+    for (label, wrong_instance) in wrong_instance_cases {
+        let bearer_context = bearer_context_with_f_teids(&[wrong_instance]);
+        let response = create_session_response_with_projection_ies(
+            Some(0x0102_0304),
+            0x0000_2000,
+            &[CAUSE_IE, control.as_slice(), bearer_context.as_slice()],
+        );
+        assert_eq!(
+            decode_create_session_response_summary_with_receive_policy(
+                &response,
+                procedure_context(),
+                policy,
+            ),
+            Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn structural_message_and_view_projection_overloads_remain_strict() {
+    let response = create_session_response_with_endpoint_roles(7, 5);
+    let structural_context = DecodeContext {
+        validation_level: ValidationLevel::Structural,
+        ..DecodeContext::default()
+    };
+    let (tail, message) = S2bMessage::decode(&response, structural_context)
+        .expect("structural decode does not opt into receive roles");
+    assert!(tail.is_empty());
+    let expected = Err(
+        s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch,
+    );
+    assert_eq!(message.create_session_response_summary(), expected);
+    let view = message
+        .as_view()
+        .unwrap_or_else(|| panic!("Create Session Response needs a typed view"));
+    assert_eq!(view.create_session_response_summary(), expected);
+}
+
+#[test]
+fn finite_create_session_response_receive_policy_matrix_projects_exact_roles() {
+    let strict = S2bCreateSessionResponseReceivePolicy::STRICT;
+    let control = strict.allow_s5_s8_pgw_control();
+    let user_plane = strict.allow_s5_s8_pgw_user_plane();
+    let both = control.allow_s5_s8_pgw_user_plane();
+    let policies = [
+        ("strict", strict, false, false),
+        ("control", control, true, false),
+        ("user-plane", user_plane, false, true),
+        ("both", both, true, true),
+    ];
+    let control_roles = [(INTERFACE_TYPE_S2B_PGW_GTP_C, false), (7, true)];
+    let user_plane_roles = [(INTERFACE_TYPE_S2B_U_PGW_GTP_U, false), (5, true)];
+
+    for (policy_name, policy, allows_s5_s8_control, allows_s5_s8_user_plane) in policies {
+        for (control_interface_type, is_s5_s8_control) in control_roles {
+            for (user_plane_interface_type, is_s5_s8_user_plane) in user_plane_roles {
+                let response = create_session_response_with_endpoint_roles(
+                    control_interface_type,
+                    user_plane_interface_type,
+                );
+                let result = decode_create_session_response_summary_with_receive_policy(
+                    &response,
+                    procedure_context(),
+                    policy,
+                );
+                let label = format!(
+                    "{policy_name}: control={control_interface_type}, user={user_plane_interface_type}"
+                );
+                if is_s5_s8_control && !allows_s5_s8_control {
+                    assert_eq!(
+                        result,
+                        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch),
+                        "{label}"
+                    );
+                    continue;
+                }
+                if is_s5_s8_user_plane && !allows_s5_s8_user_plane {
+                    assert_eq!(
+                        result,
+                        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch),
+                        "{label}"
+                    );
+                    continue;
+                }
+
+                let summary = result.unwrap_or_else(|error| panic!("{label} failed: {error:?}"));
+                let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+                    panic!("{label} projected as rejected");
+                };
+                assert_eq!(
+                    accepted.pgw_control_f_teid.interface_type, control_interface_type,
+                    "{label}"
+                );
+                assert_eq!(accepted.pgw_control_f_teid.teid, 0x1020_3040, "{label}");
+                assert_eq!(
+                    accepted.pgw_control_f_teid.ipv4,
+                    Some([192, 0, 2, 44]),
+                    "{label}"
+                );
+                assert_eq!(
+                    accepted.bearer_user_plane_f_teid.interface_type, user_plane_interface_type,
+                    "{label}"
+                );
+                assert_eq!(
+                    accepted.bearer_user_plane_f_teid.teid, 0x5060_7080,
+                    "{label}"
+                );
+                assert_eq!(
+                    accepted.bearer_user_plane_f_teid.ipv4,
+                    Some([198, 51, 100, 55]),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    assert_eq!(strict, S2bCreateSessionResponseReceivePolicy::default());
+    assert_eq!(strict, S2bCreateSessionResponseReceivePolicy::STRICT);
+}
+
+#[test]
+fn create_session_response_receive_policy_role_sets_cannot_be_swapped_or_widened() {
+    let policy = s2b::S2bCreateSessionResponseReceivePolicy::STRICT
+        .allow_s5_s8_pgw_control()
+        .allow_s5_s8_pgw_user_plane();
+    let cases = [
+        (
+            "swapped finite role codes",
+            5,
+            7,
+            s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch,
+        ),
+        (
+            "unknown control role",
+            6,
+            INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+            s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch,
+        ),
+        (
+            "unknown user-plane role",
+            INTERFACE_TYPE_S2B_PGW_GTP_C,
+            4,
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch,
+        ),
+    ];
+
+    for (label, control_interface_type, user_plane_interface_type, expected) in cases {
+        let response = create_session_response_with_endpoint_roles(
+            control_interface_type,
+            user_plane_interface_type,
+        );
+        let error = s2b::decode_create_session_response_summary_with_receive_policy(
+            &response,
+            procedure_context(),
+            policy,
+        )
+        .unwrap_err();
+        assert_eq!(error, expected, "{label}");
+        assert_eq!(error.to_string(), error.as_str(), "{label}");
+    }
+}
+
+#[test]
+fn create_session_response_receive_policy_keeps_first_singleton_occurrences() {
+    let policy = s2b::S2bCreateSessionResponseReceivePolicy::STRICT
+        .allow_s5_s8_pgw_control()
+        .allow_s5_s8_pgw_user_plane();
+    let receive_context = DecodeContext {
+        duplicate_ie_policy: DuplicateIePolicy::Last,
+        validation_level: ValidationLevel::ProcedureAware,
+        ..DecodeContext::default()
+    };
+
+    let invalid_control = raw_f_teid_ie(1, 6, 0x1111_1111, Some([192, 0, 2, 1]), None);
+    let valid_control = raw_f_teid_ie(1, 7, 0x2222_2222, Some([192, 0, 2, 2]), None);
+    let user_plane = raw_f_teid_ie(4, 5, 0x3333_3333, Some([198, 51, 100, 3]), None);
+    let bearer_context = bearer_context_with_f_teids(&[user_plane]);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            invalid_control.as_slice(),
+            valid_control.as_slice(),
+            bearer_context.as_slice(),
+        ],
+    );
+    assert_eq!(
+        s2b::decode_create_session_response_summary_with_receive_policy(
+            &response,
+            receive_context,
+            policy,
+        ),
+        Err(
+            s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch
+        )
+    );
+
+    let control = raw_f_teid_ie(1, 7, 0x4444_4444, Some([192, 0, 2, 4]), None);
+    let invalid_user_plane = raw_f_teid_ie(4, 4, 0x5555_5555, Some([198, 51, 100, 5]), None);
+    let valid_user_plane = raw_f_teid_ie(4, 5, 0x6666_6666, Some([198, 51, 100, 6]), None);
+    let bearer_context = bearer_context_with_f_teids(&[invalid_user_plane, valid_user_plane]);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, control.as_slice(), bearer_context.as_slice()],
+    );
+    assert_eq!(
+        s2b::decode_create_session_response_summary_with_receive_policy(
+            &response,
+            receive_context,
+            policy,
+        ),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch)
+    );
+
+    let retained_user_plane = raw_f_teid_ie(4, 5, 0x6767_6767, Some([198, 51, 100, 67]), None);
+    let malformed_later_user_plane = raw_f_teid_ie(4, 5, 0x6868_6868, None, None);
+    let bearer_context =
+        bearer_context_with_f_teids(&[retained_user_plane, malformed_later_user_plane]);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, control.as_slice(), bearer_context.as_slice()],
+    );
+    let summary = s2b::decode_create_session_response_summary_with_receive_policy(
+        &response,
+        receive_context,
+        policy,
+    )
+    .expect("a malformed later nested duplicate is ignored before value decode");
+    let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+        panic!("accepted response projected as rejected");
+    };
+    assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0x6767_6767);
+
+    let other_role = raw_f_teid_ie(1, 4, 0x7777_7777, Some([198, 51, 100, 7]), None);
+    let accepted_role = raw_f_teid_ie(4, 5, 0x8888_8888, Some([198, 51, 100, 8]), None);
+    let bearer_context = bearer_context_with_f_teids(&[other_role, accepted_role]);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, control.as_slice(), bearer_context.as_slice()],
+    );
+    let summary = s2b::decode_create_session_response_summary_with_receive_policy(
+        &response,
+        receive_context,
+        policy,
+    )
+    .expect("a distinct nested singleton does not poison the accepted role");
+    let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+        panic!("accepted response projected as rejected");
+    };
+    assert_eq!(accepted.bearer_user_plane_f_teid.interface_type, 5);
+    assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0x8888_8888);
+
+    let strict_control = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x8989_8989,
+        Some([192, 0, 2, 9]),
+        None,
+    );
+    let invalid_first_role = raw_f_teid_ie(4, 4, 0x9090_9090, Some([198, 51, 100, 9]), None);
+    let first_bearer_context = bearer_context_with_f_teids(&[invalid_first_role]);
+    let valid_later_role = raw_f_teid_ie(4, 5, 0x9191_9191, Some([198, 51, 100, 10]), None);
+    let later_bearer_context = bearer_context_with_f_teids(&[valid_later_role]);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            strict_control.as_slice(),
+            first_bearer_context.as_slice(),
+            later_bearer_context.as_slice(),
+        ],
+    );
+    assert_eq!(
+        s2b::decode_create_session_response_summary_with_receive_policy(
+            &response,
+            receive_context,
+            policy,
+        ),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch)
+    );
+    assert!(
+        S2bMessage::decode(&response, receive_context).is_err(),
+        "generic ProcedureAware validation must retain the same first Bearer Context"
+    );
+}
+
+#[test]
+fn create_session_response_receive_policy_preserves_endpoint_failures_and_privacy() {
+    let policy = s2b::S2bCreateSessionResponseReceivePolicy::STRICT
+        .allow_s5_s8_pgw_control()
+        .allow_s5_s8_pgw_user_plane();
+    let valid_user_plane = raw_f_teid_ie(4, 5, 0xa1a2_a3a4, Some([198, 51, 100, 77]), None);
+    let bearer_context = bearer_context_with_f_teids(&[valid_user_plane]);
+    let missing_user_plane_context = bearer_context_with_f_teids(&[]);
+    let missing_address_user_plane = raw_f_teid_ie(4, 5, 0xc1c2_c3c4, None, None);
+    let malformed_user_plane_context = bearer_context_with_f_teids(&[missing_address_user_plane]);
+    let valid_control = raw_f_teid_ie(1, 7, 0xd1d2_d3d4, Some([192, 0, 2, 65]), None);
+    let strict_control = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0xe1e2_e3e4,
+        Some([192, 0, 2, 64]),
+        None,
+    );
+    let zero_control = raw_f_teid_ie(1, 7, 0, Some([192, 0, 2, 66]), None);
+    let missing_address_control = raw_f_teid_ie(1, 7, 0xb1b2_b3b4, None, None);
+    let missing_user_plane_response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            strict_control.as_slice(),
+            missing_user_plane_context.as_slice(),
+        ],
+    );
+    assert!(
+        S2bMessage::decode(&missing_user_plane_response, procedure_context()).is_ok(),
+        "generic ProcedureAware decoding preserves EBI-only compatibility"
+    );
+    let cases = [
+        (
+            "missing control",
+            create_session_response_with_projection_ies(
+                Some(0x0102_0304),
+                0x0000_2000,
+                &[CAUSE_IE, bearer_context.as_slice()],
+            ),
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid,
+        ),
+        (
+            "missing user-plane endpoint",
+            missing_user_plane_response,
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid,
+        ),
+        (
+            "missing user-plane address",
+            create_session_response_with_projection_ies(
+                Some(0x0102_0304),
+                0x0000_2000,
+                &[
+                    CAUSE_IE,
+                    valid_control.as_slice(),
+                    malformed_user_plane_context.as_slice(),
+                ],
+            ),
+            s2b::CreateSessionResponseSummaryError::MalformedResponse,
+        ),
+        (
+            "zero control TEID",
+            create_session_response_with_projection_ies(
+                Some(0x0102_0304),
+                0x0000_2000,
+                &[CAUSE_IE, zero_control.as_slice(), bearer_context.as_slice()],
+            ),
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid,
+        ),
+        (
+            "missing control address",
+            create_session_response_with_projection_ies(
+                Some(0x0102_0304),
+                0x0000_2000,
+                &[
+                    CAUSE_IE,
+                    missing_address_control.as_slice(),
+                    bearer_context.as_slice(),
+                ],
+            ),
+            s2b::CreateSessionResponseSummaryError::MalformedResponse,
+        ),
+    ];
+
+    for (label, response, expected) in cases {
+        let error = s2b::decode_create_session_response_summary_with_receive_policy(
+            &response,
+            procedure_context(),
+            policy,
+        )
+        .unwrap_err();
+        assert_eq!(error, expected, "{label}");
+        let rendered = format!("{error:?} {error}");
+        for private_fragment in [
+            "2711790500",
+            "2981278644",
+            "3250766788",
+            "3520254932",
+            "192, 0, 2, 65",
+            "192, 0, 2, 66",
+            "198, 51, 100, 77",
+        ] {
+            assert!(!rendered.contains(private_fragment), "{label}: {rendered}");
+        }
+    }
+
+    let policy_debug = format!("{policy:?}");
+    assert!(!policy_debug.contains("192, 0, 2"));
+    assert!(!policy_debug.contains("198, 51, 100"));
+    assert!(!policy_debug.contains("2711790500"));
+
+    let private_response_teid = 0xf1e2_d3c4;
+    let rejected_response = create_session_response_with_projection_ies(
+        Some(private_response_teid),
+        0x0000_2000,
+        &[REJECTED_CAUSE_IE],
+    );
+    let rejected = s2b::decode_create_session_response_summary_with_receive_policy(
+        &rejected_response,
+        procedure_context(),
+        policy,
+    )
+    .expect("rejected response projection remains policy-independent");
+    let rejected_debug = format!("{rejected:?}");
+    assert!(rejected_debug.contains("response_teid_present"));
+    assert!(
+        !rejected_debug.contains(&private_response_teid.to_string()),
+        "rejected summary leaked its response TEID: {rejected_debug}"
+    );
+}
+
+#[test]
+fn create_session_response_receive_policy_preserves_user_plane_zero_teid_behavior() {
+    let control = raw_f_teid_ie(1, 7, 0x1020_3040, Some([192, 0, 2, 90]), None);
+    let user_plane = raw_f_teid_ie(4, 5, 0, Some([198, 51, 100, 90]), None);
+    let bearer_context = bearer_context_with_f_teids(&[user_plane]);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[CAUSE_IE, control.as_slice(), bearer_context.as_slice()],
+    );
+    let policy = S2bCreateSessionResponseReceivePolicy::STRICT
+        .allow_s5_s8_pgw_control()
+        .allow_s5_s8_pgw_user_plane();
+
+    let summary = decode_create_session_response_summary_with_receive_policy(
+        &response,
+        procedure_context(),
+        policy,
+    )
+    .expect("the existing user-plane zero-TEID behavior remains unchanged");
+    let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+        panic!("accepted response projected as rejected");
+    };
+    assert_eq!(accepted.bearer_user_plane_f_teid.interface_type, 5);
+    assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0);
 }
 
 #[test]
