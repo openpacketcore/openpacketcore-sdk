@@ -89,6 +89,42 @@ const ECP_521_SHARED_SECRET_LEN: usize = 66;
 const MODP_GENERATOR_TWO: u64 = 2;
 const MODP_PRIVATE_REJECTION_LIMIT: usize = 64;
 
+/// Nonce-length policy for the coupled initial IKE SA and initial Child SA.
+///
+/// The default is strict: both nonces must be at least half the selected PRF
+/// output length, in addition to the RFC 7296 16-to-256-octet bounds. The
+/// legacy variant is deliberately narrow and may be used only with the
+/// `derive_*initial*` APIs: it accepts a 16-octet *initiator* nonce for
+/// PRF-HMAC-SHA2-512 when the responder nonce still meets the normal 32-octet
+/// floor. It never relaxes CREATE_CHILD_SA or IKE-SA rekey derivation.
+///
+/// This value carries policy only; it neither retains nor exposes nonce or key
+/// bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Ikev2InitialExchangeNoncePolicy {
+    /// Require both nonces to meet the selected PRF preferred key-length floor.
+    #[default]
+    Strict,
+    /// Permit the documented 16-octet legacy initiator nonce only for
+    /// PRF-HMAC-SHA2-512 in an initial exchange.
+    AllowLegacyInitiatorPrfHmacSha2_512Minimum,
+}
+
+impl Ikev2InitialExchangeNoncePolicy {
+    /// Return the standards-strict default policy.
+    #[must_use]
+    pub const fn strict() -> Self {
+        Self::Strict
+    }
+
+    /// Return the narrow compatibility policy for the observed legacy
+    /// PRF-HMAC-SHA2-512 initiator nonce behavior.
+    #[must_use]
+    pub const fn allow_legacy_initiator_prf_hmac_sha2_512_minimum() -> Self {
+        Self::AllowLegacyInitiatorPrfHmacSha2_512Minimum
+    }
+}
+
 // RFC 2409 section 6.1, Oakley Group 1.
 const MODP_768_PRIME_HEX: &str = concat!(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
@@ -1706,6 +1742,10 @@ impl Error for Ikev2SaInitCryptoError {}
 /// `ppk` is an optional RFC 8784 Post-quantum Preshared Key. When supplied,
 /// only SK_d, SK_pi, and SK_pr are re-derived with `prf+ (PPK, SK_*')`; the
 /// encryption and integrity keys remain the standard RFC 7296 outputs.
+/// This strict default requires both nonces to meet the selected PRF preferred
+/// key-length floor. Use
+/// [`derive_ike_sa_init_key_material_with_nonce_policy`] only when an explicit
+/// initial-exchange compatibility policy is required.
 ///
 /// # Errors
 ///
@@ -1720,8 +1760,44 @@ pub fn derive_ike_sa_init_key_material(
     dh_shared_secret: &[u8],
     ppk: Option<&[u8]>,
 ) -> Result<Ikev2SaInitKeyMaterial, Ikev2SaInitCryptoError> {
-    validate_nonce("initiator", initiator_nonce)?;
-    validate_nonce("responder", responder_nonce)?;
+    derive_ike_sa_init_key_material_with_nonce_policy(
+        profile,
+        initiator_spi,
+        responder_spi,
+        initiator_nonce,
+        responder_nonce,
+        dh_shared_secret,
+        ppk,
+        Ikev2InitialExchangeNoncePolicy::Strict,
+    )
+}
+
+/// Derive initial IKE SA material under an explicit initial-exchange nonce policy.
+///
+/// Callers that opt into [`Ikev2InitialExchangeNoncePolicy::AllowLegacyInitiatorPrfHmacSha2_512Minimum`]
+/// must use the same policy with [`derive_initial_child_sa_key_material`] for
+/// the mandatory initial Child SA. This is intentionally a separate API from
+/// IKE-SA and Child-SA rekey derivation, which always retain strict nonce
+/// validation.
+///
+/// # Errors
+///
+/// Returns [`Ikev2SaInitCryptoError`] when the policy does not admit the
+/// nonce lengths, required secret inputs are empty, or PRF+ length limits
+/// would be exceeded.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_ike_sa_init_key_material_with_nonce_policy(
+    profile: Ikev2SaInitCryptoProfile,
+    initiator_spi: [u8; IKE_SPI_LEN],
+    responder_spi: [u8; IKE_SPI_LEN],
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+    dh_shared_secret: &[u8],
+    ppk: Option<&[u8]>,
+    nonce_policy: Ikev2InitialExchangeNoncePolicy,
+) -> Result<Ikev2SaInitKeyMaterial, Ikev2SaInitCryptoError> {
+    validate_initial_exchange_nonce(nonce_policy, "initiator", initiator_nonce, profile.prf)?;
+    validate_initial_exchange_nonce(nonce_policy, "responder", responder_nonce, profile.prf)?;
     // The admitted DH boundary validates the negotiated group and returns a
     // fixed-width secret. Keep this lower-level KDF boundary compatible with
     // independently supplied RFC 7296 test material while still rejecting an
@@ -1782,8 +1858,8 @@ pub fn derive_ike_sa_rekey_key_material(
 ) -> Result<Ikev2SaInitKeyMaterial, Ikev2SaInitCryptoError> {
     new_profile.validate_executable()?;
     validate_exact_key_len("old SK_d", old_sk_d, old_prf.output_len())?;
-    validate_nonce("initiator", initiator_nonce)?;
-    validate_nonce("responder", responder_nonce)?;
+    validate_nonce_for_prf("initiator", initiator_nonce, new_profile.prf)?;
+    validate_nonce_for_prf("responder", responder_nonce, new_profile.prf)?;
     validate_dh_shared_secret_len(new_profile.dh_group(), new_dh_shared_secret)?;
 
     let rekey_seed_len = new_dh_shared_secret
@@ -1828,7 +1904,9 @@ pub fn derive_ike_sa_rekey_key_material(
 /// Computes `prf+(SK_d, [g^ir(new) |] Ni | Nr)` and splits the output as
 /// `E_i2r | A_i2r | E_r2i | A_r2i` per RFC 7296 section 2.17. Pass
 /// `new_dh_shared_secret` for CREATE_CHILD_SA rekey with PFS; use `None` for
-/// the initial Child SA or a rekey without PFS.
+/// an initial Child SA without PFS or a rekey without PFS. This generic helper
+/// always applies strict nonce validation; callers using initial-exchange
+/// compatibility must use [`derive_initial_child_sa_key_material`] instead.
 ///
 /// # Errors
 ///
@@ -1842,9 +1920,67 @@ pub fn derive_child_sa_key_material(
     responder_nonce: &[u8],
     new_dh_shared_secret: Option<&[u8]>,
 ) -> Result<Ikev2ChildSaKeyMaterial, Ikev2SaInitCryptoError> {
+    derive_child_sa_key_material_with_initial_exchange_nonce_policy(
+        profile,
+        sk_d,
+        initiator_nonce,
+        responder_nonce,
+        new_dh_shared_secret,
+        None,
+    )
+}
+
+/// Derive the mandatory initial Child SA KEYMAT under an explicit initial-exchange
+/// nonce policy.
+///
+/// This is the only Child-SA derivation API that can use
+/// [`Ikev2InitialExchangeNoncePolicy::AllowLegacyInitiatorPrfHmacSha2_512Minimum`].
+/// It keeps the parent IKE SA and mandatory initial Child SA on the same
+/// caller-selected policy while leaving [`derive_child_sa_key_material`] strict
+/// for CREATE_CHILD_SA, including Child-SA rekey.
+///
+/// # Errors
+///
+/// Returns [`Ikev2SaInitCryptoError`] when the policy does not admit the nonce
+/// lengths, profile/key lengths are inconsistent, the optional new DH secret
+/// is empty, or PRF+ cannot produce the requested amount.
+pub fn derive_initial_child_sa_key_material(
+    profile: Ikev2ChildSaCryptoProfile,
+    sk_d: &[u8],
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+    new_dh_shared_secret: Option<&[u8]>,
+    nonce_policy: Ikev2InitialExchangeNoncePolicy,
+) -> Result<Ikev2ChildSaKeyMaterial, Ikev2SaInitCryptoError> {
+    derive_child_sa_key_material_with_initial_exchange_nonce_policy(
+        profile,
+        sk_d,
+        initiator_nonce,
+        responder_nonce,
+        new_dh_shared_secret,
+        Some(nonce_policy),
+    )
+}
+
+fn derive_child_sa_key_material_with_initial_exchange_nonce_policy(
+    profile: Ikev2ChildSaCryptoProfile,
+    sk_d: &[u8],
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+    new_dh_shared_secret: Option<&[u8]>,
+    initial_exchange_nonce_policy: Option<Ikev2InitialExchangeNoncePolicy>,
+) -> Result<Ikev2ChildSaKeyMaterial, Ikev2SaInitCryptoError> {
     validate_exact_key_len("SK_d", sk_d, profile.prf.output_len())?;
-    validate_nonce_for_prf("initiator", initiator_nonce, profile.prf)?;
-    validate_nonce_for_prf("responder", responder_nonce, profile.prf)?;
+    match initial_exchange_nonce_policy {
+        Some(policy) => {
+            validate_initial_exchange_nonce(policy, "initiator", initiator_nonce, profile.prf)?;
+            validate_initial_exchange_nonce(policy, "responder", responder_nonce, profile.prf)?;
+        }
+        None => {
+            validate_nonce_for_prf("initiator", initiator_nonce, profile.prf)?;
+            validate_nonce_for_prf("responder", responder_nonce, profile.prf)?;
+        }
+    }
     if let Some(secret) = new_dh_shared_secret {
         validate_secret_input("new DH shared secret", secret)?;
     }
@@ -1998,6 +2134,32 @@ fn validate_nonce_for_prf(
         });
     }
     Ok(())
+}
+
+fn validate_initial_exchange_nonce(
+    policy: Ikev2InitialExchangeNoncePolicy,
+    role: &'static str,
+    nonce: &[u8],
+    prf: Ikev2PrfAlgorithm,
+) -> Result<(), Ikev2SaInitCryptoError> {
+    validate_nonce(role, nonce)?;
+    if nonce.len() >= prf.output_len().div_ceil(2)
+        || matches!(
+            (policy, role, prf, nonce.len()),
+            (
+                Ikev2InitialExchangeNoncePolicy::AllowLegacyInitiatorPrfHmacSha2_512Minimum,
+                "initiator",
+                Ikev2PrfAlgorithm::HmacSha2_512,
+                IKEV2_NONCE_MIN_LEN,
+            )
+        )
+    {
+        return Ok(());
+    }
+    Err(Ikev2SaInitCryptoError::InvalidNonceLength {
+        role,
+        len: nonce.len(),
+    })
 }
 
 fn validate_exact_key_len(
@@ -4149,6 +4311,135 @@ mod tests {
                 None,
             )),
             Ikev2SaInitCryptoError::InconsistentTransformSet
+        );
+    }
+
+    #[test]
+    fn initial_exchange_legacy_sha512_nonce_policy_is_coherent_and_rekeys_stay_strict() {
+        crate::test_support::ensure_ike_crypto();
+        // Byte-synthetic interoperability vector: the parent IKE SA retains
+        // legacy MODP-768, while the mandatory initial Child SA uses a
+        // MODP-2048-sized PFS secret. No private/non-test key material is
+        // logged or retained by the API.
+        let parent_profile = must_ok(Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2DhGroup::Modp768,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+            Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+        ));
+        let child_profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+            Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+        );
+        let initiator_nonce: Vec<u8> = (0x00..0x10).collect();
+        let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
+        let parent_dh_shared_secret = [0x5a; MODP_768_SHARED_SECRET_LEN];
+        let initial_child_dh_shared_secret = [0x73; MODP_2048_SHARED_SECRET_LEN];
+        assert_eq!(
+            initial_child_dh_shared_secret.len(),
+            Ikev2DhGroup::Modp2048.shared_secret_len()
+        );
+
+        // RED: default initial-IKE and the generic CREATE_CHILD_SA helper both
+        // fail closed before any material is returned.
+        assert_eq!(
+            must_err(derive_ike_sa_init_key_material(
+                parent_profile,
+                [0x11; IKE_SPI_LEN],
+                [0x22; IKE_SPI_LEN],
+                &initiator_nonce,
+                &responder_nonce,
+                &parent_dh_shared_secret,
+                None,
+            )),
+            Ikev2SaInitCryptoError::InvalidNonceLength {
+                role: "initiator",
+                len: IKEV2_NONCE_MIN_LEN,
+            }
+        );
+        assert_eq!(
+            must_err(derive_child_sa_key_material(
+                child_profile,
+                &[0x0f; 64],
+                &initiator_nonce,
+                &responder_nonce,
+                Some(&initial_child_dh_shared_secret),
+            )),
+            Ikev2SaInitCryptoError::InvalidNonceLength {
+                role: "initiator",
+                len: IKEV2_NONCE_MIN_LEN,
+            }
+        );
+
+        // GREEN: one explicit policy is supplied to both members of the
+        // initial exchange, producing the independently calculated vector.
+        let nonce_policy =
+            Ikev2InitialExchangeNoncePolicy::allow_legacy_initiator_prf_hmac_sha2_512_minimum();
+        let parent = must_ok(derive_ike_sa_init_key_material_with_nonce_policy(
+            parent_profile,
+            [0x11; IKE_SPI_LEN],
+            [0x22; IKE_SPI_LEN],
+            &initiator_nonce,
+            &responder_nonce,
+            &parent_dh_shared_secret,
+            None,
+            nonce_policy,
+        ));
+        assert_eq!(
+            parent.sk_d(),
+            hex_to_bytes(concat!(
+                "1ef8043115a66058857ef6e5d2f006c1ef36e5dc6bcb72410b0a9159c13fd120",
+                "e721057c8a270edda2eb41fafbe12747eea208a146d915e81a3258edc5324b4e"
+            ))
+        );
+        let child = must_ok(derive_initial_child_sa_key_material(
+            child_profile,
+            parent.sk_d(),
+            &initiator_nonce,
+            &responder_nonce,
+            Some(&initial_child_dh_shared_secret),
+            nonce_policy,
+        ));
+        assert_eq!(
+            child.initiator_to_responder_encryption(),
+            hex_to_bytes("f515d2922e309f3f74fe496779b65c14d05c714b1c2937fdecc2c4e47424b847")
+        );
+        assert_eq!(
+            child.initiator_to_responder_integrity(),
+            hex_to_bytes(concat!(
+                "a2d8a1820e41ccfec135959c6538891a450d4f3d338bc057ffd4b830757fdedb",
+                "8e8838c2013da09a476f8046be728f642b59eeba19ace67a34ada81853584a94"
+            ))
+        );
+        assert_eq!(
+            child.responder_to_initiator_encryption(),
+            hex_to_bytes("4056a3c5a657900db0ffbff65f363d84949e648ab3c0a8eb43801390b0cd1030")
+        );
+        assert_eq!(
+            child.responder_to_initiator_integrity(),
+            hex_to_bytes(concat!(
+                "05cadbdbfbc86f17ed91309d4c3d800279f1f3c86e512acc6e126fa1020ac576",
+                "3fd79e62f3640138f8a6f60cf1d0af036ec91836ec54b9aaceae033631e2d7ec"
+            ))
+        );
+
+        // IKE-SA rekey has no compatibility entry point and remains strict.
+        assert_eq!(
+            must_err(derive_ike_sa_rekey_key_material(
+                Ikev2PrfAlgorithm::HmacSha2_512,
+                &[0x44; 64],
+                parent_profile,
+                [0x55; IKE_SPI_LEN],
+                [0x66; IKE_SPI_LEN],
+                &initiator_nonce,
+                &responder_nonce,
+                &parent_dh_shared_secret,
+            )),
+            Ikev2SaInitCryptoError::InvalidNonceLength {
+                role: "initiator",
+                len: IKEV2_NONCE_MIN_LEN,
+            }
         );
     }
 

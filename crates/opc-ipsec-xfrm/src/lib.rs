@@ -285,9 +285,10 @@ pub use error::XfrmError;
 pub use ikev2::{
     build_xfrm_requests_from_ikev2_child_sa, build_xfrm_requests_from_ikev2_child_sa_with_options,
     build_xfrm_requests_from_ikev2_child_sa_with_request_id, derive_child_sa_xfrm_keys,
-    Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError, Ikev2ChildSaXfrmError,
-    Ikev2ChildSaXfrmKeys, Ikev2ChildSaXfrmOptions, Ikev2ChildSaXfrmOptionsError,
-    Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests, IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
+    derive_initial_child_sa_xfrm_keys, Ikev2ChildSaDirectionalXfrmKeys,
+    Ikev2ChildSaKeyMaterialError, Ikev2ChildSaXfrmError, Ikev2ChildSaXfrmKeys,
+    Ikev2ChildSaXfrmOptions, Ikev2ChildSaXfrmOptionsError, Ikev2ChildSaXfrmRequest,
+    Ikev2ChildSaXfrmRequests, IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
 };
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
