@@ -6487,6 +6487,15 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     {
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
+    // Capture this exact released source form before recovery migration
+    // rewrites its SQLite CREATE text.  The marker is written later in this
+    // same outer transaction, after current snapshot metadata and membership
+    // scope are independently validated; a crash is therefore either wholly
+    // pre-upgrade or leaves durable provenance for the reseed retry.
+    let released_cursor_only_recovery_source = authority_profile
+        == ConsensusAuthorityProfile::FixedImmutable
+        && released_cursor_only_operator_recovery_schema_is_exact_in_sync(&tx)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     ensure_operator_recovery_schema_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     ensure_fenced_transition_receipt_ledger_activation_sync(&tx, storage_identity).map_err(
@@ -6515,6 +6524,23 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     if identity_table_exists {
         validate_existing_schema(&tx, storage_identity)?;
+    }
+    // Do not preserve compatibility provenance merely because a raw DDL form
+    // matched. The source database must first pass every current-state and
+    // fixed-quorum authority check in this very transaction; only then may a
+    // retry reconstruct a sealed successor from the DB/log authority.
+    validate_durable_authority_for_raw_access(
+        &tx,
+        storage_identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )
+    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    if released_cursor_only_recovery_source {
+        arm_legacy_fixed_snapshot_reseed_sync(&tx, storage_identity)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     }
 
     let scope = read_membership_scope_sync(&tx, storage_identity)
@@ -20013,6 +20039,75 @@ CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
 );
 "#;
 
+// These are the three exact cursor-only physical layouts emitted by the
+// released pre-V2 SDK. Keep their CREATE text separate from the current
+// migration inputs: SQLite preserves the original text and appends ALTERs, so
+// the direct, add-on, and migrated products are distinct admission forms.
+const RELEASED_CURSOR_ONLY_DIRECT_OPERATOR_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
+const RELEASED_CURSOR_ONLY_ADD_ON_OPERATOR_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
+#[derive(Clone, Copy, Debug)]
+enum ReleasedCursorOnlyOperatorRecoverySchema {
+    Direct,
+    AddOn,
+    Migrated,
+}
+
+fn install_released_cursor_only_operator_recovery_schema_sync(
+    conn: &Connection,
+    schema: ReleasedCursorOnlyOperatorRecoverySchema,
+) -> io::Result<()> {
+    match schema {
+        ReleasedCursorOnlyOperatorRecoverySchema::Direct => conn
+            .execute_batch(RELEASED_CURSOR_ONLY_DIRECT_OPERATOR_RECOVERY_SCHEMA)
+            .map_err(db_error),
+        ReleasedCursorOnlyOperatorRecoverySchema::AddOn => conn
+            .execute_batch(RELEASED_CURSOR_ONLY_ADD_ON_OPERATOR_RECOVERY_SCHEMA)
+            .map_err(db_error),
+        ReleasedCursorOnlyOperatorRecoverySchema::Migrated => {
+            conn.execute_batch(PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA)
+                .map_err(db_error)?;
+            conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
+                .map_err(db_error)
+        }
+    }
+}
+
 // The last released V2-certificate table predates the durable activation
 // fence.  Keep its two exact physical products solely to migrate a complete
 // certificate pair to the one-way marker; it is never an accepted post-fence
@@ -20084,6 +20179,120 @@ const OPERATOR_RECOVERY_FINALIZE_LOG_MIGRATION: &str = "ALTER TABLE consensus_op
 const OPERATOR_RECOVERY_FINALIZE_CERTIFICATE_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN finalize_entry_json BLOB CHECK (finalize_entry_json IS NULL OR length(finalize_entry_json) BETWEEN 1 AND 16384);";
 const OPERATOR_RECOVERY_V2_ACTIVATION_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN recovery_v2_activated INTEGER NOT NULL DEFAULT 0 CHECK (recovery_v2_activated IN (0, 1));";
 
+// This table is deliberately not part of `CONSENSUS_SCHEMA`: it is a
+// one-time, pre-fs-verity upgrade journal rather than replicated consensus
+// state.  It is created only in the same transaction which proves one of the
+// three released cursor-only recovery layouts, and is dropped only after a
+// sealed successor snapshot has replaced the exact recorded predecessor.
+const LEGACY_FIXED_SNAPSHOT_RESEED_SCHEMA: &str = r#"
+CREATE TABLE consensus_legacy_fixed_snapshot_reseed (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cluster_id BLOB NOT NULL CHECK (length(cluster_id) = 32),
+    configuration_id BLOB NOT NULL CHECK (length(configuration_id) = 32),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    meta_json BLOB NOT NULL CHECK (length(meta_json) BETWEEN 1 AND 16384),
+    file_name TEXT NOT NULL CHECK (length(file_name) > 0),
+    checksum BLOB NOT NULL CHECK (length(checksum) = 32),
+    byte_length INTEGER NOT NULL CHECK (byte_length > 0),
+    candidate_file_name TEXT CHECK (
+        candidate_file_name IS NULL OR length(candidate_file_name) > 0
+    ),
+    FOREIGN KEY(configuration_epoch)
+        REFERENCES consensus_identity(configuration_epoch)
+)
+"#;
+
+/// The exact pre-fs-verity current-snapshot record that a transaction which
+/// migrated an old cursor-only recovery table is permitted to reseed once.
+/// The old envelope is never content authority: these fields merely bind the
+/// bounded compatibility permission to one historical durable selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyFixedSnapshotReseed {
+    cluster_id: [u8; 32],
+    configuration_id: [u8; 32],
+    configuration_epoch: u64,
+    meta_json: Vec<u8>,
+    pub(crate) file_name: String,
+    pub(crate) checksum: [u8; 32],
+    pub(crate) byte_length: u64,
+    pub(crate) candidate_file_name: Option<String>,
+}
+
+type EncodedLegacyFixedSnapshotReseed = (
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    Vec<u8>,
+    String,
+    Vec<u8>,
+    i64,
+    Option<String>,
+);
+
+impl LegacyFixedSnapshotReseed {
+    pub(crate) fn matches_current(
+        &self,
+        identity: SessionConsensusIdentity,
+        current: &CurrentSnapshot,
+    ) -> io::Result<bool> {
+        Ok(self.cluster_id == *identity.cluster_id().as_bytes()
+            && self.configuration_id == *identity.configuration_id().as_bytes()
+            && self.configuration_epoch == identity.configuration_epoch().get()
+            && self.meta_json == encode_json(&current.0)?
+            && self.file_name == current.1
+            && self.checksum == current.2
+            && self.byte_length == current.3)
+    }
+}
+
+/// Classify only the three cursor-only recovery layouts emitted by the last
+/// SDK before fixed snapshots acquired fs-verity seals.  This runs before the
+/// writable recovery migration rewrites the source DDL, so its result is the
+/// durable provenance for the one-time snapshot reseed journal below.
+fn released_cursor_only_operator_recovery_schema_is_exact_in_sync(
+    conn: &Connection,
+) -> io::Result<bool> {
+    if !table_exists(conn, "consensus_operator_recovery").map_err(db_error)? {
+        return Ok(false);
+    }
+    let observed = conn
+        .query_row(
+            "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) \
+             FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+            [CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((Some(observed), observed_length)) = observed else {
+        return Ok(false);
+    };
+    if observed_length > CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES {
+        return Ok(false);
+    }
+    let observed = normalize_schema_sql(&observed);
+    for schema in [
+        ReleasedCursorOnlyOperatorRecoverySchema::Direct,
+        ReleasedCursorOnlyOperatorRecoverySchema::AddOn,
+        ReleasedCursorOnlyOperatorRecoverySchema::Migrated,
+    ] {
+        let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+        install_released_cursor_only_operator_recovery_schema_sync(&canonical, schema)?;
+        let expected: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if observed == normalize_schema_sql(&expected) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn ensure_operator_recovery_schema_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -20116,13 +20325,26 @@ fn ensure_operator_recovery_schema_inner_sync(
 ) -> io::Result<()> {
     // Classify the untouched predecessor before CREATE IF NOT EXISTS or any
     // ALTER can make an incomplete L-only/partial pair look migratable.
+    let mut admitted_cursor_only_schema = false;
     if table_exists(conn, "consensus_operator_recovery").map_err(db_error)? {
         if !operator_recovery_certificate_table_schema_is_exact_in_sync(conn, false)? {
             return Err(invalid_data(
                 "session consensus recovery schema is not a released predecessor",
             ));
         }
+        let (has_finalize_log, has_finalize_certificate, _) =
+            raw_operator_recovery_finalize_columns_exist(conn, false)?;
+        let has_cursor = operator_recovery_cursor_column_exists(conn)?;
         validate_raw_operator_recovery_v2_finalize_certificate_sync(conn, identity, false)?;
+        admitted_cursor_only_schema = has_cursor && !has_finalize_log && !has_finalize_certificate;
+    }
+    // A cursor-only table has one of the exact released layouts admitted
+    // above. Rebuild it atomically to the current standalone layout instead
+    // of appending V2 columns to its historical CREATE text: the latter would
+    // create a new, never-released intermediate DDL product that the raw gate
+    // must not accept on a later reopen.
+    if admitted_cursor_only_schema {
+        rebuild_released_cursor_only_operator_recovery_schema_sync(conn)?;
     }
     conn.execute_batch(OPERATOR_RECOVERY_SCHEMA)
         .map_err(db_error)?;
@@ -20224,6 +20446,32 @@ fn ensure_operator_recovery_schema_inner_sync(
     // machine state, or identity binding is contradictory.
     let _ = validate_current_operator_recovery_image_sync(conn, identity)?;
     Ok(())
+}
+
+fn rebuild_released_cursor_only_operator_recovery_schema_sync(conn: &Connection) -> io::Result<()> {
+    // The outer migration savepoint keeps the source row, replacement table,
+    // and current-form restore atomic. This source was raw-gated before the
+    // copy, and the normal post-migration validator proves the restored row.
+    conn.execute_batch(
+        "CREATE TEMP TABLE released_cursor_only_operator_recovery AS \
+         SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+         FROM consensus_operator_recovery; \
+         DROP TABLE consensus_operator_recovery;",
+    )
+    .map_err(db_error)?;
+    conn.execute_batch(OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute_batch(
+        "INSERT INTO consensus_operator_recovery \
+            (singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+             pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) \
+         SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+         FROM released_cursor_only_operator_recovery; \
+         DROP TABLE released_cursor_only_operator_recovery;",
+    )
+    .map_err(db_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20655,6 +20903,29 @@ fn operator_recovery_certificate_schema_forms() -> io::Result<&'static BTreeSet<
     }
 
     let mut forms = BTreeSet::new();
+
+    // The pre-V2 release persisted exactly three cursor-only products. They
+    // have neither finalization column nor the activation fence, but are safe
+    // migration sources because each retains the complete cursor-era checks,
+    // singleton key, and identity foreign key. Do not infer this family from
+    // columns: only these immutable SQLite CREATE/ALTER products are admitted.
+    for schema in [
+        ReleasedCursorOnlyOperatorRecoverySchema::Direct,
+        ReleasedCursorOnlyOperatorRecoverySchema::AddOn,
+        ReleasedCursorOnlyOperatorRecoverySchema::Migrated,
+    ] {
+        let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+        install_released_cursor_only_operator_recovery_schema_sync(&canonical, schema)?;
+        let sql: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_operator_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        forms.insert(normalize_schema_sql(&sql));
+    }
 
     // The oldest writable predecessor has neither the cursor nor either
     // finalization column. It is still a released migration source, but an
@@ -36083,6 +36354,9 @@ pub(crate) fn finalize_captured_snapshot_database_into_sync(
         "#,
         )
         .map_err(db_error)?;
+    // This private, local upgrade journal is not consensus state.  A rebuilt
+    // successor must never carry permission to admit its old unsealed source.
+    strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(&destination)?;
     ops::rotate_restore_scan_epoch_sync(&destination)
         .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
     validate_existing_schema(&destination, identity)
@@ -36241,6 +36515,10 @@ fn capture_and_finalize_snapshot_database_sync(
             "#,
         )
         .map_err(db_error)?;
+    // This local upgrade journal authorizes only the source PVC's current
+    // pre-fs-verity artifact.  Never copy it into a rebuilt snapshot, where
+    // it could otherwise outlive the exact old file it was bound to.
+    strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(&raw_destination)?;
     ops::rotate_restore_scan_epoch_sync(&raw_destination)
         .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
     validate_existing_schema(&raw_destination, identity)
@@ -39213,6 +39491,21 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             ],
         )
         .map_err(db_error)?;
+        if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+            // The fixed installer reaches this transaction only after its
+            // published descriptor has passed the immutable-generation
+            // checks below. Couple the current-row switch and legacy permit
+            // removal so an interrupted install cannot leave the old permit
+            // applicable to the new selected file.
+            clear_legacy_fixed_snapshot_reseed_after_successor_sync(
+                &tx,
+                identity,
+                meta,
+                final_file_name,
+                checksum,
+                checked_positive_u64(byte_length)?,
+            )?;
+        }
         if let Some(snapshot_log_id) = incoming_last_log_id {
             // The producer deliberately omits its Raft log and purge row
             // from a portable snapshot image. Before publishing this selected
@@ -39569,6 +39862,18 @@ pub(crate) fn save_current_snapshot_with_authority_sync(
         )?;
     }
     save_current_snapshot_in_tx(&tx, identity, meta, file_name, checksum, byte_length)?;
+    // Fixed callers reach this point only after the successor's descriptor
+    // has been sealed and bound.  Clear the old compatibility journal in the
+    // same transaction as metadata replacement, so interruption cannot leave
+    // a permit that matches the newly selected snapshot.
+    clear_legacy_fixed_snapshot_reseed_after_successor_sync(
+        &tx,
+        identity,
+        meta,
+        file_name,
+        checksum,
+        byte_length,
+    )?;
     tx.commit().map_err(db_error)
 }
 
@@ -39677,6 +39982,288 @@ pub(crate) fn read_current_snapshot_sync(
     )))
 }
 
+/// Read the private compatibility journal.  Its existence is not a generic
+/// legacy mode: it must have the exact DDL, one row for this identity, and a
+/// complete current-snapshot binding before any caller may use it.
+pub(crate) fn read_legacy_fixed_snapshot_reseed_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<Option<LegacyFixedSnapshotReseed>> {
+    if !table_exists(conn, "consensus_legacy_fixed_snapshot_reseed").map_err(db_error)? {
+        return Ok(None);
+    }
+    if !schema_object_is_exact_in_sync(
+        conn,
+        false,
+        "table",
+        "consensus_legacy_fixed_snapshot_reseed",
+        LEGACY_FIXED_SNAPSHOT_RESEED_SCHEMA,
+    )? {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed journal is invalid",
+        ));
+    }
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM consensus_legacy_fixed_snapshot_reseed",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if rows != 1 {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed journal cardinality is invalid",
+        ));
+    }
+    let (
+        cluster_id,
+        configuration_id,
+        epoch,
+        meta_json,
+        file_name,
+        checksum,
+        byte_length,
+        candidate_file_name,
+    ): EncodedLegacyFixedSnapshotReseed = conn
+        .query_row(
+            "SELECT cluster_id, configuration_id, configuration_epoch, meta_json, \
+                    file_name, checksum, byte_length, candidate_file_name \
+             FROM consensus_legacy_fixed_snapshot_reseed WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map_err(db_error)?;
+    validate_epoch(epoch, identity)?;
+    let cluster_id: [u8; 32] = cluster_id.try_into().map_err(|_| {
+        invalid_data("session consensus legacy fixed snapshot reseed cluster is invalid")
+    })?;
+    let configuration_id: [u8; 32] = configuration_id.try_into().map_err(|_| {
+        invalid_data("session consensus legacy fixed snapshot reseed configuration is invalid")
+    })?;
+    if cluster_id != *identity.cluster_id().as_bytes()
+        || configuration_id != *identity.configuration_id().as_bytes()
+    {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed identity differs",
+        ));
+    }
+    validate_published_snapshot_file_name(&file_name)?;
+    if let Some(candidate_file_name) = candidate_file_name.as_deref() {
+        validate_published_snapshot_file_name(candidate_file_name)?;
+        if candidate_file_name == file_name {
+            return Err(invalid_data(
+                "session consensus legacy fixed snapshot reseed candidate matches predecessor",
+            ));
+        }
+    }
+    let checksum = checksum.try_into().map_err(|_| {
+        invalid_data("session consensus legacy fixed snapshot reseed checksum is invalid")
+    })?;
+    let meta: opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    > = decode_json(&meta_json)?;
+    if encode_json(&meta)? != meta_json {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed metadata is not canonical",
+        ));
+    }
+    Ok(Some(LegacyFixedSnapshotReseed {
+        cluster_id,
+        configuration_id,
+        configuration_epoch: checked_positive_u64(epoch)?,
+        meta_json,
+        file_name,
+        checksum,
+        byte_length: checked_positive_u64(byte_length)?,
+        candidate_file_name,
+    }))
+}
+
+/// Atomically bind an exact released recovery-schema migration to the one
+/// pre-fs-verity current snapshot it is allowed to replace.  This is called
+/// from the outer initialization transaction, never as a standalone repair.
+fn arm_legacy_fixed_snapshot_reseed_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    let Some(current) = read_current_snapshot_sync(conn, identity)? else {
+        return Ok(());
+    };
+    if table_exists(conn, "consensus_legacy_fixed_snapshot_reseed").map_err(db_error)? {
+        let existing =
+            read_legacy_fixed_snapshot_reseed_sync(conn, identity)?.ok_or_else(|| {
+                invalid_data("session consensus legacy fixed snapshot reseed journal is missing")
+            })?;
+        if existing.matches_current(identity, &current)? {
+            return Ok(());
+        }
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed journal conflicts with current snapshot",
+        ));
+    }
+    conn.execute_batch(LEGACY_FIXED_SNAPSHOT_RESEED_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute(
+        "INSERT INTO consensus_legacy_fixed_snapshot_reseed \
+         (singleton, cluster_id, configuration_id, configuration_epoch, meta_json, \
+          file_name, checksum, byte_length, candidate_file_name) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+        params![
+            identity.cluster_id().as_bytes().as_slice(),
+            identity.configuration_id().as_bytes().as_slice(),
+            epoch_i64(identity)?,
+            encode_json(&current.0)?,
+            current.1,
+            current.2.as_slice(),
+            checked_positive_i64(current.3)?,
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Reserve one SDK-generated successor name before its first durable
+/// publication step.  If a process stops after the rename/fsync boundary but
+/// before metadata selection, the journal is the sole authority permitted to
+/// reclaim that candidate on the next preflight.  It never binds or inspects
+/// the legacy source payload.
+pub(crate) fn reserve_legacy_fixed_snapshot_reseed_candidate_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    candidate_file_name: &str,
+) -> io::Result<bool> {
+    validate_published_snapshot_file_name(candidate_file_name)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    let current = read_current_snapshot_sync(&tx, identity)?;
+    let reseed = read_legacy_fixed_snapshot_reseed_sync(&tx, identity)?;
+    match (reseed, current.as_ref()) {
+        (Some(reseed), Some(current)) if reseed.matches_current(identity, current)? => {
+            if reseed.candidate_file_name.is_some() || reseed.file_name == candidate_file_name {
+                return Err(invalid_data(
+                    "session consensus legacy fixed snapshot reseed candidate conflicts",
+                ));
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE consensus_legacy_fixed_snapshot_reseed \
+                     SET candidate_file_name = ?1 WHERE singleton = 1",
+                    [candidate_file_name],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err(invalid_data(
+                    "session consensus legacy fixed snapshot reseed candidate was not reserved",
+                ));
+            }
+            tx.commit().map_err(db_error)?;
+            Ok(true)
+        }
+        (Some(_), _) => Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed current selection conflicts",
+        )),
+        (None, _) => Ok(false),
+    }
+}
+
+/// Drop an already-reclaimed pre-metadata candidate while retaining the old
+/// selection binding.  A following retry can reserve a new name, but cannot
+/// broaden or recreate the compatibility admission itself.
+pub(crate) fn clear_legacy_fixed_snapshot_reseed_candidate_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    current: &CurrentSnapshot,
+    candidate_file_name: &str,
+) -> io::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    let reseed = read_legacy_fixed_snapshot_reseed_sync(&tx, identity)?.ok_or_else(|| {
+        invalid_data("session consensus legacy fixed snapshot reseed candidate is missing")
+    })?;
+    if !reseed.matches_current(identity, current)?
+        || reseed.candidate_file_name.as_deref() != Some(candidate_file_name)
+    {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed candidate conflicts",
+        ));
+    }
+    let changed = tx
+        .execute(
+            "UPDATE consensus_legacy_fixed_snapshot_reseed \
+             SET candidate_file_name = NULL WHERE singleton = 1",
+            [],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed candidate was not cleared",
+        ));
+    }
+    tx.commit().map_err(db_error)
+}
+
+/// Remove the compatibility journal only in the transaction that has already
+/// selected a different, sealed successor.  A journal can therefore never be
+/// left authorizing that successor if a process stops at the metadata switch.
+pub(crate) fn clear_legacy_fixed_snapshot_reseed_after_successor_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    successor_meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    successor_file_name: &str,
+    successor_checksum: [u8; 32],
+    successor_byte_length: u64,
+) -> io::Result<()> {
+    let Some(previous) = read_legacy_fixed_snapshot_reseed_sync(conn, identity)? else {
+        return Ok(());
+    };
+    if previous.meta_json == encode_json(successor_meta)?
+        && previous.file_name == successor_file_name
+        && previous.checksum == successor_checksum
+        && previous.byte_length == successor_byte_length
+    {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed successor is not distinct",
+        ));
+    }
+    conn.execute_batch("DROP TABLE consensus_legacy_fixed_snapshot_reseed;")
+        .map_err(db_error)
+}
+
+/// The journal is local upgrade provenance, not consensus state.  A snapshot
+/// rebuilt from the authoritative database/log must not perpetuate the
+/// one-time permission into another PVC or a later restart.
+fn strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(conn: &Connection) -> io::Result<()> {
+    if !table_exists(conn, "consensus_legacy_fixed_snapshot_reseed").map_err(db_error)? {
+        return Ok(());
+    }
+    if !schema_object_is_exact_in_sync(
+        conn,
+        false,
+        "table",
+        "consensus_legacy_fixed_snapshot_reseed",
+        LEGACY_FIXED_SNAPSHOT_RESEED_SCHEMA,
+    )? {
+        return Err(invalid_data(
+            "session consensus legacy fixed snapshot reseed journal is invalid",
+        ));
+    }
+    conn.execute_batch("DROP TABLE consensus_legacy_fixed_snapshot_reseed;")
+        .map_err(db_error)
+}
+
 /// Only UUID-named published images may be made durable. Staging prefixes are
 /// never an authority name, even when a corrupt database row attempts to make
 /// one look current.
@@ -39687,9 +40274,16 @@ fn validate_published_snapshot_file_name(file_name: &str) -> io::Result<()> {
     else {
         return Err(invalid_data("invalid session consensus snapshot file name"));
     };
-    uuid::Uuid::parse_str(stem)
-        .map(|_| ())
-        .map_err(|_| invalid_data("invalid session consensus snapshot file name"))
+    match uuid::Uuid::parse_str(stem) {
+        Ok(parsed)
+            if parsed.get_version() == Some(uuid::Version::Random)
+                && parsed.get_variant() == uuid::Variant::RFC4122
+                && parsed.hyphenated().to_string() == stem =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid_data("invalid session consensus snapshot file name")),
+    }
 }
 
 #[cfg(test)]
@@ -42616,6 +43210,13 @@ mod tests {
             read_fenced_transition_status_sync(&source, identity(), identity(), &request),
             Ok(FencedTransitionStatus::Recorded(_))
         ));
+        // The file-backed capture path must carry a live source journal up to
+        // finalization, then remove it before the compacted successor is
+        // sealed and published.  The journal is intentionally local upgrade
+        // provenance, never portable consensus state.
+        source
+            .execute_batch(LEGACY_FIXED_SNAPSHOT_RESEED_SCHEMA)
+            .expect("seed exact local reseed journal in file-backed source");
         let source_file = PinnedSqliteFile::from_file(
             opc_sqlite_file_control_sys::main_file_descriptor(&source)
                 .expect("duplicate live source descriptor"),
@@ -42671,10 +43272,21 @@ mod tests {
         let raw_schema =
             schema_manifest_in_sync(&raw_connection, false).expect("read raw exact schema");
         assert_eq!(
-            FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS,
+            FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS + 1,
             raw_schema.len(),
-            "the frozen current schema exactly consumes its bounded manifest"
+            "the raw source retains the local reseed journal until finalization"
         );
+        assert!(raw_schema.contains_key(&(
+            "table".to_owned(),
+            "consensus_legacy_fixed_snapshot_reseed".to_owned(),
+        )));
+        let mut successor_schema = raw_schema.clone();
+        assert!(successor_schema
+            .remove(&(
+                "table".to_owned(),
+                "consensus_legacy_fixed_snapshot_reseed".to_owned(),
+            ))
+            .is_some());
         let raw_application_id: i64 = raw_connection
             .query_row("PRAGMA application_id", [], |row| row.get(0))
             .expect("read raw application id");
@@ -42718,10 +43330,18 @@ mod tests {
         let compacted_connection =
             open_pinned_snapshot_database(&compacted).expect("open compacted pinned descriptor");
         assert_eq!(
-            raw_schema,
+            successor_schema,
             schema_manifest_in_sync(&compacted_connection, false)
                 .expect("read compacted exact schema"),
-            "logical copy preserves the complete bounded schema manifest"
+            "file-backed finalization excludes local reseed provenance"
+        );
+        assert!(
+            !table_exists(
+                &compacted_connection,
+                "consensus_legacy_fixed_snapshot_reseed",
+            )
+            .expect("query compacted local reseed journal"),
+            "the sealed successor SQLite payload cannot retain a legacy admission permit"
         );
         assert_eq!(
             raw_application_id,
@@ -42817,10 +43437,18 @@ mod tests {
             .expect("fallback retains the sealed session schema");
         validate_sealed_state_sync(&fallback_connection).expect("fallback retains sealed state");
         assert_eq!(
-            raw_schema,
+            successor_schema,
             schema_manifest_in_sync(&fallback_connection, false)
                 .expect("read fallback exact schema"),
-            "fallback preserves the complete bounded schema manifest"
+            "fallback excludes the local reseed journal from its portable image"
+        );
+        assert!(
+            !table_exists(
+                &fallback_connection,
+                "consensus_legacy_fixed_snapshot_reseed",
+            )
+            .expect("query fallback local reseed journal"),
+            "the fallback successor cannot retain a legacy admission permit"
         );
         assert_eq!(
             raw_application_id,
@@ -43085,6 +43713,87 @@ mod tests {
             "snapshot-00000000-0000-4000-8000-000000000000.opc"
         )
         .is_ok());
+        assert!(validate_published_snapshot_file_name(
+            "snapshot-00000000000040008000000000000000.opc"
+        )
+        .is_err());
+        assert!(validate_published_snapshot_file_name(
+            "snapshot-00000000-0000-1000-8000-000000000000.opc"
+        )
+        .is_err());
+        assert!(validate_published_snapshot_file_name(
+            "snapshot-00000000-0000-4000-8000-000000000000.OPC"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_fixed_snapshot_reseed_journal_fails_closed_on_marker_tampering() {
+        let backend = SqliteSessionBackend::in_memory().expect("marker fixture backend");
+        let conn = backend.conn.blocking_lock();
+        let identity = identity();
+        initialize_schema(&conn, identity, &expected_members())
+            .expect("initialize marker fixture authority");
+        conn.execute_batch(LEGACY_FIXED_SNAPSHOT_RESEED_SCHEMA)
+            .expect("create exact marker schema");
+        assert!(
+            read_legacy_fixed_snapshot_reseed_sync(&conn, identity).is_err(),
+            "an exact but empty marker table is not an upgrade permission"
+        );
+
+        let predecessor = "snapshot-00000000-0000-4000-8000-0000000000a1.opc";
+        conn.execute(
+            "INSERT INTO consensus_legacy_fixed_snapshot_reseed \
+             (singleton, cluster_id, configuration_id, configuration_epoch, meta_json, \
+              file_name, checksum, byte_length, candidate_file_name) \
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            params![
+                identity.cluster_id().as_bytes().as_slice(),
+                identity.configuration_id().as_bytes().as_slice(),
+                epoch_i64(identity).expect("fixture epoch"),
+                b"not-canonical-snapshot-meta".as_slice(),
+                predecessor,
+                [0xA1_u8; 32].as_slice(),
+                "snapshot-00000000000040008000000000000000.opc",
+            ],
+        )
+        .expect("seed marker with a parseable but noncanonical candidate name");
+        assert!(
+            read_legacy_fixed_snapshot_reseed_sync(&conn, identity).is_err(),
+            "a noncanonical candidate basename cannot become deletion authority"
+        );
+
+        conn.execute(
+            "UPDATE consensus_legacy_fixed_snapshot_reseed SET candidate_file_name = ?1",
+            [predecessor],
+        )
+        .expect("make candidate equal predecessor");
+        assert!(
+            read_legacy_fixed_snapshot_reseed_sync(&conn, identity).is_err(),
+            "the selected predecessor cannot also become its cleanup candidate"
+        );
+
+        conn.execute(
+            "UPDATE consensus_legacy_fixed_snapshot_reseed \
+             SET candidate_file_name = NULL, cluster_id = ?1",
+            [[0xFF_u8; 32].as_slice()],
+        )
+        .expect("tamper marker identity binding");
+        assert!(
+            read_legacy_fixed_snapshot_reseed_sync(&conn, identity).is_err(),
+            "a marker for another durable identity cannot authorize reseed"
+        );
+
+        conn.execute_batch(
+            "DROP TABLE consensus_legacy_fixed_snapshot_reseed; \
+             CREATE TABLE consensus_legacy_fixed_snapshot_reseed (singleton INTEGER); \
+             INSERT INTO consensus_legacy_fixed_snapshot_reseed VALUES (1), (2);",
+        )
+        .expect("seed malformed multi-row marker table");
+        assert!(
+            read_legacy_fixed_snapshot_reseed_sync(&conn, identity).is_err(),
+            "a malformed multi-row marker table is rejected before any compatibility use"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -57981,6 +58690,66 @@ LIMIT 20000;
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn sqlite_file_open_migrates_each_released_cursor_only_operator_recovery_schema() {
+        for schema in [
+            ReleasedCursorOnlyOperatorRecoverySchema::Direct,
+            ReleasedCursorOnlyOperatorRecoverySchema::AddOn,
+            ReleasedCursorOnlyOperatorRecoverySchema::Migrated,
+        ] {
+            let directory = tempfile::tempdir().expect("cursor-only recovery fixture directory");
+            let database = directory.path().join("cursor-only-recovery.sqlite");
+            let backend =
+                SqliteSessionBackend::open(&database).expect("create file-backed fixture");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members())
+                .expect("initialize current consensus schema");
+            conn.execute_batch(
+                "CREATE TEMP TABLE released_cursor_only_recovery AS \
+                 SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                        pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+                 FROM consensus_operator_recovery; \
+                 DROP TABLE consensus_operator_recovery;",
+            )
+            .expect("preserve current recovery row before released-layout fixture");
+            install_released_cursor_only_operator_recovery_schema_sync(&conn, schema)
+                .expect("install exact released cursor-only recovery layout");
+            conn.execute_batch(
+                "INSERT INTO consensus_operator_recovery \
+                    (singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                     pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) \
+                 SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                        pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+                 FROM released_cursor_only_recovery; \
+                 DROP TABLE released_cursor_only_recovery;",
+            )
+            .expect("restore released cursor-only recovery row");
+            drop(conn);
+            drop(backend);
+
+            let reopened = SqliteSessionBackend::open(&database)
+                .unwrap_or_else(|error| panic!("reopen {schema:?}: {error}"));
+            let conn = reopened.conn.blocking_lock();
+            assert!(
+                operator_recovery_certificate_table_schema_is_exact_in_sync(&conn, false)
+                    .expect("classify admitted released recovery schema"),
+                "file-open classifier must admit the exact released {schema:?} form"
+            );
+            assert!(
+                !operator_recovery_v2_activation_column_exists(&conn)
+                    .expect("read pre-migration V2 activation marker"),
+                "file-open classification must not run migration DDL for {schema:?}"
+            );
+            ensure_operator_recovery_schema_sync(&conn, identity())
+                .unwrap_or_else(|error| panic!("migrate {schema:?}: {error}"));
+            assert!(
+                operator_recovery_v2_activation_column_exists(&conn)
+                    .expect("read migrated V2 activation marker"),
+                "schema initialization must migrate {schema:?} after file-open admission"
+            );
         }
     }
 

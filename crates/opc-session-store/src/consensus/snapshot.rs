@@ -2430,6 +2430,37 @@ fn fixed_verity_measurement(file: &std::fs::File) -> io::Result<[u8; 32]> {
     opc_fs_verity_sys::measure_exact_profile(file.as_fd()).map_err(fs_verity_measure_error)
 }
 
+/// Classify the one kernel result emitted by an old fixed snapshot that
+/// predates fs-verity.  This probes descriptor metadata only: it does not
+/// read, hash, parse, or otherwise grant authority to the snapshot payload.
+/// Every other fs-verity error remains fail-closed.
+#[cfg(target_os = "linux")]
+pub(crate) fn fixed_verity_is_exactly_unsealed(file: &std::fs::File) -> io::Result<bool> {
+    match opc_fs_verity_sys::measure(file.as_fd()) {
+        // `FS_IOC_MEASURE_VERITY` is the only kernel operation whose ENODATA
+        // has the narrow legacy meaning required here.  A measured artifact
+        // must still satisfy the complete fixed profile; a partially sealed
+        // or differently profiled file is not an upgrade candidate.
+        Ok(_) => opc_fs_verity_sys::measure_exact_profile(file.as_fd())
+            .map(|_| false)
+            .map_err(fs_verity_measure_error),
+        Err(opc_fs_verity_sys::Error::Measure(error))
+            if error.raw_os_error() == Some(libc::ENODATA) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(fs_verity_measure_error(error)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn fixed_verity_is_exactly_unsealed(_file: &std::fs::File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fixed snapshot sealing is unavailable",
+    ))
+}
+
 #[cfg(not(target_os = "linux"))]
 fn fixed_verity_measurement(_file: &std::fs::File) -> io::Result<[u8; 32]> {
     Err(io::Error::new(
