@@ -76,7 +76,7 @@ const BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE: &[u8] = &[
     IE_TYPE_F_TEID,
     0x00,
     0x09,
-    0x00,
+    0x04,
     0xa1,
     0x11,
     0x22,
@@ -1032,7 +1032,7 @@ fn create_session_response_with_endpoint_roles(
         None,
     );
     let user_plane = raw_f_teid_ie(
-        0,
+        4,
         user_plane_interface_type,
         0x5060_7080,
         Some([198, 51, 100, 55]),
@@ -1456,6 +1456,54 @@ fn create_session_response_receive_policy_defaults_remain_strict() {
 }
 
 #[test]
+fn create_session_response_receive_policy_requires_instance_four_user_plane_endpoint() {
+    let policy = S2bCreateSessionResponseReceivePolicy::STRICT
+        .allow_s5_s8_pgw_control()
+        .allow_s5_s8_pgw_user_plane();
+    let control = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x1020_3040,
+        Some([192, 0, 2, 44]),
+        None,
+    );
+    let wrong_instance_cases = [
+        (
+            "strict S2b-U role in the instance-0 S1-U slot",
+            raw_f_teid_ie(
+                0,
+                INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                0x5060_7080,
+                Some([198, 51, 100, 55]),
+                None,
+            ),
+        ),
+        (
+            "opted-in S5/S8 role in another table-defined slot",
+            raw_f_teid_ie(2, 5, 0x6070_8090, Some([198, 51, 100, 56]), None),
+        ),
+    ];
+
+    for (label, wrong_instance) in wrong_instance_cases {
+        let bearer_context = bearer_context_with_f_teids(&[wrong_instance]);
+        let response = create_session_response_with_projection_ies(
+            Some(0x0102_0304),
+            0x0000_2000,
+            &[CAUSE_IE, control.as_slice(), bearer_context.as_slice()],
+        );
+        assert_eq!(
+            decode_create_session_response_summary_with_receive_policy(
+                &response,
+                procedure_context(),
+                policy,
+            ),
+            Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn structural_message_and_view_projection_overloads_remain_strict() {
     let response = create_session_response_with_endpoint_roles(7, 5);
     let structural_context = DecodeContext {
@@ -1612,7 +1660,7 @@ fn create_session_response_receive_policy_keeps_first_singleton_occurrences() {
 
     let invalid_control = raw_f_teid_ie(1, 6, 0x1111_1111, Some([192, 0, 2, 1]), None);
     let valid_control = raw_f_teid_ie(1, 7, 0x2222_2222, Some([192, 0, 2, 2]), None);
-    let user_plane = raw_f_teid_ie(0, 5, 0x3333_3333, Some([198, 51, 100, 3]), None);
+    let user_plane = raw_f_teid_ie(4, 5, 0x3333_3333, Some([198, 51, 100, 3]), None);
     let bearer_context = bearer_context_with_f_teids(&[user_plane]);
     let response = create_session_response_with_projection_ies(
         Some(0x0102_0304),
@@ -1636,8 +1684,8 @@ fn create_session_response_receive_policy_keeps_first_singleton_occurrences() {
     );
 
     let control = raw_f_teid_ie(1, 7, 0x4444_4444, Some([192, 0, 2, 4]), None);
-    let invalid_user_plane = raw_f_teid_ie(0, 4, 0x5555_5555, Some([198, 51, 100, 5]), None);
-    let valid_user_plane = raw_f_teid_ie(0, 5, 0x6666_6666, Some([198, 51, 100, 6]), None);
+    let invalid_user_plane = raw_f_teid_ie(4, 4, 0x5555_5555, Some([198, 51, 100, 5]), None);
+    let valid_user_plane = raw_f_teid_ie(4, 5, 0x6666_6666, Some([198, 51, 100, 6]), None);
     let bearer_context = bearer_context_with_f_teids(&[invalid_user_plane, valid_user_plane]);
     let response = create_session_response_with_projection_ies(
         Some(0x0102_0304),
@@ -1653,8 +1701,8 @@ fn create_session_response_receive_policy_keeps_first_singleton_occurrences() {
         Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch)
     );
 
-    let retained_user_plane = raw_f_teid_ie(0, 5, 0x6767_6767, Some([198, 51, 100, 67]), None);
-    let malformed_later_user_plane = raw_f_teid_ie(0, 5, 0x6868_6868, None, None);
+    let retained_user_plane = raw_f_teid_ie(4, 5, 0x6767_6767, Some([198, 51, 100, 67]), None);
+    let malformed_later_user_plane = raw_f_teid_ie(4, 5, 0x6868_6868, None, None);
     let bearer_context =
         bearer_context_with_f_teids(&[retained_user_plane, malformed_later_user_plane]);
     let response = create_session_response_with_projection_ies(
@@ -1674,7 +1722,7 @@ fn create_session_response_receive_policy_keeps_first_singleton_occurrences() {
     assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0x6767_6767);
 
     let other_role = raw_f_teid_ie(1, 4, 0x7777_7777, Some([198, 51, 100, 7]), None);
-    let accepted_role = raw_f_teid_ie(2, 5, 0x8888_8888, Some([198, 51, 100, 8]), None);
+    let accepted_role = raw_f_teid_ie(4, 5, 0x8888_8888, Some([198, 51, 100, 8]), None);
     let bearer_context = bearer_context_with_f_teids(&[other_role, accepted_role]);
     let response = create_session_response_with_projection_ies(
         Some(0x0102_0304),
@@ -1700,9 +1748,9 @@ fn create_session_response_receive_policy_keeps_first_singleton_occurrences() {
         Some([192, 0, 2, 9]),
         None,
     );
-    let invalid_first_role = raw_f_teid_ie(0, 4, 0x9090_9090, Some([198, 51, 100, 9]), None);
+    let invalid_first_role = raw_f_teid_ie(4, 4, 0x9090_9090, Some([198, 51, 100, 9]), None);
     let first_bearer_context = bearer_context_with_f_teids(&[invalid_first_role]);
-    let valid_later_role = raw_f_teid_ie(0, 5, 0x9191_9191, Some([198, 51, 100, 10]), None);
+    let valid_later_role = raw_f_teid_ie(4, 5, 0x9191_9191, Some([198, 51, 100, 10]), None);
     let later_bearer_context = bearer_context_with_f_teids(&[valid_later_role]);
     let response = create_session_response_with_projection_ies(
         Some(0x0102_0304),
@@ -1733,10 +1781,10 @@ fn create_session_response_receive_policy_preserves_endpoint_failures_and_privac
     let policy = s2b::S2bCreateSessionResponseReceivePolicy::STRICT
         .allow_s5_s8_pgw_control()
         .allow_s5_s8_pgw_user_plane();
-    let valid_user_plane = raw_f_teid_ie(0, 5, 0xa1a2_a3a4, Some([198, 51, 100, 77]), None);
+    let valid_user_plane = raw_f_teid_ie(4, 5, 0xa1a2_a3a4, Some([198, 51, 100, 77]), None);
     let bearer_context = bearer_context_with_f_teids(&[valid_user_plane]);
     let missing_user_plane_context = bearer_context_with_f_teids(&[]);
-    let missing_address_user_plane = raw_f_teid_ie(0, 5, 0xc1c2_c3c4, None, None);
+    let missing_address_user_plane = raw_f_teid_ie(4, 5, 0xc1c2_c3c4, None, None);
     let malformed_user_plane_context = bearer_context_with_f_teids(&[missing_address_user_plane]);
     let valid_control = raw_f_teid_ie(1, 7, 0xd1d2_d3d4, Some([192, 0, 2, 65]), None);
     let strict_control = raw_f_teid_ie(
@@ -1863,7 +1911,7 @@ fn create_session_response_receive_policy_preserves_endpoint_failures_and_privac
 #[test]
 fn create_session_response_receive_policy_preserves_user_plane_zero_teid_behavior() {
     let control = raw_f_teid_ie(1, 7, 0x1020_3040, Some([192, 0, 2, 90]), None);
-    let user_plane = raw_f_teid_ie(0, 5, 0, Some([198, 51, 100, 90]), None);
+    let user_plane = raw_f_teid_ie(4, 5, 0, Some([198, 51, 100, 90]), None);
     let bearer_context = bearer_context_with_f_teids(&[user_plane]);
     let response = create_session_response_with_projection_ies(
         Some(0x0102_0304),

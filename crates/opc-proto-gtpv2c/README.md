@@ -603,10 +603,13 @@ let response = S2bCreateSessionAcceptedResponse {
 
 Create Session Response receive decoding remains strict by default: the PGW
 control role accepts only interface type 32 and the PGW user-plane role only
-type 33. A caller that has already made its own interworking decision can use
-the one-shot `decode_create_session_response_summary_with_receive_policy`
-helper with `S2bCreateSessionResponseReceivePolicy` to independently add the
-standardized S5/S8 control type 7, user-plane type 5, or both. The policy has no
+type 33. The user-plane endpoint must be a direct member of the instance-0
+Bearer Context at F-TEID instance 4. A caller that has already made its own
+interworking decision can use the one-shot
+`decode_create_session_response_summary_with_receive_policy` helper with
+`S2bCreateSessionResponseReceivePolicy` to independently add the standardized
+S5/S8 control type 7, user-plane type 5, or both. The policy changes only the
+accepted interface type; it never broadens the instance-4 placement. It has no
 arbitrary interface-type constructor, is copied for one decode, and is applied
 to the same first retained singleton used by the returned typed summary. It
 does not affect `S2bMessage::decode`, the no-policy summary helpers, any other

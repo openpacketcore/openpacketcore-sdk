@@ -78,7 +78,7 @@ fn accepted_bearer_context(ebi: u8, teid: u32) -> BearerContext<'static> {
                 value: TypedIeValue::EpsBearerId(EpsBearerId { value: ebi }),
             },
             TypedIe {
-                instance: 0,
+                instance: 4,
                 value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
                     interface_type: INTERFACE_TYPE_S2B_U_PGW_GTP_U,
                     teid,
@@ -432,6 +432,58 @@ fn create_session_accepted_response_builder_never_emits_receive_policy_roles() {
         additional_ies: Vec::new(),
     });
     assert!(result.is_err(), "builder accepted an S5/S8 control role");
+}
+
+#[test]
+fn create_session_accepted_response_builder_requires_direct_instance_four_user_plane_endpoint() {
+    let mut wrong_instance = accepted_bearer_context(6, 0x1122_3344);
+    let endpoint = wrong_instance
+        .members
+        .iter_mut()
+        .find(|ie| ie.ie_type() == IE_TYPE_F_TEID)
+        .unwrap_or_else(|| panic!("accepted test Bearer Context needs an F-TEID"));
+    endpoint.instance = 0;
+    let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
+        bearer_context: wrong_instance,
+        additional_ies: Vec::new(),
+    });
+    assert!(
+        result.is_err(),
+        "builder accepted an S2b-U PGW endpoint in the instance-0 S1-U slot"
+    );
+
+    let mut recursively_misplaced = accepted_bearer_context(6, 0x1122_3344);
+    recursively_misplaced
+        .members
+        .retain(|ie| ie.ie_type() != IE_TYPE_F_TEID);
+    recursively_misplaced.members.push(TypedIe {
+        instance: 1,
+        value: TypedIeValue::BearerContext(BearerContext {
+            members: vec![TypedIe {
+                instance: 4,
+                value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                    interface_type: INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                    teid: 0x3040_5060,
+                    ipv4: Some([198, 51, 100, 10]),
+                    ipv6: None,
+                }),
+            }],
+        }),
+    });
+    let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
+        bearer_context: recursively_misplaced,
+        additional_ies: Vec::new(),
+    });
+    assert!(
+        result.is_err(),
+        "builder accepted an instance-4 S2b-U PGW endpoint from a nested Bearer Context"
+    );
 }
 
 #[test]

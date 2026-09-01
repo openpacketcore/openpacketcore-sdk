@@ -106,6 +106,7 @@ pub const INTERFACE_TYPE_S2B_U_PGW_GTP_U: u8 = 33;
 
 const INTERFACE_TYPE_S5_S8_PGW_GTP_U: u8 = 5;
 const INTERFACE_TYPE_S5_S8_PGW_GTP_C: u8 = 7;
+const CREATE_SESSION_RESPONSE_PGW_USER_PLANE_F_TEID_INSTANCE: u8 = 4;
 
 /// Result type for S2b Production Profile v1 constructors.
 pub type S2bProfileBuildResult<T> = Result<T, S2bProfileBuildError>;
@@ -507,9 +508,9 @@ pub struct S2bCreateSessionAcceptedResponse<'a> {
     pub pgw_control_f_teid: FullyQualifiedTeid,
     /// Bearer Context IE containing the accepted bearer EBI.
     ///
-    /// Any included PGW user-plane F-TEID must use
-    /// [`INTERFACE_TYPE_S2B_U_PGW_GTP_U`]. Receive-only compatibility policy
-    /// never broadens builder output.
+    /// Any included PGW user-plane F-TEID must be a direct member at instance
+    /// 4 and use [`INTERFACE_TYPE_S2B_U_PGW_GTP_U`]. Receive-only
+    /// compatibility policy never broadens builder output.
     pub bearer_context: BearerContext<'a>,
     /// Additional typed IEs to append after Cause, PGW control F-TEID, and Bearer Context.
     ///
@@ -1762,7 +1763,7 @@ pub enum CreateSessionResponseSummaryError {
     AcceptedResponseMissingBearerEbi,
     /// Accepted Create Session Response carried a malformed top-level PAA IE.
     AcceptedResponseMalformedPaa,
-    /// Accepted Create Session Response Bearer Context contained no F-TEID IE.
+    /// Accepted response Bearer Context contained no direct instance-4 PGW F-TEID IE.
     AcceptedResponseMissingBearerFTeid,
     /// Accepted response Bearer Context F-TEIDs were outside the active user-plane role set.
     AcceptedResponseBearerFTeidInterfaceMismatch,
@@ -5407,36 +5408,26 @@ fn find_bearer_context_pgw_user_plane_f_teid(
         return Err(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerContext);
     };
 
-    let mut saw_f_teid = false;
-    let mut seen_instances = [false; 16];
-    for member in &context.members {
-        if member.ie_type() != IE_TYPE_F_TEID {
-            continue;
-        }
-        let wire_instance = usize::from(member.instance & 0x0f);
-        if seen_instances[wire_instance] {
-            continue;
-        }
-        seen_instances[wire_instance] = true;
-        saw_f_teid = true;
-        let TypedIeValue::FullyQualifiedTeid(f_teid) = &member.value else {
-            continue;
-        };
-        if policy.accepts_pgw_user_plane(f_teid.interface_type) {
-            if f_teid.ipv4.is_none() && f_teid.ipv6.is_none() {
-                return Err(
-                    CreateSessionResponseSummaryError::AcceptedResponseMalformedBearerFTeid,
-                );
-            }
-            return Ok(f_teid.clone());
-        }
+    let Some(member) = context.members.iter().find(|member| {
+        member.ie_type() == IE_TYPE_F_TEID
+            && member.instance == CREATE_SESSION_RESPONSE_PGW_USER_PLANE_F_TEID_INSTANCE
+    }) else {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid);
+    };
+    let TypedIeValue::FullyQualifiedTeid(f_teid) = &member.value else {
+        return Err(
+            CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch,
+        );
+    };
+    if !policy.accepts_pgw_user_plane(f_teid.interface_type) {
+        return Err(
+            CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch,
+        );
     }
-
-    if saw_f_teid {
-        Err(CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch)
-    } else {
-        Err(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid)
+    if f_teid.ipv4.is_none() && f_teid.ipv6.is_none() {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseMalformedBearerFTeid);
     }
+    Ok(f_teid.clone())
 }
 
 struct AcceptedCreateSessionResponseFields {
@@ -5632,6 +5623,9 @@ fn create_session_response_validation_error(
         CreateSessionResponseSummaryError::AcceptedResponseMissingBearerEbi => {
             "Create Session Response Bearer Context requires EBI IE"
         }
+        CreateSessionResponseSummaryError::AcceptedResponseMissingBearerFTeid => {
+            "Create Session Response Bearer Context requires a direct PGW user-plane F-TEID at instance 4"
+        }
         CreateSessionResponseSummaryError::AcceptedResponseBearerFTeidInterfaceMismatch => {
             "Create Session Response Bearer Context F-TEID must use S2b-U PGW GTP-U interface type"
         }
@@ -5657,25 +5651,31 @@ fn validate_builder_create_session_response_f_teids(
             }
         }
         if let TypedIeValue::BearerContext(context) = &ie.value {
-            validate_builder_bearer_context_f_teids(context)?;
+            validate_builder_bearer_context_f_teids(context, ie.instance == 0)?;
         }
     }
     Ok(())
 }
 
-fn validate_builder_bearer_context_f_teids(context: &BearerContext<'_>) -> Result<(), DecodeError> {
+fn validate_builder_bearer_context_f_teids(
+    context: &BearerContext<'_>,
+    allow_direct_user_plane_endpoint: bool,
+) -> Result<(), DecodeError> {
     for member in &context.members {
         match &member.value {
             TypedIeValue::FullyQualifiedTeid(f_teid)
                 if member.ie_type() == IE_TYPE_F_TEID
-                    && f_teid.interface_type != INTERFACE_TYPE_S2B_U_PGW_GTP_U =>
+                    && (!allow_direct_user_plane_endpoint
+                        || member.instance
+                            != CREATE_SESSION_RESPONSE_PGW_USER_PLANE_F_TEID_INSTANCE
+                        || f_teid.interface_type != INTERFACE_TYPE_S2B_U_PGW_GTP_U) =>
             {
                 return Err(missing_ie_error(
-                    "Create Session Response builder Bearer Context F-TEIDs must use S2b-U PGW GTP-U interface type",
+                    "Create Session Response builder Bearer Context F-TEID must be a direct S2b-U PGW GTP-U endpoint at instance 4",
                 ));
             }
             TypedIeValue::BearerContext(nested) => {
-                validate_builder_bearer_context_f_teids(nested)?;
+                validate_builder_bearer_context_f_teids(nested, false)?;
             }
             _ => {}
         }
@@ -6780,7 +6780,7 @@ mod tests {
             vec![
                 bearer_ebi(5),
                 typed_ie(
-                    0,
+                    4,
                     TypedIeValue::FullyQualifiedTeid(f_teid(
                         INTERFACE_TYPE_S2B_U_PGW_GTP_U,
                         0x1122_3344,
@@ -6842,7 +6842,7 @@ mod tests {
             vec![
                 bearer_ebi(5),
                 typed_ie(
-                    0,
+                    4,
                     TypedIeValue::FullyQualifiedTeid(f_teid(
                         INTERFACE_TYPE_S2B_U_PGW_GTP_U,
                         0x1122_3344,
@@ -6868,7 +6868,7 @@ mod tests {
             vec![
                 bearer_ebi(5),
                 typed_ie(
-                    0,
+                    4,
                     TypedIeValue::FullyQualifiedTeid(f_teid(
                         INTERFACE_TYPE_S2B_U_PGW_GTP_U,
                         0x1122_3344,
@@ -6932,7 +6932,7 @@ mod tests {
                     TypedIeValue::BearerContext(bearer_context(vec![
                         bearer_ebi(5),
                         typed_ie(
-                            0,
+                            4,
                             TypedIeValue::FullyQualifiedTeid(f_teid(
                                 INTERFACE_TYPE_S2B_PGW_GTP_C,
                                 0x1122_3344,
@@ -6979,7 +6979,7 @@ mod tests {
                     TypedIeValue::BearerContext(bearer_context(vec![
                         bearer_ebi(5),
                         typed_ie(
-                            0,
+                            4,
                             TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
                                 interface_type: INTERFACE_TYPE_S2B_U_PGW_GTP_U,
                                 teid: 0x1122_3344,
@@ -7036,11 +7036,11 @@ mod tests {
         let same_instance = response_view(vec![
             bearer_ebi(5),
             typed_ie(
-                0,
+                4,
                 TypedIeValue::FullyQualifiedTeid(f_teid(4, 2, [198, 51, 100, 1])),
             ),
             typed_ie(
-                0,
+                4,
                 TypedIeValue::FullyQualifiedTeid(f_teid(5, 3, [198, 51, 100, 2])),
             ),
         ]);
@@ -7052,7 +7052,7 @@ mod tests {
         let malformed_first_role = response_view(vec![
             bearer_ebi(5),
             typed_ie(
-                0,
+                4,
                 TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
                     interface_type: INTERFACE_TYPE_S5_S8_PGW_GTP_U,
                     teid: 4,
@@ -7061,7 +7061,7 @@ mod tests {
                 }),
             ),
             typed_ie(
-                1,
+                4,
                 TypedIeValue::FullyQualifiedTeid(f_teid(5, 5, [198, 51, 100, 3])),
             ),
         ]);
@@ -7093,7 +7093,7 @@ mod tests {
                     TypedIeValue::BearerContext(bearer_context(vec![
                         bearer_ebi(5),
                         typed_ie(
-                            0,
+                            4,
                             TypedIeValue::FullyQualifiedTeid(f_teid(
                                 INTERFACE_TYPE_S2B_U_PGW_GTP_U,
                                 0x1122_3344,
