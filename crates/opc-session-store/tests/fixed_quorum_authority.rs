@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+use opc_session_store::test_support::trigger_consensus_snapshot_for_test;
 use opc_session_store::{
     derive_fixed_durable_quorum_consensus_identity, ConsensusSessionStore,
     ConsensusSessionStoreOpenError, FixedQuorumTrafficAuthority, ObservedPhysicalNodeIdentity,
@@ -33,6 +35,217 @@ use opc_session_store::{
     TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
 };
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+fn fixed_verity_available_for_test() -> bool {
+    use std::os::fd::AsFd as _;
+
+    let directory = fs_verity_snapshot_tempdir("fixed-quorum-verity-probe-");
+    let path = directory.path().join("probe");
+    let file = std::fs::File::create(&path).expect("create fs-verity capability probe");
+    let result = opc_fs_verity_sys::measure(file.as_fd());
+    drop(file);
+    match result {
+        Err(opc_fs_verity_sys::Error::Measure(error))
+            if error.raw_os_error() == Some(libc::ENODATA) =>
+        {
+            true
+        }
+        Err(opc_fs_verity_sys::Error::Measure(error))
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
+            ) =>
+        {
+            assert!(
+                !fs_verity_qualification_required(),
+                "required fs-verity qualification is unsupported at the prepared snapshot root: {error:?}"
+            );
+            false
+        }
+        other => panic!("unexpected fs-verity capability probe result: {other:?}"),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+fn fs_verity_qualification_required() -> bool {
+    std::env::var_os("OPC_FS_VERITY_QUALIFICATION").as_deref()
+        == Some(std::ffi::OsStr::new("required"))
+}
+
+/// Fixed snapshot artifacts must use CI's dedicated fs-verity-capable root.
+/// Keep SQLite databases in ordinary temporary storage: they are mutable and
+/// the CI root is intentionally only for immutable snapshot artifacts.
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+fn fs_verity_snapshot_tempdir(prefix: &str) -> tempfile::TempDir {
+    const SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+    let qualification_required = fs_verity_qualification_required();
+    match std::env::var_os(SNAPSHOT_ROOT_ENV) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute(),
+                "{SNAPSHOT_ROOT_ENV} must be an absolute fs-verity snapshot root"
+            );
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(root)
+                .expect("create fs-verity snapshot fixture directory")
+        }
+        None if qualification_required => {
+            panic!("required fs-verity qualification requires {SNAPSHOT_ROOT_ENV}")
+        }
+        None => tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create local fs-verity snapshot fixture directory"),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+fn fixed_current_snapshot_path(
+    database: &std::path::Path,
+    snapshot_directory: &std::path::Path,
+) -> PathBuf {
+    let connection = rusqlite::Connection::open(database).expect("open fixed snapshot metadata");
+    let file_name: String = connection
+        .query_row(
+            "SELECT file_name FROM consensus_snapshot WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read fixed current snapshot name");
+    snapshot_directory.join(file_name)
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+fn assert_unsealed_snapshot(path: &std::path::Path) {
+    use std::os::fd::AsFd as _;
+
+    let file = std::fs::File::open(path).expect("open unsealed fixed snapshot");
+    assert!(
+        matches!(
+            opc_fs_verity_sys::measure(file.as_fd()),
+            Err(opc_fs_verity_sys::Error::Measure(error))
+                if error.raw_os_error() == Some(libc::ENODATA)
+        ),
+        "fixture selected snapshot must be exactly unsealed"
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+fn assert_sealed_snapshot(path: &std::path::Path) {
+    use std::os::fd::AsFd as _;
+
+    let file = std::fs::File::open(path).expect("open sealed fixed successor");
+    opc_fs_verity_sys::measure_exact_profile(file.as_fd())
+        .expect("fixed successor must have the exact fs-verity profile");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReleasedCursorOnlyOperatorRecoverySchema {
+    Direct,
+    AddOn,
+    Migrated,
+}
+
+fn replace_operator_recovery_with_released_cursor_only_schema(
+    database: &std::path::Path,
+    schema: ReleasedCursorOnlyOperatorRecoverySchema,
+) {
+    let connection = rusqlite::Connection::open(database).expect("open fixed-voter schema fixture");
+    connection
+        .execute_batch(
+            "CREATE TEMP TABLE released_cursor_only_recovery AS \
+             SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                    pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+             FROM consensus_operator_recovery; \
+             DROP TABLE consensus_operator_recovery;",
+        )
+        .expect("preserve fixed-voter recovery row");
+    match schema {
+        ReleasedCursorOnlyOperatorRecoverySchema::Direct => connection
+            .execute_batch(
+                r#"
+                CREATE TABLE consensus_operator_recovery (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+                    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+                    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+                    pending_plan_digest BLOB CHECK (
+                        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+                    ),
+                    watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0),
+                    CHECK (
+                        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+                        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+                    ),
+                    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+                );
+                "#,
+            )
+            .expect("install released direct cursor-only schema"),
+        ReleasedCursorOnlyOperatorRecoverySchema::AddOn => connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+                    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+                    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+                    pending_plan_digest BLOB CHECK (
+                        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+                    ),
+                    watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0),
+                    CHECK (
+                        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+                        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+                    ),
+                    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+                );
+                "#,
+            )
+            .expect("install released add-on cursor-only schema"),
+        ReleasedCursorOnlyOperatorRecoverySchema::Migrated => connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+                    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+                    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+                    pending_plan_digest BLOB CHECK (
+                        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+                    ),
+                    CHECK (
+                        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+                        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+                    ),
+                    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+                );
+                ALTER TABLE consensus_operator_recovery
+                    ADD COLUMN watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0
+                    CHECK (watch_cursor_invalidation_floor >= 0);
+                "#,
+            )
+            .expect("install released migrated cursor-only schema"),
+    }
+    connection
+        .execute_batch(
+            "INSERT INTO consensus_operator_recovery \
+                (singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                 pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) \
+             SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                    pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+             FROM released_cursor_only_recovery; \
+             DROP TABLE released_cursor_only_recovery;",
+        )
+        .expect("restore fixed-voter released recovery row");
+}
 
 fn fixed_consumer_identity() -> SessionConsumerIdentity {
     SessionConsumerIdentity::new(
@@ -518,6 +731,19 @@ async fn open_fixed_cluster_in_with_paths(
     Vec<ConsensusSessionStore>,
     BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
 ) {
+    open_fixed_cluster_in_separate_paths(directory, directory, member_count, placement_policy).await
+}
+
+async fn open_fixed_cluster_in_separate_paths(
+    database_directory: &std::path::Path,
+    snapshot_directory: &std::path::Path,
+    member_count: usize,
+    placement_policy: PlacementResiliencePolicy,
+) -> (
+    Vec<PathBuf>,
+    Vec<ConsensusSessionStore>,
+    BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
     let members = fixed_members(member_count);
     let identity = fixed_consensus_identity(&members, placement_policy);
     let topologies = (0..member_count)
@@ -528,7 +754,7 @@ async fn open_fixed_cluster_in_with_paths(
         .collect::<Result<Vec<_>, _>>()
         .expect("fixed cluster topologies");
     let database_paths = (0..member_count)
-        .map(|index| directory.join(format!("fixed-voter-{index}.sqlite")))
+        .map(|index| database_directory.join(format!("fixed-voter-{index}.sqlite")))
         .collect::<Vec<_>>();
     let node_ids = topologies
         .iter()
@@ -564,7 +790,7 @@ async fn open_fixed_cluster_in_with_paths(
         let store = ConsensusSessionStore::open_fixed_durable_quorum(
             topology,
             SqliteSessionBackend::open(&database_paths[source]).expect("file-backed voter store"),
-            directory.join(format!("snapshots-{source}")),
+            snapshot_directory.join(format!("snapshots-{source}")),
             peers,
         )
         .await
@@ -581,6 +807,46 @@ async fn open_fixed_cluster_in_with_paths(
         result.expect("initialize fixed cluster membership");
     }
     (database_paths, stores, paths)
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+async fn reopen_single_fixed_voter_for_test(
+    database_directory: &std::path::Path,
+    snapshot_directory: &std::path::Path,
+    local_index: usize,
+) -> Result<ConsensusSessionStore, ConsensusSessionStoreOpenError> {
+    let members = fixed_members(3);
+    let identity =
+        fixed_consensus_identity(&members, PlacementResiliencePolicy::AllowReducedResilience);
+    let topology = fixed_topology_for_local(
+        local_index,
+        members.clone(),
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .expect("fixed voter reopen topology");
+    let local_node_id = topology
+        .local_consensus_node_id()
+        .expect("fixed voter reopen local node ID");
+    let peers = members
+        .iter()
+        .filter_map(|member| topology.consensus_node_id(member.replica_id()))
+        .filter(|node_id| *node_id != local_node_id)
+        .map(|node_id| {
+            let peer: Arc<dyn SessionConsensusPeer> =
+                Arc::new(ScopedLoopbackPeer::new(node_id, identity));
+            (node_id, peer)
+        })
+        .collect::<BTreeMap<_, _>>();
+    ConsensusSessionStore::open_fixed_durable_quorum(
+        topology,
+        SqliteSessionBackend::open(
+            database_directory.join(format!("fixed-voter-{local_index}.sqlite")),
+        )
+        .expect("file-backed fixed voter reopen backend"),
+        snapshot_directory.join(format!("snapshots-{local_index}")),
+        peers,
+    )
+    .await
 }
 
 async fn shutdown_fixed_cluster_for_reopen(
@@ -995,6 +1261,259 @@ async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_an
         "reopened fixed quorum RPC path must recover durable traffic authority"
     );
     shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
+}
+
+#[tokio::test]
+async fn fixed_quorum_reopen_migrates_each_released_cursor_only_recovery_schema() {
+    let (directory, database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
+    drop(stores);
+    drop(paths);
+
+    for (database, schema) in database_paths.iter().zip([
+        ReleasedCursorOnlyOperatorRecoverySchema::Direct,
+        ReleasedCursorOnlyOperatorRecoverySchema::AddOn,
+        ReleasedCursorOnlyOperatorRecoverySchema::Migrated,
+    ]) {
+        replace_operator_recovery_with_released_cursor_only_schema(database, schema);
+    }
+
+    let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_with_paths(
+        directory.path(),
+        3,
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .await;
+    assert!(
+        reopened.iter().all(|store| store.status().admitted),
+        "reopened fixed voters must retain exact durable admission"
+    );
+    assert!(
+        reopened[0]
+            .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
+            .await
+            .traffic_authority()
+            .is_granted(),
+        "reopened fixed quorum must recover durable traffic authority"
+    );
+    shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
+
+    for database in &database_paths {
+        let connection = rusqlite::Connection::open(database).expect("open migrated fixed voter");
+        let has_activation_marker: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') \
+                 WHERE name = 'recovery_v2_activated')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated recovery activation marker");
+        assert!(
+            has_activation_marker,
+            "fixed-voter reopen must migrate schema"
+        );
+    }
+}
+
+/// Exercise the public fixed-quorum open path against the exact predecessor
+/// shape that needs compatibility.  The first old artifact is a byte-identical
+/// selected `OPCSNP01` envelope without fs-verity; the remaining two are
+/// deliberately corrupted regular unsealed files. The current database
+/// carries one of the three released cursor-only recovery layouts.
+/// Compatibility may rebuild a successor from durable DB/log state, never
+/// from any old payload.
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+#[tokio::test]
+async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_selected_snapshot() {
+    // Some developer and container filesystems do not implement the ioctl.
+    // They cannot create a fixed sealed predecessor, so leave the real
+    // descriptor-level regression to fs-verity-enabled Linux CI.
+    if !fixed_verity_available_for_test() {
+        return;
+    }
+
+    let database_directory = tempfile::tempdir().expect("fixed quorum database directory");
+    let snapshot_root = fs_verity_snapshot_tempdir("fixed-quorum-reseed-snapshots-");
+    let (database_paths, stores, paths) = open_fixed_cluster_in_separate_paths(
+        database_directory.path(),
+        snapshot_root.path(),
+        3,
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .await;
+    for store in &stores {
+        trigger_consensus_snapshot_for_test(store)
+            .await
+            .expect("capture sealed fixed selected snapshot");
+    }
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
+    drop(stores);
+    drop(paths);
+
+    let old_selected = database_paths
+        .iter()
+        .enumerate()
+        .map(|(index, database)| {
+            let snapshot_directory = snapshot_root.path().join(format!("snapshots-{index}"));
+            let path = fixed_current_snapshot_path(database, &snapshot_directory);
+            let bytes = std::fs::read(&path).expect("read sealed selected fixed snapshot");
+            assert!(
+                bytes.len() >= 48,
+                "selected fixed snapshot has a complete OPCSNP01 footer"
+            );
+            assert_eq!(
+                &bytes[bytes.len() - 48..bytes.len() - 40],
+                b"OPCSNP01",
+                "old selected envelope format is OPCSNP01"
+            );
+            std::fs::remove_file(&path).expect("remove sealed selected fixed snapshot");
+            let old_payload = match index {
+                // Keep one source byte-identical to prove the released
+                // physical shape itself is admitted.
+                0 => bytes,
+                // The other two deliberately retain only untrusted regular
+                // inode data. The reseed path must not read, hash, parse, or
+                // use them as authority before rebuilding from DB/log state.
+                1 => b"truncated old selected snapshot".to_vec(),
+                2 => b"corrupt old selected snapshot".to_vec(),
+                _ => unreachable!("three-voter fixture"),
+            };
+            std::fs::write(&path, old_payload).expect("write unsealed old snapshot fixture");
+            assert_unsealed_snapshot(&path);
+            path
+        })
+        .collect::<Vec<_>>();
+
+    for (database, schema) in database_paths.iter().zip([
+        ReleasedCursorOnlyOperatorRecoverySchema::Direct,
+        ReleasedCursorOnlyOperatorRecoverySchema::AddOn,
+        ReleasedCursorOnlyOperatorRecoverySchema::Migrated,
+    ]) {
+        replace_operator_recovery_with_released_cursor_only_schema(database, schema);
+    }
+
+    let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_separate_paths(
+        database_directory.path(),
+        snapshot_root.path(),
+        3,
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .await;
+    assert!(
+        reopened.iter().all(|store| store.status().admitted),
+        "reseeded fixed voters must retain exact durable admission"
+    );
+    assert!(
+        reopened[0]
+            .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
+            .await
+            .traffic_authority()
+            .is_granted(),
+        "reseeded quorum must retain live fixed traffic authority"
+    );
+    shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
+    drop(reopened);
+    drop(reopened_paths);
+
+    for (index, (database, old_path)) in database_paths.iter().zip(old_selected).enumerate() {
+        let snapshot_directory = snapshot_root.path().join(format!("snapshots-{index}"));
+        let successor = fixed_current_snapshot_path(database, &snapshot_directory);
+        assert_ne!(
+            successor, old_path,
+            "reseed must publish a distinct selected successor"
+        );
+        assert_sealed_snapshot(&successor);
+        assert!(
+            !old_path.exists(),
+            "post-successor preflight must reclaim the old unsealed selected artifact"
+        );
+        let connection = rusqlite::Connection::open(database).expect("open reseeded fixed voter");
+        let journal_present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'consensus_legacy_fixed_snapshot_reseed')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read reseed journal presence");
+        assert!(
+            !journal_present,
+            "sealed successor metadata transaction must clear the one-time journal"
+        );
+    }
+
+    // A second public reopen proves that neither the journal nor the old
+    // namespace artifact remains necessary after the atomic metadata switch.
+    let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_separate_paths(
+        database_directory.path(),
+        snapshot_root.path(),
+        3,
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .await;
+    assert!(reopened.iter().all(|store| store.status().admitted));
+    shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
+}
+
+/// A byte-identical unsealed replacement is not an old-pin upgrade candidate
+/// unless the pre-migration database proved one of the exact legacy DDLs and
+/// created the journal in the same transaction. This reaches the public open
+/// path and its retained directory lease rather than the unit-only validator.
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+#[tokio::test]
+async fn fixed_quorum_public_reopen_rejects_unsealed_current_schema_selected_snapshot() {
+    if !fixed_verity_available_for_test() {
+        return;
+    }
+
+    let database_directory = tempfile::tempdir().expect("fixed quorum database directory");
+    let snapshot_root = fs_verity_snapshot_tempdir("fixed-quorum-unsealed-snapshots-");
+    let (database_paths, stores, paths) = open_fixed_cluster_in_separate_paths(
+        database_directory.path(),
+        snapshot_root.path(),
+        3,
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .await;
+    trigger_consensus_snapshot_for_test(&stores[0])
+        .await
+        .expect("capture sealed fixed selected snapshot");
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
+    drop(stores);
+    drop(paths);
+
+    let snapshot_directory = snapshot_root.path().join("snapshots-0");
+    let selected = fixed_current_snapshot_path(&database_paths[0], &snapshot_directory);
+    let bytes = std::fs::read(&selected).expect("read sealed selected snapshot");
+    std::fs::remove_file(&selected).expect("remove sealed selected snapshot");
+    std::fs::write(&selected, bytes).expect("replace with byte-identical unsealed snapshot");
+    assert_unsealed_snapshot(&selected);
+
+    let result =
+        reopen_single_fixed_voter_for_test(database_directory.path(), snapshot_root.path(), 0)
+            .await;
+    assert!(
+        matches!(
+            result,
+            Err(ConsensusSessionStoreOpenError::RecoveryRequired)
+        ),
+        "current-schema unsealed selected artifact must fail closed before fixed quorum opens"
+    );
+    let connection = rusqlite::Connection::open(&database_paths[0])
+        .expect("open rejected current-schema fixed voter");
+    let journal_present: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'consensus_legacy_fixed_snapshot_reseed')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read current-schema reseed journal presence");
+    assert!(
+        !journal_present,
+        "current schema must not mint a compatibility journal for an unsealed replacement"
+    );
 }
 
 #[tokio::test]
