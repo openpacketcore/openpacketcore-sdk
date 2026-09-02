@@ -11,8 +11,8 @@ use std::{error::Error, fmt};
 use opc_proto_ikev2::{
     derive_child_sa_key_material, derive_initial_child_sa_key_material, Ikev2ChildSaCryptoProfile,
     Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm, Ikev2InitialExchangeNoncePolicy,
-    Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError, Ikev2TrafficSelectorBuild,
-    IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
 use crate::{
@@ -255,13 +255,98 @@ impl Ikev2ChildSaXfrmRequests {
     }
 }
 
+/// Closed role label retained for an invalid Child-SA KEYMAT nonce diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2ChildSaNonceRole {
+    /// The locally supplied initiator nonce was invalid.
+    Initiator,
+    /// The peer-supplied responder nonce was invalid.
+    Responder,
+}
+
+impl Ikev2ChildSaNonceRole {
+    /// Fixed, redaction-safe role label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initiator => "initiator",
+            Self::Responder => "responder",
+        }
+    }
+}
+
+/// Redaction-safe details retained for an invalid Child-SA KEYMAT nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2ChildSaInvalidNonceDiagnostic {
+    role: Ikev2ChildSaNonceRole,
+    len: usize,
+}
+
+impl Ikev2ChildSaInvalidNonceDiagnostic {
+    /// Closed nonce role.
+    pub const fn role(self) -> Ikev2ChildSaNonceRole {
+        self.role
+    }
+
+    /// Observed nonce length in octets.
+    pub const fn len(self) -> usize {
+        self.len
+    }
+}
+
+/// Closed, redaction-safe snapshot of a Child-SA KEYMAT derivation failure.
+///
+/// Every failure retains its stable code. Only an `InvalidNonceLength` failure
+/// with the allowlisted `initiator` or `responder` role additionally retains a
+/// closed role and observed length. No arbitrary labels, nonce bytes, or key
+/// material are retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2ChildSaKeyMaterialDiagnostic {
+    code: Ikev2SaInitCryptoErrorCode,
+    invalid_nonce: Option<Ikev2ChildSaInvalidNonceDiagnostic>,
+}
+
+impl Ikev2ChildSaKeyMaterialDiagnostic {
+    /// Stable lower-level IKEv2 KEYMAT failure code.
+    pub const fn code(self) -> Ikev2SaInitCryptoErrorCode {
+        self.code
+    }
+
+    /// Invalid nonce details when the source role was allowlisted.
+    pub const fn invalid_nonce(self) -> Option<Ikev2ChildSaInvalidNonceDiagnostic> {
+        self.invalid_nonce
+    }
+
+    fn from_source(source: Ikev2SaInitCryptoError) -> Self {
+        let invalid_nonce = match source {
+            Ikev2SaInitCryptoError::InvalidNonceLength {
+                role: "initiator",
+                len,
+            } => Some(Ikev2ChildSaInvalidNonceDiagnostic {
+                role: Ikev2ChildSaNonceRole::Initiator,
+                len,
+            }),
+            Ikev2SaInitCryptoError::InvalidNonceLength {
+                role: "responder",
+                len,
+            } => Some(Ikev2ChildSaInvalidNonceDiagnostic {
+                role: Ikev2ChildSaNonceRole::Responder,
+                len,
+            }),
+            _ => None,
+        };
+        Self {
+            code: source.code(),
+            invalid_nonce,
+        }
+    }
+}
+
 /// Error returned while deriving Child SA KEYMAT into XFRM key material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2ChildSaKeyMaterialError {
     /// Lower-level IKEv2 KEYMAT derivation failed with a closed, redaction-safe
-    /// diagnostic. This retains safe details such as an invalid nonce's role
-    /// and length, but never nonce bytes or key material.
-    KeyDerivation(Ikev2SaInitCryptoError),
+    /// snapshot.
+    KeyDerivation(Ikev2ChildSaKeyMaterialDiagnostic),
     /// The negotiated crypto profile has no SDK XFRM algorithm mapping.
     UnsupportedAlgorithmMapping,
 }
@@ -280,7 +365,7 @@ impl Ikev2ChildSaKeyMaterialError {
 
 impl From<Ikev2SaInitCryptoError> for Ikev2ChildSaKeyMaterialError {
     fn from(source: Ikev2SaInitCryptoError) -> Self {
-        Self::KeyDerivation(source)
+        Self::KeyDerivation(Ikev2ChildSaKeyMaterialDiagnostic::from_source(source))
     }
 }
 
@@ -290,7 +375,11 @@ impl fmt::Display for Ikev2ChildSaKeyMaterialError {
     }
 }
 
-impl Error for Ikev2ChildSaKeyMaterialError {}
+impl Error for Ikev2ChildSaKeyMaterialError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
 
 /// Validation failure while mapping a negotiated Child SA into XFRM requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -961,7 +1050,7 @@ mod tests {
     use opc_proto_ikev2::{
         install_ikev2_software_crypto_module, Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation,
         Ikev2CryptoRequirements, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
-        Ikev2PrfAlgorithm, Ikev2SaInitCryptoError,
+        Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
     };
 
     fn ensure_ike_crypto() {
@@ -976,6 +1065,26 @@ mod tests {
         if let Err(message) = result {
             panic!("{message}");
         }
+    }
+
+    fn assert_invalid_nonce_diagnostic(
+        error: Ikev2ChildSaKeyMaterialError,
+        role: Ikev2ChildSaNonceRole,
+        len: usize,
+    ) {
+        let Ikev2ChildSaKeyMaterialError::KeyDerivation(diagnostic) = error else {
+            panic!("expected Child-SA KEYMAT derivation diagnostic");
+        };
+        assert_eq!(
+            diagnostic.code(),
+            Ikev2SaInitCryptoErrorCode::InvalidNonceLength
+        );
+        let nonce = match diagnostic.invalid_nonce() {
+            Some(nonce) => nonce,
+            None => panic!("missing allowlisted invalid-nonce details"),
+        };
+        assert_eq!(nonce.role(), role);
+        assert_eq!(nonce.len(), len);
     }
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
@@ -1719,21 +1828,17 @@ mod tests {
         let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
         // The existing generic helper remains the strict CREATE_CHILD_SA
         // boundary even though the initial-only helper below is opted in.
-        assert!(matches!(
-            derive_child_sa_xfrm_keys(
-                profile,
-                &[0x1e; 64],
-                &initiator_nonce,
-                &responder_nonce,
-                None,
-            ),
-            Err(Ikev2ChildSaKeyMaterialError::KeyDerivation(
-                Ikev2SaInitCryptoError::InvalidNonceLength {
-                    role: "initiator",
-                    len: 16,
-                }
-            ))
-        ));
+        let strict_error = match derive_child_sa_xfrm_keys(
+            profile,
+            &[0x1e; 64],
+            &initiator_nonce,
+            &responder_nonce,
+            None,
+        ) {
+            Ok(value) => panic!("strict Child-SA rekey unexpectedly derived keys: {value:?}"),
+            Err(error) => error,
+        };
+        assert_invalid_nonce_diagnostic(strict_error, Ikev2ChildSaNonceRole::Initiator, 16);
 
         let keys = match derive_initial_child_sa_xfrm_keys(
             profile,
@@ -1902,15 +2007,7 @@ mod tests {
                 Err(error) => error,
             };
 
-        assert_eq!(
-            error,
-            Ikev2ChildSaKeyMaterialError::KeyDerivation(
-                Ikev2SaInitCryptoError::InvalidNonceLength {
-                    role: "initiator",
-                    len: 15,
-                }
-            )
-        );
+        assert_invalid_nonce_diagnostic(error, Ikev2ChildSaNonceRole::Initiator, 15);
         assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
         assert_eq!(error.to_string(), "ikev2_child_sa_keymat_derivation_failed");
         let debug = format!("{error:?}");
@@ -1931,15 +2028,7 @@ mod tests {
                 Err(error) => error,
             };
 
-        assert_eq!(
-            error,
-            Ikev2ChildSaKeyMaterialError::KeyDerivation(
-                Ikev2SaInitCryptoError::InvalidNonceLength {
-                    role: "responder",
-                    len: 15,
-                }
-            )
-        );
+        assert_invalid_nonce_diagnostic(error, Ikev2ChildSaNonceRole::Responder, 15);
         assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
         assert_eq!(error.to_string(), "ikev2_child_sa_keymat_derivation_failed");
         let debug = format!("{error:?}");
@@ -1959,13 +2048,14 @@ mod tests {
                 Ok(value) => panic!("invalid SK_d unexpectedly derived keys: {value:?}"),
                 Err(error) => error,
             };
+        let Ikev2ChildSaKeyMaterialError::KeyDerivation(diagnostic) = error else {
+            panic!("expected Child-SA KEYMAT derivation diagnostic");
+        };
         assert_eq!(
-            error,
-            Ikev2ChildSaKeyMaterialError::KeyDerivation(Ikev2SaInitCryptoError::InvalidKeyLength {
-                name: "SK_d",
-                len: 31,
-            })
+            diagnostic.code(),
+            Ikev2SaInitCryptoErrorCode::InvalidKeyLength
         );
+        assert_eq!(diagnostic.invalid_nonce(), None);
         assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
         assert!(!format!("{error:?}").contains("0f0f"));
 
@@ -1977,6 +2067,58 @@ mod tests {
             child_sa_xfrm_keys_from_direction(unsupported_profile, &[0x01; 16], &[]),
             Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping)
         );
+    }
+
+    #[test]
+    fn child_sa_xfrm_key_derivation_snapshot_redacts_adversarial_source_labels() {
+        let malicious_role: &'static str = Box::leak(
+            "attacker-role-a1a1a1a1-deadbeef-cafebabe"
+                .to_owned()
+                .into_boxed_str(),
+        );
+        let role_error =
+            Ikev2ChildSaKeyMaterialError::from(Ikev2SaInitCryptoError::InvalidNonceLength {
+                role: malicious_role,
+                len: usize::MAX,
+            });
+        let Ikev2ChildSaKeyMaterialError::KeyDerivation(role_diagnostic) = role_error else {
+            panic!("expected Child-SA KEYMAT derivation diagnostic");
+        };
+        assert_eq!(
+            role_diagnostic.code(),
+            Ikev2SaInitCryptoErrorCode::InvalidNonceLength
+        );
+        assert_eq!(role_diagnostic.invalid_nonce(), None);
+
+        let malicious_name: &'static str = Box::leak(
+            "attacker-key-label-b2b2b2b2-0123456789abcdef"
+                .to_owned()
+                .into_boxed_str(),
+        );
+        let key_error =
+            Ikev2ChildSaKeyMaterialError::from(Ikev2SaInitCryptoError::InvalidKeyLength {
+                name: malicious_name,
+                len: usize::MAX,
+            });
+        let Ikev2ChildSaKeyMaterialError::KeyDerivation(key_diagnostic) = key_error else {
+            panic!("expected Child-SA KEYMAT derivation diagnostic");
+        };
+        assert_eq!(
+            key_diagnostic.code(),
+            Ikev2SaInitCryptoErrorCode::InvalidKeyLength
+        );
+        assert_eq!(key_diagnostic.invalid_nonce(), None);
+
+        for error in [role_error, key_error] {
+            let debug = format!("{error:?}");
+            assert!(!debug.contains(malicious_role));
+            assert!(!debug.contains(malicious_name));
+            assert!(!debug.contains("a1a1a1a1"));
+            assert!(!debug.contains("b2b2b2b2"));
+            assert!(debug.len() < 256);
+            assert_eq!(error.to_string(), "ikev2_child_sa_keymat_derivation_failed");
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]
