@@ -288,7 +288,7 @@ impl Ikev2ChildSaInvalidNonceDiagnostic {
     }
 
     /// Observed nonce length in octets.
-    pub const fn len(self) -> usize {
+    pub const fn observed_len(self) -> usize {
         self.len
     }
 }
@@ -1084,7 +1084,7 @@ mod tests {
             None => panic!("missing allowlisted invalid-nonce details"),
         };
         assert_eq!(nonce.role(), role);
-        assert_eq!(nonce.len(), len);
+        assert_eq!(nonce.observed_len(), len);
     }
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
