@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Redaction-safe Child-SA KEYMAT nonce diagnostics — `opc-ipsec-xfrm`:**
+  `Ikev2ChildSaKeyMaterialError::KeyDerivation` now retains the closed,
+  redaction-safe `Ikev2SaInitCryptoError` rather than only its code. Callers
+  can distinguish invalid initiator and responder nonce lengths without any
+  nonce bytes or key material being retained or rendered. The outer stable
+  error code and its bounded `Display` output are unchanged. Compatibility
+  note: downstream matches must change the `KeyDerivation` payload from
+  `Ikev2SaInitCryptoErrorCode` to `Ikev2SaInitCryptoError`.
+
 ### Added
 - **Create-only absent-predecessor protected roster — `opc-session-net`,
   `opc-session-store`:** adds an independent Profile V2 for the case where the

@@ -11,8 +11,8 @@ use std::{error::Error, fmt};
 use opc_proto_ikev2::{
     derive_child_sa_key_material, derive_initial_child_sa_key_material, Ikev2ChildSaCryptoProfile,
     Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm, Ikev2InitialExchangeNoncePolicy,
-    Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
-    Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError, Ikev2TrafficSelectorBuild,
+    IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
 use crate::{
@@ -258,8 +258,10 @@ impl Ikev2ChildSaXfrmRequests {
 /// Error returned while deriving Child SA KEYMAT into XFRM key material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2ChildSaKeyMaterialError {
-    /// Lower-level IKEv2 KEYMAT derivation failed.
-    KeyDerivation(Ikev2SaInitCryptoErrorCode),
+    /// Lower-level IKEv2 KEYMAT derivation failed with a closed, redaction-safe
+    /// diagnostic. This retains safe details such as an invalid nonce's role
+    /// and length, but never nonce bytes or key material.
+    KeyDerivation(Ikev2SaInitCryptoError),
     /// The negotiated crypto profile has no SDK XFRM algorithm mapping.
     UnsupportedAlgorithmMapping,
 }
@@ -278,7 +280,7 @@ impl Ikev2ChildSaKeyMaterialError {
 
 impl From<Ikev2SaInitCryptoError> for Ikev2ChildSaKeyMaterialError {
     fn from(source: Ikev2SaInitCryptoError) -> Self {
-        Self::KeyDerivation(source.code())
+        Self::KeyDerivation(source)
     }
 }
 
@@ -959,7 +961,7 @@ mod tests {
     use opc_proto_ikev2::{
         install_ikev2_software_crypto_module, Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation,
         Ikev2CryptoRequirements, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
-        Ikev2PrfAlgorithm, Ikev2SaInitCryptoErrorCode,
+        Ikev2PrfAlgorithm, Ikev2SaInitCryptoError,
     };
 
     fn ensure_ike_crypto() {
@@ -1726,7 +1728,10 @@ mod tests {
                 None,
             ),
             Err(Ikev2ChildSaKeyMaterialError::KeyDerivation(
-                Ikev2SaInitCryptoErrorCode::InvalidNonceLength
+                Ikev2SaInitCryptoError::InvalidNonceLength {
+                    role: "initiator",
+                    len: 16,
+                }
             ))
         ));
 
@@ -1885,7 +1890,65 @@ mod tests {
     }
 
     #[test]
-    fn child_sa_xfrm_key_derivation_errors_are_stable_and_redacted() {
+    fn child_sa_xfrm_key_derivation_retains_initiator_nonce_diagnostics() {
+        ensure_ike_crypto();
+        let profile = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+        );
+        let error =
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 15], &[0xb2; 16], None) {
+                Ok(value) => panic!("short initiator nonce unexpectedly derived keys: {value:?}"),
+                Err(error) => error,
+            };
+
+        assert_eq!(
+            error,
+            Ikev2ChildSaKeyMaterialError::KeyDerivation(
+                Ikev2SaInitCryptoError::InvalidNonceLength {
+                    role: "initiator",
+                    len: 15,
+                }
+            )
+        );
+        assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
+        assert_eq!(error.to_string(), "ikev2_child_sa_keymat_derivation_failed");
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("a1a1"));
+        assert!(!debug.contains("0f0f"));
+    }
+
+    #[test]
+    fn child_sa_xfrm_key_derivation_retains_responder_nonce_diagnostics() {
+        ensure_ike_crypto();
+        let profile = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+        );
+        let error =
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 15], None) {
+                Ok(value) => panic!("short responder nonce unexpectedly derived keys: {value:?}"),
+                Err(error) => error,
+            };
+
+        assert_eq!(
+            error,
+            Ikev2ChildSaKeyMaterialError::KeyDerivation(
+                Ikev2SaInitCryptoError::InvalidNonceLength {
+                    role: "responder",
+                    len: 15,
+                }
+            )
+        );
+        assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
+        assert_eq!(error.to_string(), "ikev2_child_sa_keymat_derivation_failed");
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("b2b2"));
+        assert!(!debug.contains("0f0f"));
+    }
+
+    #[test]
+    fn child_sa_xfrm_key_derivation_and_mapping_errors_remain_distinct() {
         ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
@@ -1898,12 +1961,22 @@ mod tests {
             };
         assert_eq!(
             error,
-            Ikev2ChildSaKeyMaterialError::KeyDerivation(
-                Ikev2SaInitCryptoErrorCode::InvalidKeyLength
-            )
+            Ikev2ChildSaKeyMaterialError::KeyDerivation(Ikev2SaInitCryptoError::InvalidKeyLength {
+                name: "SK_d",
+                len: 31,
+            })
         );
         assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
         assert!(!format!("{error:?}").contains("0f0f"));
+
+        let unsupported_profile = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::AesCbc128,
+        );
+        assert_eq!(
+            child_sa_xfrm_keys_from_direction(unsupported_profile, &[0x01; 16], &[]),
+            Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping)
+        );
     }
 
     #[test]
