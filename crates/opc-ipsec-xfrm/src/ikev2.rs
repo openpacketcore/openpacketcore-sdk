@@ -258,9 +258,9 @@ impl Ikev2ChildSaXfrmRequests {
 /// Closed role label retained for an invalid Child-SA KEYMAT nonce diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2ChildSaNonceRole {
-    /// The locally supplied initiator nonce was invalid.
+    /// The protocol initiator nonce was invalid.
     Initiator,
-    /// The peer-supplied responder nonce was invalid.
+    /// The protocol responder nonce was invalid.
     Responder,
 }
 
