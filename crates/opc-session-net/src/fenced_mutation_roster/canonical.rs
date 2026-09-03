@@ -1954,6 +1954,40 @@ pub trait EstablishedPublicationProvider: Send + Sync + 'static {
     /// Provider-specific error whose contents never enter SDK diagnostics.
     type Error: Send;
 
+    /// Resolve one newly terminalized Established publication in one compound
+    /// provider operation.
+    ///
+    /// This is the opt-in low-latency path for a capsule that was returned
+    /// directly by terminalization. Implementations must first inspect the
+    /// exact [`PublicationId`] journal entry. If it is absent, they must
+    /// atomically retain the call's immutable identity and payload as
+    /// `Reserved`, then durably advance that same entry to `Attempted` before
+    /// any externally visible effect. The sole effect/reconciliation path is
+    /// then the equivalent of [`Self::adopt`]; it must never manufacture a
+    /// second identity or replay an `Attempted` effect after `NotFound` or an
+    /// unknown outcome.
+    ///
+    /// The durable fence floor, current lease, and exact payload commitment
+    /// must be checked and raised atomically with the journal transition.
+    /// Cancellation, a provider crash, an invalid reply, or
+    /// [`PublicationProviderOutcome::OutcomeUnknown`] leaves the caller
+    /// status/adopt-only under this same immutable identity. Return
+    /// [`PublicationProviderOutcome::NotTransmitted`] only when this compound
+    /// request did not durably reserve or attempt the journal entry and no
+    /// external effect crossed; that is the only response that lets the SDK
+    /// retry this same compound call directly.
+    ///
+    /// The conservative default deliberately performs no I/O and grants no
+    /// publication authority. Existing providers therefore remain source
+    /// compatible and fail closed until they implement the compound journal
+    /// operation.
+    async fn publish_fresh_established(
+        &self,
+        _call: &EstablishedPublicationCall<'_>,
+    ) -> Result<PublicationProviderOutcome, Self::Error> {
+        Ok(PublicationProviderOutcome::OutcomeUnknown)
+    }
+
     /// Read the exact durable publication state without creating an intent.
     async fn status(
         &self,

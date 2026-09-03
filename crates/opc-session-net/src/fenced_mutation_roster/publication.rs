@@ -52,6 +52,13 @@ pub enum PublicationAdapterError {
     /// exact effect-free intent admission. It never authorizes replaying the
     /// external publication effect.
     BeginNotTransmitted,
+    /// The compound fresh-publication request definitely did not reserve or
+    /// attempt the provider journal entry.
+    ///
+    /// This authorizes retrying only the same opaque fresh publication capsule
+    /// through the dedicated fresh-publication API. It never authorizes a
+    /// recovered or status-derived capsule to execute.
+    FreshNotTransmitted,
 }
 
 impl fmt::Display for PublicationAdapterError {
@@ -62,6 +69,7 @@ impl fmt::Display for PublicationAdapterError {
             Self::Busy => "publication provider busy",
             Self::PayloadConflict => "publication payload conflict",
             Self::BeginNotTransmitted => "publication intent admission not transmitted",
+            Self::FreshNotTransmitted => "fresh publication request not transmitted",
         })
     }
 }
@@ -161,19 +169,101 @@ where
             // A newly materialized or recovered terminal has no process-local
             // evidence about earlier publication work. It can only discover
             // or durably admit the same effect-free provider intent.
-            PublicationState::Unclassified => self.publish_unclassified(publication).await,
+            PublicationState::FreshCompound | PublicationState::Unclassified => {
+                self.publish_unclassified(publication).await
+            }
             // Only the effect-free intent admission may be retransmitted, and
             // only after that exact call proved it did not cross transport.
             PublicationState::DirectBeginRetry => self.begin_publication(publication).await,
             // Any ambiguity, pending intent, or untrusted absence is forever
             // restricted to provider status/adopt operations.
-            PublicationState::StatusAdoptOnly => self.status_or_adopt(publication).await,
+            PublicationState::DirectFreshRetry | PublicationState::StatusAdoptOnly => {
+                self.status_or_adopt(publication).await
+            }
         };
         if matches!(result, Err(PublicationAdapterError::RecoveryRequired)) {
             self.diagnostics
                 .increment(DiagnosticsCounter::PublicationRecoveryRequired);
         }
         result
+    }
+
+    /// Publish a directly terminalized Established capsule through one
+    /// provider-owned status/reserve/attempt/adopt operation.
+    ///
+    /// This is intentionally separate from [`Self::publish`]. The provider
+    /// must implement the compound journal contract on
+    /// [`EstablishedPublicationProvider::publish_fresh_established`]; the
+    /// SDK wraps that one call in exactly one pre-effect and one post-effect
+    /// backend-current authority validation. Reconstructed/status-only
+    /// capsules fall back to status/adopt and never receive compound effect
+    /// authority.
+    pub(crate) async fn publish_fresh_established(
+        &self,
+        publication: &mut EstablishedPublication,
+    ) -> Result<PublicationEvidence, PublicationAdapterError> {
+        let scheduling_digest = match EstablishedPublicationCall::from_established(publication) {
+            Ok(call) => {
+                super::runtime::provider_scheduling_digest(call.authority().current_authority())
+            }
+            Err(_) => {
+                self.diagnostics
+                    .increment(DiagnosticsCounter::PublicationRecoveryRequired);
+                return Err(PublicationAdapterError::RecoveryRequired);
+            }
+        };
+        let _permit = match self.scheduler.try_acquire(scheduling_digest) {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.diagnostics
+                    .increment(DiagnosticsCounter::PublicationProviderBusy);
+                return Err(PublicationAdapterError::Busy);
+            }
+        };
+
+        let result = match publication.state() {
+            PublicationState::FreshCompound | PublicationState::DirectFreshRetry => {
+                self.publish_fresh_compound(publication).await
+            }
+            // A recovery/status result cannot reconstruct fresh effect
+            // authority. It may only observe/adopt the same retained ID.
+            PublicationState::Unclassified
+            | PublicationState::DirectBeginRetry
+            | PublicationState::StatusAdoptOnly => self.status_or_adopt(publication).await,
+        };
+        if matches!(result, Err(PublicationAdapterError::RecoveryRequired)) {
+            self.diagnostics
+                .increment(DiagnosticsCounter::PublicationRecoveryRequired);
+        }
+        result
+    }
+
+    async fn publish_fresh_compound(
+        &self,
+        publication: &mut EstablishedPublication,
+    ) -> Result<PublicationEvidence, PublicationAdapterError> {
+        // This write precedes the first await. Dropping a future once the
+        // provider has the call can never leave its capsule able to launch a
+        // second compound effect; recovery is status/adopt-only.
+        publication.set_state(PublicationState::StatusAdoptOnly);
+        let outcome = self.invoke_fresh_publication(publication).await?;
+        match outcome {
+            PublicationProviderOutcome::Published(evidence) => self.ack(publication, evidence),
+            PublicationProviderOutcome::NotTransmitted => {
+                publication.set_state(PublicationState::DirectFreshRetry);
+                Err(PublicationAdapterError::FreshNotTransmitted)
+            }
+            PublicationProviderOutcome::Pending(evidence) => {
+                self.validate_evidence(publication, &evidence)?;
+                Err(PublicationAdapterError::RecoveryRequired)
+            }
+            // A compound operation must not turn absence or ambiguity into
+            // fresh authority. Both are recovered by status/adopt only.
+            PublicationProviderOutcome::Absent | PublicationProviderOutcome::OutcomeUnknown => {
+                Err(PublicationAdapterError::RecoveryRequired)
+            }
+            PublicationProviderOutcome::Conflict => Err(PublicationAdapterError::PayloadConflict),
+        }
     }
 
     async fn publish_unclassified(
@@ -398,6 +488,41 @@ where
         Ok(outcome)
     }
 
+    /// Invoke exactly one provider-owned compound fresh-publication operation
+    /// between one pre-effect and one post-effect authority validation.
+    async fn invoke_fresh_publication(
+        &self,
+        publication: &EstablishedPublication,
+    ) -> Result<PublicationProviderOutcome, PublicationAdapterError> {
+        let call = EstablishedPublicationCall::from_established(publication)
+            .map_err(|_| PublicationAdapterError::RecoveryRequired)?;
+        self.validate_before(&call).await?;
+
+        let _provider_in_flight = self.diagnostics.provider_in_flight();
+        let response = tokio::time::timeout(PUBLICATION_EFFECT_DEADLINE, async {
+            self.provider.publish_fresh_established(&call).await
+        })
+        .await;
+        drop(_provider_in_flight);
+
+        // The postcheck is intentionally unconditional. A cancellation,
+        // timeout, malformed reply, direct non-transmission, or stale
+        // provider result cannot restore fresh authority under a successor.
+        if self.validate_after(&call).await.is_err() {
+            return Err(PublicationAdapterError::RecoveryRequired);
+        }
+
+        let outcome = match response {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) | Err(_) => return Err(PublicationAdapterError::RecoveryRequired),
+        };
+        if matches!(outcome, PublicationProviderOutcome::Conflict) {
+            self.diagnostics
+                .increment(DiagnosticsCounter::PublicationConflict);
+        }
+        Ok(outcome)
+    }
+
     /// Check the local revocation ledger, then a linearizable backend current
     /// authority read, then the local ledger again. The trailing local check
     /// closes a same-process successor installed while the remote read was in
@@ -495,7 +620,7 @@ mod tests {
         time::Duration,
     };
 
-    #[derive(Clone, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct CallSnapshot {
         publication_id: [u8; 32],
         roster_id: RosterId,
@@ -540,6 +665,17 @@ mod tests {
         assert_eq!(expected.payload_commitment, actual.payload_commitment);
         assert_eq!(expected.checkpoint, actual.checkpoint);
         assert_eq!(expected.result, actual.result);
+    }
+
+    fn same_durable_publication_body(expected: &CallSnapshot, actual: &CallSnapshot) -> bool {
+        expected.publication_id == actual.publication_id
+            && expected.roster_id == actual.roster_id
+            && expected.admission_commitment == actual.admission_commitment
+            && expected.terminal_body_commitment == actual.terminal_body_commitment
+            && expected.receipt_commitment == actual.receipt_commitment
+            && expected.payload_commitment == actual.payload_commitment
+            && expected.checkpoint == actual.checkpoint
+            && expected.result == actual.result
     }
 
     #[derive(Clone, Copy)]
@@ -708,6 +844,15 @@ mod tests {
         Published,
     }
 
+    #[derive(Clone, Copy)]
+    enum FreshPublicationReply {
+        Published,
+        ReservedThenUnknown,
+        EffectThenUnknown,
+        NotTransmitted,
+        Absent,
+    }
+
     #[derive(Default)]
     struct RestartPublicationJournalState {
         intent: Option<(CallSnapshot, RestartPublicationState)>,
@@ -722,6 +867,7 @@ mod tests {
         status_calls: AtomicUsize,
         begin_calls: AtomicUsize,
         adopt_calls: AtomicUsize,
+        fresh_calls: AtomicUsize,
         external_effects: AtomicUsize,
         snapshots: Mutex<Vec<CallSnapshot>>,
     }
@@ -818,6 +964,7 @@ mod tests {
     struct RestartJournalProvider {
         journal: Arc<RestartPublicationJournal>,
         lose_first_adopt_reply: bool,
+        fresh_reply: FreshPublicationReply,
     }
 
     impl RestartJournalProvider {
@@ -825,6 +972,7 @@ mod tests {
             Self {
                 journal,
                 lose_first_adopt_reply: true,
+                fresh_reply: FreshPublicationReply::Published,
             }
         }
 
@@ -832,6 +980,15 @@ mod tests {
             Self {
                 journal,
                 lose_first_adopt_reply: false,
+                fresh_reply: FreshPublicationReply::Published,
+            }
+        }
+
+        fn fresh(journal: Arc<RestartPublicationJournal>, reply: FreshPublicationReply) -> Self {
+            Self {
+                journal,
+                lose_first_adopt_reply: false,
+                fresh_reply: reply,
             }
         }
     }
@@ -839,6 +996,76 @@ mod tests {
     #[async_trait]
     impl EstablishedPublicationProvider for RestartJournalProvider {
         type Error = ();
+
+        async fn publish_fresh_established(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            let (snapshot, mut state) = self.journal.authorize(call)?;
+            self.journal.fresh_calls.fetch_add(1, Ordering::SeqCst);
+
+            match state.intent.as_ref() {
+                Some((retained, _)) if !same_durable_publication_body(retained, &snapshot) => {
+                    return Ok(PublicationProviderOutcome::Conflict);
+                }
+                Some(_) => {}
+                None if matches!(self.fresh_reply, FreshPublicationReply::NotTransmitted) => {
+                    return Ok(PublicationProviderOutcome::NotTransmitted);
+                }
+                None if matches!(self.fresh_reply, FreshPublicationReply::Absent) => {
+                    return Ok(PublicationProviderOutcome::Absent);
+                }
+                None => {
+                    // The immutable identity is durable before any attempt or
+                    // effect. This assignment models the journal's Reserved
+                    // transaction boundary.
+                    state.intent = Some((snapshot, RestartPublicationState::Reserved));
+                }
+            }
+
+            let (_, publication_state) = state
+                .intent
+                .as_mut()
+                .expect("fresh publication retained one exact journal identity");
+            match *publication_state {
+                RestartPublicationState::Published => Ok(PublicationProviderOutcome::Published(
+                    DurablePublicationProvider::evidence(call),
+                )),
+                // No provider-local transport proof permits an Attempted
+                // journal to replay an effect. A successor can only observe
+                // it and wait for a conclusive receipt.
+                RestartPublicationState::Attempted => {
+                    if self.journal.effect_completed.load(Ordering::SeqCst) {
+                        *publication_state = RestartPublicationState::Published;
+                        Ok(PublicationProviderOutcome::Published(
+                            DurablePublicationProvider::evidence(call),
+                        ))
+                    } else {
+                        Ok(PublicationProviderOutcome::Pending(
+                            DurablePublicationProvider::evidence(call),
+                        ))
+                    }
+                }
+                RestartPublicationState::Reserved => {
+                    if matches!(self.fresh_reply, FreshPublicationReply::ReservedThenUnknown) {
+                        return Ok(PublicationProviderOutcome::OutcomeUnknown);
+                    }
+
+                    // This marker is durable before the sole external effect.
+                    *publication_state = RestartPublicationState::Attempted;
+                    self.journal.external_effects.fetch_add(1, Ordering::SeqCst);
+                    self.journal.effect_completed.store(true, Ordering::SeqCst);
+                    if matches!(self.fresh_reply, FreshPublicationReply::EffectThenUnknown) {
+                        return Ok(PublicationProviderOutcome::OutcomeUnknown);
+                    }
+
+                    *publication_state = RestartPublicationState::Published;
+                    Ok(PublicationProviderOutcome::Published(
+                        DurablePublicationProvider::evidence(call),
+                    ))
+                }
+            }
+        }
 
         async fn status(
             &self,
@@ -929,6 +1156,118 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A compound provider whose first fresh call pauses after the durable
+    /// Attempted transition and before any external effect. Dropping that
+    /// future is the deterministic cancellation/crash boundary.
+    struct GatedFreshJournalProvider {
+        journal: Arc<RestartPublicationJournal>,
+        attempted: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl GatedFreshJournalProvider {
+        fn new(journal: Arc<RestartPublicationJournal>) -> Self {
+            Self {
+                journal,
+                attempted: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn wait_for_attempt(&self) {
+            self.attempted.notified().await;
+        }
+    }
+
+    #[async_trait]
+    impl EstablishedPublicationProvider for GatedFreshJournalProvider {
+        type Error = ();
+
+        async fn publish_fresh_established(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            {
+                let (snapshot, mut state) = self.journal.authorize(call)?;
+                self.journal.fresh_calls.fetch_add(1, Ordering::SeqCst);
+                match state.intent.as_ref() {
+                    Some((retained, _)) if !same_durable_publication_body(retained, &snapshot) => {
+                        return Ok(PublicationProviderOutcome::Conflict);
+                    }
+                    Some((_, RestartPublicationState::Published)) => {
+                        return Ok(PublicationProviderOutcome::Published(
+                            DurablePublicationProvider::evidence(call),
+                        ));
+                    }
+                    Some((_, RestartPublicationState::Attempted)) => {
+                        return Ok(PublicationProviderOutcome::Pending(
+                            DurablePublicationProvider::evidence(call),
+                        ));
+                    }
+                    Some((_, RestartPublicationState::Reserved)) => {}
+                    None => {
+                        state.intent = Some((snapshot, RestartPublicationState::Reserved));
+                    }
+                }
+                let (_, publication_state) = state
+                    .intent
+                    .as_mut()
+                    .expect("compound publication retained one exact identity");
+                *publication_state = RestartPublicationState::Attempted;
+            }
+
+            self.attempted.notify_one();
+            self.resume.notified().await;
+
+            let (snapshot, mut state) = self.journal.authorize(call)?;
+            let (retained, publication_state) = state
+                .intent
+                .as_mut()
+                .expect("attempted journal survives the pause");
+            if !same_durable_publication_body(retained, &snapshot)
+                || *publication_state != RestartPublicationState::Attempted
+                || self.journal.effect_completed.load(Ordering::SeqCst)
+            {
+                return Ok(PublicationProviderOutcome::Pending(
+                    DurablePublicationProvider::evidence(call),
+                ));
+            }
+            self.journal.external_effects.fetch_add(1, Ordering::SeqCst);
+            self.journal.effect_completed.store(true, Ordering::SeqCst);
+            *publication_state = RestartPublicationState::Published;
+            Ok(PublicationProviderOutcome::Published(
+                DurablePublicationProvider::evidence(call),
+            ))
+        }
+
+        async fn status(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            RestartJournalProvider::recover(Arc::clone(&self.journal))
+                .status(call)
+                .await
+        }
+
+        async fn begin_publication(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            RestartJournalProvider::recover(Arc::clone(&self.journal))
+                .begin_publication(call)
+                .await
+        }
+
+        async fn adopt(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            RestartJournalProvider::recover(Arc::clone(&self.journal))
+                .adopt(call)
+                .await
         }
     }
 
@@ -1623,6 +1962,13 @@ mod tests {
     where
         P: EstablishedPublicationProvider,
     {
+        fixture_with_roster(provider, [0x61; 16]).await
+    }
+
+    async fn fixture_with_roster<P>(provider: Arc<P>, roster_bytes: [u8; 16]) -> Fixture<P>
+    where
+        P: EstablishedPublicationProvider,
+    {
         let scope = Scope::from_digest([0x71; 32]);
         let clock = Arc::new(TestClock {
             expired: AtomicBool::new(false),
@@ -1668,9 +2014,10 @@ mod tests {
                 .expect("bounded test member")
             })
             .collect();
+        let roster_id = RosterId::from_bytes(roster_bytes).expect("nonzero test roster ID");
         let proposal = AdmissionProposal::new(
             Profile::v1(),
-            RosterId::from_bytes([0x61; 16]).expect("nonzero test roster ID"),
+            roster_id,
             members,
             EstablishedMutation::no_op(),
             b"retained admission plan".to_vec(),
@@ -1734,7 +2081,7 @@ mod tests {
             lease_backend,
             scope,
             key,
-            roster_id: RosterId::from_bytes([0x61; 16]).expect("nonzero test roster ID"),
+            roster_id,
             original_owner,
             original_admission_fence,
         }
@@ -2445,5 +2792,355 @@ mod tests {
         assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.external_effects.load(Ordering::SeqCst), 0);
         assert!(provider.snapshots().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fresh_compound_publication_uses_exactly_one_pre_and_post_authority_read() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::Published,
+        ));
+        let mut fixture = fixture(provider).await;
+        let authority_reads_before = fixture.backend.authority_reads();
+        let mutations_before = (
+            fixture.backend.registrations.load(Ordering::SeqCst),
+            fixture.backend.terminalizations.load(Ordering::SeqCst),
+        );
+
+        let evidence = fixture
+            .adapter
+            .publish_fresh_established(&mut fixture.publication)
+            .await
+            .expect("the fresh compound provider publishes one exact identity");
+
+        assert_eq!(
+            fixture.backend.authority_reads(),
+            authority_reads_before + 2
+        );
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            journal.state(),
+            RestartPublicationState::Published
+        ));
+        assert_eq!(
+            (
+                fixture.backend.registrations.load(Ordering::SeqCst),
+                fixture.backend.terminalizations.load(Ordering::SeqCst),
+            ),
+            mutations_before,
+            "the compound publication remains provider-local and cannot add a third roster mutation"
+        );
+        assert_eq!(
+            evidence.publication_id().as_bytes(),
+            &journal.intent().publication_id,
+            "the acknowledgement remains bound to the durable journal identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_crash_before_attempt_recovers_by_status_adopt_after_lease_reacquisition() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let first_provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::ReservedThenUnknown,
+        ));
+        let mut fixture = fixture(Arc::clone(&first_provider)).await;
+
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut fixture.publication)
+                .await,
+            Err(PublicationAdapterError::RecoveryRequired),
+            "a crash after Reserved cannot acknowledge or retain fresh effect authority"
+        );
+        assert!(matches!(journal.state(), RestartPublicationState::Reserved));
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
+        let intent = journal.intent();
+
+        let successor_provider = Arc::new(RestartJournalProvider::recover(Arc::clone(&journal)));
+        let (successor_adapter, _, mut recovered, successor_fence) =
+            recover_successor(&fixture, successor_provider).await;
+        successor_adapter
+            .publish_fresh_established(&mut recovered)
+            .await
+            .expect("a recovered capsule may only status/adopt the same Reserved identity");
+
+        assert!(successor_fence > intent.fence);
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            journal.state(),
+            RestartPublicationState::Published
+        ));
+        for snapshot in journal.snapshots() {
+            assert_same_durable_publication_body(&intent, &snapshot);
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_attempted_unknown_receipt_recovery_never_replays_the_effect() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::EffectThenUnknown,
+        ));
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut fixture.publication)
+                .await,
+            Err(PublicationAdapterError::RecoveryRequired),
+            "the lost post-attempt reply must remain unacknowledged"
+        );
+        assert!(matches!(
+            journal.state(),
+            RestartPublicationState::Attempted
+        ));
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+
+        let mut recovered = match fixture
+            .client
+            .terminal_status(&mut fixture.terminal)
+            .await
+            .expect("read exact retained terminal")
+        {
+            super::super::client::TerminalStatus::Committed(TerminalReceipt::Established(
+                established,
+            )) => established.into_publication(),
+            _ => panic!("terminal status must return the exact Established receipt"),
+        };
+        fixture
+            .adapter
+            .publish_fresh_established(&mut recovered)
+            .await
+            .expect("a status-derived handle adopts the completed attempted identity");
+
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            journal.state(),
+            RestartPublicationState::Published
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_attempt_leaves_a_status_adopt_only_journal_without_replay() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(GatedFreshJournalProvider::new(Arc::clone(&journal)));
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+
+        let attempted = provider.wait_for_attempt();
+        let adapter = fixture.adapter.clone();
+        let publication = fixture.publication;
+        let task = tokio::spawn(async move {
+            let mut publication = publication;
+            adapter.publish_fresh_established(&mut publication).await
+        });
+        attempted.await;
+        task.abort();
+        assert!(task.await.is_err(), "the paused fresh request is cancelled");
+
+        assert!(matches!(
+            journal.state(),
+            RestartPublicationState::Attempted
+        ));
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
+        let mut recovered = match fixture
+            .client
+            .terminal_status(&mut fixture.terminal)
+            .await
+            .expect("read the exact terminal after cancellation")
+        {
+            super::super::client::TerminalStatus::Committed(TerminalReceipt::Established(
+                established,
+            )) => established.into_publication(),
+            _ => panic!("terminal status must return the exact Established receipt"),
+        };
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut recovered)
+                .await,
+            Err(PublicationAdapterError::RecoveryRequired),
+            "an Attempted journal with no transport-conclusive resend proof cannot replay"
+        );
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fresh_compound_rejects_stale_backend_authority_before_provider_io() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::Published,
+        ));
+        let mut fixture = fixture(provider).await;
+        let reads_before = fixture.backend.authority_reads();
+        fixture.backend.expire_current_authority_for_read();
+
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut fixture.publication)
+                .await,
+            Err(PublicationAdapterError::AuthorityRejected)
+        );
+        assert_eq!(fixture.backend.authority_reads(), reads_before + 1);
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
+        assert!(journal.snapshots().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_compound_duplicate_is_serialized_to_one_effect() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::Published,
+        ));
+        let fixture = fixture(Arc::clone(&provider)).await;
+        let call = EstablishedPublicationCall::from_established(&fixture.publication)
+            .expect("fixture has one exact fresh publication");
+
+        let (first, second) = tokio::join!(
+            provider.publish_fresh_established(&call),
+            provider.publish_fresh_established(&call),
+        );
+        assert!(matches!(
+            first,
+            Ok(PublicationProviderOutcome::Published(_))
+        ));
+        assert!(matches!(
+            second,
+            Ok(PublicationProviderOutcome::Published(_))
+        ));
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            journal.state(),
+            RestartPublicationState::Published
+        ));
+    }
+
+    #[tokio::test]
+    async fn foreign_fresh_identity_conflicts_without_effect_or_roster_mutation() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::Published,
+        ));
+        let mut first = fixture(Arc::clone(&provider)).await;
+        first
+            .adapter
+            .publish_fresh_established(&mut first.publication)
+            .await
+            .expect("first journal identity publishes");
+        let retained = journal.intent();
+        let mut foreign = fixture_with_roster(Arc::clone(&provider), [0x62; 16]).await;
+        let mutations_before = (
+            foreign.backend.registrations.load(Ordering::SeqCst),
+            foreign.backend.terminalizations.load(Ordering::SeqCst),
+        );
+
+        assert_eq!(
+            foreign
+                .adapter
+                .publish_fresh_established(&mut foreign.publication)
+                .await,
+            Err(PublicationAdapterError::PayloadConflict)
+        );
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.intent(), retained);
+        assert_eq!(
+            (
+                foreign.backend.registrations.load(Ordering::SeqCst),
+                foreign.backend.terminalizations.load(Ordering::SeqCst),
+            ),
+            mutations_before,
+            "a foreign publication identity cannot create a new roster mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_direct_nontransmission_retries_only_the_same_compound_request() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::NotTransmitted,
+        ));
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut fixture.publication)
+                .await,
+            Err(PublicationAdapterError::FreshNotTransmitted)
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut fixture.publication)
+                .await,
+            Err(PublicationAdapterError::FreshNotTransmitted),
+            "only the exact fresh compound request regains retry authority"
+        );
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            journal.snapshots().len(),
+            2,
+            "each direct non-transmission is still durably fenced and bound to the same call"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_not_found_fails_closed_and_cannot_restore_effect_authority() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::fresh(
+            Arc::clone(&journal),
+            FreshPublicationReply::Absent,
+        ));
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut fixture.publication)
+                .await,
+            Err(PublicationAdapterError::RecoveryRequired)
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .publish_fresh_established(&mut fixture.publication)
+                .await,
+            Err(PublicationAdapterError::RecoveryRequired),
+            "a post-ambiguity NotFound must route only to status/adopt"
+        );
+        assert_eq!(journal.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
     }
 }
