@@ -281,7 +281,20 @@ impl Topology {
             output("ip", &["-s", "link", "show", "dev", "cprim"]),
             output("ip", &["-s", "link", "show", "dev", "csec"]),
             server_ss,
-            output("ip", &["netns", "exec", &self.server_namespace, "ip", "-s", "link", "show", "dev", "ssec"]),
+            output(
+                "ip",
+                &[
+                    "netns",
+                    "exec",
+                    &self.server_namespace,
+                    "ip",
+                    "-s",
+                    "link",
+                    "show",
+                    "dev",
+                    "ssec",
+                ],
+            ),
         )
     }
 
