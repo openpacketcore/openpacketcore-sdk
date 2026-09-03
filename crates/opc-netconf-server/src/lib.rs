@@ -31,8 +31,9 @@
 //! - Bounded XML parsing for client `<hello>` and RPC envelopes, including
 //!   fail-closed rejection of missing, empty, or duplicate client hello
 //!   capability containers, bounded XPath filter `select` expressions, plus
-//!   `MgmtLimits::max_paths_per_request` enforcement after subtree/XPath
-//!   filters expand into schema-node selections;
+//!   `MgmtLimits::max_paths_per_request` enforcement for edit payload nodes
+//!   before schema application and after subtree/XPath filters expand into
+//!   schema-node selections;
 //!   parser errors after a valid `<rpc>` envelope preserve `message-id` without
 //!   echoing payload text, bounded extra `<rpc>` attributes are copied onto all
 //!   `<rpc-reply>` forms per RFC 6241 with prefixed NETCONF reply elements when
@@ -239,6 +240,13 @@ pub use capabilities::{
     NETCONF_NOTIFICATION_NS, NOTIFICATION_1_0, WITH_DEFAULTS_1_0_BASE, WITH_DEFAULTS_NS,
     WRITABLE_RUNNING_1_0, YANG_LIBRARY_1_1_BASE, YANG_LIBRARY_REVISION,
 };
+/// Parses a bounded NETCONF `<config>` fragment into a schema-bound edit tree.
+///
+/// This is the same strict normalizer used by
+/// [`binding::NetconfConfigBinding::build_edit_config_candidate`]. Callers
+/// must supply the generated registry for the served YANG model and must not
+/// log the returned tree, because it can carry configuration values.
+pub use edit_xml::{parse_edit_config_xml, parse_edit_config_xml_with_limits};
 pub use error::{
     rpc_error_reply, rpc_get_schema_reply, rpc_ok_committed_revision_reply, rpc_ok_empty_reply,
     rpc_ok_reply, xml_escape, RpcError, NETCONF_NOT_LEADER_APP_TAG,

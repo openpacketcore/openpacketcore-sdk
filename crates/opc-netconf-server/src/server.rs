@@ -4997,6 +4997,28 @@ where
         Ok(())
     }
 
+    /// Classifies the authorization and commit operation from the effective
+    /// operation on the single schema root in a validated edit subtree.
+    ///
+    /// A root `replace` is authorization-relevant even when the candidate's
+    /// changed-path diff contains only a subset of leaves. Per-entry and
+    /// descendant `replace` operations leave the root effective operation as
+    /// `merge` and remain patches. If a legacy custom binding accepts a
+    /// request the schema parser cannot classify, preserve the conservative
+    /// historical `Patch` classification.
+    fn edit_config_write_operation(&self, request: &XmlEditConfigRequest) -> ConfigOperation {
+        match crate::edit_xml::parse_edit_config_xml_from_bounded_envelope(
+            &request.config_xml,
+            self.binding.schema_registry(),
+            request.default_operation,
+        ) {
+            Ok(edit) if edit.operation == opc_mgmt_schema::EditOperation::Replace => {
+                ConfigOperation::Replace
+            }
+            Ok(_) | Err(_) => ConfigOperation::Patch,
+        }
+    }
+
     fn replacement_changed_paths(
         &self,
         candidate: &C,
@@ -5812,8 +5834,8 @@ where
                     .await;
             }
         };
-        match self.authorize_config_write(context.principal, ConfigOperation::Patch, &changed_paths)
-        {
+        let write_operation = self.edit_config_write_operation(request);
+        match self.authorize_config_write(context.principal, write_operation, &changed_paths) {
             Ok(()) => {}
             Err(WriteAuthzFailure::Denied) => {
                 return self
@@ -5842,7 +5864,7 @@ where
             context.principal.clone(),
             self.transport,
             RequestSource::Northbound,
-            ConfigOperation::Patch,
+            write_operation,
             candidate.candidate,
             candidate.changed_paths,
             Instant::now() + Duration::from_secs(30),
@@ -6252,13 +6274,9 @@ where
             }
         };
         let previous = Some(Arc::new(base));
+        let write_operation = self.edit_config_write_operation(request);
         if self
-            .validate_config_for_datastore(
-                &candidate.candidate,
-                context,
-                ConfigOperation::Patch,
-                previous,
-            )
+            .validate_config_for_datastore(&candidate.candidate, context, write_operation, previous)
             .is_err()
         {
             return self
@@ -6270,8 +6288,7 @@ where
                 )
                 .await;
         }
-        match self.authorize_config_write(context.principal, ConfigOperation::Patch, &changed_paths)
-        {
+        match self.authorize_config_write(context.principal, write_operation, &changed_paths) {
             Ok(()) => {}
             Err(WriteAuthzFailure::Denied) => {
                 return self
@@ -8139,6 +8156,26 @@ mod tests {
                     changed_paths: ctx.changed_paths.clone(),
                 });
             Err(AuthorizationError::new("do-not-leak-authorizer-detail"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReplaceOnlyConfigAuthorizer {
+        operations: Arc<Mutex<Vec<ConfigOperation>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigAuthorizer for ReplaceOnlyConfigAuthorizer {
+        async fn authorize(&self, ctx: &AuthorizationContext) -> Result<(), AuthorizationError> {
+            self.operations
+                .lock()
+                .expect("replace-only authorizer mutex")
+                .push(ctx.operation);
+            if ctx.operation == ConfigOperation::Replace {
+                Ok(())
+            } else {
+                Err(AuthorizationError::new("operation is not replace"))
+            }
         }
     }
 
@@ -15108,6 +15145,255 @@ mod tests {
         }
     }
 
+    /// Minimal schema-valid generated-binding stand-in for end-to-end leaf-list
+    /// parsing tests. Keeping this separate from the scalar demo config avoids
+    /// blessing repeated leaf siblings in protocol-boundary tests.
+    #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct LeafListDemoConfig {
+        servers: Vec<String>,
+        aliases: Vec<String>,
+    }
+
+    impl OpcConfig for LeafListDemoConfig {
+        type Delta = ();
+
+        fn schema_digest(&self) -> SchemaDigest {
+            SchemaDigest::from_bytes([3u8; 32])
+        }
+
+        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn changed_paths(
+            &self,
+            previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, ConfigError> {
+            let mut paths = Vec::new();
+            if self.servers != previous.servers {
+                paths.push(YangPath::new("/sys:system/sys:servers").expect("servers path"));
+            }
+            if self.aliases != previous.aliases {
+                paths.push(YangPath::new("/sys:system/sys:aliases").expect("aliases path"));
+            }
+            Ok(paths)
+        }
+
+        fn subscriber_snapshot_retained_size_bytes(&self) -> Option<usize> {
+            Some(
+                std::mem::size_of::<Self>()
+                    .saturating_add(self.servers.iter().map(String::capacity).sum::<usize>())
+                    .saturating_add(self.aliases.iter().map(String::capacity).sum::<usize>()),
+            )
+        }
+
+        fn subscriber_delta_retained_size_bytes(_delta: &Self::Delta) -> Option<usize> {
+            Some(std::mem::size_of::<Self::Delta>())
+        }
+
+        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
+            Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), ValidationError> {
+            Ok(())
+        }
+
+        fn validate_semantics(
+            &self,
+            _ctx: &ValidationContext<Self>,
+        ) -> Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    struct LeafListDemoRegistry;
+
+    static LEAF_LIST_DEMO_NODES: &[NodeMeta] = &[
+        NodeMeta {
+            path: "/sys:system",
+            module: "demo-system",
+            kind: NodeKind::Container,
+            config: true,
+            leaf_type: None,
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &["/sys:system/sys:aliases", "/sys:system/sys:servers"],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:aliases",
+            module: "demo-system",
+            kind: NodeKind::LeafList,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+        NodeMeta {
+            path: "/sys:system/sys:servers",
+            module: "demo-system",
+            kind: NodeKind::LeafList,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+    ];
+
+    impl SchemaRegistry for LeafListDemoRegistry {
+        fn schema_digest(&self) -> &'static str {
+            "fnv1a64:leaf-list-demo"
+        }
+
+        fn served_models(&self) -> &'static [ModelData] {
+            MODELS
+        }
+
+        fn nodes(&self) -> &'static [NodeMeta] {
+            LEAF_LIST_DEMO_NODES
+        }
+
+        fn origins(&self) -> &'static [OriginEntry] {
+            ORIGINS
+        }
+    }
+
+    static LEAF_LIST_DEMO_REGISTRY: LeafListDemoRegistry = LeafListDemoRegistry;
+
+    struct LeafListDemoApplicator;
+
+    static LEAF_LIST_DEMO_APPLICATOR: LeafListDemoApplicator = LeafListDemoApplicator;
+
+    impl NetconfXmlEditApplicator<LeafListDemoConfig> for LeafListDemoApplicator {
+        fn apply_edit_config(
+            &self,
+            running: &LeafListDemoConfig,
+            edit: &EditConfigNode,
+        ) -> Result<LeafListDemoConfig, NetconfEditError> {
+            let mut candidate = running.clone();
+            apply_leaf_list_demo_node(&mut candidate, edit)?;
+            Ok(candidate)
+        }
+    }
+
+    fn apply_leaf_list_demo_node(
+        config: &mut LeafListDemoConfig,
+        node: &EditConfigNode,
+    ) -> Result<(), NetconfEditError> {
+        match node.schema_path {
+            "/sys:system" => {
+                if node.operation == EditOperation::Replace {
+                    config.servers.clear();
+                    config.aliases.clear();
+                }
+                for child in &node.children {
+                    apply_leaf_list_demo_node(config, child)?;
+                }
+                Ok(())
+            }
+            "/sys:system/sys:servers" => apply_leaf_list_demo_entry(&mut config.servers, node),
+            "/sys:system/sys:aliases" => apply_leaf_list_demo_entry(&mut config.aliases, node),
+            _ => Err(NetconfEditError::UnknownPath(node.schema_path.to_string())),
+        }
+    }
+
+    fn apply_leaf_list_demo_entry(
+        values: &mut Vec<String>,
+        node: &EditConfigNode,
+    ) -> Result<(), NetconfEditError> {
+        if !node.children.is_empty() {
+            return Err(NetconfEditError::MalformedXml);
+        }
+        if !node.list_keys.is_empty() {
+            return Err(NetconfEditError::KeyOnNonList {
+                path: node.schema_path,
+            });
+        }
+        let value = node.value.as_ref().ok_or(NetconfEditError::InvalidValue {
+            path: node.schema_path,
+        })?;
+        let position = values.iter().position(|current| current == value);
+        match node.operation {
+            EditOperation::Merge | EditOperation::Replace => {
+                if position.is_none() {
+                    values.push(value.clone());
+                }
+                Ok(())
+            }
+            EditOperation::Create => {
+                if position.is_some() {
+                    return Err(NetconfEditError::OperationNotSupported {
+                        path: node.schema_path,
+                        operation: node.operation,
+                        kind: NodeKind::LeafList,
+                    });
+                }
+                values.push(value.clone());
+                Ok(())
+            }
+            EditOperation::Delete => {
+                let index = position.ok_or(NetconfEditError::OperationNotSupported {
+                    path: node.schema_path,
+                    operation: node.operation,
+                    kind: NodeKind::LeafList,
+                })?;
+                values.remove(index);
+                Ok(())
+            }
+            EditOperation::Remove => {
+                if let Some(index) = position {
+                    values.remove(index);
+                }
+                Ok(())
+            }
+            EditOperation::None => Ok(()),
+        }
+    }
+
+    struct LeafListDemoBinding {
+        bus: Arc<ConfigBus<LeafListDemoConfig>>,
+    }
+
+    impl NetconfConfigBinding<LeafListDemoConfig> for LeafListDemoBinding {
+        fn config_bus(&self) -> Arc<ConfigBus<LeafListDemoConfig>> {
+            Arc::clone(&self.bus)
+        }
+
+        fn schema_registry(&self) -> &'static dyn SchemaRegistry {
+            &LEAF_LIST_DEMO_REGISTRY
+        }
+
+        fn generated_xml_edit_applicator(
+            &self,
+        ) -> Option<&dyn NetconfXmlEditApplicator<LeafListDemoConfig>> {
+            Some(&LEAF_LIST_DEMO_APPLICATOR)
+        }
+
+        fn writable_running_capability(&self) -> bool {
+            true
+        }
+
+        fn render_running_config(
+            &self,
+            _config: &LeafListDemoConfig,
+            _selection: ReadSelection<'_>,
+        ) -> Result<String, BindingError> {
+            Ok(String::new())
+        }
+    }
+
     #[derive(Default)]
     struct MemoryStartupDatastore {
         config: Mutex<Option<DemoConfig>>,
@@ -15419,6 +15705,58 @@ mod tests {
         CapturingAudit,
     ) {
         generated_edit_server_policy(policy_allow_system_but_deny_secret()).await
+    }
+
+    async fn generated_edit_server_with_config_authorizer(
+        authorizer: Arc<dyn ConfigAuthorizer>,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+    ) {
+        let bus = Arc::new(
+            ConfigBus::new(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                MockManagedDatastore::new(),
+                authorizer,
+            )
+            .await
+            .expect("replace-authorized demo bus"),
+        );
+        let server = ReadOnlyNetconfServer::new(
+            GeneratedEditBinding {
+                bus: Arc::clone(&bus),
+                startup: None,
+            },
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            CapturingAudit::default(),
+            TransportType::NetconfTls,
+        )
+        .expect("replace-authorized demo server");
+        (server, bus)
+    }
+
+    async fn leaf_list_demo_server_fixture() -> (
+        ReadOnlyNetconfServer<LeafListDemoConfig, LeafListDemoBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<LeafListDemoConfig>>,
+    ) {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(LeafListDemoConfig::default(), MockManagedDatastore::new())
+                .await
+                .expect("leaf-list demo bus"),
+        );
+        let server = ReadOnlyNetconfServer::new(
+            LeafListDemoBinding {
+                bus: Arc::clone(&bus),
+            },
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            CapturingAudit::default(),
+            TransportType::NetconfTls,
+        )
+        .expect("leaf-list demo server");
+        (server, bus)
     }
 
     async fn generated_edit_server_policy(
@@ -15982,6 +16320,167 @@ mod tests {
             .collect();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].outcome, AuditOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn running_root_replace_reaches_config_authority_as_replace() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let authorizer: Arc<dyn ConfigAuthorizer> = Arc::new(ReplaceOnlyConfigAuthorizer {
+            operations: Arc::clone(&operations),
+        });
+        let (server, bus) = generated_edit_server_with_config_authorizer(authorizer).await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0" nc:operation="replace"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains("<ok/>"));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+        assert_eq!(
+            *operations.lock().expect("replace-only authorizer mutex"),
+            vec![ConfigOperation::Replace],
+            "a full-root NETCONF replace must reach configuration authority as Replace"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_descendant_replace_remains_a_patch_for_config_authority() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let authorizer: Arc<dyn ConfigAuthorizer> = Arc::new(ReplaceOnlyConfigAuthorizer {
+            operations: Arc::clone(&operations),
+        });
+        let (server, bus) = generated_edit_server_with_config_authorizer(authorizer).await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let rpc = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0"><sys:hostname nc:operation="replace">amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>access-denied</error-tag>"));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+        assert_eq!(
+            *operations.lock().expect("replace-only authorizer mutex"),
+            vec![ConfigOperation::Patch],
+            "a descendant replace must preserve partial-edit Patch authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_edit_binding_reuses_the_raised_session_path_limit() {
+        let (server, bus) = leaf_list_demo_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+        let limits = MgmtLimits {
+            max_paths_per_request: MgmtLimits::default().max_paths_per_request + 1,
+            ..MgmtLimits::default()
+        };
+
+        let mut config = String::from(r#"<sys:system xmlns:sys="urn:opc:demo">"#);
+        for entry in 0..limits.max_paths_per_request - 1 {
+            config.push_str(&format!("<sys:servers>entry-{entry}</sys:servers>"));
+        }
+        config.push_str("</sys:system>");
+        let rpc = edit_config_rpc(&config, "merge");
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &limits,
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains("<ok/>"));
+        let snapshot = bus.current_snapshot();
+        assert_eq!(
+            snapshot.config.servers.len(),
+            limits.max_paths_per_request - 1
+        );
+        assert_eq!(
+            snapshot.config.servers.first(),
+            Some(&"entry-0".to_string())
+        );
+        assert_eq!(
+            snapshot.config.servers.last(),
+            Some(&format!("entry-{}", limits.max_paths_per_request - 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_edit_uses_the_already_bounded_envelope_capture() {
+        let (server, bus) = leaf_list_demo_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        // The envelope parser turns each empty element into a start/end pair
+        // while preserving namespace scope. The internal capture is therefore
+        // deliberately longer than the wire RPC even though the wire message
+        // itself is within the configured request limit.
+        let prefix = "p".repeat(512);
+        let config = format!(
+            r#"<{prefix}:system xmlns:{prefix}="urn:opc:demo"><{prefix}:servers/><{prefix}:aliases/></{prefix}:system>"#
+        );
+        let rpc = edit_config_rpc(&config, "merge");
+        let limits = MgmtLimits {
+            max_request_bytes: rpc.len(),
+            max_value_bytes: rpc.len(),
+            max_xpath_filter_bytes: rpc.len(),
+            ..MgmtLimits::default()
+        };
+
+        let captured_len = match crate::xml::parse_rpc(&rpc, &limits)
+            .expect("the wire RPC is bounded before its config capture")
+            .operation
+        {
+            RpcOperation::EditConfig(request) => request.config_xml.len(),
+            _ => panic!("expected edit-config request"),
+        };
+        assert!(captured_len > rpc.len());
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &rpc,
+                &limits,
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result.reply_xml.contains("<ok/>"));
+        let snapshot = bus.current_snapshot();
+        assert_eq!(snapshot.config.servers, vec![String::new()]);
+        assert_eq!(snapshot.config.aliases, vec![String::new()]);
     }
 
     #[tokio::test]
