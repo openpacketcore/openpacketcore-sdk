@@ -1910,8 +1910,21 @@ pub enum PublicationProviderOutcome {
     /// external effect; an unclassified receipt may use it only to invoke the
     /// effect-free `begin_publication` operation for the same exact identity.
     Absent,
-    /// The current effect-free intent-admission call provably did not transmit.
+    /// The legacy effect-free intent-admission call provably did not transmit.
+    ///
+    /// Only [`EstablishedPublicationProvider::begin_publication`] may return
+    /// this outcome. It authorizes retrying that same inert admission call;
+    /// it never authorizes a publication effect.
     NotTransmitted,
+    /// The one-call fresh-publication request provably did not transmit.
+    ///
+    /// Only [`EstablishedPublicationProvider::publish_fresh_established`] may
+    /// return this outcome, and only when it neither durably retained
+    /// `Reserved` nor advanced `Attempted`, and no external effect crossed.
+    /// It authorizes retrying only the same opaque fresh capsule through that
+    /// method. It is never valid after `Absent`, `Pending`, an unknown reply,
+    /// cancellation, or any durable journal/effect transition.
+    FreshNotTransmitted,
     /// Delivery or publication outcome is unknown; only status or adoption may follow.
     OutcomeUnknown,
     /// A durable publication intent exists but its outcome is not yet conclusive.
@@ -1936,17 +1949,21 @@ impl fmt::Debug for PublicationProviderOutcome {
 /// a Published tombstone after roster payload retention ends. These operations
 /// are outside roster consensus. `begin_publication` must atomically create or
 /// recover only an inert durable intent and is forbidden from crossing the
-/// external publication boundary. `adopt` is the sole operation that may
-/// reconcile or finish that effect: it must durably mark the intent attempted
-/// before external I/O and must never blind-run an indeterminate outcome.
-/// `Absent` is non-exclusionary after ambiguity and never effect authority.
+/// external publication boundary. `adopt` and the opt-in
+/// `publish_fresh_established` may reconcile or finish the sole effect, but
+/// each must durably mark the same exact journal identity `Attempted` before
+/// external I/O and must never blind-run an indeterminate outcome. `Absent`
+/// is non-exclusionary after ambiguity and never effect authority.
 ///
 /// The provider's logical state is monotonic: `Absent -> Reserved -> Attempted
 /// -> Published`, with `Conflict` sticky. Once Reserved exists, no operation
 /// may return it to Absent or recreate it; compact storage is permitted only
-/// while preserving the same logical state and exact identity. Attempted may
-/// resend only when the provider itself retained transport-conclusive
-/// NotTransmitted evidence for that exact attempted call. Every method must
+/// while preserving the same logical state and exact identity. Once Attempted
+/// or an external effect may have crossed, no caller-visible outcome may
+/// restore fresh retry authority: recovery is status/adopt-only under that
+/// identity. [`PublicationProviderOutcome::NotTransmitted`] and
+/// [`PublicationProviderOutcome::FreshNotTransmitted`] are valid only before
+/// their respective durable transition/effect boundaries. Every method must
 /// atomically compare and raise a durable per-publication fence floor, reject
 /// a lower or expired authority before I/O, and serialize that check with its
 /// state transition so a stale pod cannot race a successor.
@@ -1969,13 +1986,14 @@ pub trait EstablishedPublicationProvider: Send + Sync + 'static {
     ///
     /// The durable fence floor, current lease, and exact payload commitment
     /// must be checked and raised atomically with the journal transition.
-    /// Cancellation, a provider crash, an invalid reply, or
+    /// Cancellation, a provider crash, an invalid reply,
+    /// [`PublicationProviderOutcome::Absent`], or
     /// [`PublicationProviderOutcome::OutcomeUnknown`] leaves the caller
     /// status/adopt-only under this same immutable identity. Return
-    /// [`PublicationProviderOutcome::NotTransmitted`] only when this compound
-    /// request did not durably reserve or attempt the journal entry and no
-    /// external effect crossed; that is the only response that lets the SDK
-    /// retry this same compound call directly.
+    /// [`PublicationProviderOutcome::FreshNotTransmitted`] only when this
+    /// compound request did not durably reserve or attempt the journal entry
+    /// and no external effect crossed; that is the only response that lets
+    /// the SDK retry this same compound call directly.
     ///
     /// The conservative default deliberately performs no I/O and grants no
     /// publication authority. Existing providers therefore remain source
@@ -2007,7 +2025,8 @@ pub trait EstablishedPublicationProvider: Send + Sync + 'static {
     ///
     /// Before any external I/O, implementations must durably transition the
     /// same ID/body intent to attempted. Successors may call this operation
-    /// after ambiguity, so it must status/adopt rather than replay an effect.
+    /// after ambiguity, so it must reconcile durable status/receipt evidence
+    /// rather than replay an effect.
     async fn adopt(
         &self,
         call: &EstablishedPublicationCall<'_>,
