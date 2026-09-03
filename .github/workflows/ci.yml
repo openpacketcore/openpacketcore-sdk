@@ -377,6 +377,79 @@ jobs:
       - name: Lint opc-session-store on macOS
         run: cargo clippy --locked -p opc-session-store --all-targets --all-features -- -D warnings
 
+  # This is intentionally a required Rust-workspace lane, not a best-effort
+  # ignored test: cold SCTP static multihoming needs a real kernel, root-owned
+  # private network namespace, and a loadable SCTP module. Any missing
+  # prerequisite fails the lane instead of weakening the regression proof.
+  sctp-privileged:
+    name: Privileged Linux SCTP cold multihoming
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-sctp-privileged
+
+      - name: Require SCTP module and isolated network namespaces
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y iproute2 kmod
+          if ! sudo modprobe sctp; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sctp
+          fi
+          lsmod | grep -E '^sctp[[:space:]]'
+          sudo unshare -n -- bash -euxo pipefail -c '
+            ip link set lo up
+            ss -H -n -a -A sctp
+          '
+
+      - name: Build cold SCTP multihoming regression fixture
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/sctp-privileged-target"
+          cargo test --locked -p opc-sctp --test cold_multihoming_netns --no-run
+
+      - name: Require cold primary-down secondary-up SCTP connectx proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/sctp-privileged-target"
+          proof_log="${RUNNER_TEMP}/sctp-cold-multihoming.log"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_SCTP_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-sctp --test cold_multihoming_netns -- \
+                --ignored --exact cold_primary_down_secondary_up_establishes_within_five_seconds \
+                --nocapture --test-threads=1
+            ' 2>&1 | tee "${proof_log}"
+          grep -Fq 'cold SCTP multihoming connector=connected' "${proof_log}"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "${proof_log}"
+
+      - name: Require private namespace cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+          if sudo ip netns list | grep -q '^opc-sctp-cold-'; then
+            echo '::error::cold SCTP multihoming test left a network namespace behind'
+            sudo ip netns list
+            exit 1
+          fi
+
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
@@ -390,6 +463,7 @@ jobs:
       - rust-gtpu-cfg
       - rust-gtpu-freebsd
       - rust-gtpu-macos
+      - sctp-privileged
       - session-net-i686
     steps:
       # Preserves the single check name the previous monolithic job reported,
