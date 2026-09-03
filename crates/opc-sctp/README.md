@@ -31,7 +31,8 @@ Diameter transports are outside the current crate boundary.
   events, active-key selection, confirmed old-key retirement, and bounded
   `SctpSenderDrainOutcome` waits.
 - Observability: `SctpHealth`, `SctpPathHealth`, `SctpPathStatus`,
-  `SctpMetrics`, and `SctpMetricsSnapshot`.
+  `SctpMetrics`, `SctpMetricsSnapshot`, and the redaction-safe per-attempt
+  `SctpConnectProgressHandle`/`SctpConnectProgressSnapshot`.
 - Diameter helpers: `DiameterSctpPeer`, `DiameterSctpAssociation`,
   `DiameterSctpInbound`, `DiameterSctpProtection`, `DiameterInboundPpidPolicy`,
   `DiameterOutboundPpidPolicy`, `DiameterSctpConnectProjection`,
