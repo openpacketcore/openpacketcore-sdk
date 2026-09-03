@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Redaction-safe SCTP connect progress snapshots — `opc-sctp`:** additive
+  handle/future connect APIs expose only the furthest monotonic connector
+  stage (socket/options/bind/remote submission/connect completion/readiness/
+  `SO_ERROR`/established) for raw SCTP and every unprotected Diameter
+  production constructor, including the independent inbound/outbound PPID
+  policy entry point. The handle survives completion, failure, and future
+  cancellation, but it contains no addresses, topology, peer identity, errno,
+  packet values, or subscriber data. `connectx` is reported only as one remote
+  set submission and outcome; no per-path attempt is claimed. Existing connect
+  APIs and PPID/notification behavior are unchanged.
 - **Create-only absent-predecessor protected roster — `opc-session-net`,
   `opc-session-store`:** adds an independent Profile V2 for the case where the
   authoritative session row must not exist before admission. The exact
