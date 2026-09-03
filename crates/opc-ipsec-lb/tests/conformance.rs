@@ -744,7 +744,7 @@ async fn bgp_vip_advertiser_programs_host_route_for_export() {
 }
 
 #[tokio::test]
-async fn session_store_ownership_source_reads_authoritative_sa_owner() {
+async fn session_store_ownership_source_hides_unbound_sa_owner() {
     let store = SessionStore::new(FakeSessionBackend::new());
     let keyspace = SessionOwnershipKeyspace::new(
         TenantId::new("tenant-a").unwrap(),
@@ -781,10 +781,7 @@ async fn session_store_ownership_source_reads_authoritative_sa_owner() {
     );
 
     let source = SessionStoreOwnershipSource::new(store, keyspace);
-    assert_eq!(
-        source.sa_owner(sa).await.unwrap().unwrap().as_str(),
-        "worker-a"
-    );
+    assert_eq!(source.sa_owner(sa).await.unwrap(), None);
 }
 
 #[tokio::test]

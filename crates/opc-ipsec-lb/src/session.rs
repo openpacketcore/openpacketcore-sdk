@@ -36,6 +36,7 @@ const IKE_SA_KEY_PREFIX: &[u8] = b"opc-ipsec-lb/sa/ike/";
 const ESP_SA_KEY_PREFIX: &[u8] = b"opc-ipsec-lb/sa/esp/";
 const SCOPED_SA_KEY_DOMAIN: &[u8] = b"opc-ipsec-lb/session-store/scoped-sa-key/v1";
 const OWNERSHIP_TRANSITION_PAYLOAD_PREFIX: &[u8] = b"opc-ipsec-lb/transition/v1:";
+const OWNERSHIP_PENDING_BIRTH_PAYLOAD_PREFIX: &[u8] = b"opc-ipsec-lb/pending-birth/v1:";
 const OWNERSHIP_RETIRING_PAYLOAD_PREFIX: &[u8] = b"opc-ipsec-lb/retiring/v1:";
 /// The lease only needs to cover one fenced owner-promotion CAS. A failed
 /// writer must not prevent another promotion indefinitely.
@@ -254,7 +255,7 @@ where
         Self { backend, resolver }
     }
 
-    async fn ownership_for_key(
+    async fn shard_ownership_for_key(
         &self,
         key: SessionKey,
     ) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
@@ -263,16 +264,36 @@ where
         };
         if matches!(
             validate_ownership_record(&record, &key)?,
-            OwnershipRecordState::Retiring { .. }
+            OwnershipRecordState::PendingBirth { .. } | OwnershipRecordState::Retiring { .. }
         ) {
             return Err(IpsecLbError::ownership_conflict(
-                "ownership record is retiring",
+                "ownership record is not source-visible",
             ));
         }
         Ok(Some(OwnershipSnapshot::new(
             ClusterNode::new(record.owner.as_str()),
             OwnershipFence::new(record.fence.get())?,
         )))
+    }
+
+    /// Project only a committed SA owner. Birth and retirement records are
+    /// intentionally not datapath-visible.
+    async fn sa_ownership_for_key(
+        &self,
+        key: SessionKey,
+    ) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
+        let Some(record) = self.backend.get(&key).await.map_err(map_store_error)? else {
+            return Ok(None);
+        };
+        match validate_ownership_record(&record, &key)? {
+            OwnershipRecordState::Active { .. } => Ok(Some(OwnershipSnapshot::new(
+                ClusterNode::new(record.owner.as_str()),
+                OwnershipFence::new(record.fence.get())?,
+            ))),
+            OwnershipRecordState::Unbound
+            | OwnershipRecordState::PendingBirth { .. }
+            | OwnershipRecordState::Retiring { .. } => Ok(None),
+        }
     }
 }
 
@@ -285,14 +306,14 @@ where
     async fn shard_owner(&self, shard: ShardId) -> Result<Option<ClusterNode>, IpsecLbError> {
         let key = self.resolver.shard_key(shard)?;
         Ok(self
-            .ownership_for_key(key)
+            .shard_ownership_for_key(key)
             .await?
             .map(|snapshot| snapshot.owner().clone()))
     }
 
     async fn sa_ownership(&self, sa: SaId) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
         let key = self.resolver.sa_key(sa)?;
-        self.ownership_for_key(key).await
+        self.sa_ownership_for_key(key).await
     }
 
     async fn scoped_sa_ownership(
@@ -300,7 +321,7 @@ where
         ownership_key: SessionOwnershipKey,
     ) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
         let key = self.resolver.scoped_sa_key(&ownership_key)?;
-        self.ownership_for_key(key).await
+        self.sa_ownership_for_key(key).await
     }
 }
 
@@ -367,11 +388,11 @@ where
         }
     }
 
-    /// Build the exact authoritative birth record this fencer accepts for
-    /// `key`.
+    /// Build an unbound authoritative birth record for a shard owner or a
+    /// compatibility IKE activation.
     ///
     /// [`crate::RePinCoordinator::activate`] is a promotion, never an upsert, so
-    /// an SA must already carry an authoritative birth record owned by the
+    /// an IKE SA must already carry an authoritative birth record owned by the
     /// activating node — and every shard-owner record the coordinator reads has
     /// the same shape. Such a record must carry this crate's private ownership
     /// state type, [`StateClass::AuthoritativeSession`], generation 1, no
@@ -380,11 +401,16 @@ where
     /// hand-rolling one; a hand-rolled record fails closed at activation with
     /// `InvalidConfig { field: "session_store.state_type", .. }`.
     ///
+    /// ESP activation is stricter: it must use
+    /// [`Self::pending_activation_birth_record`], which binds the exact
+    /// transition request and remains hidden from SA owner reads until
+    /// activation commits.
+    ///
     /// The caller keeps the store interaction, because the birth CAS is theirs
     /// to sequence:
     ///
     /// 1. resolve `key` with [`SessionOwnershipKeyResolver::scoped_sa_key`] for
-    ///    an SA, or [`SessionOwnershipKeyResolver::shard_key`] for a shard
+    ///    an IKE SA, or [`SessionOwnershipKeyResolver::shard_key`] for a shard
     ///    owner — using the *same* resolver this fencer was built with;
     /// 2. `let lease = backend.acquire(&key, owner, ttl).await?;`
     /// 3. `let record = fencer.birth_record(&key, &node, &lease)?;`
@@ -442,6 +468,66 @@ where
             // activation replaces this with versioned transition-ID and
             // fingerprint bytes.
             payload: EncryptedSessionPayload::new([]),
+        })
+    }
+
+    /// Build the private, transition-bound ESP birth record for `request`.
+    ///
+    /// This record is deliberately invisible to SA ownership reads until
+    /// [`OwnershipActivationAuthority::activate_ownership`] commits the exact
+    /// request. The caller must create it with a create-only CAS under `lease`;
+    /// this helper validates that the lease names the request's exact
+    /// destination-scoped key and owner before constructing the record.
+    ///
+    /// Existing generic [`Self::birth_record`] callers retain their legacy
+    /// unbound behavior. This constructor is the stricter ESP birth boundary.
+    pub fn pending_activation_birth_record(
+        &self,
+        request: &OwnershipActivationRequest,
+        lease: &LeaseGuard,
+    ) -> Result<StoredSessionRecord, IpsecLbError> {
+        validate_sa_identifier(request.sa())?;
+        validate_ownership_key_matches_sa(request.sa(), request.ownership_key())?;
+        if !matches!(request.sa(), SaId::Esp { .. }) {
+            return Err(IpsecLbError::invalid_config(
+                "ownership_activation.sa",
+                "pending activation birth records are restricted to ESP SAs",
+            ));
+        }
+        let key = self.resolver.scoped_sa_key(&request.ownership_key())?;
+        if key.key_type.as_str() != OWNERSHIP_KEY_TYPE {
+            return Err(IpsecLbError::invalid_config(
+                "session_store.key_type",
+                "pending birth key was not produced by an ownership key resolver",
+            ));
+        }
+        if lease.key() != &key {
+            return Err(IpsecLbError::invalid_config(
+                "session_store.lease",
+                "pending birth lease was acquired for a different ownership key",
+            ));
+        }
+        let owner = OwnerId::new(request.owner().as_str()).map_err(|_| {
+            IpsecLbError::invalid_config("session_store.owner", "ownership record owner is invalid")
+        })?;
+        if lease.owner().as_str() != owner.as_str() {
+            return Err(IpsecLbError::invalid_config(
+                "session_store.lease",
+                "pending birth lease was acquired for a different owner",
+            ));
+        }
+        Ok(StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner,
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static(OWNERSHIP_KEY_TYPE),
+            expires_at: None,
+            payload: encode_ownership_pending_birth(
+                request.transition_id(),
+                request.activation_fingerprint(),
+            ),
         })
     }
 
@@ -561,7 +647,10 @@ where
             return Err(IpsecLbError::NotFound);
         };
         let committed_transition = validate_ownership_record(&current, &key)?;
-        if matches!(committed_transition, OwnershipRecordState::Retiring { .. }) {
+        if matches!(
+            committed_transition,
+            OwnershipRecordState::PendingBirth { .. } | OwnershipRecordState::Retiring { .. }
+        ) {
             return Err(IpsecLbError::ownership_conflict(
                 "ownership record is retiring",
             ));
@@ -619,7 +708,7 @@ where
         };
         if matches!(
             validate_ownership_record(&current, &key)?,
-            OwnershipRecordState::Retiring { .. }
+            OwnershipRecordState::PendingBirth { .. } | OwnershipRecordState::Retiring { .. }
         ) {
             return Err(IpsecLbError::ownership_conflict(
                 "ownership record is retiring",
@@ -745,6 +834,20 @@ where
         request: &OwnershipActivationRequest,
     ) -> Result<Option<OwnershipActivationGrant>, IpsecLbError> {
         match state {
+            OwnershipRecordState::PendingBirth {
+                transition_id,
+                activation_fingerprint,
+            } => {
+                if transition_id != request.transition_id()
+                    || activation_fingerprint != request.activation_fingerprint()
+                    || current.owner.as_str() != request.owner().as_str()
+                {
+                    return Err(IpsecLbError::ownership_conflict(
+                        "ownership key is already held by a different transition or owner",
+                    ));
+                }
+                Ok(None)
+            }
             OwnershipRecordState::Retiring { .. } => Err(IpsecLbError::ownership_conflict(
                 "ownership record is retiring",
             )),
@@ -768,6 +871,11 @@ where
                 )))
             }
             OwnershipRecordState::Unbound => {
+                if matches!(request.sa(), SaId::Esp { .. }) {
+                    return Err(IpsecLbError::ownership_conflict(
+                        "ESP activation requires a transition-bound pending birth record",
+                    ));
+                }
                 if current.owner.as_str() != request.owner().as_str() {
                     return Err(IpsecLbError::ownership_conflict(
                         "activation owner does not hold the authoritative birth record",
@@ -810,12 +918,6 @@ where
             return Ok(grant);
         }
 
-        let next_generation = current.generation.next().ok_or_else(|| {
-            IpsecLbError::invalid_config(
-                "session_store.generation",
-                "ownership record generation exhausted",
-            )
-        })?;
         let owner = OwnerId::new(request.owner().as_str()).map_err(|_| {
             IpsecLbError::invalid_config("session_store.owner", "ownership record owner is invalid")
         })?;
@@ -826,6 +928,24 @@ where
             self.lease_ttl,
         )
         .await?;
+        // The pre-lease read can only provide the fast idempotent Active path.
+        // A delete/rebirth may reuse generation one while retaining a higher
+        // fence floor, so the record to mutate must be re-read and matched
+        // under the newly acquired authority; generation alone is not an ABA
+        // identity.
+        let Some(current) = self.backend.get(&key).await.map_err(map_store_error)? else {
+            return Err(IpsecLbError::NotFound);
+        };
+        let state = validate_ownership_record(&current, &key)?;
+        if let Some(grant) = Self::classify_activation(&current, state, request)? {
+            return Ok(grant);
+        }
+        let next_generation = current.generation.next().ok_or_else(|| {
+            IpsecLbError::invalid_config(
+                "session_store.generation",
+                "ownership record generation exhausted",
+            )
+        })?;
         let committed_fence = lease.guard().map(LeaseGuard::fence).ok_or_else(|| {
             IpsecLbError::invalid_config(
                 "session_store.lease",
@@ -1230,6 +1350,10 @@ fn superseded_retirement_proof(
             transition_id,
             fingerprint,
         }
+        | OwnershipRecordState::PendingBirth {
+            transition_id,
+            activation_fingerprint: fingerprint,
+        }
         | OwnershipRecordState::Retiring {
             transition_id,
             fingerprint,
@@ -1277,6 +1401,10 @@ fn classify_retirement_finalization(
         OwnershipRecordState::Active {
             transition_id,
             fingerprint,
+        }
+        | OwnershipRecordState::PendingBirth {
+            transition_id,
+            activation_fingerprint: fingerprint,
         }
         | OwnershipRecordState::Retiring {
             transition_id,
@@ -1380,9 +1508,13 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum OwnershipRecordState {
     Unbound,
+    PendingBirth {
+        transition_id: OwnershipTransitionId,
+        activation_fingerprint: OwnershipTransitionFingerprint,
+    },
     Active {
         transition_id: OwnershipTransitionId,
         fingerprint: OwnershipTransitionFingerprint,
@@ -1393,6 +1525,12 @@ enum OwnershipRecordState {
         active_fence: OwnershipFence,
         map_owner: ShardId,
     },
+}
+
+impl fmt::Debug for OwnershipRecordState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnershipRecordState([redacted])")
+    }
 }
 
 fn validate_ownership_record(
@@ -1458,12 +1596,39 @@ fn encode_ownership_transition(
     EncryptedSessionPayload::new(payload)
 }
 
+fn encode_ownership_pending_birth(
+    transition_id: OwnershipTransitionId,
+    fingerprint: OwnershipTransitionFingerprint,
+) -> EncryptedSessionPayload {
+    let mut payload = Vec::with_capacity(OWNERSHIP_PENDING_BIRTH_PAYLOAD_PREFIX.len() + 16 + 32);
+    payload.extend_from_slice(OWNERSHIP_PENDING_BIRTH_PAYLOAD_PREFIX);
+    payload.extend_from_slice(&transition_id.get().to_be_bytes());
+    payload.extend_from_slice(&fingerprint.as_bytes());
+    EncryptedSessionPayload::new(payload)
+}
+
 fn decode_ownership_transition(
     payload: &EncryptedSessionPayload,
 ) -> Result<OwnershipRecordState, IpsecLbError> {
     let bytes = payload.as_bytes();
     if bytes.is_empty() {
         return Ok(OwnershipRecordState::Unbound);
+    }
+    if let Some(raw) = bytes.strip_prefix(OWNERSHIP_PENDING_BIRTH_PAYLOAD_PREFIX) {
+        let raw: [u8; 48] = raw.try_into().map_err(|_| {
+            IpsecLbError::invalid_config(
+                "session_store.payload",
+                "ownership pending-birth metadata length is invalid",
+            )
+        })?;
+        let mut transition = [0_u8; 16];
+        transition.copy_from_slice(&raw[..16]);
+        let mut fingerprint = [0_u8; 32];
+        fingerprint.copy_from_slice(&raw[16..]);
+        return Ok(OwnershipRecordState::PendingBirth {
+            transition_id: OwnershipTransitionId::new(u128::from_be_bytes(transition))?,
+            activation_fingerprint: OwnershipTransitionFingerprint::from_bytes(fingerprint),
+        });
     }
     if let Some(raw) = bytes.strip_prefix(OWNERSHIP_RETIRING_PAYLOAD_PREFIX) {
         let raw: [u8; 58] = raw.try_into().map_err(|_| {
@@ -2323,11 +2488,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_sa_and_shard_owners_from_session_store_metadata() {
+    async fn unbound_sa_records_are_hidden_while_shard_records_remain_compatible() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x1122_3344 };
-        let sa_record = write_owner(
+        write_owner(
             &store,
             keyspace.sa_key(sa).unwrap(),
             "worker-a",
@@ -2343,12 +2508,7 @@ mod tests {
         .await;
 
         let source = SessionStoreOwnershipSource::new(store, keyspace);
-        let sa_ownership = source.sa_ownership(sa).await.unwrap().unwrap();
-        assert_eq!(sa_ownership.owner().as_str(), "worker-a");
-        assert_eq!(
-            sa_ownership.fence(),
-            OwnershipFence::new(sa_record.fence.get()).unwrap()
-        );
+        assert_eq!(source.sa_ownership(sa).await.unwrap(), None);
         assert_eq!(
             source
                 .shard_owner(ShardId::new(7))
@@ -3387,6 +3547,22 @@ mod tests {
                 fingerprint: fingerprint(9),
             })
         );
+        let pending = encode_ownership_pending_birth(transition_id(8), fingerprint(10));
+        assert_eq!(
+            format!(
+                "{:?}",
+                decode_ownership_transition(&pending).expect("pending state")
+            ),
+            "OwnershipRecordState([redacted])"
+        );
+        let mut malformed_pending = OWNERSHIP_PENDING_BIRTH_PAYLOAD_PREFIX.to_vec();
+        malformed_pending.push(1);
+        let mut malformed_pending_record = valid.clone();
+        malformed_pending_record.payload = EncryptedSessionPayload::new(malformed_pending);
+        assert!(matches!(
+            validate_ownership_record(&malformed_pending_record, &expected_key),
+            Err(IpsecLbError::InvalidConfig { .. })
+        ));
 
         let mut wrong_record_key = valid.clone();
         wrong_record_key.key = keyspace().sa_key(SaId::Esp { spi: 8 }).unwrap();
@@ -3589,6 +3765,47 @@ mod tests {
         }
     }
 
+    async fn write_pending_activation_birth<B>(
+        store: &B,
+        keyspace: SessionOwnershipKeyspace,
+        request: &OwnershipActivationRequest,
+    ) -> StoredSessionRecord
+    where
+        B: SessionBackend + SessionLeaseManager + Clone + 'static,
+    {
+        let key = keyspace
+            .scoped_sa_key(&request.ownership_key())
+            .expect("scoped key");
+        let owner = OwnerId::new(request.owner().as_str()).expect("valid owner");
+        let lease = store
+            .acquire(&key, owner, Duration::from_secs(60))
+            .await
+            .expect("pending birth lease");
+        let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace);
+        let record = fencer
+            .pending_activation_birth_record(request, &lease)
+            .expect("pending birth record");
+        assert_eq!(record.generation, Generation::new(1));
+        assert!(record.expires_at.is_none());
+        assert_eq!(
+            store
+                .compare_and_set(CompareAndSet {
+                    key,
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: record.clone(),
+                })
+                .await
+                .expect("pending birth CAS"),
+            CompareAndSetResult::Success
+        );
+        store
+            .release(lease)
+            .await
+            .expect("pending birth lease release");
+        record
+    }
+
     /// Read-side wrapper that reports a different record fence than the one the
     /// authoritative store actually committed.
     ///
@@ -3700,6 +3917,471 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_birth_rejects_a_custom_resolver_key_with_the_wrong_type() {
+        #[derive(Clone, Debug)]
+        struct WrongKeyTypeResolver(SessionOwnershipKeyspace);
+
+        impl SessionOwnershipKeyResolver for WrongKeyTypeResolver {
+            fn shard_key(&self, shard: ShardId) -> Result<SessionKey, IpsecLbError> {
+                self.0.shard_key(shard)
+            }
+
+            fn sa_key(&self, sa: SaId) -> Result<SessionKey, IpsecLbError> {
+                self.0.sa_key(sa)
+            }
+
+            fn scoped_sa_key(
+                &self,
+                ownership_key: &SessionOwnershipKey,
+            ) -> Result<SessionKey, IpsecLbError> {
+                let mut key = self.0.scoped_sa_key(ownership_key)?;
+                key.key_type =
+                    SessionKeyType::other("wrong-ownership-key-type").expect("test key type");
+                Ok(key)
+            }
+        }
+
+        let store = FakeSessionBackend::new();
+        let resolver = WrongKeyTypeResolver(keyspace());
+        let request = activation_request_for(SaId::Esp { spi: 0x0561_0019 }, 561_019, "owner-a");
+        let key = resolver
+            .scoped_sa_key(&request.ownership_key())
+            .expect("custom scoped key");
+        let lease = store
+            .acquire(
+                &key,
+                OwnerId::new("owner-a").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("birth lease");
+        let fencer = SessionStoreOwnershipFencer::new(store.clone(), resolver);
+
+        assert_eq!(
+            fencer.pending_activation_birth_record(&request, &lease),
+            Err(IpsecLbError::invalid_config(
+                "session_store.key_type",
+                "pending birth key was not produced by an ownership key resolver",
+            ))
+        );
+        assert_eq!(store.get(&key).await.expect("read store"), None);
+    }
+
+    #[tokio::test]
+    async fn pending_birth_rejects_non_esp_and_mismatched_leases_without_mutating() {
+        let store = FakeSessionBackend::new();
+        let keyspace = keyspace();
+        let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone());
+        let ike_request = activation_request_for(
+            SaId::Ike {
+                responder_spi: 0x0561_001c,
+            },
+            561_022,
+            "owner-a",
+        );
+        let ike_key = keyspace
+            .scoped_sa_key(&ike_request.ownership_key())
+            .expect("IKE scoped key");
+        let ike_lease = store
+            .acquire(
+                &ike_key,
+                OwnerId::new("owner-a").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("IKE lease");
+        assert_eq!(
+            fencer.pending_activation_birth_record(&ike_request, &ike_lease),
+            Err(IpsecLbError::invalid_config(
+                "ownership_activation.sa",
+                "pending activation birth records are restricted to ESP SAs",
+            ))
+        );
+        store.release(ike_lease).await.expect("release IKE lease");
+
+        let request = activation_request_for(SaId::Esp { spi: 0x0561_001d }, 561_023, "owner-a");
+        let expected_key = keyspace
+            .scoped_sa_key(&request.ownership_key())
+            .expect("expected scoped key");
+        let different_key = keyspace
+            .scoped_sa_key(&scoped_key_in_context(
+                SaId::Esp { spi: 0x0561_001d },
+                [198, 51, 100, 29],
+                29,
+            ))
+            .expect("different scoped key");
+        let wrong_key_lease = store
+            .acquire(
+                &different_key,
+                OwnerId::new("owner-a").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("wrong-key lease");
+        assert_eq!(
+            fencer.pending_activation_birth_record(&request, &wrong_key_lease),
+            Err(IpsecLbError::invalid_config(
+                "session_store.lease",
+                "pending birth lease was acquired for a different ownership key",
+            ))
+        );
+        store
+            .release(wrong_key_lease)
+            .await
+            .expect("release wrong-key lease");
+
+        let wrong_owner_lease = store
+            .acquire(
+                &expected_key,
+                OwnerId::new("owner-b").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("wrong-owner lease");
+        assert_eq!(
+            fencer.pending_activation_birth_record(&request, &wrong_owner_lease),
+            Err(IpsecLbError::invalid_config(
+                "session_store.lease",
+                "pending birth lease was acquired for a different owner",
+            ))
+        );
+        store
+            .release(wrong_owner_lease)
+            .await
+            .expect("release wrong-owner lease");
+        assert_eq!(store.get(&ike_key).await.expect("IKE read"), None);
+        assert_eq!(
+            store.get(&different_key).await.expect("different read"),
+            None
+        );
+        assert_eq!(store.get(&expected_key).await.expect("expected read"), None);
+    }
+
+    #[tokio::test]
+    async fn generic_birth_remains_compatible_for_ike_and_shards_but_not_esp_activation() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let keyspace = keyspace();
+        let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone());
+
+        let ike_request = activation_request_for(
+            SaId::Ike {
+                responder_spi: 0x0561_001a,
+            },
+            561_020,
+            "owner-a",
+        );
+        let ike_key = keyspace
+            .scoped_sa_key(&ike_request.ownership_key())
+            .expect("IKE scoped key");
+        let ike_lease = store
+            .acquire(
+                &ike_key,
+                OwnerId::new("owner-a").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("IKE birth lease");
+        let ike_birth = fencer
+            .birth_record(&ike_key, &ClusterNode::new("owner-a"), &ike_lease)
+            .expect("IKE generic birth record");
+        assert_eq!(
+            store
+                .compare_and_set(CompareAndSet {
+                    key: ike_key,
+                    lease: ike_lease.clone(),
+                    expected_generation: None,
+                    new_record: ike_birth,
+                })
+                .await
+                .expect("IKE birth CAS"),
+            CompareAndSetResult::Success
+        );
+        store
+            .release(ike_lease)
+            .await
+            .expect("release IKE birth lease");
+        assert!(fencer.activate_ownership(&ike_request).await.is_ok());
+
+        let esp_request =
+            activation_request_for(SaId::Esp { spi: 0x0561_001b }, 561_021, "owner-a");
+        let esp_key = keyspace
+            .scoped_sa_key(&esp_request.ownership_key())
+            .expect("ESP scoped key");
+        let esp_lease = store
+            .acquire(
+                &esp_key,
+                OwnerId::new("owner-a").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("ESP birth lease");
+        let esp_birth = fencer
+            .birth_record(&esp_key, &ClusterNode::new("owner-a"), &esp_lease)
+            .expect("ESP generic birth record");
+        assert_eq!(
+            store
+                .compare_and_set(CompareAndSet {
+                    key: esp_key,
+                    lease: esp_lease.clone(),
+                    expected_generation: None,
+                    new_record: esp_birth,
+                })
+                .await
+                .expect("ESP birth CAS"),
+            CompareAndSetResult::Success
+        );
+        store
+            .release(esp_lease)
+            .await
+            .expect("release ESP birth lease");
+        assert!(matches!(
+            fencer.activate_ownership(&esp_request).await,
+            Err(IpsecLbError::OwnershipConflict { .. })
+        ));
+
+        let shard = ShardId::new(11);
+        let shard_key = keyspace.shard_key(shard).expect("shard key");
+        let shard_lease = store
+            .acquire(
+                &shard_key,
+                OwnerId::new("owner-a").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("shard birth lease");
+        let shard_birth = fencer
+            .birth_record(&shard_key, &ClusterNode::new("owner-a"), &shard_lease)
+            .expect("shard generic birth record");
+        assert_eq!(
+            store
+                .compare_and_set(CompareAndSet {
+                    key: shard_key,
+                    lease: shard_lease.clone(),
+                    expected_generation: None,
+                    new_record: shard_birth,
+                })
+                .await
+                .expect("shard birth CAS"),
+            CompareAndSetResult::Success
+        );
+        store
+            .release(shard_lease)
+            .await
+            .expect("release shard birth lease");
+        let source = SessionStoreOwnershipSource::new(store, keyspace);
+        assert_eq!(
+            source.shard_owner(shard).await.expect("shard source read"),
+            Some(ClusterNode::new("owner-a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_esp_birth_is_hidden_until_the_exact_activation_commits() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let keyspace = keyspace();
+        let sa = SaId::Esp { spi: 0x0561_0012 };
+        let request = activation_request_for(sa, 561_012, "owner-a");
+        let key = keyspace
+            .scoped_sa_key(&request.ownership_key())
+            .expect("scoped key");
+        let birth = write_pending_activation_birth(&store, keyspace.clone(), &request).await;
+        let source = SessionStoreOwnershipSource::new(store.clone(), keyspace.clone());
+        assert_eq!(
+            source
+                .scoped_sa_ownership(request.ownership_key())
+                .await
+                .expect("pending read"),
+            None
+        );
+
+        let different_transition = activation_request_for(sa, 561_013, "owner-a");
+        assert!(matches!(
+            SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone())
+                .recover_activation_grant(&different_transition)
+                .await,
+            Err(IpsecLbError::OwnershipConflict { .. })
+        ));
+        let different_fingerprint = OwnershipActivationRequest::new_esp(
+            0x0561_0012,
+            request.transition_id(),
+            ClusterNode::new("owner-a"),
+            crate::SteeringRule {
+                shard: ShardId::new(9),
+                owner: ShardId::new(3),
+                key: crate::SteerKey::EspSpi(0x0561_0012),
+            },
+            request.ownership_key(),
+        )
+        .expect("valid fingerprint variant");
+        assert!(matches!(
+            SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone())
+                .activate_ownership(&different_fingerprint)
+                .await,
+            Err(IpsecLbError::OwnershipConflict { .. })
+        ));
+        assert_eq!(store.get(&key).await.expect("read"), Some(birth.clone()));
+
+        let fencer = SessionStoreOwnershipFencer::new(store, keyspace);
+        let grant = fencer
+            .activate_ownership(&request)
+            .await
+            .expect("exact activation commits");
+        assert!(grant.fence().get() > birth.fence.get());
+        assert_eq!(
+            source
+                .scoped_sa_ownership(request.ownership_key())
+                .await
+                .expect("active read")
+                .expect("active owner")
+                .fence(),
+            grant.fence()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_births_are_isolated_by_destination_scope() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let keyspace = keyspace();
+        let sa = SaId::Esp { spi: 0x0561_0014 };
+        let first_ownership_key = scoped_key_in_context(sa, [192, 0, 2, 14], 7);
+        let second_ownership_key = scoped_key_in_context(sa, [198, 51, 100, 14], 8);
+        let first_request = OwnershipActivationRequest::new_esp(
+            0x0561_0014,
+            transition_id(561_016),
+            ClusterNode::new("owner-a"),
+            crate::SteeringRule {
+                shard: ShardId::new(7),
+                owner: ShardId::new(3),
+                key: crate::SteerKey::EspSpi(0x0561_0014),
+            },
+            first_ownership_key,
+        )
+        .expect("first scope request");
+        let second_request = OwnershipActivationRequest::new_esp(
+            0x0561_0014,
+            transition_id(561_017),
+            ClusterNode::new("owner-b"),
+            crate::SteeringRule {
+                shard: ShardId::new(8),
+                owner: ShardId::new(4),
+                key: crate::SteerKey::EspSpi(0x0561_0014),
+            },
+            second_ownership_key,
+        )
+        .expect("second scope request");
+        let first_key = keyspace
+            .scoped_sa_key(&first_request.ownership_key())
+            .expect("first scoped key");
+        let first_birth =
+            write_pending_activation_birth(&store, keyspace.clone(), &first_request).await;
+        let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone());
+
+        assert_eq!(
+            fencer.activate_ownership(&second_request).await,
+            Err(IpsecLbError::NotFound)
+        );
+        assert_eq!(
+            store.get(&first_key).await.expect("first read"),
+            Some(first_birth)
+        );
+
+        write_pending_activation_birth(&store, keyspace.clone(), &second_request).await;
+        let first = fencer
+            .activate_ownership(&first_request)
+            .await
+            .expect("first scope activation");
+        let second = fencer
+            .activate_ownership(&second_request)
+            .await
+            .expect("second scope activation");
+        let source = SessionStoreOwnershipSource::new(store, keyspace);
+        assert_eq!(
+            source
+                .scoped_sa_ownership(first_request.ownership_key())
+                .await
+                .expect("first source read")
+                .expect("first active owner")
+                .owner(),
+            &ClusterNode::new("owner-a")
+        );
+        assert_eq!(
+            source
+                .scoped_sa_ownership(second_request.ownership_key())
+                .await
+                .expect("second source read")
+                .expect("second active owner")
+                .owner(),
+            &ClusterNode::new("owner-b")
+        );
+        assert!(first.fence().get() > 0);
+        assert!(second.fence().get() > 0);
+    }
+
+    #[tokio::test]
+    async fn activation_rechecks_pending_birth_under_its_lease_before_cas() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let keyspace = keyspace();
+        let sa = SaId::Esp { spi: 0x0561_0013 };
+        let stale_request = activation_request_for(sa, 561_014, "owner-a");
+        let replacement_request = activation_request_for(sa, 561_015, "owner-a");
+        let key = keyspace
+            .scoped_sa_key(&stale_request.ownership_key())
+            .expect("scoped key");
+        write_pending_activation_birth(&store, keyspace.clone(), &stale_request).await;
+
+        // Pause after the stale activation's first read, then replace its
+        // generation-one pending record with a same-owner, same-generation
+        // pending record for a different transition. The store's retained
+        // fence floor does not make generation an ABA identity.
+        let mut backend = InstrumentedBackend::concurrent(store.clone());
+        backend.acquire_waits_after_apply = true;
+        let barrier = backend.read_barrier.clone().expect("read barrier");
+        let fencer = SessionStoreOwnershipFencer::new(backend.clone(), keyspace.clone());
+        let stale = tokio::spawn({
+            let fencer = fencer.clone();
+            let request = stale_request.clone();
+            async move { fencer.activate_ownership(&request).await }
+        });
+        barrier.wait().await;
+
+        let replacement_lease = store
+            .acquire(
+                &key,
+                OwnerId::new("owner-a").expect("valid owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("replacement lease");
+        store
+            .delete_fenced(&replacement_lease)
+            .await
+            .expect("delete stale pending birth");
+        store
+            .release(replacement_lease)
+            .await
+            .expect("release replacement lease");
+        let replacement =
+            write_pending_activation_birth(&store, keyspace, &replacement_request).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.acquire_applied.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stale activation acquired its lease");
+        backend.acquire_continue.notify_one();
+        barrier.wait().await;
+
+        assert!(matches!(
+            stale.await.expect("stale activation task"),
+            Err(IpsecLbError::OwnershipConflict { .. })
+        ));
+        assert_eq!(backend.cas_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(store.get(&key).await.expect("read"), Some(replacement));
+    }
+
+    #[tokio::test]
     async fn activation_promotes_a_birth_record_with_a_store_minted_generation() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
@@ -3708,13 +4390,7 @@ mod tests {
         let key = keyspace
             .scoped_sa_key(&request.ownership_key())
             .expect("scoped key");
-        let birth = write_owner(
-            &store,
-            key.clone(),
-            "owner-a",
-            StateClass::AuthoritativeSession,
-        )
-        .await;
+        let birth = write_pending_activation_birth(&store, keyspace.clone(), &request).await;
         let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace);
 
         // A birth record has not been activated yet.
@@ -3752,10 +4428,7 @@ mod tests {
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x0561_0002 };
         let request = activation_request_for(sa, 561_002, "owner-a");
-        let key = keyspace
-            .scoped_sa_key(&request.ownership_key())
-            .expect("scoped key");
-        write_owner(&store, key, "owner-a", StateClass::AuthoritativeSession).await;
+        write_pending_activation_birth(&store, keyspace.clone(), &request).await;
         let fencer = SessionStoreOwnershipFencer::new(store, keyspace);
 
         let first = fencer
@@ -3781,10 +4454,7 @@ mod tests {
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x0561_0003 };
         let request = activation_request_for(sa, 561_003, "owner-a");
-        let key = keyspace
-            .scoped_sa_key(&request.ownership_key())
-            .expect("scoped key");
-        write_owner(&store, key, "owner-a", StateClass::AuthoritativeSession).await;
+        write_pending_activation_birth(&store, keyspace.clone(), &request).await;
         let fencer = SessionStoreOwnershipFencer::new(store, keyspace);
         fencer
             .activate_ownership(&request)
@@ -3815,15 +4485,13 @@ mod tests {
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x0561_0005 };
         let request = activation_request_for(sa, 561_005, "owner-a");
-        let key = keyspace
-            .scoped_sa_key(&request.ownership_key())
-            .expect("scoped key");
-        write_owner(&store, key, "owner-b", StateClass::AuthoritativeSession).await;
+        let foreign_request = activation_request_for(sa, 561_005, "owner-b");
+        write_pending_activation_birth(&store, keyspace.clone(), &foreign_request).await;
         let fencer = SessionStoreOwnershipFencer::new(store, keyspace);
         assert_eq!(
             fencer.activate_ownership(&request).await,
             Err(IpsecLbError::ownership_conflict(
-                "activation owner does not hold the authoritative birth record",
+                "ownership key is already held by a different transition or owner",
             ))
         );
     }
@@ -3855,20 +4523,10 @@ mod tests {
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x0561_0007 };
         let request = activation_request_for(sa, 561_007, "owner-a");
-        let key = keyspace
-            .scoped_sa_key(&request.ownership_key())
-            .expect("scoped key");
-
         // A zero generation is rejected before any mutation. The grant type is
         // a non-zero fence, so a zero generation can never reach a backend.
         let zero_store = SessionStore::new(FakeSessionBackend::new());
-        write_owner(
-            &zero_store,
-            key.clone(),
-            "owner-a",
-            StateClass::AuthoritativeSession,
-        )
-        .await;
+        write_pending_activation_birth(&zero_store, keyspace.clone(), &request).await;
         let zero_fencer = SessionStoreOwnershipFencer::new(
             FenceOverrideReadBackend {
                 inner: zero_store,
@@ -3888,13 +4546,7 @@ mod tests {
         // A generation at or below the record's authoritative fence is refused
         // rather than published.
         let stale_store = SessionStore::new(FakeSessionBackend::new());
-        write_owner(
-            &stale_store,
-            key,
-            "owner-a",
-            StateClass::AuthoritativeSession,
-        )
-        .await;
+        write_pending_activation_birth(&stale_store, keyspace.clone(), &request).await;
         let stale_fencer = SessionStoreOwnershipFencer::new(
             FenceOverrideReadBackend {
                 inner: stale_store,
@@ -3917,10 +4569,8 @@ mod tests {
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x0561_0008 };
         let request = activation_request_for(sa, 561_008, "owner-a");
-        let key = keyspace
-            .scoped_sa_key(&request.ownership_key())
-            .expect("scoped key");
-        write_owner(&store, key, "owner-a", StateClass::AuthoritativeSession).await;
+        write_pending_activation_birth(&store, keyspace.clone(), &request).await;
+        let source = SessionStoreOwnershipSource::new(store.clone(), keyspace.clone());
         let fencer = SessionStoreOwnershipFencer::new(store, keyspace);
         let grant = fencer
             .activate_ownership(&request)
@@ -3938,6 +4588,13 @@ mod tests {
             admission,
             OwnershipRetirementAdmission::Granted(_)
         ));
+        assert_eq!(
+            source
+                .scoped_sa_ownership(request.ownership_key())
+                .await
+                .expect("retiring source read"),
+            None
+        );
 
         // Between `Retiring` and deletion the key must not be re-activated.
         assert_eq!(
@@ -3961,13 +4618,7 @@ mod tests {
         let key = keyspace
             .scoped_sa_key(&request.ownership_key())
             .expect("scoped key");
-        write_owner(
-            &store,
-            key.clone(),
-            "owner-a",
-            StateClass::AuthoritativeSession,
-        )
-        .await;
+        write_pending_activation_birth(&store, keyspace.clone(), &request).await;
         let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone());
 
         let activation = fencer
@@ -4009,10 +4660,14 @@ mod tests {
         // 2. A genuine rebirth of the same identity is admitted, but the store
         //    floor survived deletion, so even its birth record already sits
         //    strictly above the retirement fence.
-        let rebirth = write_owner(&store, key, "owner-a", StateClass::AuthoritativeSession).await;
-        assert!(rebirth.fence.get() > retirement.retirement_fence().get());
-
         let successor = activation_request_for(sa, 561_010, "owner-a");
+        let rebirth = write_pending_activation_birth(&store, keyspace, &successor).await;
+        assert!(rebirth.fence.get() > retirement.retirement_fence().get());
+        assert!(matches!(
+            fencer.activate_ownership(&request).await,
+            Err(IpsecLbError::OwnershipConflict { .. })
+        ));
+
         let reactivation = fencer
             .activate_ownership(&successor)
             .await
