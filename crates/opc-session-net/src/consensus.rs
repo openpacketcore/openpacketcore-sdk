@@ -267,6 +267,13 @@ fn bootstrap_protocol_error_to_peer_error(error: ProtocolError) -> SessionConsen
 }
 
 fn record_consensus_server_connection_failure(error: &ProtocolError) {
+    #[cfg(test)]
+    if matches!(
+        error,
+        ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut
+    ) {
+        crate::test_support::record_connection_timeout_failure();
+    }
     match error {
         ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
             &METRICS.session_net_connection_failure_timeout
@@ -298,6 +305,8 @@ fn record_consensus_server_connection_outcome(result: &Result<(), ProtocolError>
             METRICS
                 .session_net_connection_successes
                 .fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            crate::test_support::record_connection_success();
         }
         Err(error) => record_consensus_server_connection_failure(error),
     }
@@ -6485,9 +6494,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_explicit_retirement_before_dropping_stale_ready_connection() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let control = SessionReauthenticationControl::new();
         let resolver: RemoteAddrResolver =
@@ -6551,9 +6557,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_material_retirement_before_dropping_stale_ready_connection() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let material = crate::test_support::RotatableClientMaterial::new(
             "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/1",
@@ -7115,9 +7118,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn consensus_soft_timeout_classifies_pending_connect_without_abandoning() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let resolver: RemoteAddrResolver =
             Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
@@ -7163,9 +7163,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn configured_ceiling_also_reserves_post_connect_rpc_time() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let resolver: RemoteAddrResolver =
             Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
@@ -7315,42 +7312,50 @@ mod tests {
         bytes
     }
 
-    #[derive(Clone, Copy)]
-    struct ConnectionOutcomeMetricSnapshot {
-        idle_retirements: u64,
-        timeout_failures: u64,
-        successes: u64,
-        drain_started: u64,
-        drain_completed: u64,
+    fn connection_outcome_metrics() -> crate::test_support::ConnectionOutcomeMetricSnapshot {
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .try_with(|accounting| accounting.snapshot())
+            .expect("connection outcome accounting scope")
     }
 
-    fn connection_outcome_metrics() -> ConnectionOutcomeMetricSnapshot {
-        ConnectionOutcomeMetricSnapshot {
-            idle_retirements: METRICS
-                .session_net_lifecycle_retirement_idle_timeout
-                .load(Ordering::Relaxed),
-            timeout_failures: METRICS
-                .session_net_connection_failure_timeout
-                .load(Ordering::Relaxed),
-            successes: METRICS
-                .session_net_connection_successes
-                .load(Ordering::Relaxed),
-            drain_started: METRICS
-                .session_net_lifecycle_drain_started
-                .load(Ordering::Relaxed),
-            drain_completed: METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed),
-        }
+    fn record_test_idle_retirement() {
+        let lifecycle = ConnectionLifecycle::new(
+            test_consensus_lifecycle_policy(),
+            tokio::time::Instant::now(),
+            None,
+            None,
+            0,
+            None,
+        )
+        .expect("test connection lifecycle");
+        lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+    }
+
+    #[tokio::test]
+    async fn connection_outcome_delta_isolated_from_writer_outside_test_scope() {
+        let accounting = Arc::new(crate::test_support::ConnectionOutcomeTestAccounting::default());
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(accounting, async {
+                let before = connection_outcome_metrics();
+
+                tokio::spawn(async { record_test_idle_retirement() })
+                    .await
+                    .expect("outside metric writer");
+                record_test_idle_retirement();
+
+                let after = connection_outcome_metrics();
+                assert_eq!(after.idle_retirements, before.idle_retirements + 1);
+                assert_eq!(after.timeout_failures, before.timeout_failures);
+                assert_eq!(after.successes, before.successes);
+                assert_eq!(after.drain_started, before.drain_started + 1);
+                assert_eq!(after.drain_completed, before.drain_completed + 1);
+            })
+            .await;
     }
 
     async fn wait_for_drain_completion(minimum: u64) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed)
-                < minimum
-            {
+            while connection_outcome_metrics().drain_completed < minimum {
                 tokio::task::yield_now().await;
             }
         })
@@ -7395,12 +7400,7 @@ mod tests {
         (result, writer)
     }
 
-    #[tokio::test]
-    async fn consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
-
+    async fn assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
         let before_idle = connection_outcome_metrics();
         let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
         record_consensus_server_connection_outcome(&idle_result);
@@ -7477,6 +7477,18 @@ mod tests {
             before_handshake.idle_retirements
         );
         assert!(after_handshake.timeout_failures > before_handshake.timeout_failures);
+    }
+
+    #[tokio::test]
+    async fn consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
+        let accounting = Arc::new(crate::test_support::ConnectionOutcomeTestAccounting::default());
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(
+                accounting,
+                assert_consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout(
+                ),
+            )
+            .await;
     }
 
     #[tokio::test]
