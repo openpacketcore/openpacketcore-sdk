@@ -1262,6 +1262,34 @@ impl DiameterSctpPeer {
         )
         .await
     }
+
+    /// Start an unprotected Diameter SCTP connect with a redaction-safe
+    /// progress handle.
+    ///
+    /// This is the progress-reporting counterpart to [`Self::connect_association`].
+    /// It preserves this peer's independent inbound and outbound PPID policies;
+    /// the handle contains only generic SCTP connector stages and no peer data.
+    pub fn connect_association_with_progress(
+        &self,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<DiameterSctpAssociation, DiameterSctpError>>,
+    ) {
+        let progress = SctpConnectProgressHandle::new();
+        let peer = self.clone();
+        let future_progress = progress.clone();
+        let connect = async move {
+            let config = peer.sctp_connect_config()?;
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_handle(
+                config,
+                peer.inbound_ppid_policy,
+                peer.outbound_ppid_policy,
+                future_progress,
+            )
+            .await
+        };
+        (progress, connect)
+    }
 }
 
 /// One item received from a live Diameter SCTP association.
@@ -1319,11 +1347,26 @@ impl DiameterSctpAssociation {
     pub async fn connect_unprotected_with_config(
         config: SctpConnectConfig,
     ) -> Result<Self, DiameterSctpError> {
-        Self::connect_unprotected_with_config_and_inbound_ppid_policy(
+        let (_progress, connect) = Self::connect_unprotected_with_config_with_progress(config);
+        connect.await
+    }
+
+    /// Start an explicitly unprotected Diameter SCTP association with a
+    /// redaction-safe progress handle.
+    ///
+    /// This is the progress-reporting counterpart to
+    /// [`Self::connect_unprotected_with_config`]. It retains the strict inbound
+    /// PPID policy and standard outbound PPID 46 framing.
+    pub fn connect_unprotected_with_config_with_progress(
+        config: SctpConnectConfig,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, DiameterSctpError>>,
+    ) {
+        Self::connect_unprotected_with_config_and_inbound_ppid_policy_with_progress(
             config,
             DiameterInboundPpidPolicy::Strict,
         )
-        .await
     }
 
     /// Open an explicitly unprotected association with an inbound PPID policy.
@@ -1340,12 +1383,30 @@ impl DiameterSctpAssociation {
         config: SctpConnectConfig,
         policy: DiameterInboundPpidPolicy,
     ) -> Result<Self, DiameterSctpError> {
-        Self::connect_unprotected_with_config_and_ppid_policies(
+        let (_progress, connect) =
+            Self::connect_unprotected_with_config_and_inbound_ppid_policy_with_progress(
+                config, policy,
+            );
+        connect.await
+    }
+
+    /// Start an explicitly unprotected Diameter SCTP association with an
+    /// inbound PPID policy and a redaction-safe progress handle.
+    ///
+    /// Outbound framing remains standard PPID 46, exactly as in
+    /// [`Self::connect_unprotected_with_config_and_inbound_ppid_policy`].
+    pub fn connect_unprotected_with_config_and_inbound_ppid_policy_with_progress(
+        config: SctpConnectConfig,
+        policy: DiameterInboundPpidPolicy,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, DiameterSctpError>>,
+    ) {
+        Self::connect_unprotected_with_config_and_ppid_policies_with_progress(
             config,
             policy,
             DiameterOutboundPpidPolicy::Standard,
         )
-        .await
     }
 
     /// Open an explicitly unprotected association with independent inbound
@@ -1363,9 +1424,49 @@ impl DiameterSctpAssociation {
         inbound_policy: DiameterInboundPpidPolicy,
         outbound_policy: DiameterOutboundPpidPolicy,
     ) -> Result<Self, DiameterSctpError> {
+        let (_progress, connect) =
+            Self::connect_unprotected_with_config_and_ppid_policies_with_progress(
+                config,
+                inbound_policy,
+                outbound_policy,
+            );
+        connect.await
+    }
+
+    /// Start an explicitly unprotected Diameter SCTP association with
+    /// independent PPID policies and a redaction-safe progress handle.
+    ///
+    /// This is the production static-multihoming entry point for callers that
+    /// retain a handle across an outer timeout. The handle neither changes nor
+    /// exposes the PPID, notification, peer, or address behavior of the
+    /// resulting association.
+    pub fn connect_unprotected_with_config_and_ppid_policies_with_progress(
+        config: SctpConnectConfig,
+        inbound_policy: DiameterInboundPpidPolicy,
+        outbound_policy: DiameterOutboundPpidPolicy,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, DiameterSctpError>>,
+    ) {
+        let progress = SctpConnectProgressHandle::new();
+        let connect = Self::connect_unprotected_with_config_and_ppid_policies_with_handle(
+            config,
+            inbound_policy,
+            outbound_policy,
+            progress.clone(),
+        );
+        (progress, connect)
+    }
+
+    async fn connect_unprotected_with_config_and_ppid_policies_with_handle(
+        config: SctpConnectConfig,
+        inbound_policy: DiameterInboundPpidPolicy,
+        outbound_policy: DiameterOutboundPpidPolicy,
+        progress: SctpConnectProgressHandle,
+    ) -> Result<Self, DiameterSctpError> {
         config.validate().map_err(DiameterSctpError::from)?;
         let peer = Self::peer_from_connect_config(&config, inbound_policy, outbound_policy)?;
-        let association = SctpAssociation::connect(config)
+        let association = SctpAssociation::connect_attempt_with_handle(config, None, progress)
             .await
             .map_err(DiameterSctpError::connect)?;
         Ok(Self {
@@ -2811,14 +2912,19 @@ impl SctpAssociation {
         impl std::future::Future<Output = Result<Self, SctpError>>,
     ) {
         let progress = SctpConnectProgressHandle::new();
-        let future_progress = progress.clone();
-        let connect = async move {
-            config.validate()?;
-            platform::connect_association(config, authentication, future_progress)
-                .await
-                .map(|imp| Self { imp: Arc::new(imp) })
-        };
+        let connect = Self::connect_attempt_with_handle(config, authentication, progress.clone());
         (progress, connect)
+    }
+
+    async fn connect_attempt_with_handle(
+        config: SctpConnectConfig,
+        authentication: Option<SctpAuthenticationConfig>,
+        progress: SctpConnectProgressHandle,
+    ) -> Result<Self, SctpError> {
+        config.validate()?;
+        platform::connect_association(config, authentication, progress)
+            .await
+            .map(|imp| Self { imp: Arc::new(imp) })
     }
 
     /// Send one message.
@@ -6179,6 +6285,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diameter_full_policy_progress_preserves_handle_for_typed_config_error() {
+        let mut config = SctpConnectConfig::new("127.0.0.1:3868".parse().unwrap());
+        config.remote_addrs.clear();
+        let (progress, connect) =
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_progress(
+                config,
+                DiameterInboundPpidPolicy::AcceptLegacyZero,
+                DiameterOutboundPpidPolicy::LegacyZero,
+            );
+
+        assert!(matches!(
+            connect.await,
+            Err(DiameterSctpError::SctpConfig(SctpError::InvalidConfig {
+                field: "remote_addrs",
+                ..
+            }))
+        ));
+        assert_eq!(progress.snapshot().stage, SctpConnectStage::NotStarted);
+    }
+
     #[test]
     fn diameter_peer_rejects_invalid_sctp_config() {
         let peer = diameter_peer().with_local_addr("[::1]:0".parse().unwrap());
@@ -6899,6 +7026,39 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[ignore = "requires Linux SCTP multihoming plus passwordless sudo for a port-scoped blackhole"]
+    async fn diameter_full_policy_progress_survives_multihomed_blackhole_timeout() {
+        let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+        server_config
+            .local_addrs
+            .push("127.0.0.2:0".parse().unwrap());
+        let server = SctpEndpoint::bind(server_config).unwrap();
+        let mut remote_addrs = server.local_addresses().unwrap();
+        remote_addrs.sort_unstable();
+        let primary_blackhole = SctpPathDrop::install("127.0.0.1", remote_addrs[0].port());
+        let secondary_blackhole = SctpPathDrop::install("127.0.0.2", remote_addrs[0].port());
+        let mut config = SctpConnectConfig::new(remote_addrs[0]);
+        config.remote_addrs = remote_addrs;
+        let (progress, connect) =
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_progress(
+                config,
+                DiameterInboundPpidPolicy::AcceptLegacyZero,
+                DiameterOutboundPpidPolicy::LegacyZero,
+            );
+
+        assert!(tokio::time::timeout(Duration::from_millis(100), connect)
+            .await
+            .is_err());
+        assert_eq!(
+            progress.snapshot().stage,
+            SctpConnectStage::ConnectInProgress
+        );
+        secondary_blackhole.remove();
+        primary_blackhole.remove();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires Linux kernel SCTP support"]
     async fn loopback_multi_chunk_message_is_not_reported_truncated() {
         let server_addr: SocketAddr = "127.0.0.1:38414".parse().unwrap();
@@ -7366,16 +7526,17 @@ mod tests {
             interval_ms: Some(250),
             path_max_retrans: Some(2),
         };
-        let client = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            DiameterSctpAssociation::connect_unprotected_with_config_and_inbound_ppid_policy(
+        let (progress, connect) =
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_progress(
                 client_config,
                 DiameterInboundPpidPolicy::AcceptLegacyZero,
-            ),
-        )
-        .await
-        .expect("multihomed Diameter connect timed out")
-        .unwrap();
+                DiameterOutboundPpidPolicy::Standard,
+            );
+        let client = tokio::time::timeout(std::time::Duration::from_secs(5), connect)
+            .await
+            .expect("multihomed Diameter connect timed out")
+            .unwrap();
+        assert_eq!(progress.snapshot().stage, SctpConnectStage::Established);
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), server.accept())
             .await
             .expect("multihomed Diameter association was not accepted")
