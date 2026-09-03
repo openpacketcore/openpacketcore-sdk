@@ -377,14 +377,19 @@ jobs:
       - name: Lint opc-session-store on macOS
         run: cargo clippy --locked -p opc-session-store --all-targets --all-features -- -D warnings
 
-  # This is intentionally a required Rust-workspace lane, not a best-effort
-  # ignored test: cold SCTP static multihoming needs a real kernel, root-owned
-  # private network namespace, and a loadable SCTP module. Any missing
-  # prerequisite fails the lane instead of weakening the regression proof.
-  sctp-privileged:
-    name: Privileged Linux SCTP cold multihoming
+  # This required Rust-workspace lane executes the ignored fixture in a fresh,
+  # root-created private network namespace. It proves cold SCTP connectx over
+  # one static multihomed peer; unavailable kernel SCTP support fails rather
+  # than skips or weakens the regression proof.
+  rust-sctp-privileged:
+    name: Rust SCTP cold multihoming
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/sctp-privileged-target
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -397,7 +402,7 @@ jobs:
         with:
           shared-key: opc-sctp-privileged
 
-      - name: Require SCTP module and isolated network namespaces
+      - name: Require kernel SCTP support and isolated network namespaces
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -406,7 +411,7 @@ jobs:
             sudo apt-get install -y "linux-modules-extra-$(uname -r)"
             sudo modprobe sctp
           fi
-          lsmod | grep -E '^sctp[[:space:]]'
+          grep -qw SCTP /proc/net/protocols
           sudo unshare -n -- bash -euxo pipefail -c '
             ip link set lo up
             ss -H -n -a -A sctp
@@ -415,7 +420,6 @@ jobs:
       - name: Build cold SCTP multihoming regression fixture
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/sctp-privileged-target"
           cargo test --locked -p opc-sctp --test cold_multihoming_netns --no-run
 
       - name: Require cold primary-down secondary-up SCTP connectx proof
@@ -423,7 +427,6 @@ jobs:
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/sctp-privileged-target"
           proof_log="${RUNNER_TEMP}/sctp-cold-multihoming.log"
           sudo env \
             "PATH=${PATH}" \
@@ -463,7 +466,7 @@ jobs:
       - rust-gtpu-cfg
       - rust-gtpu-freebsd
       - rust-gtpu-macos
-      - sctp-privileged
+      - rust-sctp-privileged
       - session-net-i686
     steps:
       # Preserves the single check name the previous monolithic job reported,
