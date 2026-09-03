@@ -80,7 +80,12 @@ pub const MAX_SCTP_AUTH_KEY_BYTES: usize = opc_libsctp_sys::MAX_SCTP_AUTH_KEY_BY
 /// This is deliberately an attempt-level view, not a peer-path view. In
 /// particular, `connectx` does not expose which configured address the kernel
 /// has attempted, so this type never reports primary or secondary attempts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// A handle's reported stage never regresses. Branch-specific values such as
+/// immediate success and in-progress are evidence alternatives, not a general
+/// ordering for application policy.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SctpConnectStage {
     /// The returned connect future has not started socket setup.
@@ -152,6 +157,7 @@ impl SctpConnectStage {
 }
 
 /// A point-in-time redaction-safe SCTP connect progress snapshot.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SctpConnectProgressSnapshot {
     /// Furthest stage reached by this connect attempt.
@@ -3705,41 +3711,44 @@ mod platform {
     ) -> Result<Association, SctpError> {
         let remote = config.remote_addrs[0];
         let peer_paths = SctpPathTracker::new(&config.remote_addrs);
+        let fd_result =
+            opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne));
         progress.advance(SctpConnectStage::SocketCreationAttempted);
-        let fd = opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne))
-            .map_err(|source| io_err("socket", source))?;
+        let fd = fd_result.map_err(|source| io_err("socket", source))?;
         progress.advance(SctpConnectStage::SocketCreationSucceeded);
-        configure_fd(
+        let configure_result = configure_fd(
             fd.as_fd(),
             config.init,
             config.nodelay,
             config.rto,
             config.heartbeat,
             authentication,
-        )?;
+        );
+        configure_result?;
         progress.advance(SctpConnectStage::OptionsApplied);
         if config.local_addrs.len() == 1 {
+            let bind_result = opc_libsctp_sys::bind(fd.as_fd(), &config.local_addrs[0]);
             progress.advance(SctpConnectStage::LocalBindAttempted);
-            opc_libsctp_sys::bind(fd.as_fd(), &config.local_addrs[0])
-                .map_err(|source| io_err("bind", source))?;
+            bind_result.map_err(|source| io_err("bind", source))?;
             progress.advance(SctpConnectStage::LocalBindSucceeded);
         } else if !config.local_addrs.is_empty() {
+            let bind_result = opc_libsctp_sys::bind_addresses(fd.as_fd(), &config.local_addrs);
             progress.advance(SctpConnectStage::LocalBindAttempted);
-            opc_libsctp_sys::bind_addresses(fd.as_fd(), &config.local_addrs)
-                .map_err(|source| multihoming_io_err("bind_addresses", source))?;
+            bind_result.map_err(|source| multihoming_io_err("bind_addresses", source))?;
             progress.advance(SctpConnectStage::LocalBindSucceeded);
         } else {
             progress.advance(SctpConnectStage::LocalBindNotConfigured);
         }
-        progress.advance(SctpConnectStage::RemoteSetSubmitted);
-        let status = if config.remote_addrs.len() == 1 {
+        let status_result = if config.remote_addrs.len() == 1 {
             opc_libsctp_sys::connect(fd.as_fd(), &remote)
-                .map_err(|source| io_err("connect", source))?
+                .map_err(|source| io_err("connect", source))
         } else {
             opc_libsctp_sys::connect_addresses(fd.as_fd(), &config.remote_addrs)
-                .map_err(|source| multihoming_io_err("connect_addresses", source))?
+                .map_err(|source| multihoming_io_err("connect_addresses", source))
         };
-        let async_fd = AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
+        let status = record_remote_submission_result(&progress, status_result)?;
+        record_connect_status(&progress, status);
+        let async_fd = register_async_fd(fd)?;
         let socket = Arc::new(SctpSocket {
             fd: async_fd,
             max_message_bytes: config.max_message_bytes,
@@ -3748,10 +3757,7 @@ mod platform {
             closed: AtomicBool::new(false),
         });
         if status == opc_libsctp_sys::ConnectStatus::InProgress {
-            progress.advance(SctpConnectStage::ConnectInProgress);
             wait_connected(&socket, &progress).await?;
-        } else {
-            progress.advance(SctpConnectStage::ConnectImmediateSuccess);
         }
         if let Some(authentication) = authentication {
             require_peer_authentication(socket.fd.get_ref().as_fd(), authentication)?;
@@ -4584,6 +4590,28 @@ mod platform {
         validate_peer_authenticated_chunks(authentication, &peer_chunks)
     }
 
+    pub(super) fn record_remote_submission_result(
+        progress: &SctpConnectProgressHandle,
+        result: Result<opc_libsctp_sys::ConnectStatus, SctpError>,
+    ) -> Result<opc_libsctp_sys::ConnectStatus, SctpError> {
+        progress.advance(SctpConnectStage::RemoteSetSubmitted);
+        result
+    }
+
+    pub(super) fn record_connect_status(
+        progress: &SctpConnectProgressHandle,
+        status: opc_libsctp_sys::ConnectStatus,
+    ) {
+        progress.advance(match status {
+            opc_libsctp_sys::ConnectStatus::Connected => SctpConnectStage::ConnectImmediateSuccess,
+            opc_libsctp_sys::ConnectStatus::InProgress => SctpConnectStage::ConnectInProgress,
+        });
+    }
+
+    pub(super) fn register_async_fd(fd: OwnedFd) -> Result<AsyncFd<OwnedFd>, SctpError> {
+        AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))
+    }
+
     async fn wait_connected(
         socket: &SctpSocket,
         progress: &SctpConnectProgressHandle,
@@ -4999,6 +5027,54 @@ mod tests {
         let debug = format!("{progress:?}");
         assert!(!debug.contains("127.0.0.1"));
         assert!(!debug.contains("errno"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_progress_records_immediate_submission_error_and_status_before_registration() {
+        let error_progress = SctpConnectProgressHandle::new();
+        let error = platform::record_remote_submission_result(
+            &error_progress,
+            Err(SctpError::UnsupportedFeature {
+                feature: "test_connect_submission",
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SctpError::UnsupportedFeature { .. }));
+        assert_eq!(
+            error_progress.snapshot().stage,
+            SctpConnectStage::RemoteSetSubmitted
+        );
+
+        let registration_progress = SctpConnectProgressHandle::new();
+        platform::record_connect_status(
+            &registration_progress,
+            opc_libsctp_sys::ConnectStatus::Connected,
+        );
+        let fd: OwnedFd = std::fs::File::open("/dev/null")
+            .expect("open inert registration-failure descriptor")
+            .into();
+        assert!(matches!(
+            platform::register_async_fd(fd),
+            Err(SctpError::Io {
+                operation: "async_fd",
+                ..
+            })
+        ));
+        assert_eq!(
+            registration_progress.snapshot().stage,
+            SctpConnectStage::ConnectImmediateSuccess
+        );
+
+        let pending_progress = SctpConnectProgressHandle::new();
+        platform::record_connect_status(
+            &pending_progress,
+            opc_libsctp_sys::ConnectStatus::InProgress,
+        );
+        assert_eq!(
+            pending_progress.snapshot().stage,
+            SctpConnectStage::ConnectInProgress
+        );
     }
 
     #[tokio::test]

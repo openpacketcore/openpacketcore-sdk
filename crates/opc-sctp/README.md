@@ -32,7 +32,8 @@ Diameter transports are outside the current crate boundary.
   `SctpSenderDrainOutcome` waits.
 - Observability: `SctpHealth`, `SctpPathHealth`, `SctpPathStatus`,
   `SctpMetrics`, `SctpMetricsSnapshot`, and the redaction-safe per-attempt
-  `SctpConnectProgressHandle`/`SctpConnectProgressSnapshot`.
+  `SctpConnectProgressHandle`/`SctpConnectProgressSnapshot`/
+  `SctpConnectStage`.
 - Diameter helpers: `DiameterSctpPeer`, `DiameterSctpAssociation`,
   `DiameterSctpInbound`, `DiameterSctpProtection`, `DiameterInboundPpidPolicy`,
   `DiameterOutboundPpidPolicy`, `DiameterSctpConnectProjection`,
@@ -59,6 +60,55 @@ async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), S
     Ok(())
 }
 ```
+
+### Diameter connect progress across an application timeout
+
+Keep the progress handle outside the application timeout and time out only the
+returned future. The full-policy entry point preserves independent inbound and
+outbound PPID policy selection; it remains ordinary, explicitly unprotected
+SCTP.
+
+```rust,no_run
+use std::{net::SocketAddr, time::Duration};
+
+use opc_sctp::{
+    DiameterInboundPpidPolicy, DiameterOutboundPpidPolicy, DiameterSctpAssociation,
+    SctpConnectConfig,
+};
+
+async fn connect_diameter(
+    primary: SocketAddr,
+    secondary: SocketAddr,
+) -> Result<DiameterSctpAssociation, Box<dyn std::error::Error>> {
+    let mut config = SctpConnectConfig::new(primary);
+    config.remote_addrs.push(secondary);
+    let (progress, connect) =
+        DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_progress(
+            config,
+            DiameterInboundPpidPolicy::Strict,
+            DiameterOutboundPpidPolicy::Standard,
+        );
+
+    match tokio::time::timeout(Duration::from_secs(5), connect).await {
+        Ok(result) => Ok(result?),
+        Err(_) => {
+            let last_stage = progress.snapshot().stage;
+            Err(std::io::Error::other(last_stage.as_str()).into())
+        }
+    }
+}
+```
+
+`SctpConnectProgressSnapshot` contains only a stage enum. The taxonomy is
+socket creation attempted/succeeded, options applied, local bind
+attempted/succeeded or not configured, remote set submitted, immediate success
+or in-progress, writable readiness, successful `SO_ERROR` read, and
+established. Stages never regress for one handle, but the immediate-success and
+in-progress values are alternative kernel outcomes rather than path-attempt
+ordering. In particular, `connectx` exposes no primary/secondary attempt
+sequence. Cancelling the connect future closes its in-flight socket exactly as
+the ordinary connect API does; the handle remains readable afterwards, but it
+does not keep the socket alive or report progress after cancellation.
 
 ### Receive scratch ownership
 
