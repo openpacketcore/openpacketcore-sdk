@@ -19,8 +19,8 @@ use crate::capabilities::{
 use crate::error::RpcReplyAttributes;
 use crate::session_registry::is_valid_session_id;
 
-const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
-const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";
+pub(crate) const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
+pub(crate) const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Parsed NETCONF client `<hello>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -926,6 +926,7 @@ struct ParserState {
     filter_stack: Vec<FilterFrame>,
     edit_config_capture: Option<Writer<Vec<u8>>>,
     edit_config_capture_depth: usize,
+    edit_config_path_count: usize,
     root_closed: bool,
     xml_decl_seen: bool,
     pre_decl_misc_seen: bool,
@@ -972,8 +973,11 @@ impl ParserState {
         self.process_start(&element, &scoped.attrs, &scoped.reply_attrs, &scoped.scope)?;
         if capture_start {
             if capture_root {
+                self.edit_config_path_count = 0;
                 self.capture_config_root_start(start, &scoped.scope)?;
             } else {
+                self.edit_config_path_count = self.edit_config_path_count.saturating_add(1);
+                limits.check_paths(self.edit_config_path_count)?;
                 self.capture_event(Event::Start(start.borrow()))?;
             }
             self.edit_config_capture_depth = self.edit_config_capture_depth.saturating_add(1);
@@ -3159,7 +3163,7 @@ fn scoped_attributes(
     })
 }
 
-fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<(), XmlError> {
+pub(crate) fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<(), XmlError> {
     match prefix {
         None if uri == XML_NAMESPACE_URI || uri == XMLNS_NAMESPACE_URI => Err(XmlError::Malformed),
         None => Ok(()),
@@ -4204,6 +4208,27 @@ mod tests {
     }
 
     #[test]
+    fn public_edit_requests_remain_constructible_without_parser_limit_fields() {
+        let edit_config = EditConfigRequest {
+            target: Datastore::Running,
+            default_operation: EditDefaultOperation::Merge,
+            test_option: EditTestOption::TestThenSet,
+            test_option_explicit: false,
+            error_option: EditErrorOption::StopOnError,
+            config_xml: "<config/>".to_string(),
+        };
+        let edit_data = EditDataRequest {
+            datastore: NmdaDatastore::Running,
+            default_operation: EditDefaultOperation::Merge,
+            config_xml: Some("<config/>".to_string()),
+            url_present: false,
+        };
+
+        assert_eq!(edit_config.target, Datastore::Running);
+        assert_eq!(edit_data.datastore, NmdaDatastore::Running);
+    }
+
+    #[test]
     fn rejects_invalid_edit_config_shape() {
         let missing_target = parse_rpc(
             &rpc("<edit-config><config><sys:system xmlns:sys=\"urn:opc:test\"/></config></edit-config>"),
@@ -4373,6 +4398,30 @@ mod tests {
         )
         .expect_err("too deep");
         assert!(matches!(err, XmlError::Limit(_)));
+    }
+
+    #[test]
+    fn edit_config_payload_obeys_path_limit_before_schema_application() {
+        let limits = MgmtLimits {
+            max_paths_per_request: 2,
+            ..MgmtLimits::default()
+        };
+        let err = parse_rpc(
+            &rpc(
+                r#"<edit-config><target><running/></target><config><sys:system xmlns:sys="urn:opc:test"><sys:hostname>one</sys:hostname><sys:hostname>two</sys:hostname></sys:system></config></edit-config>"#,
+            ),
+            &limits,
+        )
+        .expect_err("three addressed edit nodes exceed the configured path limit");
+
+        assert_eq!(
+            err,
+            XmlError::Limit(opc_mgmt_limits::LimitsError::Exceeded {
+                limit: "paths_per_request",
+                max: 2,
+                actual: 3,
+            })
+        );
     }
 
     #[test]
