@@ -66,8 +66,8 @@ use opc_session_store::{
     SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
     SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
     SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
-    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
-    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    SnapshotIntegrityPolicy, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology, MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
@@ -3825,6 +3825,15 @@ impl Fleet {
                 workspace_directory: root.to_path_buf(),
                 database_path: database_path.clone(),
                 snapshot_directory: snapshots,
+                // An explicitly configured fs-verity campaign retains its
+                // exact legacy strict configuration bytes. The ordinary
+                // candidate explicitly exercises portable verified reads;
+                // this never depends on a failed filesystem capability probe.
+                snapshot_integrity: if snapshot_namespace.is_some() {
+                    None
+                } else {
+                    Some(SnapshotIntegrityPolicy::PortableVerified)
+                },
                 snapshot_root_directory: snapshot_namespace
                     .as_ref()
                     .map(|namespace| namespace.path().to_path_buf()),

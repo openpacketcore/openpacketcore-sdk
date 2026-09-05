@@ -56,6 +56,13 @@ advisory lock, and SQLite's `immutable=1` URI flag do not close that race.
 - A strict deployment must probe its selected snapshot filesystem during
   admission, before the Raft engine serves operations. Runtime storage
   corruption continues to fail closed in either policy.
+- Qualification-node configuration also selects the policy explicitly.
+  Ordinary foundation and mTLS candidate consumers use portable verification;
+  omitted historical settings retain fs-verity and its canonical bytes. An
+  explicitly configured external fs-verity campaign keeps that strict policy
+  and namespace; it rejects portable selection.
+  Configuration digests bind explicit policy choices without reclassifying
+  portable results as fs-verity release evidence.
 
 ## Narrow amendment to ADR 0017
 

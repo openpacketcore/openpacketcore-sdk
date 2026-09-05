@@ -819,6 +819,7 @@ async fn open_fixed_cluster_in_with_paths(
     .await
 }
 
+#[cfg(all(target_os = "linux", feature = "test-control"))]
 async fn open_fixed_cluster_in_separate_paths(
     database_directory: &std::path::Path,
     snapshot_directory: &std::path::Path,

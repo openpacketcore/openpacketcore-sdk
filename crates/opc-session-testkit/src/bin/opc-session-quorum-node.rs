@@ -58,8 +58,8 @@ use opc_session_store::{
     SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerV2Operation,
     SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
     SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
-    SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType, StoreError,
-    StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
+    SessionQuorumRosterIngress, SnapshotIntegrityPolicy, SqliteSessionBackend, StateClass,
+    StateType, StoreError, StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256,
@@ -1280,13 +1280,16 @@ impl QualificationNode {
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
         let store = Arc::new(
-            ConsensusSessionStore::open_fixed_durable_quorum_with_clock(
+            ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                 topology,
                 backend,
                 &snapshot_directory,
                 peers,
                 Arc::new(SystemClock),
                 Duration::from_millis(config.operation_timeout_millis),
+                config
+                    .snapshot_integrity
+                    .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
             )
             .await
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?,

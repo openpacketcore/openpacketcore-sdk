@@ -14,6 +14,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use opc_session_store::SnapshotIntegrityPolicy;
 use opc_session_testkit::qualification::{
     read_bounded_json_line, write_json_line, QualificationMember, QualificationNodeCommand,
     QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
@@ -1423,6 +1424,8 @@ struct CanonicalConfigurationManifest {
     backend_namespace: String,
     workload_schedule_sha256: String,
     operation_timeout_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_integrity: Option<SnapshotIntegrityPolicy>,
     members: Vec<QualificationMember>,
     nodes: Vec<CanonicalNodePaths>,
 }
@@ -1477,6 +1480,7 @@ impl CanonicalConfigurationManifest {
             backend_namespace: format!("qualification-{member_count}-node"),
             workload_schedule_sha256: workload_schedule_sha256.to_owned(),
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+            snapshot_integrity: Some(SnapshotIntegrityPolicy::PortableVerified),
             members,
             nodes,
         })
@@ -1514,6 +1518,7 @@ impl CanonicalConfigurationManifest {
                 workspace_directory: root.to_path_buf(),
                 database_path: root.join(&paths.database_relative_path),
                 snapshot_directory: root.join(&paths.snapshot_relative_path),
+                snapshot_integrity: self.snapshot_integrity,
                 snapshot_root_directory: None,
                 snapshot_root_device: None,
                 snapshot_root_inode: None,
@@ -1558,6 +1563,7 @@ impl CanonicalConfigurationManifest {
                     || config.workload_schedule_sha256 != first.workload_schedule_sha256
                     || config.members != first.members
                     || config.operation_timeout_millis != first.operation_timeout_millis
+                    || config.snapshot_integrity != first.snapshot_integrity
                 {
                     return Err(HarnessError::Evidence);
                 }
@@ -1578,6 +1584,7 @@ impl CanonicalConfigurationManifest {
             backend_namespace: first.backend_namespace.clone(),
             workload_schedule_sha256: first.workload_schedule_sha256.clone(),
             operation_timeout_millis: first.operation_timeout_millis,
+            snapshot_integrity: first.snapshot_integrity,
             members: first.members.clone(),
             nodes,
         };
@@ -3193,6 +3200,45 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
         )?;
     }
     Ok(())
+}
+
+#[test]
+fn canonical_configuration_binds_snapshot_policy_and_rejects_mixed_members() {
+    let addresses = (0..3)
+        .map(|index| SocketAddr::from(([127, 0, 0, 1], 17443 + index)))
+        .collect::<Vec<_>>();
+    let manifest =
+        CanonicalConfigurationManifest::new(3, &format!("sha256:{}", "a".repeat(64)), &addresses)
+            .expect("canonical portable configuration");
+    let root = Path::new("/qualification");
+    let mut configs = manifest
+        .runtime_configs(root)
+        .expect("portable runtime configs");
+    assert!(configs.iter().all(|config| {
+        config.snapshot_integrity == Some(SnapshotIntegrityPolicy::PortableVerified)
+    }));
+    assert_eq!(
+        CanonicalConfigurationManifest::from_runtime_configs(&configs, root)
+            .expect("reconstruct exact manifest"),
+        manifest
+    );
+    configs[1].snapshot_integrity = None;
+    assert!(matches!(
+        CanonicalConfigurationManifest::from_runtime_configs(&configs, root),
+        Err(HarnessError::Evidence)
+    ));
+
+    let mut legacy = manifest.clone();
+    legacy.snapshot_integrity = None;
+    assert_ne!(
+        serde_json::to_vec(&legacy).expect("legacy canonical bytes"),
+        serde_json::to_vec(&manifest).expect("portable canonical bytes")
+    );
+    assert!(legacy
+        .runtime_configs(root)
+        .expect("legacy runtime configurations")
+        .iter()
+        .all(|config| config.snapshot_integrity.is_none()));
 }
 
 #[test]
