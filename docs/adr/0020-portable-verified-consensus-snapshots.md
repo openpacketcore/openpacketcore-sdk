@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted for implementation; qualification is not yet complete.
+Accepted and implemented. Bounded single-host correctness and filesystem
+qualification has passed; this is not production performance or multi-host HA
+qualification.
 
 ## Date
 
@@ -79,7 +81,7 @@ file-control opcodes, unsafe code in session-store, or a process-default VFS
 change. Every FFI token still needs a safety justification and layout tests;
 the existing management-plane policy gate remains mandatory.
 
-## Qualification required before completion
+## Qualification requirements
 
 - Preserve the non-fs-verity snapshot creation RED and demonstrate build,
   transfer, install, restart, and recovery with fixed membership unchanged.
@@ -94,6 +96,31 @@ the existing management-plane policy gate remains mandatory.
   unsupported storage. Run portable qualification on ordinary XFS and ext4.
 - Exercise application-independent fixed-quorum recovery. Single-host
   filesystem qualification does not establish multi-host HA or performance.
+
+## Qualification evidence
+
+The implementation was qualified on 2026-09-05 with portable verified-read
+tests and the public three-voter snapshot/reopen/traffic-authority test on
+ordinary XFS and ext4. The full all-feature workspace suite passed, including
+all 1,124 storage unit tests and all 97 ordinary strict-fs-verity mTLS tests;
+the latter retains four pre-existing manual-only exclusions. Four separately
+selected portable mTLS consumer, rotation, and fenced-transition checks also
+passed without a dedicated fs-verity campaign selected.
+
+The corruption, lifetime, memory, cancellation, primary-lock progress, and
+offline-recovery regressions above are executable tests, not assurances based
+on filesystem permissions. A 32 MiB debug-build measurement on each filesystem
+observed approximately 1.02 seconds for indexing, 1.49 seconds for verified
+SHA-consumed reading, and 0.51 seconds for raw SHA-consumed reading. These are
+single-host observations, not release-build throughput targets or a storage
+sizing recommendation. Representative production workloads and multi-host
+recovery remain separate qualification obligations.
+
+Qualification exposed intermittent survivor-observation and lease-renewal
+failures in the existing recovery scenario. Subsequent complete and repeated
+exact runs passed, but those passes do not establish the cause or claim a fix
+for the intermittent failures. Fixed-category lease and elapsed-deadline
+diagnostics retain the original authority checks and time budgets.
 
 ## References
 
