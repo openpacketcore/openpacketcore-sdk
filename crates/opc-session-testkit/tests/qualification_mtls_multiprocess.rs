@@ -5628,7 +5628,11 @@ impl Fleet {
             let observation_started = Instant::now();
             assert!(
                 observation_started < observation_deadline,
-                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, pulse_elapsed={:?}, coverage_elapsed={:?}, observation_overrun={:?}, absolute_remaining={:?}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                observation_started.saturating_duration_since(progress.pulse_observed_at),
+                observation_started.saturating_duration_since(progress.coverage_observed_at),
+                observation_started.saturating_duration_since(observation_deadline),
+                absolute_deadline.saturating_duration_since(observation_started),
                 progress.pulse_checkpoint,
                 progress.coverage_checkpoint,
                 self.stderr_diagnostics()

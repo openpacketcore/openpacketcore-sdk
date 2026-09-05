@@ -856,6 +856,11 @@ impl QualificationTrafficFailure {
         stage: QualificationTrafficFailureStage,
         error: &LeaseError,
     ) -> Self {
+        // Keep authority failures distinguishable without logging backend
+        // strings, session keys, owners, credentials, or other material.
+        if let Some(reason) = qualification_lease_authority_failure_reason(error) {
+            eprintln!("qualification traffic lease rejected: stage={stage:?} reason={reason}");
+        }
         Self {
             code,
             stage,
@@ -1110,6 +1115,17 @@ fn qualification_lease_error_class(error: &LeaseError) -> QualificationTrafficEr
         | LeaseError::StaleFence
         | LeaseError::NotFound
         | LeaseError::InvalidSessionTtl => QualificationTrafficErrorClass::LeaseLostOrInvalid,
+    }
+}
+
+fn qualification_lease_authority_failure_reason(error: &LeaseError) -> Option<&'static str> {
+    match error {
+        LeaseError::AlreadyHeld => Some("already-held"),
+        LeaseError::Expired => Some("expired"),
+        LeaseError::StaleFence => Some("stale-fence"),
+        LeaseError::NotFound => Some("not-found"),
+        LeaseError::InvalidSessionTtl => Some("invalid-session-ttl"),
+        LeaseError::Backend(_) | LeaseError::OperationOutcomeUnavailable => None,
     }
 }
 
@@ -6413,6 +6429,32 @@ mod tests {
         assert!(!observation
             .synthetic_release_response_loss_pending
             .load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn traffic_lease_authority_diagnostics_are_fixed_and_omit_backend_details() {
+        for (error, expected) in [
+            (LeaseError::AlreadyHeld, "already-held"),
+            (LeaseError::Expired, "expired"),
+            (LeaseError::StaleFence, "stale-fence"),
+            (LeaseError::NotFound, "not-found"),
+            (LeaseError::InvalidSessionTtl, "invalid-session-ttl"),
+        ] {
+            assert_eq!(
+                qualification_lease_authority_failure_reason(&error),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            qualification_lease_authority_failure_reason(&LeaseError::Backend(
+                "must-not-cross-control-boundary".to_owned(),
+            )),
+            None,
+        );
+        assert_eq!(
+            qualification_lease_authority_failure_reason(&LeaseError::OperationOutcomeUnavailable),
+            None,
+        );
     }
 
     #[test]
