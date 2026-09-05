@@ -378,6 +378,9 @@ fn attestation_deadline_from_verification_start(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ConsensusSessionStoreOpenError {
+    /// The selected filesystem cannot satisfy the explicit integrity policy.
+    #[error("required snapshot integrity is unavailable; qualify fs-verity storage or explicitly select portable verified snapshots")]
+    SnapshotIntegrityUnavailable,
     /// Dynamic consensus requires Linux descriptor-pinned SQLite handling and
     /// is unsupported on this platform.
     #[error("dynamic session consensus is unsupported on this platform")]
@@ -456,6 +459,9 @@ pub(crate) struct OperatorRecoveryCommitRequest {
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
+            SessionConsensusStorageError::SnapshotIntegrityUnavailable => {
+                Self::SnapshotIntegrityUnavailable
+            }
             SessionConsensusStorageError::UnsupportedPlatform => {
                 Self::DynamicConsensusUnsupportedPlatform
             }
@@ -2957,6 +2963,16 @@ impl fmt::Debug for ConsensusSessionStore {
 }
 
 impl ConsensusSessionStore {
+    /// Explicit local fixed-quorum snapshot policy, or `None` for dynamic
+    /// membership. This is configuration, not a claim of live quorum health.
+    pub fn snapshot_integrity_policy(&self) -> Option<super::SnapshotIntegrityPolicy> {
+        (self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum).then(|| {
+            self.inner
+                .terminal_recovery_handoff_consumer
+                .snapshot_integrity_policy()
+        })
+    }
+
     /// Return fixed, redaction-safe diagnostic counters for this store.
     pub fn diagnostic_snapshot(&self) -> ConsensusStoreDiagnosticSnapshot {
         self.inner.diagnostics.snapshot()
@@ -3087,6 +3103,53 @@ impl ConsensusSessionStore {
         clock: Arc<dyn Clock>,
         operation_timeout: Duration,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
+            topology,
+            backend,
+            snapshot_dir,
+            peers,
+            clock,
+            operation_timeout,
+            super::SnapshotIntegrityPolicy::FsVerity,
+        )
+        .await
+    }
+
+    /// Open a fixed quorum with an explicit snapshot integrity policy.
+    ///
+    /// `PortableVerified` uses bounded verified reads on ordinary Linux
+    /// filesystems. `FsVerity` requires kernel sealing support. Neither policy
+    /// changes membership, placement, durable authority, or fencing. There is
+    /// no automatic fallback. The legacy opener retains `FsVerity` semantics.
+    pub async fn open_fixed_durable_quorum_with_snapshot_integrity(
+        topology: ValidatedQuorumTopology,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+        snapshot_integrity: super::SnapshotIntegrityPolicy,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
+            topology,
+            backend,
+            snapshot_dir,
+            peers,
+            Arc::new(SystemClock),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+            snapshot_integrity,
+        )
+        .await
+    }
+
+    /// Explicit integrity-policy opener with an injected qualification clock.
+    pub async fn open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
+        topology: ValidatedQuorumTopology,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+        snapshot_integrity: super::SnapshotIntegrityPolicy,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
         if !cfg!(target_os = "linux") {
             return Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform);
         }
@@ -3156,6 +3219,7 @@ impl ConsensusSessionStore {
                 peer_directory.clone(),
                 placement_policy,
                 roster_attestation_trust_root.clone(),
+                snapshot_integrity,
             )
             .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
@@ -16054,12 +16118,13 @@ mod membership_tests {
         .expect("open no-follow inherited snapshot leaf");
         let snapshot_path = PathBuf::from(format!("/proc/self/fd/{}/", snapshot_fd.as_raw_fd()));
         let topology = fixed_shutdown_topology();
-        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),
             SqliteSessionBackend::open(workspace.path().join("store.sqlite"))
                 .expect("open procfd fixed-store backend"),
             snapshot_path,
             unavailable_fixed_shutdown_peers(&topology),
+            crate::SnapshotIntegrityPolicy::PortableVerified,
         )
         .await
         .expect("full fixed-store admission through inherited procfd snapshot leaf");
@@ -16078,11 +16143,12 @@ mod membership_tests {
         let topology = fixed_shutdown_topology();
         let backend = SqliteSessionBackend::open(&database_path).expect("file-backed backend");
         let mut checkpoint_workers = backend.proactive_checkpoint_worker_observation_for_test();
-        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),
             backend,
             &snapshot_path,
             unavailable_fixed_shutdown_peers(&topology),
+            crate::SnapshotIntegrityPolicy::PortableVerified,
         )
         .await
         .expect("open fixed store with both maintenance lanes");
@@ -16143,11 +16209,12 @@ mod membership_tests {
         // shutdown. Reopen only after this fixture releases its last old
         // store handle, exactly as a process restart does.
         drop(store);
-        let reopened = ConsensusSessionStore::open_fixed_durable_quorum(
+        let reopened = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),
             SqliteSessionBackend::open(&database_path).expect("reopen file-backed backend"),
             &snapshot_path,
             unavailable_fixed_shutdown_peers(&topology),
+            crate::SnapshotIntegrityPolicy::PortableVerified,
         )
         .await
         .expect("reopen after maintenance joins and core shutdown");
@@ -16166,16 +16233,18 @@ mod membership_tests {
         let topology = fixed_shutdown_topology();
         let backend = SqliteSessionBackend::open(&database_path).expect("file-backed backend");
         let mut checkpoint_workers = backend.proactive_checkpoint_worker_observation_for_test();
-        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_clock(
-            topology.clone(),
-            backend,
-            &snapshot_path,
-            unavailable_fixed_shutdown_peers(&topology),
-            Arc::new(SystemClock),
-            Duration::from_millis(25),
-        )
-        .await
-        .expect("open fixed store with bounded shutdown deadline");
+        let store =
+            ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
+                topology.clone(),
+                backend,
+                &snapshot_path,
+                unavailable_fixed_shutdown_peers(&topology),
+                Arc::new(SystemClock),
+                Duration::from_millis(25),
+                crate::SnapshotIntegrityPolicy::PortableVerified,
+            )
+            .await
+            .expect("open fixed store with bounded shutdown deadline");
         assert!(tokio::time::timeout(
             Duration::from_secs(1),
             checkpoint_workers.wait_for_worker_count(1),
@@ -22648,11 +22717,12 @@ mod membership_tests {
         let backend = SqliteSessionBackend::open(&database_path)
             .expect("file-backed prune-readiness backend");
         let inspection_backend = backend.clone();
-        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),
             backend,
             &snapshot_path,
             unavailable_fixed_shutdown_peers(&topology),
+            crate::SnapshotIntegrityPolicy::PortableVerified,
         )
         .await
         .expect("open fixed prune-readiness store");

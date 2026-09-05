@@ -197,11 +197,12 @@ async fn start_fixed_quorum_with_main_sync_vfs(
             })
             .collect::<BTreeMap<_, _>>();
         stores.push(
-            ConsensusSessionStore::open_fixed_durable_quorum(
+            ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
                 topologies[source].clone(),
                 backends[source].clone(),
                 directory.join(format!("snapshots-{source}")),
                 configured_peers,
+                opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
             )
             .await
             .expect("open exact fixed voter"),

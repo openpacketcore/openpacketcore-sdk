@@ -11,7 +11,7 @@ use opc_session_net::{
     DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
     DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
 };
-use opc_session_store::ReplicaEndpoint;
+use opc_session_store::{ReplicaEndpoint, SnapshotIntegrityPolicy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -338,6 +338,7 @@ pub fn render_qualification_kubernetes_manifest(
             workspace_directory: PathBuf::from(WORKSPACE_DIRECTORY),
             database_path: PathBuf::from(DATABASE_PATH),
             snapshot_directory: PathBuf::from(SNAPSHOT_DIRECTORY),
+            snapshot_integrity: Some(SnapshotIntegrityPolicy::PortableVerified),
             snapshot_root_directory: None,
             snapshot_root_device: None,
             snapshot_root_inode: None,
@@ -897,6 +898,10 @@ mod tests {
                     serde_json::from_str(encoded).expect("strict node config");
                 assert_eq!(node.schema_version, QUALIFICATION_NODE_SCHEMA_VERSION);
                 assert_eq!(node.node_index, node_index);
+                assert_eq!(
+                    node.snapshot_integrity,
+                    Some(SnapshotIntegrityPolicy::PortableVerified)
+                );
                 assert_eq!(node.snapshot_root_directory, None);
                 assert_eq!(node.snapshot_root_device, None);
                 assert_eq!(node.snapshot_root_inode, None);

@@ -66,8 +66,8 @@ use opc_session_store::{
     SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
     SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
     SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
-    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
-    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    SnapshotIntegrityPolicy, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology, MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
@@ -3825,6 +3825,15 @@ impl Fleet {
                 workspace_directory: root.to_path_buf(),
                 database_path: database_path.clone(),
                 snapshot_directory: snapshots,
+                // An explicitly configured fs-verity campaign retains its
+                // exact legacy strict configuration bytes. The ordinary
+                // candidate explicitly exercises portable verified reads;
+                // this never depends on a failed filesystem capability probe.
+                snapshot_integrity: if snapshot_namespace.is_some() {
+                    None
+                } else {
+                    Some(SnapshotIntegrityPolicy::PortableVerified)
+                },
                 snapshot_root_directory: snapshot_namespace
                     .as_ref()
                     .map(|namespace| namespace.path().to_path_buf()),
@@ -5619,7 +5628,11 @@ impl Fleet {
             let observation_started = Instant::now();
             assert!(
                 observation_started < observation_deadline,
-                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, pulse_elapsed={:?}, coverage_elapsed={:?}, observation_overrun={:?}, absolute_remaining={:?}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                observation_started.saturating_duration_since(progress.pulse_observed_at),
+                observation_started.saturating_duration_since(progress.coverage_observed_at),
+                observation_started.saturating_duration_since(observation_deadline),
+                absolute_deadline.saturating_duration_since(observation_started),
                 progress.pulse_checkpoint,
                 progress.coverage_checkpoint,
                 self.stderr_diagnostics()

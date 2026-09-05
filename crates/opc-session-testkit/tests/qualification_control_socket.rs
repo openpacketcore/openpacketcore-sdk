@@ -10,6 +10,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use opc_session_store::SnapshotIntegrityPolicy;
 use opc_session_testkit::qualification::{
     qualification_concurrent_state_type, read_bounded_json_line, write_json_line,
     QualificationConcurrentBatchOutcome, QualificationConcurrentBatchSlot,
@@ -186,6 +187,7 @@ fn write_configs(root: &Path, addresses: &[SocketAddr]) -> Vec<PathBuf> {
                 workspace_directory: root.to_path_buf(),
                 database_path: node_directory.join("session.sqlite"),
                 snapshot_directory: node_directory.join("snapshots"),
+                snapshot_integrity: Some(SnapshotIntegrityPolicy::PortableVerified),
                 snapshot_root_directory: None,
                 snapshot_root_device: None,
                 snapshot_root_inode: None,
@@ -263,6 +265,7 @@ fn write_fleet_control_configs(
             workspace_directory: node_directory.clone(),
             database_path: node_directory.join("session.sqlite"),
             snapshot_directory: node_directory.join("snapshots"),
+            snapshot_integrity: Some(SnapshotIntegrityPolicy::PortableVerified),
             snapshot_root_directory: None,
             snapshot_root_device: None,
             snapshot_root_inode: None,

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted (amended 2026-09-05 by ADR 0020 for the narrowly scoped read-only
+verified snapshot VFS; implementation qualification is pending)
 
 ## Date
 
@@ -77,8 +78,10 @@ an SCTP-terminating CNF is in scope:
    bundled Linux Unix VFS. Its opt-in test feature may register one non-default
    VFS that rejects unnamed temporary opens and delegates named opens to the
    bundled default VFS. This does not authorize borrowed-handle exposure,
-   pathname authority, file contents, another opcode, a production VFS, or
-   general SQLite FFI. Each allowlisted sys crate does **not** inherit
+   pathname authority, another opcode, or general SQLite FFI. ADR 0020 adds
+   one explicit exception: a non-default, read-only snapshot VFS whose owned
+   buffers are verified in safe Rust, with no write, journal, WAL, temporary,
+   mmap, or arbitrary-path access. Each allowlisted sys crate does **not** inherit
    `[workspace.lints]` (so the workspace-wide `unsafe_code = "forbid"` stays in
    force for every other crate); it sets its own local crate policy
    (`unsafe_code = "allow"` plus `unsafe_op_in_unsafe_fn = "deny"`, or
@@ -96,7 +99,7 @@ an SCTP-terminating CNF is in scope:
    allowlisted sys crates (`opc-libsctp-sys` and later, reviewed kernel-UAPI
    boundaries such as `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`, and the
    fixed-profile descriptor-only `opc-fs-verity-sys`, plus the pinned
-   file-control and test-only VFS boundary in
+   file-control, test-only VFS, and ADR 0020 read-only snapshot VFS boundary in
    `opc-sqlite-file-control-sys`); the same gate also rejects each allowed sys
    crate if it
    inherits `[workspace.lints]`, rejects it if it lacks the required local unsafe

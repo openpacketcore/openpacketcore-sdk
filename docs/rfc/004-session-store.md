@@ -908,18 +908,31 @@ epoch-derived and do not include the fixed-profile or placement-policy binding.
 `ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
 where descriptor-pinned SQLite snapshots are available; other platforms MUST
 return `FixedQuorumUnsupportedPlatform` before durable initialization.
-Linux alone is insufficient for the fixed profile: the snapshot filesystem
-MUST support the exact fs-verity v1 profile (SHA-256, 4 KiB block size, no salt,
-and no signature). Build, installation, startup, and recovery MUST reject an
-unsupported filesystem or an unsealed fixed-profile artifact before it can be
-accepted as durable state. The dynamic profile remains available without this
-fixed artifact requirement, but MUST retain its bounded corruption detection
-and fail closed on invalid snapshot evidence.
-This is not an online migration: an existing pre-fixed or unsealed
-metadata-referenced artifact is not auto-sealed, auto-repaired, or accepted on
-open. Operators MUST preserve it and use the reviewed offline
-reseed/recovery/migration procedure before reopening; a startup retry,
-metadata edit, or byte-identical replacement does not cross this boundary.
+The local snapshot integrity mechanism is an explicit construction policy,
+independent of fixed membership and placement. The legacy opener selects
+`SnapshotIntegrityPolicy::FsVerity`: the filesystem MUST support the exact
+v1/SHA-256/4 KiB profile with no salt or signature, and admission MUST probe it
+before starting Raft. Build, installation, startup, and recovery MUST reject an
+unsealed artifact under that policy. It MUST NOT silently fall back.
+
+The additive `open_fixed_durable_quorum_with_snapshot_integrity` opener also
+admits `PortableVerified` on supported ordinary Linux filesystems. As specified
+in [ADR 0020](../adr/0020-portable-verified-consensus-snapshots.md), every consumed
+snapshot byte, including SQLite reads, MUST pass through owned buffers verified
+against one retained, bounded, process-owned digest index. A full checksum scan
+followed by unchecked descriptor I/O, mmap, or reopening a pathname MUST NOT
+qualify. Indexing MUST occur outside the primary SQLite lock. Existing envelope,
+authoritative checksum, descriptor/namespace identity, and publication fences
+remain mandatory. The dynamic profile retains its bounded corruption detection
+without claiming either fixed snapshot protection.
+
+Portable selection MAY consume an existing sealed image but MUST NOT repair or
+rewrite it during admission. An old strict reader MUST reject a newly written
+unsealed image; rollback requires a compatible reader or a separately qualified
+explicit offline conversion on capable storage. Recovery plans and resumable
+workflows MUST authenticate the selected policy; omitted legacy fields retain
+strict semantics and canonical bytes. Membership, placement, snapshot wire
+format, and destructive-confirmation requirements are unchanged.
 Fixed membership does not authorize dynamic membership transitions, a second
 consensus engine, a controller feed, or a new packet-core protocol path.
 `try_from_fixed_durable_quorum_with_authenticated_placement` may additionally

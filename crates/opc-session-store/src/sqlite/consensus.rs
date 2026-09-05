@@ -5716,6 +5716,7 @@ pub(crate) struct SqliteConsensusCore {
     /// The active topology identity lives in `consensus_membership_scope`.
     pub(crate) storage_identity: SessionConsensusIdentity,
     pub(crate) authority_profile: ConsensusAuthorityProfile,
+    pub(crate) snapshot_integrity: crate::consensus::SnapshotIntegrityPolicy,
     pub(crate) fixed_placement_policy: Option<PlacementResiliencePolicy>,
     pub(crate) expected_members: BTreeSet<SessionConsensusNodeId>,
     pub(crate) expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
@@ -6323,6 +6324,7 @@ impl SqliteConsensusCore {
             expected_members,
             expected_bindings,
             snapshot_dir: Arc::new(canonical_snapshot_dir),
+            snapshot_integrity: crate::consensus::SnapshotIntegrityPolicy::FsVerity,
             snapshot_cleanup_failed: Arc::new(AtomicBool::new(false)),
             snapshot_publication_indeterminate: Arc::new(AtomicBool::new(false)),
             // The core is shared by state-machine apply, snapshots, and
@@ -35323,6 +35325,11 @@ fn pinned_snapshot_uri(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
     read_only: bool,
 ) -> String {
+    if read_only {
+        if let Some(uri) = pinned.portable_sqlite_uri() {
+            return uri;
+        }
+    }
     let mode = if read_only { "ro" } else { "rw" };
     format!(
         "file:/proc/self/fd/{}?mode={mode}&cache=private{}{}",

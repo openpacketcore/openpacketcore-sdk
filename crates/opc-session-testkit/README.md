@@ -61,6 +61,16 @@ client/server configs to
 `SessionConsensusServer::new`. The manifest still performs the exact peer
 SPIFFE-ID check after certificate-chain authentication.
 
+Snapshot protection is a separate, explicit node-configuration choice. Ordinary
+foundation, mTLS candidate, and rendered Kubernetes configurations select
+`"snapshot_integrity": "portable_verified"`; fixed voter identity and fencing
+are unchanged. An mTLS campaign explicitly configured with the dedicated
+fs-verity snapshot root retains the strict profile instead. An omitted field
+retains the legacy `fs_verity` policy, including its fail-closed admission probe.
+The external fs-verity namespace rejects portable selection, and its retained
+strict configuration serialization is unchanged. Portable campaign results do
+not substitute for the release profile's fs-verity evidence.
+
 The candidate build has no default features:
 
 ```console
