@@ -2334,7 +2334,7 @@ mod tests {
         let directory = network.peer_directory();
         let bindings = member_bindings(&members);
         let (mut log_store, mut state_machine, storage_identity) =
-            storage::open_fixed_with_member_bindings(
+            storage::open_fixed_with_member_bindings_and_roster_attestation_root(
                 &backend,
                 temp.path().join("snapshots"),
                 scope,
@@ -2342,6 +2342,10 @@ mod tests {
                 bindings.clone(),
                 directory.clone(),
                 crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
+                None,
+                // This fixture qualifies fixed RPC authority on ordinary
+                // storage, independently of the strict filesystem profile.
+                crate::SnapshotIntegrityPolicy::PortableVerified,
             )
             .await
             .expect("fixed follower storage");

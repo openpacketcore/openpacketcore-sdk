@@ -29,7 +29,8 @@ use crate::consensus::types::{FinalizeOperatorRecoveryV2Intent, SessionMutationO
 use crate::consensus::{
     SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
     SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusRequestId, SessionMutationIntent, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionConsensusRequestId, SessionMutationIntent, SnapshotIntegrityPolicy,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::sqlite::{consensus, open_regular_read_nofollow, ops};
 use crate::{
@@ -464,6 +465,7 @@ pub(super) struct InspectionInput<'a> {
     pub(super) identity: SessionConsensusIdentity,
     pub(super) expected_members: &'a BTreeSet<SessionConsensusNodeId>,
     pub(super) limits: RecoveryLimits,
+    pub(super) snapshot_integrity: SnapshotIntegrityPolicy,
 }
 
 pub(super) struct ResetInput<'a> {
@@ -506,6 +508,11 @@ struct WorkflowRecord {
     /// the same (or stricter would require a new authenticated workflow)
     /// envelope rather than silently widening to RecoveryLimits::default().
     limits: WorkflowLimits,
+    #[serde(
+        default = "SnapshotIntegrityPolicy::legacy",
+        skip_serializing_if = "SnapshotIntegrityPolicy::is_legacy"
+    )]
+    snapshot_integrity: SnapshotIntegrityPolicy,
     source_branch_digest: RecoveryDigest,
     source_authority_profile: RecoveryAuthorityProfile,
     source_fixed_placement_policy: Option<RecoveryFixedPlacementPolicy>,
@@ -1111,22 +1118,22 @@ fn inspect_current(
     let mut snapshot_file = snapshot_file;
     let current_snapshot_identity = match snapshot_file.as_mut() {
         Some(file) => current_snapshot_identity(
-            input.key,
+            &input,
             conn,
             storage_identity,
             &paths.snapshots,
             authority_profile == RecoveryAuthorityProfile::FixedImmutable,
-            input.limits,
             Some(file),
+            budget,
         )?,
         None => current_snapshot_identity(
-            input.key,
+            &input,
             conn,
             storage_identity,
             &paths.snapshots,
             authority_profile == RecoveryAuthorityProfile::FixedImmutable,
-            input.limits,
             None,
+            budget,
         )?,
     };
     if storage_identity.cluster_id() != input.identity.cluster_id() {
@@ -4122,6 +4129,7 @@ pub(super) fn backup_and_reset_replica(
             version: WORKFLOW_VERSION,
             plan_digest: input.plan.plan_digest,
             limits: WorkflowLimits::from_recovery(input.limits),
+            snapshot_integrity: input.plan.body.snapshot_integrity,
             source_branch_digest: input.plan.body.source_branch_digest,
             source_authority_profile: input.plan.body.source_authority_profile,
             source_fixed_placement_policy: input.plan.body.source_fixed_placement_policy,
@@ -4509,6 +4517,7 @@ pub(super) fn backup_and_reset_replica(
                                 .join(file_name),
                             input.limits,
                             staged_fixed_immutable,
+                            input.plan.body.snapshot_integrity,
                         )?;
                         (
                             Some(pinned_file_identity(input.key, &installed)?),
@@ -4614,6 +4623,7 @@ pub(super) fn backup_and_reset_replica(
                         .join(file_name),
                     input.limits,
                     staged_fixed_immutable,
+                    input.plan.body.snapshot_integrity,
                 )?;
                 let snapshot_identity = Some(pinned_file_identity(input.key, &installed)?);
                 let paths = canonical_replica_paths(target, false)?;
@@ -4687,6 +4697,7 @@ pub(super) fn backup_and_reset_replica(
                     &staged_snapshot,
                     input.limits,
                     staged_fixed_immutable,
+                    input.plan.body.snapshot_integrity,
                 )?;
                 if Some(pinned_file_identity(input.key, &installed)?) != expected_snapshot_identity
                 {
@@ -4730,6 +4741,7 @@ pub(super) fn backup_and_reset_replica(
                         path,
                         input.limits,
                         staged_fixed_immutable,
+                        input.plan.body.snapshot_integrity,
                     )?;
                     if Some(pinned_file_identity(input.key, installed)?)
                         != expected_snapshot_identity
@@ -4801,6 +4813,7 @@ pub(super) fn backup_and_reset_replica(
                             path,
                             input.limits,
                             staged_fixed_immutable,
+                            input.plan.body.snapshot_integrity,
                         )?;
                         if Some(pinned_file_identity(input.key, installed)?)
                             != expected_snapshot_identity
@@ -4888,6 +4901,7 @@ pub(super) fn backup_and_reset_replica(
                     path,
                     input.limits,
                     staged_fixed_immutable,
+                    input.plan.body.snapshot_integrity,
                 )?;
                 if Some(pinned_file_identity(input.key, installed)?) != expected_snapshot_identity {
                     return Err(RecoveryError::BackupCorrupt);
@@ -4961,6 +4975,7 @@ pub(super) fn backup_and_reset_replica(
             path,
             input.limits,
             staged_fixed_immutable,
+            input.plan.body.snapshot_integrity,
         )?;
         if Some(pinned_file_identity(input.key, snapshot)?) != *expected_identity {
             return Err(RecoveryError::BackupCorrupt);
@@ -4979,6 +4994,7 @@ pub(super) fn backup_and_reset_replica(
             path,
             input.limits,
             staged_fixed_immutable,
+            input.plan.body.snapshot_integrity,
         )?;
         if Some(pinned_file_identity(input.key, snapshot)?) != *expected_identity {
             return Err(RecoveryError::BackupCorrupt);
@@ -5280,6 +5296,7 @@ fn inspect_planned_fleet(input: &ResetInput<'_>) -> Result<(), RecoveryError> {
                 identity: input.plan.body.identity,
                 expected_members: &input.plan.body.expected_members,
                 limits: input.limits,
+                snapshot_integrity: input.plan.body.snapshot_integrity,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -5439,6 +5456,7 @@ fn ensure_target_backup(
         plan.body.identity,
         &paths.snapshots,
         limits,
+        plan.body.snapshot_integrity,
         None,
     )?;
     let observed_snapshot_identity = target_snapshot
@@ -5456,6 +5474,7 @@ fn ensure_target_backup(
             &destination,
             limits.max_snapshot_bytes(),
             snapshot.fixed_immutable,
+            plan.body.snapshot_integrity,
         )?;
         let (digest, length) =
             digest_pinned_file(&mut destination_file, limits.max_snapshot_bytes())?;
@@ -5492,6 +5511,7 @@ fn ensure_target_backup(
             identity: plan.body.identity,
             expected_members: &plan.body.expected_members,
             limits,
+            snapshot_integrity: plan.body.snapshot_integrity,
         },
         canonical_replica_paths(&backed_up_replica, false)?,
         &backup_database_file,
@@ -5697,6 +5717,7 @@ fn create_checkpoint(
         plan.body.identity,
         &source_paths.snapshots,
         limits,
+        plan.body.snapshot_integrity,
         None,
     )?;
     let (snapshot_name, snapshot_digest, snapshot_identity, mut snapshot_file) =
@@ -5712,6 +5733,7 @@ fn create_checkpoint(
                 &destination,
                 limits.max_snapshot_bytes(),
                 snapshot.fixed_immutable,
+                plan.body.snapshot_integrity,
             )?;
             let digest = digest_pinned_file(&mut destination_file, limits.max_snapshot_bytes())?.0;
             let identity = pinned_file_identity(key, &destination_file)?;
@@ -5742,6 +5764,7 @@ fn create_checkpoint(
             identity: plan.body.identity,
             expected_members: &plan.body.expected_members,
             limits,
+            snapshot_integrity: plan.body.snapshot_integrity,
         },
         canonical_replica_paths(&replica, false)?,
         &database_file,
@@ -5831,6 +5854,7 @@ fn verify_checkpoint(
             identity: plan.body.identity,
             expected_members: &plan.body.expected_members,
             limits,
+            snapshot_integrity: plan.body.snapshot_integrity,
         },
         canonical_replica_paths(&replica, false)?,
         &database_file,
@@ -5921,6 +5945,7 @@ fn stage_source(
             identity: plan.body.identity,
             expected_members: &plan.body.expected_members,
             limits,
+            snapshot_integrity: plan.body.snapshot_integrity,
         },
         canonical_replica_paths(&staged_replica, false)?,
         &staged_database_file,
@@ -6057,6 +6082,7 @@ fn stage_source(
         plan.body.identity,
         &paths.snapshots,
         limits,
+        plan.body.snapshot_integrity,
         checkpoint_snapshot,
     )?;
     let (source_snapshot_name, mut staged_snapshot_file, mut checkpoint_snapshot_file) =
@@ -6067,6 +6093,7 @@ fn stage_source(
                 staged_snapshot,
                 limits.max_snapshot_bytes(),
                 snapshot.fixed_immutable,
+                plan.body.snapshot_integrity,
             )?;
             let inspection_pin = snapshot.file.try_clone()?;
             (
@@ -6308,6 +6335,7 @@ fn verify_staged_source(mut input: StagedSourceVerification<'_>) -> Result<(), R
             identity: input.plan.body.identity,
             expected_members: &input.plan.body.expected_members,
             limits: input.limits,
+            snapshot_integrity: input.plan.body.snapshot_integrity,
         },
         canonical_replica_paths(&staged_replica, false)?,
         input.database,
@@ -6546,6 +6574,7 @@ fn prepare_staged_snapshot(
         &temporary,
         limits.max_snapshot_bytes(),
         fixed_immutable,
+        plan.body.snapshot_integrity,
     )?;
     file.verify_path_identity(&temporary)
         .map_err(|_| RecoveryError::FileOperationFailed)?;
@@ -7000,6 +7029,7 @@ fn open_verified_installed_snapshot(
     staged_snapshot: &Path,
     limits: RecoveryLimits,
     fixed_immutable: bool,
+    snapshot_integrity: SnapshotIntegrityPolicy,
 ) -> Result<PinnedSnapshotFile, RecoveryError> {
     validate_snapshot_name(file_name)?;
     let paths = canonical_replica_paths(target, false)?;
@@ -7007,8 +7037,8 @@ fn open_verified_installed_snapshot(
     let installed = paths.snapshots.join(file_name);
     let mut installed_file = PinnedSnapshotFile::open(&installed)?;
     if fixed_immutable {
-        measure_fixed_snapshot_file(staged_file)?;
-        measure_fixed_snapshot_file(&installed_file)?;
+        staged_file.admit_fixed_integrity(snapshot_integrity, limits.max_snapshot_bytes())?;
+        installed_file.admit_fixed_integrity(snapshot_integrity, limits.max_snapshot_bytes())?;
     }
     let expected = verify_pinned_snapshot_file(staged_file, limits.max_snapshot_bytes(), None)?;
     let observed =
@@ -7027,12 +7057,13 @@ fn verify_snapshot_matches_staged(
     installed_path: &Path,
     limits: RecoveryLimits,
     fixed_immutable: bool,
+    snapshot_integrity: SnapshotIntegrityPolicy,
 ) -> Result<(), RecoveryError> {
     staged_file.verify_path_identity(staged_snapshot)?;
     installed_file.verify_path_identity(installed_path)?;
     if fixed_immutable {
-        measure_fixed_snapshot_file(staged_file)?;
-        measure_fixed_snapshot_file(installed_file)?;
+        staged_file.admit_fixed_integrity(snapshot_integrity, limits.max_snapshot_bytes())?;
+        installed_file.admit_fixed_integrity(snapshot_integrity, limits.max_snapshot_bytes())?;
     }
     let expected = verify_pinned_snapshot_file(staged_file, limits.max_snapshot_bytes(), None)?;
     let observed = verify_pinned_snapshot_file(installed_file, limits.max_snapshot_bytes(), None)?;
@@ -7064,6 +7095,7 @@ fn target_matches_staged_recovery(
             identity: plan.body.identity,
             expected_members: &plan.body.expected_members,
             limits,
+            snapshot_integrity: plan.body.snapshot_integrity,
         },
         canonical_replica_paths(target, false)?,
         target_database,
@@ -7108,6 +7140,7 @@ fn verify_target_installed_from_pinned(
             identity: plan.body.identity,
             expected_members: &plan.body.expected_members,
             limits,
+            snapshot_integrity: plan.body.snapshot_integrity,
         },
         paths,
         database,
@@ -7196,6 +7229,7 @@ fn verify_target_finalized_from_pinned(
             identity: plan.body.identity,
             expected_members: &plan.body.expected_members,
             limits,
+            snapshot_integrity: plan.body.snapshot_integrity,
         },
         paths,
         database,
@@ -8477,6 +8511,7 @@ pub(super) fn record_rejoined_with_terminal_proof(
                 identity: plan.body.identity,
                 expected_members: &plan.body.expected_members,
                 limits,
+                snapshot_integrity: plan.body.snapshot_integrity,
             },
             canonical_replica_paths(latch.replica, false)?,
             &latch.database,
@@ -8700,6 +8735,7 @@ fn prepare_test_workflow_inner(
         plan.body.identity,
         &target_paths.snapshots,
         RecoveryLimits::default(),
+        plan.body.snapshot_integrity,
         None,
     )?
     .ok_or(RecoveryError::InvalidRequest)?;
@@ -8728,6 +8764,7 @@ fn prepare_test_workflow_inner(
             version: WORKFLOW_VERSION,
             plan_digest: plan.plan_digest,
             limits: WorkflowLimits::from_recovery(RecoveryLimits::default()),
+            snapshot_integrity: plan.body.snapshot_integrity,
             source_branch_digest: plan.body.source_branch_digest,
             source_authority_profile: plan.body.source_authority_profile,
             source_fixed_placement_policy: plan.body.source_fixed_placement_policy,
@@ -9083,6 +9120,7 @@ fn read_workflow(
     let encoded = serde_json::to_vec(&sealed.record).map_err(|_| RecoveryError::BackupCorrupt)?;
     verify_mac(key, WORKFLOW_MAC_DOMAIN, &[&encoded], sealed.mac)?;
     if sealed.record.version != WORKFLOW_VERSION
+        || sealed.record.snapshot_integrity != plan.body.snapshot_integrity
         || sealed.record.plan_digest != plan.plan_digest
         || sealed.record.source_branch_digest != plan.body.source_branch_digest
         || sealed.record.source_authority_profile != plan.body.source_authority_profile
@@ -9140,13 +9178,13 @@ struct SnapshotReference {
 /// checkpoint copy cannot accept a byte-identical replacement merely because
 /// its envelope checksum still agrees with SQLite metadata.
 fn current_snapshot_identity(
-    key: &RecoveryIntegrityKey,
+    input: &InspectionInput<'_>,
     conn: &Connection,
     identity: SessionConsensusIdentity,
     snapshot_dir: &Path,
     fixed_immutable: bool,
-    limits: RecoveryLimits,
     pinned_snapshot: Option<&mut PinnedSnapshotFile>,
+    budget: &InspectionBudget,
 ) -> Result<Option<RecoveryDigest>, RecoveryError> {
     let snapshot = consensus::read_current_snapshot_sync(conn, identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
@@ -9157,50 +9195,52 @@ fn current_snapshot_identity(
     let path = snapshot_dir.join(file_name);
     match pinned_snapshot {
         Some(file) => current_snapshot_identity_from_pinned(
-            key,
+            input,
             file,
             &path,
             fixed_immutable,
-            checksum,
-            length,
-            limits,
+            (checksum, length),
+            budget,
         ),
         None => {
             let mut file = PinnedSnapshotFile::open(&path)?;
             current_snapshot_identity_from_pinned(
-                key,
+                input,
                 &mut file,
                 &path,
                 fixed_immutable,
-                checksum,
-                length,
-                limits,
+                (checksum, length),
+                budget,
             )
         }
     }
 }
 
 fn current_snapshot_identity_from_pinned(
-    key: &RecoveryIntegrityKey,
+    input: &InspectionInput<'_>,
     file: &mut PinnedSnapshotFile,
     path: &Path,
     fixed_immutable: bool,
-    checksum: [u8; 32],
-    length: u64,
-    limits: RecoveryLimits,
+    expected: ([u8; 32], u64),
+    budget: &InspectionBudget,
 ) -> Result<Option<RecoveryDigest>, RecoveryError> {
     // A supplied descriptor must name the snapshot selected by the exact
     // pinned database.  This path resolution is only an equality assertion,
     // never an authority-bearing open.
     file.verify_path_identity(path)?;
     if fixed_immutable {
-        measure_fixed_snapshot_file(file)?;
+        file.admit_fixed_integrity_with_budget(
+            input.snapshot_integrity,
+            input.limits.max_snapshot_bytes(),
+            Some(budget),
+        )?;
     }
-    let observed = verify_pinned_snapshot_file(file, limits.max_snapshot_bytes(), None)?;
-    if observed != (checksum, length) {
+    let observed =
+        verify_pinned_snapshot_file(file, input.limits.max_snapshot_bytes(), Some(budget))?;
+    if observed != expected {
         return Err(RecoveryError::CorruptReplica);
     }
-    let snapshot_identity = pinned_file_identity(key, file)?;
+    let snapshot_identity = pinned_file_identity(input.key, file)?;
     file.verify_path_identity(path)?;
     Ok(Some(snapshot_identity))
 }
@@ -9210,6 +9250,8 @@ fn current_snapshot_identity_from_pinned(
 /// whose fs-verity state, envelope and inode identity are trusted.
 struct PinnedSnapshotFile {
     file: File,
+    #[cfg(target_os = "linux")]
+    portable: Option<std::sync::Arc<crate::consensus::verified_snapshot::PortableSnapshot>>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -9468,6 +9510,7 @@ pub(super) fn acquire_finalization_pins<'a>(
             plan.body.identity,
             &paths.snapshots,
             limits,
+            plan.body.snapshot_integrity,
             None,
         )
         .map_err(|_| RecoveryError::BackupCorrupt)?;
@@ -9571,6 +9614,7 @@ pub(super) fn acquire_finalization_pins<'a>(
                 plan.body.identity,
                 &paths.snapshots,
                 limits,
+                plan.body.snapshot_integrity,
                 None,
             )? {
                 Some(mut snapshot) => {
@@ -9602,7 +9646,10 @@ pub(super) fn acquire_finalization_pins<'a>(
                     let mut file = PinnedSnapshotFile::open(&path)
                         .map_err(|_| RecoveryError::BackupCorrupt)?;
                     if fixed_immutable {
-                        measure_fixed_snapshot_file(&file)?;
+                        file.admit_fixed_integrity(
+                            plan.body.snapshot_integrity,
+                            limits.max_snapshot_bytes(),
+                        )?;
                     }
                     let digest = digest_pinned_file(&mut file, limits.max_snapshot_bytes())?.0;
                     let identity = pinned_file_identity(key, &file)?;
@@ -9811,6 +9858,7 @@ fn capture_legacy_bootstrap_predecessor(
                 identity: plan.body.identity,
                 expected_members: &plan.body.expected_members,
                 limits,
+                snapshot_integrity: plan.body.snapshot_integrity,
             },
             canonical_replica_paths(pin.replica, false)?,
             &pin.database,
@@ -10046,7 +10094,10 @@ fn classify_finalization_pins_with_phase(
         ) {
             (Some(path), Some(file), Some(identity), digest) => {
                 if latch.fixed_immutable {
-                    measure_fixed_snapshot_file(file)?;
+                    file.admit_fixed_integrity(
+                        plan.body.snapshot_integrity,
+                        limits.max_snapshot_bytes(),
+                    )?;
                 }
                 let observed_digest = digest_pinned_file(file, limits.max_snapshot_bytes())?.0;
                 if pinned_file_identity(key, file)? != identity
@@ -10079,6 +10130,7 @@ fn classify_finalization_pins_with_phase(
                     identity: plan.body.identity,
                     expected_members: &plan.body.expected_members,
                     limits,
+                    snapshot_integrity: plan.body.snapshot_integrity,
                 },
                 canonical_replica_paths(latch.replica, false)?,
                 &latch.database,
@@ -10157,7 +10209,10 @@ fn classify_finalization_pins_with_phase(
         ) {
             (Some(path), Some(file), Some(identity), Some(digest)) => {
                 if target.fixed_immutable {
-                    measure_fixed_snapshot_file(file)?;
+                    file.admit_fixed_integrity(
+                        plan.body.snapshot_integrity,
+                        limits.max_snapshot_bytes(),
+                    )?;
                 }
                 if digest_pinned_file(file, limits.max_snapshot_bytes())?.0 != digest
                     || pinned_file_identity(key, file)? != identity
@@ -10183,6 +10238,7 @@ fn classify_finalization_pins_with_phase(
                 identity: plan.body.identity,
                 expected_members: &plan.body.expected_members,
                 limits,
+                snapshot_integrity: plan.body.snapshot_integrity,
             },
             canonical_replica_paths(target.replica, false)?,
             &target.database,
@@ -10292,6 +10348,7 @@ fn current_snapshot_reference_from_pinned(
     identity: SessionConsensusIdentity,
     snapshot_dir: &Path,
     limits: RecoveryLimits,
+    snapshot_integrity: SnapshotIntegrityPolicy,
     pinned_snapshot: Option<PinnedSnapshotFile>,
 ) -> Result<Option<SnapshotReference>, RecoveryError> {
     let conn = open_read_only_pinned(database)?;
@@ -10319,7 +10376,7 @@ fn current_snapshot_reference_from_pinned(
         .unwrap_or(PinnedSnapshotFile::open(&path).map_err(|_| RecoveryError::CorruptReplica)?);
     let fixed_immutable = fixed_immutable_profile(&conn)?;
     if fixed_immutable {
-        measure_fixed_snapshot_file(&file)?;
+        file.admit_fixed_integrity(snapshot_integrity, limits.max_snapshot_bytes())?;
     }
     let (checksum, length) =
         verify_pinned_snapshot_file(&mut file, limits.max_snapshot_bytes(), None)?;
@@ -10473,6 +10530,9 @@ fn open_authenticated_staged_snapshot(
     };
     validate_snapshot_name(name)?;
     let mut file = PinnedSnapshotFile::open(staged_snapshot)?;
+    if workflow.source_authority_profile == RecoveryAuthorityProfile::FixedImmutable {
+        file.admit_fixed_integrity(workflow.snapshot_integrity, limits.max_snapshot_bytes())?;
+    }
     let digest = digest_pinned_file(&mut file, limits.max_snapshot_bytes())?.0;
     let identity = pinned_file_identity(key, &file)?;
     file.verify_path_identity(staged_snapshot)?;
@@ -10485,6 +10545,87 @@ fn open_authenticated_staged_snapshot(
 }
 
 impl PinnedSnapshotFile {
+    /// Capture once; later admissions re-use the original process-owned
+    /// image. Recapturing here would let a later write replace its authority.
+    fn admit_fixed_integrity(
+        &mut self,
+        policy: SnapshotIntegrityPolicy,
+        maximum: u64,
+    ) -> Result<(), RecoveryError> {
+        self.admit_fixed_integrity_with_budget(policy, maximum, None)
+    }
+
+    fn admit_fixed_integrity_with_budget(
+        &mut self,
+        policy: SnapshotIntegrityPolicy,
+        maximum: u64,
+        budget: Option<&InspectionBudget>,
+    ) -> Result<(), RecoveryError> {
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        match policy {
+            SnapshotIntegrityPolicy::FsVerity => measure_fixed_snapshot_file(self),
+            SnapshotIntegrityPolicy::PortableVerified => {
+                #[cfg(target_os = "linux")]
+                {
+                    if self.portable.is_none() {
+                        self.portable = Some(
+                            crate::consensus::verified_snapshot::PortableSnapshot::capture_checked(
+                                self.file
+                                    .try_clone()
+                                    .map_err(|_| RecoveryError::FileOperationFailed)?,
+                                maximum,
+                                || {
+                                    if let Some(budget) = budget {
+                                        budget.check().map_err(|_| {
+                                            std::io::Error::new(
+                                                std::io::ErrorKind::TimedOut,
+                                                "snapshot inspection deadline exceeded",
+                                            )
+                                        })?;
+                                    }
+                                    Ok(())
+                                },
+                            )
+                            .map_err(|error| {
+                                if error.kind() == std::io::ErrorKind::TimedOut {
+                                    RecoveryError::WorkLimitExceeded
+                                } else {
+                                    RecoveryError::CorruptReplica
+                                }
+                            })?,
+                        );
+                    }
+                    self.portable
+                        .as_ref()
+                        .ok_or(RecoveryError::CorruptReplica)?
+                        .source
+                        .validate()
+                        .map_err(|_| RecoveryError::CorruptReplica)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = maximum;
+                    Err(RecoveryError::InvalidRequest)
+                }
+            }
+        }
+    }
+
+    fn reader(&self) -> Result<crate::consensus::snapshot::PinnedSnapshotReader, RecoveryError> {
+        #[cfg(target_os = "linux")]
+        if let Some(portable) = &self.portable {
+            return Ok(crate::consensus::snapshot::PinnedSnapshotReader::Portable(
+                portable.source.reader(),
+            ));
+        }
+        self.file
+            .try_clone()
+            .map(crate::consensus::snapshot::PinnedSnapshotReader::File)
+            .map_err(|_| RecoveryError::FileOperationFailed)
+    }
+
     fn open(path: &Path) -> Result<Self, RecoveryError> {
         let file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
         let metadata = file.metadata().map_err(|_| RecoveryError::CorruptReplica)?;
@@ -10498,6 +10639,8 @@ impl PinnedSnapshotFile {
                 file,
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                #[cfg(target_os = "linux")]
+                portable: None,
             })
         }
         #[cfg(not(unix))]
@@ -10532,6 +10675,8 @@ impl PinnedSnapshotFile {
                 file,
                 device: self.device,
                 inode: self.inode,
+                #[cfg(target_os = "linux")]
+                portable: self.portable.clone(),
             })
         }
         #[cfg(not(unix))]
@@ -10612,12 +10757,13 @@ fn digest_pinned_file(
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max {
         return Err(RecoveryError::BackupCorrupt);
     }
-    file.file
+    let mut reader = file.reader()?;
+    reader
         .seek(SeekFrom::Start(0))
         .map_err(|_| RecoveryError::BackupCorrupt)?;
     let mut hasher = Sha256::new();
     hasher.update(FILE_DIGEST_DOMAIN);
-    let length = hash_reader(&mut file.file, &mut hasher, max, None)?;
+    let length = hash_reader(&mut reader, &mut hasher, max, None)?;
     if length != metadata.len() {
         return Err(RecoveryError::BackupCorrupt);
     }
@@ -10680,6 +10826,7 @@ fn copy_snapshot_file_bounded(
     destination: &Path,
     max: u64,
     fixed_immutable: bool,
+    snapshot_integrity: SnapshotIntegrityPolicy,
 ) -> Result<PinnedSnapshotFile, RecoveryError> {
     use std::io::{Seek, SeekFrom};
 
@@ -10690,16 +10837,19 @@ fn copy_snapshot_file_bounded(
     if !source_metadata.is_file() || source_metadata.len() == 0 || source_metadata.len() > max {
         return Err(RecoveryError::WorkLimitExceeded);
     }
-    source
-        .file
+    if fixed_immutable {
+        source.admit_fixed_integrity(snapshot_integrity, max)?;
+    }
+    let expected = verify_pinned_snapshot_file(source, max, None)?;
+    let mut reader = source.reader()?;
+    reader
         .seek(SeekFrom::Start(0))
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     let mut writer = private_create_new(destination)?;
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut copied = 0_u64;
     loop {
-        let read = source
-            .file
+        let read = reader
             .read(&mut buffer)
             .map_err(|_| RecoveryError::FileOperationFailed)?;
         if read == 0 {
@@ -10737,10 +10887,17 @@ fn copy_snapshot_file_bounded(
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     drop(writer);
     if fixed_immutable {
-        seal_fixed_snapshot_file(&destination_file)?;
+        if snapshot_integrity == SnapshotIntegrityPolicy::FsVerity {
+            seal_fixed_snapshot_file(&destination_file)?;
+        }
+        destination_file.admit_fixed_integrity(snapshot_integrity, max)?;
     }
-    verify_pinned_snapshot_file(&mut destination_file, max, None)
-        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    if verify_pinned_snapshot_file(&mut destination_file, max, None)
+        .map_err(|_| RecoveryError::FileOperationFailed)?
+        != expected
+    {
+        return Err(RecoveryError::SourceChanged);
+    }
     destination_file
         .verify_path_identity(destination)
         .map_err(|_| RecoveryError::FileOperationFailed)?;
@@ -10766,8 +10923,11 @@ fn verify_pinned_snapshot_file(
     if let Some(budget) = budget {
         budget.check()?;
     }
-    let file = &mut pinned.file;
-    let metadata = file.metadata().map_err(|_| RecoveryError::CorruptReplica)?;
+    let metadata = pinned
+        .file
+        .metadata()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let mut file = pinned.reader()?;
     if !metadata.is_file()
         || metadata.len() <= SNAPSHOT_ENVELOPE_FOOTER_BYTES
         || metadata.len() > max_bytes
@@ -10999,9 +11159,14 @@ fn open_read_only_pinned(file: &PinnedSnapshotFile) -> Result<Connection, Recove
     let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.file.as_raw_fd()));
     #[cfg(test)]
     let descriptor_path = pinned_sqlite_open_path_for_test(descriptor_path);
+    let descriptor_path = file.portable.as_ref().map_or(descriptor_path, |portable| {
+        PathBuf::from(portable.sqlite_uri())
+    });
     let conn = Connection::open_with_flags(
         descriptor_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|_| RecoveryError::DatabaseUnavailable)?;
     #[cfg(test)]
@@ -12231,15 +12396,25 @@ mod fixed_snapshot_copy_tests {
             Err(error) => panic!("unexpected source seal error: {error:?}"),
         }
         let mut source_file = PinnedSnapshotFile::open(&source).expect("pin fixed source");
-        let _fixed_file =
-            copy_snapshot_file_bounded(&mut source_file, &fixed_destination, 1024, true)
-                .expect("copy and seal fixed recovery artifact");
+        let _fixed_file = copy_snapshot_file_bounded(
+            &mut source_file,
+            &fixed_destination,
+            1024,
+            true,
+            SnapshotIntegrityPolicy::FsVerity,
+        )
+        .expect("copy and seal fixed recovery artifact");
         measure_fixed_snapshot(&fixed_destination)
             .expect("fixed recovery copy has a kernel seal before use");
 
-        let _dynamic_file =
-            copy_snapshot_file_bounded(&mut source_file, &dynamic_destination, 1024, false)
-                .expect("copy dynamic recovery artifact");
+        let _dynamic_file = copy_snapshot_file_bounded(
+            &mut source_file,
+            &dynamic_destination,
+            1024,
+            false,
+            SnapshotIntegrityPolicy::FsVerity,
+        )
+        .expect("copy dynamic recovery artifact");
         assert!(
             measure_fixed_snapshot(&dynamic_destination).is_err(),
             "dynamic recovery copy must not be described as immutable"
@@ -12359,8 +12534,14 @@ mod fixed_snapshot_copy_tests {
         let replacement = directory.path().join("replacement.opc");
         std::fs::write(&source, snapshot_envelope(b"original")).expect("write source");
         let mut source_file = PinnedSnapshotFile::open(&source).expect("pin source");
-        let destination = copy_snapshot_file_bounded(&mut source_file, &temporary, 1024, false)
-            .expect("copy pinned destination");
+        let destination = copy_snapshot_file_bounded(
+            &mut source_file,
+            &temporary,
+            1024,
+            false,
+            SnapshotIntegrityPolicy::FsVerity,
+        )
+        .expect("copy pinned destination");
         std::fs::rename(&temporary, &promoted).expect("promote destination");
         destination
             .verify_path_identity(&promoted)
