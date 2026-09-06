@@ -474,7 +474,7 @@ async fn workload_cleanup_excludes_live_writer_and_preserves_neighbor_scope(
     let _serial = PRIVILEGED_TEST_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let _net = TestNet::provision();
+    let net = TestNet::provision();
     let first = WorkloadTestScope::new();
     let neighbor = WorkloadTestScope::new();
     let owner = EbpfGtpuDataplaneBackend::for_workload(first.scope);
@@ -489,27 +489,44 @@ async fn workload_cleanup_excludes_live_writer_and_preserves_neighbor_scope(
         .await
         .expect("populate scoped owner");
 
-    let neighbor_owner = EbpfGtpuDataplaneBackend::for_workload(neighbor.scope);
-    let mut neighbor_request = CreateGtpDeviceRequest::new("ue0");
-    neighbor_request.bind_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 1));
-    let neighbor_device = neighbor_owner
-        .create_device(neighbor_request)
-        .await
-        .expect("create neighboring scope");
+    // Co-located workloads may use the same interface name in separate netns.
+    // Their programs remain globally visible while their pin scopes differ.
+    let neighbor_scope = neighbor.scope;
+    let (neighbor_owner, neighbor_device, neighbor_filters) = in_netns(&net.auth_ns, move || {
+        run("ip", &["link", "add", "s2bu", "type", "dummy"]);
+        run("ip", &["link", "set", "s2bu", "up"]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let owner = EbpfGtpuDataplaneBackend::for_workload(neighbor_scope);
+            let mut request = CreateGtpDeviceRequest::new("s2bu");
+            request.bind_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 1));
+            let device = owner
+                .create_device(request)
+                .await
+                .expect("create neighboring scope in separate netns");
+            let filters = [tc_filters("ingress"), tc_filters("egress")];
+            (owner, device, filters)
+        })
+    });
     let neighbor_pin = neighbor
         .scope
         .bpffs_pin_root()
-        .join("ue0")
+        .join("s2bu")
         .join(MAP_UPLINK_FAR);
     let neighbor_id = MapInfo::from_pin(&neighbor_pin)?.id();
     let pin_dir = first.scope.bpffs_pin_root().join("s2bu");
     let before = pin_directory_listing(&pin_dir);
     let filters_before = [tc_filters("ingress"), tc_filters("egress")];
     let replacement = EbpfGtpuDataplaneBackend::for_workload(first.scope);
-    assert!(replacement
-        .reset_workload_graph(first.scope, "s2bu")
-        .await
-        .is_err());
+    assert!(matches!(
+        replacement.reset_workload_graph(first.scope, "s2bu").await,
+        Err(opc_gtpu_dataplane::GtpuError::RetryRequired {
+            operation: "ebpf_workload_cleanup_writer_busy",
+        })
+    ));
     assert_eq!(pin_directory_listing(&pin_dir), before);
     assert_eq!(
         [tc_filters("ingress"), tc_filters("egress")],
@@ -568,6 +585,13 @@ async fn workload_cleanup_excludes_live_writer_and_preserves_neighbor_scope(
     }
     assert!(!pin_dir.exists());
     assert_eq!(MapInfo::from_pin(&neighbor_pin)?.id(), neighbor_id);
+    assert_eq!(
+        in_netns(&net.auth_ns, || [
+            tc_filters("ingress"),
+            tc_filters("egress")
+        ]),
+        neighbor_filters
+    );
     let fresh = replacement
         .create_device(request)
         .await
@@ -584,14 +608,22 @@ async fn workload_cleanup_excludes_live_writer_and_preserves_neighbor_scope(
         .reset_workload_graph(first.scope, "s2bu")
         .await
         .expect("repeat empty cleanup");
-    neighbor_owner
-        .remove_device(&neighbor_device)
-        .await
-        .expect("remove neighbor graph");
-    neighbor_owner
-        .reset_workload_graph(neighbor.scope, "ue0")
-        .await
-        .expect("verify neighbor absence");
+    in_netns(&net.auth_ns, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            neighbor_owner
+                .remove_device(&neighbor_device)
+                .await
+                .expect("remove neighbor graph");
+            neighbor_owner
+                .reset_workload_graph(neighbor_scope, "s2bu")
+                .await
+                .expect("verify neighbor absence");
+        });
+    });
     Ok(())
 }
 

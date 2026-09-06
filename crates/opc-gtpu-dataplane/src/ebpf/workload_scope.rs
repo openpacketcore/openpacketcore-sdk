@@ -65,8 +65,9 @@ impl EbpfGtpuDataplaneBackend {
     /// writer and operation locks, verifies the exact local hooks and map
     /// references, detaches those hooks, and unpins only recognized objects in
     /// this scope. Only the unbound interface-name IPv4 graph is supported;
-    /// grouped selector namespaces retain their separate lifecycle. It accepts partial pin sets left by interrupted creation
-    /// or cleanup. Missing objects are success on a subsequent call.
+    /// grouped selector namespaces retain their separate lifecycle. It accepts
+    /// partial pin sets left by interrupted creation or cleanup. Missing
+    /// objects are success on a subsequent call.
     ///
     /// This does not preserve sessions. It never attaches forwarding programs,
     /// enters another network namespace, or cleans another node. Empty writer
@@ -77,7 +78,8 @@ impl EbpfGtpuDataplaneBackend {
     /// Refuses a backend configured for a different or shared pin root, any
     /// locally managed device, an active writer, foreign objects or program
     /// references, and external retained-graph recovery authority. A failed
-    /// cleanup may have detached hooks or removed some pins; retry this method
+    /// cleanup may have detached hooks or removed some pins. A busy writer lock
+    /// or remaining program references returns `RetryRequired`; retry this method
     /// before ordinary attachment. An inspection failure never authorizes
     /// deletion. Callers must not serve when cleanup fails.
     pub async fn reset_workload_graph(

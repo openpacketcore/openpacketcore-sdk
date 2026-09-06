@@ -20,10 +20,18 @@ pub(super) fn reset(
     {
         return Err(GtpuError::AlreadyExists);
     }
+    let writer_busy = |error| match error {
+        GtpuError::AlreadyExists => GtpuError::RetryRequired {
+            operation: "ebpf_workload_cleanup_writer_busy",
+        },
+        error => error,
+    };
     let exclusion =
-        AyaGtpuRuntime::acquire_optional_existing_historical_25_ordinary_exclusion(pin_dir)?;
+        AyaGtpuRuntime::acquire_optional_existing_historical_25_ordinary_exclusion(pin_dir)
+            .map_err(writer_busy)?;
     let ownership =
-        AyaGtpuRuntime::acquire_reconciler_ownership_inner(pin_dir, None, true, exclusion)?;
+        AyaGtpuRuntime::acquire_reconciler_ownership_inner(pin_dir, None, true, exclusion)
+            .map_err(writer_busy)?;
     let lock = AyaGtpuRuntime::acquire_operation_control_lock(&ownership, OPERATION)?;
     let mut port = KernelCleanup {
         ownership,
