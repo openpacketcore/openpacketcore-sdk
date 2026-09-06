@@ -1470,6 +1470,14 @@ record.
 
 ## 12. Security and Privacy Analysis
 
+The optional `EbpfWorkloadScope` lifecycle applies only to unbound IPv4
+interface graphs outside this RFC's grouped selector namespace protocol.
+`reset_workload_graph` MUST refuse a namespace containing selector-authority
+or decommission markers, including an otherwise empty graph. It MUST NOT
+remove either marker or infer a fresh durable selector history from graph
+absence. Its local writer lock and repeatable pin inventory are not substitutes
+for this RFC's permanent protected record or authority-bearing migration.
+
 | Threat | Required mitigation |
 | :--- | :--- |
 | Split brain or concurrent claimant | One complete ledger CAS, monotonic generation, host-global control lock, and exact readback; disagreement poisons or fails closed. |

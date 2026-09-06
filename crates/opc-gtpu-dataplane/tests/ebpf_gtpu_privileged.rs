@@ -431,6 +431,249 @@ struct TestNet {
     nft_table: String,
 }
 
+struct WorkloadTestScope {
+    scope: opc_gtpu_dataplane::EbpfWorkloadScope,
+    identity: TestOwnedDirectoryIdentity,
+}
+
+impl WorkloadTestScope {
+    fn new() -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.workload-cleanup-test.v1");
+        digest.update(std::process::id().to_be_bytes());
+        digest.update(
+            PRIVILEGED_TEST_SEQ
+                .fetch_add(1, Ordering::Relaxed)
+                .to_be_bytes(),
+        );
+        let scope = opc_gtpu_dataplane::EbpfWorkloadScope::new(digest.finalize().into())
+            .expect("nonzero test scope");
+        let identity = create_test_owned_private_directory_tree(
+            &scope.bpffs_pin_root(),
+            "create isolated workload test scope",
+        );
+        Self { scope, identity }
+    }
+}
+
+impl Drop for WorkloadTestScope {
+    fn drop(&mut self) {
+        assert!(remove_owned_test_directory(
+            &self.scope.bpffs_pin_root(),
+            self.identity
+        ));
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn workload_cleanup_excludes_live_writer_and_preserves_neighbor_scope(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _net = TestNet::provision();
+    let first = WorkloadTestScope::new();
+    let neighbor = WorkloadTestScope::new();
+    let owner = EbpfGtpuDataplaneBackend::for_workload(first.scope);
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner
+        .create_device(request.clone())
+        .await
+        .expect("create scoped owner");
+    owner
+        .install_pdp_context_classified(session_context(device.ifindex))
+        .await
+        .expect("populate scoped owner");
+
+    let neighbor_owner = EbpfGtpuDataplaneBackend::for_workload(neighbor.scope);
+    let mut neighbor_request = CreateGtpDeviceRequest::new("ue0");
+    neighbor_request.bind_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 1));
+    let neighbor_device = neighbor_owner
+        .create_device(neighbor_request)
+        .await
+        .expect("create neighboring scope");
+    let neighbor_pin = neighbor
+        .scope
+        .bpffs_pin_root()
+        .join("ue0")
+        .join(MAP_UPLINK_FAR);
+    let neighbor_id = MapInfo::from_pin(&neighbor_pin)?.id();
+    let pin_dir = first.scope.bpffs_pin_root().join("s2bu");
+    let before = pin_directory_listing(&pin_dir);
+    let filters_before = [tc_filters("ingress"), tc_filters("egress")];
+    let replacement = EbpfGtpuDataplaneBackend::for_workload(first.scope);
+    assert!(replacement
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&pin_dir), before);
+    assert_eq!(
+        [tc_filters("ingress"), tc_filters("egress")],
+        filters_before
+    );
+    assert!(EbpfGtpuDataplaneBackend::new()
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .is_err());
+
+    // A process restart retains its netns. Cleanup must fence the old hooks
+    // before deleting even a populated graph, then allow fresh attachment.
+    drop(owner);
+    let control_root = first.scope.bpffs_pin_root().join("GTPU_RECONCILER_LOCKS");
+    let control_name = fs::read_dir(&control_root)?
+        .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_owned())
+        .find_map(|name| name.strip_suffix("-operation-v1").map(str::to_owned))
+        .expect("current namespace operation lock");
+    let authority_marker = control_root
+        .join(control_name)
+        .join(format!("SELECTOR_AUTHORITY_V1_{}", "a".repeat(64)));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&authority_marker)?;
+    assert!(replacement
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .is_err());
+    assert!(authority_marker.is_dir());
+    assert_eq!(pin_directory_listing(&pin_dir), before);
+    assert_eq!(
+        [tc_filters("ingress"), tc_filters("egress")],
+        filters_before
+    );
+    fs::remove_dir(authority_marker)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match replacement.reset_workload_graph(first.scope, "s2bu").await {
+            Ok(()) => break,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_workload_cleanup_program_references",
+            }) => {
+                // Kernel program destruction may lag the last tc detach.
+                // The graph must stay pinned until that reference is gone.
+                assert!(!tc_filters("ingress").contains("opc_gtpu"));
+                assert!(!tc_filters("egress").contains("opc_gtpu"));
+                assert_eq!(pin_directory_listing(&pin_dir), before);
+                assert!(
+                    Instant::now() < deadline,
+                    "detached programs must eventually retire"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("same-namespace cleanup failed: {error:?}"),
+        }
+    }
+    assert!(!pin_dir.exists());
+    assert_eq!(MapInfo::from_pin(&neighbor_pin)?.id(), neighbor_id);
+    let fresh = replacement
+        .create_device(request)
+        .await
+        .expect("create fresh graph after reset");
+    replacement
+        .remove_device(&fresh)
+        .await
+        .expect("orderly graph teardown");
+    replacement
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .expect("verify graph absence after teardown");
+    replacement
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .expect("repeat empty cleanup");
+    neighbor_owner
+        .remove_device(&neighbor_device)
+        .await
+        .expect("remove neighbor graph");
+    neighbor_owner
+        .reset_workload_graph(neighbor.scope, "ue0")
+        .await
+        .expect("verify neighbor absence");
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn workload_cleanup_refuses_old_netns_and_foreign_pins_then_reclaims_partial_graph(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let net = TestNet::provision();
+    let scoped = WorkloadTestScope::new();
+    run("ip", &["link", "set", "s2bu", "netns", &net.pgw_ns]);
+    let scope = scoped.scope;
+    in_netns(&net.pgw_ns, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let owner = EbpfGtpuDataplaneBackend::for_workload(scope);
+            let mut request = CreateGtpDeviceRequest::new("s2bu");
+            request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+            owner
+                .create_device(request)
+                .await
+                .expect("create graph in old network namespace");
+            drop(owner);
+        });
+    });
+    let pin_dir = scoped.scope.bpffs_pin_root().join("s2bu");
+    let before = pin_directory_listing(&pin_dir);
+    let replacement = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+
+    // Interface absence in the new namespace cannot prove the old pod dead.
+    assert!(replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&pin_dir), before);
+    run("ip", &["-n", &net.pgw_ns, "link", "del", "s2bu"]);
+
+    // Reject an unknown leaf before changing any recognized pins.
+    let foreign = pin_dir.join("FOREIGN_PIN");
+    MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR))?.pin(&foreign)?;
+    let foreign_before = pin_directory_listing(&pin_dir);
+    assert!(replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&pin_dir), foreign_before);
+    fs::remove_file(foreign)?;
+
+    let original_far = MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR))?;
+    fs::remove_file(pin_dir.join(MAP_UPLINK_FAR))?;
+    MapData::from_pin(pin_dir.join(MAP_CONFIG))?.pin(pin_dir.join(MAP_UPLINK_FAR))?;
+    let wrong_abi_before = pin_directory_listing(&pin_dir);
+    assert!(replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&pin_dir), wrong_abi_before);
+    fs::remove_file(pin_dir.join(MAP_UPLINK_FAR))?;
+    original_far.pin(pin_dir.join(MAP_UPLINK_FAR))?;
+
+    // A killed cleanup can leave an arbitrary recognized subset. The next
+    // startup must inventory it afresh, including when its interface is gone.
+    for name in [MAP_UPLINK_FAR, MAP_UPLINK_DSCP, MAP_CONFIG] {
+        fs::remove_file(pin_dir.join(name))?;
+    }
+    replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    assert!(!pin_dir.exists());
+    replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TestOwnedDirectoryIdentity {
     dev: u64,
