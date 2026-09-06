@@ -1,6 +1,6 @@
 //! Locally owned workload state with repeatable teardown.
 
-use super::{EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig};
+use super::EbpfGtpuDataplaneBackend;
 use crate::GtpuError;
 use std::{fmt, path::PathBuf};
 
@@ -52,9 +52,9 @@ impl EbpfGtpuDataplaneBackend {
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn for_workload(scope: EbpfWorkloadScope) -> Self {
-        Self::with_config(EbpfGtpuDataplaneBackendConfig {
+        Self::with_config(super::EbpfGtpuDataplaneBackendConfig {
             bpffs_pin_root: scope.bpffs_pin_root(),
-            ..EbpfGtpuDataplaneBackendConfig::default()
+            ..super::EbpfGtpuDataplaneBackendConfig::default()
         })
     }
 
