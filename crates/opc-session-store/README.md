@@ -877,9 +877,11 @@ with their canonical JSON encoding. For the fixed batch shape, optionally
 inside one authority envelope, that byte comparison also proves the complete
 structural schema without parsing all payload byte arrays a second time.
 Other V2 shapes retain the generic duplicate-aware structural audit. Prepared
-SQLite statements cache query plans only: schema and exact log witnesses are
-read and authenticated again on every use. The immutable V2 protocol digest is
-computed once; every persisted receipt and request binding is still verified.
+SQLite statements cache query plans only: schema, complete membership authority,
+exact log witnesses, and restore revisions are read and authenticated again on
+every use. The existing statement cache capacity is unchanged. The immutable
+V2 protocol digest is computed once; every persisted receipt and request
+binding is still verified.
 
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal

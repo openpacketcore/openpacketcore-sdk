@@ -7578,7 +7578,7 @@ fn read_membership_history_sync(
         return Ok(Vec::new());
     }
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT storage_configuration_epoch, configuration_id, configuration_epoch, members_json, transition_id, transition_digest, transition_start_index, cutover_index FROM consensus_membership_history ORDER BY configuration_epoch ASC",
         )
         .map_err(db_error)?;
@@ -7641,7 +7641,7 @@ fn read_membership_terminal_history_sync(
         return Ok(Vec::new());
     }
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT storage_configuration_epoch, transition_id, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index FROM consensus_membership_terminal_history ORDER BY transition_start_index ASC, transition_id ASC",
         )
         .map_err(db_error)?;
@@ -7835,8 +7835,11 @@ pub(crate) fn read_membership_scope_sync(
         });
     }
     let row: MembershipScopeRow = conn
-        .query_row(
+        .prepare_cached(
             "SELECT storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, pending_transition_start_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, pending_learners_ready_index, terminal_learners_ready_index, current_bindings_json, desired_bindings_json, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index FROM consensus_membership_scope WHERE singleton = 1",
+        )
+        .map_err(db_error)?
+        .query_row(
             [],
             |row| {
                 Ok((
@@ -24905,7 +24908,9 @@ fn read_log_pointer(
         "SELECT configuration_epoch, term, log_index, log_id_json FROM {table} WHERE singleton = 1"
     );
     let row = conn
-        .query_row(&sql, [], |row| {
+        .prepare_cached(&sql)
+        .map_err(db_error)?
+        .query_row([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -56575,6 +56580,70 @@ LIMIT 20000;
                 }
             ))),
         );
+    }
+
+    #[test]
+    fn cached_authority_and_pointer_queries_read_current_rows() {
+        let backend = SqliteSessionBackend::in_memory().expect("query cache backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        for _ in 0..2 {
+            assert_eq!(
+                read_membership_scope_sync(&conn, identity())
+                    .expect("read and warm complete scope queries")
+                    .current_identity,
+                identity(),
+            );
+        }
+        for table in [
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_applied",
+        ] {
+            for _ in 0..2 {
+                assert_eq!(read_log_pointer(&conn, table, identity()).unwrap(), None);
+            }
+            set_test_log_pointer(&conn, table, &log_id(1));
+            assert_eq!(
+                read_log_pointer(&conn, table, identity()).unwrap(),
+                Some(log_id(1))
+            );
+            conn.execute(&format!("UPDATE {table} SET term = term + 1"), [])
+                .expect("mismatch the current term and encoded exact pointer");
+            assert_eq!(
+                read_log_pointer(&conn, table, identity())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+            );
+            conn.execute(&format!("DELETE FROM {table}"), [])
+                .expect("restore the absent pointer fixture");
+        }
+        read_membership_scope_sync(&conn, identity())
+            .expect("scope remains valid before corruption");
+        conn.execute(
+            "UPDATE consensus_membership_scope SET current_members_json = x'5b5d'",
+            [],
+        )
+        .expect("change the current authority row after warming its statement");
+        assert_eq!(
+            read_membership_scope_sync(&conn, identity())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let (epoch, revision, _) =
+            ops::read_restore_scan_state_sync(&conn).expect("read and warm restore revision");
+        for increment in 1..=2 {
+            ops::advance_restore_scan_revision_sync(&conn).expect("advance the fresh revision");
+            let (observed_epoch, observed_revision, _) = ops::read_restore_scan_state_sync(&conn)
+                .expect("read the current revision from a reused statement");
+            assert_eq!(
+                (observed_epoch, observed_revision),
+                (epoch, revision + increment)
+            );
+        }
     }
 
     #[test]

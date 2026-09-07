@@ -236,17 +236,17 @@ pub(crate) fn read_restore_scan_state_sync(
     conn: &Connection,
 ) -> Result<RestoreScanState, StoreError> {
     let (epoch, revision, cursor_key) = conn
-        .query_row(
+        .prepare_cached(
             "SELECT epoch, revision, cursor_key FROM restore_scan_state WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            },
         )
+        .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
         .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
     let epoch = epoch.try_into().map_err(|_| {
         StoreError::Serialization("session restore metadata is invalid".to_string())
@@ -271,10 +271,11 @@ pub(crate) fn advance_restore_scan_revision_sync(conn: &Connection) -> Result<()
         StoreError::BackendUnavailable("session restore metadata exhausted".into())
     })?;
     let changed = conn
-        .execute(
+        .prepare_cached(
             "UPDATE restore_scan_state SET revision = ?1 WHERE singleton = 1 AND revision = ?2",
-            params![sqlite_u64(next)?, sqlite_u64(revision)?],
         )
+        .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?
+        .execute(params![sqlite_u64(next)?, sqlite_u64(revision)?])
         .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
     if changed != 1 {
         return Err(StoreError::BackendUnavailable(
