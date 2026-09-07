@@ -22910,6 +22910,8 @@ fn validate_exact_fenced_transition_v2_log_json(
 /// exact structural schema, including when a V2 discriminant appears only in
 /// data an ordinary derived decoder would ignore.
 fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeConfig>> {
+    #[cfg(test)]
+    log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::FullDecode);
     if bytes.is_empty() || bytes.len() > SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES {
         return Err(invalid_data("session consensus log entry size is invalid"));
     }
@@ -22922,6 +22924,170 @@ fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeC
         validate_exact_fenced_transition_v2_log_json(bytes, &entry)?;
     }
     Ok(entry)
+}
+
+// These are optional retention limits, not durable-row acceptance limits.
+// A proof owns the original encoded allocation only; the first typed Entry
+// still drops at the highest-row helper's return. In particular, a byte-length
+// estimate must not stand in for the capacities hidden inside a decoded Entry.
+const LOG_ROW_REUSE_MAX_RAW_CAPACITY: usize = 32 * 1024;
+const LOG_ROW_REUSE_MAX_RETAINED_BYTES: usize = 64 * 1024;
+const LOG_ROW_REUSE_AGGREGATE_BYTES: usize = 4 * 1024 * 1024;
+
+struct LogRowRetentionBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl LogRowRetentionBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Option<LogRowRetentionPermit<'_>> {
+        let used = self.used.load(Ordering::Acquire);
+        let next = used.checked_add(bytes).filter(|next| *next <= self.limit)?;
+        // One attempt only. Even ordinary reservation contention uses the
+        // original decoder; this optional optimization never waits or retries.
+        self.used
+            .compare_exchange(used, next, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(LogRowRetentionPermit {
+            budget: self,
+            bytes,
+        })
+    }
+}
+
+struct LogRowRetentionPermit<'budget> {
+    budget: &'budget LogRowRetentionBudget,
+    bytes: usize,
+}
+
+impl Drop for LogRowRetentionPermit<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::Release);
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Refund);
+    }
+}
+
+static LOG_ROW_RETENTION_BUDGET: LogRowRetentionBudget =
+    LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+
+struct LogRowCanonicalProof<'budget> {
+    // Field destruction order is part of the resource contract: free these
+    // bytes before the final permit returns their capacity. No Clone or early
+    // permit refund is permitted, and no decoded value survives in this proof.
+    encoded: Vec<u8>,
+    epoch: i64,
+    term: i64,
+    index: i64,
+    #[cfg(test)]
+    _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+    _permit: LogRowRetentionPermit<'budget>,
+}
+
+struct LogRowReadReuse<'budget> {
+    budget: &'budget LogRowRetentionBudget,
+    proof: Option<LogRowCanonicalProof<'budget>>,
+    capture_attempted: bool,
+}
+
+impl<'budget> LogRowReadReuse<'budget> {
+    fn new(budget: &'budget LogRowRetentionBudget) -> Self {
+        Self {
+            budget,
+            proof: None,
+            capture_attempted: false,
+        }
+    }
+
+    fn retained_bytes(encoded_capacity: usize) -> Option<usize> {
+        if encoded_capacity > LOG_ROW_REUSE_MAX_RAW_CAPACITY {
+            return None;
+        }
+        // Account for the containing owner and a moved proof's fixed storage
+        // conservatively in addition to the actual Vec capacity. There are no
+        // copied bytes or retained decoded allocations.
+        encoded_capacity
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<LogRowCanonicalProof<'budget>>())
+            .filter(|bytes| *bytes <= LOG_ROW_REUSE_MAX_RETAINED_BYTES)
+    }
+
+    fn capture_after_full_audit(
+        &mut self,
+        epoch: i64,
+        term: i64,
+        index: i64,
+        encoded: Vec<u8>,
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) {
+        let first_attempt = !std::mem::replace(&mut self.capture_attempted, true);
+        let retained_bytes = Self::retained_bytes(encoded.capacity()).filter(|_| {
+            first_attempt && log_entry_has_exact_fenced_transition_v2_batch_shape(entry)
+        });
+        let Some(retained_bytes) = retained_bytes else {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Ineligible);
+            return;
+        };
+        let Some(permit) = self.budget.try_reserve(retained_bytes) else {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::BudgetFallback);
+            return;
+        };
+        self.proof = Some(LogRowCanonicalProof {
+            encoded,
+            epoch,
+            term,
+            index,
+            #[cfg(test)]
+            _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+            _permit: permit,
+        });
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Captured);
+    }
+
+    // Call only at the original decoder position, after field conversions and
+    // epoch validation. Exact fresh bytes prove only the prior pure canonical
+    // audit; typed decoding and every consumer-specific validation still run.
+    fn decode(
+        &mut self,
+        epoch: i64,
+        term: i64,
+        index: i64,
+        encoded: &[u8],
+    ) -> io::Result<Entry<SessionRaftTypeConfig>> {
+        if self
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.index == index)
+        {
+            let matches = self.proof.as_ref().is_some_and(|proof| {
+                proof.epoch == epoch
+                    && proof.term == term
+                    && proof.index == index
+                    && proof.encoded == encoded
+            });
+            // Consume on a same-index match or mismatch. Bytes are destroyed
+            // before their permit is refunded, and before the later decode.
+            drop(self.proof.take());
+            if matches {
+                #[cfg(test)]
+                log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Hit);
+                return decode_json(encoded);
+            }
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::TupleFallback);
+        }
+        decode_consensus_log_entry(encoded)
+    }
 }
 
 fn epoch_i64(identity: SessionConsensusIdentity) -> io::Result<i64> {
@@ -24815,6 +24981,18 @@ fn replay_unapplied_log_prefix_sync(
     before: u64,
     projection: &mut MembershipLogProjection,
 ) -> io::Result<Option<u64>> {
+    // Append keeps both of its original full highest-row audits and every
+    // prefix decode. Only a range-read owner may capture a canonical proof.
+    replay_unapplied_log_prefix_with_reuse_sync(conn, storage_identity, before, projection, None)
+}
+
+fn replay_unapplied_log_prefix_with_reuse_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    before: u64,
+    projection: &mut MembershipLogProjection,
+    mut reuse: Option<&mut LogRowReadReuse<'_>>,
+) -> io::Result<Option<u64>> {
     let applied_log_id = read_applied_sync(conn, storage_identity)?;
     let applied = applied_log_id.as_ref().map(|log_id| log_id.index);
     let first = applied
@@ -24826,7 +25004,7 @@ fn replay_unapplied_log_prefix_sync(
         .transpose()?
         .unwrap_or(0)
         .max(logical_log_start(conn, storage_identity, 0)?);
-    let target = last_log_sync(conn, storage_identity)?
+    let target = last_log_with_optional_capture_sync(conn, storage_identity, reuse.as_deref_mut())?
         .map(|log_id| {
             log_id
                 .index
@@ -24855,7 +25033,10 @@ fn replay_unapplied_log_prefix_sync(
         let index: i64 = row.get(2).map_err(db_error)?;
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, storage_identity)?;
-        let entry = decode_consensus_log_entry(&encoded)?;
+        let entry = match reuse.as_deref_mut() {
+            Some(reuse) => reuse.decode(epoch, term, index, &encoded)?,
+            None => decode_consensus_log_entry(&encoded)?,
+        };
         if entry.log_id.index != expected
             || checked_u64(index)? != expected
             || checked_u64(term)? != entry.log_id.leader_id.term
@@ -26086,6 +26267,14 @@ pub(crate) fn last_log_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    last_log_with_optional_capture_sync(conn, identity, None)
+}
+
+fn last_log_with_optional_capture_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    reuse: Option<&mut LogRowReadReuse<'_>>,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     let floor = read_purged_sync(conn, identity)?;
     let row = conn
         .query_row(
@@ -26109,6 +26298,11 @@ pub(crate) fn last_log_sync(
     if let EntryPayload::Normal(command) = &entry.payload {
         validate_command_for_log(command, identity)?;
     }
+    if let Some(reuse) = reuse {
+        reuse.capture_after_full_audit(epoch, term, index, encoded, &entry);
+    }
+    #[cfg(test)]
+    log_row_reuse_test_observer::after_highest_audit(conn);
     Ok(Some(entry.log_id))
 }
 
@@ -26266,6 +26460,30 @@ fn read_log_range_with_batch_sync(
     append_entries_batch: bool,
     recovery_profile: LogRangeRecoveryProfile,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    let mut reuse = LogRowReadReuse::new(&LOG_ROW_RETENTION_BUDGET);
+    read_log_range_with_batch_and_reuse_sync(
+        conn,
+        identity,
+        start,
+        end,
+        limit,
+        append_entries_batch,
+        recovery_profile,
+        &mut reuse,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_log_range_with_batch_and_reuse_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    append_entries_batch: bool,
+    recovery_profile: LogRangeRecoveryProfile,
+    reuse: &mut LogRowReadReuse<'_>,
+) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let start_u64 = start;
     let start = checked_i64(start)?;
     let end = end.map(checked_i64).transpose()?;
@@ -26300,8 +26518,13 @@ fn read_log_range_with_batch_sync(
         .transpose()?
         .unwrap_or(0)
         .max(start_u64);
-    let applied_index =
-        replay_unapplied_log_prefix_sync(conn, identity, start_u64, &mut projection)?;
+    let applied_index = replay_unapplied_log_prefix_with_reuse_sync(
+        conn,
+        identity,
+        start_u64,
+        &mut projection,
+        Some(reuse),
+    )?;
     let mut entries = Vec::new();
     let sql = match (end, limit) {
         (Some(_), Some(_)) => {
@@ -26332,7 +26555,7 @@ fn read_log_range_with_batch_sync(
         let index: i64 = row.get(2).map_err(db_error)?;
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, identity)?;
-        let entry = decode_consensus_log_entry(&encoded)?;
+        let entry = reuse.decode(epoch, term, index, &encoded)?;
         validate_log_id(&entry.log_id)?;
         if checked_u64(term)? != entry.log_id.leader_id.term
             || checked_u64(index)? != entry.log_id.index
@@ -40886,6 +41109,108 @@ pub(crate) use tests::{
 };
 
 #[cfg(test)]
+mod log_row_reuse_test_observer {
+    use std::cell::RefCell;
+
+    use rusqlite::Connection;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Event {
+        FullDecode,
+        Captured,
+        Hit,
+        TupleFallback,
+        Ineligible,
+        BudgetFallback,
+        HighestAudit,
+        AfterBytesDrop,
+        Refund,
+    }
+
+    type AfterHighestAudit = Box<dyn FnOnce(&Connection)>;
+
+    struct Observation {
+        events: Vec<Event>,
+        after_highest_audit: Option<AfterHighestAudit>,
+    }
+
+    thread_local! {
+        static OBSERVATION: RefCell<Option<Observation>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn note(event: Event) {
+        OBSERVATION.with(|state| {
+            if let Some(observation) = state.borrow_mut().as_mut() {
+                assert!(observation.events.len() < 256, "bounded test observation");
+                observation.events.push(event);
+            }
+        });
+    }
+
+    pub(super) fn after_highest_audit(conn: &Connection) {
+        note(Event::HighestAudit);
+        let hook = OBSERVATION.with(|state| {
+            state
+                .borrow_mut()
+                .as_mut()
+                .and_then(|observation| observation.after_highest_audit.take())
+        });
+        if let Some(hook) = hook {
+            hook(conn);
+        }
+    }
+
+    pub(super) struct AfterBytesDrop;
+
+    impl Drop for AfterBytesDrop {
+        fn drop(&mut self) {
+            note(Event::AfterBytesDrop);
+        }
+    }
+
+    pub(super) struct Scope(bool);
+
+    impl Scope {
+        pub(super) fn new() -> Self {
+            OBSERVATION.with(|state| {
+                assert!(state.borrow().is_none(), "one observation per test call");
+                *state.borrow_mut() = Some(Observation {
+                    events: Vec::with_capacity(256),
+                    after_highest_audit: None,
+                });
+            });
+            Self(true)
+        }
+
+        pub(super) fn after_highest_audit(&self, hook: impl FnOnce(&Connection) + 'static) {
+            OBSERVATION.with(|state| {
+                let mut state = state.borrow_mut();
+                let observation = state.as_mut().expect("active observation");
+                assert!(observation.after_highest_audit.is_none());
+                observation.after_highest_audit = Some(Box::new(hook));
+            });
+        }
+
+        pub(super) fn finish(mut self) -> Vec<Event> {
+            let observation = OBSERVATION.with(|state| state.borrow_mut().take().unwrap());
+            assert!(observation.after_highest_audit.is_none(), "test hook ran");
+            self.0 = false;
+            observation.events
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if self.0 {
+                OBSERVATION.with(|state| {
+                    state.borrow_mut().take();
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -40902,6 +41227,1543 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+
+    const SDK741_COMPONENT_LAST: u64 = 4;
+
+    #[derive(Clone, Copy)]
+    enum Sdk741Payload {
+        Create,
+        Renew,
+    }
+
+    impl Sdk741Payload {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Create => "create",
+                Self::Renew => "renew_update",
+            }
+        }
+    }
+
+    struct Sdk741Fixture {
+        entries: Vec<Entry<SessionRaftTypeConfig>>,
+        outcomes: Vec<Vec<FencedTransitionOutcome>>,
+    }
+
+    fn sdk741_seal_record(record: &mut StoredSessionRecord, nonce_id: u64, create: bool) {
+        // Public deterministic test-vector API; these are synthetic keys,
+        // identities and plaintext. Each record vector uses a distinct nonce.
+        let handle = opc_key::KeyHandle::new(
+            KeyId::new("sdk741-component-test-vector").unwrap(),
+            opc_key::KeyPurpose::Session,
+            record.key.tenant.clone(),
+            opc_key::Zeroizing::new([0x74; opc_key::AES_256_GCM_SIV_KEY_LEN]),
+        );
+        let namespace = "sdk-702-v2-qualification";
+        let aad = crate::record::build_session_envelope_aad(record, namespace, &handle)
+            .expect("bind actual session AAD");
+        let plaintext: &[u8] = if create {
+            b"qualification"
+        } else {
+            b"qualification-update"
+        };
+        let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
+        nonce[4..].copy_from_slice(&nonce_id.to_be_bytes());
+        let encoded =
+            opc_crypto::encrypt_envelope_with_handle_and_nonce(&handle, &aad, plaintext, nonce)
+                .expect("seal deterministic synthetic record");
+        let opened = opc_crypto::decrypt_envelope_with_handle(&handle, &aad, &encoded)
+            .expect("authenticate every synthetic envelope");
+        assert!(opened.as_slice() == plaintext, "exact envelope round trip");
+        record.payload = EncryptedSessionPayload::try_envelope(encoded)
+            .expect("admitted authenticated envelope");
+    }
+
+    fn sdk741_component_request(
+        payload: Sdk741Payload,
+        row: u64,
+        slot: usize,
+        previous: Option<&FencedTransitionOutcome>,
+    ) -> FencedTransitionV2Request {
+        let mut record_key = key();
+        let key_row = if matches!(payload, Sdk741Payload::Create) {
+            row
+        } else {
+            1
+        };
+        record_key.stable_id = Bytes::from(format!("sdk741-{}-{key_row}-{slot}", payload.name()))
+            .try_into()
+            .expect("bounded distinct synthetic key");
+        let owner = OwnerId::new("sdk741-component-owner").unwrap();
+        let mut record = StoredSessionRecord {
+            key: record_key.clone(),
+            generation: Generation::new(1),
+            owner: owner.clone(),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: crate::StateType::from_static("sdk-702-v2-qualification"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        let create = previous.is_none();
+        let lease = if let Some(previous) = previous {
+            assert!(previous.lease().key() == &record_key);
+            record.owner = previous.lease().owner().clone();
+            record.fence = previous.lease().fence();
+            record.generation = previous.committed_generation().next().unwrap();
+            FencedTransitionLease::renew(previous.lease().clone(), Duration::from_secs(60))
+                .expect("renew exact committed predecessor")
+        } else {
+            FencedTransitionLease::acquire(
+                record_key,
+                owner,
+                FenceToken::new(0),
+                Duration::from_secs(60),
+            )
+            .expect("acquire a distinct fresh key")
+        };
+        let number = row * 8
+            + u64::try_from(slot).unwrap()
+            + if matches!(payload, Sdk741Payload::Create) {
+                128
+            } else {
+                256
+            };
+        sdk741_seal_record(&mut record, number, create);
+        let mutation = if let Some(previous) = previous {
+            FencedTransitionMutation::update(previous.committed_generation(), record)
+        } else {
+            FencedTransitionMutation::create(record)
+        };
+        FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).unwrap(),
+            crate::fenced_transition::FencedTransitionV2CallerNonce::from_bytes(
+                u128::from(number).to_be_bytes(),
+            ),
+            lease,
+            mutation,
+        )
+        .expect("self-authenticating synthetic request")
+    }
+
+    fn sdk741_apply_batch(
+        conn: &Connection,
+        caps: &BackendCapabilities,
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> Vec<FencedTransitionOutcome> {
+        let applied = apply_entries_sync(conn, identity(), caps, vec![entry.clone()])
+            .expect("apply positive component batch");
+        assert_eq!(applied.responses.len(), 1);
+        let Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) =
+            &applied.responses[0].result
+        else {
+            panic!("positive setup must return a V2 batch result");
+        };
+        let EntryPayload::Normal(command) = &entry.payload else {
+            panic!("positive fixture is a normal command");
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = &command.intent else {
+            panic!("positive fixture is an eight-item batch");
+        };
+        assert_eq!(requests.len(), 8);
+        assert_eq!(outcomes.len(), 8);
+        outcomes
+            .iter()
+            .zip(requests)
+            .map(|(outcome, request)| {
+                let outcome = outcome
+                    .as_ref()
+                    .expect("each intended setup mutation succeeds");
+                assert!(
+                    outcome.matches_v2_request(request),
+                    "exact request/result identity"
+                );
+                let expected =
+                    if matches!(request.mutation(), FencedTransitionMutation::Create { .. }) {
+                        FencedTransitionMutationResult::Created
+                    } else {
+                        FencedTransitionMutationResult::Updated
+                    };
+                assert_eq!(outcome.mutation(), expected);
+                assert!(outcome.lease().key() == request.lease().key());
+                assert_eq!(outcome.lease().fence(), FenceToken::new(1));
+                outcome.clone()
+            })
+            .collect()
+    }
+
+    fn sdk741_initialize(conn: &Connection, caps: &BackendCapabilities) {
+        initialize_schema(conn, identity(), &expected_members()).expect("component schema");
+        let membership = membership_entry();
+        append_logs_sync(conn, identity(), std::slice::from_ref(&membership))
+            .expect("append exact membership");
+        save_committed_sync(conn, identity(), Some(membership.log_id)).expect("commit membership");
+        let applied =
+            apply_entries_sync(conn, identity(), caps, vec![membership]).expect("apply membership");
+        assert!(applied
+            .responses
+            .iter()
+            .all(|response| response.result.is_ok()));
+        activate_v2_ledger_fixture(conn);
+        validate_fenced_transition_v2_receipts_sync(conn, identity()).expect("valid activation");
+    }
+
+    fn sdk741_build_fixture(directory: &Path, payload: Sdk741Payload) -> Sdk741Fixture {
+        let backend = SqliteSessionBackend::open(
+            directory.join(format!("{}-witness.sqlite", payload.name())),
+        )
+        .expect("disk-backed component witness");
+        let conn = backend.conn.blocking_lock();
+        sdk741_initialize(&conn, &backend.caps);
+        let mut fixture = Sdk741Fixture {
+            entries: vec![membership_entry()],
+            outcomes: vec![Vec::new()],
+        };
+        for row in 1..=SDK741_COMPONENT_LAST {
+            let requests = (0..8)
+                .map(|slot| {
+                    let previous = if matches!(payload, Sdk741Payload::Renew) && row > 1 {
+                        Some(&fixture.outcomes[usize::try_from(row - 1).unwrap()][slot])
+                    } else {
+                        None
+                    };
+                    sdk741_component_request(payload, row, slot, previous)
+                })
+                .collect();
+            let entry = fenced_transition_v2_batch_entry(
+                row,
+                requests,
+                timestamp(u8::try_from(row).unwrap()),
+            );
+            let encoded = encode_json(&entry).unwrap();
+            assert!(decode_consensus_log_entry(&encoded).unwrap() == entry);
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                .expect("append positive batch");
+            save_committed_sync(&conn, identity(), Some(entry.log_id))
+                .expect("commit positive batch");
+            let outcomes = sdk741_apply_batch(&conn, &backend.caps, &entry);
+            fixture.entries.push(entry);
+            fixture.outcomes.push(outcomes);
+        }
+        assert_eq!(fixture.entries.len(), 5);
+        assert!(fixture.entries.len() <= 64);
+        assert!(conn.is_autocommit());
+        fixture
+    }
+
+    fn sdk741_seed_case(
+        directory: &Path,
+        label: &str,
+        fixture: &Sdk741Fixture,
+        applied_through: u64,
+    ) -> SqliteSessionBackend {
+        let backend = SqliteSessionBackend::open(directory.join(format!("{label}.sqlite")))
+            .expect("disk-backed component case");
+        {
+            let conn = backend.conn.blocking_lock();
+            sdk741_initialize(&conn, &backend.caps);
+            for entry in fixture.entries.iter().skip(1) {
+                append_logs_sync(&conn, identity(), std::slice::from_ref(entry))
+                    .expect("append exact original fixture");
+                save_committed_sync(&conn, identity(), Some(entry.log_id))
+                    .expect("commit exact original fixture");
+                if entry.log_id.index <= applied_through {
+                    let actual = sdk741_apply_batch(&conn, &backend.caps, entry);
+                    assert!(
+                        actual == fixture.outcomes[usize::try_from(entry.log_id.index).unwrap()]
+                    );
+                }
+            }
+            assert_eq!(
+                read_applied_sync(&conn, identity()).unwrap(),
+                Some(log_id(applied_through))
+            );
+            assert_eq!(
+                last_log_sync(&conn, identity()).unwrap(),
+                Some(log_id(SDK741_COMPONENT_LAST))
+            );
+            assert!(conn.is_autocommit());
+        }
+        backend
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Sdk741Reader {
+        Limited,
+        Strict,
+        Published684,
+        PhysicalRetained,
+        DynamicStrict,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Sdk741Read {
+        reader: Sdk741Reader,
+        start: u64,
+        end: u64,
+    }
+
+    impl Sdk741Read {
+        fn limited(start: u64, end: u64) -> Self {
+            Self {
+                reader: Sdk741Reader::Limited,
+                start,
+                end,
+            }
+        }
+
+        fn run(self, conn: &Connection) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+            match self.reader {
+                Sdk741Reader::Limited => {
+                    read_limited_log_range_sync(conn, identity(), self.start, self.end, 8)
+                }
+                Sdk741Reader::Strict => {
+                    read_log_range_sync(conn, identity(), self.start, Some(self.end), Some(8))
+                }
+                Sdk741Reader::Published684 => read_log_range_for_recovery_sync(
+                    conn,
+                    identity(),
+                    self.start,
+                    Some(self.end),
+                    Some(8),
+                ),
+                Sdk741Reader::PhysicalRetained => read_physical_log_range_for_recovery_sync(
+                    conn,
+                    identity(),
+                    self.start,
+                    Some(self.end),
+                    Some(8),
+                ),
+                Sdk741Reader::DynamicStrict => with_durable_authority_raw_read_sync(
+                    conn,
+                    identity(),
+                    ConsensusAuthorityProfile::Dynamic,
+                    &expected_members(),
+                    &BTreeMap::new(),
+                    None,
+                    |conn| {
+                        read_log_range_sync(conn, identity(), self.start, Some(self.end), Some(8))
+                    },
+                ),
+            }
+        }
+    }
+
+    fn sdk741_hash(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn sdk741_state_hash(conn: &Connection) -> String {
+        let mut digest = Sha256::new();
+        digest.update(format!("{:?}", read_machine_sync(conn, identity()).unwrap()).as_bytes());
+        digest.update(format!("{:?}", read_applied_sync(conn, identity()).unwrap()).as_bytes());
+        digest.update(format!("{:?}", read_purged_sync(conn, identity()).unwrap()).as_bytes());
+        digest.update(format!("{:?}", read_committed_sync(conn, identity()).unwrap()).as_bytes());
+        let mut stmt = conn.prepare("SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log ORDER BY log_index").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            for column in 0..3 {
+                digest.update(row.get::<_, i64>(column).unwrap().to_le_bytes());
+            }
+            let encoded: Vec<u8> = row.get(3).unwrap();
+            digest.update(u64::try_from(encoded.len()).unwrap().to_le_bytes());
+            digest.update(&encoded);
+            count += 1;
+            assert!(count <= 64);
+        }
+        format!("{:x}", digest.finalize())
+    }
+
+    enum Sdk741Expected<'a> {
+        Rows(&'a [Entry<SessionRaftTypeConfig>]),
+        Invalid(&'a str),
+    }
+
+    fn sdk741_oracle(
+        conn: &Connection,
+        name: &str,
+        read: Sdk741Read,
+        expected: Sdk741Expected<'_>,
+        records: &mut Vec<serde_json::Value>,
+    ) {
+        let before = sdk741_state_hash(conn);
+        let autocommit = conn.is_autocommit();
+        let changes = conn.total_changes();
+        let scope = log_row_reuse_test_observer::Scope::new();
+        let result = read.run(conn);
+        let observation = scope.finish();
+        log_row_reuse_assert_closed(&observation);
+        let outcome = match (result, expected) {
+            (Ok(actual), Sdk741Expected::Rows(expected)) => {
+                assert!(actual == expected, "positive oracle mismatch: {name}");
+                serde_json::json!({
+                    "ok": true,
+                    "indices": actual.iter().map(|entry| entry.log_id.index).collect::<Vec<_>>(),
+                    "full_entries_sha256": sdk741_hash(&encode_json(&actual).unwrap()),
+                })
+            }
+            (Err(error), Sdk741Expected::Invalid(expected)) => {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
+                assert_eq!(error.to_string(), expected, "{name}");
+                serde_json::json!({"ok": false, "kind": "InvalidData", "message": error.to_string()})
+            }
+            _ => panic!("oracle result class changed: {name}"),
+        };
+        let after = sdk741_state_hash(conn);
+        assert_eq!(before, after, "reader changed durable state: {name}");
+        assert_eq!(
+            changes,
+            conn.total_changes(),
+            "reader performed SQL writes: {name}"
+        );
+        assert_eq!(
+            autocommit,
+            conn.is_autocommit(),
+            "reader changed transaction ownership: {name}"
+        );
+        let oracle = serde_json::json!({
+            "case": name, "reader": format!("{:?}", read.reader),
+            "start": read.start, "end": read.end, "outcome": outcome,
+            "before_state_sha256": before, "after_state_sha256": after,
+            "autocommit_before": autocommit, "autocommit_after": conn.is_autocommit(),
+            "sql_total_changes_delta": conn.total_changes() - changes,
+        });
+        eprintln!(
+            "SDK741_LOG_REUSE {}",
+            serde_json::json!({
+                "type": "oracle", "oracle": oracle,
+                "full_decodes": log_row_reuse_event_count(&observation, log_row_reuse_test_observer::Event::FullDecode),
+                "proof_hits": log_row_reuse_event_count(&observation, log_row_reuse_test_observer::Event::Hit),
+            })
+        );
+        records.push(oracle);
+    }
+
+    fn sdk741_correctness(
+        directory: &Path,
+        payload: Sdk741Payload,
+        fixture: &Sdk741Fixture,
+        records: &mut Vec<serde_json::Value>,
+    ) {
+        let backend = sdk741_seed_case(
+            directory,
+            &format!("{}-oracles", payload.name()),
+            fixture,
+            4,
+        );
+        let conn = backend.conn.blocking_lock();
+        let intact = sdk741_state_hash(&conn);
+        let malformed = decode_consensus_log_entry(b"{").err().unwrap().to_string();
+        let mismatch = "persisted session consensus log row mismatch";
+        let hole = "persisted session consensus log range contains a hole";
+        for reader in [
+            Sdk741Reader::Limited,
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+            Sdk741Reader::DynamicStrict,
+        ] {
+            sdk741_oracle(
+                &conn,
+                &format!("{}-valid-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 1,
+                    end: 5,
+                },
+                Sdk741Expected::Rows(&fixture.entries[1..]),
+                records,
+            );
+        }
+        for (fault, sql, start, end, error) in [
+            ("malformed-last-outside-range", "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4", 1, 3, malformed.as_str()),
+            ("malformed-returned-row", "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 2", 1, 3, malformed.as_str()),
+            ("last-log-id-sql-term", "UPDATE consensus_log SET term = term + 1 WHERE log_index = 4", 1, 3, mismatch),
+            ("returned-log-id-sql-term", "UPDATE consensus_log SET term = term + 1 WHERE log_index = 2", 1, 3, mismatch),
+            ("leading-hole", "DELETE FROM consensus_log WHERE log_index = 1", 1, 4, hole),
+            ("internal-hole", "DELETE FROM consensus_log WHERE log_index = 2", 1, 4, hole),
+            ("paired-last-before-earlier-row", "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4; UPDATE consensus_log SET term = term + 1 WHERE log_index = 1", 1, 3, malformed.as_str()),
+        ] {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            tx.execute_batch(sql).expect("install bounded uncommitted fault");
+            for reader in [Sdk741Reader::Limited, Sdk741Reader::Strict, Sdk741Reader::Published684,
+                Sdk741Reader::PhysicalRetained, Sdk741Reader::DynamicStrict] {
+                // Physical recovery adopts the first returned index without
+                // a purge predecessor, including when the requested start is 1.
+                let expected = if fault == "leading-hole"
+                    && matches!(reader, Sdk741Reader::PhysicalRetained)
+                {
+                    Sdk741Expected::Rows(&fixture.entries[2..4])
+                } else {
+                    Sdk741Expected::Invalid(error)
+                };
+                sdk741_oracle(&tx, &format!("{}-{fault}-{reader:?}", payload.name()),
+                    Sdk741Read { reader, start, end }, expected, records);
+                assert!(!conn.is_autocommit());
+            }
+            tx.rollback().expect("caller alone rolls back fault");
+            assert!(conn.is_autocommit());
+            assert_eq!(intact, sdk741_state_hash(&conn), "rollback restores exact original rows");
+        }
+        // A valid caller-uncommitted removal changes the visible last row.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert_eq!(
+            tx.execute("DELETE FROM consensus_log WHERE log_index = 4", [])
+                .unwrap(),
+            1
+        );
+        for reader in [
+            Sdk741Reader::Limited,
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+            Sdk741Reader::DynamicStrict,
+        ] {
+            sdk741_oracle(
+                &tx,
+                &format!("{}-caller-uncommitted-visible-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 3,
+                    end: 5,
+                },
+                Sdk741Expected::Rows(&fixture.entries[3..4]),
+                records,
+            );
+        }
+        tx.rollback().unwrap();
+        assert_eq!(intact, sdk741_state_hash(&conn));
+        sdk741_oracle(
+            &conn,
+            &format!("{}-after-caller-rollback", payload.name()),
+            Sdk741Read::limited(3, 5),
+            Sdk741Expected::Rows(&fixture.entries[3..5]),
+            records,
+        );
+
+        // The recovery-only physical cursor may start after an omitted prefix;
+        // the strict and Published684 readers retain their exact start rule.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        tx.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .unwrap();
+        for reader in [Sdk741Reader::Strict, Sdk741Reader::Published684] {
+            sdk741_oracle(
+                &tx,
+                &format!("{}-omitted-prefix-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 0,
+                    end: 5,
+                },
+                Sdk741Expected::Invalid(hole),
+                records,
+            );
+        }
+        sdk741_oracle(
+            &tx,
+            &format!("{}-omitted-prefix-physical", payload.name()),
+            Sdk741Read {
+                reader: Sdk741Reader::PhysicalRetained,
+                start: 0,
+                end: 5,
+            },
+            Sdk741Expected::Rows(&fixture.entries[1..5]),
+            records,
+        );
+        tx.rollback().unwrap();
+        assert_eq!(intact, sdk741_state_hash(&conn));
+        assert!(conn.is_autocommit());
+        drop(conn);
+
+        let prefix_backend = sdk741_seed_case(
+            directory,
+            &format!("{}-prefix-oracles", payload.name()),
+            fixture,
+            1,
+        );
+        let prefix = prefix_backend.conn.blocking_lock();
+        for reader in [
+            Sdk741Reader::Limited,
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+            Sdk741Reader::DynamicStrict,
+        ] {
+            sdk741_oracle(
+                &prefix,
+                &format!("{}-unapplied-middle-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 3,
+                    end: 5,
+                },
+                Sdk741Expected::Rows(&fixture.entries[3..5]),
+                records,
+            );
+            sdk741_oracle(
+                &prefix,
+                &format!("{}-unapplied-beyond-tail-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 5,
+                    end: 6,
+                },
+                Sdk741Expected::Rows(&[]),
+                records,
+            );
+        }
+        assert!(prefix.is_autocommit());
+    }
+
+    fn log_row_reuse_event_count(
+        events: &[log_row_reuse_test_observer::Event],
+        wanted: log_row_reuse_test_observer::Event,
+    ) -> usize {
+        events.iter().filter(|event| **event == wanted).count()
+    }
+
+    fn log_row_reuse_assert_closed(events: &[log_row_reuse_test_observer::Event]) {
+        use log_row_reuse_test_observer::Event;
+        let captured = log_row_reuse_event_count(events, Event::Captured);
+        assert!(captured <= 1, "one candidate per read");
+        assert!(log_row_reuse_event_count(events, Event::Hit) <= captured);
+        assert_eq!(
+            captured,
+            log_row_reuse_event_count(events, Event::AfterBytesDrop)
+        );
+        assert_eq!(captured, log_row_reuse_event_count(events, Event::Refund));
+        for (index, event) in events.iter().enumerate() {
+            if *event == Event::AfterBytesDrop {
+                assert_eq!(events.get(index + 1), Some(&Event::Refund));
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_preserves_corrected_baseline_oracles() {
+        let mut records = Vec::new();
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let directory = tempfile::tempdir().expect("private disk fixture");
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            let expected_fixture = match payload {
+                Sdk741Payload::Create => {
+                    "f3e00ff5135f949d270522fecddcfdde801e6ff4296bac62a1b7eab256ad42ad"
+                }
+                Sdk741Payload::Renew => {
+                    "62d2eebf3b0fb5eee269bd7224a6bb7e5ed048489add9f4a068ca3af53395273"
+                }
+            };
+            assert_eq!(
+                sdk741_hash(&encode_json(&fixture.entries).unwrap()),
+                expected_fixture
+            );
+            sdk741_correctness(directory.path(), payload, &fixture, &mut records);
+            for (shape, applied, read, expected) in [
+                (
+                    "last_applied",
+                    4,
+                    Sdk741Read::limited(4, 5),
+                    &fixture.entries[4..5],
+                ),
+                (
+                    "range_ending_last",
+                    4,
+                    Sdk741Read::limited(3, 5),
+                    &fixture.entries[3..5],
+                ),
+                (
+                    "range_before_last",
+                    4,
+                    Sdk741Read::limited(1, 3),
+                    &fixture.entries[1..3],
+                ),
+                (
+                    "unapplied_beyond_tail",
+                    1,
+                    Sdk741Read::limited(5, 6),
+                    &fixture.entries[0..0],
+                ),
+                (
+                    "reclaimed_empty",
+                    4,
+                    Sdk741Read::limited(0, 6),
+                    &fixture.entries[0..0],
+                ),
+            ] {
+                let backend = sdk741_seed_case(
+                    directory.path(),
+                    &format!("{}-{shape}", payload.name()),
+                    &fixture,
+                    applied,
+                );
+                let conn = backend.conn.blocking_lock();
+                if shape == "reclaimed_empty" {
+                    purge_logs_sync(&conn, identity(), &log_id(4)).unwrap();
+                    assert_eq!(
+                        conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        0
+                    );
+                }
+                // Keep the old oracle's historical name to compare its exact
+                // frozen digest. This is one correctness read, with no timer,
+                // warmup, sample loop or measurement campaign.
+                sdk741_oracle(
+                    &conn,
+                    &format!("{}-measured-shape-{shape}", payload.name()),
+                    read,
+                    Sdk741Expected::Rows(expected),
+                    &mut records,
+                );
+            }
+        }
+        assert_eq!(records.len(), 128);
+        let digest = sdk741_hash(&serde_json::to_vec(&records).unwrap());
+        assert_eq!(
+            digest,
+            "9ea2abc4b697f59d7a640b99a11a3ebca92e66863aec2e4ca4a23aed53839b92"
+        );
+        eprintln!("SDK741_LOG_REUSE {{\"type\":\"baseline_oracle_equivalence\",\"count\":128,\"sha256\":\"{digest}\"}}");
+    }
+
+    fn log_row_reuse_local_read(
+        conn: &Connection,
+        start: u64,
+        end: u64,
+        budget_limit: usize,
+        scope: log_row_reuse_test_observer::Scope,
+    ) -> (
+        io::Result<Vec<Entry<SessionRaftTypeConfig>>>,
+        Vec<log_row_reuse_test_observer::Event>,
+    ) {
+        let budget = LogRowRetentionBudget::new(budget_limit);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let result = read_log_range_with_batch_and_reuse_sync(
+            conn,
+            identity(),
+            start,
+            Some(end),
+            Some(8),
+            true,
+            LogRangeRecoveryProfile::Strict,
+            &mut reuse,
+        );
+        drop(reuse);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        (result, events)
+    }
+
+    fn log_row_reuse_error(result: io::Result<Vec<Entry<SessionRaftTypeConfig>>>) -> String {
+        let error = result.expect_err("expected reader rejection");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        error.to_string()
+    }
+
+    #[test]
+    fn log_row_reuse_removes_only_the_later_full_decode_in_each_overlap() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let directory = tempfile::tempdir().unwrap();
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            for (shape, applied, start, end, expected, original_decodes, hits) in [
+                ("last", 4, 4, 5, &fixture.entries[4..5], 2, 1),
+                ("ending_last", 4, 3, 5, &fixture.entries[3..5], 3, 1),
+                ("before_last", 4, 1, 3, &fixture.entries[1..3], 3, 0),
+                ("prefix_last", 1, 5, 6, &fixture.entries[0..0], 4, 1),
+                ("empty", 4, 0, 6, &fixture.entries[0..0], 0, 0),
+            ] {
+                let backend = sdk741_seed_case(directory.path(), shape, &fixture, applied);
+                let conn = backend.conn.blocking_lock();
+                if shape == "empty" {
+                    purge_logs_sync(&conn, identity(), &log_id(4)).unwrap();
+                }
+                let before = sdk741_state_hash(&conn);
+                let changes = conn.total_changes();
+                for enabled in [false, true] {
+                    let (result, events) = log_row_reuse_local_read(
+                        &conn,
+                        start,
+                        end,
+                        if enabled {
+                            LOG_ROW_REUSE_AGGREGATE_BYTES
+                        } else {
+                            0
+                        },
+                        Scope::new(),
+                    );
+                    assert!(result.unwrap() == expected, "{} {shape}", payload.name());
+                    let expected_hits = if enabled { hits } else { 0 };
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::Hit),
+                        expected_hits
+                    );
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::FullDecode),
+                        original_decodes - expected_hits
+                    );
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::HighestAudit),
+                        usize::from(shape != "empty")
+                    );
+                    assert_eq!(before, sdk741_state_hash(&conn));
+                    assert_eq!(changes, conn.total_changes());
+                    assert!(conn.is_autocommit());
+                    eprintln!(
+                        "SDK741_LOG_REUSE {}",
+                        serde_json::json!({
+                            "type": "decode_counts", "payload": payload.name(), "shape": shape,
+                            "enabled": enabled, "full_decodes": original_decodes - expected_hits,
+                            "hits": expected_hits,
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_requires_every_fresh_sql_field_and_byte() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let mut changed = fixture.entries[4].clone();
+        if let EntryPayload::Normal(command) = &mut changed.payload {
+            command.logical_time = timestamp(5);
+        }
+        let changed_bytes = encode_json(&changed).unwrap();
+        assert!(decode_consensus_log_entry(&changed_bytes).unwrap() == changed);
+        assert_eq!(changed.log_id, fixture.entries[4].log_id);
+        let malformed = decode_consensus_log_entry(b"{").err().unwrap().to_string();
+        let mut noncanonical = encode_json(&fixture.entries[4]).unwrap();
+        noncanonical.push(b' ');
+        let canonical_error = decode_consensus_log_entry(&noncanonical)
+            .err()
+            .unwrap()
+            .to_string();
+        for prefix in [false, true] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                if prefix {
+                    "fresh-prefix"
+                } else {
+                    "fresh-range"
+                },
+                &fixture,
+                if prefix { 3 } else { 4 },
+            );
+            let conn = backend.conn.blocking_lock();
+            let intact = sdk741_state_hash(&conn);
+            for fault in [
+                "epoch",
+                "term",
+                "index",
+                "valid-bytes",
+                "malformed-bytes",
+                "noncanonical-bytes",
+                "epoch-before-malformed",
+                "decode-before-term",
+            ] {
+                for enabled in [false, true] {
+                    let tx =
+                        Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+                    // The epoch intentionally violates a foreign key. Keep
+                    // enforcement enabled, but defer it in this caller-owned
+                    // negative fixture so the reader sees the corrupt tuple.
+                    // This transaction always rolls back; no invalid commit
+                    // or production constraint change is admitted.
+                    assert!(conn
+                        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                        .unwrap());
+                    tx.pragma_update(None, "defer_foreign_keys", true).unwrap();
+                    let scope = Scope::new();
+                    let bytes = changed_bytes.clone();
+                    let noncanonical = noncanonical.clone();
+                    scope.after_highest_audit(move |conn| {
+                        let sql = match fault {
+                            "epoch" => "UPDATE consensus_log SET configuration_epoch = configuration_epoch + 1 WHERE log_index = 4",
+                            "term" => "UPDATE consensus_log SET term = term + 1 WHERE log_index = 4",
+                            "index" => "UPDATE consensus_log SET log_index = 5 WHERE log_index = 4",
+                            "epoch-before-malformed" => "UPDATE consensus_log SET configuration_epoch = configuration_epoch + 1, entry_json = X'7B' WHERE log_index = 4",
+                            "decode-before-term" => "UPDATE consensus_log SET term = term + 1, entry_json = X'7B' WHERE log_index = 4",
+                            "malformed-bytes" => "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4",
+                            "valid-bytes" | "noncanonical-bytes" => {
+                                conn.execute("UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 4",
+                                    [if fault == "valid-bytes" { bytes } else { noncanonical }]).unwrap();
+                                return;
+                            }
+                            _ => unreachable!(),
+                        };
+                        conn.execute(sql, []).unwrap();
+                    });
+                    let before_changes = conn.total_changes();
+                    let (result, events) = log_row_reuse_local_read(
+                        &tx,
+                        if prefix { 5 } else { 4 },
+                        6,
+                        if enabled {
+                            LOG_ROW_REUSE_AGGREGATE_BYTES
+                        } else {
+                            0
+                        },
+                        scope,
+                    );
+                    let expected_error = match fault {
+                        "epoch" | "epoch-before-malformed" => Some("session consensus configuration epoch mismatch"),
+                        "term" if prefix => Some("persisted session consensus unapplied log projection is not contiguous"),
+                        "term" | "index" if !prefix => Some("persisted session consensus log row mismatch"),
+                        "index" => Some("persisted session consensus unapplied log projection has a hole"),
+                        "malformed-bytes" | "decode-before-term" => Some(malformed.as_str()),
+                        "noncanonical-bytes" => Some(canonical_error.as_str()),
+                        "valid-bytes" => None,
+                        _ => unreachable!(),
+                    };
+                    if let Some(expected) = expected_error {
+                        assert_eq!(log_row_reuse_error(result), expected, "{prefix} {fault}");
+                    } else {
+                        let expected = if prefix {
+                            Vec::new()
+                        } else {
+                            vec![changed.clone()]
+                        };
+                        assert!(result.unwrap() == expected);
+                    }
+                    assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::Captured),
+                        usize::from(enabled)
+                    );
+                    let early = matches!(fault, "epoch" | "epoch-before-malformed")
+                        || (prefix && fault == "index");
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::FullDecode),
+                        if early { 1 } else { 2 }
+                    );
+                    assert_eq!(
+                        conn.total_changes() - before_changes,
+                        1,
+                        "only the injected SQL mutation"
+                    );
+                    assert!(!conn.is_autocommit(), "caller still owns its transaction");
+                    tx.rollback().unwrap();
+                    assert!(conn.is_autocommit());
+                    assert!(!conn
+                        .pragma_query_value(None, "defer_foreign_keys", |row| row.get::<_, bool>(0))
+                        .unwrap());
+                    assert!(conn
+                        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                        .unwrap());
+                    assert_eq!(intact, sdk741_state_hash(&conn));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_observes_dynamic_changes_and_fixed_snapshot_ownership() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        for authority in [
+            ConsensusAuthorityProfile::Dynamic,
+            ConsensusAuthorityProfile::FixedImmutable,
+        ] {
+            let database = directory
+                .path()
+                .join(format!("visibility-{authority:?}.sqlite"));
+            let backend = SqliteSessionBackend::open(&database).unwrap();
+            let conn = backend.conn.blocking_lock();
+            initialize_schema_with_profile(&conn, identity(), &members, authority).unwrap();
+            let policy = (authority == ConsensusAuthorityProfile::FixedImmutable)
+                .then_some(PlacementResiliencePolicy::RequireIndependentFailureDomains);
+            let mut entries = fixture.entries.clone();
+            entries[0] = membership_entry_at(0, vec![members.clone()], members.clone());
+            // Exercise the other eligible representation through its actual
+            // authority admission, append, apply and reader paths.
+            if let EntryPayload::Normal(command) = &mut entries[4].payload {
+                command.intent = SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(),
+                    mutation: Box::new(command.intent.clone()),
+                };
+            }
+            for entry in &entries {
+                append_logs_with_authority_sync(
+                    &conn,
+                    identity(),
+                    authority,
+                    &members,
+                    &bindings,
+                    policy,
+                    std::slice::from_ref(entry),
+                )
+                .unwrap();
+                save_committed_with_authority_sync(
+                    &conn,
+                    identity(),
+                    authority,
+                    &members,
+                    &bindings,
+                    policy,
+                    Some(entry.log_id),
+                )
+                .unwrap();
+                let applied = apply_entries_with_authority_sync(
+                    &conn,
+                    identity(),
+                    &backend.caps,
+                    authority,
+                    &members,
+                    &bindings,
+                    policy,
+                    vec![entry.clone()],
+                )
+                .unwrap();
+                assert_eq!(applied.responses.len(), 1);
+                if entry.log_id.index == 0 {
+                    assert!(applied.responses[0].result.is_ok());
+                    activate_v2_ledger_fixture(&conn);
+                } else {
+                    let Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) =
+                        &applied.responses[0].result
+                    else {
+                        panic!("positive authorized batch");
+                    };
+                    assert_eq!(outcomes.len(), 8);
+                    assert!(outcomes.iter().all(Result::is_ok));
+                }
+            }
+            let mut changed = entries[4].clone();
+            if let EntryPayload::Normal(command) = &mut changed.payload {
+                command.logical_time = timestamp(5);
+            }
+            let changed_bytes = encode_json(&changed).unwrap();
+            assert!(decode_consensus_log_entry(&changed_bytes).unwrap() == changed);
+            let writer = Connection::open(&database).unwrap();
+            let scope = Scope::new();
+            let written = changed_bytes.clone();
+            scope.after_highest_audit(move |reader| {
+                assert_eq!(
+                    reader.is_autocommit(),
+                    authority == ConsensusAuthorityProfile::Dynamic
+                );
+                writer
+                    .execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 4",
+                        [written],
+                    )
+                    .unwrap();
+                assert!(writer.is_autocommit());
+            });
+            let (result, events) = with_durable_authority_raw_read_sync(
+                &conn,
+                identity(),
+                authority,
+                &members,
+                &bindings,
+                policy,
+                |conn| {
+                    Ok(log_row_reuse_local_read(
+                        conn,
+                        4,
+                        5,
+                        LOG_ROW_REUSE_AGGREGATE_BYTES,
+                        scope,
+                    ))
+                },
+            )
+            .unwrap();
+            let fixed = authority == ConsensusAuthorityProfile::FixedImmutable;
+            assert!(result.unwrap() == vec![if fixed { entries[4].clone() } else { changed }]);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::Hit),
+                usize::from(fixed)
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                if fixed { 1 } else { 2 }
+            );
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 1);
+            assert!(conn.is_autocommit());
+            let current: Vec<u8> = conn
+                .query_row(
+                    "SELECT entry_json FROM consensus_log WHERE log_index = 4",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                current, changed_bytes,
+                "the next call observes the committed writer"
+            );
+            let (next, events) =
+                log_row_reuse_local_read(&conn, 4, 5, LOG_ROW_REUSE_AGGREGATE_BYTES, Scope::new());
+            assert!(next.unwrap() == vec![decode_consensus_log_entry(&changed_bytes).unwrap()]);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 1);
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_hits_still_enforce_leader_and_projection_checks() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        for prefix in [false, true] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                if prefix {
+                    "leader-prefix"
+                } else {
+                    "leader-range"
+                },
+                &fixture,
+                if prefix { 2 } else { 4 },
+            );
+            let conn = backend.conn.blocking_lock();
+            let mut predecessor = fixture.entries[3].clone();
+            predecessor.log_id = LogId::new(CommittedLeaderId::new(2, node_id()), 3);
+            conn.execute(
+                "UPDATE consensus_log SET term = 2, entry_json = ?1 WHERE log_index = 3",
+                [encode_json(&predecessor).unwrap()],
+            )
+            .unwrap();
+            for enabled in [false, true] {
+                let (result, events) = log_row_reuse_local_read(
+                    &conn,
+                    if prefix { 5 } else { 3 },
+                    6,
+                    if enabled {
+                        LOG_ROW_REUSE_AGGREGATE_BYTES
+                    } else {
+                        0
+                    },
+                    Scope::new(),
+                );
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    if prefix {
+                        "persisted session consensus unapplied log leader ordering regressed"
+                    } else {
+                        "persisted session consensus log leader ordering regressed"
+                    }
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::Hit),
+                    usize::from(enabled)
+                );
+                assert!(conn.is_autocommit());
+            }
+        }
+        // An earlier membership error must still win while the unused,
+        // fully audited tail proof is owned by this same read.
+        for prefix in [false, true] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                if prefix {
+                    "membership-prefix"
+                } else {
+                    "membership-range"
+                },
+                &fixture,
+                if prefix { 2 } else { 4 },
+            );
+            let conn = backend.conn.blocking_lock();
+            let invalid_membership = membership_entry_at(3, vec![members(&[99])], members(&[99]));
+            conn.execute(
+                "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 3",
+                [encode_json(&invalid_membership).unwrap()],
+            )
+            .unwrap();
+            let before = sdk741_state_hash(&conn);
+            let changes = conn.total_changes();
+            for enabled in [false, true] {
+                let (result, events) = log_row_reuse_local_read(
+                    &conn,
+                    if prefix { 5 } else { 3 },
+                    6,
+                    if enabled {
+                        LOG_ROW_REUSE_AGGREGATE_BYTES
+                    } else {
+                        0
+                    },
+                    Scope::new(),
+                );
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    "session consensus membership does not match admitted topology"
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::Captured),
+                    usize::from(enabled)
+                );
+                assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+                assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 2);
+                assert_eq!(before, sdk741_state_hash(&conn));
+                assert_eq!(changes, conn.total_changes());
+                assert!(conn.is_autocommit());
+            }
+        }
+        let backend = sdk741_seed_case(directory.path(), "activation-consumer", &fixture, 3);
+        let conn = backend.conn.blocking_lock();
+        conn.execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+            .unwrap();
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).unwrap(),
+            FencedTransitionV2LedgerLayout::Activated
+        );
+        assert!(
+            !MembershipLogProjection::load(&conn, identity(), false)
+                .unwrap()
+                .projected_v2_scope_activated
+        );
+        for start in [4, 5] {
+            for enabled in [false, true] {
+                let (result, events) = log_row_reuse_local_read(
+                    &conn,
+                    start,
+                    6,
+                    if enabled {
+                        LOG_ROW_REUSE_AGGREGATE_BYTES
+                    } else {
+                        0
+                    },
+                    Scope::new(),
+                );
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    "projected fenced transition V2 batch lacks an exact activation certificate"
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::Hit),
+                    usize::from(enabled)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_leaves_append_audits_and_error_order_unchanged() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        for (applied, full_decodes) in [(4, 2), (1, 5)] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                &format!("append-{applied}"),
+                &fixture,
+                applied,
+            );
+            let conn = backend.conn.blocking_lock();
+            let intact = sdk741_state_hash(&conn);
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let scope = Scope::new();
+            append_logs_in_tx(&tx, identity(), &[blank_entry(5)]).unwrap();
+            let events = scope.finish();
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                full_decodes
+            );
+            assert_eq!(log_row_reuse_event_count(&events, Event::HighestAudit), 2);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 0);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+            assert!(!conn.is_autocommit());
+            tx.rollback().unwrap();
+            assert_eq!(intact, sdk741_state_hash(&conn));
+        }
+        let backend = sdk741_seed_case(directory.path(), "append-faults", &fixture, 3);
+        let conn = backend.conn.blocking_lock();
+        let intact = sdk741_state_hash(&conn);
+        let malformed = decode_consensus_log_entry(b"{").err().unwrap().to_string();
+        for (sql, next, expected, decodes) in [
+            ("UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4; UPDATE consensus_log SET term = 99 WHERE log_index = 2", 5, malformed.as_str(), 1),
+            ("UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 2", 6, "session consensus log append would create a hole", 1),
+            ("DELETE FROM consensus_fenced_transition_v2_activation", 5, "projected fenced transition V2 batch lacks an exact activation certificate", 3),
+        ] {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            tx.execute_batch(sql).unwrap();
+            let before_changes = conn.total_changes();
+            let scope = Scope::new();
+            let error = append_logs_in_tx(&tx, identity(), &[blank_entry(next)]).err().unwrap();
+            let events = scope.finish();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), decodes);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 0);
+            assert_eq!(conn.total_changes(), before_changes);
+            assert!(!conn.is_autocommit());
+            tx.rollback().unwrap();
+            assert_eq!(intact, sdk741_state_hash(&conn));
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_charges_capacity_and_consumes_at_most_once() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let entry = &fixture.entries[4];
+        let canonical = encode_json(entry).unwrap();
+        assert!(canonical.len() < LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+        for capacity in [
+            LOG_ROW_REUSE_MAX_RAW_CAPACITY,
+            LOG_ROW_REUSE_MAX_RAW_CAPACITY + 1,
+        ] {
+            let mut encoded = Vec::with_capacity(capacity);
+            encoded.extend_from_slice(&canonical);
+            assert_eq!(encoded.capacity(), capacity);
+            let expected_charge = LogRowReadReuse::retained_bytes(encoded.capacity());
+            let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+            let mut reuse = LogRowReadReuse::new(&budget);
+            assert!(decode_consensus_log_entry(&encoded).unwrap() == *entry);
+            validate_command_for_log(
+                match &entry.payload {
+                    EntryPayload::Normal(command) => command,
+                    _ => unreachable!(),
+                },
+                identity(),
+            )
+            .unwrap();
+            let scope = Scope::new();
+            reuse.capture_after_full_audit(epoch_i64(identity()).unwrap(), 1, 4, encoded, entry);
+            assert_eq!(
+                budget.used.load(Ordering::Acquire),
+                expected_charge.unwrap_or(0)
+            );
+            for _ in 0..2 {
+                assert!(
+                    reuse
+                        .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                        .unwrap()
+                        == *entry
+                );
+            }
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            // Even after consumption, this owner cannot retain another row.
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry,
+            );
+            assert!(reuse.proof.is_none());
+            drop(reuse);
+            let events = scope.finish();
+            log_row_reuse_assert_closed(&events);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::Hit),
+                usize::from(expected_charge.is_some())
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                if expected_charge.is_some() { 1 } else { 2 }
+            );
+        }
+        assert!(LogRowReadReuse::retained_bytes(usize::MAX).is_none());
+        assert_eq!(SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES, 16 * 1024 * 1024);
+        eprintln!(
+            "SDK741_LOG_REUSE {}",
+            serde_json::json!({
+                "type": "memory_layout", "owner_bytes": std::mem::size_of::<LogRowReadReuse<'_>>(),
+                "proof_bytes": std::mem::size_of::<LogRowCanonicalProof<'_>>(),
+                "maximum_raw_capacity": LOG_ROW_REUSE_MAX_RAW_CAPACITY,
+                "maximum_actual_charge": LogRowReadReuse::retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY).unwrap(),
+                "per_eligible_owner_limit": LOG_ROW_REUSE_MAX_RETAINED_BYTES,
+                "aggregate_retention_limit": LOG_ROW_REUSE_AGGREGATE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn log_row_reuse_keeps_oversized_valid_batches_on_the_original_path() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let backend = SqliteSessionBackend::open(directory.path().join("large.sqlite")).unwrap();
+        let conn = backend.conn.blocking_lock();
+        sdk741_initialize(&conn, &backend.caps);
+        let requests: Vec<_> = (0..32)
+            .map(|slot| sdk741_component_request(Sdk741Payload::Create, 1, slot, None))
+            .collect();
+        let entry = fenced_transition_v2_batch_entry(1, requests.clone(), timestamp(1));
+        let bytes = encode_json(&entry).unwrap();
+        assert!(bytes.len() > LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+        assert!(bytes.len() < SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES);
+        assert!(decode_consensus_log_entry(&bytes).unwrap() == entry);
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&entry)).unwrap();
+        save_committed_sync(&conn, identity(), Some(entry.log_id)).unwrap();
+        let applied =
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![entry.clone()]).unwrap();
+        let Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) =
+            &applied.responses[0].result
+        else {
+            panic!("positive large batch");
+        };
+        assert_eq!(outcomes.len(), requests.len());
+        for (outcome, request) in outcomes.iter().zip(&requests) {
+            assert!(outcome
+                .as_ref()
+                .expect("every large batch mutation succeeds")
+                .matches_v2_request(request));
+        }
+        let (result, events) =
+            log_row_reuse_local_read(&conn, 1, 2, LOG_ROW_REUSE_AGGREGATE_BYTES, Scope::new());
+        assert!(result.unwrap() == vec![entry]);
+        assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 2);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Ineligible), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+    }
+
+    #[test]
+    fn log_row_reuse_budget_closes_concurrent_and_unwinding_owners() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let entry = &fixture.entries[4];
+        let canonical = encode_json(entry).unwrap();
+        let charge = LogRowReadReuse::retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY).unwrap();
+        let budget = LogRowRetentionBudget::new(charge * 2);
+        let ready = std::sync::Barrier::new(9);
+        let release = std::sync::Barrier::new(9);
+        let retained = AtomicUsize::new(0);
+        std::thread::scope(|threads| {
+            for _ in 0..8 {
+                threads.spawn(|| {
+                    let mut bytes = Vec::with_capacity(LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+                    bytes.extend_from_slice(&canonical);
+                    let mut reuse = LogRowReadReuse::new(&budget);
+                    reuse.capture_after_full_audit(
+                        epoch_i64(identity()).unwrap(),
+                        1,
+                        4,
+                        bytes,
+                        entry,
+                    );
+                    if reuse.proof.is_some() {
+                        retained.fetch_add(1, Ordering::AcqRel);
+                    }
+                    ready.wait();
+                    release.wait();
+                    drop(reuse);
+                });
+            }
+            ready.wait();
+            let retained = retained.load(Ordering::Acquire);
+            assert!((1..=2).contains(&retained));
+            assert_eq!(budget.used.load(Ordering::Acquire), retained * charge);
+            release.wait();
+        });
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let overflow = LogRowRetentionBudget::new(usize::MAX);
+        overflow.used.store(usize::MAX - 8, Ordering::Release);
+        assert!(overflow.try_reserve(16).is_none());
+        assert_eq!(overflow.used.load(Ordering::Acquire), usize::MAX - 8);
+        let scope = Scope::new();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut reuse = LogRowReadReuse::new(&budget);
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry,
+            );
+            assert!(reuse.proof.is_some());
+            panic!("controlled retained-owner unwind");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+        // No test callback or retained proof survives an observation unwind.
+        let _ = std::panic::catch_unwind(|| {
+            let _scope = Scope::new();
+            panic!("controlled observer unwind");
+        });
+        assert!(Scope::new().finish().is_empty());
+    }
+
+    #[test]
+    fn log_row_reuse_preserves_true_published_684_reader_distinctions() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let backend =
+            SqliteSessionBackend::open(directory.path().join("published.sqlite")).unwrap();
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).unwrap();
+        let entries = vec![membership_entry(), blank_entry(1)];
+        append_logs_sync(&conn, identity(), &entries).unwrap();
+        save_committed_sync(&conn, identity(), Some(log_id(1))).unwrap();
+        let applied =
+            apply_entries_sync(&conn, identity(), &backend.caps, entries.clone()).unwrap();
+        assert!(applied
+            .responses
+            .iter()
+            .all(|response| response.result.is_ok()));
+        drop_protected_roster_namespace_fixture(&conn);
+        conn.execute_batch("DROP TABLE consensus_fenced_transition_receipts; DROP TABLE consensus_fenced_transition_activation; ALTER TABLE consensus_identity DROP COLUMN fenced_transition_receipt_ledger_activated;").unwrap();
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_sync(&conn).unwrap(),
+            FencedTransitionReceiptLedgerLayout::Published684
+        );
+        for reader in [
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+        ] {
+            let scope = Scope::new();
+            let result = Sdk741Read {
+                reader,
+                start: 0,
+                end: 2,
+            }
+            .run(&conn);
+            let events = scope.finish();
+            if matches!(reader, Sdk741Reader::Strict) {
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    "persisted fenced transition receipt activation is invalid"
+                );
+                assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 0);
+            } else {
+                assert!(result.unwrap() == entries);
+                assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 3);
+                assert_eq!(log_row_reuse_event_count(&events, Event::Ineligible), 1);
+            }
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 0);
+            assert!(conn.is_autocommit());
+        }
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        tx.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .unwrap();
+        assert_eq!(
+            log_row_reuse_error(read_log_range_for_recovery_sync(
+                &tx,
+                identity(),
+                0,
+                Some(2),
+                Some(8)
+            )),
+            "persisted session consensus log range contains a hole"
+        );
+        assert!(
+            read_physical_log_range_for_recovery_sync(&tx, identity(), 0, Some(2), Some(8))
+                .unwrap()
+                == entries[1..]
+        );
+        assert!(!conn.is_autocommit());
+        tx.rollback().unwrap();
+        assert!(
+            read_log_range_for_recovery_sync(&conn, identity(), 0, Some(2), Some(8)).unwrap()
+                == entries
+        );
+    }
 
     #[test]
     fn durable_log_audit_parallelism_is_fixed_and_skips_small_frontier_advances() {
