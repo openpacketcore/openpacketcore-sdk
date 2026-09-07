@@ -969,15 +969,24 @@ struct ConsensusConnectionLaneState {
     changed: Arc<Notify>,
     reaper_started: AtomicBool,
     in_flight: Semaphore,
+    /// Test-only notification when the reaper clears this lane. Waiters
+    /// recheck the current connection so an earlier retirement cannot satisfy
+    /// a wait after the lane has been reused.
+    #[cfg(test)]
+    retired_for_test: tokio::sync::watch::Sender<()>,
 }
 
 impl ConsensusConnectionLaneState {
     fn new() -> Self {
+        #[cfg(test)]
+        let (retired_for_test, _) = tokio::sync::watch::channel(());
         Self {
             connection: Mutex::new(None),
             changed: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
             in_flight: Semaphore::new(1),
+            #[cfg(test)]
+            retired_for_test,
         }
     }
 }
@@ -1180,6 +1189,8 @@ async fn reap_cached_consensus_connection(
                             )
                             .await;
                     }
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 if consensus_connection_idle_expired(connection, now) {
@@ -1189,6 +1200,8 @@ async fn reap_cached_consensus_connection(
                     let retired = cached.take();
                     drop(cached);
                     drop(retired);
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 Some(
@@ -7205,13 +7218,15 @@ mod tests {
         assert_eq!(superseded, 0);
         assert_eq!(abandoned, 0);
         drop(peer);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < attempts {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= attempts),
+        )
         .await
-        .expect("pool shutdown must settle detached attempt accounting");
+        .expect("pool shutdown must settle detached attempt accounting")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (attempts, attempts, 0, attempts));
     }
 
@@ -9488,16 +9503,26 @@ mod tests {
         );
     }
 
+    /// Waits until the cached-connection reaper empties `lane`.
+    ///
+    /// Subscribe before inspecting the connection to avoid a lost wakeup.
+    /// Recheck after every retirement notification, including when this lane
+    /// was used by an earlier connection. Parking lets a paused clock advance.
     async fn wait_for_cached_lane_to_empty(
         pool: &ConsensusConnectionPool,
         lane: ConsensusConnectionLane,
     ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let lane = pool.lane(lane);
+        let mut retired = lane.retired_for_test.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async move {
             loop {
-                if pool.lane(lane).connection.lock().await.is_none() {
+                if lane.connection.lock().await.is_none() {
                     return;
                 }
-                tokio::task::yield_now().await;
+                retired
+                    .changed()
+                    .await
+                    .expect("lane retirement watch channel must outlive the waiter");
             }
         })
         .await
