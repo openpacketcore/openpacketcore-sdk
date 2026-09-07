@@ -35,9 +35,9 @@ dependencies = [
 
 [[package]]
 name = "aes"
-version = "0.9.3"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35f0f96ce78e38c3dc6d8948aa8163d06385be74000f3c7a95bf1eef35d3ea32"
+checksum = "f1fc76eaeac4c9164506c466d4ffdd8ec9d0c5bf57ee97177c4d8eceb3a0e138"
 dependencies = [
  "cipher 0.5.2",
  "cpubits",
@@ -66,7 +66,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f2b8006a0c83f52b62ba44a97b58bf76fe2f70a329e588f67f89691d93d498f"
 dependencies = [
  "aead 0.6.0",
- "aes 0.9.3",
+ "aes 0.9.1",
  "cipher 0.5.2",
  "ctr 0.10.1",
  "ctutils",
@@ -3363,7 +3363,7 @@ dependencies = [
 name = "opc-proto-ikev2"
 version = "0.2.0"
 dependencies = [
- "aes 0.9.3",
+ "aes 0.9.1",
  "aes-gcm 0.11.1",
  "async-trait",
  "bytes",
@@ -4146,7 +4146,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "279a91971a1d8eb1260a30938eae3be9cb67b472dffecb222fbbbe2fd2dc1453"
 dependencies = [
- "aes 0.9.3",
+ "aes 0.9.1",
  "cbc",
  "der 0.8.2",
  "pbkdf2",
@@ -4940,7 +4940,7 @@ version = "0.62.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8b67b5a0d8068c89dcbe9d95df986af7a851d1f3c604525274c37468e60464f"
 dependencies = [
- "aes 0.9.3",
+ "aes 0.9.1",
  "bitflags",
  "block-padding",
  "byteorder",
@@ -5528,7 +5528,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d801accda99469cde6d73da741422610fdf6508a72d9a69d1b55cb241c720597"
 dependencies = [
  "aead 0.6.0",
- "aes 0.9.3",
+ "aes 0.9.1",
  "aes-gcm 0.11.1",
  "chacha20 0.10.2",
  "cipher 0.5.2",
