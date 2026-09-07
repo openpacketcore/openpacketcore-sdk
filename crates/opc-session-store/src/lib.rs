@@ -162,9 +162,10 @@ pub use consensus::{
     SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-    PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
-    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionTopologyTransportAdmissionError, SnapshotIntegrityPolicy,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,
+    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,

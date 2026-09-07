@@ -29,6 +29,8 @@
 //! deliberately advertised only for fully materialized, non-GSO packets.
 
 use std::cell::RefCell;
+
+mod workload_scope;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 #[cfg(any(target_os = "linux", test))]
@@ -42,6 +44,7 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "linux", test))]
 use std::task::{Context, Poll};
+pub use workload_scope::EbpfWorkloadScope;
 
 use async_trait::async_trait;
 use opc_dataplane_observation::{
@@ -1365,6 +1368,18 @@ fn state_indeterminate(operation: &'static str) -> GtpuError {
 }
 
 pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
+    /// Reconcile one exclusively owned workload graph to absence.
+    fn reset_workload_graph(
+        &self,
+        _ifindex: Option<u32>,
+        _pin_dir: &Path,
+        _tc_priority: u16,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "workload_cleanup",
+        })
+    }
+
     /// Resolve an interface index by name in the current netns.
     fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError>;
 
@@ -14911,6 +14926,8 @@ fn historical_ebpf_recovery_compatibility_kat_frozen(
 mod aya_runtime {
     //! aya-based kernel runtime: loads the committed CO-RE object, attaches
     //! tc clsact filters, and performs pinned BPF map operations.
+
+    mod workload_scope;
 
     use std::collections::{HashMap, HashSet};
     use std::fmt;
@@ -38212,6 +38229,15 @@ mod aya_runtime {
     }
 
     impl EbpfGtpuRuntime for AyaGtpuRuntime {
+        fn reset_workload_graph(
+            &self,
+            ifindex: Option<u32>,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<(), GtpuError> {
+            workload_scope::reset(self, ifindex, pin_dir, tc_priority)
+        }
+
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
             sys::ifindex_by_name(name).map_err(|error| match error.kind() {
                 io::ErrorKind::NotFound => GtpuError::NotFound,

@@ -1612,13 +1612,39 @@ async fn fixed_cluster(
     Vec<std::path::PathBuf>,
     Vec<Arc<ScopedLoopbackPeer>>,
 ) {
-    fixed_cluster_with_snapshot_root(directory, directory, clock).await
+    fixed_cluster_with_snapshot_integrity(
+        directory,
+        directory,
+        clock,
+        opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
+    )
+    .await
 }
 
 async fn fixed_cluster_with_snapshot_root(
     directory: &Path,
     snapshot_root: &Path,
     clock: Arc<dyn Clock>,
+) -> (
+    Vec<ConsensusSessionStore>,
+    Vec<std::path::PathBuf>,
+    Vec<std::path::PathBuf>,
+    Vec<Arc<ScopedLoopbackPeer>>,
+) {
+    fixed_cluster_with_snapshot_integrity(
+        directory,
+        snapshot_root,
+        clock,
+        opc_session_store::SnapshotIntegrityPolicy::FsVerity,
+    )
+    .await
+}
+
+async fn fixed_cluster_with_snapshot_integrity(
+    directory: &Path,
+    snapshot_root: &Path,
+    clock: Arc<dyn Clock>,
+    snapshot_integrity: opc_session_store::SnapshotIntegrityPolicy,
 ) -> (
     Vec<ConsensusSessionStore>,
     Vec<std::path::PathBuf>,
@@ -1666,13 +1692,14 @@ async fn fixed_cluster_with_snapshot_root(
             })
             .collect::<BTreeMap<_, _>>();
         stores.push(
-            ConsensusSessionStore::open_fixed_durable_quorum_with_clock(
+            ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                 topologies[source].clone(),
                 SqliteSessionBackend::open(&database_paths[source]).expect("SQLite voter"),
                 &snapshot_paths[source],
                 peers,
                 Arc::clone(&clock),
                 DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                snapshot_integrity,
             )
             .await
             .expect("open fixed voter"),

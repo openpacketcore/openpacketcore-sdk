@@ -156,6 +156,14 @@ authenticated quarantine backup.
 
 Reuse the same sealed plan, integrity key, exact replica set, confirmation, and
 backup root. Do not delete individual artifacts or create a new source choice.
+Fixed-quorum campaigns also retain their explicitly selected snapshot integrity
+policy. `LegacyForkRecovery::new` keeps the legacy strict fs-verity policy;
+applications using portable verified snapshots must select
+`with_snapshot_integrity(SnapshotIntegrityPolicy::PortableVerified)` before
+planning and reuse it for execution and finalization. The plan and workflow
+authenticate this field, and the live fixed-quorum store must agree during
+finalization. Legacy plans that omit the field keep their strict meaning.
+Changing policy is not a recovery bypass or automatic artifact conversion.
 The workflow authenticates its journal, every target manifest, the immutable
 checkpoint, and the staged image before continuing. Per-file states record
 copy/install intent before creation, rename, and fsync boundaries. A retry
