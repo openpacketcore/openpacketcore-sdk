@@ -24,6 +24,9 @@ use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd, RawFd};
 use std::os::linux::fs::MetadataExt as _;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+#[cfg(target_os = "linux")]
+use super::verified_snapshot::PortableSnapshot;
+use super::SnapshotIntegrityPolicy;
 use crate::fenced_mutation_roster::PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES;
 
 #[cfg(target_os = "linux")]
@@ -736,18 +739,21 @@ pub(crate) struct PinnedSqliteFile {
     path: PathBuf,
     identity: FileIdentity,
     immutable_generation: Option<ImmutableFileGeneration>,
+    #[cfg(target_os = "linux")]
+    portable: Option<Arc<PortableSnapshot>>,
     cleanup: Option<UnpublishedSnapshotArtifact>,
 }
 
-/// Kernel-enforced content, length, and Linux inode-generation authority
+/// Verified logical content, length, and Linux inode-generation authority
 /// bound to a fixed snapshot artifact. This is kept separate from the live
 /// SQLite descriptor identity: SQLite legitimately changes a live database
 /// through another descriptor while a published or install artifact must
 /// never change after it is verified.
 ///
-/// This is deliberately not a userspace hash claim: `digest` is the
-/// fixed-profile fs-verity measurement of the read-only descriptor.  A live
-/// SQLite descriptor must never carry this state.
+/// `digest` identifies either the exact fs-verity measurement or the retained
+/// portable verified-read source. A bare userspace hash is insufficient: the
+/// portable source must verify every later consumed block. A live SQLite
+/// descriptor must never carry this state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ImmutableFileGeneration {
     length: u64,
@@ -1108,6 +1114,20 @@ impl UnpublishedSnapshotArtifact {
 
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// Remove only the exact SDK-created inode and observe durable cleanup.
+    pub(crate) fn remove_owned(&mut self) -> io::Result<()> {
+        if self.sqlite_sidecars || !self.sidecars.is_empty() {
+            return Err(invalid_data(
+                "explicit snapshot cleanup requires a plain artifact",
+            ));
+        }
+        if !Self::remove_if_owned(&mut self.cleanup, self.identity)? {
+            return Err(invalid_data("snapshot cleanup identity changed"));
+        }
+        self.armed = false;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1517,6 +1537,8 @@ impl PinnedSqliteFile {
             path,
             identity,
             immutable_generation: None,
+            #[cfg(target_os = "linux")]
+            portable: None,
             cleanup: None,
         })
     }
@@ -1605,6 +1627,8 @@ impl PinnedSqliteFile {
             path: self.path.clone(),
             identity: self.identity,
             immutable_generation: self.immutable_generation,
+            #[cfg(target_os = "linux")]
+            portable: self.portable.clone(),
             cleanup: None,
         })
     }
@@ -1814,6 +1838,134 @@ impl PinnedSqliteFile {
         self.verify_immutable_generation()
     }
 
+    /// Bind this exact descriptor to the explicitly selected integrity policy.
+    /// Portable capture is a bounded full scan and must run outside the live
+    /// database lock, on a blocking worker. Subsequent reads retain its proof.
+    pub(crate) fn seal_with_integrity(
+        &mut self,
+        policy: SnapshotIntegrityPolicy,
+    ) -> io::Result<()> {
+        match policy {
+            SnapshotIntegrityPolicy::FsVerity => self.seal_fixed(),
+            SnapshotIntegrityPolicy::PortableVerified => self.capture_portable(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_portable(&mut self) -> io::Result<()> {
+        self.verify_linked_identity()?;
+        // Exercise the same worker/primary-lock contract at initial indexing,
+        // before the later authenticated envelope scan and publication fence.
+        #[cfg(test)]
+        block_fixed_prepublication_scan(&self.path);
+        let portable =
+            PortableSnapshot::capture(self.file.try_clone()?, SNAPSHOT_ENVELOPE_MAX_BYTES)?;
+        let metadata = self.file.metadata()?;
+        self.immutable_generation = Some(ImmutableFileGeneration {
+            length: portable.source.length(),
+            digest: portable.source.digest(),
+            change_time: linux_file_change_time(&metadata),
+        });
+        self.portable = Some(portable);
+        self.verify_immutable_generation()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn capture_portable(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "portable snapshots require Linux",
+        ))
+    }
+
+    fn integrity_measurement(&self) -> io::Result<[u8; 32]> {
+        #[cfg(target_os = "linux")]
+        if let Some(portable) = &self.portable {
+            portable.source.validate()?;
+            return Ok(portable.source.digest());
+        }
+        fixed_verity_measurement(&self.file)
+    }
+
+    /// SQLite must use the verified reader, never reopen the underlying file.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn portable_sqlite_uri(&self) -> Option<String> {
+        self.portable.as_ref().map(|portable| portable.sqlite_uri())
+    }
+
+    fn integrity_reader(&self) -> io::Result<PinnedSnapshotReader> {
+        #[cfg(target_os = "linux")]
+        if let Some(portable) = &self.portable {
+            return Ok(PinnedSnapshotReader::Portable(portable.source.reader()));
+        }
+        Ok(PinnedSnapshotReader::File(self.file.try_clone()?))
+    }
+
+    /// Bind an extracted raw SQLite image to its already-validated envelope.
+    /// A newly captured digest index alone cannot authorize different bytes
+    /// written between extraction and admission.
+    pub(crate) fn verify_payload_checksum(&self, expected: [u8; 32]) -> io::Result<()> {
+        self.verify_immutable_generation()?;
+        #[cfg(target_os = "linux")]
+        if let Some(portable) = &self.portable {
+            return if portable.source.digest() == expected {
+                Ok(())
+            } else {
+                Err(invalid_data(
+                    "extracted snapshot checksum differs from its envelope",
+                ))
+            };
+        }
+        let mut reader = self.integrity_reader()?;
+        reader.seek(io::SeekFrom::Start(0))?;
+        let mut hash = sha2::Sha256::new();
+        let mut bytes = zeroize::Zeroizing::new(vec![0; 64 * 1024]);
+        loop {
+            let count = reader.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&bytes[..count]);
+        }
+        let digest: [u8; 32] = hash.finalize().into();
+        self.verify_immutable_generation()?;
+        if digest != expected {
+            return Err(invalid_data(
+                "extracted snapshot checksum differs from its envelope",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit a persisted or recovery-owned artifact without resolving a path.
+    pub(crate) fn from_file_and_verify(
+        file: std::fs::File,
+        path: PathBuf,
+        policy: SnapshotIntegrityPolicy,
+    ) -> io::Result<Self> {
+        match policy {
+            SnapshotIntegrityPolicy::FsVerity => Self::from_file_and_measure_fixed(file, path),
+            SnapshotIntegrityPolicy::PortableVerified => {
+                let mut pinned = Self::from_file(file, path)?;
+                pinned.capture_portable()?;
+                Ok(pinned)
+            }
+        }
+    }
+
+    /// Retain the namespace alongside the verified descriptor and proof.
+    pub(crate) fn from_file_and_verify_in_namespace(
+        file: std::fs::File,
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+        policy: SnapshotIntegrityPolicy,
+    ) -> io::Result<Self> {
+        let mut pinned =
+            Self::from_file_and_verify(file, namespace.sqlite_child_path(name)?, policy)?;
+        pinned.namespace = Some((namespace, name.to_os_string()));
+        Ok(pinned)
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn seal_fixed(&mut self) -> io::Result<()> {
         let _ = self;
@@ -1946,7 +2098,7 @@ impl PinnedSqliteFile {
             )
         })?;
         self.verify_bound_immutable_metadata(expected)?;
-        let digest = fixed_verity_measurement(&self.file)?;
+        let digest = self.integrity_measurement()?;
         if digest == expected.digest {
             Ok(())
         } else {
@@ -2011,7 +2163,7 @@ impl PinnedSqliteFile {
         })?;
         #[cfg(test)]
         block_fixed_prepublication_scan(&self.path);
-        let mut reader = self.file.try_clone()?;
+        let mut reader = self.integrity_reader()?;
         reader.seek(io::SeekFrom::Start(0))?;
         let mut payload_hasher = sha2::Sha256::new();
         let mut trailing = [0_u8; 48];
@@ -2172,7 +2324,7 @@ impl PinnedSqliteFile {
                     "session consensus snapshot immutable length is inconsistent",
                 ));
             }
-            let rebound_digest = fixed_verity_measurement(&self.file)?;
+            let rebound_digest = self.integrity_measurement()?;
             if rebound_digest != sealed_generation.digest {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2242,7 +2394,7 @@ impl PinnedSqliteFile {
         {
             return Err(invalid_data("session consensus snapshot size is invalid"));
         }
-        let mut reader = self.file.try_clone()?;
+        let mut reader = self.integrity_reader()?;
         reader.seek(io::SeekFrom::End(-i64::try_from(footer_bytes).map_err(
             |_| invalid_data("session consensus snapshot footer size is invalid"),
         )?))?;
@@ -2276,7 +2428,7 @@ impl PinnedSqliteFile {
     ///
     /// The bounded scan above remains the sole content authority. This method
     /// deliberately performs only descriptor identity/link, pathname identity,
-    /// fs-verity measurement, length, and Linux kernel change-time generation
+    /// retained integrity-source measurement, length, and Linux change-time
     /// checks so SQLite's mutex need not cover a second full-file hash.
     pub(crate) fn verify_bound_immutable_snapshot_envelope(
         &self,
@@ -2525,6 +2677,32 @@ impl fmt::Debug for PinnedSqliteFile {
     }
 }
 
+pub(crate) enum PinnedSnapshotReader {
+    File(std::fs::File),
+    #[cfg(target_os = "linux")]
+    Portable(super::verified_snapshot::VerifiedReader),
+}
+
+impl io::Read for PinnedSnapshotReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buffer),
+            #[cfg(target_os = "linux")]
+            Self::Portable(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl io::Seek for PinnedSnapshotReader {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::File(file) => file.seek(position),
+            #[cfg(target_os = "linux")]
+            Self::Portable(reader) => reader.seek(position),
+        }
+    }
+}
+
 /// A seekable, chunkable snapshot file and its SDK-controlled staging path.
 pub(crate) struct SessionSnapshotFile {
     file: tokio::fs::File,
@@ -2546,6 +2724,12 @@ pub(crate) struct SessionSnapshotFile {
     seek_in_flight: bool,
     replay: Option<SnapshotReplayRead>,
     io_poisoned: bool,
+    #[cfg(target_os = "linux")]
+    portable: Option<Arc<PortableSnapshot>>,
+    #[cfg(target_os = "linux")]
+    verified_read: Option<tokio::task::JoinHandle<io::Result<VerifiedReadBuffer>>>,
+    #[cfg(target_os = "linux")]
+    verified_ready: Option<VerifiedReadBuffer>,
 }
 
 /// An owned block read while proving a sender retry matches accepted bytes.
@@ -3258,6 +3442,12 @@ fn remove_snapshot_cleanup_if_owned(
     ))
 }
 
+#[cfg(target_os = "linux")]
+struct VerifiedReadBuffer {
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    _memory: super::verified_snapshot::VerificationMemory,
+}
+
 #[allow(dead_code)]
 impl SessionSnapshotFile {
     /// Create a new receiving file. Existing data is never reused.
@@ -3432,12 +3622,39 @@ impl SessionSnapshotFile {
             seek_in_flight: false,
             replay: None,
             io_poisoned: false,
+            #[cfg(target_os = "linux")]
+            portable: None,
+            #[cfg(target_os = "linux")]
+            verified_read: None,
+            #[cfg(target_os = "linux")]
+            verified_ready: None,
         })
     }
 
     /// Convert an already-open standard file without resolving its path again.
     pub(crate) async fn from_std(file: std::fs::File, path: PathBuf) -> io::Result<Self> {
         Self::from_file(tokio::fs::File::from_std(file), path).await
+    }
+
+    /// Transfer a pinned image without dropping its verified-read authority.
+    pub(crate) async fn from_pinned(pinned: PinnedSqliteFile, path: PathBuf) -> io::Result<Self> {
+        // Admission/publication already fenced the namespace. Do not repeat
+        // that fence after a durable commit: a later pathname replacement
+        // cannot change the bytes in the retained strict sealed descriptor.
+        // Portable consumption still verifies through its retained source.
+        if !pinned.has_immutable_generation() {
+            return Err(invalid_data("snapshot transfer has no integrity authority"));
+        }
+        #[cfg(target_os = "linux")]
+        let portable = pinned.portable.clone();
+        let snapshot = Self::from_std(pinned.into_file(), path).await?;
+        #[cfg(target_os = "linux")]
+        let snapshot = {
+            let mut snapshot = snapshot;
+            snapshot.portable = portable;
+            snapshot
+        };
+        Ok(snapshot)
     }
 
     /// SDK-controlled path associated with this handle.
@@ -3481,6 +3698,10 @@ impl SessionSnapshotFile {
         cloned.extent = self.extent;
         cloned.receiving = self.receiving;
         cloned.receive_limit_exceeded = self.receive_limit_exceeded;
+        #[cfg(target_os = "linux")]
+        {
+            cloned.portable = self.portable.clone();
+        }
         Ok(cloned)
     }
 
@@ -3491,12 +3712,6 @@ impl SessionSnapshotFile {
             Some(cleanup) => cleanup.remove().await,
             None => Ok(()),
         }
-    }
-
-    /// Consume the wrapper and return the already-open Tokio file.
-    pub(crate) fn into_file(self) -> io::Result<tokio::fs::File> {
-        self.receiving_file_access()?;
-        Ok(self.file)
     }
 
     /// Consume the wrapper and return the already-open standard file.
@@ -3528,6 +3743,13 @@ impl SessionSnapshotFile {
     }
 
     fn receiving_file_access(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.portable.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "verified snapshot cannot expose unchecked file reads",
+            ));
+        }
         if self._receive_admission.is_some() {
             Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -3798,6 +4020,10 @@ impl AsyncRead for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        #[cfg(target_os = "linux")]
+        if self.portable.is_some() {
+            return self.poll_verified_read(cx, buf);
+        }
         match self.as_mut().poll_reconcile_before_other_action(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -3810,6 +4036,87 @@ impl AsyncRead for SessionSnapshotFile {
             )));
         }
         Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SessionSnapshotFile {
+    fn poll_verified_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        use std::future::Future as _;
+        if self.seek_in_flight {
+            match self.as_mut().poll_complete(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if self.io_poisoned {
+            return Poll::Ready(Err(self.poisoned_error()));
+        }
+        if output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.verified_read.is_none() && self.verified_ready.is_none() {
+            let Some(portable) = self.portable.clone() else {
+                return Poll::Ready(Err(invalid_data("verified snapshot proof is absent")));
+            };
+            let offset = self.cursor;
+            let length = usize::try_from(portable.source.length().saturating_sub(offset))
+                .unwrap_or(usize::MAX)
+                .min(output.remaining())
+                .min(64 * 1024);
+            let memory = match super::verified_snapshot::VerificationMemory::reserve(64 * 1024) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    self.poison();
+                    return Poll::Ready(Err(error));
+                }
+            };
+            self.verified_read = Some(tokio::task::spawn_blocking(move || {
+                portable.source.validate()?;
+                let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
+                if length != 0 {
+                    portable.source.read_exact_at(offset, &mut bytes)?;
+                }
+                Ok(VerifiedReadBuffer {
+                    bytes,
+                    _memory: memory,
+                })
+            }));
+        }
+        if let Some(read) = self.verified_read.as_mut() {
+            match Pin::new(read).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.verified_read = None;
+                    match result
+                        .map_err(|_| io::Error::other("verified snapshot reader worker failed"))
+                        .and_then(|result| result)
+                    {
+                        Ok(bytes) => self.verified_ready = Some(bytes),
+                        Err(error) => {
+                            self.poison();
+                            return Poll::Ready(Err(error));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(mut bytes) = self.verified_ready.take() {
+            // Polling may resume with a smaller buffer after cancellation.
+            let count = bytes.bytes.len().min(output.remaining());
+            output.put_slice(&bytes.bytes[..count]);
+            self.cursor += count as u64;
+            if count < bytes.bytes.len() {
+                bytes.bytes.drain(..count);
+                self.verified_ready = Some(bytes);
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -3951,12 +4258,34 @@ impl AsyncSeek for SessionSnapshotFile {
         if target > self.received_maximum {
             return Err(self.receive_limit_error("snapshot seek exceeds size limit"));
         }
+        #[cfg(target_os = "linux")]
+        if self.portable.is_some() {
+            // A cancelled read owns no caller buffer and never advances the
+            // logical cursor. Drain its bounded worker before replacing it.
+            // The next read discards its result if a seek intervened.
+            self.verified_ready = None;
+            self.cursor = target;
+            self.seek_in_flight = true;
+            return Ok(());
+        }
         Pin::new(&mut self.file).start_seek(io::SeekFrom::Start(target))?;
         self.seek_in_flight = true;
         Ok(())
     }
 
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        #[cfg(target_os = "linux")]
+        if self.portable.is_some() {
+            use std::future::Future as _;
+            if let Some(read) = self.verified_read.as_mut() {
+                if Pin::new(read).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.verified_read = None;
+            }
+            self.seek_in_flight = false;
+            return Poll::Ready(Ok(self.cursor));
+        }
         match Pin::new(&mut self.file).poll_complete(cx) {
             Poll::Ready(Ok(position)) if position <= self.received_maximum => {
                 self.cursor = position;
@@ -4006,6 +4335,100 @@ mod tests {
     };
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn portable_transport_cancelled_read_seek_and_clones_preserve_verified_cursor() {
+        use tokio::io::AsyncRead as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single-worker test runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("portable transport directory");
+            let path = directory.path().join("snapshot.opc");
+            let expected = (0..(160 * 1024))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            std::fs::write(&path, &expected).expect("transport fixture");
+            let pinned = PinnedSqliteFile::from_file_and_verify(
+                std::fs::File::open(&path).expect("transport descriptor"),
+                path.clone(),
+                crate::SnapshotIntegrityPolicy::PortableVerified,
+            )
+            .expect("transport proof");
+            let mut reader = SessionSnapshotFile::from_pinned(pinned, path)
+                .await
+                .expect("verified transport");
+            let mut large = vec![0; 64 * 1024];
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let entered_worker = Arc::clone(&entered);
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_worker.notify_one();
+                wait.recv().expect("release blocking lane");
+            });
+            entered.notified().await;
+            // Poll one read, then abandon its future/buffer. A subsequent poll
+            // may supply a smaller buffer; the verified result must not be lost.
+            std::future::poll_fn(|cx| {
+                let mut output = tokio::io::ReadBuf::new(&mut large);
+                let _ = Pin::new(&mut reader).poll_read(cx, &mut output);
+                assert!(
+                    output.filled().is_empty(),
+                    "the first poll starts the blocking read"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            release.send(()).expect("allow pending read to proceed");
+            blocker.await.expect("blocking lane released");
+            let mut small = [0; 7];
+            reader
+                .read_exact(&mut small)
+                .await
+                .expect("resume cancelled read with smaller buffer");
+            assert_eq!(&expected[..7], &small);
+            let mut clone = reader
+                .try_clone()
+                .await
+                .expect("independent verified cursor");
+            let mut tail = Vec::new();
+            reader
+                .read_to_end(&mut tail)
+                .await
+                .expect("read retained result and suffix");
+            assert_eq!(&expected[7..], tail);
+            clone
+                .read_exact(&mut small)
+                .await
+                .expect("clone retains logical offset");
+            assert_eq!(&expected[7..14], &small);
+            clone
+                .seek(io::SeekFrom::Start(100_000))
+                .await
+                .expect("verified seek");
+            std::future::poll_fn(|cx| {
+                let mut output = tokio::io::ReadBuf::new(&mut large);
+                let _ = Pin::new(&mut clone).poll_read(cx, &mut output);
+                std::task::Poll::Ready(())
+            })
+            .await;
+            clone
+                .seek(io::SeekFrom::Start(23))
+                .await
+                .expect("seek drains abandoned worker");
+            clone
+                .read_exact(&mut small)
+                .await
+                .expect("read from new logical position");
+            assert_eq!(&expected[23..30], &small);
+            assert!(clone.file().is_err());
+            assert!(clone.file_mut().is_err());
+            assert!(clone.into_std().await.is_err());
+        });
+    }
 
     #[test]
     fn physical_snapshot_ceiling_covers_the_frozen_roster_ledger_without_overflow() {

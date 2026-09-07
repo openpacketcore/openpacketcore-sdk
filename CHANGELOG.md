@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
+  workload scopes select separate bpffs roots and local writer locks. An
+  explicit stopped-generation reset reclaims only the unbound current IPv4
+  interface graph, including recognized partial pin sets, while refusing live
+  writers, foreign program references and permanent selector history. Cleanup
+  is local to the node; no resident agent or cluster API is introduced.
+- **Explicit portable fixed-quorum snapshot integrity — `opc-session-store`:**
+  adds an explicit `PortableVerified` policy with bounded descriptor-pinned
+  verified reads for transport, SQLite installation, restart, and offline
+  recovery. Fixed membership, placement, fencing, and the snapshot envelope
+  remain unchanged. Existing fixed-quorum openers retain strict fs-verity and
+  now reject unavailable sealing support during admission. Recovery plans and
+  workflows authenticate the policy; omitted legacy fields remain strict.
+  Older strict readers cannot reopen new unsealed snapshots. See ADR 0020 and
+  issue #771 for qualification and rollout constraints.
 - **Redaction-safe SCTP connect progress snapshots — `opc-sctp`:** additive
   handle/future connect APIs expose only the furthest monotonic connector
   stage (socket/options/bind/remote submission/connect completion/readiness/

@@ -29,9 +29,9 @@ use opc_session_store::{
     SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
     SessionTopologyTransitionId, SessionTopologyTransitionRequest,
     SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
-    SessionTopologyUniformCommitAdmissionProof, SqliteSessionBackend, TopologyAttestationClaims,
-    TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationProvenance,
-    TopologyAttestationTime, TopologyAttestationVerificationError,
+    SessionTopologyUniformCommitAdmissionProof, SnapshotIntegrityPolicy, SqliteSessionBackend,
+    TopologyAttestationClaims, TopologyAttestationEvidence, TopologyAttestationPolicy,
+    TopologyAttestationProvenance, TopologyAttestationTime, TopologyAttestationVerificationError,
     TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
 };
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -573,6 +573,81 @@ async fn fixed_placement_policy_changes_authenticated_scope_before_durable_open(
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn strict_snapshot_admission_fails_before_raft_and_portable_is_explicit() {
+    use opc_session_store::SnapshotIntegrityPolicy;
+    let directory = tempfile::Builder::new()
+        .prefix("snapshot-admission-")
+        .tempdir_in("/dev/shm")
+        .expect("filesystem without fs-verity");
+    let database = directory.path().join("voter.sqlite");
+    let snapshots = directory.path().join("snapshots");
+    let topology = fixed_topology_for_local(
+        0,
+        fixed_members(3),
+        PlacementResiliencePolicy::RequireIndependentFailureDomains,
+    )
+    .expect("fixed topology");
+    for legacy in [true, false] {
+        let backend = SqliteSessionBackend::open(&database).expect("backend");
+        let result = if legacy {
+            ConsensusSessionStore::open_fixed_durable_quorum(
+                topology.clone(),
+                backend,
+                &snapshots,
+                scoped_peers(&topology),
+            )
+            .await
+        } else {
+            ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+                topology.clone(),
+                backend,
+                &snapshots,
+                scoped_peers(&topology),
+                SnapshotIntegrityPolicy::FsVerity,
+            )
+            .await
+        };
+        assert_eq!(
+            ConsensusSessionStoreOpenError::SnapshotIntegrityUnavailable,
+            result.expect_err("strict policy must fail during admission")
+        );
+        let conn = rusqlite::Connection::open(&database).expect("inspect failed admission");
+        let initialized: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'consensus_identity')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect consensus initialization");
+        assert!(
+            !initialized,
+            "strict capability failure precedes durable Raft initialization"
+        );
+        assert_eq!(
+            0,
+            std::fs::read_dir(&snapshots)
+                .expect("probe cleanup")
+                .count()
+        );
+    }
+    let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+        topology.clone(),
+        SqliteSessionBackend::open(&database).expect("portable backend"),
+        &snapshots,
+        scoped_peers(&topology),
+        SnapshotIntegrityPolicy::PortableVerified,
+    )
+    .await
+    .expect("explicit portable admission on the same filesystem");
+    assert_eq!(
+        Some(SnapshotIntegrityPolicy::PortableVerified),
+        store.snapshot_integrity_policy()
+    );
+    store.shutdown().await.expect("shutdown portable admission");
+}
+
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn fixed_durable_quorum_rejects_unsupported_platform_before_durable_initialization() {
@@ -684,12 +759,13 @@ async fn open_fixed_cluster_with_members(
             })
             .collect::<BTreeMap<_, _>>();
         stores.push(
-            ConsensusSessionStore::open_fixed_durable_quorum(
+            ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
                 topology,
                 SqliteSessionBackend::open(directory.path().join(format!("voter-{source}.sqlite")))
                     .expect("file-backed voter store"),
                 directory.path().join(format!("snapshots-{source}")),
                 peers,
+                SnapshotIntegrityPolicy::PortableVerified,
             )
             .await
             .expect("open fixed cluster voter"),
@@ -731,14 +807,45 @@ async fn open_fixed_cluster_in_with_paths(
     Vec<ConsensusSessionStore>,
     BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
 ) {
-    open_fixed_cluster_in_separate_paths(directory, directory, member_count, placement_policy).await
+    // Authority tests run on ordinary storage with an explicit policy;
+    // dedicated sealed-snapshot tests use the strict wrapper below.
+    open_fixed_cluster_in_separate_paths_with_integrity(
+        directory,
+        directory,
+        member_count,
+        placement_policy,
+        SnapshotIntegrityPolicy::PortableVerified,
+    )
+    .await
 }
 
+#[cfg(all(target_os = "linux", feature = "test-control"))]
 async fn open_fixed_cluster_in_separate_paths(
     database_directory: &std::path::Path,
     snapshot_directory: &std::path::Path,
     member_count: usize,
     placement_policy: PlacementResiliencePolicy,
+) -> (
+    Vec<PathBuf>,
+    Vec<ConsensusSessionStore>,
+    BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
+    open_fixed_cluster_in_separate_paths_with_integrity(
+        database_directory,
+        snapshot_directory,
+        member_count,
+        placement_policy,
+        SnapshotIntegrityPolicy::FsVerity,
+    )
+    .await
+}
+
+async fn open_fixed_cluster_in_separate_paths_with_integrity(
+    database_directory: &std::path::Path,
+    snapshot_directory: &std::path::Path,
+    member_count: usize,
+    placement_policy: PlacementResiliencePolicy,
+    snapshot_integrity: SnapshotIntegrityPolicy,
 ) -> (
     Vec<PathBuf>,
     Vec<ConsensusSessionStore>,
@@ -787,11 +894,12 @@ async fn open_fixed_cluster_in_separate_paths(
                 (node_ids[target], peer)
             })
             .collect::<BTreeMap<_, _>>();
-        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology,
             SqliteSessionBackend::open(&database_paths[source]).expect("file-backed voter store"),
             snapshot_directory.join(format!("snapshots-{source}")),
             peers,
+            snapshot_integrity,
         )
         .await
         .expect("open fixed cluster voter");
@@ -1199,7 +1307,7 @@ async fn file_backed_fixed_five_voter_quorum_reaches_granted_authority() {
                 (node_ids[target], peer)
             })
             .collect::<BTreeMap<_, _>>();
-        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology,
             SqliteSessionBackend::open(
                 directory
@@ -1209,6 +1317,7 @@ async fn file_backed_fixed_five_voter_quorum_reaches_granted_authority() {
             .expect("file-backed voter store"),
             directory.path().join(format!("snapshots-{source}")),
             peers,
+            SnapshotIntegrityPolicy::PortableVerified,
         )
         .await
         .expect("open fixed five-voter store");
@@ -1314,6 +1423,82 @@ async fn fixed_quorum_reopen_migrates_each_released_cursor_only_recovery_schema(
             "fixed-voter reopen must migrate schema"
         );
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+#[tokio::test]
+async fn portable_fixed_three_voter_quorum_snapshots_and_reopens_with_authority() {
+    let policy = PlacementResiliencePolicy::AllowReducedResilience;
+    let (directory, database_paths, stores, paths) = open_fixed_cluster_with_paths(3, policy).await;
+    for store in &stores {
+        assert_eq!(
+            Some(SnapshotIntegrityPolicy::PortableVerified),
+            store.snapshot_integrity_policy()
+        );
+        trigger_consensus_snapshot_for_test(store)
+            .await
+            .expect("capture portable fixed snapshot");
+    }
+    // The engine trigger acknowledges scheduling, not durable publication.
+    // Require every voter to finish publishing before inspecting its image.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for database in &database_paths {
+            loop {
+                let connection = rusqlite::Connection::open(database)
+                    .expect("inspect portable snapshot publication");
+                let published: bool = connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM consensus_snapshot WHERE singleton = 1)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read portable publication state");
+                drop(connection);
+                if published {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .expect("all portable fixed snapshots must publish within the test deadline");
+    let selected = database_paths
+        .iter()
+        .enumerate()
+        .map(|(index, database)| {
+            let path = fixed_current_snapshot_path(
+                database,
+                &directory.path().join(format!("snapshots-{index}")),
+            );
+            let bytes = std::fs::read(&path).expect("published portable image");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
+    drop(stores);
+    drop(paths);
+    let (_, reopened, paths) = open_fixed_cluster_in_with_paths(directory.path(), 3, policy).await;
+    for store in &reopened {
+        assert_eq!(
+            Some(SnapshotIntegrityPolicy::PortableVerified),
+            store.snapshot_integrity_policy()
+        );
+        assert_eq!(
+            FixedQuorumTrafficAuthority::Granted,
+            store
+                .probe_fixed_durable_quorum_readiness_at(
+                    TopologyAttestationTime::from_unix_seconds(1)
+                )
+                .await
+                .traffic_authority(),
+            "verified snapshot reopen preserves fixed-quorum traffic authority"
+        );
+    }
+    for (path, bytes) in selected {
+        assert_eq!(bytes, std::fs::read(path).expect("reopened selected image"));
+    }
+    shutdown_fixed_cluster_for_reopen(&reopened, &paths).await;
 }
 
 /// Exercise the public fixed-quorum open path against the exact predecessor
@@ -1535,11 +1720,12 @@ async fn fixed_durable_quorum_reopen_rejects_placement_policy_mismatch() {
         drop(paths);
         let members = fixed_members(3);
         let topology = fixed_topology_for_local(0, members, reopened).expect("reopen topology");
-        let error = ConsensusSessionStore::open_fixed_durable_quorum(
+        let error = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),
             SqliteSessionBackend::open(&database_paths[0]).expect("reopen backend"),
             directory.path().join("snapshots-0"),
             scoped_peers(&topology),
+            SnapshotIntegrityPolicy::PortableVerified,
         )
         .await
         .expect_err("fixed placement policy must be durably bound");
@@ -1555,12 +1741,13 @@ async fn fixed_five_voter_store_without_a_majority_reports_no_quorum() {
     let topology = fixed_topology(fixed_members(5)).expect("fixed five-voter topology");
     let peers = scoped_peers(&topology);
     let directory = tempfile::tempdir().expect("fixed five-voter directory");
-    let store = ConsensusSessionStore::open_fixed_durable_quorum(
+    let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
         topology,
         SqliteSessionBackend::open(directory.path().join("fixed-voter.sqlite"))
             .expect("file-backed voter store"),
         directory.path().join("snapshots"),
         peers,
+        SnapshotIntegrityPolicy::PortableVerified,
     )
     .await
     .expect("open fixed five-voter store");
@@ -2304,12 +2491,13 @@ async fn fixed_quorum_rejects_every_dynamic_transition_entry_point() {
     let identity = topology.consensus_identity().expect("consensus identity");
     let peers = scoped_peers(&topology);
     let directory = tempfile::tempdir().expect("fixed quorum directory");
-    let store = ConsensusSessionStore::open_fixed_durable_quorum(
+    let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
         topology,
         SqliteSessionBackend::open(directory.path().join("fixed-voter.sqlite"))
             .expect("file-backed voter store"),
         directory.path().join("snapshots"),
         peers,
+        SnapshotIntegrityPolicy::PortableVerified,
     )
     .await
     .expect("open fixed durable quorum");
@@ -2357,11 +2545,12 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     let fixed_database = directory.path().join("fixed.sqlite");
     let dynamic_database = directory.path().join("dynamic.sqlite");
 
-    let fixed_store = ConsensusSessionStore::open_fixed_durable_quorum(
+    let fixed_store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
         fixed.clone(),
         SqliteSessionBackend::open(&fixed_database).expect("file-backed fixed store"),
         directory.path().join("fixed-snapshots"),
         scoped_peers(&fixed),
+        SnapshotIntegrityPolicy::PortableVerified,
     )
     .await
     .expect("open fixed store");
@@ -2370,11 +2559,12 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
         .await
         .expect("drain fixed store before durable reopen");
     drop(fixed_store);
-    let fixed_reopened = ConsensusSessionStore::open_fixed_durable_quorum(
+    let fixed_reopened = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
         fixed.clone(),
         SqliteSessionBackend::open(&fixed_database).expect("file-backed fixed store"),
         directory.path().join("fixed-snapshots"),
         scoped_peers(&fixed),
+        SnapshotIntegrityPolicy::PortableVerified,
     )
     .await
     .expect("reopen fixed store with its persisted authority profile");
@@ -2408,13 +2598,15 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
         .await
         .expect("drain dynamic store before profile mismatch probe");
     drop(dynamic_store);
-    let dynamic_as_fixed = ConsensusSessionStore::open_fixed_durable_quorum(
-        fixed.clone(),
-        SqliteSessionBackend::open(dynamic_database).expect("file-backed dynamic store"),
-        directory.path().join("dynamic-snapshots"),
-        scoped_peers(&fixed),
-    )
-    .await;
+    let dynamic_as_fixed =
+        ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+            fixed.clone(),
+            SqliteSessionBackend::open(dynamic_database).expect("file-backed dynamic store"),
+            directory.path().join("dynamic-snapshots"),
+            scoped_peers(&fixed),
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
     assert!(matches!(
         dynamic_as_fixed,
         Err(ConsensusSessionStoreOpenError::DurableIdentityMismatch)
@@ -2504,11 +2696,12 @@ async fn placement_expiry_downgrades_only_the_fixed_quorum_placement_result() {
                 .join(format!("fixed-voter-{source}.sqlite")),
         )
         .expect("file-backed voter store");
-        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology,
             backend,
             directory.path().join(format!("snapshots-{source}")),
             peers,
+            SnapshotIntegrityPolicy::PortableVerified,
         )
         .await
         .expect("open fixed durable quorum voter");

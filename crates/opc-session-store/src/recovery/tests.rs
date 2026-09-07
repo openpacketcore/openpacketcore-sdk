@@ -345,6 +345,7 @@ fn sealed_test_plan<A: RecoveryAuthorizer>(
     let source_fixed_placement_policy = source.fixed_placement_policy;
     let source_protected_roster_digest = source.protected_roster_digest;
     let body = RecoveryPlanBody {
+        snapshot_integrity: manager.snapshot_integrity,
         version: RECOVERY_PLAN_VERSION,
         identity,
         expected_members: BTreeSet::from([node]),
@@ -623,6 +624,28 @@ fn two_branch_legacy_dry_run_is_deterministic_redacted_and_non_mutating() {
             .collect::<Vec<_>>()
     );
     let encoded = serde_json::to_string(&plan).expect("serialize redacted plan");
+    assert!(
+        !encoded.contains("snapshot_integrity"),
+        "legacy strict plans retain their canonical shape"
+    );
+    let decoded: RecoveryPlan =
+        serde_json::from_str(&encoded).expect("read legacy plan without policy");
+    assert_eq!(
+        crate::SnapshotIntegrityPolicy::FsVerity,
+        decoded.snapshot_integrity_policy()
+    );
+    assert_eq!(
+        encoded,
+        serde_json::to_string(&decoded).expect("unchanged strict serialization")
+    );
+    verify_plan(&manager.integrity_key, &decoded).expect("legacy plan seal remains valid");
+    let mut tampered = decoded;
+    tampered.body.snapshot_integrity = crate::SnapshotIntegrityPolicy::PortableVerified;
+    assert_eq!(
+        Err(RecoveryError::StalePlan),
+        verify_plan(&manager.integrity_key, &tampered),
+        "policy changes invalidate the authenticated plan"
+    );
     assert!(!encoded.contains(first_id.as_str()));
     assert!(!encoded.contains(second_id.as_str()));
     assert!(!encoded.contains(third_id.as_str()));
@@ -1421,6 +1444,7 @@ fn inspection_enforces_database_value_row_and_deadline_budgets() {
     ] {
         assert_eq!(
             inspect_replica(InspectionInput {
+                snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
                 key: &key,
                 replica: &replica,
                 identity: identity(),
@@ -1469,6 +1493,7 @@ fn current_recovery_inspection_enforces_the_consensus_payload_cap() {
 
     assert_eq!(
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -1509,6 +1534,7 @@ fn current_recovery_rejects_a_regressed_lease_allocator() {
 
     assert_eq!(
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -1582,6 +1608,7 @@ fn recovery_inspection_rejects_invalid_legacy_lease_semantics() {
 
         assert_eq!(
             inspect_replica(InspectionInput {
+                snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
                 key: &integrity_key(),
                 replica: &replica,
                 identity: identity(),
@@ -1853,6 +1880,7 @@ fn current_recovery_capacity_masks_retained_purged_prefix() {
 
     let limits = bounded_current_recovery_limits(&replica);
     let before = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &integrity_key(),
         replica: &replica,
         identity: identity(),
@@ -1869,6 +1897,7 @@ fn current_recovery_capacity_masks_retained_purged_prefix() {
     drop(conn);
 
     let after = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &integrity_key(),
         replica: &replica,
         identity: identity(),
@@ -1903,6 +1932,7 @@ fn current_recovery_capacity_rejects_an_oversized_authoritative_suffix() {
 
     assert_eq!(
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -3021,6 +3051,7 @@ fn inspect_current_fixture(
     members: &BTreeSet<SessionConsensusNodeId>,
 ) -> Result<RecoveryReplicaEvidence, RecoveryError> {
     inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &integrity_key(),
         replica,
         identity: identity(),
@@ -3420,6 +3451,7 @@ fn current_recovery_inspection_rejects_malformed_fenced_receipt_response_json() 
 
     assert_eq!(
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -3449,6 +3481,7 @@ fn current_recovery_inspection_rejects_partial_receipt_commitment_schema() {
 
         assert_eq!(
             inspect_replica(InspectionInput {
+                snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
                 key: &integrity_key(),
                 replica: &replica,
                 identity: identity(),
@@ -3485,6 +3518,7 @@ fn current_recovery_inspection_rejects_empty_and_populated_precommitment_receipt
         drop(conn);
 
         let inspected = inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -3520,6 +3554,7 @@ fn current_recovery_inspection_rejects_premature_fenced_receipt_tombstone() {
 
     assert_eq!(
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -3554,6 +3589,7 @@ fn current_recovery_inspection_rejects_fenced_receipt_beyond_durable_floors() {
 
     assert_eq!(
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -3589,6 +3625,7 @@ fn current_recovery_inspection_accepts_pre_ledger_replica() {
     drop(conn);
 
     inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &integrity_key(),
         replica: &replica,
         identity: identity(),
@@ -3694,6 +3731,7 @@ fn inspect_sealed_protected_roster_v2_fixture(
     members: &BTreeSet<SessionConsensusNodeId>,
 ) -> Result<RecoveryReplicaEvidence, RecoveryError> {
     inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &integrity_key(),
         replica,
         identity: fixture_identity,
@@ -4253,6 +4291,7 @@ fn current_recovery_inspection_normalizes_exact_pre_acquisition_lease_schema() {
         drop(conn);
 
         let inspected = inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -4270,6 +4309,7 @@ fn current_recovery_inspection_normalizes_exact_pre_acquisition_lease_schema() {
                 .expect("writable migration adds non-authoritative marker"),
         );
         let migrated = inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -4751,6 +4791,7 @@ async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint(
         .into_iter()
         .map(|index| {
             inspect_replica(InspectionInput {
+                snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
                 key: &manager.integrity_key,
                 replica: &replicas[index],
                 identity: identity(),
@@ -4781,6 +4822,7 @@ async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint(
         .into_iter()
         .map(|index| {
             inspect_replica(InspectionInput {
+                snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
                 key: &manager.integrity_key,
                 replica: &replicas[index],
                 identity: identity(),
@@ -4793,6 +4835,7 @@ async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint(
     assert_eq!(majority_after, majority_before);
 
     let repaired = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &replicas[2],
         identity: identity(),
@@ -4899,6 +4942,7 @@ fn current_recovery_rejects_divergent_retained_prefix_even_with_a_current_snapsh
 
     let manager = recovery(AllowRecovery);
     let source_with_snapshot = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &replicas[0],
         identity: identity(),
@@ -4915,6 +4959,7 @@ fn current_recovery_rejects_divergent_retained_prefix_even_with_a_current_snapsh
     std::fs::remove_file(replicas[0].snapshot_directory.join(file_name))
         .expect("remove non-authoritative source snapshot");
     let source_without_snapshot = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &replicas[0],
         identity: identity(),
@@ -4928,6 +4973,7 @@ fn current_recovery_rejects_divergent_retained_prefix_even_with_a_current_snapsh
     );
 
     let voter = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &replicas[1],
         identity: identity(),
@@ -5052,6 +5098,7 @@ fn current_recovery_does_not_copy_a_redundant_historical_source_snapshot() {
     drop(conn);
 
     let source_evidence = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &replicas[0],
         identity: identity(),
@@ -5060,6 +5107,7 @@ fn current_recovery_does_not_copy_a_redundant_historical_source_snapshot() {
     })
     .expect("inspect source with a source-local historical snapshot");
     let voter_evidence = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &replicas[1],
         identity: identity(),
@@ -5072,6 +5120,7 @@ fn current_recovery_does_not_copy_a_redundant_historical_source_snapshot() {
         "a snapshot below the physically retained commit is not branch evidence"
     );
     let target_evidence = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &replicas[2],
         identity: identity(),
@@ -5142,6 +5191,21 @@ fn current_recovery_does_not_copy_a_redundant_historical_source_snapshot() {
 
 #[test]
 fn current_recovery_carries_an_authoritative_snapshot_boundary_across_resume() {
+    snapshot_boundary_recovery_across_resume(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn portable_fixed_recovery_carries_snapshot_boundary_across_resume() {
+    snapshot_boundary_recovery_across_resume(true);
+}
+
+fn snapshot_boundary_recovery_across_resume(portable_fixed: bool) {
+    let policy = if portable_fixed {
+        crate::SnapshotIntegrityPolicy::PortableVerified
+    } else {
+        crate::SnapshotIntegrityPolicy::FsVerity
+    };
     let temp = tempfile::tempdir().expect("temporary directory");
     let backup = private_tempdir();
     let ids = [
@@ -5207,7 +5271,15 @@ fn current_recovery_carries_an_authoritative_snapshot_boundary_across_resume() {
             .expect("checkpoint snapshot boundary fixture");
     }
 
-    let manager = recovery(AllowRecovery);
+    if portable_fixed {
+        for replica in &replicas {
+            let conn = Connection::open(&replica.database_path).expect("open fixed fixture");
+            conn.execute_batch(
+                "UPDATE consensus_identity SET authority_profile = 2, fixed_placement_policy = 1 WHERE singleton = 1; PRAGMA wal_checkpoint(TRUNCATE);",
+            ).expect("materialize fixed authority fixture without altering membership");
+        }
+    }
+    let manager = recovery(AllowRecovery).with_snapshot_integrity(policy);
     assert!(
         matches!(
             manager.plan(
@@ -5247,6 +5319,25 @@ fn current_recovery_carries_an_authoritative_snapshot_boundary_across_resume() {
             RecoveryLimits::default(),
         )
         .expect("exact snapshot-boundary majority");
+    assert_eq!(policy, plan.snapshot_integrity_policy());
+    if portable_fixed {
+        assert_eq!(
+            RecoveryAuthorityProfile::FixedImmutable,
+            plan.body.source_authority_profile
+        );
+        assert_eq!(
+            Err(RecoveryError::StalePlan),
+            recovery(AllowRecovery).execute(
+                &context(),
+                &plan,
+                &RecoveryConfirmation::verified(&plan),
+                &replicas,
+                backup.path(),
+                RecoveryLimits::default(),
+            ),
+            "a strict manager must not resume a portable campaign"
+        );
+    }
     let targets = replicas[2..].iter().collect::<Vec<_>>();
     // Force the selected target leaf through `Present`: its arbitrary prior
     // inode is authenticated in the workflow and must be removed only by the
@@ -5682,6 +5773,7 @@ async fn activated_current_checkpoint_recovery_preserves_fenced_transition_evide
         .into_iter()
         .map(|index| {
             inspect_replica(InspectionInput {
+                snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
                 key: &manager.integrity_key,
                 replica: &replicas[index],
                 identity: identity(),
@@ -5743,6 +5835,7 @@ async fn activated_current_checkpoint_recovery_preserves_fenced_transition_evide
 
     for replica in &replicas {
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &manager.integrity_key,
             replica,
             identity: identity(),
@@ -5992,6 +6085,7 @@ fn pinned_inspection_keeps_terminal_predicate_on_the_x_wal_snapshot() {
     let observed_x_proof = Arc::clone(&observed_x);
     let result = inspect_replica_with_descriptor_snapshot_proof_for_test(
         InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &integrity_key(),
             replica: &replica,
             identity: identity(),
@@ -7114,6 +7208,7 @@ async fn legacy_log_tail_is_quarantined_cleared_and_old_cursors_fail_closed() {
     drop(advanced);
     assert_eq!(
         inspect_replica(InspectionInput {
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
             key: &manager.integrity_key,
             replica: &replicas[0],
             identity: identity(),
@@ -8412,6 +8507,7 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
     let manager = recovery(AllowRecovery);
     let expected_members = BTreeSet::from([node]);
     let source_evidence = inspect_replica(InspectionInput {
+        snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         key: &manager.integrity_key,
         replica: &recovery_replica,
         identity: store_identity,

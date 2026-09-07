@@ -1316,6 +1316,40 @@ is indeterminate and fails before either hook changes. The SDK never invents
 `Any`, derives a peer from an untrusted packet, or labels endpoint-unbound
 forwarding state production-ready.
 
+#### Isolated workload lifecycle
+
+`EbpfGtpuDataplaneBackend::for_workload(EbpfWorkloadScope)` gives one stable
+workload its own bpffs root and local writer locks. Supply a collision-resistant
+digest of the tenant and stable workload slot; retain it across process and pod
+replacements. It is a naming boundary, not protection against another privileged
+host process. This mode needs no cluster API or resident node agent.
+
+After invalidating the previous forwarding generation and isolating ingress,
+call `reset_workload_graph(scope, interface)` before normal attachment. The SDK
+acquires the existing writer and operation locks, inspects every present pin,
+verifies local hooks and global program references, detaches owned hooks, and
+removes the recognized, unbound IPv4 interface graph. Inspection
+failure, a live writer, foreign objects, an older schema, selector-authority or
+decommission markers, or external recovery
+authority refuses cleanup. No sessions are preserved by this reset.
+
+Cleanup accepts a recognized partial pin set and is repeatable after process
+loss at any effect boundary. It does not need a cleanup journal: each attempt
+enumerates the stable, exclusively owned namespace again. Unknown entries are
+never deleted. On orderly shutdown, stop producers, call `remove_device`, then
+reset the workload graph to verify absence. Grouped dual-stack selector
+namespaces retain their separate lifecycle and cannot use this reset. Empty lock
+directories remain to preserve lock-inode identity.
+
+The operation sees only the current node. A workload moved elsewhere cannot
+collect the old node's state until it returns, unless an external administrator
+does so. Pins retain kernel memory until unpinned or rebooted. Pins alone do not
+execute programs, but surviving hooks or other references may keep an old graph
+active; local interface absence is never treated as proof of their absence.
+This API scans loaded programs and refuses references outside the verified local
+hooks. Shared-root and historical migration continue to use their separate
+authority-bearing APIs below.
+
 #### Orphaned current-schema graph recovery
 
 `GtpuDataplaneBackend::recover_orphaned_current_ebpf_graph_with_authority` is
