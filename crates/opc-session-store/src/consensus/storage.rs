@@ -4018,9 +4018,9 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
-        let result = {
+        {
             let conn = self.core.conn.lock().await;
-            consensus::save_vote_with_authority_sync(
+            let result = consensus::save_vote_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
@@ -4028,13 +4028,13 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                 &self.core.expected_bindings,
                 self.core.fixed_placement_policy,
                 vote,
-            )
+            );
+            if result.is_ok() {
+                self.core.signal_proactive_checkpoint(&conn);
+            }
+            result
         }
-        .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error));
-        if result.is_ok() {
-            self.core.signal_proactive_checkpoint();
-        }
-        result
+        .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))
     }
 
     async fn read_vote(
@@ -4058,9 +4058,9 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
-        let result = {
+        {
             let conn = self.core.conn.lock().await;
-            consensus::save_committed_with_authority_sync(
+            let result = consensus::save_committed_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
@@ -4068,13 +4068,13 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                 &self.core.expected_bindings,
                 self.core.fixed_placement_policy,
                 committed,
-            )
+            );
+            if result.is_ok() {
+                self.core.signal_proactive_checkpoint(&conn);
+            }
+            result
         }
-        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
-        if result.is_ok() {
-            self.core.signal_proactive_checkpoint();
-        }
-        result
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
     }
 
     async fn read_committed(
@@ -4107,7 +4107,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::append_logs_with_authority_and_diagnostics_sync(
+            let result = consensus::append_logs_with_authority_and_diagnostics_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
@@ -4116,14 +4116,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                 self.core.fixed_placement_policy,
                 &entries,
                 self.core.diagnostics.as_deref(),
-            )
+            );
+            if result.is_ok() && has_entries {
+                self.core.signal_proactive_checkpoint(&conn);
+            }
+            result
         };
         match result {
             Ok(()) => {
                 callback.log_io_completed(Ok(()));
-                if has_entries {
-                    self.core.signal_proactive_checkpoint();
-                }
                 Ok(())
             }
             Err(error) => {
@@ -4139,9 +4140,9 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
-        let result = {
+        {
             let conn = self.core.conn.lock().await;
-            (|| -> io::Result<()> {
+            let result = (|| -> io::Result<()> {
                 ensure_recovery_terminal_allows_log_compaction(&self.core, &conn)
                     .map_err(|_| io::Error::other("operator recovery blocks log truncation"))?;
                 consensus::truncate_logs_with_authority_sync(
@@ -4153,13 +4154,13 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                     self.core.fixed_placement_policy,
                     &log_id,
                 )
-            })()
+            })();
+            if result.is_ok() {
+                self.core.signal_proactive_checkpoint(&conn);
+            }
+            result
         }
-        .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error));
-        if result.is_ok() {
-            self.core.signal_proactive_checkpoint();
-        }
-        result
+        .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 
     async fn purge(
@@ -4172,7 +4173,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            (|| -> io::Result<()> {
+            let result = (|| -> io::Result<()> {
                 ensure_recovery_terminal_allows_log_compaction(&self.core, &conn)
                     .map_err(|_| io::Error::other("operator recovery blocks log purge"))?;
                 if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable
@@ -4198,11 +4199,14 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                         &log_id,
                     )
                 }
-            })()
+            })();
+            if result.is_ok() {
+                self.core.signal_proactive_checkpoint(&conn);
+            }
+            result
         }
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error));
         if result.is_ok() {
-            self.core.signal_proactive_checkpoint();
             if let Some(lane) = self.core.consensus_log_prune_lane() {
                 lane.signal();
             }
@@ -4334,14 +4338,14 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 self.observe_applied_membership(&membership)
                     .map_err(membership_admission_storage_error)?;
             }
+            // Observe the connection-local page count only after a successful
+            // commit, while this exact primary connection remains held. The
+            // fixed-capacity send does not await checkpoint work.
+            if has_entries {
+                self.core.signal_proactive_checkpoint(&conn);
+            }
             applied
         };
-        // This follows the successful durable state-machine commit and only
-        // enqueues fixed-capacity best-effort work. It never awaits a
-        // checkpoint before Openraft can publish the accepted response.
-        if has_entries {
-            self.core.signal_proactive_checkpoint();
-        }
         if let Some(last_applied) = last_applied {
             self.core.applied_progress.send_replace(Some(last_applied));
         }
@@ -4997,6 +5001,9 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         // is complete now; retaining the named guard through post-commit
         // diagnostics would self-deadlock on the diagnostic re-lock below,
         // and would also strand OpenRaft's concurrently dispatched PurgeLog.
+        if install_result.is_ok() {
+            self.core.signal_proactive_checkpoint(&conn);
+        }
         drop(conn);
         let (previous, previous_artifact) = match install_result {
             Ok(previous) => previous,
@@ -5029,7 +5036,6 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
             }
         }
-        self.core.signal_proactive_checkpoint();
         raw_artifact.remove().await.map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -10014,7 +10020,7 @@ mod tests {
         // the remaining fixed cadence signals schedule one observed PASSIVE
         // checkpoint while the reader still pins its pre-apply WAL cut.
         for _ in 1..64 {
-            checkpoint_lane.signal();
+            checkpoint_lane.signal(None);
         }
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -10028,7 +10034,7 @@ mod tests {
         .expect("reader-pinned PASSIVE checkpoint reports incomplete progress");
         consensus::release_snapshot_read_sync(&reader).expect("release deferred snapshot reader");
         for _ in 0..64 {
-            checkpoint_lane.signal();
+            checkpoint_lane.signal(None);
         }
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {

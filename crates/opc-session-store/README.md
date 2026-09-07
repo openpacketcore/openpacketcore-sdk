@@ -888,6 +888,13 @@ scope validation within one SQLite read transaction. An autocommit caller gets
 a read transaction for that load; an existing caller transaction retains its
 ownership. Each later load validates the current durable state again.
 
+The coalescing background checkpoint lane also observes pages written by each
+successful primary commit. Wide transactions can request its single worker
+after half the primary writer's 1,000-page fallback, while the existing
+64-write cadence still handles sparse writes or unavailable page statistics.
+The bounded page counter is only a scheduling hint: the primary automatic
+checkpoint, EXTRA synchronization, and all WAL/workspace limits are unchanged.
+
 Full snapshot replication-log audits keep SQLite reads on the caller thread
 and decode bounded batches with at most eight workers, 4,096 rows and 16 MiB
 of encoded row data. Every row still receives the complete typed, sequence,

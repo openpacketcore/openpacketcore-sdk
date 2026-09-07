@@ -3767,10 +3767,14 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
 //
 // The primary writer's unchanged 1,000-page automatic checkpoint remains the
 // resource and durability fallback. This lane is only an optimization, so its
-// fixed durable-write cadence is deliberately much smaller than that fallback
-// in the least-dense one-WAL-page-per-write case, without claiming a page
-// bound for larger bounded transactions.
+// fixed durable-write cadence handles sparse transactions. Wide V2 batches
+// can cross the page fallback before 64 writes, so an independent page-write
+// budget requests the same coalescing worker halfway to that fallback. This
+// is advisory headroom, not a page bound: one large transaction, a busy reader,
+// or a delayed worker can still require the unchanged primary fallback.
 const PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH: u64 = 64;
+const PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH: u64 =
+    super::SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES as u64 / 2;
 /// Physical pruning is deliberately bounded independently of the logical
 /// Openraft purge acknowledgement.  The floor is durable before this lane is
 /// signalled, so a cancelled or failed turn may retain disk space but can
@@ -5273,6 +5277,7 @@ pub(crate) struct ProactiveCheckpointLane {
     /// A bounded, store-scoped countdown. It is never an accumulating write
     /// counter, so wraparound cannot turn a busy store into per-write work.
     durable_writes_until_signal: AtomicU64,
+    page_writes_until_signal: AtomicU64,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
@@ -5325,6 +5330,7 @@ impl ProactiveCheckpointLane {
             stop,
             stopping: AtomicBool::new(false),
             durable_writes_until_signal: AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH),
+            page_writes_until_signal: AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH),
             active_interrupt: Mutex::new(None),
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
@@ -5358,12 +5364,17 @@ impl ProactiveCheckpointLane {
     /// work after it expires is `try_send`: a full lane already retains one
     /// pending checkpoint, and a stopped lane is ignored. No accepted
     /// response awaits checkpoint work.
-    pub(crate) fn signal(&self) {
+    pub(crate) fn signal(&self, written_pages: Option<u32>) {
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
         if matches!(
-            schedule_proactive_checkpoint_ticket(&self.durable_writes_until_signal, &self.sender),
+            schedule_proactive_checkpoint_ticket(
+                &self.durable_writes_until_signal,
+                &self.page_writes_until_signal,
+                written_pages,
+                &self.sender,
+            ),
             ProactiveCheckpointTicket::Enqueued
         ) {
             if let Some(diagnostics) = &self.diagnostics {
@@ -5376,6 +5387,8 @@ impl ProactiveCheckpointLane {
     pub(crate) fn reset_durable_write_budget_for_test(&self) {
         self.durable_writes_until_signal
             .store(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH, Ordering::Release);
+        self.page_writes_until_signal
+            .store(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH, Ordering::Release);
     }
 
     #[cfg(feature = "test-vfs")]
@@ -5465,6 +5478,28 @@ enum ProactiveCheckpointTicket {
     Closed,
 }
 
+fn consume_proactive_checkpoint_page_write_budget(budget: &AtomicU64, pages: u32) -> bool {
+    if pages == 0 {
+        return false;
+    }
+    let pages = u64::from(pages);
+    let mut remaining = budget.load(Ordering::Relaxed);
+    loop {
+        let expired = pages >= remaining;
+        // A single wide commit requests at most one ticket. Its excess never
+        // accumulates into a retry queue or causes per-write catch-up work.
+        let next = if expired {
+            PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH
+        } else {
+            remaining - pages
+        };
+        match budget.compare_exchange_weak(remaining, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return expired,
+            Err(observed) => remaining = observed,
+        }
+    }
+}
+
 /// The exact `wal_checkpoint(PASSIVE)` outcome relevant to diagnostics.
 ///
 /// SQLite reports a zero busy column when it made whatever progress was
@@ -5477,17 +5512,22 @@ enum ProactivePassiveCheckpointDisposition {
     Incomplete,
 }
 
-/// Schedule one ticket only when the fixed durable-write cadence expires.
+/// Schedule one ticket when either bounded write cadence expires.
 ///
-/// Resetting the bounded cadence before the nonblocking send means a full
-/// channel still retains its one existing ticket while the next fixed batch
+/// Resetting each expired budget before the nonblocking send means a full
+/// channel still retains its one existing ticket while the next bounded batch
 /// starts. That avoids retry tasks or an accumulating queue after a worker
 /// falls behind.
 fn schedule_proactive_checkpoint_ticket(
     budget: &AtomicU64,
+    page_budget: &AtomicU64,
+    written_pages: Option<u32>,
     sender: &tokio::sync::mpsc::Sender<()>,
 ) -> ProactiveCheckpointTicket {
-    if !consume_proactive_checkpoint_durable_write_budget(budget) {
+    let write_cadence_expired = consume_proactive_checkpoint_durable_write_budget(budget);
+    let page_cadence_expired = written_pages
+        .is_some_and(|pages| consume_proactive_checkpoint_page_write_budget(page_budget, pages));
+    if !write_cadence_expired && !page_cadence_expired {
         return ProactiveCheckpointTicket::BelowCadence;
     }
     match sender.try_send(()) {
@@ -6004,9 +6044,9 @@ impl SqliteConsensusCore {
     }
 
     /// Request non-blocking PASSIVE checkpoint work after a primary commit.
-    pub(crate) fn signal_proactive_checkpoint(&self) {
+    pub(crate) fn signal_proactive_checkpoint(&self, conn: &Connection) {
         if let Some(lane) = &self.proactive_checkpoint_lane {
-            lane.signal();
+            lane.signal(opc_sqlite_file_control_sys::take_page_write_count(conn).ok());
         }
     }
 
@@ -6296,6 +6336,12 @@ impl SqliteConsensusCore {
                     )
                 })
                 .transpose()?;
+            if proactive_checkpoint_lane.is_some() {
+                // Exclude schema/open work from the first durable-write hint.
+                // An unavailable statistic keeps the fixed event cadence and
+                // primary automatic checkpoint fallback fully operational.
+                let _ = opc_sqlite_file_control_sys::take_page_write_count(&conn);
+            }
             let consensus_log_prune_lane =
                 if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
                     database_file
@@ -42898,17 +42944,18 @@ mod tests {
     #[test]
     fn proactive_checkpoint_full_lane_retains_one_ticket_across_threshold_resets() {
         let budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
+        let page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
 
         for _ in 1..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH {
             assert_eq!(
-                schedule_proactive_checkpoint_ticket(&budget, &sender),
+                schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
                 ProactiveCheckpointTicket::BelowCadence,
                 "no ticket is queued before the exact threshold"
             );
         }
         assert_eq!(
-            schedule_proactive_checkpoint_ticket(&budget, &sender),
+            schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
             ProactiveCheckpointTicket::Enqueued,
             "the exact threshold queues the worker's active ticket"
         );
@@ -42920,13 +42967,13 @@ mod tests {
 
         for _ in 1..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH {
             assert_eq!(
-                schedule_proactive_checkpoint_ticket(&budget, &sender),
+                schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
                 ProactiveCheckpointTicket::BelowCadence,
                 "the next fixed cadence remains below its threshold"
             );
         }
         assert_eq!(
-            schedule_proactive_checkpoint_ticket(&budget, &sender),
+            schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
             ProactiveCheckpointTicket::Enqueued,
             "one pending ticket is retained while the worker is active"
         );
@@ -42938,13 +42985,13 @@ mod tests {
 
         for _ in 1..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH {
             assert_eq!(
-                schedule_proactive_checkpoint_ticket(&budget, &sender),
+                schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
                 ProactiveCheckpointTicket::BelowCadence,
                 "the full lane still consumes the next fixed cadence"
             );
         }
         assert_eq!(
-            schedule_proactive_checkpoint_ticket(&budget, &sender),
+            schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
             ProactiveCheckpointTicket::Full,
             "a full capacity-one lane does not enqueue a second pending ticket"
         );
@@ -42962,6 +43009,130 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty),
             "no second pending ticket is retained"
+        );
+    }
+
+    #[test]
+    fn proactive_checkpoint_page_budget_is_bounded_and_independent_of_sparse_write_cadence() {
+        let write_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
+        let page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let page_batch = u32::try_from(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH).expect("page batch");
+        assert_eq!(
+            schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, Some(0), &sender),
+            ProactiveCheckpointTicket::BelowCadence,
+        );
+        assert_eq!(page_budget.load(Ordering::Acquire), u64::from(page_batch));
+        assert_eq!(
+            schedule_proactive_checkpoint_ticket(
+                &write_budget,
+                &page_budget,
+                Some(page_batch - 1),
+                &sender,
+            ),
+            ProactiveCheckpointTicket::BelowCadence,
+        );
+        assert_eq!(page_budget.load(Ordering::Acquire), 1);
+        assert_eq!(
+            schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, Some(1), &sender),
+            ProactiveCheckpointTicket::Enqueued,
+            "wide commits wake the lane before the sparse-write cadence",
+        );
+        assert_eq!(
+            write_budget.load(Ordering::Acquire),
+            PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH - 3
+        );
+        assert_eq!(page_budget.load(Ordering::Acquire), u64::from(page_batch));
+        assert_eq!(
+            schedule_proactive_checkpoint_ticket(
+                &write_budget,
+                &page_budget,
+                Some(u32::MAX),
+                &sender,
+            ),
+            ProactiveCheckpointTicket::Full,
+            "an arbitrarily large hint retains only the one pending ticket",
+        );
+        assert_eq!(page_budget.load(Ordering::Acquire), u64::from(page_batch));
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+        for _ in 4..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH - 1 {
+            assert_eq!(
+                schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, None, &sender),
+                ProactiveCheckpointTicket::BelowCadence,
+                "an unavailable statistic preserves the existing write cadence",
+            );
+        }
+        assert_eq!(
+            schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, None, &sender),
+            ProactiveCheckpointTicket::Enqueued,
+        );
+        drop(receiver);
+        assert_eq!(
+            schedule_proactive_checkpoint_ticket(
+                &write_budget,
+                &page_budget,
+                Some(page_batch),
+                &sender,
+            ),
+            ProactiveCheckpointTicket::Closed,
+            "a stopped lane still receives no retry task",
+        );
+    }
+
+    #[test]
+    fn proactive_checkpoint_page_statistic_matches_real_wal_frames_and_resets_without_writes() {
+        let directory = tempfile::tempdir().expect("page statistic directory");
+        let path = directory.path().join("page-statistic.sqlite");
+        let conn = Connection::open(&path).expect("page statistic writer");
+        apply_pragma_profile(&conn, false, true).expect("production WAL profile");
+        conn.execute_batch(
+            "CREATE TABLE page_fixture(value BLOB); PRAGMA wal_checkpoint(TRUNCATE)",
+        )
+        .expect("page statistic schema");
+        opc_sqlite_file_control_sys::take_page_write_count(&conn).expect("reset setup pages");
+        conn.execute("INSERT INTO page_fixture VALUES (zeroblob(524288))", [])
+            .expect("commit wide WAL transaction");
+        let page_size: u64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("actual WAL page size");
+        let wal_path = directory.path().join("page-statistic.sqlite-wal");
+        let wal_before = std::fs::read(&wal_path).expect("committed WAL bytes");
+        let main_before = std::fs::read(&path).expect("main before statistic");
+        let frames = (u64::try_from(wal_before.len()).expect("WAL length") - 32) / (page_size + 24);
+        assert!(frames > 1 && frames < 1_000);
+        assert_eq!(
+            u64::from(
+                opc_sqlite_file_control_sys::take_page_write_count(&conn).expect("page count")
+            ),
+            frames,
+            "the safe counter reports the actual wide commit's WAL page frames",
+        );
+        assert_eq!(
+            opc_sqlite_file_control_sys::take_page_write_count(&conn).expect("reset count"),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("WAL after statistic"),
+            wal_before
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("main after statistic"),
+            main_before
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i32>(0))
+                .expect("synchronous"),
+            3
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i32>(0))
+                .expect("fallback"),
+            1_000
         );
     }
 
@@ -64989,6 +65160,148 @@ BEGIN IMMEDIATE;
                 samples[4_091].as_nanos(),
             );
         }
+    }
+
+    #[test]
+    #[ignore = "release-profile component cost diagnosis for SDK-741"]
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    fn wide_v2_checkpoint_cadence_cost_diagnostic() {
+        use opc_sqlite_file_control_sys::{
+            block_test_main_sync, install_test_main_sync_block_vfs, TEST_MAIN_SYNC_BLOCK_VFS_NAME,
+        };
+
+        install_test_main_sync_block_vfs().expect("register diagnostic sync VFS");
+        let directory = tempfile::tempdir().expect("checkpoint diagnostic directory");
+        let backend = SqliteSessionBackend::open_with_vfs_for_test(
+            directory.path().join("wide-v2.sqlite"),
+            TEST_MAIN_SYNC_BLOCK_VFS_NAME,
+        )
+        .expect("open production writer through sync observation VFS");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        append_logs_sync(&conn, identity(), &[membership_entry()]).expect("append membership");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply membership");
+        activate_v2_ledger_fixture(&conn);
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("drain setup WAL before measuring writes");
+        assert_eq!(
+            conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i32>(0))
+                .expect("unchanged writer threshold"),
+            1_000,
+        );
+        let mut observation = block_test_main_sync();
+        // Count the real VFS callbacks without injecting any delay or error.
+        observation.release();
+        let _ = opc_sqlite_file_control_sys::take_page_write_count(&conn)
+            .expect("reset diagnostic setup page count");
+        let budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
+        let page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
+        let hint_write_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
+        let hint_page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
+        let (hint_sender, _hint_receiver) = tokio::sync::mpsc::channel(1);
+        let mut first_page_hint_ticket = None;
+        let mut total_written_pages = 0_u64;
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut first_foreground_checkpoint = None;
+        let mut first_proactive_ticket = None;
+        let mut durable_writes = 0;
+        let mut commit_durations = Vec::new();
+        for batch in 0_u8..22 {
+            let requests = (0_u8..8)
+                .map(|item| {
+                    let nonce = batch * 8 + item + 1;
+                    let mut record_key = key();
+                    record_key.stable_id = Bytes::from(vec![nonce; 16])
+                        .try_into()
+                        .expect("distinct fixture key");
+                    let record = sealed_record_for_key(record_key.clone(), 1_024);
+                    let lease = FencedTransitionLease::acquire(
+                        record_key,
+                        record.owner.clone(),
+                        crate::FenceToken::new(0),
+                        Duration::from_secs(300),
+                    )
+                    .expect("fixture lease");
+                    FencedTransitionV2Request::new(
+                        FencedTransitionV2HistoryEpoch::new(1).expect("fixture epoch"),
+                        crate::fenced_transition::FencedTransitionV2CallerNonce::from_bytes(
+                            [nonce; 16],
+                        ),
+                        lease,
+                        FencedTransitionMutation::create(record),
+                    )
+                    .expect("eight distinct valid V2 create requests")
+                })
+                .collect();
+            let entry =
+                fenced_transition_v2_batch_entry(u64::from(batch) + 1, requests, timestamp(1));
+            for stage in ["append", "commit-index", "apply"] {
+                let syncs_before = observation.main_sync_count();
+                let started = Instant::now();
+                match stage {
+                    "append" => append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                        .expect("append full V2 batch"),
+                    "commit-index" => save_committed_sync(&conn, identity(), Some(entry.log_id))
+                        .expect("persist committed batch index"),
+                    "apply" => {
+                        let applied = apply_entries_sync(
+                            &conn,
+                            identity(),
+                            &backend.caps,
+                            vec![entry.clone()],
+                        )
+                        .expect("apply full V2 batch");
+                        assert!(matches!(
+                            applied.responses.as_slice(),
+                            [SessionConsensusResponse {
+                                result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                                ..
+                            }] if outcomes.len() == 8 && outcomes.iter().all(Result::is_ok)
+                        ));
+                    }
+                    _ => unreachable!("fixed diagnostic stages"),
+                }
+                let elapsed = started.elapsed();
+                durable_writes += 1;
+                let checkpointed = observation.main_sync_count() > syncs_before;
+                if checkpointed {
+                    first_foreground_checkpoint.get_or_insert(durable_writes);
+                }
+                let pages = opc_sqlite_file_control_sys::take_page_write_count(&conn)
+                    .expect("read exact committed page count");
+                total_written_pages += u64::from(pages);
+                let hint = schedule_proactive_checkpoint_ticket(
+                    &hint_write_budget,
+                    &hint_page_budget,
+                    Some(pages),
+                    &hint_sender,
+                );
+                if hint == ProactiveCheckpointTicket::Enqueued {
+                    first_page_hint_ticket.get_or_insert(durable_writes);
+                }
+                let ticket =
+                    schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender);
+                if ticket == ProactiveCheckpointTicket::Enqueued {
+                    first_proactive_ticket.get_or_insert(durable_writes);
+                }
+                commit_durations.push((stage, checkpointed, elapsed.as_micros()));
+            }
+        }
+        eprintln!(
+            "sdk-741 checkpoint component: batch_items=8 payload_bytes=1024 durable_writes={durable_writes} first_foreground_checkpoint={first_foreground_checkpoint:?} first_proactive_ticket={first_proactive_ticket:?} first_page_hint_ticket={first_page_hint_ticket:?} total_written_pages={total_written_pages} main_syncs={} wal_syncs={} stages={commit_durations:?}",
+            observation.main_sync_count(),
+            observation.wal_sync_count(),
+        );
+        assert!(first_foreground_checkpoint.is_some());
+        assert!(
+            first_page_hint_ticket.expect("page ticket")
+                < first_foreground_checkpoint.expect("foreground checkpoint")
+        );
+        assert_eq!(
+            first_proactive_ticket,
+            Some(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH)
+        );
     }
 
     #[test]
