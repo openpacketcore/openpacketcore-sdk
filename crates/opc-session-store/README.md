@@ -865,6 +865,22 @@ replenished or permanently retires that permit. This prevents a write-held
 SQLite connection from globally serializing unrelated acceptance reads without
 creating a connection, task, or pool entry per caller or subscriber.
 
+Snapshot copy and compaction share the store's primary-writer pressure signal.
+An existing 32 ms foreground pause earns a 32 ms snapshot work turn before
+another pause, so sustained traffic cannot repeatedly charge a pause at every
+SQLite progress callback. Snapshot startup also yields the physical-prune
+writer before reserving its legacy reseed candidate, using the same writer
+handoff as append and apply.
+
+Durable V2 batches still undergo complete typed decoding and exact comparison
+with their canonical JSON encoding. For the fixed batch shape, optionally
+inside one authority envelope, that byte comparison also proves the complete
+structural schema without parsing all payload byte arrays a second time.
+Other V2 shapes retain the generic duplicate-aware structural audit. Prepared
+SQLite statements cache query plans only: schema and exact log witnesses are
+read and authenticated again on every use. The immutable V2 protocol digest is
+computed once; every persisted receipt and request binding is still verified.
+
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal
 submission remains `BackendUnavailable`. Once `client_write_ff` accepts the

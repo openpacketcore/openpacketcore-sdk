@@ -1857,9 +1857,16 @@ impl fmt::Debug for FencedTransitionV2Request {
 /// has no negotiable history-limit fields: two implementations advertising
 /// [`FencedTransitionV2Capability::V2`] must report the same digest.
 pub fn fenced_transition_v2_profile_digest() -> [u8; FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES] {
-    fenced_transition_v2_profile_digest_with_retention_inputs(
-        FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
-    )
+    // Every input is an immutable protocol constant. Receipt validation still
+    // authenticates each row; rehashing these same descriptors for every row
+    // only repeats the construction of the protocol's fixed domain separator.
+    static DIGEST: std::sync::OnceLock<[u8; FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES]> =
+        std::sync::OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        fenced_transition_v2_profile_digest_with_retention_inputs(
+            FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -4597,6 +4604,12 @@ mod tests {
                         + FENCED_TRANSITION_V2_RECLAIM_BATCH
             );
         }
+        assert_eq!(
+            fenced_transition_v2_profile_digest(),
+            fenced_transition_v2_profile_digest_with_retention_inputs(
+                FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
+            ),
+        );
         assert_eq!(
             fenced_transition_v2_profile_digest(),
             [

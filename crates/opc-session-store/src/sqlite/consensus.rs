@@ -4259,6 +4259,7 @@ pub(crate) struct ConsensusSnapshotForegroundPacer {
     primary_writers: Option<Arc<AtomicUsize>>,
     writer_generation: Option<Arc<AtomicU64>>,
     observed_writer_generation: Arc<AtomicU64>,
+    last_pause_finished: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ConsensusSnapshotForegroundPacer {
@@ -4268,10 +4269,25 @@ impl ConsensusSnapshotForegroundPacer {
             primary_writers: Some(primary_writers),
             writer_generation: Some(writer_generation),
             observed_writer_generation: Arc::new(AtomicU64::new(observed_writer_generation)),
+            last_pause_finished: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn pace_with(&self, pause: impl FnOnce(Duration)) -> bool {
+    fn pace_with(&self, now: impl Fn() -> Instant, pause: impl FnOnce(Duration)) -> bool {
+        // One foreground pause earns one equally bounded snapshot work turn.
+        // Charging a fresh pause after each tiny SQLite progress callback can
+        // otherwise starve compaction while writers remain continuously busy,
+        // retaining the source WAL and delaying physical reclamation. This
+        // mutex belongs only to snapshot pacing, never to a primary writer.
+        let mut last_pause_finished = self
+            .last_pause_finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_pause_finished.is_some_and(|finished| {
+            now().saturating_duration_since(finished) < SNAPSHOT_FOREGROUND_PACING_PAUSE
+        }) {
+            return false;
+        }
         let writer_generation_advanced =
             self.writer_generation.as_ref().is_some_and(|generation| {
                 let current = generation.load(Ordering::Acquire);
@@ -4286,6 +4302,16 @@ impl ConsensusSnapshotForegroundPacer {
                 .is_some_and(|writers| writers.load(Ordering::Acquire) != 0)
         {
             pause(SNAPSHOT_FOREGROUND_PACING_PAUSE);
+            *last_pause_finished = Some(now());
+            // Writers that ran during this pause have already received their
+            // foreground turn. Acknowledge them when snapshot work resumes,
+            // otherwise steady traffic can recharge the same pause at every
+            // backup page group or compaction progress callback. A writer
+            // still pending is checked independently at the next callback.
+            if let Some(generation) = &self.writer_generation {
+                self.observed_writer_generation
+                    .store(generation.load(Ordering::Acquire), Ordering::Release);
+            }
             true
         } else {
             false
@@ -4293,7 +4319,7 @@ impl ConsensusSnapshotForegroundPacer {
     }
 
     fn pace(&self) {
-        let _ = self.pace_with(std::thread::sleep);
+        let _ = self.pace_with(Instant::now, std::thread::sleep);
     }
 }
 
@@ -7055,11 +7081,10 @@ fn initialize_schema_with_storage_anchor_and_pending(
 }
 
 fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [name],
-        |row| row.get(0),
-    )
+    )?
+    .query_row([name], |row| row.get(0))
 }
 
 pub(crate) fn read_storage_identity_sync(
@@ -18237,13 +18262,11 @@ fn fenced_transition_v2_schema_is_exact_in_sync(
         "main.sqlite_master"
     };
     let unexpected: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM {master} WHERE sql IS NOT NULL AND ((tbl_name IN ('consensus_fenced_transition_v2_receipts', 'consensus_fenced_transition_v2_activation', 'consensus_fenced_transition_v2_history') AND type IN ('index', 'trigger')) OR name IN ('consensus_fenced_transition_v2_receipts_reclaim', 'consensus_fenced_transition_v2_receipts_due'))"
-            ),
-            [],
-            |row| row.get(0),
-        )
+        .prepare_cached(&format!(
+            "SELECT COUNT(*) FROM {master} WHERE sql IS NOT NULL AND ((tbl_name IN ('consensus_fenced_transition_v2_receipts', 'consensus_fenced_transition_v2_activation', 'consensus_fenced_transition_v2_history') AND type IN ('index', 'trigger')) OR name IN ('consensus_fenced_transition_v2_receipts_reclaim', 'consensus_fenced_transition_v2_receipts_due'))"
+        ))
+        .map_err(db_error)?
+        .query_row([], |row| row.get(0))
         .map_err(db_error)?;
     Ok(unexpected == 2)
 }
@@ -18260,11 +18283,15 @@ fn schema_object_is_exact_in_sync(
     } else {
         "main.sqlite_master"
     };
+    // Cache only the bounded statement program. Every invocation still reads
+    // and compares the current complete schema text, including on a reused
+    // connection after schema or identity changes.
     let observed = conn
+        .prepare_cached(&format!(
+            "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM {master} WHERE type = ?2 AND name = ?3"
+        ))
+        .map_err(db_error)?
         .query_row(
-            &format!(
-                "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM {master} WHERE type = ?2 AND name = ?3"
-            ),
             params![CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES, kind, name],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
         )
@@ -18272,7 +18299,8 @@ fn schema_object_is_exact_in_sync(
         .map_err(db_error)?;
     Ok(observed.is_some_and(|(sql, len)| {
         len <= CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES
-            && sql.is_some_and(|sql| normalize_schema_sql(&sql) == normalize_schema_sql(expected))
+            && sql
+                .is_some_and(|sql| normalized_schema_sql(&sql).eq(normalized_schema_sql(expected)))
     }))
 }
 
@@ -19858,11 +19886,14 @@ fn schema_manifest_in_sync(
     Ok(manifest)
 }
 
-fn normalize_schema_sql(sql: &str) -> String {
+fn normalized_schema_sql(sql: &str) -> impl Iterator<Item = char> + '_ {
     sql.chars()
         .filter(|character| !character.is_ascii_whitespace())
         .map(|character| character.to_ascii_lowercase())
-        .collect()
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    normalized_schema_sql(sql).collect()
 }
 
 /// Require the complete activated V1 receipt layout, not merely a pair of
@@ -20070,11 +20101,11 @@ fn persisted_schema_version_in_sync(conn: &Connection, attached: bool) -> io::Re
     } else {
         "main.consensus_identity"
     };
-    conn.query_row(
-        &format!("SELECT schema_version FROM {source} WHERE singleton = 1"),
-        [],
-        |row| row.get(0),
-    )
+    conn.prepare_cached(&format!(
+        "SELECT schema_version FROM {source} WHERE singleton = 1"
+    ))
+    .map_err(db_error)?
+    .query_row([], |row| row.get(0))
     .map_err(db_error)
 }
 
@@ -22493,7 +22524,7 @@ pub(crate) fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn db_error(_: rusqlite::Error) -> io::Error {
+fn db_error(_error: rusqlite::Error) -> io::Error {
     io::Error::other("session consensus SQLite operation failed")
 }
 
@@ -22772,10 +22803,42 @@ fn scan_log_json_for_fenced_transition_v2(bytes: &[u8]) -> io::Result<bool> {
     Ok(scan.0)
 }
 
+fn log_entry_has_exact_fenced_transition_v2_batch_shape(
+    entry: &Entry<SessionRaftTypeConfig>,
+) -> bool {
+    let EntryPayload::Normal(command) = &entry.payload else {
+        return false;
+    };
+    matches!(
+        command.intent,
+        SessionMutationIntent::FencedTransitionV2Batch(_)
+    ) || matches!(&command.intent, SessionMutationIntent::Authorized { mutation, .. }
+            if matches!(mutation.as_ref(), SessionMutationIntent::FencedTransitionV2Batch(_)))
+}
+
 fn validate_exact_fenced_transition_v2_log_json(
     bytes: &[u8],
     entry: &Entry<SessionRaftTypeConfig>,
 ) -> io::Result<()> {
+    let canonical = encode_json(entry)
+        .map_err(|_| invalid_data("session consensus V2 log entry encoding failed"))?;
+    if bytes != canonical.as_slice() {
+        return Err(invalid_data(
+            "session consensus V2 log entry schema is invalid",
+        ));
+    }
+    // A batch, optionally under its one authority envelope, serializes only
+    // fixed-field structs/enums, strings, integers and byte arrays. Its typed
+    // decoder has already traversed and authenticated every request. Exact
+    // equality with that complete serialization also proves every original
+    // key, value, order and delimiter: ignored or duplicate fields, escaped
+    // alternatives and trailing JSON cannot survive this comparison. Parsing
+    // those same numeric byte arrays a second time adds no schema evidence.
+    // Keep the generic structural audit for other intent shapes, including
+    // recursive authority envelopes and V2 hidden in ignored legacy fields.
+    if log_entry_has_exact_fenced_transition_v2_batch_shape(entry) {
+        return Ok(());
+    }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let audited =
         <ExactFencedTransitionV2Json as serde::Deserialize>::deserialize(&mut deserializer)
@@ -22783,16 +22846,7 @@ fn validate_exact_fenced_transition_v2_log_json(
     deserializer
         .end()
         .map_err(|_| invalid_data("session consensus V2 log entry schema is invalid"))?;
-    let canonical = encode_json(entry)
-        .map_err(|_| invalid_data("session consensus V2 log entry encoding failed"))?;
-    // The duplicate-aware visitor deliberately materializes the whole JSON
-    // value while it rejects nested duplicate keys; canonical *bytes*, not
-    // that normalized value, are the durable V2 equality relation.
-    let _ = &audited.value;
-    if audited.has_duplicate_key
-        || !audited.contains_v2_discriminant
-        || bytes != canonical.as_slice()
-    {
+    if audited.has_duplicate_key || !audited.contains_v2_discriminant {
         return Err(invalid_data(
             "session consensus V2 log entry schema is invalid",
         ));
@@ -24901,8 +24955,11 @@ fn retained_log_id_at_sync(
     index: u64,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index = ?1",
+        )
+        .map_err(db_error)?
+        .query_row(
             [checked_i64(index)?],
             |row| {
                 Ok((
@@ -25264,6 +25321,11 @@ fn decode_durable_log_audit_batch(
     rows: &[EncodedDurableLogAuditRow],
     identity: SessionConsensusIdentity,
 ) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    if rows.len() < DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS {
+        // Even discovering CPU/cgroup capacity involves OS work. Ordinary
+        // frontier advances have no parallel work to size and stay inline.
+        return decode_durable_log_audit_rows(rows, identity);
+    }
     decode_durable_log_audit_batch_with_available_parallelism(
         rows,
         identity,
@@ -40567,20 +40629,92 @@ mod tests {
             Arc::clone(&primary_writers),
             Arc::clone(&writer_generation),
         );
+        let now = std::cell::Cell::new(Instant::now());
+        let advance = || now.set(now.get() + SNAPSHOT_FOREGROUND_PACING_PAUSE);
         let mut pauses = Vec::new();
 
-        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(!pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
         writer_generation.fetch_add(1, Ordering::AcqRel);
-        assert!(pacer.pace_with(|pause| pauses.push(pause)));
-        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
+        assert!(!pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
 
         primary_writers.store(1, Ordering::Release);
-        assert!(pacer.pace_with(|pause| pauses.push(pause)));
-        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        advance();
+        assert!(pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
+        advance();
+        assert!(pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
         primary_writers.store(0, Ordering::Release);
-        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        advance();
+        assert!(!pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
 
         assert_eq!(pauses, vec![SNAPSHOT_FOREGROUND_PACING_PAUSE; 3]);
+    }
+
+    #[test]
+    fn snapshot_foreground_pacer_does_not_recharge_writers_served_during_its_pause() {
+        let primary_writers = Arc::new(AtomicUsize::new(0));
+        let writer_generation = Arc::new(AtomicU64::new(0));
+        let pacer = ConsensusSnapshotForegroundPacer::new(
+            Arc::clone(&primary_writers),
+            Arc::clone(&writer_generation),
+        );
+        let now = std::cell::Cell::new(Instant::now());
+        writer_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(pacer.pace_with(
+            || now.get(),
+            |_| {
+                // These writers have already received the entire foreground
+                // pause. No writer is pending when snapshot work resumes.
+                writer_generation.fetch_add(4, Ordering::AcqRel);
+            }
+        ));
+        now.set(now.get() + SNAPSHOT_FOREGROUND_PACING_PAUSE);
+        assert!(
+            !pacer.pace_with(|| now.get(), |_| {}),
+            "writes completed during a foreground pause must not charge another pause"
+        );
+        writer_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            pacer.pace_with(|| now.get(), |_| {}),
+            "new foreground work still yields"
+        );
+        primary_writers.store(1, Ordering::Release);
+        now.set(now.get() + SNAPSHOT_FOREGROUND_PACING_PAUSE);
+        assert!(
+            pacer.pace_with(|| now.get(), |_| {}),
+            "pending writers still yield"
+        );
+    }
+
+    #[test]
+    fn snapshot_foreground_pacer_reserves_progress_under_continuous_writer_pressure() {
+        let primary_writers = Arc::new(AtomicUsize::new(1));
+        let generation = Arc::new(AtomicU64::new(0));
+        let pacer = ConsensusSnapshotForegroundPacer::new(primary_writers, Arc::clone(&generation));
+        let now = std::cell::Cell::new(Instant::now());
+        let mut pauses = 0;
+        for _ in 0..3 {
+            assert!(pacer.pace_with(
+                || now.get(),
+                |duration| {
+                    pauses += 1;
+                    now.set(now.get() + duration);
+                    generation.fetch_add(1, Ordering::AcqRel);
+                }
+            ));
+            for _ in 0..32 {
+                generation.fetch_add(1, Ordering::AcqRel);
+                assert!(
+                    !pacer.pace_with(|| now.get(), |_| panic!("snapshot work turn was starved")),
+                    "even continuously active writers cannot recharge a pause within a snapshot work turn"
+                );
+                now.set(now.get() + Duration::from_millis(1));
+            }
+        }
+        assert_eq!(
+            pauses, 3,
+            "foreground receives its full turn after each bounded work turn"
+        );
     }
 
     #[test]
@@ -56444,6 +56578,32 @@ LIMIT 20000;
     }
 
     #[test]
+    fn cached_v2_schema_queries_recheck_live_schema_and_format() {
+        let backend = SqliteSessionBackend::in_memory().expect("schema cache backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        activate_v2_ledger_fixture(&conn);
+        for _ in 0..2 {
+            assert_eq!(
+                fenced_transition_v2_ledger_layout_sync(&conn).expect("warm exact schema query"),
+                FencedTransitionV2LedgerLayout::Activated,
+            );
+        }
+        conn.execute_batch("DROP INDEX consensus_fenced_transition_v2_receipts_due")
+            .expect("remove required index after caching statement");
+        assert!(fenced_transition_v2_ledger_layout_sync(&conn).is_err());
+        conn.execute_batch(FENCED_TRANSITION_V2_DUE_INDEX_SCHEMA_SQL)
+            .expect("restore exact index");
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).expect("observe restored exact index"),
+            FencedTransitionV2LedgerLayout::Activated,
+        );
+        conn.execute_batch("UPDATE consensus_identity SET schema_version = 1 WHERE singleton = 1")
+            .expect("change format while statements remain cached");
+        assert!(fenced_transition_v2_ledger_layout_sync(&conn).is_err());
+    }
+
+    #[test]
     fn fenced_transition_v2_projection_batch_reuses_one_schema_audit_and_one_receipt_probe() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
@@ -64269,6 +64429,200 @@ BEGIN IMMEDIATE;
                 io::ErrorKind::InvalidData,
                 "{case}",
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-profile component cost diagnosis for SDK-741"]
+    fn durable_v2_log_decode_cost_diagnostic() {
+        fn measure(stage: &str, mut work: impl FnMut()) {
+            let mut samples = Vec::with_capacity(4_096);
+            for _ in 0..4_096 {
+                let started = Instant::now();
+                work();
+                samples.push(started.elapsed());
+            }
+            let total = samples.iter().sum::<Duration>();
+            samples.sort_unstable();
+            eprintln!(
+                "sdk-741 component: stage={stage} samples={} total_us={} p50_ns={} p99_ns={} p999_ns={}",
+                samples.len(),
+                total.as_micros(),
+                samples[2_047].as_nanos(),
+                samples[4_055].as_nanos(),
+                samples[4_091].as_nanos(),
+            );
+        }
+
+        let entry = fenced_transition_v2_batch_entry(
+            1,
+            (1..=8)
+                .map(|nonce| fenced_transition_v2_request(nonce, 1, "decode-cost-fixture"))
+                .collect(),
+            timestamp(1),
+        );
+        let bytes = encode_json(&entry).expect("encode eight-item diagnostic row");
+        eprintln!("sdk-741 component: batch_items=8 row_bytes={}", bytes.len());
+        assert_eq!(
+            decode_consensus_log_entry(&bytes).expect("exact row"),
+            entry
+        );
+        measure("full_durable_decode", || {
+            std::hint::black_box(decode_consensus_log_entry(std::hint::black_box(&bytes)))
+                .expect("full row decoding");
+        });
+        measure("typed_decode", || {
+            std::hint::black_box(decode_json::<Entry<SessionRaftTypeConfig>>(
+                std::hint::black_box(&bytes),
+            ))
+            .expect("typed row decoding");
+        });
+        measure("exact_schema_validation", || {
+            validate_exact_fenced_transition_v2_log_json(
+                std::hint::black_box(&bytes),
+                std::hint::black_box(&entry),
+            )
+            .expect("exact row schema");
+        });
+        measure("canonical_encoding", || {
+            std::hint::black_box(encode_json(std::hint::black_box(&entry)))
+                .expect("canonical row encoding");
+        });
+        measure("profile_digest", || {
+            std::hint::black_box(fenced_transition_v2_profile_digest());
+        });
+        measure("available_parallelism", || {
+            let _ = std::hint::black_box(std::thread::available_parallelism());
+        });
+    }
+
+    #[test]
+    fn canonical_v2_batch_validation_matches_complete_structural_audit() {
+        fn strict_v2_json_reference(
+            bytes: &[u8],
+            entry: &Entry<SessionRaftTypeConfig>,
+        ) -> io::Result<()> {
+            let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+            let audited =
+                <ExactFencedTransitionV2Json as serde::Deserialize>::deserialize(&mut deserializer)
+                    .map_err(|_| {
+                        invalid_data("session consensus V2 log entry schema is invalid")
+                    })?;
+            deserializer
+                .end()
+                .map_err(|_| invalid_data("session consensus V2 log entry schema is invalid"))?;
+            let canonical = encode_json(entry)
+                .map_err(|_| invalid_data("session consensus V2 log entry encoding failed"))?;
+            // The visitor checks every nested object for duplicates; canonical bytes
+            // remain the authority for the exact schema, ordering and scalar values.
+            if audited.has_duplicate_key
+                || !audited.contains_v2_discriminant
+                || bytes != canonical.as_slice()
+            {
+                return Err(invalid_data(
+                    "session consensus V2 log entry schema is invalid",
+                ));
+            }
+            Ok(())
+        }
+
+        for count in [0_usize, 1, 8] {
+            let mut direct = fenced_transition_v2_batch_entry(
+                1,
+                (0..count.max(1))
+                    .map(|nonce| {
+                        fenced_transition_v2_request(nonce as u8 + 1, 1, "canonical-batch-schema")
+                    })
+                    .collect(),
+                timestamp(1),
+            );
+            if count == 0 {
+                let EntryPayload::Normal(command) = &mut direct.payload else {
+                    panic!("normal batch fixture");
+                };
+                // Durable decoding has always accepted this typed shape;
+                // semantic admission separately rejects an empty batch.
+                command.intent = SessionMutationIntent::FencedTransitionV2Batch(Vec::new());
+            }
+            let mut authorized = direct.clone();
+            let EntryPayload::Normal(command) = &mut authorized.payload else {
+                panic!("batch fixture must contain a normal command");
+            };
+            command.intent = SessionMutationIntent::Authorized {
+                origin: node_id(),
+                authority_identity: identity(),
+                mutation: Box::new(command.intent.clone()),
+            };
+            for entry in [direct, authorized] {
+                let canonical = encode_json(&entry).expect("encode exact batch shape");
+                strict_v2_json_reference(&canonical, &entry).expect("old full structural audit");
+                assert_eq!(
+                    decode_consensus_log_entry(&canonical).expect("full typed canonical row"),
+                    entry
+                );
+
+                // Splice fields at every object, retaining all existing byte
+                // order. This includes objects whose derived decoder ignores
+                // unknown fields, so typed decoding alone cannot pass this
+                // regression by accident.
+                for (offset, byte) in canonical.iter().enumerate() {
+                    if *byte != b'{' {
+                        continue;
+                    }
+                    for extra in [
+                        br#""future":null,"#.as_slice(),
+                        br#""future":{"x":1,"x":2},"#.as_slice(),
+                        br#""future":{"\u0046encedTransitionV2":null},"#.as_slice(),
+                    ] {
+                        let mut hostile = canonical[..=offset].to_vec();
+                        hostile.extend_from_slice(extra);
+                        hostile.extend_from_slice(&canonical[offset + 1..]);
+                        assert!(strict_v2_json_reference(&hostile, &entry).is_err());
+                        assert!(decode_consensus_log_entry(&hostile).is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_v2_json_traversal_preserves_nested_duplicate_and_discriminant_evidence() {
+        for (encoded, duplicate, v2) in [
+            (r#"{"a":[{"x":1},{"x":2}]}"#, false, false),
+            (r#"{"a":[{"x":1,"x":2}]}"#, true, false),
+            (r#"{"a":[{"x":1,"\u0078":2}]}"#, true, false),
+            (
+                r#"{"a":[{"x":1,"x":2},{"FencedTransitionV2":null}]}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"a":[{"\u0046encedTransitionV2":null},{"x":1,"x":2}]}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"a":[{"FinalizeOperatorRecoveryV2":null}]}"#,
+                false,
+                true,
+            ),
+            (
+                r#"{"a":["FencedTransitionV2",null,true,1,1.5]}"#,
+                false,
+                false,
+            ),
+        ] {
+            let audit: ExactFencedTransitionV2Json =
+                serde_json::from_str(encoded).expect("complete JSON traversal");
+            assert_eq!(audit.has_duplicate_key, duplicate);
+            assert_eq!(audit.contains_v2_discriminant, v2);
+        }
+        for malformed in [
+            r#"{"FencedTransitionV2":null}{}"#,
+            r#"{"FencedTransitionV2":null,"a":[0,]}"#,
+            r#"{"FencedTransitionV2":null,"a":1e999}"#,
+        ] {
+            assert!(serde_json::from_str::<ExactFencedTransitionV2Json>(malformed).is_err());
         }
     }
 

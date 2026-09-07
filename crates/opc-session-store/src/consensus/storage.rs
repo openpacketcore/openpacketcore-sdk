@@ -5505,6 +5505,11 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         let legacy_reseed_candidate = if self.core.authority_profile
             == ConsensusAuthorityProfile::FixedImmutable
         {
+            // Reservation takes BEGIN IMMEDIATE even when no legacy journal
+            // exists. Use the same writer handoff as append/apply/publication
+            // before taking core.conn, so our own prune lane cannot turn
+            // snapshot startup into a fatal SQLITE_BUSY storage error.
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
             consensus::reserve_legacy_fixed_snapshot_reseed_candidate_sync(
                 &conn,
@@ -9874,6 +9879,45 @@ mod tests {
             "the completed physical prune drains the durable logical backlog"
         );
         drop(conn);
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_snapshot_startup_yields_prune_writer_before_reserving_legacy_candidate() {
+        let directory = FixedRawReadStoreFixture::new();
+        prepare_dormant_fixed_prune_backlog(&directory).await;
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "physical prune owns the SQLite writer before snapshot startup"
+        );
+
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), builder.build_snapshot())
+            .await
+            .expect("snapshot startup coordinates with the existing prune writer")
+            .expect("snapshot reservation must not fail with SQLITE_BUSY");
+        assert!(
+            gate.preemption_requested(),
+            "snapshot startup yields the prune turn"
+        );
+        assert_eq!(snapshot.meta.last_log_id, Some(log_id(129)));
+        drop(snapshot);
+        log_store
+            .blocking_append([blank_entry(130)])
+            .await
+            .expect("primary append remains usable after snapshot startup");
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("the preempted physical prune resumes and drains its backlog");
         lane.shutdown().await;
     }
 
