@@ -131,6 +131,14 @@ impl RpcError {
         )
     }
 
+    /// `(application, data-exists)`.
+    pub const fn data_exists() -> Self {
+        Self::new(
+            NetconfError::new(NetconfErrorType::Application, NetconfErrorTag::DataExists),
+            "data exists",
+        )
+    }
+
     /// `(application, data-missing)`.
     pub const fn data_missing() -> Self {
         Self::new(

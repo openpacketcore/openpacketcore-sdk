@@ -6,8 +6,9 @@ use opc_config_bus::ConfigBus;
 use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::{
-    DefaultReport, NetconfEditError, NetconfProjectionError, NetconfXmlEditApplicator,
-    NetconfXmlRenderContext, NetconfXmlRenderer, SchemaRegistry,
+    DefaultReport, EditOperation, NetconfEditError, NetconfProjectionError,
+    NetconfXmlEditApplicator, NetconfXmlRenderContext, NetconfXmlRenderer, NodeKind,
+    SchemaRegistry,
 };
 use thiserror::Error;
 
@@ -207,6 +208,12 @@ pub enum EditConfigError {
     /// The client-supplied config fragment is invalid for the served model.
     #[error("NETCONF edit-config value is invalid")]
     InvalidValue,
+    /// An entry targeted by `create` already exists (RFC 6241 `data-exists`).
+    #[error("NETCONF edit-config data already exists")]
+    DataExists,
+    /// An entry targeted by `delete` does not exist (RFC 6241 `data-missing`).
+    #[error("NETCONF edit-config data is missing")]
+    DataMissing,
     /// Translation failed for an internal reason.
     #[error("NETCONF edit-config translation failed")]
     Failed {
@@ -227,7 +234,7 @@ impl EditConfigError {
     pub fn detail(&self) -> Option<&str> {
         match self {
             Self::Failed { detail } => Some(detail),
-            Self::Unsupported | Self::InvalidValue => None,
+            Self::Unsupported | Self::InvalidValue | Self::DataExists | Self::DataMissing => None,
         }
     }
 }
@@ -737,6 +744,16 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
 
 fn netconf_edit_error_to_binding_error(err: NetconfEditError) -> EditConfigError {
     match err {
+        NetconfEditError::OperationNotSupported {
+            operation: EditOperation::Create,
+            kind: NodeKind::LeafList,
+            ..
+        } => EditConfigError::DataExists,
+        NetconfEditError::OperationNotSupported {
+            operation: EditOperation::Delete,
+            kind: NodeKind::LeafList,
+            ..
+        } => EditConfigError::DataMissing,
         NetconfEditError::UnsupportedShape { .. } => EditConfigError::InvalidValue,
         NetconfEditError::OperationNotSupported { .. } => EditConfigError::InvalidValue,
         NetconfEditError::ReadOnly { .. } => EditConfigError::InvalidValue,
