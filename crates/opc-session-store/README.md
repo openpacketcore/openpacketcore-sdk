@@ -889,6 +889,12 @@ every use. The existing statement cache capacity is unchanged. The immutable
 V2 protocol digest is computed once; every persisted receipt and request
 binding is still verified.
 
+Logical purge reuses its complete current-floor row audit within the same
+transaction when proving the next floor and applied frontier. Any applied tail
+beyond that first scan is fully decoded before publication. Exact marker,
+lineage and no-hole checks remain; each new purge call audits its current
+durable rows again. Physical pruning keeps its separate validation and limits.
+
 Membership projection loading shares complete layout, certificate, history and
 scope validation within one SQLite read transaction. An autocommit caller gets
 a read transaction for that load; an existing caller transaction retains its

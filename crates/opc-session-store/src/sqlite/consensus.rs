@@ -26671,8 +26671,10 @@ fn logical_purge_logs_in_tx(
     through: &LogId<SessionConsensusNodeId>,
     _index: i64,
 ) -> io::Result<()> {
+    let mut current_witnesses = None;
     if let Some(current) = read_purged_sync(tx, identity)? {
-        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        let witnesses = validated_log_witnesses_through_sync(tx, identity, &current)?;
+        validate_exact_log_prefix_from_witnesses_sync(tx, identity, &current, false, &witnesses)?;
         if through.index < current.index {
             // A delayed engine notification may describe a prefix which the
             // snapshot replacement transaction already made durable. It is
@@ -26696,10 +26698,43 @@ fn logical_purge_logs_in_tx(
             through,
             "session consensus purged index regressed",
         )?;
+        current_witnesses = Some(witnesses);
     }
     let applied = read_applied_sync(tx, identity)?
         .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
-    let witnesses = validated_log_witnesses_through_sync(tx, identity, &applied)?;
+    let witnesses = if let Some(mut witnesses) = current_witnesses {
+        // The current-floor audit already decoded every retained row through
+        // the highest compaction marker. No row or marker has changed in this
+        // transaction. Preserve that audit's error and idempotence ordering,
+        // then decode only the applied tail beyond its complete scan bound.
+        // These witnesses never escape this transaction or authorize a later
+        // call without a fresh full-row audit.
+        validate_log_id(&applied)?;
+        let previous_scan_end = witnesses
+            .last_key_value()
+            .map(|(index, _)| *index)
+            .ok_or_else(|| invalid_data("session consensus purge audit lacks an exact witness"))?;
+        let start = previous_scan_end
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+        insert_validated_log_rows_in_range_sync(
+            tx,
+            identity,
+            start,
+            applied.index,
+            &mut witnesses,
+        )?;
+        for pair in witnesses.values().collect::<Vec<_>>().windows(2) {
+            ensure_log_id_not_after(
+                pair[0],
+                pair[1],
+                "session consensus durable log leader ordering regressed",
+            )?;
+        }
+        witnesses
+    } else {
+        validated_log_witnesses_through_sync(tx, identity, &applied)?
+    };
     validate_exact_log_prefix_from_witnesses_sync(tx, identity, &applied, false, &witnesses)?;
     ensure_log_id_not_after(
         through,
@@ -48446,6 +48481,283 @@ mod tests {
             read_purged_sync(&conn, identity()).expect("read one-scan purge floor"),
             Some(log_id(PURGE_INDEX)),
         );
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_reuses_exact_rows_and_audits_the_applied_tail() {
+        const CURRENT_INDEX: u64 = 3_071;
+        const SNAPSHOT_INDEX: u64 = 8_191;
+        const APPLIED_INDEX: u64 = SNAPSHOT_INDEX + 64;
+        const PURGE_INDEX: u64 = 7_167;
+
+        let backend = backend_with_blank_logs(APPLIED_INDEX).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        set_test_purge_floor(&conn, &log_id(CURRENT_INDEX));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(APPLIED_INDEX));
+        save_test_snapshot_marker(&conn, log_id(SNAPSHOT_INDEX), "later-purge-one-scan");
+
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin later purge");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+            .expect("audit the current floor, new floor and applied tail");
+        tx.commit().expect("commit later purge");
+        assert_eq!(
+            committed_log_validation_decoded_rows_for_test(),
+            usize::try_from(APPLIED_INDEX + 1).expect("fixture row count"),
+            "each retained payload must be audited exactly once within this transaction",
+        );
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("new exact purge floor"),
+            Some(log_id(PURGE_INDEX)),
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM consensus_log", [], |row| row
+                .get::<_, i64>(0))
+                .expect("logical publication retains physical rows"),
+            i64::try_from(APPLIED_INDEX + 1).expect("fixture row count"),
+        );
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_rejects_corruption_in_both_audit_intervals() {
+        for corruption in [
+            "prefix-v2",
+            "tail-v2",
+            "prefix-hole",
+            "tail-hole",
+            "tail-row-mismatch",
+            "tail-lineage",
+            "snapshot-marker",
+            "purge-marker",
+        ] {
+            let backend = backend_with_blank_logs(191).await;
+            let conn = backend.conn.lock().await;
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("fixture membership");
+            set_test_purge_floor(&conn, &log_id(31));
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(191));
+            save_test_snapshot_marker(&conn, log_id(127), "later-purge-corruption");
+            let index = match corruption {
+                "prefix-v2" | "prefix-hole" => 64,
+                "snapshot-marker" => 127,
+                "purge-marker" => 31,
+                _ => 160,
+            };
+            match corruption {
+                "prefix-v2" | "tail-v2" => {
+                    let entry = fenced_transition_v2_entry(
+                        index,
+                        fenced_transition_v2_request(0x96, 1, "later-purge-strict-owner"),
+                        timestamp(2),
+                    );
+                    conn.execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                        params![
+                            noncanonical_v2_log_json(&entry),
+                            i64::try_from(index).unwrap()
+                        ],
+                    )
+                    .expect("strict interior V2 corruption");
+                }
+                "prefix-hole" | "tail-hole" => {
+                    conn.execute("DELETE FROM consensus_log WHERE log_index = ?1", [index])
+                        .expect("interior hole");
+                }
+                "tail-row-mismatch" => {
+                    conn.execute(
+                        "UPDATE consensus_log SET term = 2 WHERE log_index = ?1",
+                        [index],
+                    )
+                    .expect("row column disagrees with exact JSON LogId");
+                }
+                _ => {
+                    let mut entry = blank_entry(index);
+                    let term = if corruption == "tail-lineage" { 0 } else { 2 };
+                    entry.log_id = LogId::new(CommittedLeaderId::new(term, node_id()), index);
+                    conn.execute(
+                        "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = ?3",
+                        params![term, encode_json(&entry).unwrap(), index],
+                    )
+                    .expect("exact but conflicting lineage");
+                }
+            }
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin rejected later purge");
+            assert_eq!(
+                logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+                    .expect_err(corruption)
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "{corruption}",
+            );
+            assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(31)));
+            drop(tx);
+            assert_eq!(
+                read_purged_sync(&conn, identity()).unwrap(),
+                Some(log_id(31))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_preserves_current_audit_and_idempotence_error_order() {
+        let backend = backend_with_blank_logs(191).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("fixture membership");
+        set_test_purge_floor(&conn, &log_id(31));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(191));
+        save_test_snapshot_marker(&conn, log_id(127), "later-purge-error-order");
+        let corrupt = |index| {
+            noncanonical_v2_log_json(&fenced_transition_v2_entry(
+                index,
+                fenced_transition_v2_request(0x96, 1, "later-purge-order-owner"),
+                timestamp(2),
+            ))
+        };
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 160",
+            [corrupt(160)],
+        )
+        .expect("invalid unapplied-audit tail");
+        for through in [log_id(31), log_id(30)] {
+            reset_committed_log_validation_decoded_rows_for_test();
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin idempotent notification");
+            logical_purge_logs_in_tx(&tx, identity(), &through, through.index as i64)
+                .expect("idempotence follows the complete current audit without extending it");
+            assert_eq!(committed_log_validation_decoded_rows_for_test(), 128);
+            assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(31)));
+        }
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin conflicting notification");
+        let conflicting = LogId::new(CommittedLeaderId::new(2, node_id()), 31);
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &conflicting, 31)
+                .expect_err("current-floor conflict precedes later tail corruption")
+                .to_string(),
+            "session consensus purged index regressed",
+        );
+        drop(tx);
+
+        conn.execute("DELETE FROM consensus_applied", [])
+            .expect("missing applied pointer");
+        let encoded = corrupt(64);
+        let expected = decode_consensus_log_entry(&encoded)
+            .expect_err("strict V2 fixture")
+            .to_string();
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 64",
+            [encoded],
+        )
+        .expect("invalid row inside the current audit");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin rejected current audit");
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+                .expect_err("current-row corruption precedes a missing applied pointer")
+                .to_string(),
+            expected,
+        );
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(31)));
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_keeps_the_snapshot_witness_beyond_applied() {
+        let backend = backend_with_blank_logs(191).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("fixture membership");
+        set_test_purge_floor(&conn, &log_id(31));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(127));
+        save_test_snapshot_marker(&conn, log_id(191), "later-purge-future-marker");
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin purge with later snapshot");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+            .expect("full witness range extends through snapshot beyond applied");
+        assert_eq!(committed_log_validation_decoded_rows_for_test(), 192);
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(95)));
+        tx.rollback().expect("restore prior logical floor");
+        conn.execute("DELETE FROM consensus_log WHERE log_index <= 31", [])
+            .expect("model completed physical reclamation through prior floor");
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin purge after physical reclamation");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+            .expect("current marker and fully decoded suffix prove the new floor");
+        assert_eq!(committed_log_validation_decoded_rows_for_test(), 160);
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(95)));
+    }
+
+    #[tokio::test]
+    #[ignore = "release-profile later logical purge diagnosis for SDK-741"]
+    async fn later_logical_purge_cost_diagnostic() {
+        const CURRENT_INDEX: u64 = 3_071;
+        const SNAPSHOT_INDEX: u64 = 8_191;
+        const APPLIED_INDEX: u64 = SNAPSHOT_INDEX + 64;
+        const PURGE_INDEX: u64 = 7_167;
+
+        let directory = tempfile::tempdir().expect("private disk-backed purge fixture");
+        let backend = SqliteSessionBackend::open(directory.path().join("purge.sqlite"))
+            .expect("open purge fixture");
+        let conn = backend.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("fixture schema");
+        append_logs_sync(&conn, identity(), &[membership_entry()]).expect("fixture membership");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        let mut entry = fenced_transition_v2_batch_entry(
+            1,
+            (1..=8)
+                .map(|nonce| fenced_transition_v2_request(nonce, 1, "purge-cost-fixture"))
+                .collect(),
+            timestamp(1),
+        );
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin bounded row-by-row fixture construction");
+        for index in 1..=APPLIED_INDEX {
+            entry.log_id = log_id(index);
+            let encoded = encode_json(&entry).expect("canonical eight-item V2 row");
+            tx.execute(
+                "INSERT INTO consensus_log (configuration_epoch, term, log_index, entry_json) VALUES (?1, ?2, ?3, ?4)",
+                params![epoch_i64(identity()).unwrap(), 1_i64, i64::try_from(index).unwrap(), encoded],
+            )
+            .expect("write one complete fixture row");
+        }
+        tx.commit()
+            .expect("commit purge fixture before measurement");
+        set_test_purge_floor(&conn, &log_id(CURRENT_INDEX));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(APPLIED_INDEX));
+        save_test_snapshot_marker(&conn, log_id(SNAPSHOT_INDEX), "later-purge-cost");
+        let row_bytes = encode_json(&entry).expect("fixture dimensions").len();
+        for iteration in 0..3 {
+            reset_committed_log_validation_decoded_rows_for_test();
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin actual later purge transaction");
+            let started = Instant::now();
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+                .expect("actual later purge fully audits rows");
+            let elapsed = started.elapsed();
+            assert_eq!(
+                read_purged_sync(&tx, identity()).unwrap(),
+                Some(log_id(PURGE_INDEX))
+            );
+            eprintln!(
+                "sdk-741 later purge: iteration={iteration} retained_rows={} batch_items=8 row_bytes={row_bytes} decoded_rows={} purge_us={}",
+                APPLIED_INDEX + 1,
+                committed_log_validation_decoded_rows_for_test(),
+                elapsed.as_micros(),
+            );
+            tx.rollback()
+                .expect("restore the same current floor for the next measurement");
+            assert_eq!(
+                read_purged_sync(&conn, identity()).unwrap(),
+                Some(log_id(CURRENT_INDEX))
+            );
+        }
     }
 
     #[tokio::test]
