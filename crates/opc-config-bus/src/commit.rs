@@ -25,10 +25,10 @@ use crate::alarms::{
     CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
 };
 use crate::authorizer::{ConfigAuthorizer, DenyAllAuthorizer};
-use crate::datastore::ManagedDatastore;
+use crate::datastore::{CommittedRevisionSource, ManagedDatastore};
 use crate::restore::{
     restore_validation_context, startup_bootstrap_principal, validate_publishable_stored_config,
-    validate_startup_config,
+    validate_restored_recovery_marker, validate_startup_config, validate_stored_schema_digest,
 };
 use crate::rollback::resolve_candidate;
 use crate::subscribers::{ConfigReceiver, SubscriberLagPolicy, SubscriberState};
@@ -37,7 +37,7 @@ use crate::types::{
     ConfirmedCommitResolution, DriftState, PublishedSnapshot, StoreError, StoreErrorCode,
     StoredConfig, StoredRequestFingerprint, StoredRequestMode,
 };
-use crate::ConfigProjectionHead;
+use crate::{ConfigProjectionHead, ConfigProjectionPublication, ConfigProjectionRebuilder};
 
 pub(crate) const DEFAULT_COMMIT_QUEUE_CAPACITY: usize = 32;
 const UNSUPPORTED_VALIDATE_ONLY_OPERATION_MESSAGE: &str =
@@ -74,6 +74,14 @@ const SHADOW_MUTATION_REJECTED_MESSAGE: &str =
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
     pub(crate) reply: oneshot::Sender<Result<CommitResult, CommitError>>,
+}
+
+pub(crate) enum WorkerRequest<C: OpcConfig> {
+    Submit(Box<Submission<C>>),
+    Reconcile {
+        source: Arc<dyn CommittedRevisionSource<C>>,
+        reply: oneshot::Sender<Result<ConfigProjectionHead, StoreError>>,
+    },
 }
 
 enum PendingTimerUpdate {
@@ -139,6 +147,19 @@ impl RecoveryState {
         self.fenced.store(true, Ordering::Release);
         crate::metrics::record_recovery_fence_active(true);
     }
+
+    pub(crate) fn clear(&self) {
+        let mut slot = match self.reason.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config recovery-fence state");
+                poisoned.into_inner()
+            }
+        };
+        *slot = None;
+        self.fenced.store(false, Ordering::Release);
+        crate::metrics::record_recovery_fence_active(false);
+    }
 }
 
 pub(crate) struct CommitAdmissionLimits {
@@ -172,7 +193,7 @@ impl CommitAdmissionLimits {
 /// Sequenced config commit worker with atomic snapshot publication.
 #[derive(Clone)]
 pub struct ConfigBus<C: OpcConfig> {
-    pub(crate) tx: mpsc::Sender<Submission<C>>,
+    pub(crate) tx: mpsc::Sender<WorkerRequest<C>>,
     pub(crate) snapshot: Arc<AtomicConfigSnapshot<C>>,
     pub(crate) subscribers: Arc<Mutex<Vec<Arc<SubscriberState<C>>>>>,
     pub(crate) authority_mode: AuthorityMode,
@@ -181,6 +202,7 @@ pub struct ConfigBus<C: OpcConfig> {
     pub(crate) authorizer: Arc<dyn ConfigAuthorizer>,
     pub(crate) admission_limits: Arc<CommitAdmissionLimits>,
     pub(crate) store: Arc<dyn ManagedDatastore<C>>,
+    pub(crate) authority: Arc<Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>>,
 }
 
 impl<C: OpcConfig> ConfigBus<C> {
@@ -201,6 +223,7 @@ impl<C: OpcConfig> ConfigBus<C> {
         let subscribers = Arc::new(Mutex::new(Vec::new()));
         let recovery = Arc::new(RecoveryState::default());
         let admission_limits = Arc::new(CommitAdmissionLimits::default());
+        let authority = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::channel(queue_capacity);
 
         tokio::spawn(worker_loop(
@@ -213,6 +236,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             alarm_manager.clone(),
             authorizer.clone(),
             impact_classifier.clone(),
+            Arc::clone(&authority),
             pending_deadline,
         ));
 
@@ -226,6 +250,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             authorizer,
             admission_limits,
             store,
+            authority,
         }
     }
 
@@ -253,6 +278,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             authorizer: Arc::new(DenyAllAuthorizer),
             admission_limits,
             store,
+            authority: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -295,10 +321,10 @@ impl<C: OpcConfig> ConfigBus<C> {
             ));
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        let sent = self.tx.try_send(Submission {
+        let sent = self.tx.try_send(WorkerRequest::Submit(Box::new(Submission {
             request,
             reply: reply_tx,
-        });
+        })));
 
         let sub = match sent {
             Ok(_) => {
@@ -468,6 +494,64 @@ impl<C: OpcConfig> ConfigBus<C> {
     pub fn authorizer(&self) -> Arc<dyn ConfigAuthorizer> {
         self.authorizer.clone()
     }
+
+    /// Binds an optional writer-of-record authority gate to this authoritative
+    /// bus. Existing constructors leave the gate absent for compatibility.
+    ///
+    /// Once present, the single worker consults it immediately before every
+    /// durable mutation and automatic confirmed-commit expiry rollback. The
+    /// gate is also used by [`Self::reconcile_from`] to prove the canonical
+    /// target head before replacing a stale local projection.
+    #[must_use]
+    pub fn with_authority_port(self, authority: Arc<dyn crate::ConfigAuthorityPort>) -> Self {
+        self.set_authority_port(Some(authority));
+        self
+    }
+
+    /// Replaces the optional writer-of-record authority gate for all clones
+    /// of this bus. Passing `None` restores constructor-compatible local
+    /// behavior.
+    pub fn set_authority_port(&self, authority: Option<Arc<dyn crate::ConfigAuthorityPort>>) {
+        let mut slot = match self.authority.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config authority slot");
+                poisoned.into_inner()
+            }
+        };
+        *slot = authority;
+    }
+
+    /// Rebuilds this live authoritative projection from one locally applied,
+    /// publication-safe committed-revision source.
+    ///
+    /// The rebuild is a control request on the existing worker, so it cannot
+    /// race submission or confirmed-commit expiry. It never bootstraps a
+    /// missing head. Validation completes before the snapshot swap; a failed
+    /// read, validation, authority proof, or revision regression leaves the
+    /// current projection and timer unchanged. Subscribers receive one bounded
+    /// explicit resynchronization marker after a successful replacement.
+    pub async fn reconcile_from<S>(&self, source: S) -> Result<ConfigProjectionHead, StoreError>
+    where
+        S: CommittedRevisionSource<C> + 'static,
+    {
+        if self.authority_mode == AuthorityMode::Shadow {
+            return Err(StoreError::unavailable(
+                "shadow config bus cannot reconcile an authoritative projection",
+            ));
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(WorkerRequest::Reconcile {
+                source: Arc::new(source),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| StoreError::unavailable("config commit worker is unavailable"))?;
+        reply_rx
+            .await
+            .map_err(|_| StoreError::unavailable("config commit worker is unavailable"))?
+    }
 }
 
 impl<C: OpcConfig> ConfigSnapshot<C> for ConfigBus<C> {
@@ -490,7 +574,7 @@ fn pending_deadline_fire_at(deadline: &Timestamp) -> tokio::time::Instant {
 }
 
 async fn worker_loop<C: OpcConfig>(
-    mut rx: mpsc::Receiver<Submission<C>>,
+    mut rx: mpsc::Receiver<WorkerRequest<C>>,
     snapshot: Arc<AtomicConfigSnapshot<C>>,
     subscribers: Arc<Mutex<Vec<Arc<SubscriberState<C>>>>>,
     recovery: Arc<RecoveryState>,
@@ -499,6 +583,7 @@ async fn worker_loop<C: OpcConfig>(
     alarm_manager: SharedAlarmManager,
     authorizer: Arc<dyn ConfigAuthorizer>,
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
+    authority: Arc<Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>>,
     initial_pending_deadline: Option<Timestamp>,
 ) {
     let mut pending_fire_at = initial_pending_deadline
@@ -510,8 +595,60 @@ async fn worker_loop<C: OpcConfig>(
 
         tokio::select! {
             submission_opt = rx.recv() => {
-                let Some(submission) = submission_opt else {
+                let Some(request) = submission_opt else {
                     break;
+                };
+
+                let submission = match request {
+                    WorkerRequest::Submit(submission) => *submission,
+                    WorkerRequest::Reconcile {
+                        source,
+                        reply,
+                    } => {
+                        let Some(authority) = authority_port(authority.as_ref()) else {
+                            let _ = reply.send(Err(StoreError::unavailable(
+                                "authoritative projection reconciliation requires a local authority port",
+                            )));
+                            continue;
+                        };
+                        let publication_slot = Arc::new(Mutex::new(None));
+                        let rebuilt = authority
+                            .reconcile_local_projection(Box::new(WorkerProjectionRebuilder {
+                                source,
+                                snapshot: Arc::clone(&snapshot),
+                                subscribers: Arc::clone(&subscribers),
+                                recovery: Arc::clone(&recovery),
+                                publication_slot: Arc::clone(&publication_slot),
+                            }))
+                            .await;
+                        let published = take_projection_publication(&publication_slot);
+                        if let Some(publication) = published {
+                            pending_fire_at = publication
+                                .pending_confirmed_deadline()
+                                .as_ref()
+                                .map(pending_deadline_fire_at);
+                        }
+                        match rebuilt {
+                            Ok(publication) => {
+                                if published == Some(publication) {
+                                    let _ = reply.send(Ok(publication.head()));
+                                } else {
+                                    recovery.fence(
+                                        "projection publication acknowledgement was inconsistent",
+                                    );
+                                    let _ = reply.send(Err(StoreError::unavailable(
+                                        "projection publication acknowledgement was inconsistent",
+                                    )));
+                                }
+                            }
+                            Err(_) => {
+                                let _ = reply.send(Err(StoreError::unavailable(
+                                    "local config authority is unavailable for projection reconciliation",
+                                )));
+                            }
+                        }
+                        continue;
+                    }
                 };
 
                 let has_pending = pending_fire_at.is_some();
@@ -525,6 +662,7 @@ async fn worker_loop<C: OpcConfig>(
                     store.as_ref(),
                     authorizer.as_ref(),
                     impact_classifier.clone(),
+                    authority.as_ref(),
                     has_pending,
                 ))
                 .catch_unwind()
@@ -575,6 +713,16 @@ async fn worker_loop<C: OpcConfig>(
                 let rollback_tx_id = TxId::new();
 
                 let rollback_res = async {
+                    ensure_authority(
+                        authority.as_ref(),
+                        ConfigProjectionHead::new(current_snap.tx_id, current_snap.version),
+                    )
+                    .await
+                    .map_err(|_| {
+                        StoreError::unavailable(
+                            "local config authority is unavailable for confirmed-commit expiry",
+                        )
+                    })?;
                     let latest_stored = store
                         .load_latest()
                         .await
@@ -725,6 +873,7 @@ async fn process_commit<C: OpcConfig>(
     store: &dyn ManagedDatastore<C>,
     authorizer: &dyn ConfigAuthorizer,
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
+    authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
     has_pending: bool,
 ) -> Result<ProcessedCommit, CommitError> {
     if let Some(reason) = recovery.reason() {
@@ -745,6 +894,13 @@ async fn process_commit<C: OpcConfig>(
     enforce_candidate_payload_limit(request.candidate.as_ref(), admission_limits.as_ref())?;
 
     let current = snapshot.current_snapshot();
+    if request_requires_authority(&request.mode) {
+        ensure_authority(
+            authority,
+            ConfigProjectionHead::new(current.tx_id, current.version),
+        )
+        .await?;
+    }
     if matches!(request.mode, CommitMode::CommitConfirmed { .. }) && current.tx_id.is_none() {
         return Err(CommitError::rollback_unavailable(
             "commit-confirmed requires a durable rollback parent",
@@ -1109,6 +1265,131 @@ async fn process_commit<C: OpcConfig>(
             })
         }
     }
+}
+
+fn request_requires_authority(mode: &CommitMode) -> bool {
+    !matches!(mode, CommitMode::ValidateOnly)
+}
+
+fn authority_port(
+    authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
+) -> Option<Arc<dyn crate::ConfigAuthorityPort>> {
+    let slot = match authority.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => {
+            tracing::error!("recovering poisoned config authority slot");
+            poisoned.into_inner()
+        }
+    };
+    slot.clone()
+}
+
+async fn ensure_authority(
+    authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
+    head: ConfigProjectionHead,
+) -> Result<(), CommitError> {
+    let Some(authority) = authority_port(authority) else {
+        return Ok(());
+    };
+    match authority
+        .ensure_local_authority(crate::ConfigAuthorityOperation::Write, head)
+        .await
+    {
+        crate::ConfigAuthorityOutcome::LocalAuthority => Ok(()),
+        crate::ConfigAuthorityOutcome::Retry { .. }
+        | crate::ConfigAuthorityOutcome::Unavailable => Err(CommitError::new(
+            CommitErrorCode::AdmissionRejected,
+            "local config authority is unavailable",
+        )),
+    }
+}
+
+struct WorkerProjectionRebuilder<C: OpcConfig> {
+    source: Arc<dyn CommittedRevisionSource<C>>,
+    snapshot: Arc<AtomicConfigSnapshot<C>>,
+    subscribers: Arc<Mutex<Vec<Arc<SubscriberState<C>>>>>,
+    recovery: Arc<RecoveryState>,
+    publication_slot: Arc<Mutex<Option<ConfigProjectionPublication>>>,
+}
+
+#[async_trait::async_trait]
+impl<C: OpcConfig> ConfigProjectionRebuilder for WorkerProjectionRebuilder<C> {
+    async fn rebuild(
+        self: Box<Self>,
+        expected: ConfigProjectionHead,
+    ) -> Result<ConfigProjectionPublication, StoreError> {
+        let publication = rebuild_projection(
+            self.source.as_ref(),
+            self.snapshot,
+            self.subscribers,
+            self.recovery,
+            expected,
+        )
+        .await?;
+        let mut slot = match self.publication_slot.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned projection publication slot");
+                poisoned.into_inner()
+            }
+        };
+        *slot = Some(publication);
+        Ok(publication)
+    }
+}
+
+fn take_projection_publication(
+    publication_slot: &Mutex<Option<ConfigProjectionPublication>>,
+) -> Option<ConfigProjectionPublication> {
+    let mut slot = match publication_slot.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => {
+            tracing::error!("recovering poisoned projection publication slot");
+            poisoned.into_inner()
+        }
+    };
+    slot.take()
+}
+
+async fn rebuild_projection<C: OpcConfig>(
+    source: &dyn CommittedRevisionSource<C>,
+    snapshot: Arc<AtomicConfigSnapshot<C>>,
+    subscribers: Arc<Mutex<Vec<Arc<SubscriberState<C>>>>>,
+    recovery: Arc<RecoveryState>,
+    expected: ConfigProjectionHead,
+) -> Result<ConfigProjectionPublication, StoreError> {
+    let stored = source
+        .load_committed_latest()
+        .await?
+        .ok_or_else(|| StoreError::not_found("committed revision source has no applied head"))?;
+    validate_stored_schema_digest(&stored)?;
+    validate_restored_recovery_marker(&stored)?;
+
+    let current = snapshot.current_snapshot();
+    if stored.version < current.version
+        || (stored.version == current.version && Some(stored.tx_id) != current.tx_id)
+    {
+        return Err(StoreError::unavailable(
+            "committed revision source regressed from the live projection",
+        ));
+    }
+
+    let validation_context = restore_validation_context(&stored);
+    let rebuilt = validate_startup_config(stored.config, validation_context).await?;
+    let head = ConfigProjectionHead::new(Some(stored.tx_id), stored.version);
+    if head != expected {
+        return Err(StoreError::unavailable(
+            "committed revision source does not match the authority target",
+        ));
+    }
+
+    snapshot.publish(Some(stored.tx_id), stored.version, Arc::new(rebuilt));
+    recovery.clear();
+    fanout_resync(&subscribers, stored.version);
+    Ok(ConfigProjectionPublication::new(
+        head,
+        stored.confirmed_deadline,
+    ))
 }
 
 fn ensure_candidate_base_version<C: OpcConfig>(
@@ -1524,6 +1805,26 @@ fn fanout<C: OpcConfig>(
     }
 }
 
+fn fanout_resync<C: OpcConfig>(
+    subscribers: &Arc<Mutex<Vec<Arc<SubscriberState<C>>>>>,
+    latest_version: ConfigVersion,
+) {
+    let snapshot = {
+        let mut guard = match subscribers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config subscriber-list state");
+                poisoned.into_inner()
+            }
+        };
+        guard.retain(|subscriber| !subscriber.closed.load(Ordering::Acquire));
+        guard.clone()
+    };
+    for subscriber in snapshot {
+        subscriber.force_resync(latest_version);
+    }
+}
+
 fn log_store_error(operation: &str, request_id: RequestId, error: &StoreError) {
     tracing::error!(
         request_id = %request_id,
@@ -1660,6 +1961,78 @@ mod tests {
         }
     }
 
+    impl CommittedRevisionSource<CountingSizeConfig>
+        for crate::InMemoryManagedDatastore<CountingSizeConfig>
+    {
+    }
+
+    struct RebuildingAuthority {
+        expected: ConfigProjectionHead,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ConfigAuthorityPort for RebuildingAuthority {
+        async fn ensure_local_authority(
+            &self,
+            _operation: crate::ConfigAuthorityOperation,
+            _projection: ConfigProjectionHead,
+        ) -> crate::ConfigAuthorityOutcome {
+            crate::ConfigAuthorityOutcome::LocalAuthority
+        }
+
+        async fn reconcile_local_projection(
+            &self,
+            rebuild: Box<dyn crate::ConfigProjectionRebuilder>,
+        ) -> Result<crate::ConfigProjectionPublication, crate::ConfigAuthorityOutcome> {
+            rebuild
+                .rebuild(self.expected)
+                .await
+                .map_err(|_| crate::ConfigAuthorityOutcome::Unavailable)
+        }
+    }
+
+    struct BlockingRebuildingAuthority {
+        expected: ConfigProjectionHead,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ConfigAuthorityPort for BlockingRebuildingAuthority {
+        async fn ensure_local_authority(
+            &self,
+            _operation: crate::ConfigAuthorityOperation,
+            _projection: ConfigProjectionHead,
+        ) -> crate::ConfigAuthorityOutcome {
+            crate::ConfigAuthorityOutcome::LocalAuthority
+        }
+
+        async fn reconcile_local_projection(
+            &self,
+            rebuild: Box<dyn crate::ConfigProjectionRebuilder>,
+        ) -> Result<crate::ConfigProjectionPublication, crate::ConfigAuthorityOutcome> {
+            self.started.notify_one();
+            self.release.notified().await;
+            rebuild
+                .rebuild(self.expected)
+                .await
+                .map_err(|_| crate::ConfigAuthorityOutcome::Unavailable)
+        }
+    }
+
+    struct UnavailableAuthority;
+
+    #[async_trait::async_trait]
+    impl crate::ConfigAuthorityPort for UnavailableAuthority {
+        async fn ensure_local_authority(
+            &self,
+            _operation: crate::ConfigAuthorityOperation,
+            _projection: ConfigProjectionHead,
+        ) -> crate::ConfigAuthorityOutcome {
+            crate::ConfigAuthorityOutcome::Unavailable
+        }
+    }
+
     impl CaptureSubscriber {
         fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
             Self { events }
@@ -1780,6 +2153,151 @@ mod tests {
         assert!(first.retained_bytes() > 0);
         assert_eq!(first.retained_bytes(), second.retained_bytes());
         assert_eq!(count_only.retained_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_replaces_the_live_slot_and_forces_subscriber_resync() {
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let local_store = Arc::new(crate::InMemoryManagedDatastore::new());
+        let bus = ConfigBus::new_dev_only(
+            CountingSizeConfig {
+                snapshot_calls: Arc::clone(&snapshot_calls),
+            },
+            local_store,
+        )
+        .await
+        .expect("bus starts");
+        let subscriber = bus.subscribe(SubscriberLagPolicy::DropNewest, 1);
+
+        let source = Arc::new(crate::InMemoryManagedDatastore::new());
+        let tenant = opc_types::TenantId::new("test-tenant").expect("test tenant");
+        let principal = TrustedPrincipal::new(
+            opc_config_model::WorkloadIdentity::Internal("test".to_owned()),
+            tenant,
+        );
+        let tx_id = TxId::new();
+        source
+            .seed(StoredConfig::new(
+                tx_id,
+                ConfigVersion::new(1),
+                principal,
+                RequestSource::Internal,
+                CountingSizeConfig { snapshot_calls },
+            ))
+            .await;
+        bus.set_authority_port(Some(Arc::new(RebuildingAuthority {
+            expected: ConfigProjectionHead::new(Some(tx_id), ConfigVersion::new(1)),
+        })));
+        bus.recovery.fence("test fence");
+
+        let head = bus
+            .reconcile_from(source)
+            .await
+            .expect("publication-safe source rebuilds the live bus");
+        assert_eq!(
+            head,
+            ConfigProjectionHead::new(Some(tx_id), ConfigVersion::new(1))
+        );
+        assert_eq!(bus.projection_head(), head);
+        assert_eq!(bus.drift_state(), DriftState::InSync);
+        let event = subscriber.recv().await.expect("reconciliation resync");
+        let ConfigEvent::ResyncRequired { latest_version } = event else {
+            panic!("reconciliation must force subscriber resync");
+        };
+        assert_eq!(latest_version, ConfigVersion::new(1));
+    }
+
+    #[tokio::test]
+    async fn cancelled_reconciliation_caller_cannot_detach_worker_publication() {
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let bus = ConfigBus::new_dev_only(
+            CountingSizeConfig {
+                snapshot_calls: Arc::clone(&snapshot_calls),
+            },
+            crate::InMemoryManagedDatastore::new(),
+        )
+        .await
+        .expect("bus starts");
+        let source = Arc::new(crate::InMemoryManagedDatastore::new());
+        let tenant = opc_types::TenantId::new("test-tenant").expect("test tenant");
+        let principal = TrustedPrincipal::new(
+            opc_config_model::WorkloadIdentity::Internal("test".to_owned()),
+            tenant,
+        );
+        let tx_id = TxId::new();
+        source
+            .seed(StoredConfig::new(
+                tx_id,
+                ConfigVersion::new(1),
+                principal,
+                RequestSource::Internal,
+                CountingSizeConfig { snapshot_calls },
+            ))
+            .await;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started_wait = started.notified();
+        bus.set_authority_port(Some(Arc::new(BlockingRebuildingAuthority {
+            expected: ConfigProjectionHead::new(Some(tx_id), ConfigVersion::new(1)),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })));
+
+        let (reply, receiver) = oneshot::channel();
+        bus.tx
+            .try_send(WorkerRequest::Reconcile { source, reply })
+            .expect("control request enqueues");
+        started_wait.await;
+        drop(receiver);
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while bus.version() != ConfigVersion::new(1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker finishes publication after its caller is cancelled");
+
+        assert_eq!(bus.version(), ConfigVersion::new(1));
+        assert_eq!(bus.projection_head().tx_id(), Some(tx_id));
+    }
+
+    #[tokio::test]
+    async fn authority_gate_rejects_direct_mutation_before_store_access() {
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let bus = ConfigBus::new_dev_only(
+            CountingSizeConfig {
+                snapshot_calls: Arc::clone(&snapshot_calls),
+            },
+            crate::InMemoryManagedDatastore::new(),
+        )
+        .await
+        .expect("bus starts")
+        .with_authority_port(Arc::new(UnavailableAuthority));
+        let tenant = opc_types::TenantId::new("test-tenant").expect("test tenant");
+        let principal = TrustedPrincipal::new(
+            opc_config_model::WorkloadIdentity::Internal("test".to_owned()),
+            tenant,
+        );
+
+        let error = bus
+            .submit(CommitRequest::new(
+                RequestId::new(),
+                principal,
+                opc_config_model::TransportType::Internal,
+                RequestSource::Internal,
+                ConfigOperation::Replace,
+                CommitMode::Commit,
+                Instant::now() + std::time::Duration::from_secs(1),
+                Some(CountingSizeConfig { snapshot_calls }),
+                Vec::new(),
+            ))
+            .await
+            .expect_err("unproven local authority rejects mutation");
+        assert_eq!(error.code, CommitErrorCode::AdmissionRejected);
+        assert_eq!(bus.version(), ConfigVersion::INITIAL);
     }
 
     #[tokio::test]

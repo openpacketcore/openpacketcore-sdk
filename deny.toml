@@ -14,6 +14,19 @@ ignore = [
     # runs --all-features, so the dependency is flagged regardless. Remove
     # once `rsa` ships the constant-time rewrite (tracked for the 0.10 line).
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: no fixed version; verify-only by default, signing opt-in via rsa-signing feature" },
+    # OOB reads deserializing untrusted rkyv archives containing Rc/Arc.
+    # rkyv 0.7.46 is only a lockfile entry here: it is the optional,
+    # never-enabled rkyv integration of rust_decimal, reached through the
+    # pinned openraft fork's byte-unit dependency (byte-unit consumes
+    # rust_decimal with default features off and nothing enables the rkyv
+    # feature), so it is never compiled into or linked by any workspace
+    # artifact under any feature set. No patched 0.7.x release exists (the
+    # advisory's fix is >= 0.8.17, which rust_decimal 1.42.1's `^0.7.46`
+    # requirement cannot reach), and rust_decimal and byte-unit are already
+    # at their newest releases. Remove once rust_decimal's rkyv integration
+    # moves to a patched rkyv, or the pinned openraft no longer pulls
+    # rust_decimal via byte-unit. Mirror of .cargo/audit.toml — keep in sync.
+    { id = "RUSTSEC-2026-0235", reason = "rkyv OOB read: never compiled (optional never-enabled rust_decimal feature); no patched 0.7.x release exists" },
 ]
 
 [licenses]

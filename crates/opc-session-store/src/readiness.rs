@@ -7,6 +7,185 @@
 
 use crate::topology::ReplicaId;
 
+/// Explicit deployment choice for the physical-placement resilience claim.
+///
+/// This policy does not alter Openraft membership, election, leases, fencing,
+/// recovery, persisted scope checks, or mutation sequencing. The strict
+/// default also rejects correlated failure-domain descriptors at topology
+/// admission. After admission, the policy controls how the independently
+/// verified physical-placement claim is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum PlacementResiliencePolicy {
+    /// Require fresh authenticated evidence of independent physical placement.
+    ///
+    /// This is the default. Missing, expired, correlated, or otherwise
+    /// unknown placement never becomes an independent-placement claim.
+    #[default]
+    RequireIndependentFailureDomains,
+    /// Permit traffic authority to be reported with an explicit reduced-
+    /// resilience placement disposition when independent placement is absent.
+    ///
+    /// This is an operator choice; it never converts absent evidence into an
+    /// independent-placement claim.
+    AllowReducedResilience,
+}
+
+/// Redaction-safe resilience disposition of the physical-placement claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PlacementResilienceDisposition {
+    /// Fresh authenticated evidence qualified independent placement.
+    IndependentPlacementQualified,
+    /// An explicit policy accepted correlated or unknown placement without
+    /// asserting independence.
+    ReducedResilience,
+    /// The strict default withheld the independent-placement claim.
+    IndependentPlacementWithheld,
+}
+
+impl PlacementResilienceDisposition {
+    /// Stable low-cardinality result code.
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::IndependentPlacementQualified => "independent_placement_qualified",
+            Self::ReducedResilience => "reduced_resilience",
+            Self::IndependentPlacementWithheld => "independent_placement_withheld",
+        }
+    }
+
+    /// Whether this disposition asserts independent physical placement.
+    pub const fn is_independent_placement_qualified(self) -> bool {
+        matches!(self, Self::IndependentPlacementQualified)
+    }
+}
+
+/// Typed redaction-safe placement-resilience result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlacementResilienceReport {
+    policy: PlacementResiliencePolicy,
+    disposition: PlacementResilienceDisposition,
+}
+
+impl PlacementResilienceReport {
+    pub(crate) const fn qualified(policy: PlacementResiliencePolicy) -> Self {
+        Self {
+            policy,
+            disposition: PlacementResilienceDisposition::IndependentPlacementQualified,
+        }
+    }
+
+    pub(crate) const fn unverified(policy: PlacementResiliencePolicy) -> Self {
+        let disposition = match policy {
+            PlacementResiliencePolicy::RequireIndependentFailureDomains => {
+                PlacementResilienceDisposition::IndependentPlacementWithheld
+            }
+            PlacementResiliencePolicy::AllowReducedResilience => {
+                PlacementResilienceDisposition::ReducedResilience
+            }
+        };
+        Self {
+            policy,
+            disposition,
+        }
+    }
+
+    /// Policy selected for this disposition.
+    pub const fn policy(self) -> PlacementResiliencePolicy {
+        self.policy
+    }
+
+    /// Placement resilience disposition.
+    pub const fn disposition(self) -> PlacementResilienceDisposition {
+        self.disposition
+    }
+}
+
+impl PlacementResiliencePolicy {
+    /// Evaluate a deployment whose physical placement is not independently
+    /// qualified. This is useful to surface the explicit policy result without
+    /// manufacturing placement evidence.
+    #[must_use]
+    pub const fn evaluate_unverified(self) -> PlacementResilienceReport {
+        PlacementResilienceReport::unverified(self)
+    }
+}
+
+/// Redaction-safe result of the fixed durable quorum traffic-authority check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FixedQuorumTrafficAuthority {
+    /// The exact fixed 3- or 5-voter durable quorum completed the required
+    /// recovery, membership, and linearizable-majority checks.
+    Granted,
+    /// A structural fixed-quorum precondition was not established.
+    StructuralRecoveryRequired,
+    /// The recovery latch is active or durable recovery cannot be established.
+    RecoveryRequired,
+    /// The exact membership or a fresh linearizable majority barrier is absent.
+    NoQuorum,
+}
+
+impl FixedQuorumTrafficAuthority {
+    /// Whether traffic mutation authority is present at this instant.
+    pub const fn is_granted(self) -> bool {
+        matches!(self, Self::Granted)
+    }
+
+    /// Stable low-cardinality authority code.
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::StructuralRecoveryRequired => "structural_recovery_required",
+            Self::RecoveryRequired => "recovery_required",
+            Self::NoQuorum => "no_quorum",
+        }
+    }
+}
+
+/// Separate fixed-quorum authority and placement-resilience observations.
+///
+/// Placement freshness is deliberately absent from [`Self::traffic_authority`]
+/// so expiring placement evidence can only downgrade the resilience claim. A
+/// future authoritative mutation still executes through the same Openraft
+/// path and rechecks its own quorum conditions.
+#[must_use = "fixed quorum readiness evidence must be inspected"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedQuorumReadinessReport {
+    traffic_authority: FixedQuorumTrafficAuthority,
+    placement_resilience: PlacementResilienceReport,
+    durable_readiness: DurableReadinessReport,
+}
+
+impl FixedQuorumReadinessReport {
+    pub(crate) const fn new(
+        traffic_authority: FixedQuorumTrafficAuthority,
+        placement_resilience: PlacementResilienceReport,
+        durable_readiness: DurableReadinessReport,
+    ) -> Self {
+        Self {
+            traffic_authority,
+            placement_resilience,
+            durable_readiness,
+        }
+    }
+
+    /// Fixed durable quorum mutation-authority result.
+    pub const fn traffic_authority(&self) -> FixedQuorumTrafficAuthority {
+        self.traffic_authority
+    }
+
+    /// Physical-placement resilience result, independent of traffic authority.
+    pub const fn placement_resilience(&self) -> PlacementResilienceReport {
+        self.placement_resilience
+    }
+
+    /// Underlying Openraft recovery, membership, and barrier observation.
+    pub const fn durable_readiness(&self) -> &DurableReadinessReport {
+        &self.durable_readiness
+    }
+}
+
 /// Local Openraft recovery posture observed during a durable-readiness probe.
 ///
 /// This is deliberately lower-cardinality than Openraft's internal metrics.

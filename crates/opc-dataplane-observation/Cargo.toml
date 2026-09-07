@@ -1,0 +1,16 @@
+[package]
+name = "opc-dataplane-observation"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Backend-neutral bounded traffic-continuity assessment for OpenPacketCore"
+documentation = "https://docs.rs/opc-dataplane-observation"
+keywords = ["5g", "dataplane", "observation", "proof", "fencing"]
+categories = ["network-programming"]
+publish = false
+
+[lints]
+workspace = true

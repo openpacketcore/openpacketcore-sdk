@@ -1284,8 +1284,8 @@ mod tests {
         let lease_rendered = format!("{lease:?}");
         let record_rendered = format!("{record:?}");
 
-        assert!(lease_rendered.contains("[20 bytes]"));
-        assert!(record_rendered.contains("[20 bytes]"));
+        assert_eq!(lease_rendered, "LeaseGuard(<redacted>)");
+        assert_eq!(record_rendered, "StoredSessionRecord(<redacted>)");
         assert!(!lease_rendered.contains(raw_stable_id));
         assert!(!record_rendered.contains(raw_stable_id));
     }

@@ -29,10 +29,12 @@ rustflags=(
   "-C" "debuginfo=2"
   "-C" "linker=${linker}"
   "-C" "link-arg=--btf"
-  "--remap-path-prefix=${repo_root}=/opc-sdk"
-  "--remap-path-prefix=${sysroot}=/rust-sysroot"
-  "--remap-path-prefix=${cargo_home}=/cargo-home"
+  # rustc applies the last matching remap. Keep the broad home mapping first
+  # so the more specific dependency, sysroot, and repository paths win.
   "--remap-path-prefix=${HOME}=/build-home"
+  "--remap-path-prefix=${cargo_home}=/cargo-home"
+  "--remap-path-prefix=${sysroot}=/rust-sysroot"
+  "--remap-path-prefix=${repo_root}=/opc-sdk"
 )
 
 (

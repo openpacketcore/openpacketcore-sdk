@@ -205,23 +205,37 @@ pub fn receive_message_outcome(
     if buffer.is_empty() {
         return Ok(ReceiveMessageOutcome::Complete { bytes_received: 0 });
     }
-    // SAFETY: `buffer` is a valid writable byte slice for its length and the
-    // socket fd is live. `recv` writes at most `buffer.len()` bytes.
+    let mut peer = kernel_netlink_addr(0);
+    let mut peer_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    // SAFETY: `buffer` is a valid writable byte slice for its length, `peer`
+    // and `peer_len` are initialized writable address outputs, and the socket
+    // fd is live. `recvfrom` writes at most `buffer.len()` bytes.
     // `MSG_TRUNC` causes the kernel to return the real datagram length even
     // when it exceeds the buffer, which lets us detect silent truncation below.
     let rc = unsafe {
-        libc::recv(
+        libc::recvfrom(
             socket.fd.as_raw_fd(),
             buffer.as_mut_ptr().cast::<libc::c_void>(),
             buffer.len(),
             libc::MSG_TRUNC,
+            (&mut peer as *mut libc::sockaddr_nl).cast::<libc::sockaddr>(),
+            &mut peer_len,
         )
     };
     if rc < 0 {
         Err(io::Error::last_os_error())
+    } else if !is_kernel_sender(&peer, peer_len) {
+        Ok(ReceiveMessageOutcome::RejectedNonKernel)
     } else {
         Ok(classify_recv(rc as usize, buffer.len()))
     }
+}
+
+fn is_kernel_sender(peer: &libc::sockaddr_nl, peer_len: libc::socklen_t) -> bool {
+    peer_len == mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t
+        && i32::from(peer.nl_family) == libc::AF_NETLINK
+        && peer.nl_pid == 0
+        && peer.nl_groups == 0
 }
 
 /// Classify a successful `recv` return value against the caller buffer.
@@ -284,6 +298,24 @@ mod tests {
         assert_eq!(addr.nl_family, libc::AF_NETLINK as libc::sa_family_t);
         assert_eq!(addr.nl_pid, 0);
         assert_eq!(addr.nl_groups, 0);
+    }
+
+    #[test]
+    fn sender_validation_requires_exact_kernel_unicast_identity() {
+        let length = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+        let mut peer = kernel_netlink_addr(0);
+        assert!(is_kernel_sender(&peer, length));
+
+        peer.nl_pid = 1;
+        assert!(!is_kernel_sender(&peer, length));
+        peer.nl_pid = 0;
+        peer.nl_groups = 1;
+        assert!(!is_kernel_sender(&peer, length));
+        peer.nl_groups = 0;
+        peer.nl_family = libc::AF_UNIX as libc::sa_family_t;
+        assert!(!is_kernel_sender(&peer, length));
+        peer.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        assert!(!is_kernel_sender(&peer, length - 1));
     }
 
     #[test]
@@ -380,6 +412,97 @@ mod tests {
         Some(sock)
     }
 
+    /// Queue one real userspace-originated netlink datagram for provenance
+    /// rejection without requiring `CAP_NET_ADMIN` or an XFRM mutation.
+    fn userspace_netlink_socket_with(payload: &[u8]) -> Option<NetlinkSocket> {
+        const NETLINK_USERSOCK: libc::c_int = 2;
+
+        fn socket() -> io::Result<OwnedFd> {
+            // SAFETY: constant Linux netlink arguments return a fresh
+            // descriptor, transferred immediately into `OwnedFd`.
+            let fd = unsafe {
+                libc::socket(
+                    libc::AF_NETLINK,
+                    libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    NETLINK_USERSOCK,
+                )
+            };
+            owned_fd(fd)
+        }
+
+        fn autobind(fd: &OwnedFd) -> io::Result<libc::sockaddr_nl> {
+            let requested = kernel_netlink_addr(0);
+            // SAFETY: `requested` is initialized and `fd` is a live netlink
+            // descriptor. A zero port ID asks Linux to assign a unique one.
+            if unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    (&requested as *const libc::sockaddr_nl).cast::<libc::sockaddr>(),
+                    mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut actual = kernel_netlink_addr(0);
+            let mut length = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            // SAFETY: `actual` and `length` are initialized writable outputs.
+            if unsafe {
+                libc::getsockname(
+                    fd.as_raw_fd(),
+                    (&mut actual as *mut libc::sockaddr_nl).cast::<libc::sockaddr>(),
+                    &mut length,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if length != mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t
+                || i32::from(actual.nl_family) != libc::AF_NETLINK
+                || actual.nl_pid == 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid userspace netlink autobind identity",
+                ));
+            }
+            Ok(actual)
+        }
+
+        let receiver = match socket().and_then(|fd| autobind(&fd).map(|addr| (fd, addr))) {
+            Ok(receiver) => receiver,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("receiver netlink setup failed: {error}"),
+        };
+        let sender = match socket().and_then(|fd| autobind(&fd).map(|addr| (fd, addr))) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("sender netlink setup failed: {error}"),
+        };
+        assert_ne!(receiver.1.nl_pid, sender.1.nl_pid);
+        // SAFETY: both descriptors and addresses are live/initialized, and
+        // `payload` is a valid immutable byte slice.
+        let sent = unsafe {
+            libc::sendto(
+                sender.0.as_raw_fd(),
+                payload.as_ptr().cast::<libc::c_void>(),
+                payload.len(),
+                0,
+                (&receiver.1 as *const libc::sockaddr_nl).cast::<libc::sockaddr>(),
+                mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return None;
+            }
+            panic!("userspace netlink send failed: {error}");
+        }
+        assert_eq!(sent as usize, payload.len());
+        Some(NetlinkSocket { fd: receiver.0 })
+    }
+
     /// Unwrap a test fixture, or print a skip diagnostic and return from the
     /// calling test when the sandbox denies local datagram IPC.
     macro_rules! skip_if_sandbox_denies {
@@ -395,61 +518,60 @@ mod tests {
     }
 
     #[test]
-    fn receive_message_reads_fitting_datagram() {
+    fn receive_message_rejects_non_netlink_datagram_without_exposing_bytes() {
         let payload = b"hello xfrm";
         let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 32];
         let outcome = receive_message_outcome(&sock, &mut buf).unwrap();
-        assert_eq!(
-            outcome,
-            ReceiveMessageOutcome::Complete {
-                bytes_received: payload.len()
-            }
-        );
-        assert_eq!(&buf[..payload.len()], payload);
+        assert_eq!(outcome, ReceiveMessageOutcome::RejectedNonKernel);
     }
 
     #[test]
-    fn receive_message_reads_exact_fit_datagram() {
+    fn receive_message_rejects_real_userspace_netlink_peer() {
+        let sock = skip_if_sandbox_denies!(userspace_netlink_socket_with(b"forged xfrm ack"));
+        let mut buffer = [0_u8; 64];
+
+        assert_eq!(
+            receive_message_outcome(&sock, &mut buffer).unwrap(),
+            ReceiveMessageOutcome::RejectedNonKernel
+        );
+        assert_eq!(
+            receive_message_outcome(&sock, &mut buffer)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+            "the rejected datagram must be consumed exactly once"
+        );
+    }
+
+    #[test]
+    fn receive_message_rejects_exact_fit_non_netlink_datagram() {
         let payload = b"exactfit";
         assert_eq!(payload.len(), 8);
         let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 8];
         let outcome = receive_message_outcome(&sock, &mut buf).unwrap();
-        assert_eq!(
-            outcome,
-            ReceiveMessageOutcome::Complete {
-                bytes_received: payload.len()
-            }
-        );
-        assert_eq!(&buf, payload);
+        assert_eq!(outcome, ReceiveMessageOutcome::RejectedNonKernel);
     }
 
     #[test]
-    fn receive_message_reports_and_consumes_oversized_datagram() {
+    fn receive_message_checks_sender_before_classifying_oversized_datagram() {
         let payload = b"0123456789abcdef";
         assert_eq!(payload.len(), 16);
         let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 8];
         let outcome = receive_message_outcome(&sock, &mut buf).unwrap();
-        assert_eq!(
-            outcome,
-            ReceiveMessageOutcome::ConsumedOversize {
-                buffer_bytes: buf.len(),
-                datagram_bytes: payload.len(),
-            }
-        );
-        assert_eq!(&buf, &payload[..buf.len()]);
+        assert_eq!(outcome, ReceiveMessageOutcome::RejectedNonKernel);
 
         let error = receive_message_outcome(&sock, &mut buf).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
-    fn legacy_receive_api_maps_consumed_oversize_to_invalid_data() {
+    fn legacy_receive_api_rejects_non_kernel_sender() {
         let payload = b"0123456789abcdef";
         let inner = skip_if_sandbox_denies!(datagram_socket_with(payload));
         let socket = crate::NetlinkSocket { inner };
@@ -458,7 +580,8 @@ mod tests {
         let error = crate::receive_message(&socket, &mut buf).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("buffer is 8 bytes"));
-        assert!(error.to_string().contains("datagram is 16 bytes"));
+        assert!(error
+            .to_string()
+            .contains("did not originate from the kernel"));
     }
 }

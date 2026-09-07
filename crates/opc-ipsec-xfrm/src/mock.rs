@@ -8,13 +8,14 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    validate_exact_remove_policy_request, validate_relocate_sa_request, validate_sa_output_mark,
-    validate_sa_query, AllocateSpiRequest, ExactRemovePolicyRequest, InstallPolicyRequest,
-    InstallSaRequest, IpAddress, LifetimeConfig, LifetimeCurrent, PolicyParameters, QuerySaRequest,
-    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
-    SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector,
-    SaReplayState, SaState, SaStatistics, SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection,
-    XfrmId, XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    validate_exact_remove_policy_request, validate_policy_query, validate_relocate_sa_request,
+    validate_sa_output_mark, validate_sa_query, AllocateSpiRequest, ExactRemovePolicyRequest,
+    InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig, LifetimeCurrent,
+    PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
+    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaRelocationDirection,
+    SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState,
+    SaStatistics, SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark,
+    XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -560,6 +561,29 @@ impl XfrmBackend for MockXfrmBackend {
             ))
             .map(|record| record.identity.clone())
             .ok_or(XfrmError::NotFound)
+    }
+
+    async fn query_policy(
+        &self,
+        request: QueryPolicyRequest,
+    ) -> Result<PolicyParameters, XfrmError> {
+        validate_policy_query(&request)?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        // Policy queries are deliberately not recorded in `operations`: the
+        // established `MockOperation` enum is exhaustive, and adding an
+        // observation-only variant for an optional capability would break that
+        // contract (see `MockSaRelocation` for the same convention).
+        let key = (
+            request.selector().clone(),
+            request.direction(),
+            request.mark(),
+            request.if_id().filter(|if_id| *if_id != 0),
+        );
+        state.policies.get(&key).cloned().ok_or(XfrmError::NotFound)
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {

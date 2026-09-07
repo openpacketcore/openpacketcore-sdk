@@ -4,16 +4,19 @@ use std::str::FromStr;
 
 use super::ops::{
     advance_restore_scan_revision_sync, current_fence_sync, format_rfc3339_normalized, get_sync,
-    insert_or_replace_fence_sync, insert_or_replace_record_sync, persisted_owner_id, persisted_u64,
-    sqlite_u64, timestamp_unix_millis,
+    insert_or_replace_fence_sync, insert_or_replace_record_sync, persisted_normalized_timestamp,
+    persisted_owner_id, persisted_u64, sqlite_u64, timestamp_unix_millis,
 };
 use crate::{
     backend::{
-        next_replication_sequence, validate_replication_prefix, ReplicationEntry, ReplicationOp,
-        ReplicationTxId, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+        next_replication_sequence, validate_replication_prefix,
+        ProtectedRosterEstablishedSuccessor, ReplicationEntry, ReplicationOp, ReplicationTxId,
+        REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
     },
     capability::BackendCapabilities,
     error::StoreError,
+    model::StateClass,
+    record::SessionPayloadEncoding,
 };
 
 pub(crate) fn sqlite_replication_sequence(sequence: u64) -> Result<i64, StoreError> {
@@ -62,7 +65,20 @@ pub(crate) fn hydrate_replication_entry(
 pub(crate) fn apply_replicated_op_sync(
     conn: &Connection,
     op: ReplicationOp,
-    _caps: &BackendCapabilities,
+    caps: &BackendCapabilities,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    // Keep this defense at the replay boundary as callers other than the
+    // public async adapter can invoke this synchronous helper directly.
+    // In particular, validate an entire nested batch before its first child
+    // can mutate the transaction.
+    validate_replication_payloads(&op, caps.max_value_bytes)?;
+    apply_validated_replicated_op_sync(conn, op, now)
+}
+
+fn apply_validated_replicated_op_sync(
+    conn: &Connection,
+    op: ReplicationOp,
     now: Timestamp,
 ) -> Result<(), StoreError> {
     match op {
@@ -258,8 +274,8 @@ pub(crate) fn apply_replicated_op_sync(
             conn.execute(
                 r#"
                 INSERT OR REPLACE INTO leases (
-                    tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at
-                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)
+                    tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, acquired_at, expires_at_unix_ms, guard_expires_at
+                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)
                 "#,
                 params![
                     key.tenant.as_str(),
@@ -269,6 +285,7 @@ pub(crate) fn apply_replicated_op_sync(
                     sqlite_u64(credential_id)?,
                     owner.as_str(),
                     sqlite_u64(fence.get())?,
+                    format_rfc3339_normalized(now),
                     expires_at_unix_ms,
                     format_rfc3339_normalized(expires_at),
                 ],
@@ -304,31 +321,64 @@ pub(crate) fn apply_replicated_op_sync(
             ttl: _,
             expires_at,
         } => {
+            // A renew event carries no acquisition timestamp by design. It
+            // must preserve an already-authoritative value, never synthesize
+            // one for a migrated legacy row.
             let current_fence = current_fence_sync(conn, &key)?;
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
+            let persisted_authority = conn
+                .query_row(
+                    r#"
+                    SELECT acquired_at, guard_expires_at
+                    FROM leases
+                    WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
+                    "#,
+                    params![
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                    ],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            persisted_authority
+                .and_then(|(acquired_at, guard_expires_at)| {
+                    let guard_expires_at = persisted_normalized_timestamp(Some(guard_expires_at))?;
+                    persisted_normalized_timestamp(acquired_at)
+                        .filter(|acquired_at| *acquired_at <= guard_expires_at)
+                        .map(|_| ())
+                })
+                .ok_or(StoreError::StaleFence)?;
             let expires_at_unix_ms = timestamp_unix_millis(expires_at)?;
 
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO leases (
-                    tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at
-                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)
+            let changed = conn
+                .execute(
+                    r#"
+                UPDATE leases
+                SET expires_at_unix_ms = ?1, guard_expires_at = ?2
+                WHERE tenant = ?3 AND nf_kind = ?4 AND key_type = ?5 AND stable_id = ?6
+                  AND active = 1 AND credential_id = ?7 AND owner = ?8 AND fence = ?9
                 "#,
-                params![
-                    key.tenant.as_str(),
-                    key.nf_kind.as_str(),
-                    key.key_type.to_string(),
-                    key.stable_id.as_ref(),
-                    sqlite_u64(credential_id)?,
-                    owner.as_str(),
-                    sqlite_u64(fence.get())?,
-                    expires_at_unix_ms,
-                    format_rfc3339_normalized(expires_at),
-                ],
-            )
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    params![
+                        expires_at_unix_ms,
+                        format_rfc3339_normalized(expires_at),
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                        sqlite_u64(credential_id)?,
+                        owner.as_str(),
+                        sqlite_u64(fence.get())?,
+                    ],
+                )
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            if changed != 1 {
+                return Err(StoreError::StaleFence);
+            }
 
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())
@@ -361,13 +411,388 @@ pub(crate) fn apply_replicated_op_sync(
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())
         }
+        ReplicationOp::ProtectedRosterEstablished {
+            key,
+            expected_record,
+            successor,
+            owner,
+            fence,
+            credential_id,
+            guard_acquired_at,
+            guard_expires_at,
+        } => apply_protected_roster_established_sync(
+            conn,
+            &key,
+            &expected_record,
+            *successor,
+            &owner,
+            fence,
+            credential_id,
+            guard_acquired_at,
+            guard_expires_at,
+            now,
+        ),
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key,
+            record,
+            owner,
+            fence,
+            credential_id,
+            guard_acquired_at,
+            guard_expires_at,
+        } => apply_protected_roster_established_create_sync(
+            conn,
+            &key,
+            &record,
+            &owner,
+            fence,
+            credential_id,
+            guard_acquired_at,
+            guard_expires_at,
+            now,
+        ),
         ReplicationOp::Batch { ops } => {
             for sub_op in ops {
-                apply_replicated_op_sync(conn, sub_op, _caps, now)?;
+                apply_validated_replicated_op_sync(conn, sub_op, now)?;
             }
             Ok(())
         }
     }
+}
+
+/// Validate the narrow shape that the protected-roster terminal builder
+/// materializes from an immutable admission.  This is intentionally stricter
+/// than an ordinary CAS: a roster terminal never carries a TTL row or an
+/// unsealed payload, and its successor retains the admission provenance even
+/// when the execution lease has moved to a higher fence.
+fn validate_protected_roster_authoritative_record(
+    record: &crate::StoredSessionRecord,
+    key: &crate::model::SessionKey,
+) -> Result<(), StoreError> {
+    if record.key != *key
+        || record.state_class != StateClass::AuthoritativeSession
+        || record.expires_at.is_some()
+        || record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1
+    {
+        return Err(StoreError::InvalidKey(
+            "protected roster replication record is invalid".into(),
+        ));
+    }
+    record
+        .payload
+        .validate_envelope_for_record(record)
+        .map_err(|_| {
+            StoreError::Serialization("protected roster replication record is invalid".into())
+        })
+}
+
+/// Validate the exact session-record effect of a protected-roster V2
+/// Established terminal from absence.  Unlike the V1 present-predecessor
+/// terminal, this is an insert-only effect and therefore has a fixed first
+/// generation as part of its durable replay contract.
+pub(crate) fn validate_protected_roster_established_create(
+    record: &crate::StoredSessionRecord,
+    key: &crate::model::SessionKey,
+) -> Result<(), StoreError> {
+    validate_protected_roster_authoritative_record(record, key)?;
+    if record.generation != crate::model::Generation::new(1) {
+        return Err(StoreError::InvalidKey(
+            "protected roster create replication record is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the session-record projection of one already-committed protected
+/// roster Established terminal.  Its roster receipt/proof state belongs to
+/// the Raft transaction; this separate replication journal replays only the
+/// exact business effect while retaining a higher successor fence floor.
+#[allow(clippy::too_many_arguments)]
+fn apply_protected_roster_established_sync(
+    conn: &Connection,
+    key: &crate::model::SessionKey,
+    expected_record: &crate::StoredSessionRecord,
+    successor: ProtectedRosterEstablishedSuccessor,
+    owner: &crate::model::OwnerId,
+    fence: crate::model::FenceToken,
+    credential_id: u64,
+    guard_acquired_at: Timestamp,
+    guard_expires_at: Timestamp,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    validate_protected_roster_authoritative_record(expected_record, key)?;
+    if credential_id == 0
+        || guard_expires_at <= guard_acquired_at
+        || fence.get() < expected_record.fence.get()
+    {
+        return Err(StoreError::StaleFence);
+    }
+    let current_fence = current_fence_sync(conn, key)?;
+    if current_fence > fence.get() {
+        return Err(StoreError::StaleFence);
+    }
+
+    let lease: Option<(i32, i64, String, i64, Option<String>, String)> = conn
+        .query_row(
+            r#"
+            SELECT active, credential_id, owner, fence, acquired_at, guard_expires_at
+            FROM leases
+            WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
+            "#,
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster replication unavailable".into())
+        })?;
+    let Some((
+        active,
+        stored_credential,
+        stored_owner,
+        stored_fence,
+        stored_acquired,
+        stored_expiry,
+    )) = lease
+    else {
+        return Err(StoreError::StaleFence);
+    };
+    let stored_acquired =
+        persisted_normalized_timestamp(stored_acquired).ok_or(StoreError::StaleFence)?;
+    let stored_expiry = Timestamp::from_str(&stored_expiry).map_err(|_| {
+        StoreError::Serialization("protected roster replication metadata is invalid".into())
+    })?;
+    if active == 0
+        || persisted_u64(stored_credential)? != credential_id
+        || persisted_owner_id(stored_owner)? != *owner
+        || persisted_u64(stored_fence)? != fence.get()
+        || stored_acquired != guard_acquired_at
+        || stored_expiry != guard_expires_at
+    {
+        return Err(StoreError::StaleFence);
+    }
+    if guard_expires_at <= now {
+        return Err(StoreError::LeaseExpired);
+    }
+
+    let current = super::ops::get_raw_sync(conn, key)?;
+    if current.as_ref() != Some(expected_record) {
+        return Err(StoreError::CasConflict);
+    }
+    match successor {
+        ProtectedRosterEstablishedSuccessor::Put { record } => {
+            validate_protected_roster_authoritative_record(&record, key)?;
+            // The established Update path is the only generation-advancing
+            // materialization.  It intentionally preserves the original
+            // owner/fence provenance rather than adopting `fence` above.
+            if record.owner != expected_record.owner
+                || record.fence != expected_record.fence
+                || record.generation <= expected_record.generation
+            {
+                return Err(StoreError::CasConflict);
+            }
+            insert_or_replace_record_sync(conn, &record)?;
+        }
+        ProtectedRosterEstablishedSuccessor::Delete => {
+            let removed = conn
+                .execute(
+                    "DELETE FROM session_records WHERE tenant=?1 AND nf_kind=?2 AND key_type=?3 AND stable_id=?4",
+                    params![
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                    ],
+                )
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "protected roster replication unavailable".into(),
+                    )
+                })?;
+            if removed != 1 {
+                return Err(StoreError::CasConflict);
+            }
+            advance_restore_scan_revision_sync(conn)?;
+        }
+        ProtectedRosterEstablishedSuccessor::NoOp => {}
+    }
+    // Do not rewrite equal floors, but atomically raise a missing or lower
+    // floor after the exact business CAS succeeds.  This permanently rejects
+    // any later replay under the immutable admission's older fence.
+    if current_fence < fence.get() {
+        insert_or_replace_fence_sync(conn, key, fence.get())?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_protected_roster_established_create_sync(
+    conn: &Connection,
+    key: &crate::model::SessionKey,
+    record: &crate::StoredSessionRecord,
+    owner: &crate::model::OwnerId,
+    fence: crate::model::FenceToken,
+    credential_id: u64,
+    guard_acquired_at: Timestamp,
+    guard_expires_at: Timestamp,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    validate_protected_roster_established_create(record, key)?;
+    if credential_id == 0
+        || guard_expires_at <= guard_acquired_at
+        || fence.get() < record.fence.get()
+    {
+        return Err(StoreError::StaleFence);
+    }
+    let current_fence = current_fence_sync(conn, key)?;
+    if current_fence > fence.get() {
+        return Err(StoreError::StaleFence);
+    }
+    let lease: Option<(i32, i64, String, i64, Option<String>, String)> = conn
+        .query_row(
+            r#"
+            SELECT active, credential_id, owner, fence, acquired_at, guard_expires_at
+            FROM leases
+            WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
+            "#,
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster replication unavailable".into())
+        })?;
+    let Some((
+        active,
+        stored_credential,
+        stored_owner,
+        stored_fence,
+        stored_acquired,
+        stored_expiry,
+    )) = lease
+    else {
+        return Err(StoreError::StaleFence);
+    };
+    let stored_acquired =
+        persisted_normalized_timestamp(stored_acquired).ok_or(StoreError::StaleFence)?;
+    let stored_expiry = Timestamp::from_str(&stored_expiry).map_err(|_| {
+        StoreError::Serialization("protected roster replication metadata is invalid".into())
+    })?;
+    if active == 0
+        || persisted_u64(stored_credential)? != credential_id
+        || persisted_owner_id(stored_owner)? != *owner
+        || persisted_u64(stored_fence)? != fence.get()
+        || stored_acquired != guard_acquired_at
+        || stored_expiry != guard_expires_at
+    {
+        return Err(StoreError::StaleFence);
+    }
+    if guard_expires_at <= now {
+        return Err(StoreError::LeaseExpired);
+    }
+    if super::ops::get_raw_sync(conn, key)?.is_some() {
+        return Err(StoreError::CasConflict);
+    }
+    super::ops::insert_record_if_absent_sync(conn, record)?;
+    if current_fence < fence.get() {
+        insert_or_replace_fence_sync(conn, key, fence.get())?;
+    }
+    Ok(())
+}
+
+fn validate_replication_payload_len(
+    record: &crate::StoredSessionRecord,
+    max_value_bytes: usize,
+) -> Result<(), StoreError> {
+    if record.payload.len() > max_value_bytes {
+        return Err(StoreError::PayloadTooLarge {
+            actual: record.payload.len(),
+            max: max_value_bytes,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_replication_payloads(
+    root: &ReplicationOp,
+    max_value_bytes: usize,
+) -> Result<(), StoreError> {
+    // This preflight is shared by the public adapter, append/rebuild helpers,
+    // and the replay defense above. Structure is checked first so walking an
+    // untrusted tree stays bounded before we inspect every nested CAS.
+    root.validate_structure()?;
+
+    let mut pending = vec![root];
+    while let Some(op) = pending.pop() {
+        match op {
+            ReplicationOp::CompareAndSet {
+                key, new_record, ..
+            } => {
+                if new_record.key != *key {
+                    return Err(StoreError::InvalidKey(
+                        "compare-and-set key does not match record key".into(),
+                    ));
+                }
+                validate_replication_payload_len(new_record, max_value_bytes)?;
+            }
+            ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                ..
+            } => {
+                if expected_record.key != *key {
+                    return Err(StoreError::InvalidKey(
+                        "protected roster replication key does not match record key".into(),
+                    ));
+                }
+                validate_replication_payload_len(expected_record, max_value_bytes)?;
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
+                    if record.key != *key {
+                        return Err(StoreError::InvalidKey(
+                            "protected roster replication key does not match record key".into(),
+                        ));
+                    }
+                    validate_replication_payload_len(record, max_value_bytes)?;
+                }
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                validate_protected_roster_established_create(record, key)?;
+                validate_replication_payload_len(record, max_value_bytes)?;
+            }
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn replicate_entry_sync(
@@ -377,6 +802,7 @@ pub(crate) fn replicate_entry_sync(
     now: Timestamp,
 ) -> Result<bool, StoreError> {
     entry.validate()?;
+    validate_replication_payloads(&entry.op, caps.max_value_bytes)?;
     let sqlite_sequence = sqlite_replication_sequence(entry.sequence)?;
     let tx = super::standalone_transaction(conn)?;
 
@@ -467,6 +893,9 @@ pub(crate) fn rebuild_replication_state_sync(
     caps: &BackendCapabilities,
 ) -> Result<(), StoreError> {
     validate_replication_prefix(entries)?;
+    for entry in entries {
+        validate_replication_payloads(&entry.op, caps.max_value_bytes)?;
+    }
     let tx = super::standalone_transaction(conn)?;
 
     let removed_records = tx
@@ -513,4 +942,129 @@ pub(crate) fn rebuild_replication_state_sync(
     tx.commit()
         .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use bytes::Bytes;
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
+    };
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    use super::*;
+    use crate::{
+        EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKey, SessionKeyType,
+        StateType, StoredSessionRecord,
+    };
+
+    fn timestamp(second: u8) -> Timestamp {
+        Timestamp::from_str(&format!("2026-08-27T00:00:{second:02}Z")).expect("timestamp")
+    }
+
+    fn key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::from_static("replication-v2-tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"replication-v2-create")
+                .try_into()
+                .expect("stable ID"),
+        }
+    }
+
+    fn sealed_payload_for(record: &StoredSessionRecord) -> EncryptedSessionPayload {
+        let key_id = KeyId::new("replication-v2-test-key").expect("key ID");
+        let aad = EnvelopeAad::session(
+            record.key.tenant.clone(),
+            1,
+            SessionAad::new(
+                record.key.nf_kind.as_str(),
+                "replication-v2-keyed-digest",
+                record.state_type.as_str(),
+                record.generation.get(),
+                record.fence.get(),
+                "replication-v2-test-backend",
+            )
+            .expect("session AAD"),
+        );
+        let encoded = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0x31; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: vec![0x7A; AEAD_TAG_LEN],
+        }
+        .encode()
+        .expect("canonical envelope");
+        EncryptedSessionPayload::try_envelope(encoded).expect("valid envelope")
+    }
+
+    fn sealed_authoritative_record() -> StoredSessionRecord {
+        let mut record = StoredSessionRecord {
+            key: key(),
+            generation: Generation::new(1),
+            owner: OwnerId::new("replication-v2-owner").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("replication-v2-state"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        record.payload = sealed_payload_for(&record);
+        record
+    }
+
+    fn established_create(record: StoredSessionRecord) -> ReplicationOp {
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key: record.key.clone(),
+            owner: record.owner.clone(),
+            fence: record.fence,
+            record,
+            credential_id: 1,
+            guard_acquired_at: timestamp(1),
+            guard_expires_at: timestamp(2),
+        }
+    }
+
+    fn assert_create_preflight_rejected(record: StoredSessionRecord) {
+        assert!(
+            validate_replication_payloads(&established_create(record), 4096).is_err(),
+            "invalid V2 protected-roster create must fail replication preflight"
+        );
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_accepts_strict_authoritative_record() {
+        validate_replication_payloads(&established_create(sealed_authoritative_record()), 4096)
+            .expect("strict V2 protected-roster create record is accepted");
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_rejects_non_authoritative_record() {
+        let mut record = sealed_authoritative_record();
+        record.state_class = StateClass::ReplicatedDr;
+
+        assert_create_preflight_rejected(record);
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_rejects_expiring_record() {
+        let mut record = sealed_authoritative_record();
+        record.expires_at = Some(timestamp(3));
+
+        assert_create_preflight_rejected(record);
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_rejects_record_with_wrong_bound_aad() {
+        let mut record = sealed_authoritative_record();
+        record.state_type = StateType::from_static("replication-v2-other-state");
+
+        assert_create_preflight_rejected(record);
+    }
 }

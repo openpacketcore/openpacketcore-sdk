@@ -1229,6 +1229,50 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
     }
 }
 
+/// Receive one unicast netlink datagram and prove that the kernel sent it.
+///
+/// Netlink header fields are payload controlled and therefore do not
+/// authenticate the sender. Callers making authoritative decisions from an
+/// ACK, echo, or dump must also validate the `sockaddr_nl` returned by
+/// `recvfrom`: kernel-originated unicast replies have port id and groups zero.
+pub fn receive_kernel_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
+    if buffer.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "kernel netlink receive buffer is empty",
+        ));
+    }
+    let mut sender = kernel_netlink_addr(0);
+    let mut sender_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    // SAFETY: `buffer` is a valid writable byte slice, `sender` and
+    // `sender_len` are initialized writable address outputs, and the socket fd
+    // is live. MSG_TRUNC preserves the pending datagram's real length.
+    let rc = unsafe {
+        libc::recvfrom(
+            socket.fd.as_raw_fd(),
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            buffer.len(),
+            libc::MSG_TRUNC,
+            (&mut sender as *mut libc::sockaddr_nl).cast::<libc::sockaddr>(),
+            &mut sender_len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if sender_len != mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t
+        || i32::from(sender.nl_family) != libc::AF_NETLINK
+        || sender.nl_pid != 0
+        || sender.nl_groups != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "netlink datagram was not sent by the kernel",
+        ));
+    }
+    classify_recv(rc as usize, buffer.len())
+}
+
 fn classify_recv(received_len: usize, buf_len: usize) -> io::Result<usize> {
     if received_len > buf_len {
         Err(io::Error::new(
@@ -1666,5 +1710,68 @@ mod tests {
         let err = receive_message(&sock, &mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn receive_kernel_message_rejects_forged_userspace_peer() {
+        let open = || match open_netlink_socket(libc::NETLINK_USERSOCK) {
+            Ok(socket) => Some(socket),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("open NETLINK_USERSOCK failed: {error}"),
+        };
+        let Some(victim) = open() else {
+            eprintln!("skipping: user netlink IPC denied by sandbox");
+            return;
+        };
+        let Some(attacker) = open() else {
+            eprintln!("skipping: user netlink IPC denied by sandbox");
+            return;
+        };
+
+        // Forge the header fields that higher-level parsers traditionally
+        // validate. They remain attacker-controlled payload bytes; only the
+        // recvfrom sockaddr can authenticate the kernel sender.
+        let mut forged_ack = [0_u8; 20];
+        let forged_ack_len = forged_ack.len() as u32;
+        forged_ack[..4].copy_from_slice(&forged_ack_len.to_ne_bytes());
+        forged_ack[4..6].copy_from_slice(&2_u16.to_ne_bytes()); // NLMSG_ERROR
+        forged_ack[8..12].copy_from_slice(&1_u32.to_ne_bytes());
+        forged_ack[12..16].copy_from_slice(&victim.port_id().to_ne_bytes());
+        let mut destination = kernel_netlink_addr(0);
+        destination.nl_pid = victim.port_id();
+        // SAFETY: `forged_ack` is a valid immutable buffer, `destination` is a
+        // fully initialized sockaddr_nl for the live victim, and the attacker
+        // descriptor remains owned for the duration of the call.
+        let sent = unsafe {
+            libc::sendto(
+                attacker.fd.as_raw_fd(),
+                forged_ack.as_ptr().cast::<libc::c_void>(),
+                forged_ack.len(),
+                0,
+                (&destination as *const libc::sockaddr_nl).cast::<libc::sockaddr>(),
+                mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                eprintln!("skipping: user netlink send denied by sandbox");
+                return;
+            }
+            panic!("send forged netlink ACK failed: {error}");
+        }
+        assert_eq!(sent as usize, forged_ack.len());
+
+        let mut buffer = [0_u8; 64];
+        let error = receive_kernel_message(&victim, &mut buffer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not sent by the kernel"));
+    }
+
+    #[test]
+    fn receive_kernel_message_rejects_empty_buffer() {
+        let socket = open_netlink_socket(libc::NETLINK_ROUTE).unwrap();
+        let error = receive_kernel_message(&socket, &mut []).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

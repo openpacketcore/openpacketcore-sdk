@@ -7,13 +7,13 @@
 //! rejecting writes whose fence token is lower than the key's recorded token,
 //! so an owner that pauses past its TTL can never overwrite its successor.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
 use opc_types::Timestamp;
 
 use crate::{
-    error::LeaseError,
+    error::{LeaseError, StoreError},
     model::{FenceToken, OwnerId, SessionKey},
 };
 
@@ -21,7 +21,7 @@ use crate::{
 ///
 /// Callers can inspect the lease metadata, but only the lease manager can mint
 /// a valid guard, which makes the guard suitable as proof for fenced mutations.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseGuard {
     key: SessionKey,
     owner: OwnerId,
@@ -29,6 +29,12 @@ pub struct LeaseGuard {
     acquired_at: Timestamp,
     expires_at: Timestamp,
     credential_id: u64,
+}
+
+impl fmt::Debug for LeaseGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LeaseGuard(<redacted>)")
+    }
 }
 
 impl LeaseGuard {
@@ -92,6 +98,19 @@ impl LeaseGuard {
     /// use it to reject renewal responses that silently replace credentials.
     pub fn credential_id(&self) -> u64 {
         self.credential_id
+    }
+
+    /// Validate the time-independent structure of a deserialized guard.
+    ///
+    /// Construction inside this crate already enforces these invariants, but
+    /// authenticated consumer requests deserialize the public DTO before a
+    /// backend sees it.  Rechecking here prevents a forged wire value from
+    /// reaching any lease or mutation effect boundary.
+    pub(crate) fn validate_profile(&self) -> Result<(), StoreError> {
+        if self.fence.get() == 0 || self.credential_id == 0 || self.expires_at < self.acquired_at {
+            return Err(StoreError::InvalidKey("invalid lease guard".into()));
+        }
+        Ok(())
     }
 }
 

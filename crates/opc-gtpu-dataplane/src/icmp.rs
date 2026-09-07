@@ -11,16 +11,120 @@
 //! MTU out of band (for example MSS clamping) unless they run a host
 //! component that consumes the signal.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use opc_gtpu_ebpf_common::{
     internet_checksum, GtpuPmtuSignal, ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET,
     ICMPV4_TYPE_DESTINATION_UNREACHABLE, ICMPV6_TYPE_PACKET_TOO_BIG,
 };
 
+use opc_gtpu_ebpf_common::GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN;
+
 /// Maximum bytes of the invoking packet quoted inside one ICMPv6 Packet Too
 /// Big message: the minimum IPv6 MTU minus the outer IPv6 and ICMP headers.
 const ICMPV6_MAX_QUOTE: usize = 1280 - 40 - 8;
+
+const ICMP_ECHO_HEADER_LEN: usize = 8;
+const ICMPV4_ECHO_REQUEST: u8 = 8;
+const ICMPV6_ECHO_REQUEST: u8 = 128;
+
+/// Build the fixed, optionless traffic-proof ICMP Echo Request inner packet.
+///
+/// This is crate-visible because only the affine traffic-proof dispatcher may
+/// select the PAA and authenticated payload. Callers cannot use this helper to
+/// construct arbitrary probe packets.
+pub(crate) fn build_traffic_proof_icmp_echo_request(
+    source: IpAddr,
+    destination: IpAddr,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+) -> Option<Vec<u8>> {
+    match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => Some(build_traffic_proof_icmpv4_echo(
+            source,
+            destination,
+            identifier,
+            sequence,
+            payload,
+        )),
+        (IpAddr::V6(source), IpAddr::V6(destination)) => Some(build_traffic_proof_icmpv6_echo(
+            source,
+            destination,
+            identifier,
+            sequence,
+            payload,
+        )),
+        _ => None,
+    }
+}
+
+fn build_traffic_proof_icmpv4_echo(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+) -> Vec<u8> {
+    const IPV4_HEADER_LEN: usize = 20;
+    const TOTAL_LEN: u16 = (IPV4_HEADER_LEN
+        + ICMP_ECHO_HEADER_LEN
+        + GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN)
+        as u16;
+    let mut packet = vec![0; usize::from(TOTAL_LEN)];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&TOTAL_LEN.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 1;
+    packet[12..16].copy_from_slice(&source.octets());
+    packet[16..20].copy_from_slice(&destination.octets());
+    let header_checksum = internet_checksum(&packet[..IPV4_HEADER_LEN]);
+    packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    let icmp = IPV4_HEADER_LEN;
+    packet[icmp] = ICMPV4_ECHO_REQUEST;
+    packet[icmp + 4..icmp + 6].copy_from_slice(&identifier.to_be_bytes());
+    packet[icmp + 6..icmp + 8].copy_from_slice(&sequence.to_be_bytes());
+    packet[icmp + ICMP_ECHO_HEADER_LEN..].copy_from_slice(payload);
+    let checksum = internet_checksum(&packet[icmp..]);
+    packet[icmp + 2..icmp + 4].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
+fn build_traffic_proof_icmpv6_echo(
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+) -> Vec<u8> {
+    const IPV6_HEADER_LEN: usize = 40;
+    const ICMP_LEN: u16 =
+        (ICMP_ECHO_HEADER_LEN + GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN) as u16;
+    let mut packet = vec![0; IPV6_HEADER_LEN + usize::from(ICMP_LEN)];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&ICMP_LEN.to_be_bytes());
+    packet[6] = 58;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+
+    let icmp = IPV6_HEADER_LEN;
+    packet[icmp] = ICMPV6_ECHO_REQUEST;
+    packet[icmp + 4..icmp + 6].copy_from_slice(&identifier.to_be_bytes());
+    packet[icmp + 6..icmp + 8].copy_from_slice(&sequence.to_be_bytes());
+    packet[icmp + ICMP_ECHO_HEADER_LEN..].copy_from_slice(payload);
+
+    let mut checksum_input = Vec::with_capacity(40 + usize::from(ICMP_LEN));
+    checksum_input.extend_from_slice(&source.octets());
+    checksum_input.extend_from_slice(&destination.octets());
+    checksum_input.extend_from_slice(&u32::from(ICMP_LEN).to_be_bytes());
+    checksum_input.extend_from_slice(&[0, 0, 0, 58]);
+    checksum_input.extend_from_slice(&packet[icmp..]);
+    let checksum = internet_checksum(&checksum_input);
+    packet[icmp + 2..icmp + 4].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
 
 /// Build an ICMPv4 Destination Unreachable "fragmentation needed and DF set"
 /// message (RFC 792 type 3 code 4) with the RFC 1191 next-hop MTU, quoting

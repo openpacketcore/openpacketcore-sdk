@@ -136,9 +136,19 @@ control-plane stack.
   `Gtpv2cDecodeError` end to end, or its member identity will vanish with no
   compile error.
 
-  Declared residual: the non-`ProcedureAware` S2b receive branches still select
-  the clause 7.7.8 discard from a type allowlist rather than from a resolved
-  per-IE profile.
+  The clause 7.7.8 malformed-optional-IE discard is keyed on resolved presence,
+  not IE type: the profiled receiver resolves
+  `(procedure, direction, scope, ie_type, instance)` from the receive grammar
+  and discards a malformed IE only where its slot is presence-O (Tables
+  7.2.1-1, 7.2.2-1, 7.2.3-1, 7.2.3-2, 7.2.9.1-1, 7.2.9.2-1), at every
+  validation level. The exact S2b rows include Create Session Request ePDG IP
+  Address and Node Identifier, Create Session Response APCO, and Delete Session
+  Sender F-TEID. Bearer TFT, PCO and Failed Bearer Context entries are the
+  issue-requested cross-interface compatibility rows already admitted by the
+  receive grammar; their table conditions name S4/S11 or S5/S8/S11, not S2b.
+  Mandatory, Conditional, unlisted and unresolvable slots fail closed; the
+  profile-less sequence decoders and the canonical builder always fail closed.
+  See CONFORMANCE.md for the full contract.
 - `inspect_gtpv2c_request` and `Gtpv2cErrorResponsePlanner` form a separate
   zero-allocation error boundary. Inspection retains only a reply-safe fixed
   header envelope; planning returns either an explicit standards-required
@@ -589,6 +599,43 @@ let response = S2bCreateSessionAcceptedResponse {
     bearer_context,
     additional_ies: Vec::new(),
 };
+```
+
+Create Session Response receive decoding remains strict by default: the PGW
+control role accepts only interface type 32 and the PGW user-plane role only
+type 33. The user-plane endpoint must be a direct member of the instance-0
+Bearer Context at F-TEID instance 4. A caller that has already made its own
+interworking decision can use the one-shot
+`decode_create_session_response_summary_with_receive_policy` helper with
+`S2bCreateSessionResponseReceivePolicy` to independently add the standardized
+S5/S8 control type 7, user-plane type 5, or both. The policy changes only the
+accepted interface type; it never broadens the instance-4 placement. It has no
+arbitrary interface-type constructor, is copied for one decode, and is applied
+to the same first retained singleton used by the returned typed summary. It
+does not affect `S2bMessage::decode`, the no-policy summary helpers, any other
+GTPv2-C procedure, or canonical builders; those remain strict S2b.
+
+```rust
+use opc_proto_gtpv2c::{
+    decode_create_session_response_summary_with_receive_policy,
+    S2bCreateSessionResponseReceivePolicy,
+};
+use opc_protocol::{DecodeContext, ValidationLevel};
+
+# let response_bytes: &[u8] = &[];
+let receive_policy = S2bCreateSessionResponseReceivePolicy::STRICT
+    .allow_s5_s8_pgw_control()
+    .allow_s5_s8_pgw_user_plane();
+let receive_context = DecodeContext {
+    validation_level: ValidationLevel::ProcedureAware,
+    ..DecodeContext::default()
+};
+let summary = decode_create_session_response_summary_with_receive_policy(
+    response_bytes,
+    receive_context,
+    receive_policy,
+);
+# let _ = summary;
 ```
 
 The former loose Update Bearer shell with a single `bearer_context` has been

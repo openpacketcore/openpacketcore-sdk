@@ -17,6 +17,23 @@ mod envelope;
 mod fragment;
 mod pmtu;
 mod session;
+mod tft_classifier;
+/// Privileged traffic-observation map ABI shared only by the trusted loader
+/// and tc program.
+///
+/// This module is public solely because those components are separate crates.
+/// It is hidden from the supported common-crate API: registration bytes carry
+/// private return-tag key material and must never cross a product, diagnostic,
+/// or untrusted boundary.
+///
+/// The secret-bearing registration is deliberately absent from the crate root:
+///
+/// ```compile_fail,E0432
+/// use opc_gtpu_ebpf_common::GtpuTrafficObservationRegistration;
+/// ```
+#[doc(hidden)]
+#[path = "traffic_observation.rs"]
+pub mod trusted_traffic_observation_abi;
 
 pub use envelope::{
     classify_ipv6_extension_step, classify_ipv6_gtpu_ingress, classify_udp_checksum,
@@ -44,15 +61,33 @@ pub use pmtu::{
 pub use session::{
     gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     gtpu_session_group_authorizes_downlink, gtpu_session_group_authorizes_uplink,
-    select_gtpu_session_entry_wire, GtpuSessionAuthorityHeader, GtpuSessionDeviceConfig,
-    GtpuSessionDeviceId, GtpuSessionDownlinkKey, GtpuSessionEntry, GtpuSessionEntryWireView,
-    GtpuSessionGeneration, GtpuSessionGroupId, GtpuSessionGroupPhase, GtpuSessionGroupRecord,
-    GtpuSessionGroupRef, GtpuSessionIndexCandidate, GtpuSessionIpFamily, GtpuSessionPaa,
-    GtpuSessionTransactionId, GtpuSessionTransactionPhase, GtpuSessionTransactionRecord,
-    GtpuSessionUplinkKey, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
-    GTPU_SESSION_ENTRY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
-    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
+    select_gtpu_session_entry_wire, GtpuSessionAuthorityHeader, GtpuSessionAuthorityWireView,
+    GtpuSessionDeviceConfig, GtpuSessionDeviceId, GtpuSessionDownlinkKey, GtpuSessionEntry,
+    GtpuSessionEntryWireView, GtpuSessionGeneration, GtpuSessionGroupId, GtpuSessionGroupPhase,
+    GtpuSessionGroupRecord, GtpuSessionGroupRef, GtpuSessionIndexCandidate, GtpuSessionIpFamily,
+    GtpuSessionPaa, GtpuSessionTransactionId, GtpuSessionTransactionPhase,
+    GtpuSessionTransactionRecord, GtpuSessionUplinkKey, GTPU_SESSION_CONFIG_VALUE_LEN,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_ENTRY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+    GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT,
+    GTPU_SESSION_IPV6_SLOT, GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN,
     GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+};
+pub use tft_classifier::*;
+pub use trusted_traffic_observation_abi::{
+    GtpuTrafficObservationBinding, GtpuTrafficObservationDirection, GtpuTrafficObservationEvent,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_FENCE_LEN, GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
+    GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
+    GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_PUBLICATION_ID_MAX,
+    GTPU_TRAFFIC_OBSERVATION_PUBLICATION_SEQUENCE_INDEX,
+    GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAX_ENTRIES, GTPU_TRAFFIC_OBSERVATION_RING_BYTES,
+    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
 };
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
@@ -292,6 +327,9 @@ pub const MAP_SESSION_UPLINK_INDEX: &str = "GTPU_UL_INDEX";
 pub const MAP_SESSION_DOWNLINK_INDEX: &str = "GTPU_DL_INDEX";
 /// BPF map name: durable userspace-only grouped-session transaction journal.
 pub const MAP_SESSION_TRANSACTIONS: &str = "GTPU_SESS_TXN";
+/// BPF map name: durable userspace-only selector-authority operation stamps.
+/// tc programs never read this map.
+pub const MAP_SESSION_SELECTOR_STAMPS: &str = "GTPU_SEL_STAMP";
 /// BPF map name: managed IPv6 local-endpoint/device configuration.
 pub const MAP_CONFIG_IPV6: &str = "GTPU_CONFIG6";
 /// BPF map name: independent grouped-session schema marker.
@@ -1139,6 +1177,7 @@ fn binding_wires_equal<const N: usize>(
 /// [`DownlinkEndpointBinding::validate_ipv4_packet`]. It exists so the eBPF
 /// classifier does not materialize the full 44-byte typed value on its
 /// verifier-limited stack.
+#[inline(never)]
 pub fn validate_ipv4_downlink_binding_wire(
     value: &[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
     peer_address: [u8; 4],
@@ -2374,8 +2413,13 @@ mod tests {
             MAP_SESSION_UPLINK_INDEX,
             MAP_SESSION_DOWNLINK_INDEX,
             MAP_SESSION_TRANSACTIONS,
+            MAP_SESSION_SELECTOR_STAMPS,
             MAP_CONFIG_IPV6,
             MAP_SESSION_SCHEMA,
+            MAP_TFT_CLASSIFIER_SCHEMA,
+            MAP_TFT_CLASSIFIER_META,
+            MAP_TFT_CLASSIFIER_FILTERS,
+            MAP_TFT_CLASSIFIER_COUNTERS,
         ];
         for name in new_names {
             assert!(name.len() <= BPF_OBJ_NAME_VISIBLE_LEN);
@@ -2400,8 +2444,13 @@ mod tests {
             MAP_SESSION_UPLINK_INDEX,
             MAP_SESSION_DOWNLINK_INDEX,
             MAP_SESSION_TRANSACTIONS,
+            MAP_SESSION_SELECTOR_STAMPS,
             MAP_CONFIG_IPV6,
             MAP_SESSION_SCHEMA,
+            MAP_TFT_CLASSIFIER_SCHEMA,
+            MAP_TFT_CLASSIFIER_META,
+            MAP_TFT_CLASSIFIER_FILTERS,
+            MAP_TFT_CLASSIFIER_COUNTERS,
         ];
         for (index, name) in all_names.iter().enumerate() {
             let name = &name.as_bytes()[..name.len().min(BPF_OBJ_NAME_VISIBLE_LEN)];

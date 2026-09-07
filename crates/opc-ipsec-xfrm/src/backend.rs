@@ -4,9 +4,9 @@ use async_trait::async_trait;
 
 use crate::model::{
     validate_exact_remove_policy_request, AllocateSpiRequest, ExactRemovePolicyRequest,
-    InstallPolicyRequest, InstallSaRequest, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaRelocationIdentity, SaState,
-    SpiAllocation, XfrmCapability, XfrmProbe,
+    InstallPolicyRequest, InstallSaRequest, PolicyParameters, QueryPolicyRequest, QuerySaRequest,
+    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
+    SaRelocationIdentity, SaState, SpiAllocation, XfrmCapability, XfrmProbe,
 };
 use crate::XfrmError;
 
@@ -25,6 +25,23 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
 
     /// Query an existing Security Association.
     async fn query_sa(&self, request: QuerySaRequest) -> Result<SaState, XfrmError>;
+
+    /// Query one exactly identified Security Policy.
+    ///
+    /// This is the policy counterpart of [`Self::query_sa`]: an observation
+    /// authority that reports the current kernel parameters of the exact
+    /// selector/direction/mark/interface identity, or [`XfrmError::NotFound`]
+    /// when no such policy exists. It never authorizes a mutation. Backends
+    /// without an exact single-policy readback fail closed with
+    /// [`XfrmError::UnsupportedFeature`].
+    async fn query_policy(
+        &self,
+        _request: QueryPolicyRequest,
+    ) -> Result<PolicyParameters, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "exact_policy_query",
+        })
+    }
 
     /// Query the exact current-state snapshot needed to authorize one SA
     /// relocation.

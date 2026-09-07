@@ -26,10 +26,12 @@ from pathlib import Path
 GRPC_STACK = {"tonic", "prost", "prost-types", "tonic-build"}
 GRPC_ALLOWED_ROOTS = {"opc-gnmi-server"}
 UNSAFE_ALLOWED_ROOTS = {
+    "opc-fs-verity-sys",
     "opc-libsctp-sys",
     "opc-linux-gtpu-sys",
     "opc-linux-route-sys",
     "opc-linux-xfrm-sys",
+    "opc-sqlite-file-control-sys",
 }
 
 

@@ -603,6 +603,12 @@ pub(crate) struct CounterResumeActorRequest {
     pub(crate) request: EspCounterResumeApplyRequest,
 }
 
+impl CounterResumeActorRequest {
+    pub(crate) fn parameters(&self) -> &SaParameters {
+        &self.request.parameters
+    }
+}
+
 impl fmt::Debug for CounterResumeActorRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CounterResumeActorRequest(<redacted>)")

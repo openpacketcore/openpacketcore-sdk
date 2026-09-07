@@ -102,8 +102,10 @@ jobs:
             --test xfrm_dscp_privileged \
             --test xfrm_namespace_bound_privileged \
             --test xfrm_object_recovery_privileged \
+            --test xfrm_object_roster_recovery_privileged \
             --test xfrm_peer_observation_privileged \
             --test xfrm_relocation_privileged \
+            --test xfrm_sa_relocation_recovery_privileged \
             --no-run
 
       - name: Run namespace-bound counter and first-packet proof
@@ -172,6 +174,89 @@ jobs:
           sudo env \
             "PATH=${PATH}" \
             "OPC_XFRM_RUN_OBJECT_RECOVERY_PRIVILEGED=1" \
+            "${test_binary}" --ignored --nocapture --test-threads=1
+
+      - name: Run durable grouped object roster process-loss recovery proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          # The committed source is the authority on how many roster detectors
+          # must run; the shipped binary cannot be, because every detector
+          # returns Ok early when the privileged environment variable is unset
+          # and libtest counts a skip as a pass.
+          roster_source="crates/opc-ipsec-xfrm/tests/xfrm_object_roster_recovery_privileged.rs"
+          expected_tests="$(grep -c '^#\[ignore' "${roster_source}")"
+          echo "roster suite expects ${expected_tests} tests from ${roster_source}"
+          test "${expected_tests}" -gt 0
+          test_binary="$(
+            cargo test --locked -p opc-ipsec-xfrm \
+              --test xfrm_object_roster_recovery_privileged \
+              --no-run \
+              --message-format=json \
+            | python3 -c '
+          import json
+          import sys
+
+          executables = [
+              event.get("executable")
+              for line in sys.stdin
+              if (event := json.loads(line)).get("reason") == "compiler-artifact"
+              and event.get("target", {}).get("name")
+              == "xfrm_object_roster_recovery_privileged"
+              and event.get("executable")
+          ]
+          if len(executables) != 1:
+              raise SystemExit("expected exactly one object-roster recovery privileged test executable")
+          print(executables[0])
+          '
+          )"
+          roster_log="${RUNNER_TEMP}/xfrm-677-roster.log"
+          sudo env \
+            "PATH=${PATH}" \
+            "OPC_XFRM_RUN_OBJECT_ROSTER_RECOVERY_PRIVILEGED=1" \
+            "${test_binary}" --ignored --nocapture --test-threads=1 2>&1 | tee "${roster_log}"
+
+          # A green exit code alone proves nothing: a mis-set environment
+          # variable would skip every detector and still exit zero. Require the
+          # absence of skip markers and the exact committed test count.
+          if grep -q 'skipping:' "${roster_log}"; then
+            echo "::error::privileged roster recovery detectors skipped instead of running"
+            exit 1
+          fi
+          grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${roster_log}"
+
+      - name: Run durable SA relocation process-loss recovery proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          test_binary="$(
+            cargo test --locked -p opc-ipsec-xfrm \
+              --test xfrm_sa_relocation_recovery_privileged \
+              --no-run \
+              --message-format=json \
+            | python3 -c '
+          import json
+          import sys
+
+          executables = [
+              event.get("executable")
+              for line in sys.stdin
+              if (event := json.loads(line)).get("reason") == "compiler-artifact"
+              and event.get("target", {}).get("name") == "xfrm_sa_relocation_recovery_privileged"
+              and event.get("executable")
+          ]
+          if len(executables) != 1:
+              raise SystemExit("expected exactly one SA relocation recovery privileged test executable")
+          print(executables[0])
+          '
+          )"
+          sudo env \
+            "PATH=${PATH}" \
+            "OPC_XFRM_RUN_SA_RELOCATION_RECOVERY_PRIVILEGED=1" \
             "${test_binary}" --ignored --nocapture --test-threads=1
 
       - name: Run real XFRM output-mark and tc datapath proof

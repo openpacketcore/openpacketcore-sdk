@@ -13,6 +13,7 @@ use opc_types::{SpiffeId, Timestamp};
 use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::CertificateDer;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -47,6 +48,26 @@ impl TlsMaterialEpoch {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+const AUTHENTICATED_CONSUMER_ROTATION_JITTER_RANGE: Duration = Duration::from_secs(30);
+
+fn directed_authenticated_consumer_jitter(initiator: &SpiffeId, acceptor: &SpiffeId) -> Duration {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openpacketcore/tls/consumer-rotation-jitter/v1\0");
+    for field in [initiator.as_str().as_bytes(), acceptor.as_str().as_bytes()] {
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(field);
+    }
+    let digest = hasher.finalize();
+    let mut prefix = [0_u8; 16];
+    prefix.copy_from_slice(&digest[..16]);
+    let sample = u128::from_be_bytes(prefix);
+    let ceiling = AUTHENTICATED_CONSUMER_ROTATION_JITTER_RANGE.as_nanos();
+    let nanos = sample % ceiling.saturating_add(1);
+    let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+    let subsecond_nanos = u32::try_from(nanos % 1_000_000_000).unwrap_or(999_999_999);
+    Duration::new(seconds, subsecond_nanos)
 }
 
 /// Availability of coherent TLS material.
@@ -166,23 +187,30 @@ impl fmt::Display for TlsMaterialReloadReason {
 /// controller validates every certificate it will present. An upstream
 /// identity-source status describes source acquisition and is not a substitute
 /// for this admission status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TlsMaterialStatus {
     epoch: TlsMaterialEpoch,
     availability: TlsMaterialAvailability,
     reason: Option<TlsMaterialReloadReason>,
     leaf_expires_at: Option<Timestamp>,
     certificate_chain_expires_at: Option<Timestamp>,
+    /// Monotonic acceptance instant for `epoch`. This is deliberately omitted
+    /// from serialization and redacted Debug output: it exists only so
+    /// authenticated transports anchor cooperative drain jitter to the actual
+    /// publication rather than to an arbitrarily late first observation.
+    #[serde(skip_serializing)]
+    published_at: tokio::time::Instant,
 }
 
 impl TlsMaterialStatus {
-    const fn initial() -> Self {
+    fn initial() -> Self {
         Self {
             epoch: TlsMaterialEpoch::INITIAL,
             availability: TlsMaterialAvailability::Initializing,
             reason: Some(TlsMaterialReloadReason::AwaitingInitialMaterial),
             leaf_expires_at: None,
             certificate_chain_expires_at: None,
+            published_at: tokio::time::Instant::now(),
         }
     }
 
@@ -209,6 +237,30 @@ impl TlsMaterialStatus {
     /// Earliest expiry across the retained presented certificate chain.
     pub const fn certificate_chain_expires_at(self) -> Option<Timestamp> {
         self.certificate_chain_expires_at
+    }
+
+    /// Monotonic instant at which the current accepted epoch was published.
+    ///
+    /// Rejected updates that retain the last-good epoch retain this instant.
+    /// The value is process-local and must never be serialized or logged.
+    pub const fn published_at(self) -> tokio::time::Instant {
+        self.published_at
+    }
+}
+
+impl fmt::Debug for TlsMaterialStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsMaterialStatus")
+            .field("epoch", &self.epoch)
+            .field("availability", &self.availability)
+            .field("reason", &self.reason)
+            .field("leaf_expires_at", &self.leaf_expires_at)
+            .field(
+                "certificate_chain_expires_at",
+                &self.certificate_chain_expires_at,
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -560,6 +612,33 @@ impl TlsMaterialController {
         *self.inner.status_tx.borrow()
     }
 
+    /// Return a fixed-domain opaque commitment to the pinned local SPIFFE
+    /// identity.
+    ///
+    /// The commitment remains stable when that identity rotates certificates
+    /// or keys. It never exposes identity text, certificates, or key material,
+    /// and is absent until this controller has accepted or was configured with
+    /// a local identity pin.
+    pub fn local_spiffe_identity_commitment(&self) -> Option<[u8; 32]> {
+        self.refresh();
+        let state = lock_unpoisoned(&self.inner.state);
+        let identity = state.pinned_spiffe_id.as_ref().or_else(|| {
+            state
+                .snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.state.identity.spiffe_id)
+        })?;
+        let mut digest = Sha256::new();
+        digest.update(b"openpacketcore/tls/local-spiffe-identity-commitment/v1\0");
+        digest.update(
+            u16::try_from(identity.as_str().len())
+                .expect("validated SPIFFE identity length fits commitment encoding")
+                .to_be_bytes(),
+        );
+        digest.update(identity.as_str().as_bytes());
+        Some(digest.finalize().into())
+    }
+
     /// Subscribe to status changes driven by snapshot/status access.
     pub fn subscribe_status(&self) -> watch::Receiver<TlsMaterialStatus> {
         self.refresh();
@@ -764,6 +843,7 @@ impl TlsMaterialController {
             reason: None,
             leaf_expires_at: Some(leaf_expires_at),
             certificate_chain_expires_at: Some(certificate_chain_expires_at),
+            published_at: tokio::time::Instant::now(),
         };
         let pin = snapshot.state.identity.spiffe_id.clone();
         match (self.inner.metrics.as_ref(), metrics_publication) {
@@ -978,13 +1058,14 @@ fn expire_locked(
         .and_then(|snapshot| snapshot.metrics_publication.as_ref())
         .cloned();
     controller.snapshot = None;
-    let epoch = status_tx.borrow().epoch;
+    let current = *status_tx.borrow();
     status_tx.send_replace(TlsMaterialStatus {
-        epoch,
+        epoch: current.epoch,
         availability: TlsMaterialAvailability::Unavailable,
         reason: Some(TlsMaterialReloadReason::LastGoodExpired),
         leaf_expires_at: None,
         certificate_chain_expires_at: None,
+        published_at: current.published_at,
     });
     if let (Some(metrics), Some(publication)) = (metrics, metrics_publication.as_ref()) {
         metrics.record_expired_once(publication);
@@ -1016,6 +1097,7 @@ fn publish_rejection(
         leaf_expires_at: retained.map(TlsMaterialSnapshot::leaf_expires_at),
         certificate_chain_expires_at: retained
             .map(TlsMaterialSnapshot::certificate_chain_expires_at),
+        published_at: current.published_at,
     });
     if reason == TlsMaterialReloadReason::LastGoodExpired {
         return;
@@ -1056,6 +1138,7 @@ fn publish_expired_candidate(
         leaf_expires_at: retained.map(TlsMaterialSnapshot::leaf_expires_at),
         certificate_chain_expires_at: retained
             .map(TlsMaterialSnapshot::certificate_chain_expires_at),
+        published_at: current.published_at,
     });
 }
 
@@ -1285,6 +1368,15 @@ impl TlsClientHandshake {
         self.snapshot.certificate_chain_expires_at()
     }
 
+    /// Derive the one bounded initiator-to-acceptor consumer rotation jitter.
+    ///
+    /// The private digest and local authenticated identity are never returned.
+    /// The domain and 30-second range are fixed so this is not a caller-chosen
+    /// modular digest oracle. A stricter transport policy may clamp the result.
+    pub fn consumer_rotation_jitter(&self, peer: &SpiffeId) -> Duration {
+        directed_authenticated_consumer_jitter(&self.snapshot.state.identity.spiffe_id, peer)
+    }
+
     /// Verify the snapshot is still current after TLS and application negotiation.
     pub fn admit(&self) -> Result<TlsAdmittedConnection, TlsMaterialError> {
         self.controller.admit(&self.snapshot)
@@ -1344,6 +1436,14 @@ impl TlsServerHandshake {
     /// Earliest expiry across the fixed local certificate chain.
     pub fn certificate_chain_expires_at(&self) -> Timestamp {
         self.snapshot.certificate_chain_expires_at()
+    }
+
+    /// Derive the same bounded initiator-to-acceptor jitter as the client.
+    ///
+    /// The authenticated peer is the initiator on a server handshake. The
+    /// private digest and local authenticated identity are never returned.
+    pub fn consumer_rotation_jitter(&self, peer: &SpiffeId) -> Duration {
+        directed_authenticated_consumer_jitter(peer, &self.snapshot.state.identity.spiffe_id)
     }
 
     /// Verify the snapshot is still current after TLS and application negotiation.
@@ -1431,6 +1531,34 @@ impl<E: std::error::Error + 'static> std::error::Error for TlsHandshakeRunError<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_rotation_jitter_is_directed_stable_distinct_and_fixed_range() {
+        let client_a = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/client-a",
+        )
+        .expect("client A identity");
+        let client_b = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/client-b",
+        )
+        .expect("client B identity");
+        let server = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/server",
+        )
+        .expect("server identity");
+
+        let client_a_first = directed_authenticated_consumer_jitter(&client_a, &server);
+        let client_a_second = directed_authenticated_consumer_jitter(&client_a, &server);
+        let client_b_jitter = directed_authenticated_consumer_jitter(&client_b, &server);
+        let reverse_jitter = directed_authenticated_consumer_jitter(&server, &client_a);
+
+        assert_eq!(client_a_first, client_a_second);
+        assert_ne!(client_a_first, client_b_jitter);
+        assert_ne!(client_a_first, reverse_jitter);
+        for jitter in [client_a_first, client_b_jitter, reverse_jitter] {
+            assert!(jitter <= AUTHENTICATED_CONSUMER_ROTATION_JITTER_RANGE);
+        }
+    }
 
     #[test]
     fn material_shape_bounds_accept_exact_and_reject_each_one_over() {

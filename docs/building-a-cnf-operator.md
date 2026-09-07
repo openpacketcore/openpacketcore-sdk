@@ -32,7 +32,7 @@ For the full rationale see [ADR 0007](adr/0007-operator-lifecycle-rust-policy-co
 
 You will need:
 
-- Go 1.26.4+
+- Go 1.26.6+
 - kubebuilder / controller-runtime
 - The `operator-sdk-go` module
 

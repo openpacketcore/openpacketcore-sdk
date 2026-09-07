@@ -102,7 +102,11 @@ evidence.
   profile evaluation over fresh authenticated evidence may report `Quorum`.
 - `ConsensusSessionStore::open` is the operational construction path.
   `QuorumSessionStore` is a compatibility type alias to that same Openraft
-  implementation, not a second quorum algorithm. Callers install its
+  implementation, not a second quorum algorithm. Durable consensus
+  construction is Linux-only: dynamic construction returns the typed
+  `DynamicConsensusUnsupportedPlatform` error on other platforms before
+  creating snapshot directories or consensus schema state. Standalone
+  `SqliteSessionBackend` use remains cross-platform. Callers install its
   consensus RPC handler, then call `initialize_cluster` for pristine storage.
   Every member may make that call concurrently. On clean first formation only
   the canonical lowest node initializes Openraft; the other pristine members
@@ -116,6 +120,85 @@ evidence.
   quorum evidence. Descriptor-only labs may use that engine-only probe;
   production traffic uses `probe_production_durable_readiness`, which first
   requires still-fresh `AuthenticatedPlatform` topology evidence.
+
+### Fixed durable-quorum consumer recipe
+
+For a fixed deployment, choose one `PlacementResiliencePolicy` and carry that
+same value through topology admission and the runtime. Build exactly three or
+five `QuorumReplicaDescriptor` values, each with a distinct `ReplicaId`,
+`ReplicaEndpoint` (use `.invalid` names in examples), `ReplicaTlsIdentity`
+(for example `spiffe://example.invalid/session/voter/0`), and
+`ReplicaBackingIdentity`; the strict default also requires distinct declared
+`ReplicaFailureDomain` values. For each local voter, construct the topology and
+open its file-backed SQLite store as follows. The `identity` must be the
+fixed-profile- and policy-bound result of
+`derive_fixed_durable_quorum_consensus_identity`; the ordinary descriptor-only
+consensus identity remains for dynamic profiles. This constructor is supported
+only on Linux because fixed quorum recovery uses descriptor-pinned SQLite
+snapshots; on other platforms it returns
+`ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform` before
+initializing durable Raft state.
+
+```rust
+let members = vec![
+    QuorumReplicaDescriptor::new(
+        ReplicaId::new("voter-0")?,
+        ReplicaEndpoint::new("voter-0.session.invalid", 7443)?,
+        ReplicaTlsIdentity::new("spiffe://example.invalid/session/voter/0")?,
+        ReplicaFailureDomain::new("failure-domain-0")?,
+        ReplicaBackingIdentity::new("backing-0")?,
+    ),
+    QuorumReplicaDescriptor::new(
+        ReplicaId::new("voter-1")?,
+        ReplicaEndpoint::new("voter-1.session.invalid", 7443)?,
+        ReplicaTlsIdentity::new("spiffe://example.invalid/session/voter/1")?,
+        ReplicaFailureDomain::new("failure-domain-1")?,
+        ReplicaBackingIdentity::new("backing-1")?,
+    ),
+    QuorumReplicaDescriptor::new(
+        ReplicaId::new("voter-2")?,
+        ReplicaEndpoint::new("voter-2.session.invalid", 7443)?,
+        ReplicaTlsIdentity::new("spiffe://example.invalid/session/voter/2")?,
+        ReplicaFailureDomain::new("failure-domain-2")?,
+        ReplicaBackingIdentity::new("backing-2")?,
+    ),
+]; // use five entries for the fixed five-voter profile
+let policy = PlacementResiliencePolicy::default();
+// Or explicitly opt in: PlacementResiliencePolicy::AllowReducedResilience.
+let fingerprints = members
+    .iter()
+    .map(QuorumReplicaDescriptor::configuration_fingerprint)
+    .collect::<Vec<_>>();
+let identity = derive_fixed_durable_quorum_consensus_identity(
+    cluster_id,
+    configuration_epoch,
+    &fingerprints,
+    policy,
+);
+let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+    QuorumTopologyConfig::new_consensus(local_replica_id, members.clone(), identity),
+    policy,
+)?;
+let store = ConsensusSessionStore::open_fixed_durable_quorum(
+    topology,
+    SqliteSessionBackend::open("voter-0.sqlite")?,
+    "snapshots-voter-0",
+    consensus_peers,
+).await?;
+```
+
+`consensus_peers` must contain exactly the other fixed voters and each peer must
+be authenticated and bound to the same policy-bound fixed-quorum identity.
+`open_fixed_durable_quorum` rejects in-memory SQLite, non-fixed topologies, and
+peer-set or scope mismatches; it does not add members dynamically. After
+`initialize_cluster`, gate live traffic only on
+`probe_fixed_durable_quorum_readiness[_at](...).traffic_authority().is_granted()`.
+Inspect `placement_resilience().disposition()` separately. A fresh controller
+or attestation observation can qualify, withhold, or expire the placement
+claim, but its freshness is not a live traffic gate; traffic authority comes
+from the durable recovery/membership/linearizable-majority check. The explicit
+`AllowReducedResilience` mode never lowers the quorum majority and never claims
+independent HA placement.
 - `recovery::LegacyForkRecovery` is the default-deny offline administrative
   boundary for a drained fleet. It creates a sealed, redaction-safe plan,
   quarantines every explicit target before mutation, installs one immutable
@@ -134,9 +217,10 @@ evidence.
   `RestoreBlockReason`, summaries, page-size constants, and
   `summarize_restore_records`. Durable SQLite scans seek over the existing
   composite primary key, examine at most 4,096 live candidates plus one
-  lookahead per page, cap combined payloads at 4 MiB, retained page bytes at
-  8 MiB, and examined key/filter metadata at 8 MiB, and stop after 2,000,000
-  SQLite VM steps or 1 second of SQLite work. One absolute restore deadline
+  lookahead per page, cap combined **stored** payloads at 4 MiB + 64 KiB,
+  retained page bytes at 8 MiB, and examined key/filter metadata at 8 MiB,
+  and stop after 2,000,000 SQLite VM steps or 1 second of SQLite work. One
+  absolute restore deadline
   begins at the public entry point and covers the Openraft barrier/apply path,
   worker admission, asynchronous connection admission, SQLite progress, and
   task join. Each backend admits exactly one blocking restore worker, and the
@@ -159,6 +243,11 @@ evidence.
   remains below 2 KiB and fits the legacy adapter's minimum frame.
   Exact response sizing returns typed `RestoreScanResponseTooLarge` without a
   partial frame unless peers negotiated a sufficient frame (up to 16 MiB).
+  The local stored-page ceiling is intentionally independent of session-net
+  v5's fixed 2,096,128-byte frame-safe wire payload ceiling: local SQLite
+  restore can recover its advertised 4 MiB + 64 KiB stored record limit,
+  including sealing-envelope overhead, but an oversized local page is never
+  transportable as a v5 page.
 - `opc-session-net` protocol v5 can transport only the durable opaque restore
   page profile. Compatibility offset cursors from `FakeSessionBackend` are
   local test evidence and are rejected by both remote client and server; this
@@ -172,7 +261,7 @@ evidence.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 6, error-set revision 9,
+  Its profile pins wire-schema revision 7, error-set revision 9,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -184,8 +273,9 @@ evidence.
   request IDs, when present, use the canonical lowercase hyphenated 36-byte UUID encoding.
   Revision 2 added exact directional frame negotiation. Revision 3 replaces
   revision 2's inspectable cursor fields with the confidential authenticated
-  token, adds the page cursor profile, and pins the 4 MiB payload plus 4,096
-  examined-candidate bounds. Error-set revision 3 carries typed restore
+  token, adds the page cursor profile, and originally pins the restore payload
+  plus 4,096 examined-candidate bounds. Wire-schema revision 7 corrects that
+  payload fence to a worst-case-JSON-safe 2,096,128 bytes. Error-set revision 3 carries typed restore
   stale-cursor, work-budget, and direct-CAS idempotency outcomes; revision 4
   adds the replication-log range, page-limit, and compacted-cursor outcomes;
   revision 5 adds the non-CAS backend and lease ambiguity outcomes; revision 6
@@ -247,19 +337,22 @@ evidence.
   fleet upgrade.
 - Every protocol-v5 response and watch item is fully bounded-encoded before its
   length prefix is emitted. Common non-pageable and complete-page successes use
-  one bounded encode with no sizing preflight. If a complete pageable response
-  is too large, that direct attempt emits no prefix; bounded logarithmic sizing
-  probes and the final encode reuse the same absolute deadline established
-  before the first encode/probe. Lazy exact-length boxed chunks are not
+  one bounded encode with no sizing preflight. If a replication-log page is too
+  large, that direct attempt emits no prefix; bounded logarithmic sizing probes
+  and the final encode reuse the same absolute deadline established before the
+  first encode/probe. Restore pages are validated as whole backend results and
+  are never transport-shaped. Lazy exact-length boxed chunks are not
   coalesced and retained
   encoded-JSON byte storage stays within the frame limit. Chunk metadata and
   allocator slab/RSS overhead are separate. Deadline and server-abort
   cancellation are checked cooperatively between synchronous serializer
   writes/chunks, and the same deadline continues through prefix, payload, and
   flush.
-  Get/CAS records and positional batches are never truncated;
-  restore/log pages may return only a complete cursor/sequence-preserving
-  prefix; watch cannot skip an oversized sequence. A small SDK-owned,
+  Get/CAS records and positional batches are never truncated. Restore backends
+  may independently return shorter cursor-correct pages under their own
+  budgets, while replication-log pages may return only a complete
+  sequence-preserving prefix. The transport never trims or rewrites restore
+  pages/cursors; watch cannot skip an oversized sequence. A small SDK-owned,
   redaction-safe fallback is used when representable, otherwise the connection
   closes fail-closed. Slow-reader timeout releases the connection slot.
 - Transport capabilities advertise
@@ -468,6 +561,38 @@ handshake does not make an opaque `OPCH` payload readable by an older binary.
 
 ### Validated HA construction
 
+#### Snapshot namespace trust contract
+
+The consensus snapshot directory is a private SDK namespace, not a general
+scratch directory. On Linux, admission retains an
+`O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` directory descriptor.
+The admitted descriptor's `fstat` owner must equal the effective UID and its
+mode must satisfy `mode & 022 == 0`; an insecure pre-existing directory is
+rejected. The SDK creates a missing namespace with mode `0700` and creates
+snapshot artifacts with mode `0600`.
+
+After admission, namespace work is directory-FD-relative, so a replacement of
+the parent pathname cannot redirect admitted cleanup, receive, build, install,
+or validation work into a replacement directory. The durable metadata keeps
+logical basenames rather than treating a mutable parent pathname as authority.
+The supported writer model is cooperative SDK processes running under one
+dedicated service UID and serialized by the namespace/database leases.
+
+This is deliberately not a privileged-attacker boundary. It excludes `root`,
+`CAP_DAC_OVERRIDE`, `CAP_FOWNER`, non-cooperating processes with the same
+effective UID, and writable aliases of the retained directory from the trust
+model. POSIX ACLs must not grant an effective group-class write path: the ACL
+group-class mask and the directory mode must remain non-writable. Operators
+must use a dedicated UID, a private parent directory, and no untrusted shared
+UID; owner or mode mismatch fails closed. The contract does not claim universal
+unlink-by-FD semantics or resistance to a privileged actor.
+
+All public durable consensus constructors are Linux-only. Dynamic construction
+returns `DynamicConsensusUnsupportedPlatform` before consensus-owned filesystem
+or schema initialization; fixed construction retains its distinct
+`FixedQuorumUnsupportedPlatform` error. This boundary does not restrict
+standalone `SqliteSessionBackend` use.
+
 Build the complete descriptor set first, derive its order-independent
 configuration digest with `opc_consensus::derive_configuration_id`, and pass
 the resulting `ConsensusIdentity` to `QuorumTopologyConfig::new_consensus`.
@@ -497,10 +622,11 @@ cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
-The exact consensus contract uses transport/wire-schema revision 3 and
-error-set revision 5. Revision 3 adds the bounded topology-admission barrier,
-and error revision 5 adds `TopologyAuthorityRevoked`.
-Revision 2/error revision 4 or older fails before dispatch. Drain traffic and
+The exact consensus contract uses transport/wire-schema revision 4 and
+error-set revision 6. Revision 4 makes the forwarded consumer scope explicit,
+so a peer cannot silently downgrade a consumer-scoped operation to an internal
+call; error revision 6 binds that semantic boundary into the exact profile.
+Revision 3/error revision 5 or older fails before dispatch. Drain traffic and
 writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 
@@ -732,6 +858,13 @@ caller cancellation or timeout cannot
 cancel it or start an overlapping check. Openraft still supplies every quorum
 proof; the supervisor is only a local resource bound.
 
+File-backed fixed-quorum V2 acceptance snapshots use three process-scoped WAL
+reader lanes shared by every clone. Each checkout owns one reader and one
+matching permit through its fresh transaction; a lost or unusable reader is
+replenished or permanently retires that permit. This prevents a write-held
+SQLite connection from globally serializing unrelated acceptance reads without
+creating a connection, task, or pool entry per caller or subscriber.
+
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal
 submission remains `BackendUnavailable`. Once `client_write_ff` accepts the
@@ -756,7 +889,8 @@ backward. It never selects a branch by counting application rows visible now.
 Snapshot receive/build/promote staging is file-backed and bounded. On restart,
 the adapter validates the one metadata-referenced snapshot before Openraft
 starts, removes only SDK-named interrupted staging files and unreferenced
-promoted snapshots, and fails closed above 8,192 directory entries
+promoted snapshots, and fails closed after inspecting more than 32 directory
+entries (including unrecognized entries)
 or the current snapshot is missing, corrupt, or inconsistent. Snapshot table
 replacement remains one SQLite transaction, so retry after interruption is
 idempotent. Because Openraft schedules snapshot apply and covered-log purge on
@@ -764,6 +898,44 @@ separate workers, purge waits at most ten seconds for the persisted applied
 floor and otherwise fails closed. Fences, lease credentials, application
 sequence, request outcomes, and logical time move together with the
 authoritative state-machine image.
+
+Fixed membership is independent of the local snapshot integrity mechanism.
+Use `open_fixed_durable_quorum_with_snapshot_integrity(..., policy)` to select
+one explicitly:
+
+- `SnapshotIntegrityPolicy::PortableVerified` captures a process-owned SHA-256
+  block index from the exact pinned descriptor, then verifies every block
+  consumed by transport, extraction, and a non-default read-only SQLite VFS.
+  It works on ordinary supported Linux filesystems without fs-verity. Same-inode
+  writes or truncation cannot substitute changed bytes after validation.
+- `SnapshotIntegrityPolicy::FsVerity` retains the strict v1/SHA-256/4 KiB kernel
+  seal with no salt or signature. Admission probes the selected filesystem
+  before starting Raft. Unavailable capability returns
+  `SnapshotIntegrityUnavailable`; there is no automatic portable fallback.
+  Existing `open_fixed_durable_quorum` and its clock-injected variant select
+  this strict policy for compatibility.
+
+Both policies preserve the envelope format, expected checksum, descriptor and
+namespace fences, membership, placement, publication transaction, and recovery
+checks. Portable indexing runs on a blocking worker outside the primary SQLite
+lock. Blocks range from 64 KiB to 2 MiB, with at most 16 MiB of digests per image;
+clones share the index and verified cache. A process-wide 128 MiB reservation
+bounds indices, capture/cache replacement buffers, and pending transport reads.
+Exhaustion fails closed before allocating more verification work. It is not a
+whole-snapshot memory copy, chmod guarantee, or hash-then-reopen sequence.
+Dynamic authority retains its existing bounded corruption detection and does
+not claim either fixed snapshot protection.
+
+Explicit portable selection can read existing sealed images, but an old strict
+reader cannot reopen newly written unsealed snapshots. A rollout or rollback
+must retain compatible readers or use a separately reviewed offline conversion
+on capable storage. Neither policy repairs snapshots, changes durable authority,
+or accepts a replacement merely because its bytes match. Offline administrators
+must explicitly select the same policy using
+`LegacyForkRecovery::with_snapshot_integrity`; the plan and workflow authenticate
+that selection, and resume/finalization reject a policy mismatch. Legacy plans
+without the field retain their exact strict meaning and serialization. See
+[ADR 0020](../../docs/adr/0020-portable-verified-consensus-snapshots.md).
 
 Runbook: keep traffic and ownership publication closed unless readiness is
 `Ready`. During `catching_up` or `awaiting_quorum`, restore authenticated peer
@@ -942,8 +1114,10 @@ fail closed.
 This is a compatibility boundary. The public error enums gain variants, so
 external exhaustive matches must add arms. Protocol v4 introduced the TTL
 fixed-width DTOs in error revision 1; current v5 error revision 9 retains those
-encodings and adds bounded expiry-preflight and topology-authority outcomes. An error-revision-8 or
-older peer is not admitted. Before upgrading a store created by an older SDK, audit
+encodings and adds bounded expiry-preflight and topology-authority outcomes. The
+exact direct v5 profile is wire-schema revision 7/error-set revision 9; every
+non-current direct profile combination (including error revision 8 or older) is
+not admitted. Before upgrading a store created by an older SDK, audit
 its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or
 rebuild; the SDK does not silently clamp or rewrite them. Replicated
@@ -1020,8 +1194,12 @@ entries. The negotiated frame limit remains a separate encoded-byte bound.
 Outbound sizing and emitted encoding use capped buffers and emit no prefix when
 the result cannot fit. Batch results retain exact positional cardinality and are
 never shortened. Replication-log results may expose only the largest complete
-contiguous prefix; restore pages may expose only a complete cursor
-prefix. An over-limit watch entry is not skipped because doing so would hide a
+contiguous prefix. Restore backends may independently return a shorter
+cursor-correct page under their count, payload, or work budgets, but the
+transport validates that complete page against the fixed wire cap and negotiated
+frame and never trims or rewrites it. An oversize restore page returns typed
+`RestoreScanResponseTooLarge` when representable or closes. An over-limit watch
+entry is not skipped because doing so would hide a
 sequence gap; the stream terminates after a representable fixed error or by
 closing the connection. Rejected owned operation trees continue to be
 dismantled iteratively.
@@ -1076,6 +1254,153 @@ rollback; callers must follow the existing request-id/idempotency, fencing, and
 authoritative re-read rules before retrying. Diagnostics use fixed
 operation-family/reason categories and never record keys, owners, payloads,
 transaction IDs, peer identities, or backend/peer-controlled error text.
+
+## Atomic fenced transitions
+
+The exact V1 atomic surface combines one lease acquire/renew and one same-key
+create/update/delete/TTL mutation at a single capable backend linearization
+point. V1 alone does not promise local restart recovery. A protected production
+composition MUST add an SDK-owned `PreparedFencedTransitionJournal` to the
+outer `EncryptingSessionBackend` or `RemoteSealingSessionBackend`; only that
+journaled composition advertises `AtomicFencedTransitionCapability::V2`.
+Legacy wrapper constructors remain source compatible but their atomic surface
+stays fail closed until a journal is installed.
+
+The journal is a dedicated SQLite database on a caller-selected durable volume.
+That volume MUST be a local filesystem with truthful POSIX locking, `fsync`,
+directory-sync, and storage-barrier semantics; NFS-like mounts are unsupported.
+Its containing directory and file MUST be private, and its stable 32-byte
+`PreparedFencedTransitionJournalKey` MUST come from secret configuration
+independent of record-encryption/provider keys. Preparation rejects an already
+bound request ID before expiry/provider work, protects create/update exactly
+once after the authoritative expiry preflight, and commits the complete opaque
+prepared token to the journal before returning. Delete/refresh remain
+body- and provider-free. Execute/status reload and byte-compare the journaled
+token and never reseal, unseal, or reconstruct it. After a process restart,
+`recover_prepared_fenced_transition` looks it up by the same caller-stable
+`FencedTransitionRequestId`; `NotFound` at the consensus status barrier never
+deletes the journal row or proves that a delayed proposal cannot commit.
+
+Provisioning and recovery are deliberately separate: callers MUST use
+`PreparedFencedTransitionJournal::create_new` exactly once to provision a
+missing journal, and MUST use `open_existing` after every restart. Opening a
+missing, truncated, reset, or partially initialized path fails closed and never
+creates an authenticated empty journal. The integrity key is unique to exactly
+one durable journal path/storage boundary: callers MUST restore the same
+path/file/key together and MUST NOT reuse that key for another journal. This is
+a trusted private durable-path boundary: the deployment MUST give the effective
+user exclusive writer authority. An actor with equivalent same-user
+path-replacement authority is inside that storage boundary because it already
+has the SDK process's file authority. The containing directory MUST reserve the
+database leaf and its SQLite sidecar names exclusively for this journal. One
+process MUST clone the admitted journal handle rather than reopening the same
+inode or opening it directly through SQLite. Platforms without the Unix path
+and SQLite-VFS checks fail closed for V2.
+
+The schema-3 journal authenticates more than each row: a per-journal random
+incarnation, bounded row count, and root over the complete request-ID/tag set
+are committed by a separate HMAC. One fixed writer and four fixed WAL readers
+serve the process-scoped journal handle; callers clone that handle rather than
+creating per-request connections. Health streams the complete bounded history
+through ordered cursors while retaining only 4,096 bucket aggregates and the
+at-most-eight epoch states. Lookup/recovery and insertion use the same fixed
+pool and authenticate their selected bounded state. The authenticated covering
+index is the presence authority. Its scan cross-validates each indexed row and
+fixed tag against the table, plus independently ordered table and primary-index
+cursors; divergent table, primary, or secondary-index state therefore cannot
+become false absence. Schema 3 places the fixed tag before the potentially
+overflowing prepared body, so the global proof remains independent of body
+size. Lookup authenticates the selected token, while insertion re-reads its new
+row and updates the membership commitment atomically before returning success.
+The SQLite catalog is an exact whitelist of the two SDK tables, generated
+primary-key autoindex, and membership index, so any other object, including a
+reserved-prefix object, fails closed before journal setup. These checks detect
+offline row deletion, addition, primary-key replacement, index divergence, and
+tag corruption in the same durable file.
+A corrupt selected body fails its exact row authentication and cannot be
+treated as absent or rebound. Restoring an older complete valid database
+snapshot cannot be detected without an external monotonic anti-rollback anchor
+and is outside the same-durable-file guarantee.
+
+`FencedTransitionExecuteError` separates a definitely pre-dispatch
+`NotTransmitted`, a possibly delivered `OutcomeUnknown { request_id }`, and a
+confirmed `Rejected` store result. Journal absence, corruption, wrong key, or
+unavailability prevents a new dispatch. Any ambiguity returned by an inner
+layer remains ambiguity under the expected outer request ID. Observation
+unprotects only a returned record and preserves the authority fence.
+
+This is a breaking replacement for passing a logical request directly to
+execute/status. Custom backends must implement the prepare/execute/status trio;
+transparent adapters must forward it and may forward the protected-byte
+preservation witness only when the complete durable path retains bytes exactly.
+Defaults fail closed. Nested local/remote protection wrappers are unsupported.
+The explicit authenticated-consumer physical bridge implements only this
+atomic subset below a protected wrapper; all unrelated `SessionBackend`
+authority fails closed and it does not implement lease coordination.
+
+Prepared tokens use a bounded, versioned magic/version/length frame and wiping
+in-memory storage. A golden V1 compatibility corpus covers both lease forms,
+every mutation, record/expiry shapes, and each supported protection-stack
+shape/order. Journal rows contain request metadata and, for protected writes,
+ciphertext; the HMAC authenticates them but does not encrypt them. Never log,
+diagnose, export, or place token/journal contents in fixtures or metrics.
+
+V2 guarantees recovery after loss of the process while the same durable
+volume, path, journal key, protection namespace/mode, authenticated consumer
+identity (when used), and stable consensus cluster remain available. It does
+not claim recovery after volume/host loss. Endpoint, leader, certificate/key,
+provider key, and consensus configuration-epoch rotation do not change the
+binding. A rolling upgrade MUST deploy readers for the prepared-token and
+journal schema everywhere recovery may run before enabling V2. Rollback
+requires draining every unresolved/delayed request or retaining a compatible
+reader and the same journal; never re-encode, reseal, reconstruct, copy into a
+fresh journal identity, or migrate an in-flight token.
+
+The separate epoch-fenced receipt-history protocol uses
+`FencedTransitionV2Request`, not a prepared V1 token. A protected wrapper
+advertises `FencedTransitionV2Capability::V2` only after it is configured with
+its own `FencedTransitionV2PreparedJournal` through
+`with_fenced_transition_v2_journal` and a stable
+`FencedTransitionV2JournalScope` through
+`with_fenced_transition_v2_journal_scope`. For a consensus backend, derive
+that scope with `FencedTransitionV2JournalScope::for_consensus_cluster`; do
+not use a rotatable sealing key or provider endpoint. The journal binds that
+scope together with the wrapper mode and payload namespace before it invokes a
+provider or the inner backend. A missing scope on a standalone backend, a
+different namespace, a local/remote mode change, or a different cluster fails
+closed. The V2 journal has a distinct path, key, schema, and 56-byte
+complete-ID namespace; it maps the validated outer ID to one sealed inner V2
+request, never stores the caller plaintext body, and is never the permanent
+capped V1 journal. Exact retries after an ambiguous send, restart, or
+record-protection-key rotation reuse that same sealed inner request. A mapping
+remains until the inner consensus history reports an epoch at or below
+`retired_through`; only then may the wrapper reclaim it, after which an exact
+delayed retry remains terminally `Retired`. Schema-1 unscoped V2 journals are
+not migrated in place: provision a fresh scoped V2 journal after draining any
+unresolved requests. Missing, mixed, legacy, wrong-key, wrong-scope, or
+corrupt V2 journal state fails closed rather than falling back to V1 or
+resealing a caller request.
+
+`SessionBackend::fenced_transition_v2_batch` coalesces 1 through 256 ordered
+requests from one epoch into one physical backend batch while preserving one
+full-ID result per submitted item. It is not a cross-item conditional or
+all-or-nothing transaction. Protected wrappers first recover every retained
+mapping and seal and journal every fresh item before dispatching the one inner
+batch; a local preparation failure therefore has no consensus effect, while a
+later retry or key rotation reuses each exact stored sealed request.
+
+V2 keeps exactly one writable epoch and at most seven contiguous closed replay
+epochs. Each epoch holds at most 131,072 request bindings, so receipts and the
+protected journal have a fixed maximum of 1,048,576 bindings; receipt semantic
+content is additionally capped at 18,469,617,664 bytes (storage-engine page
+overhead has its own journal/store file limit). A consensus maintenance entry
+opens the immediate successor while a replay slot is available. When all eight
+slots are retained, a new identity is deterministically rejected before record
+or lease effects; a later maintenance entry can retire the oldest epoch only
+after its exact-result window and reclaim it in ordered 1,024-entry batches.
+During that reclamation the active epoch remains writable, but no ninth epoch
+is allocated. This is generic bounded SDK lifecycle state, not subscriber or
+network-function policy.
 
 ## Fenced ownership
 

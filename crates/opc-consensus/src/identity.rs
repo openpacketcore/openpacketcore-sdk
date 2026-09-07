@@ -255,12 +255,8 @@ pub fn derive_node_id(
     hasher.update(stable_member_id);
     let digest: [u8; 32] = hasher.finalize().into();
 
-    for chunk in digest.chunks_exact(8) {
-        let value = u64::from_be_bytes(
-            chunk
-                .try_into()
-                .expect("SHA-256 chunks are exactly eight bytes"),
-        ) & CONSENSUS_NODE_ID_MAX;
+    for chunk in digest.as_chunks::<8>().0 {
+        let value = u64::from_be_bytes(*chunk) & CONSENSUS_NODE_ID_MAX;
         if let Ok(node_id) = ConsensusNodeId::new(value) {
             return Ok(node_id);
         }

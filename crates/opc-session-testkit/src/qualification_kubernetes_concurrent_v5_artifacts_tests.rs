@@ -1,4 +1,4 @@
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -1,36 +1,56 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::future::join_all;
-use opc_consensus::{
-    derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+use opc_consensus::engine::{
+    error::{InstallSnapshotError, RaftError},
+    raft::InstallSnapshotResponse,
 };
+#[cfg(feature = "test-control")]
+use opc_consensus::DURABLE_OPENRAFT_PROFILE;
+use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity};
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
     serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
 };
-use opc_session_store::{
-    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload, Generation,
-    OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionTopologyAbortAdmissionProof,
-    SessionTopologyCandidateBootstrap, SessionTopologyCandidateRetirementProof,
-    SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
-    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
-    SessionTopologyTransitionId, SessionTopologyTransitionPeers, SessionTopologyTransitionPhase,
-    SessionTopologyTransitionRequest, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, SessionTopologyUniformCommitAdmissionProof,
-    SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, ValidatedQuorumTopology,
+#[cfg(feature = "test-control")]
+use opc_session_store::test_support::{
+    assert_mixed_compacted_roster_status_and_terminal_conflict_for_test,
+    assert_stale_predecessor_signed_fresh_roster_admission_rejected_for_test,
+    recover_signed_roster_terminal_authority_for_test,
+    release_signed_fresh_roster_admission_for_test, roster_attestation_trust_root_for_test,
+    submit_signed_fresh_roster_admission_for_test, submit_signed_fresh_roster_cycle_for_test,
+    terminalize_signed_fresh_roster_admission_for_test,
+    topology_transition_request_with_roster_attestation_trust_root_for_test,
+    trigger_consensus_snapshot_for_test, wait_for_consensus_log_purge_beyond_for_test,
 };
-use opc_types::{NetworkFunctionKind, TenantId};
+#[cfg(not(target_os = "linux"))]
+use opc_session_store::ConsensusSessionStoreOpenError;
+use opc_session_store::{
+    Clock, CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
+    FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2Request, Generation, OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    RosterAttestationTrustRootV1, SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusStorageAnchor, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateBootstrap,
+    SessionTopologyCandidateRetirementProof, SessionTopologyJointCommitAdmissionProof,
+    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyPrePrepareUnstageProof,
+    SessionTopologyTransitionError, SessionTopologyTransitionId, SessionTopologyTransitionPeers,
+    SessionTopologyTransitionPhase, SessionTopologyTransitionRequest,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
+    SessionTopologyUniformCommitAdmissionProof, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+};
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use tempfile::TempDir;
 
 const INITIAL_MEMBER_COUNT: usize = 3;
@@ -40,7 +60,82 @@ const TRANSITION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_DEADLINE: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+#[derive(Clone, Debug)]
+struct MutableClock(Arc<Mutex<Timestamp>>);
+
+impl MutableClock {
+    fn new(now: Timestamp) -> Self {
+        Self(Arc::new(Mutex::new(now)))
+    }
+
+    fn set(&self, now: Timestamp) {
+        *self.0.lock().expect("dynamic clock mutex") = now;
+    }
+}
+
+impl Clock for MutableClock {
+    fn now_utc(&self) -> Timestamp {
+        *self.0.lock().expect("dynamic clock mutex")
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn public_dynamic_consensus_rejects_unsupported_platform_before_durable_initialization() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let snapshot_dir = directory.path().join("must-not-exist");
+    let descriptor = member(0);
+    let cluster_id =
+        ConsensusClusterId::new("unsupported-dynamic-platform").expect("cluster identity");
+    let identity = consensus_identity(std::slice::from_ref(&descriptor), cluster_id, 1);
+    let topology = ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+        replica_id(0),
+        vec![descriptor],
+        identity,
+    )
+    .expect("valid lab singleton");
+    // A file-backed backend itself performs Linux-only recovery-latch
+    // authority admission. This public unsupported-platform boundary must
+    // reach `ConsensusSessionStore::open` before any durable initialization,
+    // so use the ephemeral fixture accepted by that boundary instead.
+    let backend = SqliteSessionBackend::in_memory().expect("ephemeral backend");
+
+    let result = ConsensusSessionStore::open(
+        topology,
+        backend,
+        snapshot_dir.clone(),
+        std::collections::BTreeMap::new(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform)
+    ));
+    assert!(
+        !snapshot_dir.exists(),
+        "unsupported construction must not create a snapshot directory"
+    );
+}
+
 type LoopbackHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum V2ProfilePeerOverride {
+    Exact = 0,
+    V1Only = 1,
+    MismatchedV2 = 2,
+}
+
+impl V2ProfilePeerOverride {
+    fn from_atomic(value: usize) -> Self {
+        match value {
+            1 => Self::V1Only,
+            2 => Self::MismatchedV2,
+            _ => Self::Exact,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct LoopbackPeer {
@@ -50,6 +145,10 @@ struct LoopbackPeer {
     enabled: Arc<AtomicBool>,
     topology_response_drops_remaining: Arc<AtomicUsize>,
     topology_responses_dropped: Arc<AtomicUsize>,
+    v2_profile_override: Arc<AtomicUsize>,
+    v2_profile_probes: Arc<AtomicUsize>,
+    install_snapshot_received: Arc<AtomicUsize>,
+    install_snapshot_notify: Arc<tokio::sync::Notify>,
 }
 
 impl fmt::Debug for LoopbackPeer {
@@ -80,14 +179,68 @@ impl SessionConsensusPeer for LoopbackPeer {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
-        if request.identity != self.scope {
+        if request.identity != self.scope
+            && request.family != SessionConsensusRpcFamily::TopologyAdmissionBarrier
+        {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
         let family = request.family;
+        let override_reply =
+            V2ProfilePeerOverride::from_atomic(self.v2_profile_override.load(Ordering::Acquire));
+        let is_v2_profile_probe = matches!(
+            family,
+            SessionConsensusRpcFamily::TopologyAdmissionBarrier
+                | SessionConsensusRpcFamily::ReadBarrier
+        ) && request.payload.len() >= 32;
+        if is_v2_profile_probe && override_reply != V2ProfilePeerOverride::Exact {
+            self.v2_profile_probes.fetch_add(1, Ordering::AcqRel);
+            match override_reply {
+                // A V1-only peer rejects the unknown V2 wire shape before it
+                // can decode an exact-profile probe.
+                V2ProfilePeerOverride::V1Only => {
+                    return Ok(SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::Protocol),
+                    });
+                }
+                // Both V2 probe payloads end with the fixed-width profile
+                // digest. Mutating only that byte preserves the wire shape
+                // and makes the real remote handler return its fail-closed
+                // mismatched-profile answer.
+                V2ProfilePeerOverride::MismatchedV2 => {
+                    let mut mismatched = request;
+                    let last = mismatched
+                        .payload
+                        .last_mut()
+                        .expect("V2 profile probe payload is nonempty");
+                    *last ^= 0x01;
+                    let Some(handler) = self.handler.read().await.clone() else {
+                        return Err(SessionConsensusPeerError::Unavailable);
+                    };
+                    return Ok(handler.handle(mismatched.sender, mismatched).await);
+                }
+                V2ProfilePeerOverride::Exact => unreachable!("exact override returned early"),
+            }
+        }
         let Some(handler) = self.handler.read().await.clone() else {
             return Err(SessionConsensusPeerError::Unavailable);
         };
         let response = handler.handle(request.sender, request).await;
+        if family == SessionConsensusRpcFamily::InstallSnapshot {
+            let engine_accepted = response.result.as_ref().ok().is_some_and(|payload| {
+                postcard::from_bytes::<
+                    Result<
+                        InstallSnapshotResponse<SessionConsensusNodeId>,
+                        RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+                    >,
+                >(payload)
+                .is_ok_and(|result| result.is_ok())
+            });
+            if engine_accepted {
+                self.install_snapshot_received
+                    .fetch_add(1, Ordering::AcqRel);
+                self.install_snapshot_notify.notify_waiters();
+            }
+        }
         if family == SessionConsensusRpcFamily::TopologyAdmissionBarrier
             && self
                 .topology_response_drops_remaining
@@ -110,6 +263,10 @@ struct LoopbackNetwork {
     links: Vec<Vec<Arc<AtomicBool>>>,
     topology_response_drops_remaining: Vec<Vec<Arc<AtomicUsize>>>,
     topology_responses_dropped: Vec<Vec<Arc<AtomicUsize>>>,
+    v2_profile_overrides: Vec<Vec<Arc<AtomicUsize>>>,
+    v2_profile_probes: Vec<Vec<Arc<AtomicUsize>>>,
+    install_snapshot_received: Vec<Arc<AtomicUsize>>,
+    install_snapshot_notifies: Vec<Arc<tokio::sync::Notify>>,
 }
 
 impl LoopbackNetwork {
@@ -129,12 +286,26 @@ impl LoopbackNetwork {
             .collect::<Vec<_>>();
         let topology_response_drops_remaining = atomic_usize_matrix(node_ids.len());
         let topology_responses_dropped = atomic_usize_matrix(node_ids.len());
+        let v2_profile_overrides = atomic_usize_matrix(node_ids.len());
+        let v2_profile_probes = atomic_usize_matrix(node_ids.len());
+        let install_snapshot_received = node_ids
+            .iter()
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+        let install_snapshot_notifies = node_ids
+            .iter()
+            .map(|_| Arc::new(tokio::sync::Notify::new()))
+            .collect();
         Self {
             node_ids,
             handlers,
             links,
             topology_response_drops_remaining,
             topology_responses_dropped,
+            v2_profile_overrides,
+            v2_profile_probes,
+            install_snapshot_received,
+            install_snapshot_notifies,
         }
     }
 
@@ -177,6 +348,10 @@ impl LoopbackNetwork {
                     topology_responses_dropped: Arc::clone(
                         &self.topology_responses_dropped[source][target],
                     ),
+                    v2_profile_override: Arc::clone(&self.v2_profile_overrides[source][target]),
+                    v2_profile_probes: Arc::clone(&self.v2_profile_probes[source][target]),
+                    install_snapshot_received: Arc::clone(&self.install_snapshot_received[target]),
+                    install_snapshot_notify: Arc::clone(&self.install_snapshot_notifies[target]),
                 });
                 (self.node_ids[target], peer)
             })
@@ -223,6 +398,40 @@ impl LoopbackNetwork {
 
     fn dropped_topology_responses(&self, source: usize, target: usize) -> usize {
         self.topology_responses_dropped[source][target].load(Ordering::Acquire)
+    }
+
+    fn set_v2_profile_override_for_target(
+        &self,
+        target: usize,
+        override_reply: V2ProfilePeerOverride,
+    ) {
+        for source in 0..self.node_ids.len() {
+            if source != target {
+                self.v2_profile_overrides[source][target]
+                    .store(override_reply as usize, Ordering::Release);
+            }
+        }
+    }
+
+    fn v2_profile_probes_to(&self, target: usize) -> usize {
+        (0..self.node_ids.len())
+            .filter(|source| *source != target)
+            .map(|source| self.v2_profile_probes[source][target].load(Ordering::Acquire))
+            .sum()
+    }
+
+    fn install_snapshot_count_to(&self, target: usize) -> usize {
+        self.install_snapshot_received[target].load(Ordering::Acquire)
+    }
+
+    async fn wait_for_install_snapshot_to(&self, target: usize, baseline: usize) {
+        loop {
+            let notified = self.install_snapshot_notifies[target].notified();
+            if self.install_snapshot_count_to(target) > baseline {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -369,23 +578,41 @@ struct DynamicFleet {
     network: LoopbackNetwork,
     transports: Vec<Arc<RecordingTransportAdmission>>,
     cluster_id: ConsensusClusterId,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    clock: Arc<MutableClock>,
 }
 
 impl DynamicFleet {
     async fn start_three() -> Self {
+        Self::start_three_with_roster_attestation_trust_root(None).await
+    }
+
+    async fn start_three_with_roster_attestation_trust_root(
+        roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("create dynamic-membership directory");
+        let clock = Arc::new(MutableClock::new(Timestamp::now_utc()));
         let members = (0..EXPANDED_MEMBER_COUNT).map(member).collect::<Vec<_>>();
         let cluster_id =
             ConsensusClusterId::new("dynamic-membership-integration").expect("cluster identity");
-        let initial_identity = consensus_identity(&members[..INITIAL_MEMBER_COUNT], cluster_id, 1);
+        let initial_identity = consensus_identity_with_roster_attestation_trust_root(
+            &members[..INITIAL_MEMBER_COUNT],
+            cluster_id,
+            1,
+            roster_attestation_trust_root.as_ref(),
+        );
         let initial_topologies = (0..INITIAL_MEMBER_COUNT)
             .map(|index| {
-                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                let configuration = QuorumTopologyConfig::new_consensus(
                     replica_id(index),
                     members[..INITIAL_MEMBER_COUNT].to_vec(),
                     initial_identity,
-                ))
-                .expect("initial topology")
+                );
+                let configuration = match roster_attestation_trust_root.as_ref() {
+                    Some(root) => configuration.with_roster_attestation_trust_root(root.clone()),
+                    None => configuration,
+                };
+                ValidatedQuorumTopology::try_from(configuration).expect("initial topology")
             })
             .collect::<Vec<_>>();
         let node_ids = members
@@ -413,11 +640,12 @@ impl DynamicFleet {
         let mut stores = Vec::with_capacity(EXPANDED_MEMBER_COUNT);
         for index in 0..INITIAL_MEMBER_COUNT {
             let peers = network.peers_for_indices(index, initial_identity, 0..INITIAL_MEMBER_COUNT);
-            let store = ConsensusSessionStore::open_with_operation_timeout(
+            let store = ConsensusSessionStore::open_with_clock(
                 initial_topologies[index].clone(),
                 backends[index].clone(),
                 directory.path().join(format!("snapshots-{index}")),
                 peers,
+                clock.clone(),
                 STORE_OPERATION_TIMEOUT,
             )
             .await
@@ -439,6 +667,22 @@ impl DynamicFleet {
             network,
             transports: Vec::new(),
             cluster_id,
+            roster_attestation_trust_root,
+            clock,
+        }
+    }
+
+    fn topology_configuration(
+        &self,
+        local_replica_id: ReplicaId,
+        members: Vec<QuorumReplicaDescriptor>,
+        identity: SessionConsensusIdentity,
+    ) -> QuorumTopologyConfig {
+        let configuration =
+            QuorumTopologyConfig::new_consensus(local_replica_id, members, identity);
+        match self.roster_attestation_trust_root.as_ref() {
+            Some(root) => configuration.with_roster_attestation_trust_root(root.clone()),
+            None => configuration,
         }
     }
 
@@ -448,18 +692,25 @@ impl DynamicFleet {
         desired_indices: &[usize],
         transition_seed: u8,
     ) -> SessionTopologyTransitionRequest {
-        SessionTopologyTransitionRequest::try_new(
-            SessionTopologyTransitionId::from_bytes([transition_seed; 16]),
-            self.cluster_id,
-            ConsensusConfigurationEpoch::new(expected_epoch).expect("expected epoch"),
-            ConsensusConfigurationEpoch::new(expected_epoch + 1).expect("desired epoch"),
-            desired_indices
-                .iter()
-                .map(|index| self.members[*index].clone())
-                .collect(),
-            TRANSITION_OPERATION_TIMEOUT,
-        )
-        .expect("valid topology transition")
+        let transition_id = SessionTopologyTransitionId::from_bytes([transition_seed; 16]);
+        let expected_epoch =
+            ConsensusConfigurationEpoch::new(expected_epoch).expect("expected epoch");
+        let desired_epoch =
+            ConsensusConfigurationEpoch::new(expected_epoch.get() + 1).expect("desired epoch");
+        let desired_members = desired_indices
+            .iter()
+            .map(|index| self.members[*index].clone())
+            .collect();
+        let request = self.stores[0]
+            .new_topology_transition_request(
+                transition_id,
+                desired_members,
+                TRANSITION_OPERATION_TIMEOUT,
+            )
+            .expect("valid topology transition from the admitted current store scope");
+        assert_eq!(request.expected_epoch(), expected_epoch);
+        assert_eq!(request.desired_epoch(), desired_epoch);
+        request
     }
 
     async fn add_candidates(
@@ -468,24 +719,22 @@ impl DynamicFleet {
         request: &SessionTopologyTransitionRequest,
     ) {
         let storage_anchor: SessionConsensusStorageAnchor = self.stores[0].storage_anchor();
-        let current_identity = current_topology
-            .consensus_identity()
-            .expect("candidate predecessor identity");
-        let current_members = current_topology.members().to_vec();
         for index in INITIAL_MEMBER_COUNT..EXPANDED_MEMBER_COUNT {
-            let bootstrap = SessionTopologyCandidateBootstrap::try_new(
-                storage_anchor,
-                current_identity,
-                current_members.clone(),
-                request.clone(),
-                self.members[index].clone(),
-            )
-            .expect("validate candidate bootstrap");
-            let store = ConsensusSessionStore::open_membership_candidate(
+            let bootstrap =
+                SessionTopologyCandidateBootstrap::try_new_from_validated_current_topology(
+                    storage_anchor,
+                    current_topology.clone(),
+                    request.clone(),
+                    self.members[index].clone(),
+                )
+                .expect("validate candidate bootstrap");
+            let store = ConsensusSessionStore::open_membership_candidate_with_clock(
                 bootstrap,
                 self._backends[index].clone(),
                 self._directory.path().join(format!("snapshots-{index}")),
                 self.network.peers_for_request(index, request),
+                self.clock.clone(),
+                STORE_OPERATION_TIMEOUT,
             )
             .await
             .expect("open membership candidate");
@@ -495,17 +744,17 @@ impl DynamicFleet {
     }
 
     async fn provision_expansion(&mut self, request: &SessionTopologyTransitionRequest) {
-        let initial_topology =
-            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-                replica_id(0),
-                self.members[..INITIAL_MEMBER_COUNT].to_vec(),
-                consensus_identity(
-                    &self.members[..INITIAL_MEMBER_COUNT],
-                    self.cluster_id,
-                    request.expected_epoch().get(),
-                ),
-            ))
-            .expect("initial topology for candidate admission");
+        let initial_topology = ValidatedQuorumTopology::try_from(self.topology_configuration(
+            replica_id(0),
+            self.members[..INITIAL_MEMBER_COUNT].to_vec(),
+            consensus_identity_with_roster_attestation_trust_root(
+                &self.members[..INITIAL_MEMBER_COUNT],
+                self.cluster_id,
+                request.expected_epoch().get(),
+                self.roster_attestation_trust_root.as_ref(),
+            ),
+        ))
+        .expect("initial topology for candidate admission");
         self.add_candidates(&initial_topology, request).await;
         self.bind_transport_admission();
         self.stage_on_all(request);
@@ -516,13 +765,14 @@ impl DynamicFleet {
         index: usize,
         request: &SessionTopologyTransitionRequest,
     ) -> SessionConsensusNodeId {
-        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+        let topology = ValidatedQuorumTopology::try_from(self.topology_configuration(
             replica_id(index),
             self.members[..INITIAL_MEMBER_COUNT].to_vec(),
-            consensus_identity(
+            consensus_identity_with_roster_attestation_trust_root(
                 &self.members[..INITIAL_MEMBER_COUNT],
                 self.cluster_id,
                 request.expected_epoch().get(),
+                self.roster_attestation_trust_root.as_ref(),
             ),
         ))
         .expect("restart predecessor topology");
@@ -533,11 +783,11 @@ impl DynamicFleet {
             .expect("retained restart placeholder");
         let placeholder = self.stores[placeholder_index].clone();
         let retired = std::mem::replace(&mut self.stores[index], placeholder);
+        retired
+            .shutdown()
+            .await
+            .expect("fully drain retained consensus member before durable reopen");
         drop(retired);
-        // The topology supervisor only holds weak store references. Give the
-        // retired incarnation a scheduling turn to observe its final drop
-        // before opening the same durable Raft state.
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let successor = tokio::time::timeout(TEST_DEADLINE, async {
             loop {
@@ -561,11 +811,12 @@ impl DynamicFleet {
                 .expect("restart predecessor identity"),
             0..INITIAL_MEMBER_COUNT,
         );
-        let reopened = ConsensusSessionStore::open_with_operation_timeout(
+        let reopened = ConsensusSessionStore::open_with_clock(
             topology,
             self._backends[index].clone(),
             self._directory.path().join(format!("snapshots-{index}")),
             peers,
+            self.clock.clone(),
             STORE_OPERATION_TIMEOUT,
         )
         .await
@@ -602,26 +853,32 @@ impl DynamicFleet {
             .expect("restart placeholder");
         let placeholder = self.stores[placeholder_index].clone();
         let retired = std::mem::replace(&mut self.stores[index], placeholder);
+        retired
+            .shutdown()
+            .await
+            .expect("fully drain consensus member before durable reopen");
         drop(retired);
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-            replica_id(index),
-            active_indices
-                .iter()
-                .map(|member| self.members[*member].clone())
-                .collect(),
-            identity,
-        ))
+        let topology = ValidatedQuorumTopology::try_from(
+            self.topology_configuration(
+                replica_id(index),
+                active_indices
+                    .iter()
+                    .map(|member| self.members[*member].clone())
+                    .collect(),
+                identity,
+            ),
+        )
         .expect("restart active topology");
         let peers = self
             .network
             .peers_for_indices(index, identity, active_indices.iter().copied());
-        let reopened = ConsensusSessionStore::open_with_operation_timeout(
+        let reopened = ConsensusSessionStore::open_with_clock(
             topology,
             self._backends[index].clone(),
             self._directory.path().join(format!("snapshots-{index}")),
             peers,
+            self.clock.clone(),
             STORE_OPERATION_TIMEOUT,
         )
         .await
@@ -803,6 +1060,11 @@ async fn live_three_to_five_to_three_preserves_quorum_and_fences_removed_voters(
     prove_read_write_on_every_active_store(&fleet.stores, &[0, 1, 2], "epoch-1").await;
 
     let expand = fleet.transition_request(1, &[0, 1, 2, 3, 4], 0x35);
+    assert_eq!(
+        expand.desired_identity(),
+        consensus_identity(&fleet.members[..EXPANDED_MEMBER_COUNT], fleet.cluster_id, 2),
+        "the legacy rootless constructor must retain its exact configuration identity"
+    );
     fleet.provision_expansion(&expand).await;
     let expand_proof = fleet.prepare(&expand, &[0, 1, 2, 3, 4]).await;
     fleet.commit(&expand, &expand_proof, &[0, 1, 2, 3, 4]).await;
@@ -899,6 +1161,235 @@ async fn live_three_to_five_to_three_preserves_quorum_and_fences_removed_voters(
     );
 }
 
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn root_preserving_three_to_five_reactivates_profile_and_accepts_successor_signed_roster() {
+    let root = roster_attestation_trust_root_for_test();
+    let mut fleet =
+        DynamicFleet::start_three_with_roster_attestation_trust_root(Some(root.clone())).await;
+    let initial = [0, 1, 2];
+    let expanded = [0, 1, 2, 3, 4];
+
+    // Activate the predecessor certificate first. A completed topology change
+    // deliberately invalidates it, so the successor call below is a genuine
+    // exact-scope reactivation rather than an initial activation.
+    let predecessor_leader = fleet.wait_transition_caller(&initial).await;
+    fleet.stores[predecessor_leader]
+        .activate_protected_roster_profile()
+        .await
+        .expect("activate predecessor protected-roster profile");
+
+    let current_identity = consensus_identity_with_roster_attestation_trust_root(
+        &fleet.members[..INITIAL_MEMBER_COUNT],
+        fleet.cluster_id,
+        1,
+        Some(&root),
+    );
+
+    // Preserve both kinds of honest predecessor history across the cutover.
+    // The later real reopen must accept their root-certified predecessor
+    // identity from durable membership lineage, rather than incorrectly
+    // rechecking them as successor-signed artifacts.
+    let predecessor_live =
+        submit_signed_fresh_roster_admission_for_test(&fleet.stores[predecessor_leader], 0xD5)
+            .await
+            .expect("record predecessor signed live PollAdmit");
+    assert_eq!(predecessor_live.authority_identity(), current_identity);
+    release_signed_fresh_roster_admission_for_test(
+        &fleet.stores[predecessor_leader],
+        &predecessor_live,
+    )
+    .await
+    .expect("release predecessor lease before successor takeover");
+    assert_eq!(
+        submit_signed_fresh_roster_cycle_for_test(&fleet.stores[predecessor_leader], 0xD6)
+            .await
+            .expect("record predecessor signed retained terminal"),
+        current_identity,
+    );
+
+    let current_topology = ValidatedQuorumTopology::try_from(fleet.topology_configuration(
+        replica_id(0),
+        fleet.members[..INITIAL_MEMBER_COUNT].to_vec(),
+        current_identity,
+    ))
+    .expect("root-aware predecessor topology");
+    let rootless_request = SessionTopologyTransitionRequest::try_new(
+        SessionTopologyTransitionId::from_bytes([0xD1; 16]),
+        fleet.cluster_id,
+        ConsensusConfigurationEpoch::new(1).expect("predecessor epoch"),
+        ConsensusConfigurationEpoch::new(2).expect("successor epoch"),
+        fleet.members[..EXPANDED_MEMBER_COUNT].to_vec(),
+        TRANSITION_OPERATION_TIMEOUT,
+    )
+    .expect("well-formed rootless request");
+    let wrong_root = RosterAttestationTrustRootV1::new([0xD2; 32], root.compressed_public_key())
+        .expect("well-formed substituted root");
+    let wrong_root_request =
+        topology_transition_request_with_roster_attestation_trust_root_for_test(
+            SessionTopologyTransitionId::from_bytes([0xD3; 16]),
+            fleet.cluster_id,
+            ConsensusConfigurationEpoch::new(1).expect("predecessor epoch"),
+            ConsensusConfigurationEpoch::new(2).expect("successor epoch"),
+            fleet.members[..EXPANDED_MEMBER_COUNT].to_vec(),
+            TRANSITION_OPERATION_TIMEOUT,
+            wrong_root,
+        )
+        .expect("well-formed wrong-root request");
+
+    for rejected in [&rootless_request, &wrong_root_request] {
+        assert!(matches!(
+            SessionTopologyCandidateBootstrap::try_new_from_validated_current_topology(
+                fleet.stores[0].storage_anchor(),
+                current_topology.clone(),
+                rejected.clone(),
+                fleet.members[3].clone(),
+            ),
+            Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+        ));
+        assert_eq!(
+            fleet.stores[0].stage_topology_transition_peers(
+                rejected,
+                fleet.network.peers_for_request(0, rejected),
+            ),
+            Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+            "a root-aware current topology must reject a caller-supplied or missing root"
+        );
+    }
+
+    let expand = fleet.transition_request(1, &expanded, 0xD4);
+    fleet.provision_expansion(&expand).await;
+    let expand_proof = fleet.prepare(&expand, &expanded).await;
+    fleet.commit(&expand, &expand_proof, &expanded).await;
+    wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
+
+    let successor_leader = fleet.wait_transition_caller(&expanded).await;
+    let restarted = expanded
+        .iter()
+        .copied()
+        .find(|candidate| *candidate != successor_leader)
+        .expect("non-leader successor for durable roster reopen");
+    fleet
+        .restart_member_in_scope(restarted, &expanded, expand.desired_identity(), &expand)
+        .await;
+    fleet.stores[restarted]
+        .initialize_cluster()
+        .await
+        .expect("reopen accepts live and retained predecessor roster evidence");
+    wait_ready(&fleet.stores, &expanded).await;
+
+    let successor_leader = fleet.wait_transition_caller(&expanded).await;
+    fleet.stores[successor_leader]
+        .activate_protected_roster_profile()
+        .await
+        .expect("reactivate protected-roster profile under successor scope");
+    assert_stale_predecessor_signed_fresh_roster_admission_rejected_for_test(
+        &fleet.stores[successor_leader],
+        current_identity,
+        0xD8,
+    )
+    .await
+    .expect(
+        "a fresh predecessor-identity admission is rejected before consensus submission after successor activation",
+    );
+    let snapshot_target = expanded
+        .iter()
+        .copied()
+        .find(|candidate| *candidate != successor_leader)
+        .expect("successor follower for real snapshot installation");
+    let target_old_applied = fleet.stores[snapshot_target]
+        .status()
+        .applied_index
+        .expect("isolated follower has an applied predecessor index");
+    let install_snapshot_baseline = fleet.network.install_snapshot_count_to(snapshot_target);
+    fleet.network.isolate(snapshot_target);
+    let mut predecessor_terminal = terminalize_signed_fresh_roster_admission_for_test(
+        &fleet.stores[successor_leader],
+        0xD5,
+        &predecessor_live,
+    )
+    .await
+    .expect("successor terminalizes predecessor live roster");
+    assert_eq!(
+        predecessor_terminal.authority_identity(),
+        expand.desired_identity(),
+        "the immutable predecessor admission and current successor terminal must both authenticate"
+    );
+    advance_consensus_past_snapshot_retention_for_test(&fleet.stores[successor_leader]).await;
+    let retention_time = fleet
+        .clock
+        .now_utc()
+        .add_seconds(2 * 24 * 60 * 60)
+        .expect("mixed roster retention time");
+    fleet.clock.set(retention_time);
+    recover_signed_roster_terminal_authority_for_test(
+        &fleet.stores[successor_leader],
+        &predecessor_live,
+        &mut predecessor_terminal,
+    )
+    .await
+    .expect("higher-fence recovery advances replicated time and production reclaim");
+    assert_mixed_compacted_roster_status_and_terminal_conflict_for_test(
+        &fleet.stores[successor_leader],
+        0xD5,
+        &predecessor_live,
+        &predecessor_terminal,
+        false,
+    )
+    .await
+    .expect(
+        "mixed tombstone keeps authenticated status Compacted and terminal conflict non-definitive",
+    );
+    trigger_consensus_snapshot_for_test(&fleet.stores[successor_leader])
+        .await
+        .expect("capture a post-rollover mixed-identity roster snapshot");
+    wait_for_consensus_log_purge_beyond_for_test(
+        &fleet.stores[successor_leader],
+        target_old_applied,
+    )
+    .await
+    .expect("leader purges beyond isolated follower before healing");
+    fleet.network.heal(snapshot_target);
+    tokio::time::timeout(
+        TEST_DEADLINE,
+        fleet
+            .network
+            .wait_for_install_snapshot_to(snapshot_target, install_snapshot_baseline),
+    )
+    .await
+    .expect("healed follower receives a real InstallSnapshot RPC");
+    wait_ready_labeled(&fleet.stores, &expanded, "post-install-snapshot").await;
+    fleet
+        .restart_member_in_scope(
+            snapshot_target,
+            &expanded,
+            expand.desired_identity(),
+            &expand,
+        )
+        .await;
+    fleet.stores[snapshot_target]
+        .initialize_cluster()
+        .await
+        .expect("post-rollover snapshot recovery authenticates mixed roster history");
+    wait_ready_labeled(&fleet.stores, &expanded, "post-snapshot-restart").await;
+    assert_mixed_compacted_roster_status_and_terminal_conflict_for_test(
+        &fleet.stores[snapshot_target],
+        0xD5,
+        &predecessor_live,
+        &predecessor_terminal,
+        true,
+    )
+    .await
+    .expect(
+        "snapshot target retains the exact D5 tombstone and authenticates its compacted status and terminal conflict",
+    );
+    let verified_authority_identity =
+        submit_signed_fresh_roster_cycle_for_test(&fleet.stores[successor_leader], 0xD7)
+            .await
+            .expect("record fresh signed PollAdmit and terminal proof under successor scope");
+    assert_eq!(verified_authority_identity, expand.desired_identity());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_first_abort_retries_lost_candidate_ack_and_restores_old_authority() {
     let mut fleet = DynamicFleet::start_three().await;
@@ -929,6 +1420,136 @@ async fn terminal_first_abort_retries_lost_candidate_ack_and_restores_old_author
             "aborted candidate {index} retained application authority"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_history_requires_exact_prospective_learner_and_recertifies_after_cutover_restart() {
+    let mut fleet = DynamicFleet::start_three().await;
+    let initial = [0, 1, 2];
+    let initial_leader = fleet.wait_transition_caller(&initial).await;
+    let initial_v2 = v2_transition_request(b"initial-v2", 0x61);
+    assert!(matches!(
+        fleet.stores[initial_leader]
+            .fenced_transition_v2(initial_v2)
+            .await
+            .expect("initial real-fleet V2 activation"),
+        outcome if matches!(outcome.mutation(), FencedTransitionMutationResult::Created)
+    ));
+    assert_eq!(
+        fleet.stores[initial_leader]
+            .fenced_transition_v2_capability()
+            .await
+            .expect("initial V2 certificate remains available"),
+        Some(FencedTransitionV2Capability::V2)
+    );
+
+    let expanded = [0, 1, 2, 3, 4];
+    let expand = fleet.transition_request(1, &expanded, 0xC2);
+    fleet.provision_expansion(&expand).await;
+    let candidate = 3;
+    let leader = fleet.wait_transition_caller(&initial).await;
+    let before_v1 = fleet.stores[leader].status();
+    let candidate_before_v1 = fleet.stores[candidate].status();
+    fleet
+        .network
+        .set_v2_profile_override_for_target(candidate, V2ProfilePeerOverride::V1Only);
+    assert_eq!(
+        fleet.stores[leader]
+            .prepare_topology_transition(&expand, fleet.network.peers_for_request(leader, &expand))
+            .await,
+        Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+        "a V1-only candidate must fail before OpenRaft add_learner"
+    );
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        before_v1.last_log_index.map(|index| index + 1),
+        "the rejected V1 candidate appended only the predecessor Prepare control"
+    );
+    assert_eq!(
+        fleet.stores[candidate].status().last_log_index,
+        candidate_before_v1.last_log_index,
+        "the rejected V1 candidate received neither learner replication nor membership admission"
+    );
+    assert!(!fleet.stores[candidate].status().admitted);
+    assert_eq!(fleet.network.v2_profile_probes_to(candidate), 1);
+
+    let before_mismatch = fleet.stores[leader].status();
+    let candidate_before_mismatch = fleet.stores[candidate].status();
+    fleet
+        .network
+        .set_v2_profile_override_for_target(candidate, V2ProfilePeerOverride::MismatchedV2);
+    assert_eq!(
+        fleet.stores[leader]
+            .prepare_topology_transition(&expand, fleet.network.peers_for_request(leader, &expand))
+            .await,
+        Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+        "a V2 candidate with the wrong exact profile must fail before OpenRaft add_learner"
+    );
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        before_mismatch.last_log_index,
+        "a rejected profile retry appended no learner, replication, or membership log entry"
+    );
+    assert_eq!(
+        fleet.stores[candidate].status().last_log_index,
+        candidate_before_mismatch.last_log_index,
+        "a mismatched candidate remained outside replicated learner state"
+    );
+    assert_eq!(fleet.network.v2_profile_probes_to(candidate), 2);
+
+    fleet
+        .network
+        .set_v2_profile_override_for_target(candidate, V2ProfilePeerOverride::Exact);
+    let proof = fleet.prepare(&expand, &expanded).await;
+    fleet.commit(&expand, &proof, &expanded).await;
+    wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
+
+    // The successful cutover deliberately clears the predecessor-scoped V2
+    // certificate. Reopen a real successor voter and make its fresh proof see
+    // a valid V2 wire payload with the wrong digest.
+    let successor = candidate;
+    fleet
+        .restart_member_in_scope(successor, &expanded, expand.desired_identity(), &expand)
+        .await;
+    fleet.stores[successor]
+        .initialize_cluster()
+        .await
+        .expect("reinitialize the reopened completed-cutover voter");
+    wait_ready(&fleet.stores, &expanded).await;
+    let recertification_peer = 4;
+    let before_recertification_probe = fleet.network.v2_profile_probes_to(recertification_peer);
+    let before_recertification_log = fleet.stores[successor].status().last_log_index;
+    fleet.network.set_v2_profile_override_for_target(
+        recertification_peer,
+        V2ProfilePeerOverride::MismatchedV2,
+    );
+    assert!(matches!(
+        fleet.stores[successor]
+            .fenced_transition_v2(v2_transition_request(b"mismatched-recertification", 0x62))
+            .await,
+        Err(StoreError::CapabilityNotSupported(reason))
+            if reason == "atomic_fenced_transition_epoch_history_v2"
+    ));
+    assert!(
+        fleet.network.v2_profile_probes_to(recertification_peer) > before_recertification_probe,
+        "the successor reused predecessor V2 proof instead of re-probing"
+    );
+    assert_eq!(
+        fleet.stores[successor].status().last_log_index,
+        before_recertification_log,
+        "failed re-certification must not append a replacement V2 activation"
+    );
+
+    fleet
+        .network
+        .set_v2_profile_override_for_target(recertification_peer, V2ProfilePeerOverride::Exact);
+    assert!(matches!(
+        fleet.stores[successor]
+            .fenced_transition_v2(v2_transition_request(b"exact-recertification", 0x63))
+            .await
+            .expect("exact V2 re-certification after cutover"),
+        outcome if matches!(outcome.mutation(), FencedTransitionMutationResult::Created)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1254,7 +1875,15 @@ async fn run_lost_joint_quorum_case(case: LostJointQuorum, seed: u8) {
 }
 
 async fn wait_ready(stores: &[ConsensusSessionStore], active: &[usize]) {
-    tokio::time::timeout(TEST_DEADLINE, async {
+    wait_ready_labeled(stores, active, "active-membership").await;
+}
+
+async fn wait_ready_labeled(
+    stores: &[ConsensusSessionStore],
+    active: &[usize],
+    stage: &'static str,
+) {
+    let ready = tokio::time::timeout(TEST_DEADLINE, async {
         loop {
             let reports = join_all(
                 active
@@ -1268,8 +1897,30 @@ async fn wait_ready(stores: &[ConsensusSessionStore], active: &[usize]) {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     })
-    .await
-    .expect("active membership reaches durable readiness");
+    .await;
+    if ready.is_err() {
+        let reports = join_all(
+            active
+                .iter()
+                .map(|index| stores[*index].probe_durable_readiness()),
+        )
+        .await;
+        let diagnostics = reports
+            .iter()
+            .map(|report| {
+                let progress = report.recovery_progress();
+                (
+                    report.reason_code(),
+                    progress.reason_code(),
+                    progress.local_log_index(),
+                    progress.local_applied_index(),
+                    progress.snapshot_index(),
+                    progress.purged_index(),
+                )
+            })
+            .collect::<Vec<_>>();
+        panic!("{stage} durable readiness timed out: {diagnostics:?}");
+    }
 }
 
 async fn wait_application_authority_fenced(stores: &[ConsensusSessionStore]) {
@@ -1428,16 +2079,80 @@ fn consensus_identity(
     cluster_id: ConsensusClusterId,
     epoch: u64,
 ) -> ConsensusIdentity {
+    consensus_identity_with_roster_attestation_trust_root(members, cluster_id, epoch, None)
+}
+
+fn consensus_identity_with_roster_attestation_trust_root(
+    members: &[QuorumReplicaDescriptor],
+    cluster_id: ConsensusClusterId,
+    epoch: u64,
+    roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
+) -> ConsensusIdentity {
     let epoch = ConsensusConfigurationEpoch::new(epoch).expect("configuration epoch");
     let fingerprints = members
         .iter()
         .map(QuorumReplicaDescriptor::configuration_fingerprint)
         .collect::<Vec<_>>();
-    ConsensusIdentity::new(
+    opc_session_store::topology::derive_durable_quorum_consensus_identity_with_roster_attestation_root(
         cluster_id,
-        derive_configuration_id(cluster_id, epoch, &fingerprints),
         epoch,
+        &fingerprints,
+        roster_attestation_trust_root,
     )
+}
+
+fn v2_transition_request(label: &[u8], nonce: u8) -> FencedTransitionV2Request {
+    let key = session_key(label);
+    let owner = owner(format!("v2-topology-owner-{nonce}"));
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        FenceToken::new(0),
+        Duration::from_secs(30),
+    )
+    .expect("valid V2 acquire lease");
+    let fence = lease.committed_fence().expect("V2 acquire fence");
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner,
+        fence,
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("dynamic-membership-v2-profile-proof"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("synthetic-dynamic-membership-v2-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "dynamic-membership-v2-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "dynamic-membership-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let envelope = CryptoEnvelopeV1 {
+        algorithm: AeadAlgorithm::Aes256GcmSiv,
+        key_id: key_id.clone(),
+        nonce: vec![0x63; AES_256_GCM_SIV_NONCE_LEN],
+        aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+        ciphertext_and_tag: vec![0xB6; AEAD_TAG_LEN],
+    }
+    .encode()
+    .expect("test envelope");
+    record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
+    FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes([nonce; 16]),
+        lease,
+        FencedTransitionMutation::create(record),
+    )
+    .expect("self-authenticating V2 request")
 }
 
 fn session_key(label: &[u8]) -> SessionKey {
@@ -1449,6 +2164,29 @@ fn session_key(label: &[u8]) -> SessionKey {
             .try_into()
             .expect("bounded stable ID"),
     }
+}
+
+#[cfg(feature = "test-control")]
+async fn advance_consensus_past_snapshot_retention_for_test(store: &ConsensusSessionStore) {
+    let key = session_key(b"roster-mixed-snapshot-gap");
+    let mut lease = store
+        .acquire(
+            &key,
+            owner("roster-mixed-snapshot-gap-owner".to_owned()),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("acquire unrelated snapshot-gap lease");
+    for _ in 0..=DURABLE_OPENRAFT_PROFILE.retained_logs {
+        lease = store
+            .renew(&lease, Duration::from_secs(60))
+            .await
+            .expect("advance unrelated snapshot-gap lease");
+    }
+    store
+        .release(lease)
+        .await
+        .expect("release unrelated snapshot-gap lease");
 }
 
 fn owner(label: String) -> OwnerId {

@@ -187,7 +187,9 @@ fn decode_hex_seed(seed: &str) -> Vec<u8> {
         .expect("test fuzz seed has hex prefix");
     assert_eq!(hex.len() % 2, 0);
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair).expect("test fuzz seed is ASCII");
             u8::from_str_radix(text, 16).expect("test fuzz seed is hexadecimal")

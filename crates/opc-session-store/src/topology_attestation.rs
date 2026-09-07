@@ -760,7 +760,10 @@ pub(crate) fn verify_topology_attestations(
     now: TopologyAttestationTime,
 ) -> Result<VerifiedQuorumTopologyAttestation, QuorumTopologyError> {
     let monotonic_verified_at = Instant::now();
-    if topology.summary().mode() != QuorumTopologyMode::AttestedHa {
+    if !matches!(
+        topology.summary().mode(),
+        QuorumTopologyMode::AttestedHa | QuorumTopologyMode::FixedDurableQuorum
+    ) {
         return Err(QuorumTopologyError::TopologyEvidenceRequiresAttestedHa);
     }
     if evidence.len() != topology.members().len() || evidence.len() > QUORUM_TOPOLOGY_MAX_MEMBERS {

@@ -273,6 +273,48 @@ impl<C: OpcConfig> SubscriberState<C> {
         }
     }
 
+    /// Replaces any queued deltas with one explicit resynchronization marker.
+    ///
+    /// Projection reconciliation has no safely derivable delta stream, so it
+    /// uses this path instead of applying the subscriber's ordinary overflow
+    /// policy. The marker remains bounded; a byte budget too small even for
+    /// that marker closes only the affected subscriber.
+    pub(crate) fn force_resync(&self, latest_version: opc_types::ConfigVersion) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                crate::metrics::record_subscriber_notification_failure();
+                tracing::error!("recovering poisoned config subscriber queue");
+                poisoned.into_inner()
+            }
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        queue.clear();
+        let retained_bytes = self
+            .retained_byte_budget
+            .map(|_| std::mem::size_of::<ConfigEvent<C>>())
+            .unwrap_or(0);
+        if self
+            .retained_byte_budget
+            .is_some_and(|budget| retained_bytes > budget)
+        {
+            queue.disconnect_reason = Some(SubscriberDisconnectReason::RetainedByteBudgetExceeded);
+            self.closed.store(true, Ordering::Release);
+        } else {
+            queue.push(
+                ConfigEvent::ResyncRequired { latest_version },
+                retained_bytes,
+            );
+        }
+        drop(queue);
+        self.notify.notify_one();
+    }
+
     pub(crate) fn pop(&self) -> Option<ConfigEvent<C>> {
         match self.queue.lock() {
             Ok(mut queue) => queue.pop(),
