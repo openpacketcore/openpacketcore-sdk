@@ -2630,7 +2630,8 @@ mod tests {
     }
 
     // Live channel round trips need executor scheduling; paused auto-advance
-    // can outrun the channel. Retain the existing one-second contention margin.
+    // can outrun the channel. Bound previously unbounded round-trip waits;
+    // the existing 100 ms metric-observation bounds remain separate below.
     fn profile_channel_completion_bound(profile: super::super::IngressRedirectProfile) -> Duration {
         profile
             .receipt_retry_horizon()
@@ -3875,13 +3876,13 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("captured-replay injection exceeded profile bound"))
             .unwrap_or_else(|error| panic!("inject captured replay: {error}"));
-        within_profile_channel_completion_bound(profile, async {
+        tokio::time::timeout(Duration::from_millis(100), async {
             while second_session.metrics().replay_drops == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("captured-replay processing exceeded profile bound"));
+        .unwrap_or_else(|_| panic!("captured-replay processing exceeded 100 ms observation bound"));
         assert_eq!(second_session.metrics().replay_drops, 1);
         assert_eq!(second_session.metrics().delivered, 1);
         within_profile_channel_completion_bound(profile, first.shutdown())
@@ -3932,13 +3933,13 @@ mod tests {
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
         drop(operation);
-        within_profile_channel_completion_bound(profile, async {
+        tokio::time::timeout(Duration::from_millis(100), async {
             while first.metrics().delivery_receipts == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("endpoint-owned completion exceeded profile bound"));
+        .unwrap_or_else(|_| panic!("endpoint-owned completion exceeded 100 ms observation bound"));
         assert_eq!(first.metrics().send_attempts, 2);
         assert_eq!(second.metrics().cached_receipts_replayed, 1);
         within_profile_channel_completion_bound(profile, first.shutdown())
