@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Nested NETCONF leaf-list recovery edits — `opc-yanggen`,
+  `opc-netconf-server`:** generated numeric leafref leaf-lists now compile,
+  and repeated typed list keys or singleton parents cannot bypass duplicate
+  leaf-list edit rejection. Leaf-list `create`/`delete` existence failures
+  preserve RFC `data-exists`/`data-missing` replies for running, candidate,
+  and startup. Full-root replacements with multiple values under keyed APNs
+  have generated service/commit-path regression coverage. Compatibility note:
+  exhaustive `EditConfigError` matches must handle `DataExists` and
+  `DataMissing`; ambiguous repeated-parent edits now fail with `invalid-value`.
 - **Redaction-safe Child-SA KEYMAT nonce diagnostics — `opc-ipsec-xfrm`:**
   `Ikev2ChildSaKeyMaterialError::KeyDerivation` now retains an
   `Ikev2ChildSaKeyMaterialDiagnostic`: a closed snapshot containing the stable
