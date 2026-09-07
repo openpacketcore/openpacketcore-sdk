@@ -1072,7 +1072,11 @@ impl fmt::Debug for TerminalReceipt {
 /// This capsule is deliberately not cloneable and never separates an
 /// authority token from its protected bytes. Public consumers may inspect and
 /// consume the exact terminal only into the opaque capsule accepted by a
-/// startup-fixed publication adapter through [`Self::into_publication`].
+/// startup-fixed publication adapter through [`Self::into_publication`]. A
+/// terminal delivered directly by terminalization retains the one fresh
+/// compound-publication capability. A terminal reconstructed by status or
+/// recovery is deliberately ineligible for that compound capability and must
+/// use the adapter's existing status-first recovery path.
 ///
 /// ```compile_fail
 /// use opc_session_net::FencedMutationRosterEstablishedTerminal;
@@ -1080,6 +1084,7 @@ impl fmt::Debug for TerminalReceipt {
 /// ```
 pub struct EstablishedTerminal {
     receipt: Box<TerminalCommitReceipt>,
+    publication_state: PublicationState,
 }
 
 impl EstablishedTerminal {
@@ -1102,7 +1107,7 @@ impl EstablishedTerminal {
     pub fn into_publication(self) -> EstablishedPublication {
         EstablishedPublication {
             receipt: *self.receipt,
-            state: PublicationState::Unclassified,
+            state: self.publication_state,
         }
     }
 }
@@ -1153,9 +1158,11 @@ impl fmt::Debug for AbortedTerminal {
 ///
 /// A startup-fixed [`super::FencedMutationRosterProviderAdapter`]
 /// is the only public consumer. The capsule owns the exact established bytes
-/// and tracks whether its inert provider intent is unclassified, retryable
-/// after a direct begin non-transmission proof, or status/adopt-only after
-/// ambiguity.
+/// and privately tracks whether a direct terminalization may invoke the
+/// provider's one fresh compound operation, an inert provider intent is
+/// unclassified or retryable after direct non-transmission proof, or it is
+/// status/adopt-only after ambiguity. Recovered capsules never regain the
+/// fresh compound capability.
 pub struct EstablishedPublication {
     receipt: TerminalCommitReceipt,
     state: PublicationState,
@@ -1163,8 +1170,12 @@ pub struct EstablishedPublication {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicationState {
+    /// A direct terminalization result may use the one compound fresh path.
+    FreshCompound,
     Unclassified,
     DirectBeginRetry,
+    /// Only a direct non-transmission of the compound call may retry it.
+    DirectFreshRetry,
     StatusAdoptOnly,
 }
 
@@ -1777,9 +1788,9 @@ impl FencedMutationRosterClient {
             .terminalize(prepared.registration.as_ref(), &prepared.prepared)
             .await
         {
-            Ok(receipt) => Ok(TerminalizationOutcome::Committed(receipt_from_executor(
-                receipt,
-            )?)),
+            Ok(receipt) => Ok(TerminalizationOutcome::Committed(
+                receipt_from_fresh_terminalization(receipt)?,
+            )),
             Err(ExecutorError::TerminalizeNotTransmitted) => {
                 prepared.state.restore_after_not_transmitted();
                 Ok(TerminalizationOutcome::NotTransmitted)
@@ -1876,10 +1887,24 @@ fn recovery_member_outcome(
 }
 
 fn receipt_from_executor(receipt: TerminalCommitReceipt) -> Result<TerminalReceipt, ClientError> {
+    receipt_from_executor_with_publication_state(receipt, PublicationState::Unclassified)
+}
+
+fn receipt_from_fresh_terminalization(
+    receipt: TerminalCommitReceipt,
+) -> Result<TerminalReceipt, ClientError> {
+    receipt_from_executor_with_publication_state(receipt, PublicationState::FreshCompound)
+}
+
+fn receipt_from_executor_with_publication_state(
+    receipt: TerminalCommitReceipt,
+    publication_state: PublicationState,
+) -> Result<TerminalReceipt, ClientError> {
     match receipt.phase() {
         Phase::Established if receipt.publication_authority().is_some() => {
             Ok(TerminalReceipt::Established(EstablishedTerminal {
                 receipt: Box::new(receipt),
+                publication_state,
             }))
         }
         Phase::Aborted if receipt.publication_authority().is_none() => {

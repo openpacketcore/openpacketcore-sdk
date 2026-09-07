@@ -75,6 +75,147 @@ pub const DIAMETER_DEFAULT_STREAM_ID: u16 = 0;
 /// Maximum SCTP-AUTH shared-secret bytes accepted by the kernel UAPI.
 pub const MAX_SCTP_AUTH_KEY_BYTES: usize = opc_libsctp_sys::MAX_SCTP_AUTH_KEY_BYTES;
 
+/// The furthest redaction-safe stage reached by an SCTP connect attempt.
+///
+/// This is deliberately an attempt-level view, not a peer-path view. In
+/// particular, `connectx` does not expose which configured address the kernel
+/// has attempted, so this type never reports primary or secondary attempts.
+///
+/// A handle's reported stage never regresses. Branch-specific values such as
+/// immediate success and in-progress are evidence alternatives, not a general
+/// ordering for application policy.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SctpConnectStage {
+    /// The returned connect future has not started socket setup.
+    NotStarted = 0,
+    /// Socket creation was invoked.
+    SocketCreationAttempted = 1,
+    /// Socket creation returned a descriptor.
+    SocketCreationSucceeded = 2,
+    /// All requested pre-connect socket options were applied.
+    OptionsApplied = 3,
+    /// No local address set was configured for this attempt.
+    LocalBindNotConfigured = 4,
+    /// The configured local address set was submitted to the kernel.
+    LocalBindAttempted = 5,
+    /// The configured local address set was accepted by the kernel.
+    LocalBindSucceeded = 6,
+    /// The configured remote address set was submitted to the kernel.
+    RemoteSetSubmitted = 7,
+    /// The kernel reported that connect or connectx completed immediately.
+    ConnectImmediateSuccess = 8,
+    /// The kernel reported that connect or connectx is in progress.
+    ConnectInProgress = 9,
+    /// Writable readiness was observed while waiting for an in-progress connect.
+    WritableObserved = 10,
+    /// A successful `SO_ERROR` read was observed after writable readiness.
+    SocketErrorChecked = 11,
+    /// The association was established by this connector.
+    Established = 12,
+}
+
+impl SctpConnectStage {
+    /// Stable machine-readable name for this stage.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::SocketCreationAttempted => "socket_creation_attempted",
+            Self::SocketCreationSucceeded => "socket_creation_succeeded",
+            Self::OptionsApplied => "options_applied",
+            Self::LocalBindNotConfigured => "local_bind_not_configured",
+            Self::LocalBindAttempted => "local_bind_attempted",
+            Self::LocalBindSucceeded => "local_bind_succeeded",
+            Self::RemoteSetSubmitted => "remote_set_submitted",
+            Self::ConnectImmediateSuccess => "connect_immediate_success",
+            Self::ConnectInProgress => "connect_in_progress",
+            Self::WritableObserved => "writable_observed",
+            Self::SocketErrorChecked => "socket_error_checked",
+            Self::Established => "established",
+        }
+    }
+
+    const fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::SocketCreationAttempted,
+            2 => Self::SocketCreationSucceeded,
+            3 => Self::OptionsApplied,
+            4 => Self::LocalBindNotConfigured,
+            5 => Self::LocalBindAttempted,
+            6 => Self::LocalBindSucceeded,
+            7 => Self::RemoteSetSubmitted,
+            8 => Self::ConnectImmediateSuccess,
+            9 => Self::ConnectInProgress,
+            10 => Self::WritableObserved,
+            11 => Self::SocketErrorChecked,
+            12 => Self::Established,
+            _ => Self::NotStarted,
+        }
+    }
+}
+
+/// A point-in-time redaction-safe SCTP connect progress snapshot.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SctpConnectProgressSnapshot {
+    /// Furthest stage reached by this connect attempt.
+    pub stage: SctpConnectStage,
+}
+
+/// Cloneable read-only progress handle for one SCTP connect attempt.
+///
+/// The handle retains no socket authority and contains no addresses, peer
+/// identity, errno, or packet data. It remains readable after the connect
+/// future completes, fails, or is cancelled.
+#[derive(Clone)]
+pub struct SctpConnectProgressHandle {
+    stage: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl SctpConnectProgressHandle {
+    fn new() -> Self {
+        Self {
+            stage: Arc::new(std::sync::atomic::AtomicU8::new(
+                SctpConnectStage::NotStarted as u8,
+            )),
+        }
+    }
+
+    fn advance(&self, stage: SctpConnectStage) {
+        let mut observed = self.stage.load(Ordering::Acquire);
+        while observed < stage as u8 {
+            match self.stage.compare_exchange_weak(
+                observed,
+                stage as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    /// Return the current immutable progress snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> SctpConnectProgressSnapshot {
+        SctpConnectProgressSnapshot {
+            stage: SctpConnectStage::from_raw(self.stage.load(Ordering::Acquire)),
+        }
+    }
+}
+
+impl fmt::Debug for SctpConnectProgressHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SctpConnectProgressHandle")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 const SCTP_DATA_CHUNK_TYPE: u8 = 0;
 #[cfg(any(target_os = "linux", test))]
@@ -1127,6 +1268,34 @@ impl DiameterSctpPeer {
         )
         .await
     }
+
+    /// Start an unprotected Diameter SCTP connect with a redaction-safe
+    /// progress handle.
+    ///
+    /// This is the progress-reporting counterpart to [`Self::connect_association`].
+    /// It preserves this peer's independent inbound and outbound PPID policies;
+    /// the handle contains only generic SCTP connector stages and no peer data.
+    pub fn connect_association_with_progress(
+        &self,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<DiameterSctpAssociation, DiameterSctpError>>,
+    ) {
+        let progress = SctpConnectProgressHandle::new();
+        let peer = self.clone();
+        let future_progress = progress.clone();
+        let connect = async move {
+            let config = peer.sctp_connect_config()?;
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_handle(
+                config,
+                peer.inbound_ppid_policy,
+                peer.outbound_ppid_policy,
+                future_progress,
+            )
+            .await
+        };
+        (progress, connect)
+    }
 }
 
 /// One item received from a live Diameter SCTP association.
@@ -1184,11 +1353,26 @@ impl DiameterSctpAssociation {
     pub async fn connect_unprotected_with_config(
         config: SctpConnectConfig,
     ) -> Result<Self, DiameterSctpError> {
-        Self::connect_unprotected_with_config_and_inbound_ppid_policy(
+        let (_progress, connect) = Self::connect_unprotected_with_config_with_progress(config);
+        connect.await
+    }
+
+    /// Start an explicitly unprotected Diameter SCTP association with a
+    /// redaction-safe progress handle.
+    ///
+    /// This is the progress-reporting counterpart to
+    /// [`Self::connect_unprotected_with_config`]. It retains the strict inbound
+    /// PPID policy and standard outbound PPID 46 framing.
+    pub fn connect_unprotected_with_config_with_progress(
+        config: SctpConnectConfig,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, DiameterSctpError>>,
+    ) {
+        Self::connect_unprotected_with_config_and_inbound_ppid_policy_with_progress(
             config,
             DiameterInboundPpidPolicy::Strict,
         )
-        .await
     }
 
     /// Open an explicitly unprotected association with an inbound PPID policy.
@@ -1205,12 +1389,30 @@ impl DiameterSctpAssociation {
         config: SctpConnectConfig,
         policy: DiameterInboundPpidPolicy,
     ) -> Result<Self, DiameterSctpError> {
-        Self::connect_unprotected_with_config_and_ppid_policies(
+        let (_progress, connect) =
+            Self::connect_unprotected_with_config_and_inbound_ppid_policy_with_progress(
+                config, policy,
+            );
+        connect.await
+    }
+
+    /// Start an explicitly unprotected Diameter SCTP association with an
+    /// inbound PPID policy and a redaction-safe progress handle.
+    ///
+    /// Outbound framing remains standard PPID 46, exactly as in
+    /// [`Self::connect_unprotected_with_config_and_inbound_ppid_policy`].
+    pub fn connect_unprotected_with_config_and_inbound_ppid_policy_with_progress(
+        config: SctpConnectConfig,
+        policy: DiameterInboundPpidPolicy,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, DiameterSctpError>>,
+    ) {
+        Self::connect_unprotected_with_config_and_ppid_policies_with_progress(
             config,
             policy,
             DiameterOutboundPpidPolicy::Standard,
         )
-        .await
     }
 
     /// Open an explicitly unprotected association with independent inbound
@@ -1228,9 +1430,49 @@ impl DiameterSctpAssociation {
         inbound_policy: DiameterInboundPpidPolicy,
         outbound_policy: DiameterOutboundPpidPolicy,
     ) -> Result<Self, DiameterSctpError> {
+        let (_progress, connect) =
+            Self::connect_unprotected_with_config_and_ppid_policies_with_progress(
+                config,
+                inbound_policy,
+                outbound_policy,
+            );
+        connect.await
+    }
+
+    /// Start an explicitly unprotected Diameter SCTP association with
+    /// independent PPID policies and a redaction-safe progress handle.
+    ///
+    /// This is the production static-multihoming entry point for callers that
+    /// retain a handle across an outer timeout. The handle neither changes nor
+    /// exposes the PPID, notification, peer, or address behavior of the
+    /// resulting association.
+    pub fn connect_unprotected_with_config_and_ppid_policies_with_progress(
+        config: SctpConnectConfig,
+        inbound_policy: DiameterInboundPpidPolicy,
+        outbound_policy: DiameterOutboundPpidPolicy,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, DiameterSctpError>>,
+    ) {
+        let progress = SctpConnectProgressHandle::new();
+        let connect = Self::connect_unprotected_with_config_and_ppid_policies_with_handle(
+            config,
+            inbound_policy,
+            outbound_policy,
+            progress.clone(),
+        );
+        (progress, connect)
+    }
+
+    async fn connect_unprotected_with_config_and_ppid_policies_with_handle(
+        config: SctpConnectConfig,
+        inbound_policy: DiameterInboundPpidPolicy,
+        outbound_policy: DiameterOutboundPpidPolicy,
+        progress: SctpConnectProgressHandle,
+    ) -> Result<Self, DiameterSctpError> {
         config.validate().map_err(DiameterSctpError::from)?;
         let peer = Self::peer_from_connect_config(&config, inbound_policy, outbound_policy)?;
-        let association = SctpAssociation::connect(config)
+        let association = SctpAssociation::connect_attempt_with_handle(config, None, progress)
             .await
             .map_err(DiameterSctpError::connect)?;
         Ok(Self {
@@ -2613,10 +2855,29 @@ impl SctpEndpoint {
 impl SctpAssociation {
     /// Connect one SCTP association.
     pub async fn connect(config: SctpConnectConfig) -> Result<Self, SctpError> {
-        config.validate()?;
-        platform::connect_association(config, None)
-            .await
-            .map(|imp| Self { imp: Arc::new(imp) })
+        let (_progress, connect) = Self::connect_with_progress(config);
+        connect.await
+    }
+
+    /// Start an SCTP connect attempt with a redaction-safe progress handle.
+    ///
+    /// The returned future performs the same connect operation as
+    /// [`Self::connect`]. Its paired handle can be retained by an outer timeout
+    /// or cancellation guard to report only the furthest connector stage that
+    /// was actually reached. It contains no peer addresses, errno, packet
+    /// values, topology, or subscriber data, and it does not invoke callbacks.
+    ///
+    /// The progress stage is monotonic. For a multi-address remote set,
+    /// `RemoteSetSubmitted`, `ConnectImmediateSuccess`, and
+    /// `ConnectInProgress` describe the single `connectx` submission only;
+    /// Linux does not expose individual configured-path attempts.
+    pub fn connect_with_progress(
+        config: SctpConnectConfig,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, SctpError>>,
+    ) {
+        Self::connect_attempt(config, None)
     }
 
     /// Connect an association that requires SCTP-AUTH on selected chunks.
@@ -2629,8 +2890,45 @@ impl SctpAssociation {
         config: SctpConnectConfig,
         authentication: SctpAuthenticationConfig,
     ) -> Result<Self, SctpError> {
+        let (_progress, connect) =
+            Self::connect_with_authentication_and_progress(config, authentication);
+        connect.await
+    }
+
+    /// Start an authenticated SCTP connect attempt with a progress handle.
+    ///
+    /// This is the authenticated counterpart to [`Self::connect_with_progress`]
+    /// and has the same cancellation and socket-close behavior as
+    /// [`Self::connect_with_authentication`].
+    pub fn connect_with_authentication_and_progress(
+        config: SctpConnectConfig,
+        authentication: SctpAuthenticationConfig,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, SctpError>>,
+    ) {
+        Self::connect_attempt(config, Some(authentication))
+    }
+
+    fn connect_attempt(
+        config: SctpConnectConfig,
+        authentication: Option<SctpAuthenticationConfig>,
+    ) -> (
+        SctpConnectProgressHandle,
+        impl std::future::Future<Output = Result<Self, SctpError>>,
+    ) {
+        let progress = SctpConnectProgressHandle::new();
+        let connect = Self::connect_attempt_with_handle(config, authentication, progress.clone());
+        (progress, connect)
+    }
+
+    async fn connect_attempt_with_handle(
+        config: SctpConnectConfig,
+        authentication: Option<SctpAuthenticationConfig>,
+        progress: SctpConnectProgressHandle,
+    ) -> Result<Self, SctpError> {
         config.validate()?;
-        platform::connect_association(config, Some(authentication))
+        platform::connect_association(config, authentication, progress)
             .await
             .map(|imp| Self { imp: Arc::new(imp) })
     }
@@ -3409,34 +3707,48 @@ mod platform {
     pub async fn connect_association(
         config: SctpConnectConfig,
         authentication: Option<SctpAuthenticationConfig>,
+        progress: SctpConnectProgressHandle,
     ) -> Result<Association, SctpError> {
         let remote = config.remote_addrs[0];
         let peer_paths = SctpPathTracker::new(&config.remote_addrs);
-        let fd = opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne))
-            .map_err(|source| io_err("socket", source))?;
-        configure_fd(
+        let fd_result =
+            opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne));
+        progress.advance(SctpConnectStage::SocketCreationAttempted);
+        let fd = fd_result.map_err(|source| io_err("socket", source))?;
+        progress.advance(SctpConnectStage::SocketCreationSucceeded);
+        let configure_result = configure_fd(
             fd.as_fd(),
             config.init,
             config.nodelay,
             config.rto,
             config.heartbeat,
             authentication,
-        )?;
+        );
+        configure_result?;
+        progress.advance(SctpConnectStage::OptionsApplied);
         if config.local_addrs.len() == 1 {
-            opc_libsctp_sys::bind(fd.as_fd(), &config.local_addrs[0])
-                .map_err(|source| io_err("bind", source))?;
+            let bind_result = opc_libsctp_sys::bind(fd.as_fd(), &config.local_addrs[0]);
+            progress.advance(SctpConnectStage::LocalBindAttempted);
+            bind_result.map_err(|source| io_err("bind", source))?;
+            progress.advance(SctpConnectStage::LocalBindSucceeded);
         } else if !config.local_addrs.is_empty() {
-            opc_libsctp_sys::bind_addresses(fd.as_fd(), &config.local_addrs)
-                .map_err(|source| multihoming_io_err("bind_addresses", source))?;
+            let bind_result = opc_libsctp_sys::bind_addresses(fd.as_fd(), &config.local_addrs);
+            progress.advance(SctpConnectStage::LocalBindAttempted);
+            bind_result.map_err(|source| multihoming_io_err("bind_addresses", source))?;
+            progress.advance(SctpConnectStage::LocalBindSucceeded);
+        } else {
+            progress.advance(SctpConnectStage::LocalBindNotConfigured);
         }
-        let status = if config.remote_addrs.len() == 1 {
+        let status_result = if config.remote_addrs.len() == 1 {
             opc_libsctp_sys::connect(fd.as_fd(), &remote)
-                .map_err(|source| io_err("connect", source))?
+                .map_err(|source| io_err("connect", source))
         } else {
             opc_libsctp_sys::connect_addresses(fd.as_fd(), &config.remote_addrs)
-                .map_err(|source| multihoming_io_err("connect_addresses", source))?
+                .map_err(|source| multihoming_io_err("connect_addresses", source))
         };
-        let async_fd = AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
+        let status = record_remote_submission_result(&progress, status_result)?;
+        record_connect_status(&progress, status);
+        let async_fd = register_async_fd(fd)?;
         let socket = Arc::new(SctpSocket {
             fd: async_fd,
             max_message_bytes: config.max_message_bytes,
@@ -3445,7 +3757,7 @@ mod platform {
             closed: AtomicBool::new(false),
         });
         if status == opc_libsctp_sys::ConnectStatus::InProgress {
-            wait_connected(&socket).await?;
+            wait_connected(&socket, &progress).await?;
         }
         if let Some(authentication) = authentication {
             require_peer_authentication(socket.fd.get_ref().as_fd(), authentication)?;
@@ -3454,6 +3766,7 @@ mod platform {
         {
             peer_paths.initialize_primary_reachable(primary_peer);
         }
+        progress.advance(SctpConnectStage::Established);
         let (auth_events, _auth_events_receiver) = tokio::sync::broadcast::channel(16);
         Ok(Association {
             socket,
@@ -4277,16 +4590,46 @@ mod platform {
         validate_peer_authenticated_chunks(authentication, &peer_chunks)
     }
 
-    async fn wait_connected(socket: &SctpSocket) -> Result<(), SctpError> {
+    pub(super) fn record_remote_submission_result(
+        progress: &SctpConnectProgressHandle,
+        result: Result<opc_libsctp_sys::ConnectStatus, SctpError>,
+    ) -> Result<opc_libsctp_sys::ConnectStatus, SctpError> {
+        progress.advance(SctpConnectStage::RemoteSetSubmitted);
+        result
+    }
+
+    pub(super) fn record_connect_status(
+        progress: &SctpConnectProgressHandle,
+        status: opc_libsctp_sys::ConnectStatus,
+    ) {
+        progress.advance(match status {
+            opc_libsctp_sys::ConnectStatus::Connected => SctpConnectStage::ConnectImmediateSuccess,
+            opc_libsctp_sys::ConnectStatus::InProgress => SctpConnectStage::ConnectInProgress,
+        });
+    }
+
+    pub(super) fn register_async_fd(fd: OwnedFd) -> Result<AsyncFd<OwnedFd>, SctpError> {
+        AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))
+    }
+
+    async fn wait_connected(
+        socket: &SctpSocket,
+        progress: &SctpConnectProgressHandle,
+    ) -> Result<(), SctpError> {
         loop {
             let mut guard = socket
                 .fd
                 .writable()
                 .await
                 .map_err(|source| io_err("connect_ready", source))?;
+            progress.advance(SctpConnectStage::WritableObserved);
             match guard.try_io(|inner| opc_libsctp_sys::socket_error(inner.get_ref().as_fd())) {
-                Ok(Ok(None)) => return Ok(()),
+                Ok(Ok(None)) => {
+                    progress.advance(SctpConnectStage::SocketErrorChecked);
+                    return Ok(());
+                }
                 Ok(Ok(Some(source))) => {
+                    progress.advance(SctpConnectStage::SocketErrorChecked);
                     socket.mark_closed();
                     socket.metrics.record_io_error();
                     return Err(io_err("connect", source));
@@ -4323,6 +4666,7 @@ mod platform {
     pub async fn connect_association(
         _config: SctpConnectConfig,
         _authentication: Option<SctpAuthenticationConfig>,
+        _progress: SctpConnectProgressHandle,
     ) -> Result<Association, SctpError> {
         Err(SctpError::UnsupportedPlatform)
     }
@@ -4661,6 +5005,92 @@ mod tests {
         push_u32_ne(&mut payload, indication);
         push_i32_ne(&mut payload, assoc_id);
         payload
+    }
+
+    #[test]
+    fn connect_progress_is_monotonic_and_redaction_safe() {
+        let progress = SctpConnectProgressHandle::new();
+        assert_eq!(
+            progress.snapshot(),
+            SctpConnectProgressSnapshot {
+                stage: SctpConnectStage::NotStarted,
+            }
+        );
+
+        progress.advance(SctpConnectStage::RemoteSetSubmitted);
+        progress.advance(SctpConnectStage::OptionsApplied);
+        progress.advance(SctpConnectStage::Established);
+        progress.advance(SctpConnectStage::ConnectInProgress);
+
+        assert_eq!(progress.snapshot().stage, SctpConnectStage::Established);
+        assert_eq!(progress.snapshot().stage.as_str(), "established");
+        let debug = format!("{progress:?}");
+        assert!(!debug.contains("127.0.0.1"));
+        assert!(!debug.contains("errno"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_progress_records_immediate_submission_error_and_status_before_registration() {
+        let error_progress = SctpConnectProgressHandle::new();
+        let error = platform::record_remote_submission_result(
+            &error_progress,
+            Err(SctpError::UnsupportedFeature {
+                feature: "test_connect_submission",
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SctpError::UnsupportedFeature { .. }));
+        assert_eq!(
+            error_progress.snapshot().stage,
+            SctpConnectStage::RemoteSetSubmitted
+        );
+
+        let registration_progress = SctpConnectProgressHandle::new();
+        platform::record_connect_status(
+            &registration_progress,
+            opc_libsctp_sys::ConnectStatus::Connected,
+        );
+        let fd: OwnedFd = std::fs::File::open("/dev/null")
+            .expect("open inert registration-failure descriptor")
+            .into();
+        assert!(matches!(
+            platform::register_async_fd(fd),
+            Err(SctpError::Io {
+                operation: "async_fd",
+                ..
+            })
+        ));
+        assert_eq!(
+            registration_progress.snapshot().stage,
+            SctpConnectStage::ConnectImmediateSuccess
+        );
+
+        let pending_progress = SctpConnectProgressHandle::new();
+        platform::record_connect_status(
+            &pending_progress,
+            opc_libsctp_sys::ConnectStatus::InProgress,
+        );
+        assert_eq!(
+            pending_progress.snapshot().stage,
+            SctpConnectStage::ConnectInProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_progress_preserves_handle_for_immediate_typed_config_error() {
+        let mut config = SctpConnectConfig::new("127.0.0.1:3868".parse().unwrap());
+        config.remote_addrs.clear();
+        let (progress, connect) = SctpAssociation::connect_with_progress(config);
+
+        assert!(matches!(
+            connect.await,
+            Err(SctpError::InvalidConfig {
+                field: "remote_addrs",
+                ..
+            })
+        ));
+        assert_eq!(progress.snapshot().stage, SctpConnectStage::NotStarted);
     }
 
     #[test]
@@ -5931,6 +6361,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diameter_full_policy_progress_preserves_handle_for_typed_config_error() {
+        let mut config = SctpConnectConfig::new("127.0.0.1:3868".parse().unwrap());
+        config.remote_addrs.clear();
+        let (progress, connect) =
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_progress(
+                config,
+                DiameterInboundPpidPolicy::AcceptLegacyZero,
+                DiameterOutboundPpidPolicy::LegacyZero,
+            );
+
+        assert!(matches!(
+            connect.await,
+            Err(DiameterSctpError::SctpConfig(SctpError::InvalidConfig {
+                field: "remote_addrs",
+                ..
+            }))
+        ));
+        assert_eq!(progress.snapshot().stage, SctpConnectStage::NotStarted);
+    }
+
     #[test]
     fn diameter_peer_rejects_invalid_sctp_config() {
         let peer = diameter_peer().with_local_addr("[::1]:0".parse().unwrap());
@@ -6602,9 +7053,10 @@ mod tests {
     async fn loopback_data_message_reports_intact_metadata() {
         let server_addr: SocketAddr = "127.0.0.1:38413".parse().unwrap();
         let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
-        let client = SctpAssociation::connect(SctpConnectConfig::new(server_addr))
-            .await
-            .unwrap();
+        let (progress, connect) =
+            SctpAssociation::connect_with_progress(SctpConnectConfig::new(server_addr));
+        let client = connect.await.unwrap();
+        assert_eq!(progress.snapshot().stage, SctpConnectStage::Established);
         let accepted = server.accept().await.unwrap();
 
         let payload = Bytes::from(vec![0x5A_u8; 300]);
@@ -6623,6 +7075,62 @@ mod tests {
         assert!(!received.control_truncated);
         assert_eq!(received.stream_id, 1);
         assert_eq!(received.ppid, DIAMETER_SCTP_PPID);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux SCTP plus passwordless sudo for a port-scoped blackhole"]
+    async fn connect_progress_survives_pending_blackhole_timeout() {
+        let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(
+            "127.0.0.1:0".parse().unwrap(),
+        ))
+        .unwrap();
+        let server_addr = server.local_addresses().unwrap()[0];
+        let blackhole = SctpPathDrop::install("127.0.0.1", server_addr.port());
+        let (progress, connect) =
+            SctpAssociation::connect_with_progress(SctpConnectConfig::new(server_addr));
+
+        assert!(tokio::time::timeout(Duration::from_millis(100), connect)
+            .await
+            .is_err());
+        assert_eq!(
+            progress.snapshot().stage,
+            SctpConnectStage::ConnectInProgress
+        );
+        blackhole.remove();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux SCTP multihoming plus passwordless sudo for a port-scoped blackhole"]
+    async fn diameter_full_policy_progress_survives_multihomed_blackhole_timeout() {
+        let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+        server_config
+            .local_addrs
+            .push("127.0.0.2:0".parse().unwrap());
+        let server = SctpEndpoint::bind(server_config).unwrap();
+        let mut remote_addrs = server.local_addresses().unwrap();
+        remote_addrs.sort_unstable();
+        let primary_blackhole = SctpPathDrop::install("127.0.0.1", remote_addrs[0].port());
+        let secondary_blackhole = SctpPathDrop::install("127.0.0.2", remote_addrs[0].port());
+        let mut config = SctpConnectConfig::new(remote_addrs[0]);
+        config.remote_addrs = remote_addrs;
+        let (progress, connect) =
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_progress(
+                config,
+                DiameterInboundPpidPolicy::AcceptLegacyZero,
+                DiameterOutboundPpidPolicy::LegacyZero,
+            );
+
+        assert!(tokio::time::timeout(Duration::from_millis(100), connect)
+            .await
+            .is_err());
+        assert_eq!(
+            progress.snapshot().stage,
+            SctpConnectStage::ConnectInProgress
+        );
+        secondary_blackhole.remove();
+        primary_blackhole.remove();
     }
 
     #[cfg(target_os = "linux")]
@@ -7094,16 +7602,17 @@ mod tests {
             interval_ms: Some(250),
             path_max_retrans: Some(2),
         };
-        let client = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            DiameterSctpAssociation::connect_unprotected_with_config_and_inbound_ppid_policy(
+        let (progress, connect) =
+            DiameterSctpAssociation::connect_unprotected_with_config_and_ppid_policies_with_progress(
                 client_config,
                 DiameterInboundPpidPolicy::AcceptLegacyZero,
-            ),
-        )
-        .await
-        .expect("multihomed Diameter connect timed out")
-        .unwrap();
+                DiameterOutboundPpidPolicy::Standard,
+            );
+        let client = tokio::time::timeout(std::time::Duration::from_secs(5), connect)
+            .await
+            .expect("multihomed Diameter connect timed out")
+            .unwrap();
+        assert_eq!(progress.snapshot().stage, SctpConnectStage::Established);
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), server.accept())
             .await
             .expect("multihomed Diameter association was not accepted")

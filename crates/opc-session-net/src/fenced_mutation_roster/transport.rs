@@ -172,6 +172,24 @@ where
     {
         self.publication.publish(publication).await
     }
+
+    /// Publish a directly terminalized Established capsule through the
+    /// provider's one-call durable fresh-publication primitive.
+    ///
+    /// A provider that has not opted into
+    /// [`EstablishedPublicationProvider::publish_fresh_established`] fails
+    /// closed. Recovered and status-derived capsules are automatically
+    /// restricted to status/adopt; this method never grants them execution
+    /// authority.
+    pub async fn publish_fresh_established(
+        &self,
+        publication: &mut super::client::EstablishedPublication,
+    ) -> Result<super::canonical::PublicationEvidence, super::publication::PublicationAdapterError>
+    {
+        self.publication
+            .publish_fresh_established(publication)
+            .await
+    }
 }
 
 pub(crate) fn compose_client<P>(

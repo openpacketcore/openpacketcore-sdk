@@ -7,9 +7,14 @@
 pub mod network;
 pub(crate) mod raft_adapter;
 pub(crate) mod snapshot;
+mod snapshot_integrity;
 pub(crate) mod storage;
 pub(crate) mod store;
 pub mod types;
+#[cfg(target_os = "linux")]
+pub(crate) mod verified_snapshot;
+
+pub use snapshot_integrity::SnapshotIntegrityPolicy;
 
 #[cfg(feature = "test-control")]
 #[doc(hidden)]

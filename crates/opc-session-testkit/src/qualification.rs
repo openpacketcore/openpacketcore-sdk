@@ -32,8 +32,9 @@ use opc_session_net::{
 };
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, RosterAttestationTrustRootV1, SessionConsumerScope, StateType,
-    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, STABLE_ID_MAX_BYTES,
+    ReplicaId, ReplicaTlsIdentity, RosterAttestationTrustRootV1, SessionConsumerScope,
+    SnapshotIntegrityPolicy, StateType, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, STABLE_ID_MAX_BYTES,
 };
 use opc_tls::{TlsMaterialAvailability, TlsMaterialReloadReason, TlsMaterialStatus};
 use opc_types::{SpiffeId, Timestamp};
@@ -4398,6 +4399,12 @@ pub struct QualificationNodeConfig {
     pub workspace_directory: PathBuf,
     pub database_path: PathBuf,
     pub snapshot_directory: PathBuf,
+    /// Explicit snapshot protection, independent of topology and transport.
+    /// Omission preserves the historical strict fs-verity policy; there is no
+    /// capability-dependent fallback. Release-only external namespaces require
+    /// fs-verity even when a caller explicitly selects a policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_integrity: Option<SnapshotIntegrityPolicy>,
     /// Optional owner-private campaign namespace for immutable snapshots.
     /// Mutable database and control paths remain under `workspace_directory`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4455,7 +4462,8 @@ impl QualificationNodeConfig {
             // lexical `..` or nested path cannot gain a pre-canonicalization
             // side effect outside the pinned campaign directory.
             || (has_external_snapshot_namespace
-                && (!matches!(
+                && (self.snapshot_integrity == Some(SnapshotIntegrityPolicy::PortableVerified)
+                    || !matches!(
                     &self.transport,
                     QualificationTransportConfig::ProjectedMtls(_)
                 )
@@ -4584,6 +4592,7 @@ impl fmt::Debug for QualificationNodeConfig {
             .field("workspace_directory", &"<redacted>")
             .field("database_path", &"<redacted>")
             .field("snapshot_directory", &"<redacted>")
+            .field("snapshot_integrity", &self.snapshot_integrity)
             .field("snapshot_root_directory", &"<redacted>")
             .field("snapshot_root_device", &self.snapshot_root_device)
             .field("snapshot_root_inode", &self.snapshot_root_inode)
@@ -8986,6 +8995,7 @@ mod tests {
             workspace_directory: PathBuf::from("/qualification"),
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
+            snapshot_integrity: None,
             snapshot_root_directory: None,
             snapshot_root_device: None,
             snapshot_root_inode: None,
@@ -9026,12 +9036,46 @@ mod tests {
             workspace_directory: PathBuf::from("/qualification"),
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
+            snapshot_integrity: None,
             snapshot_root_directory: None,
             snapshot_root_device: None,
             snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         }
+    }
+
+    #[test]
+    fn config_snapshot_integrity_preserves_legacy_bytes_and_requires_explicit_portable() {
+        let legacy = valid_config();
+        let encoded = serde_json::to_value(&legacy).expect("encode legacy configuration");
+        assert!(encoded.get("snapshot_integrity").is_none());
+        let decoded: QualificationNodeConfig =
+            serde_json::from_value(encoded.clone()).expect("decode legacy configuration");
+        assert_eq!(decoded.snapshot_integrity, None);
+        assert_eq!(
+            decoded
+                .snapshot_integrity
+                .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
+            SnapshotIntegrityPolicy::FsVerity
+        );
+        assert_eq!(
+            serde_json::to_value(decoded).expect("reencode legacy"),
+            encoded
+        );
+
+        let mut portable = legacy;
+        portable.snapshot_integrity = Some(SnapshotIntegrityPolicy::PortableVerified);
+        assert_eq!(portable.validate(), Ok(()));
+        let mut encoded = serde_json::to_value(&portable).expect("encode portable configuration");
+        assert_eq!(encoded["snapshot_integrity"], "portable_verified");
+        assert_eq!(
+            serde_json::from_value::<QualificationNodeConfig>(encoded.clone())
+                .expect("decode portable configuration"),
+            portable
+        );
+        encoded["snapshot_integrity"] = serde_json::json!("automatic");
+        assert!(serde_json::from_value::<QualificationNodeConfig>(encoded).is_err());
     }
 
     #[test]
@@ -9058,6 +9102,15 @@ mod tests {
         config.snapshot_root_device = Some(1);
         config.snapshot_root_inode = Some(2);
         assert!(config.validate().is_ok());
+        config.snapshot_integrity = Some(SnapshotIntegrityPolicy::PortableVerified);
+        assert_eq!(
+            config.validate(),
+            Err(QualificationConfigError::Configuration),
+            "portable protection cannot substitute for fs-verity release evidence"
+        );
+        config.snapshot_integrity = Some(SnapshotIntegrityPolicy::FsVerity);
+        assert_eq!(config.validate(), Ok(()));
+        config.snapshot_integrity = None;
 
         config.database_path = PathBuf::from("/fs-verity-campaign/node-0.sqlite");
         assert_eq!(

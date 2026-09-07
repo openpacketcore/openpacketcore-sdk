@@ -4,11 +4,12 @@
 //! tree: prefixes are resolved, namespaces are mapped to served modules, element
 //! names are mapped to schema paths, `nc:operation` attributes are normalized,
 //! and list keys are collected before any non-key children. The emitted tree
-//! carries leaf values (which may be secrets) but never logs them or echoes them
-//! in error messages.
+//! carries leaf and leaf-list entry values (which may be secrets) but never
+//! logs them or echoes them in error messages.
 
 use std::collections::BTreeMap;
 
+use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::{
     bare_segment, EditConfigNode, EditOperation, NetconfEditError, NodeKind, SchemaRegistry,
 };
@@ -16,27 +17,79 @@ use quick_xml::events::BytesStart;
 use quick_xml::reader::Reader;
 
 use crate::capabilities::{NETCONF_BASE_NS, NETCONF_NMDA_NS};
-use crate::xml::EditDefaultOperation;
+use crate::xml::{validate_namespace_binding, EditDefaultOperation, XML_NAMESPACE_URI};
 
 /// Parses a NETCONF `<config>` element into a schema-bound edit tree.
 ///
 /// `default_operation` is the RFC 6241 `<default-operation>` from the request.
 /// Per-node `nc:operation` attributes override it. The returned tree contains
-/// exactly one top-level data node (the schema root container).
-#[expect(
-    clippy::expect_used,
-    reason = "stack non-emptiness checked at the End-event guard"
-)]
-pub(crate) fn parse_edit_config_xml(
+/// exactly one top-level data node (the schema root container). This
+/// compatibility entry point uses [`MgmtLimits::default`]; server bindings and
+/// callers with deployment-specific limits should use
+/// [`parse_edit_config_xml_with_limits`].
+pub fn parse_edit_config_xml(
     config_xml: &str,
     registry: &'static dyn SchemaRegistry,
     default_operation: EditDefaultOperation,
+) -> Result<EditConfigNode, NetconfEditError> {
+    parse_edit_config_xml_with_limits(
+        config_xml,
+        registry,
+        default_operation,
+        &MgmtLimits::default(),
+    )
+}
+
+/// Parses a NETCONF `<config>` fragment with the supplied validated limits.
+///
+/// Direct callers must supply the limits that bound their input. Server
+/// bindings use the private already-envelope-bounded parser path instead, so a
+/// rewritten capture is not compared with the original wire-message size.
+pub fn parse_edit_config_xml_with_limits(
+    config_xml: &str,
+    registry: &'static dyn SchemaRegistry,
+    default_operation: EditDefaultOperation,
+    limits: &MgmtLimits,
+) -> Result<EditConfigNode, NetconfEditError> {
+    limits
+        .validate()
+        .map_err(|_| NetconfEditError::MalformedXml)?;
+    limits
+        .check_request_bytes(config_xml.len())
+        .map_err(|_| NetconfEditError::MalformedXml)?;
+
+    parse_edit_config_xml_inner(config_xml, registry, default_operation, Some(limits))
+}
+
+/// Parses a config fragment already bounded by the NETCONF RPC envelope.
+///
+/// The outer parser validates the complete wire message, XML depth, attributes,
+/// namespace bindings, values, and addressed-node count before it creates the
+/// namespace-preserving capture passed to a binding.  This private seam must
+/// not reapply the whole-message byte limit to that rewritten capture: adding
+/// inherited namespace declarations or expanding an empty element can make the
+/// capture longer than the original wire bytes without increasing input size.
+pub(crate) fn parse_edit_config_xml_from_bounded_envelope(
+    config_xml: &str,
+    registry: &'static dyn SchemaRegistry,
+    default_operation: EditDefaultOperation,
+) -> Result<EditConfigNode, NetconfEditError> {
+    parse_edit_config_xml_inner(config_xml, registry, default_operation, None)
+}
+
+fn parse_edit_config_xml_inner(
+    config_xml: &str,
+    registry: &'static dyn SchemaRegistry,
+    default_operation: EditDefaultOperation,
+    limits: Option<&MgmtLimits>,
 ) -> Result<EditConfigNode, NetconfEditError> {
     let mut reader = Reader::from_str(config_xml);
     reader.config_mut().trim_text(false);
     let decoder = reader.decoder();
 
     let mut stack: Vec<Frame> = Vec::new();
+    let mut addressed_nodes = 0usize;
+    let mut root = None;
 
     loop {
         match reader
@@ -44,10 +97,22 @@ pub(crate) fn parse_edit_config_xml(
             .map_err(|_| NetconfEditError::MalformedXml)?
         {
             quick_xml::events::Event::Start(start) => {
+                if root.is_some() {
+                    return Err(NetconfEditError::MalformedXml);
+                }
+                validate_start_limits(&start, decoder, limits)?;
+                check_depth(stack.len() + 1, limits)?;
+                count_addressed_node(&stack, &mut addressed_nodes, limits)?;
                 let frame = push_element(&start, &mut stack, registry, decoder, default_operation)?;
                 stack.push(frame);
             }
             quick_xml::events::Event::Empty(start) => {
+                if root.is_some() {
+                    return Err(NetconfEditError::MalformedXml);
+                }
+                validate_start_limits(&start, decoder, limits)?;
+                check_depth(stack.len() + 1, limits)?;
+                count_addressed_node(&stack, &mut addressed_nodes, limits)?;
                 let frame = push_element(&start, &mut stack, registry, decoder, default_operation)?;
                 // Empty elements close immediately; finalize and attach to parent.
                 let node = finalize_frame(frame, registry)?;
@@ -61,37 +126,129 @@ pub(crate) fn parse_edit_config_xml(
                     &frame.local_name,
                     &frame.namespace,
                 )?;
-                let frame = stack.pop().expect("validated stack has a frame");
+                let frame = stack.pop().ok_or(NetconfEditError::MalformedXml)?;
                 let node = finalize_frame(frame, registry)?;
                 if stack.is_empty() {
-                    // Closing the `<config>` wrapper: return its single data child.
-                    return node
+                    // Closing the `<config>` wrapper. Continue through EOF so
+                    // trailing roots or non-whitespace data cannot be ignored.
+                    let child = node
                         .children
                         .into_iter()
                         .next()
-                        .ok_or(NetconfEditError::MalformedXml);
+                        .ok_or(NetconfEditError::MalformedXml)?;
+                    if root.replace(child).is_some() {
+                        return Err(NetconfEditError::MalformedXml);
+                    }
+                    continue;
                 }
                 attach_child(&mut stack, node)?;
             }
             quick_xml::events::Event::Text(text) => {
+                check_value_bytes(text.as_ref().len(), limits)?;
                 let decoded = text.decode().map_err(|_| NetconfEditError::MalformedXml)?;
                 if let Some(frame) = stack.last_mut() {
                     frame.text.push_str(&decoded);
+                } else if !decoded.trim().is_empty() {
+                    return Err(NetconfEditError::MalformedXml);
                 }
             }
             quick_xml::events::Event::CData(cdata) => {
+                check_value_bytes(cdata.as_ref().len(), limits)?;
                 let decoded = cdata.decode().map_err(|_| NetconfEditError::MalformedXml)?;
-                if let Some(frame) = stack.last_mut() {
-                    frame.text.push_str(&decoded);
-                }
+                let frame = stack.last_mut().ok_or(NetconfEditError::MalformedXml)?;
+                frame.text.push_str(&decoded);
             }
             quick_xml::events::Event::Comment(_) => {}
-            quick_xml::events::Event::Eof => break,
+            quick_xml::events::Event::Eof => return root.ok_or(NetconfEditError::MalformedXml),
             _ => return Err(NetconfEditError::MalformedXml),
         }
     }
+}
 
-    Err(NetconfEditError::MalformedXml)
+fn validate_start_limits(
+    start: &BytesStart<'_>,
+    decoder: quick_xml::encoding::Decoder,
+    limits: Option<&MgmtLimits>,
+) -> Result<(), NetconfEditError> {
+    let mut attribute_count = 0usize;
+    let mut namespace_count = 0usize;
+
+    for attr in start.attributes().with_checks(true) {
+        let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
+        attribute_count = attribute_count.saturating_add(1);
+        let key = decode_utf8(attr.key.as_ref())?;
+        let value = attr
+            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+            .map_err(|_| NetconfEditError::MalformedXml)?;
+        check_value_bytes(value.len(), limits)?;
+
+        if key == "xmlns" {
+            namespace_count = namespace_count.saturating_add(1);
+            validate_namespace_binding(None, value.as_ref())
+                .map_err(|_| NetconfEditError::MalformedXml)?;
+        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+            namespace_count = namespace_count.saturating_add(1);
+            if prefix.is_empty() {
+                return Err(NetconfEditError::MalformedXml);
+            }
+            validate_namespace_binding(Some(prefix), value.as_ref())
+                .map_err(|_| NetconfEditError::MalformedXml)?;
+        }
+    }
+
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    if attribute_count > limits.max_xml_attributes_per_element
+        || namespace_count > limits.max_xml_namespace_decls
+    {
+        return Err(NetconfEditError::MalformedXml);
+    }
+    Ok(())
+}
+
+fn check_value_bytes(
+    value_bytes: usize,
+    limits: Option<&MgmtLimits>,
+) -> Result<(), NetconfEditError> {
+    if let Some(limits) = limits {
+        limits
+            .check_value_bytes(value_bytes)
+            .map_err(|_| NetconfEditError::MalformedXml)?;
+    }
+    Ok(())
+}
+
+fn check_depth(depth: usize, limits: Option<&MgmtLimits>) -> Result<(), NetconfEditError> {
+    if let Some(limits) = limits {
+        limits
+            .check_depth(depth)
+            .map_err(|_| NetconfEditError::MalformedXml)?;
+    }
+    Ok(())
+}
+
+/// Counts a data node before schema resolution allocates or groups it.
+///
+/// The first frame is the NETCONF `<config>` wrapper and does not address a
+/// configuration node; every subsequent element does. The counter uses the
+/// caller's request limits, matching the enclosing RPC parser.
+fn count_addressed_node(
+    stack: &[Frame],
+    addressed_nodes: &mut usize,
+    limits: Option<&MgmtLimits>,
+) -> Result<(), NetconfEditError> {
+    if stack.is_empty() {
+        return Ok(());
+    }
+
+    *addressed_nodes = addressed_nodes.saturating_add(1);
+    if let Some(limits) = limits {
+        limits
+            .check_paths(*addressed_nodes)
+            .map_err(|_| NetconfEditError::MalformedXml)?;
+    }
+    Ok(())
 }
 
 fn map_default_operation(default: EditDefaultOperation) -> EditOperation {
@@ -113,10 +270,24 @@ fn parse_operation(value: &str) -> Result<EditOperation, NetconfEditError> {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct NsScope {
     default: Option<String>,
     bindings: BTreeMap<String, String>,
+}
+
+impl Default for NsScope {
+    fn default() -> Self {
+        // XML 1.0 reserves this implicit binding. Keep the standalone parser
+        // aligned with the envelope parser and never let a captured fragment
+        // reinterpret `xml:*` through an illegal redeclaration.
+        let mut bindings = BTreeMap::new();
+        bindings.insert("xml".to_string(), XML_NAMESPACE_URI.to_string());
+        Self {
+            default: None,
+            bindings,
+        }
+    }
 }
 
 struct Frame {
@@ -171,7 +342,7 @@ fn push_element(
     let (local, namespace, ns_scope, op_attr) = resolve_start(start, parent_scope, decoder)?;
 
     let parent = stack.last().expect("non-empty stack has a parent");
-    if parent.node_kind == NodeKind::Leaf {
+    if matches!(parent.node_kind, NodeKind::Leaf | NodeKind::LeafList) {
         return Err(NetconfEditError::MalformedXml);
     }
 
@@ -220,32 +391,53 @@ fn resolve_start(
     let raw_name = start.name();
     let (prefix, local) = split_qname(raw_name.as_ref())?;
     let mut scope = parent_scope.cloned().unwrap_or_default();
-    let mut operation = None;
 
+    // Namespace declarations apply to the entire start tag rather than only
+    // the attributes after their textual position. Resolve them first so a
+    // legal `nc:operation` that precedes `xmlns:nc` is not rejected merely
+    // because the XML parser yielded attributes in source order.
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
         let key = decode_utf8(attr.key.as_ref())?;
+        if key == "xmlns" {
+            let value = attr
+                .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+                .map_err(|_| NetconfEditError::MalformedXml)?;
+            scope.default = Some(value.to_string());
+        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+            let value = attr
+                .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+                .map_err(|_| NetconfEditError::MalformedXml)?;
+            scope.bindings.insert(prefix.to_string(), value.to_string());
+        }
+    }
+
+    let mut operation = None;
+    for attr in start.attributes().with_checks(true) {
+        let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
+        let key = decode_utf8(attr.key.as_ref())?;
+        if key == "xmlns" || key.starts_with("xmlns:") {
+            continue;
+        }
         let value = attr
             .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
             .map_err(|_| NetconfEditError::MalformedXml)?;
         let value = value.as_ref();
 
-        if key == "xmlns" {
-            scope.default = Some(value.to_string());
-        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
-            scope.bindings.insert(prefix.to_string(), value.to_string());
-        } else {
-            let (attr_prefix, attr_local) = split_qname(attr.key.as_ref())?;
-            let attr_ns = match attr_prefix {
-                Some(p) => scope.bindings.get(p).cloned(),
-                None => scope.default.clone(),
-            };
-            if attr_local == "operation" && attr_ns.as_deref() == Some(NETCONF_BASE_NS) {
-                operation = Some(parse_operation(value)?);
-            } else {
-                // Unknown non-namespace attribute; fail closed.
+        let (attr_prefix, attr_local) = split_qname(attr.key.as_ref())?;
+        let attr_ns = match attr_prefix {
+            Some(p) => scope.bindings.get(p).cloned(),
+            // The default XML namespace never applies to attributes.
+            None => None,
+        };
+        if attr_local == "operation" && attr_ns.as_deref() == Some(NETCONF_BASE_NS) {
+            if operation.is_some() {
                 return Err(NetconfEditError::MalformedXml);
             }
+            operation = Some(parse_operation(value)?);
+        } else {
+            // Unknown non-namespace attribute; fail closed.
+            return Err(NetconfEditError::MalformedXml);
         }
     }
 
@@ -356,7 +548,7 @@ fn finalize_frame(
     _registry: &dyn SchemaRegistry,
 ) -> Result<EditConfigNode, NetconfEditError> {
     match frame.node_kind {
-        NodeKind::Leaf => Ok(EditConfigNode {
+        NodeKind::Leaf | NodeKind::LeafList => Ok(EditConfigNode {
             schema_path: frame.schema_path,
             operation: frame.operation,
             value: Some(frame.text),
@@ -387,10 +579,6 @@ fn finalize_frame(
             value: None,
             children: frame.children,
             list_keys: BTreeMap::new(),
-        }),
-        NodeKind::LeafList => Err(NetconfEditError::UnsupportedShape {
-            path: frame.schema_path,
-            kind: NodeKind::LeafList,
         }),
     }
 }
@@ -504,12 +692,25 @@ mod tests {
             default: None,
             has_default: false,
             presence: false,
-            child_paths: &["/ex:system/ex:hostname"],
+            child_paths: &["/ex:system/ex:hostname", "/ex:system/ex:servers"],
         },
         NodeMeta {
             path: "/ex:system/ex:hostname",
             module: "example",
             kind: NodeKind::Leaf,
+            config: true,
+            leaf_type: Some(LeafType::String),
+            key_leaves: &[],
+            data_class: DataClass::Public,
+            default: None,
+            has_default: false,
+            presence: false,
+            child_paths: &[],
+        },
+        NodeMeta {
+            path: "/ex:system/ex:servers",
+            module: "example",
+            kind: NodeKind::LeafList,
             config: true,
             leaf_type: Some(LeafType::String),
             key_leaves: &[],
@@ -543,10 +744,11 @@ mod tests {
 
     #[test]
     fn parser_preserves_string_leaf_whitespace() {
-        let edit = parse_edit_config_xml(
+        let edit = parse_edit_config_xml_with_limits(
             r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>  router1  </ex:hostname></ex:system></config>"#,
             &REGISTRY,
             EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
         )
         .expect("edit");
 
@@ -556,10 +758,11 @@ mod tests {
 
     #[test]
     fn parser_preserves_cdata_leaf_text() {
-        let edit = parse_edit_config_xml(
+        let edit = parse_edit_config_xml_with_limits(
             r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname><![CDATA[  router1  ]]></ex:hostname></ex:system></config>"#,
             &REGISTRY,
             EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
         )
         .expect("edit");
 
@@ -569,10 +772,11 @@ mod tests {
 
     #[test]
     fn default_operation_none_propagates_to_unannotated_nodes() {
-        let edit = parse_edit_config_xml(
+        let edit = parse_edit_config_xml_with_limits(
             r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
             &REGISTRY,
             EditDefaultOperation::None,
+            &MgmtLimits::default(),
         )
         .expect("edit");
 
@@ -581,11 +785,171 @@ mod tests {
     }
 
     #[test]
+    fn parser_normalizes_repeated_leaf_list_entries_and_namespace_operations() {
+        let edit = parse_edit_config_xml_with_limits(
+            r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><ex:system xmlns:ex="urn:example" nc:operation="replace" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0"><ex:servers>one</ex:servers><ex:servers>two</ex:servers></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect("leaf-list edit");
+
+        assert_eq!(edit.operation, EditOperation::Replace);
+        assert_eq!(edit.children.len(), 2);
+        assert!(edit.children.iter().all(|node| {
+            node.schema_path == "/ex:system/ex:servers"
+                && node.operation == EditOperation::Replace
+                && node.children.is_empty()
+                && node.list_keys.is_empty()
+        }));
+    }
+
+    #[test]
+    fn parser_rejects_nested_leaf_list_content() {
+        let err = parse_edit_config_xml_with_limits(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:servers><ex:hostname>bad</ex:hostname></ex:servers></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect_err("leaf-list entries must be scalar");
+
+        assert!(matches!(err, NetconfEditError::MalformedXml));
+    }
+
+    #[test]
+    fn public_parser_uses_the_caller_configured_addressed_node_limit() {
+        let limits = MgmtLimits {
+            max_paths_per_request: MgmtLimits::default().max_paths_per_request + 1,
+            ..MgmtLimits::default()
+        };
+        let limit = limits.max_paths_per_request - 1;
+        let mut xml = String::from(r#"<config><ex:system xmlns:ex="urn:example">"#);
+        for _ in 0..limit {
+            xml.push_str("<ex:servers>entry</ex:servers>");
+        }
+        xml.push_str("</ex:system></config>");
+
+        let edit = parse_edit_config_xml_with_limits(
+            &xml,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &limits,
+        )
+        .expect("explicitly raised node limit must match the envelope parser");
+        assert_eq!(edit.children.len(), limit);
+    }
+
+    #[test]
+    fn public_parser_rejects_trailing_roots_and_unqualified_operations() {
+        let trailing_root = parse_edit_config_xml_with_limits(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config><config><ex:system xmlns:ex="urn:example"/></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect_err("a config fragment must contain exactly one root");
+        assert!(matches!(trailing_root, NetconfEditError::MalformedXml));
+
+        let trailing_text = parse_edit_config_xml_with_limits(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config>trailing"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect_err("a config fragment must reach EOF without trailing text");
+        assert!(matches!(trailing_text, NetconfEditError::MalformedXml));
+
+        let unqualified_operation = parse_edit_config_xml_with_limits(
+            r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><ex:system xmlns:ex="urn:example" operation="replace"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect_err("the default namespace must not qualify an operation attribute");
+        assert!(matches!(
+            unqualified_operation,
+            NetconfEditError::MalformedXml
+        ));
+
+        let pre_root_cdata = parse_edit_config_xml_with_limits(
+            r#"<![CDATA[trailing]]><config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect_err("CDATA outside the sole config root must fail");
+        assert!(matches!(pre_root_cdata, NetconfEditError::MalformedXml));
+
+        let post_root_cdata = parse_edit_config_xml_with_limits(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config><![CDATA[trailing]]>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect_err("CDATA after the sole config root must fail");
+        assert!(matches!(post_root_cdata, NetconfEditError::MalformedXml));
+    }
+
+    #[test]
+    fn standalone_parser_enforces_xml_limits_and_reserved_namespaces() {
+        let depth_limited = MgmtLimits {
+            max_xml_depth: 2,
+            ..MgmtLimits::default()
+        };
+        let depth = parse_edit_config_xml_with_limits(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &depth_limited,
+        )
+        .expect_err("the direct parser must enforce nesting limits");
+        assert!(matches!(depth, NetconfEditError::MalformedXml));
+
+        let attribute_limited = MgmtLimits {
+            max_xml_attributes_per_element: 1,
+            max_xml_namespace_decls: 1,
+            ..MgmtLimits::default()
+        };
+        let attributes = parse_edit_config_xml_with_limits(
+            r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:ex="urn:example"><ex:system><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &attribute_limited,
+        )
+        .expect_err("the direct parser must bound attributes and namespace declarations");
+        assert!(matches!(attributes, NetconfEditError::MalformedXml));
+
+        let value_limited = MgmtLimits {
+            max_value_bytes: 3,
+            ..MgmtLimits::default()
+        };
+        let value = parse_edit_config_xml_with_limits(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &value_limited,
+        )
+        .expect_err("the direct parser must bound text values");
+        assert!(matches!(value, NetconfEditError::MalformedXml));
+
+        let rebind = parse_edit_config_xml_with_limits(
+            r#"<config xmlns:xml="urn:ietf:params:xml:ns:netconf:base:1.0"><ex:system xmlns:ex="urn:example" xml:operation="merge"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
+        )
+        .expect_err("the XML reserved prefix must not be rebound as NETCONF");
+        assert!(matches!(rebind, NetconfEditError::MalformedXml));
+    }
+
+    #[test]
     fn prefixed_config_requires_declared_prefix() {
-        let err = parse_edit_config_xml(
+        let err = parse_edit_config_xml_with_limits(
             r#"<nc:config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></nc:config>"#,
             &REGISTRY,
             EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
         )
         .expect_err("undeclared config prefix must fail");
 
@@ -594,13 +958,25 @@ mod tests {
 
     #[test]
     fn mismatched_end_tag_fails_closed() {
-        let err = parse_edit_config_xml(
+        let err = parse_edit_config_xml_with_limits(
             r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:host></ex:system></config>"#,
             &REGISTRY,
             EditDefaultOperation::Merge,
+            &MgmtLimits::default(),
         )
         .expect_err("mismatched tag must fail");
 
         assert!(matches!(err, NetconfEditError::MalformedXml));
+    }
+
+    #[test]
+    fn legacy_public_parser_signature_remains_default_bounded() {
+        let edit = parse_edit_config_xml(
+            r#"<config><ex:system xmlns:ex="urn:example"><ex:hostname>router1</ex:hostname></ex:system></config>"#,
+            &REGISTRY,
+            EditDefaultOperation::Merge,
+        )
+        .expect("three-argument public parser remains available");
+        assert_eq!(edit.schema_path, "/ex:system");
     }
 }

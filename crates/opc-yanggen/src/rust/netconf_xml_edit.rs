@@ -3,9 +3,9 @@
 //! The emitted module implements `opc_mgmt_schema::NetconfXmlEditApplicator` for
 //! the generated root config type. It applies a normalized `EditConfigNode`
 //! tree produced by the server-side XML parser to a clone of the running config
-//! and returns the full candidate. It is fail-closed for shapes whose edit
-//! semantics are ambiguous in this slice (leaf-lists, keyless lists, custom
-//! typedefs, choice/case).
+//! and returns the full candidate. It supports schema-typed leaf-list entries
+//! and is fail-closed for shapes whose edit semantics remain ambiguous in this
+//! slice (keyless lists, custom typedefs, choice/case).
 
 use super::{
     clean_segment, is_sensitive_name, last_segment, to_pascal_case, to_snake_case,
@@ -41,7 +41,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             SchemaNodeKind::Container | SchemaNodeKind::List => {
                 apply_fns.push(apply_children_fn(node, &nodes_by_path, input)?);
             }
-            SchemaNodeKind::Leaf | SchemaNodeKind::LeafList => {}
+            SchemaNodeKind::Leaf => {}
+            SchemaNodeKind::LeafList => {
+                apply_fns.push(apply_leaf_list_fn(node, &nodes_by_path)?);
+            }
             SchemaNodeKind::Choice | SchemaNodeKind::Case => {
                 return Err(RustGenerationError::new(format!(
                     "netconf_xml_edit: unsupported node kind {:?} at {}",
@@ -161,6 +164,8 @@ fn apply_children_fn(
         to_pascal_case(clean_segment(last_segment(&node.path)))
     );
 
+    let mut leaf_list_group_arms = TokenStream::new();
+    let mut leaf_list_apply_stmts = TokenStream::new();
     let mut arms = TokenStream::new();
     for child_path in &node.child_paths {
         let Some(child) = nodes_by_path.get(child_path) else {
@@ -330,13 +335,28 @@ fn apply_children_fn(
                 }
             }
             SchemaNodeKind::LeafList => {
-                quote! {
+                let leaf_list_fn_ident = format_ident!("apply_{}", path_to_snake(&child.path));
+                let nodes_ident = format_ident!("{}_entries", path_to_snake(&child.path));
+                let values = if is_sensitive {
+                    quote! { value.#field_ident.get_mut() }
+                } else {
+                    quote! { &mut value.#field_ident }
+                };
+                leaf_list_group_arms.extend(quote! {
                     #child_path_lit => {
-                        return Err(NetconfEditError::UnsupportedShape {
-                            path: child.schema_path,
-                            kind: NodeKind::LeafList,
-                        });
+                        leaf_list_children
+                            .entry(child.schema_path)
+                            .or_default()
+                            .push(child);
                     }
+                });
+                leaf_list_apply_stmts.extend(quote! {
+                    if let Some(#nodes_ident) = leaf_list_children.get(#child_path_lit) {
+                        #leaf_list_fn_ident(#nodes_ident, #values)?;
+                    }
+                });
+                quote! {
+                    #child_path_lit => {}
                 }
             }
             SchemaNodeKind::Choice | SchemaNodeKind::Case => quote! {},
@@ -344,11 +364,30 @@ fn apply_children_fn(
         arms.extend(arm);
     }
 
+    let leaf_list_grouping = if leaf_list_group_arms.is_empty() {
+        TokenStream::new()
+    } else {
+        quote! {
+            let mut leaf_list_children: std::collections::BTreeMap<
+                &'static str,
+                Vec<&EditConfigNode>,
+            > = std::collections::BTreeMap::new();
+            for child in children {
+                match child.schema_path {
+                    #leaf_list_group_arms
+                    _ => {}
+                }
+            }
+            #leaf_list_apply_stmts
+        }
+    };
+
     Ok(quote! {
         fn #fn_ident(
             children: &[EditConfigNode],
             value: &mut #type_ident,
         ) -> Result<(), NetconfEditError> {
+            #leaf_list_grouping
             for child in children {
                 match child.schema_path {
                     #arms
@@ -362,6 +401,192 @@ fn apply_children_fn(
             Ok(())
         }
     })
+}
+
+/// Emit an applicator for one schema leaf-list.
+///
+/// The parser represents each XML leaf-list element as an individual child
+/// node. Applying those nodes as a group keeps the generated collection work
+/// bounded and preserves their document order. Per RFC 7950 section 7.7.9, a
+/// leaf-list entry `replace` is an entry upsert, not a request to clear the
+/// collection. Enclosing container/root `replace` resets the `Vec` before this
+/// helper is called, so a full-subtree replacement still receives exactly the
+/// XML entries in document order. That preserves `ordered-by user` order and
+/// provides a deterministic server order for `ordered-by system`.
+fn apply_leaf_list_fn(
+    node: &SchemaNode,
+    nodes_by_path: &HashMap<String, &SchemaNode>,
+) -> Result<TokenStream, RustGenerationError> {
+    let fn_ident = format_ident!("apply_{}", path_to_snake(&node.path));
+    let key_fn_ident = format_ident!("leaf_list_key_{}", path_to_snake(&node.path));
+    let path = &node.path;
+    let element_type = raw_type(node, nodes_by_path);
+
+    if !node.config {
+        return Ok(quote! {
+            fn #fn_ident(
+                nodes: &[&EditConfigNode],
+                _values: &mut Vec<#element_type>,
+            ) -> Result<(), NetconfEditError> {
+                let path = nodes.first().map_or(#path, |node| node.schema_path);
+                Err(NetconfEditError::ReadOnly { path })
+            }
+        });
+    }
+
+    if matches!(
+        resolved_type(node, nodes_by_path),
+        Some(TypeRef::Custom { .. }) | None
+    ) {
+        return Ok(quote! {
+            fn #fn_ident(
+                nodes: &[&EditConfigNode],
+                _values: &mut Vec<#element_type>,
+            ) -> Result<(), NetconfEditError> {
+                let path = nodes.first().map_or(#path, |node| node.schema_path);
+                Err(NetconfEditError::UnsupportedShape {
+                    path,
+                    kind: NodeKind::LeafList,
+                })
+            }
+        });
+    }
+
+    let parse_expr = parse_leaf_value_expr(node, nodes_by_path)?;
+    let key_expr = leaf_list_value_key_expr(node, nodes_by_path)?;
+
+    Ok(quote! {
+        fn #key_fn_ident(value: &#element_type) -> String {
+            #key_expr
+        }
+
+        fn #fn_ident(
+            nodes: &[&EditConfigNode],
+            values: &mut Vec<#element_type>,
+        ) -> Result<(), NetconfEditError> {
+            let mut edits = Vec::with_capacity(nodes.len());
+            let mut edit_keys = std::collections::BTreeSet::new();
+            let has_mutation = nodes
+                .iter()
+                .any(|node| node.operation != EditOperation::None);
+            for node in nodes {
+                if node.schema_path != #path {
+                    return Err(NetconfEditError::UnknownPath(node.schema_path.to_string()));
+                }
+                if !node.children.is_empty() {
+                    return Err(NetconfEditError::MalformedXml);
+                }
+                if !node.list_keys.is_empty() {
+                    return Err(NetconfEditError::KeyOnNonList {
+                        path: node.schema_path,
+                    });
+                }
+                let _v = node
+                    .value
+                    .as_deref()
+                    .ok_or(NetconfEditError::InvalidValue { path: #path })?;
+                #parse_expr
+                let key = #key_fn_ident(&parsed);
+                if !edit_keys.insert(key.clone()) {
+                    return Err(NetconfEditError::InvalidValue { path: #path });
+                }
+                edits.push((node.operation, parsed, key));
+            }
+
+            if !has_mutation {
+                return Ok(());
+            }
+
+            // Refuse to mutate an invalid running collection. A complete
+            // enclosing-subtree replacement starts from `Default` before this
+            // helper runs, so it is still able to repair an old collection.
+            let mut current_keys = std::collections::BTreeSet::new();
+            for value in values.iter() {
+                if !current_keys.insert(#key_fn_ident(value)) {
+                    return Err(NetconfEditError::InvalidValue { path: #path });
+                }
+            }
+
+            let mut removed_keys = std::collections::BTreeSet::new();
+            let mut additions = Vec::new();
+            for (operation, parsed, key) in edits {
+                match operation {
+                    // RFC 7950 section 7.7.9 defines entry-level `replace` as
+                    // an upsert. The enclosing root/container handles a
+                    // collection replacement by resetting the parent first.
+                    EditOperation::Merge | EditOperation::Replace => {
+                        if current_keys.insert(key) {
+                            additions.push(parsed);
+                        }
+                    }
+                    EditOperation::Create => {
+                        if !current_keys.insert(key) {
+                            return Err(NetconfEditError::OperationNotSupported {
+                                path: #path,
+                                operation,
+                                kind: NodeKind::LeafList,
+                            });
+                        }
+                        additions.push(parsed);
+                    }
+                    EditOperation::Delete => {
+                        if !current_keys.remove(&key) {
+                            return Err(NetconfEditError::OperationNotSupported {
+                                path: #path,
+                                operation,
+                                kind: NodeKind::LeafList,
+                            });
+                        }
+                        removed_keys.insert(key);
+                    }
+                    EditOperation::Remove => {
+                        if current_keys.remove(&key) {
+                            removed_keys.insert(key);
+                        }
+                    }
+                    EditOperation::None => {}
+                }
+            }
+            if !removed_keys.is_empty() {
+                values.retain(|value| !removed_keys.contains(&#key_fn_ident(value)));
+            }
+            values.extend(additions);
+            Ok(())
+        }
+    })
+}
+
+/// Emits a deterministic typed identity key for a leaf-list value.
+///
+/// The generated applicator needs value identity for YANG leaf-list entry
+/// operations, but generated numeric wrappers deliberately expose only
+/// `PartialEq`. A canonical string key avoids an O(n²) scan while preserving
+/// numeric equivalence (for example, distinct lexical `uint16` spellings) and
+/// does not appear in errors or logs.
+fn leaf_list_value_key_expr(
+    node: &SchemaNode,
+    nodes_by_path: &HashMap<String, &SchemaNode>,
+) -> Result<TokenStream, RustGenerationError> {
+    match resolved_type(node, nodes_by_path) {
+        Some(TypeRef::Boolean) => Ok(quote! {
+            if *value { "true".to_string() } else { "false".to_string() }
+        }),
+        Some(TypeRef::Uint16) | Some(TypeRef::Uint32) => Ok(quote! { value.to_string() }),
+        Some(TypeRef::Int64) => Ok(quote! { value.0.to_string() }),
+        Some(TypeRef::Decimal64) => Ok(quote! {
+            let bits = if value.0 == 0.0 { 0_u64 } else { value.0.to_bits() };
+            bits.to_string()
+        }),
+        Some(TypeRef::Empty) => Ok(quote! { String::new() }),
+        Some(TypeRef::String)
+        | Some(TypeRef::IdentityRef { .. })
+        | Some(TypeRef::LeafRef { .. })
+        | Some(TypeRef::Enumeration { .. }) => Ok(quote! { value.clone() }),
+        Some(TypeRef::Custom { .. }) | None => Err(RustGenerationError::new(format!(
+            "netconf_xml_edit: unsupported leaf-list type at {}",
+            node.path
+        ))),
+    }
 }
 
 fn apply_list_fn(
@@ -582,7 +807,11 @@ fn parse_leaf_value_expr(
             #int64_range_check
         },
         Some(TypeRef::Decimal64) => quote! {
-            let parsed = YangDecimal64(_v.trim().parse::<f64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
+            let decimal = _v.trim().parse::<f64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
+            if !decimal.is_finite() {
+                return Err(NetconfEditError::InvalidValue { path: #path });
+            }
+            let parsed = YangDecimal64(decimal);
         },
         Some(TypeRef::Empty) => quote! {
             if !_v.trim().is_empty() {
