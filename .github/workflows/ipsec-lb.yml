@@ -82,7 +82,7 @@ jobs:
           timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_roster_contracts[@]}")
           skips=()
           for timing_contract in "${timing_contracts[@]}"; do
-            skips+=(--skip "$timing_contract")
+            skips+=(--skip "stateless_quorum_consumer::$timing_contract")
           done
           cargo test --locked \
             -p opc-ipsec-lb \
@@ -99,22 +99,22 @@ jobs:
               -p opc-session-net \
               --all-features \
               --quiet \
-              --test stateless_quorum_consumer \
+              --lib \
               -- \
               --test-threads=1 \
               --exact \
-              "$timing_contract"
+              "stateless_quorum_consumer::$timing_contract"
           done
           for timing_contract in "${optimized_roster_contracts[@]}"; do
             env CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
               -p opc-session-net \
               --all-features \
               --quiet \
-              --test stateless_quorum_consumer \
+              --lib \
               -- \
               --test-threads=1 \
               --exact \
-              "$timing_contract"
+              "stateless_quorum_consumer::$timing_contract"
           done
 
   docs:

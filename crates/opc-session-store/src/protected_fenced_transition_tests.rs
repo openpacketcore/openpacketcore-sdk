@@ -114,6 +114,42 @@ impl JournalFixture {
             1
         );
     }
+
+    fn delete_prepared_token(&self) {
+        let connection =
+            rusqlite::Connection::open(&self.path).expect("open journal fixture for deletion");
+        assert_eq!(
+            connection
+                .execute("DELETE FROM prepared_fenced_transition_journal", [])
+                .expect("delete prepared fixture token"),
+            1
+        );
+    }
+
+    fn substitute_prepared_token(
+        &self,
+        target: FencedTransitionRequestId,
+        replacement: FencedTransitionRequestId,
+    ) {
+        let connection =
+            rusqlite::Connection::open(&self.path).expect("open journal fixture for substitution");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE prepared_fenced_transition_journal \
+                     SET prepared_schema_version = (SELECT prepared_schema_version \
+                         FROM prepared_fenced_transition_journal WHERE request_id = ?1), \
+                         prepared_token = (SELECT prepared_token \
+                         FROM prepared_fenced_transition_journal WHERE request_id = ?1), \
+                         integrity_tag = (SELECT integrity_tag \
+                         FROM prepared_fenced_transition_journal WHERE request_id = ?1) \
+                     WHERE request_id = ?2",
+                    rusqlite::params![replacement.as_bytes(), target.as_bytes()],
+                )
+                .expect("substitute a different journaled prepared token"),
+            1
+        );
+    }
 }
 
 fn protected_v2_journal_scope_for<B: SessionBackend + ?Sized>(
@@ -2692,6 +2728,36 @@ async fn protected_fenced_transition_rejects_oversized_journal_row_without_effec
 }
 
 #[tokio::test]
+async fn protected_fenced_transition_router_projection_rejects_substituted_journal_token() {
+    let spy = Arc::new(AtomicSpy::new());
+    let journal = JournalFixture::new(0xc3);
+    let wrapper = Arc::new(
+        RemoteSealingSessionBackend::new(
+            Arc::clone(&spy),
+            CountingRemoteProvider::with_key("projection-substitution", 0xc3),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(journal.open()),
+    );
+    let first = wrapper
+        .prepare_fenced_transition(create_request(0xc3))
+        .await
+        .expect("prepare first protected transition");
+    let second = wrapper
+        .prepare_fenced_transition(create_request(0xc4))
+        .await
+        .expect("prepare replacement protected transition");
+    journal.substitute_prepared_token(first.request_id(), second.request_id());
+
+    assert!(matches!(
+        wrapper.fenced_transition(&first).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert_eq!(spy.dispatches(), 0);
+    assert!(spy.statuses().is_empty());
+}
+
+#[tokio::test]
 async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_physical_request() {
     let spy = Arc::new(AtomicSpy::new());
     spy.delay_ambiguous_commit();
@@ -2837,6 +2903,53 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
     );
     assert_eq!(spy.prepared().len(), 2);
     assert_eq!(spy.get_calls(), 0, "conflict recovery must not read back");
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_router_projection_rechecks_the_journal_before_dispatch() {
+    let local_spy = Arc::new(AtomicSpy::new());
+    let local_journal = JournalFixture::new(0xc1);
+    let local = Arc::new(
+        EncryptingSessionBackend::new(
+            Arc::clone(&local_spy),
+            CountingKeyProvider::with_key("projection-local", 0xc1),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(local_journal.open()),
+    );
+    let local_prepared = local
+        .prepare_fenced_transition(create_request(0xc1))
+        .await
+        .expect("prepare local protected transition");
+    local_journal.delete_prepared_token();
+    assert!(matches!(
+        local.fenced_transition(&local_prepared).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert_eq!(local_spy.dispatches(), 0);
+    assert!(local_spy.statuses().is_empty());
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    let remote_journal = JournalFixture::new(0xc2);
+    let remote = Arc::new(
+        RemoteSealingSessionBackend::new(
+            Arc::clone(&remote_spy),
+            CountingRemoteProvider::with_key("projection-remote", 0xc2),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(remote_journal.open()),
+    );
+    let remote_prepared = remote
+        .prepare_fenced_transition(create_request(0xc2))
+        .await
+        .expect("prepare remote protected transition");
+    remote_journal.delete_prepared_token();
+    assert!(matches!(
+        remote.fenced_transition(&remote_prepared).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert_eq!(remote_spy.dispatches(), 0);
+    assert!(remote_spy.statuses().is_empty());
 }
 
 #[tokio::test]

@@ -28,9 +28,9 @@ use super::snapshot::rename_noreplace_in_directory;
 use super::snapshot::snapshot_cleanup_unlink_guard_name_authenticates_metadata;
 use super::snapshot::{
     acknowledge_unpublished_snapshot_cleanup_failure,
-    create_unpublished_snapshot_file_in_namespace, has_unpublished_snapshot_cleanup_failure,
-    pending_unpublished_snapshot_cleanup_failures, readonly_nofollow,
-    record_unpublished_snapshot_cleanup_failure_in_namespace, PinnedSqliteFile,
+    create_unpublished_snapshot_file_in_namespace, fixed_verity_is_exactly_unsealed,
+    has_unpublished_snapshot_cleanup_failure, pending_unpublished_snapshot_cleanup_failures,
+    readonly_nofollow, record_unpublished_snapshot_cleanup_failure_in_namespace, PinnedSqliteFile,
     RetainedSnapshotDirectory, SessionSnapshotFile, UnpublishedSnapshotArtifact,
     SNAPSHOT_ENVELOPE_FOOTER_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES, SNAPSHOT_MAX_BYTES,
 };
@@ -44,7 +44,7 @@ use super::snapshot::{
 };
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
-    SessionTopologyMemberBinding,
+    SessionTopologyMemberBinding, SnapshotIntegrityPolicy,
 };
 use crate::backend::ReplicationEntry;
 use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
@@ -179,6 +179,34 @@ fn take_snapshot_directory_validation_failure(
     } else {
         false
     }
+}
+
+// Model only the crash boundary after an SDK-owned successor has been renamed
+// and its directory fsynced, but before its metadata transaction.  The test
+// leaves the exact journal-reserved candidate in place for next-open preflight
+// reclamation; production has no hook at this boundary.
+#[cfg(test)]
+fn legacy_fixed_snapshot_reseed_candidate_process_losses(
+) -> &'static std::sync::Mutex<BTreeSet<PathBuf>> {
+    static LOSSES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    LOSSES.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_legacy_fixed_snapshot_reseed_candidate_process_loss(snapshot_directory: PathBuf) {
+    legacy_fixed_snapshot_reseed_candidate_process_losses()
+        .lock()
+        .expect("legacy reseed candidate process-loss hook")
+        .insert(snapshot_directory);
+}
+
+#[cfg(test)]
+fn take_legacy_fixed_snapshot_reseed_candidate_process_loss(snapshot_directory: &Path) -> bool {
+    legacy_fixed_snapshot_reseed_candidate_process_losses()
+        .lock()
+        .expect("legacy reseed candidate process-loss hook")
+        .remove(snapshot_directory)
 }
 
 // The path-to-core handoff is a separate causal boundary from ordinary
@@ -2081,6 +2109,9 @@ async fn wait_before_fixed_snapshot_return(final_path: &Path) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SessionConsensusStorageError {
+    /// The explicitly required snapshot integrity capability is unavailable.
+    #[error("required session consensus snapshot integrity is unavailable")]
+    SnapshotIntegrityUnavailable,
     /// Durable consensus initialization is unsupported on this platform.
     #[error("session consensus storage is unsupported on this platform")]
     UnsupportedPlatform,
@@ -2170,12 +2201,107 @@ pub(crate) enum LiveTerminalRecoveryHandoffState {
 /// publication and descriptor-bound consumption.  The embedded gate identity
 /// makes a token from another core fail closed rather than serializing the
 /// wrong namespace.
+#[derive(Clone)]
 pub(crate) struct LiveTerminalRecoveryHandoffGate {
     snapshot_gate: Arc<tokio::sync::Mutex<()>>,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// A cancelled integrity worker must keep the single snapshot transaction
+/// and namespace lease until its last descriptor read has completed.
+#[derive(Clone)]
+struct SnapshotIntegrityWork {
+    _gate: LiveTerminalRecoveryHandoffGate,
+    _lease: Arc<SnapshotDirectoryLease>,
+}
+
+async fn seal_snapshot_pin(
+    mut pinned: PinnedSqliteFile,
+    policy: SnapshotIntegrityPolicy,
+    expected_payload_checksum: Option<[u8; 32]>,
+    retention: Option<SnapshotIntegrityWork>,
+) -> io::Result<PinnedSqliteFile> {
+    tokio::task::spawn_blocking(move || {
+        let _retention = retention;
+        pinned.seal_with_integrity(policy)?;
+        if let Some(checksum) = expected_payload_checksum {
+            pinned.verify_payload_checksum(checksum)?;
+        }
+        Ok(pinned)
+    })
+    .await
+    .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
+}
+
+async fn verify_received_snapshot(
+    mut pinned: PinnedSqliteFile,
+    path: PathBuf,
+    retention: SnapshotIntegrityWork,
+) -> io::Result<(
+    PinnedSqliteFile,
+    [u8; 32],
+    super::snapshot::ImmutableSnapshotEnvelope,
+)> {
+    tokio::task::spawn_blocking(move || {
+        let _retention = retention;
+        let (checksum, length) = pinned.snapshot_envelope_footer_from_pinned_descriptor(
+            &path,
+            SNAPSHOT_FOOTER_MAGIC,
+            SNAPSHOT_FOOTER_BYTES,
+            SNAPSHOT_MAX_BYTES,
+        )?;
+        let envelope = pinned.verify_snapshot_envelope_and_bind_immutable_generation(
+            &path,
+            SNAPSHOT_FOOTER_MAGIC,
+            SNAPSHOT_FOOTER_BYTES,
+            SNAPSHOT_MAX_BYTES,
+            checksum,
+            length,
+        )?;
+        Ok((pinned, checksum, envelope))
+    })
+    .await
+    .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
+}
+
+/// Capture a restart/transfer proof and authenticate it against the durable
+/// metadata on a blocking worker, never under the live SQLite connection.
+async fn verify_admitted_snapshot(
+    file: std::fs::File,
+    lease: Arc<SnapshotDirectoryLease>,
+    name: std::ffi::OsString,
+    policy: SnapshotIntegrityPolicy,
+    checksum: [u8; 32],
+    length: u64,
+) -> io::Result<PinnedSqliteFile> {
+    tokio::task::spawn_blocking(move || {
+        let path = lease.namespace.sqlite_child_path(&name)?;
+        let mut pinned = PinnedSqliteFile::from_file_and_verify_in_namespace(
+            file,
+            Arc::clone(&lease.namespace),
+            &name,
+            policy,
+        )?;
+        let verified = pinned.verify_snapshot_envelope_and_bind_immutable_generation(
+            &path,
+            SNAPSHOT_FOOTER_MAGIC,
+            SNAPSHOT_FOOTER_BYTES,
+            SNAPSHOT_MAX_BYTES,
+            checksum,
+            length,
+        )?;
+        pinned.verify_bound_immutable_snapshot_envelope(&path, verified.total_length)?;
+        Ok(pinned)
+    })
+    .await
+    .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
 }
 
 impl LiveTerminalRecoveryHandoffConsumer {
+    pub(crate) fn snapshot_integrity_policy(&self) -> SnapshotIntegrityPolicy {
+        self.core.snapshot_integrity
+    }
+
     fn from_live_snapshot_owner(
         core: &SqliteConsensusCore,
         snapshot_directory_lease: &Arc<SnapshotDirectoryLease>,
@@ -2195,7 +2321,7 @@ impl LiveTerminalRecoveryHandoffConsumer {
         let guard = Arc::clone(&snapshot_gate).lock_owned().await;
         Ok(LiveTerminalRecoveryHandoffGate {
             snapshot_gate,
-            _guard: guard,
+            _guard: Arc::new(guard),
         })
     }
 
@@ -2261,11 +2387,8 @@ impl LiveTerminalRecoveryHandoffConsumer {
         // current record between the descriptor-bound classifier and the
         // descriptor-bound consumer.
         if self.core.terminal_recovery_handoff_pending()? {
-            validate_and_clean_snapshot_directory(
-                &self.core,
-                Some(self.snapshot_directory_lease.as_ref()),
-            )
-            .await?;
+            validate_and_clean_snapshot_directory(&self.core, Some(&self.snapshot_directory_lease))
+                .await?;
             return Ok(LiveTerminalRecoveryHandoffState::Consumed);
         }
 
@@ -2312,11 +2435,8 @@ impl LiveTerminalRecoveryHandoffConsumer {
             consensus::LiveTerminalRecoveryHandoffInstallOutcome::Installed => {}
         }
 
-        validate_and_clean_snapshot_directory(
-            &self.core,
-            Some(self.snapshot_directory_lease.as_ref()),
-        )
-        .await?;
+        validate_and_clean_snapshot_directory(&self.core, Some(&self.snapshot_directory_lease))
+            .await?;
         Ok(LiveTerminalRecoveryHandoffState::Consumed)
     }
 
@@ -2664,6 +2784,7 @@ pub(crate) async fn open_with_member_bindings(
         ConsensusAuthorityProfile::Dynamic,
         None,
         None,
+        SnapshotIntegrityPolicy::FsVerity,
     )
     .await
 }
@@ -2698,41 +2819,7 @@ pub(crate) async fn open_with_member_bindings_and_roster_attestation_root(
         ConsensusAuthorityProfile::Dynamic,
         None,
         roster_attestation_trust_root,
-    )
-    .await
-}
-
-/// Open one durable fixed-quorum authority store.
-///
-/// Unlike the dynamic entry point, this binds the original durable storage
-/// identity to `identity` permanently and rejects membership transitions.
-#[cfg(test)]
-pub(crate) async fn open_fixed_with_member_bindings(
-    backend: &SqliteSessionBackend,
-    snapshot_dir: impl Into<PathBuf>,
-    identity: SessionConsensusIdentity,
-    expected_members: BTreeSet<SessionConsensusNodeId>,
-    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
-    membership_admission: SessionRaftPeerDirectory,
-    placement_policy: PlacementResiliencePolicy,
-) -> Result<
-    (
-        SqliteConsensusLogStore,
-        SqliteConsensusStateMachine,
-        SessionConsensusIdentity,
-    ),
-    SessionConsensusStorageError,
-> {
-    open_with_member_bindings_for_profile(
-        backend,
-        snapshot_dir,
-        identity,
-        expected_members,
-        expected_bindings,
-        membership_admission,
-        ConsensusAuthorityProfile::FixedImmutable,
-        Some(placement_policy),
-        None,
+        SnapshotIntegrityPolicy::FsVerity,
     )
     .await
 }
@@ -2748,6 +2835,7 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
     membership_admission: SessionRaftPeerDirectory,
     placement_policy: PlacementResiliencePolicy,
     roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    snapshot_integrity: SnapshotIntegrityPolicy,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -2766,8 +2854,42 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
         ConsensusAuthorityProfile::FixedImmutable,
         Some(placement_policy),
         roster_attestation_trust_root,
+        snapshot_integrity,
     )
     .await
+}
+
+/// Qualify the exact admitted filesystem before initializing consensus state.
+/// The probe is an ordinary recoverable SDK staging child, not a permanent
+/// capability marker: storage may change between process incarnations.
+async fn preflight_fs_verity(
+    lease: Arc<SnapshotDirectoryLease>,
+) -> Result<(), SessionConsensusStorageError> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let name = std::ffi::OsString::from(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
+        let (mut writer, mut cleanup) = create_unpublished_snapshot_file_in_namespace(
+            Arc::clone(&lease.namespace),
+            &name,
+            true,
+            false,
+        )?;
+        writer.write_all(b"OPC snapshot integrity preflight\n")?;
+        writer.sync_all()?;
+        let mut pinned =
+            PinnedSqliteFile::from_file(writer, lease.namespace.sqlite_child_path(&name)?)?;
+        pinned.rebind_in_namespace(Arc::clone(&lease.namespace), &name)?;
+        let mut reader = pinned.pin_readonly_from_writer()?;
+        drop(pinned);
+        let result = reader.seal_fixed();
+        // Observe cleanup even when qualification fails. Drop retains its
+        // usual failure latch if exact cleanup itself cannot complete.
+        cleanup.remove_owned()?;
+        result
+    })
+    .await
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    .map_err(|_| SessionConsensusStorageError::SnapshotIntegrityUnavailable)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2781,6 +2903,7 @@ async fn open_with_member_bindings_for_profile(
     authority_profile: ConsensusAuthorityProfile,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    snapshot_integrity: SnapshotIntegrityPolicy,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -2793,8 +2916,13 @@ async fn open_with_member_bindings_for_profile(
     let snapshot_directory_lease = acquire_snapshot_directory_lease(backend, &snapshot_dir)
         .await
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable
+        && snapshot_integrity == SnapshotIntegrityPolicy::FsVerity
+    {
+        preflight_fs_verity(Arc::clone(&snapshot_directory_lease)).await?;
+    }
     run_snapshot_directory_admission_test_hook(&snapshot_directory_lease.canonical_directory);
-    let core = SqliteConsensusCore::initialize_with_roster_attestation_root_with_admitted_snapshot_directory(
+    let mut core = SqliteConsensusCore::initialize_with_roster_attestation_root_with_admitted_snapshot_directory(
         backend,
         snapshot_directory_lease.canonical_directory.clone(),
         identity,
@@ -2805,7 +2933,23 @@ async fn open_with_member_bindings_for_profile(
         roster_attestation_trust_root,
     )
     .await?;
+    core.snapshot_integrity = snapshot_integrity;
+    // Validate the selected legacy descriptor before constructing a successor.
+    // The compatibility branch accepts only the journal-bound `measure(2)`
+    // ENODATA result and never reads the old payload.  Running this after a
+    // build would let a marker alone authorize a replacement.
     validate_and_clean_snapshot_directory(&core, Some(&snapshot_directory_lease)).await?;
+    if reseed_legacy_fixed_snapshot_from_authoritative_database(
+        &core,
+        Arc::clone(&snapshot_directory_lease),
+    )
+    .await?
+    {
+        // Metadata publication atomically clears the journal. Only then may
+        // ordinary scavenging reclaim the unsealed predecessor by its old
+        // namespace identity; it is never read or used as unlink authority.
+        validate_and_clean_snapshot_directory(&core, Some(&snapshot_directory_lease)).await?;
+    }
     let storage_identity = core.storage_identity;
     let shutdown_guard = ConsensusStorageShutdownGuard::tracked();
     let state_machine_shutdown_guard = shutdown_guard.child();
@@ -2829,6 +2973,47 @@ async fn open_with_member_bindings_for_profile(
         },
         storage_identity,
     ))
+}
+
+/// Replace the one exact old selected fixed artifact with a newly built,
+/// sealed snapshot. The current old file is never opened for contents: its
+/// only compatibility classification happens under the builder's namespace
+/// lease as a typed fs-verity `ENODATA` probe.
+async fn reseed_legacy_fixed_snapshot_from_authoritative_database(
+    core: &SqliteConsensusCore,
+    snapshot_directory_lease: Arc<SnapshotDirectoryLease>,
+) -> Result<bool, SessionConsensusStorageError> {
+    if core.authority_profile != ConsensusAuthorityProfile::FixedImmutable {
+        return Ok(false);
+    }
+    let should_reseed = {
+        let conn = core.conn.lock().await;
+        let current = consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        let reseed =
+            consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, core.storage_identity)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        match (reseed.as_ref(), current.as_ref()) {
+            (Some(reseed), Some(current)) => reseed
+                .matches_current(core.storage_identity, current)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?,
+            (Some(_), None) => return Err(SessionConsensusStorageError::CorruptState),
+            (None, _) => false,
+        }
+    };
+    if !should_reseed {
+        return Ok(false);
+    }
+    let mut builder = SqliteConsensusSnapshotBuilder {
+        core: core.clone(),
+        _snapshot_directory_lease: snapshot_directory_lease,
+        _shutdown_guard: ConsensusStorageShutdownGuard::tracked(),
+    };
+    builder
+        .build_snapshot()
+        .await
+        .map(|_| true)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)
 }
 
 #[cfg(test)]
@@ -3085,7 +3270,7 @@ async fn reclaim_detached_failed_snapshot_namespace(
 
 async fn validate_and_clean_snapshot_directory(
     core: &SqliteConsensusCore,
-    lease: Option<&SnapshotDirectoryLease>,
+    lease: Option<&Arc<SnapshotDirectoryLease>>,
 ) -> Result<usize, SessionConsensusStorageError> {
     // `core.snapshot_dir` remains the durable/logical key.  Every operation
     // on its children is instead issued through the retained descriptor. A
@@ -3122,11 +3307,45 @@ async fn validate_and_clean_snapshot_directory(
             reclaim_detached_failed_snapshot_namespace(Arc::clone(failure.namespace())).await?;
         }
     }
-    let current = {
+    let (current, legacy_fixed_snapshot_reseed) = {
         let conn = core.conn.lock().await;
-        consensus::read_current_snapshot_sync(&conn, core.storage_identity)
-            .map_err(|_| SessionConsensusStorageError::CorruptState)?
+        (
+            consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?,
+            consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, core.storage_identity)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?,
+        )
     };
+    let legacy_reseed_matches_current =
+        match (legacy_fixed_snapshot_reseed.as_ref(), current.as_ref()) {
+            (Some(reseed), Some(current)) => reseed
+                .matches_current(core.storage_identity, current)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?,
+            (Some(_), None) => return Err(SessionConsensusStorageError::CorruptState),
+            (None, _) => false,
+        };
+    if legacy_reseed_matches_current && core.snapshot_integrity != SnapshotIntegrityPolicy::FsVerity
+    {
+        // The released reseed journal authorizes only a strict sealed
+        // successor. Complete that exact migration before changing policy;
+        // portable admission must not reinterpret its deletion authority.
+        return Err(SessionConsensusStorageError::RecoveryRequired);
+    }
+    if let (Some(current), Some(candidate_file_name)) = (
+        current.as_ref(),
+        legacy_fixed_snapshot_reseed
+            .as_ref()
+            .filter(|_| legacy_reseed_matches_current)
+            .and_then(|reseed| reseed.candidate_file_name.as_deref()),
+    ) {
+        reclaim_legacy_fixed_snapshot_reseed_candidate(
+            core,
+            &lease.namespace,
+            current,
+            candidate_file_name,
+        )
+        .await?;
+    }
     #[cfg(test)]
     if take_snapshot_directory_validation_failure(
         &core.snapshot_dir,
@@ -3153,14 +3372,23 @@ async fn validate_and_clean_snapshot_directory(
     // current snapshot. Validate that descriptor itself against the admitted
     // descriptor; do not replace either with a pathname reopen before the
     // terminal latch is consumed.
-    let mut terminal_handoff_file = core
-        .terminal_recovery_snapshot_handoff_file(
+    let mut terminal_handoff_file = if legacy_reseed_matches_current {
+        // The one-time reseed intentionally does not consume a terminal
+        // handoff against an artifact it will never read. A pending handoff
+        // requires ordinary sealed recovery instead.
+        if core.terminal_recovery_handoff_pending()? {
+            return Err(SessionConsensusStorageError::CorruptState);
+        }
+        None
+    } else {
+        core.terminal_recovery_snapshot_handoff_file(
             current
                 .as_ref()
                 .map(|(_, file_name, _, _)| file_name.as_str()),
             admitted_current_file.as_ref(),
         )
-        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+    };
     if let Some((_, file_name, expected_checksum, expected_length)) = &current {
         let path = lease
             .namespace
@@ -3168,43 +3396,55 @@ async fn validate_and_clean_snapshot_directory(
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
         let (checksum, length) =
             if core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                // Keep validation on the measured O_RDONLY descriptor. Reopening
-                // by pathname after measuring would admit a byte-identical,
-                // unsealed replacement racing startup.
-                // Fixed snapshots require pre-existing fs-verity capability
-                // evidence. Do not repair a pre-feature unsealed image by
-                // sealing it here: it must fail closed and be recovered by an
-                // explicit reseed/recovery path.
-                let file = match terminal_handoff_file.take() {
-                    Some(file) => Ok(file),
-                    None => admitted_current_file
+                if legacy_reseed_matches_current {
+                    // Probe only the kernel fs-verity state of the admitted
+                    // descriptor. No old envelope byte is read or parsed:
+                    // the ensuing replacement is reconstructed solely from
+                    // the separately validated DB/log state.
+                    let file = admitted_current_file
                         .as_ref()
-                        .ok_or_else(|| io::Error::other("missing admitted current snapshot"))
-                        .and_then(std::fs::File::try_clone),
-                };
-                let mut pinned = file
-                    .and_then(|file| {
-                        PinnedSqliteFile::from_file_and_measure_fixed_in_namespace(
-                            file,
-                            Arc::clone(&lease.namespace),
-                            std::ffi::OsStr::new(file_name),
-                        )
-                    })
-                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-                let verified = pinned
-                    .verify_snapshot_envelope_and_bind_immutable_generation(
-                        &path,
-                        SNAPSHOT_FOOTER_MAGIC,
-                        SNAPSHOT_FOOTER_BYTES,
-                        SNAPSHOT_MAX_BYTES,
+                        .ok_or(SessionConsensusStorageError::CorruptState)?;
+                    // `measure(2)` is meaningful only for a regular inode.
+                    // Keep special files (including FIFOs opened with
+                    // O_NONBLOCK) outside the compatibility classifier.
+                    if !file
+                        .metadata()
+                        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                        .is_file()
+                    {
+                        return Err(SessionConsensusStorageError::CorruptState);
+                    }
+                    if !fixed_verity_is_exactly_unsealed(file)
+                        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                    {
+                        return Err(SessionConsensusStorageError::CorruptState);
+                    }
+                    (*expected_checksum, *expected_length)
+                } else {
+                    // Capture/validate the selected policy on this exact
+                    // admitted descriptor. The strict policy requires an
+                    // existing seal; portable readers retain a verified image
+                    // authenticated against the durable checksum. Neither
+                    // path repairs or substitutes the admitted object.
+                    let file = match terminal_handoff_file.take() {
+                        Some(file) => Ok(file),
+                        None => admitted_current_file
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("missing admitted current snapshot"))
+                            .and_then(std::fs::File::try_clone),
+                    };
+                    verify_admitted_snapshot(
+                        file.map_err(|_| SessionConsensusStorageError::CorruptState)?,
+                        Arc::clone(lease),
+                        std::ffi::OsString::from(file_name),
+                        core.snapshot_integrity,
                         *expected_checksum,
                         *expected_length,
                     )
+                    .await
                     .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-                pinned
-                    .verify_bound_immutable_snapshot_envelope(&path, verified.total_length)
-                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-                (*expected_checksum, verified.total_length)
+                    (*expected_checksum, *expected_length)
+                }
             } else {
                 let file = match terminal_handoff_file.take() {
                     Some(file) => Ok(file),
@@ -3429,14 +3669,64 @@ async fn validate_and_clean_snapshot_directory(
         // for the next gated operation rather than consuming it speculatively.
         return Err(SessionConsensusStorageError::BackendUnavailable);
     }
-    core.consume_terminal_recovery_handoff_after_snapshot_validation(
-        current
-            .as_ref()
-            .map(|(_, file_name, _, _)| file_name.as_str()),
-        admitted_current_file.as_ref(),
-    )
-    .await?;
+    if !legacy_reseed_matches_current {
+        core.consume_terminal_recovery_handoff_after_snapshot_validation(
+            current
+                .as_ref()
+                .map(|(_, file_name, _, _)| file_name.as_str()),
+            admitted_current_file.as_ref(),
+        )
+        .await?;
+    }
     Ok(durable_survivors)
+}
+
+/// Reclaim the one sealed candidate that an exact local reseed journal
+/// reserved before an interrupted pre-metadata publication.  The candidate is
+/// not selected state and is never opened for payload bytes: its private
+/// journal name plus an exact immutable fs-verity descriptor are the complete
+/// deletion authority.  Any other object/type/profile remains fail-closed.
+async fn reclaim_legacy_fixed_snapshot_reseed_candidate(
+    core: &SqliteConsensusCore,
+    namespace: &Arc<RetainedSnapshotDirectory>,
+    current: &consensus::CurrentSnapshot,
+    candidate_file_name: &str,
+) -> Result<(), SessionConsensusStorageError> {
+    let candidate = std::ffi::OsString::from(candidate_file_name);
+    match open_snapshot_child_in_namespace(Arc::clone(namespace), candidate.clone()).await {
+        Ok(file) => {
+            if !file
+                .metadata()
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                .is_file()
+                || fixed_verity_is_exactly_unsealed(&file)
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?
+            {
+                return Err(SessionConsensusStorageError::CorruptState);
+            }
+            namespace
+                .unlink(std::ffi::OsStr::new(candidate_file_name))
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(SessionConsensusStorageError::CorruptState),
+    }
+    // Even an ENOENT is a recovery result that may follow a crash or a
+    // previously interrupted unlink.  Establish the retained namespace's
+    // durability boundary before clearing the only database reservation; a
+    // failed sync must retain the marker so the next open cannot confuse an
+    // undurable namespace with a completed reclamation.
+    namespace
+        .sync()
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    let conn = core.conn.lock().await;
+    consensus::clear_legacy_fixed_snapshot_reseed_candidate_sync(
+        &conn,
+        core.storage_identity,
+        current,
+        candidate_file_name,
+    )
+    .map_err(|_| SessionConsensusStorageError::CorruptState)
 }
 
 fn is_canonical_snapshot_uuid(token: &str) -> bool {
@@ -4146,6 +4436,10 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     io::Error::other(error),
                 )
             })?;
+        let integrity_work = SnapshotIntegrityWork {
+            _gate: snapshot_gate.clone(),
+            _lease: Arc::clone(&self._snapshot_directory_lease),
+        };
         reject_indeterminate_snapshot_publication(&self.core).map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -4266,22 +4560,23 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     )
                 })?
                 .len();
-            let (promoted_cleanup, mut promoted_pin) =
-                copy_and_promote_from_reader_fixed_in_namespace(
-                    &mut snapshot,
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    &promoted_name,
-                    std::ffi::OsStr::new(&file_name),
-                    received_length,
+            let (promoted_cleanup, promoted_pin) = copy_and_promote_from_reader_fixed_in_namespace(
+                &mut snapshot,
+                Arc::clone(&self._snapshot_directory_lease.namespace),
+                &promoted_name,
+                std::ffi::OsStr::new(&file_name),
+                received_length,
+                self.core.snapshot_integrity,
+                integrity_work.clone(),
+            )
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
                 )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Write,
-                        error,
-                    )
-                })?;
+            })?;
             snapshot.close_and_cleanup().await.map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
@@ -4291,47 +4586,25 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             })?;
             #[cfg(test)]
             wait_before_promoted_verify(&final_path).await;
-            let (checksum, total_length) = promoted_pin
-                .snapshot_envelope_footer_from_pinned_descriptor(
-                    &final_path,
-                    SNAPSHOT_FOOTER_MAGIC,
-                    SNAPSHOT_FOOTER_BYTES,
-                    SNAPSHOT_MAX_BYTES,
-                )
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-            let verified = promoted_pin
-                .verify_snapshot_envelope_and_bind_immutable_generation(
-                    &final_path,
-                    SNAPSHOT_FOOTER_MAGIC,
-                    SNAPSHOT_FOOTER_BYTES,
-                    SNAPSHOT_MAX_BYTES,
-                    checksum,
-                    total_length,
-                )
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-            let mut sealed_source = SessionSnapshotFile::from_std(
-                promoted_pin
-                    .try_clone()
+            let (promoted_pin, checksum, verified) =
+                verify_received_snapshot(promoted_pin, final_path.clone(), integrity_work.clone())
+                    .await
                     .map_err(|error| {
                         storage_error(
                             ErrorSubject::Snapshot(Some(meta.signature())),
                             ErrorVerb::Read,
                             error,
                         )
-                    })?
-                    .into_file(),
+                    })?;
+            let total_length = verified.total_length;
+            let mut sealed_source = SessionSnapshotFile::from_pinned(
+                promoted_pin.try_clone().map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?,
                 final_path.clone(),
             )
             .await
@@ -4389,7 +4662,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             // The raw image is a private derivative of the validated envelope.
             // Pin and seal it before SQLite attaches it so a writable alias can
             // never change the database after its bound extraction hash.
-            let mut raw_pin = raw_snapshot.pin_readonly_from_writer().map_err(|error| {
+            let raw_pin = raw_snapshot.pin_readonly_from_writer().map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
@@ -4405,7 +4678,14 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 )
             })?;
             drop(raw_file);
-            raw_pin.seal_fixed().map_err(|error| {
+            let raw_pin = seal_snapshot_pin(
+                raw_pin,
+                self.core.snapshot_integrity,
+                Some(checksum),
+                Some(integrity_work.clone()),
+            )
+            .await
+            .map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
@@ -4554,32 +4834,77 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         // replacement transaction. Fixed-profile predecessor verification is
         // a bounded full scan; snapshot ownership already excludes another
         // publisher, so it does not need either primary writer guard.
-        let previous = {
+        let (previous, legacy_reseed_predecessor) = {
             let conn = self.core.conn.lock().await;
-            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
-                |error| {
+            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
+                .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
                         ErrorVerb::Read,
                         error,
                     )
-                },
-            )?
+                })?;
+            let legacy_reseed_predecessor =
+                if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                    let reseed = consensus::read_legacy_fixed_snapshot_reseed_sync(
+                        &conn,
+                        self.core.storage_identity,
+                    )
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                    match (reseed.as_ref(), previous.as_ref()) {
+                        (Some(reseed), Some(previous)) => reseed
+                            .matches_current(self.core.storage_identity, previous)
+                            .map_err(|error| {
+                                storage_error(
+                                    ErrorSubject::Snapshot(Some(meta.signature())),
+                                    ErrorVerb::Read,
+                                    error,
+                                )
+                            })?,
+                        (Some(_), None) => {
+                            return Err(storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                consensus::invalid_data(
+                                    "legacy fixed snapshot reseed has no current snapshot",
+                                ),
+                            ));
+                        }
+                        (None, _) => false,
+                    }
+                } else {
+                    false
+                };
+            (previous, legacy_reseed_predecessor)
         };
-        let previous_artifact = track_previous_snapshot_artifact(
-            &previous,
-            Arc::clone(&self.core.snapshot_cleanup_failed),
-            self.core.authority_profile,
-            Arc::clone(&self._snapshot_directory_lease),
-        )
-        .await
-        .map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                error,
+        let previous_artifact = if legacy_reseed_predecessor {
+            // The legacy image has no immutable payload pin. Do not open it
+            // for a scan or use it as an unlink authority; normal restart
+            // cleanup may reclaim it only after successor metadata commits.
+            None
+        } else {
+            track_previous_snapshot_artifact(
+                &previous,
+                Arc::clone(&self.core.snapshot_cleanup_failed),
+                self.core.authority_profile,
+                self.core.snapshot_integrity,
+                Arc::clone(&self._snapshot_directory_lease),
             )
-        })?;
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?
+        };
         #[cfg(test)]
         wait_before_recovery_publication_fence(self.core.snapshot_dir.as_ref()).await;
         let _membership_apply = if installs_uniform_cutover {
@@ -4712,19 +5037,21 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 error,
             )
         })?;
-        remove_old_snapshot(
-            previous,
-            &file_name,
-            previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
-        )
-        .await
-        .map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Write,
-                error,
+        if !legacy_reseed_predecessor {
+            remove_old_snapshot(
+                previous,
+                &file_name,
+                previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
             )
-        })?;
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -4774,11 +5101,15 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-                let mut pinned = PinnedSqliteFile::from_file_and_measure_fixed_in_namespace(
+                let pinned = verify_admitted_snapshot(
                     file,
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsStr::new(&file_name),
+                    Arc::clone(&self._snapshot_directory_lease),
+                    std::ffi::OsString::from(&file_name),
+                    self.core.snapshot_integrity,
+                    expected_checksum,
+                    expected_length,
                 )
+                .await
                 .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
@@ -4786,32 +5117,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-                let verified = pinned
-                    .verify_snapshot_envelope_and_bind_immutable_generation(
-                        &path,
-                        SNAPSHOT_FOOTER_MAGIC,
-                        SNAPSHOT_FOOTER_BYTES,
-                        SNAPSHOT_MAX_BYTES,
-                        expected_checksum,
-                        expected_length,
-                    )
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                pinned
-                    .verify_bound_immutable_snapshot_envelope(&path, verified.total_length)
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                let snapshot = SessionSnapshotFile::from_std(pinned.into_file(), path.clone())
+                let snapshot = SessionSnapshotFile::from_pinned(pinned, path.clone())
                     .await
                     .map_err(|error| {
                         storage_error(
@@ -4820,7 +5126,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                             error,
                         )
                     })?;
-                (snapshot, expected_checksum, verified.total_length)
+                (snapshot, expected_checksum, expected_length)
             } else {
                 let file = open_snapshot_child_in_namespace(
                     Arc::clone(&self._snapshot_directory_lease.namespace),
@@ -5139,6 +5445,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     io::Error::other(error),
                 )
             })?;
+        let integrity_work = SnapshotIntegrityWork {
+            _gate: snapshot_guard.clone(),
+            _lease: Arc::clone(&self._snapshot_directory_lease),
+        };
         reject_indeterminate_snapshot_publication(&self.core).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
@@ -5187,6 +5497,26 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
             })?;
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
+        // Persist the sole candidate name before its first durable rename.
+        // If the process stops after rename/fsync and before metadata commit,
+        // preflight can reclaim only this exact sealed namespace child before
+        // reserving another successor. Ordinary snapshots do not create or
+        // broaden this compatibility state.
+        let legacy_reseed_candidate = if self.core.authority_profile
+            == ConsensusAuthorityProfile::FixedImmutable
+        {
+            let conn = self.core.conn.lock().await;
+            consensus::reserve_legacy_fixed_snapshot_reseed_candidate_sync(
+                &conn,
+                self.core.storage_identity,
+                &file_name,
+            )
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?
+        } else {
+            false
+        };
+        #[cfg(not(test))]
+        let _ = legacy_reseed_candidate;
         let final_path = self
             ._snapshot_directory_lease
             .namespace
@@ -5242,6 +5572,8 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 &vacuum_name,
                 std::ffi::OsStr::new(&file_name),
                 self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable,
+                self.core.snapshot_integrity,
+                integrity_work.clone(),
             )
             .await
             .map_err(|error| {
@@ -5291,6 +5623,8 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 &raw_name,
                 std::ffi::OsStr::new(&file_name),
                 self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable,
+                self.core.snapshot_integrity,
+                integrity_work.clone(),
             )
             .await
             .map_err(|error| {
@@ -5341,6 +5675,25 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .map_err(|error| {
                 storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
             })?;
+        #[cfg(test)]
+        if legacy_reseed_candidate
+            && take_legacy_fixed_snapshot_reseed_candidate_process_loss(
+                self.core.snapshot_dir.as_ref(),
+            )
+        {
+            // The renamed, fsync'd descriptor survives exactly as it would
+            // after process loss. The next open consults the journal-bound
+            // name before it retries the DB-authoritative successor build.
+            published_cleanup.disarm();
+            return Err(storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected legacy fixed snapshot reseed candidate process loss",
+                ),
+            ));
+        }
         #[cfg(test)]
         let fixed_prepublication_scan_boundary = (self.core.authority_profile
             == ConsensusAuthorityProfile::FixedImmutable)
@@ -5435,32 +5788,77 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // serializes every publisher, but before taking either primary SQLite
         // writer guard. Fixed-profile authentication performs a bounded full
         // envelope scan and must not stall unrelated Raft work.
-        let previous = {
+        let (previous, legacy_reseed_predecessor) = {
             let conn = self.core.conn.lock().await;
-            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
-                |error| {
+            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
+                .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
                         ErrorVerb::Read,
                         error,
                     )
-                },
-            )?
+                })?;
+            let legacy_reseed_predecessor =
+                if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                    let reseed = consensus::read_legacy_fixed_snapshot_reseed_sync(
+                        &conn,
+                        self.core.storage_identity,
+                    )
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                    match (reseed.as_ref(), previous.as_ref()) {
+                        (Some(reseed), Some(previous)) => reseed
+                            .matches_current(self.core.storage_identity, previous)
+                            .map_err(|error| {
+                                storage_error(
+                                    ErrorSubject::Snapshot(Some(meta.signature())),
+                                    ErrorVerb::Read,
+                                    error,
+                                )
+                            })?,
+                        (Some(_), None) => {
+                            return Err(storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                consensus::invalid_data(
+                                    "legacy fixed snapshot reseed has no current snapshot",
+                                ),
+                            ));
+                        }
+                        (None, _) => false,
+                    }
+                } else {
+                    false
+                };
+            (previous, legacy_reseed_predecessor)
         };
-        let previous_artifact = track_previous_snapshot_artifact(
-            &previous,
-            Arc::clone(&self.core.snapshot_cleanup_failed),
-            self.core.authority_profile,
-            Arc::clone(&self._snapshot_directory_lease),
-        )
-        .await
-        .map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                error,
+        let previous_artifact = if legacy_reseed_predecessor {
+            // The legacy image has no immutable payload pin.  Its pathname is
+            // retained until the successor's metadata and journal-clear commit;
+            // never read, measure, or use it as unlink authority here.
+            None
+        } else {
+            track_previous_snapshot_artifact(
+                &previous,
+                Arc::clone(&self.core.snapshot_cleanup_failed),
+                self.core.authority_profile,
+                self.core.snapshot_integrity,
+                Arc::clone(&self._snapshot_directory_lease),
             )
-        })?;
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?
+        };
         #[cfg(test)]
         wait_before_recovery_publication_fence(self.core.snapshot_dir.as_ref()).await;
         let prune_preemption = self.core.request_consensus_log_prune_preemption().await;
@@ -5547,19 +5945,21 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // Every raw/vacuum staging pin either dropped during SQLite
         // finalization or transferred its exact cleanup guard to
         // `published_cleanup`; no separate pathname artifact may race it.
-        remove_old_snapshot(
-            previous,
-            &file_name,
-            previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
-        )
-        .await
-        .map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Write,
-                error,
+        if !legacy_reseed_predecessor {
+            remove_old_snapshot(
+                previous,
+                &file_name,
+                previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
             )
-        })?;
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
+        }
         let snapshot = if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
             // The descriptor was sealed, measured, scanned, and bound before
             // metadata publication. Return that exact descriptor: reopening
@@ -5574,16 +5974,15 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     io::Error::other("fixed snapshot publication lost its pinned descriptor"),
                 )
             })?;
-            let mut snapshot =
-                SessionSnapshotFile::from_std(published_pin.into_file(), final_path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
+            let mut snapshot = SessionSnapshotFile::from_pinned(published_pin, final_path.clone())
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
             // `PinnedSqliteFile` verifies through a cloned descriptor. Unix
             // descriptor clones share their file offset, so transfer remains
             // exact-handle but may arrive at EOF after the bounded scan.
@@ -5728,6 +6127,8 @@ async fn seal_snapshot_database_in_place(
     raw_snapshot: PinnedSqliteFile,
     final_path: &Path,
     fixed_profile: bool,
+    snapshot_integrity: SnapshotIntegrityPolicy,
+    integrity_work: Option<SnapshotIntegrityWork>,
 ) -> io::Result<(
     SessionSnapshotFile,
     Option<PinnedSqliteFile>,
@@ -5814,17 +6215,16 @@ async fn seal_snapshot_database_in_place(
     output.write_all(&checksum).await?;
     output.flush().await?;
     output.sync_all().await?;
-    let (snapshot, fixed_pin) = if let Some(mut fixed_pin) = fixed_pin {
+    let (snapshot, fixed_pin) = if let Some(fixed_pin) = fixed_pin {
         drop(output);
-        fixed_pin.seal_fixed()?;
+        let fixed_pin =
+            seal_snapshot_pin(fixed_pin, snapshot_integrity, None, integrity_work).await?;
         // Keep the original immutable pin for the caller's verification and
         // publication. The snapshot transport handle is only an exact-descriptor
         // clone used for the existing return contract.
-        let snapshot = SessionSnapshotFile::from_std(
-            fixed_pin.try_clone()?.into_file(),
-            final_path.to_path_buf(),
-        )
-        .await?;
+        let snapshot =
+            SessionSnapshotFile::from_pinned(fixed_pin.try_clone()?, final_path.to_path_buf())
+                .await?;
         (snapshot, Some(fixed_pin))
     } else {
         (
@@ -5844,6 +6244,8 @@ async fn seal_snapshot_database_in_place_in_namespace(
     raw_name: &std::ffi::OsStr,
     final_name: &std::ffi::OsStr,
     fixed_profile: bool,
+    snapshot_integrity: SnapshotIntegrityPolicy,
+    integrity_work: SnapshotIntegrityWork,
 ) -> io::Result<(
     SessionSnapshotFile,
     Option<PinnedSqliteFile>,
@@ -5853,7 +6255,14 @@ async fn seal_snapshot_database_in_place_in_namespace(
 )> {
     raw_snapshot.bind_cleanup_to_namespace(Arc::clone(&namespace), raw_name)?;
     let final_path = namespace.sqlite_child_path(final_name)?;
-    seal_snapshot_database_in_place(raw_snapshot, &final_path, fixed_profile).await
+    seal_snapshot_database_in_place(
+        raw_snapshot,
+        &final_path,
+        fixed_profile,
+        snapshot_integrity,
+        Some(integrity_work),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -6117,6 +6526,8 @@ async fn copy_and_promote_from_reader_fixed_in_namespace<R>(
     temporary_name: &std::ffi::OsStr,
     final_name: &std::ffi::OsStr,
     expected_length: u64,
+    snapshot_integrity: SnapshotIntegrityPolicy,
+    integrity_work: SnapshotIntegrityWork,
 ) -> io::Result<(UnpublishedSnapshotArtifact, PinnedSqliteFile)>
 where
     R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
@@ -6149,7 +6560,7 @@ where
     namespace.rename_noreplace(temporary_name, final_name)?;
     cleanup.rebind_in_namespace(Arc::clone(&namespace), final_name)?;
     pin.rebind_in_namespace(Arc::clone(&namespace), final_name)?;
-    pin.seal_fixed()?;
+    let pin = seal_snapshot_pin(pin, snapshot_integrity, None, Some(integrity_work)).await?;
     namespace.sync()?;
     Ok((cleanup, pin))
 }
@@ -6272,6 +6683,7 @@ async fn track_previous_snapshot_artifact(
     previous: &Option<consensus::CurrentSnapshot>,
     cleanup_failed: Arc<AtomicBool>,
     authority_profile: ConsensusAuthorityProfile,
+    snapshot_integrity: SnapshotIntegrityPolicy,
     namespace_lease: Arc<SnapshotDirectoryLease>,
 ) -> io::Result<Option<RetainedCurrentSnapshotArtifact>> {
     let Some((_, file_name, expected_checksum, expected_length)) = previous.as_ref() else {
@@ -6289,25 +6701,15 @@ async fn track_previous_snapshot_artifact(
             std::ffi::OsString::from(file_name),
         )
         .await?;
-        let mut pinned = PinnedSqliteFile::from_file_and_measure_fixed_in_namespace(
+        let pinned = verify_admitted_snapshot(
             file,
-            Arc::clone(&namespace_lease.namespace),
-            std::ffi::OsStr::new(file_name),
-        )?;
-        let verified = pinned.verify_snapshot_envelope_and_bind_immutable_generation(
-            &path,
-            SNAPSHOT_FOOTER_MAGIC,
-            SNAPSHOT_FOOTER_BYTES,
-            SNAPSHOT_MAX_BYTES,
+            Arc::clone(&namespace_lease),
+            std::ffi::OsString::from(file_name),
+            snapshot_integrity,
             *expected_checksum,
             *expected_length,
-        )?;
-        pinned.verify_bound_immutable_snapshot_envelope(&path, verified.total_length)?;
-        if verified.total_length != *expected_length {
-            return Err(consensus::invalid_data(
-                "previous fixed snapshot length differs from durable row",
-            ));
-        }
+        )
+        .await?;
         pinned.into_file()
     } else {
         let file = open_snapshot_child_in_namespace(
@@ -8982,9 +9384,15 @@ mod tests {
         let inode = compacted.identity();
 
         let (mut snapshot, _fixed_pin, checksum, length, cleanup) =
-            seal_snapshot_database_in_place(compacted, &final_path, false)
-                .await
-                .expect("seal compacted inode in place");
+            seal_snapshot_database_in_place(
+                compacted,
+                &final_path,
+                false,
+                SnapshotIntegrityPolicy::FsVerity,
+                None,
+            )
+            .await
+            .expect("seal compacted inode in place");
         let held = snapshot_handle_identity_pin(&snapshot, &compacted_path)
             .await
             .expect("pin sealed inode");
@@ -9040,7 +9448,14 @@ mod tests {
         gate.arm();
         *seal_in_place_gate().lock().expect("set in-place seal gate") = Some(Arc::clone(&gate));
         let seal = tokio::spawn(async move {
-            seal_snapshot_database_in_place(compacted, &final_path, false).await
+            seal_snapshot_database_in_place(
+                compacted,
+                &final_path,
+                false,
+                SnapshotIntegrityPolicy::FsVerity,
+                None,
+            )
+            .await
         });
         gate.wait_started().await;
         seal.abort();
@@ -9213,6 +9628,23 @@ mod tests {
         SqliteConsensusStateMachine,
         PathBuf,
     ) {
+        open_fixed_raw_read_store_with_integrity(
+            directory,
+            diagnostics,
+            SnapshotIntegrityPolicy::FsVerity,
+        )
+        .await
+    }
+
+    async fn open_fixed_raw_read_store_with_integrity(
+        directory: &FixedRawReadStoreFixture,
+        diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
+        snapshot_integrity: SnapshotIntegrityPolicy,
+    ) -> (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        PathBuf,
+    ) {
         let database = directory.path().join("fixed-raw-read.sqlite");
         let backend = SqliteSessionBackend::open(&database).expect("fixed raw-read backend");
         let backend = match diagnostics {
@@ -9220,7 +9652,7 @@ mod tests {
             None => backend,
         };
         let members = fixed_raw_read_members();
-        let core = SqliteConsensusCore::initialize(
+        let mut core = SqliteConsensusCore::initialize(
             &backend,
             directory.snapshot_path().join("fixed-raw-read-snapshots"),
             identity(1),
@@ -9231,6 +9663,7 @@ mod tests {
         )
         .await
         .expect("open exact fixed raw-read store");
+        core.snapshot_integrity = snapshot_integrity;
         let snapshot_directory_lease =
             acquire_snapshot_directory_lease(&backend, core.snapshot_dir.as_ref())
                 .await
@@ -10175,6 +10608,242 @@ mod tests {
             .expect("sealed fixed generation remains valid after rejected truncate");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn portable_fixed_quorum_builds_and_reads_snapshot_without_fs_verity() {
+        // tmpfs deliberately has no fs-verity support, independently of the
+        // separate ext4 scratch root used by strict fs-verity qualification.
+        let directory = FixedRawReadStoreFixture {
+            database: tempfile::Builder::new()
+                .prefix("portable-fixed-database-")
+                .tempdir_in("/dev/shm")
+                .expect("create portable fixed database directory"),
+            snapshots: tempfile::Builder::new()
+                .prefix("portable-fixed-snapshots-")
+                .tempdir_in("/dev/shm")
+                .expect("create portable fixed snapshot directory"),
+        };
+        let (_, mut state_machine, _) = open_fixed_raw_read_store_with_integrity(
+            &directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        state_machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply unchanged fixed membership");
+        let mut snapshot = state_machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("portable fixed quorum snapshots without filesystem sealing");
+        let bytes = tokio::io::copy(&mut snapshot.snapshot, &mut tokio::io::sink())
+            .await
+            .expect("read verified portable snapshot");
+        assert!(bytes > SNAPSHOT_FOOTER_BYTES);
+        assert_eq!(
+            ConsensusAuthorityProfile::FixedImmutable,
+            state_machine.core.authority_profile,
+            "portable snapshot verification must preserve fixed membership authority"
+        );
+        let current = state_machine
+            .get_current_snapshot()
+            .await
+            .expect("reopen published portable snapshot")
+            .expect("portable snapshot was durably published");
+        assert_eq!(snapshot.meta, current.meta);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn portable_fixed_fixture() -> FixedRawReadStoreFixture {
+        portable_fixed_fixture_in(std::env::temp_dir())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn portable_fixed_fixture_in(root: impl AsRef<Path>) -> FixedRawReadStoreFixture {
+        FixedRawReadStoreFixture {
+            database: tempfile::Builder::new()
+                .prefix("portable-database-")
+                .tempdir_in(root.as_ref())
+                .expect("portable database directory"),
+            snapshots: tempfile::Builder::new()
+                .prefix("portable-snapshots-")
+                .tempdir_in(root.as_ref())
+                .expect("portable snapshot directory"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn portable_fixed_snapshot_installs_restarts_and_rejects_changed_generation() {
+        use std::os::unix::fs::FileExt as _;
+        let source_directory = portable_fixed_fixture();
+        let (mut source_log, mut source, _) = open_fixed_raw_read_store_with_integrity(
+            &source_directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        append_commit_and_apply(
+            &mut source_log,
+            &mut source,
+            [fixed_initial_membership_entry(), blank_entry(1)],
+            "portable source cut",
+        )
+        .await;
+        let mut built = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("build portable source");
+        let target_directory = portable_fixed_fixture();
+        let (mut target_log, mut target, _) = open_fixed_raw_read_store_with_integrity(
+            &target_directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        append_commit_and_apply(
+            &mut target_log,
+            &mut target,
+            [fixed_initial_membership_entry()],
+            "portable target membership",
+        )
+        .await;
+        let mut receiver = target
+            .begin_receiving_snapshot()
+            .await
+            .expect("portable receiver");
+        tokio::io::copy(&mut built.snapshot, &mut receiver)
+            .await
+            .expect("verified transfer");
+        target
+            .install_snapshot(&built.meta, receiver)
+            .await
+            .expect("verified SQLite install");
+        assert_eq!(
+            Some(log_id(1)),
+            target.applied_state().await.expect("installed cut").0
+        );
+        let mut current = target
+            .get_current_snapshot()
+            .await
+            .expect("installed snapshot")
+            .expect("current");
+        assert_eq!(built.meta, current.meta);
+        let mut expected = Vec::new();
+        current
+            .snapshot
+            .read_to_end(&mut expected)
+            .await
+            .expect("installed verified bytes");
+        assert!(
+            current.snapshot.file().is_err(),
+            "no unchecked descriptor read escape"
+        );
+        drop(current);
+        drop(target_log);
+        drop(target);
+        let (_reopened_log, mut reopened, _) = open_fixed_raw_read_store_with_integrity(
+            &target_directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        validate_and_clean_snapshot_directory(
+            &reopened.core,
+            Some(&reopened._snapshot_directory_lease),
+        )
+        .await
+        .expect("portable startup validation");
+        let mut restored = reopened
+            .get_current_snapshot()
+            .await
+            .expect("restart current")
+            .expect("restart snapshot");
+        let mut observed = Vec::new();
+        restored
+            .snapshot
+            .read_to_end(&mut observed)
+            .await
+            .expect("restart verified bytes");
+        assert_eq!(expected, observed);
+        assert_eq!(
+            ConsensusAuthorityProfile::FixedImmutable,
+            reopened.core.authority_profile
+        );
+        let file_name = {
+            let conn = reopened.core.conn.lock().await;
+            consensus::read_current_snapshot_sync(&conn, reopened.core.storage_identity)
+                .expect("durable snapshot row")
+                .expect("snapshot row")
+                .1
+        };
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(reopened.core.snapshot_dir.join(file_name))
+            .expect("ordinary filesystem remains writable");
+        writer
+            .write_all_at(b"corrupt", 128)
+            .expect("same-inode corruption");
+        writer.sync_all().expect("sync corruption");
+        restored
+            .snapshot
+            .rewind()
+            .await
+            .expect("rewind logical snapshot");
+        assert!(
+            tokio::io::copy(&mut restored.snapshot, &mut tokio::io::sink())
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_and_clean_snapshot_directory(
+                &reopened.core,
+                Some(&reopened._snapshot_directory_lease)
+            )
+            .await
+            .is_err(),
+            "restart cannot accept corrupt bytes against the durable checksum"
+        );
+        assert_eq!(
+            Some(log_id(1)),
+            reopened
+                .applied_state()
+                .await
+                .expect("live state unchanged")
+                .0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn explicit_fs_verity_preflight_rejects_tmpfs_and_cleans_probe() {
+        let directory = portable_fixed_fixture_in("/dev/shm");
+        let backend = SqliteSessionBackend::open(directory.path().join("strict-preflight.sqlite"))
+            .expect("strict probe backend");
+        let lease = acquire_snapshot_directory_lease(&backend, directory.snapshot_path())
+            .await
+            .expect("strict probe namespace");
+        assert_eq!(
+            SessionConsensusStorageError::SnapshotIntegrityUnavailable,
+            preflight_fs_verity(Arc::clone(&lease))
+                .await
+                .expect_err("tmpfs cannot seal")
+        );
+        assert!(
+            lease
+                .namespace
+                .entries(32)
+                .expect("read probe namespace")
+                .is_empty(),
+            "preflight must leave no staging artifact or permanent marker"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prepublication_seal_rejects_writes_without_blocking_primary_connection() {
         let directory = FixedRawReadStoreFixture::new();
@@ -10304,6 +10973,298 @@ mod tests {
                 .await
                 .is_err(),
             "fixed restart accepts an unsealed replacement"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn legacy_fixed_reseed_reclaims_renamed_fsynced_candidate_before_retry() {
+        use std::os::fd::AsFd as _;
+
+        let directory = FixedRawReadStoreFixture::new();
+        let probe_path = directory.snapshot_path().join("probe");
+        let probe = std::fs::File::create(&probe_path).expect("create fs-verity probe");
+        match opc_fs_verity_sys::measure(probe.as_fd()) {
+            Err(opc_fs_verity_sys::Error::Measure(error))
+                if error.raw_os_error() == Some(libc::ENODATA) => {}
+            Err(opc_fs_verity_sys::Error::Measure(error))
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
+                ) =>
+            {
+                assert!(
+                    std::env::var_os("OPC_FS_VERITY_QUALIFICATION").as_deref()
+                        != Some(std::ffi::OsStr::new("required")),
+                    "required fs-verity qualification is unsupported at the prepared snapshot root: {error:?}"
+                );
+                return;
+            }
+            other => panic!("unexpected fs-verity capability result: {other:?}"),
+        }
+        drop(probe);
+
+        let (mut log_store, mut state_machine, database) =
+            open_fixed_raw_read_store(&directory).await;
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "persist fixed membership before legacy reseed snapshot",
+        )
+        .await;
+        let mut initial_builder = state_machine.get_snapshot_builder().await;
+        let initial = initial_builder
+            .build_snapshot()
+            .await
+            .expect("build sealed fixed predecessor");
+        let old_file_name = {
+            let conn = state_machine.core.conn.lock().await;
+            consensus::read_current_snapshot_sync(&conn, state_machine.core.storage_identity)
+                .expect("read fixed predecessor metadata")
+                .expect("fixed predecessor metadata")
+                .1
+        };
+        let snapshot_directory = state_machine.core.snapshot_dir.as_ref().clone();
+        let old_path = snapshot_directory.join(&old_file_name);
+        let old_bytes = std::fs::read(&old_path).expect("read sealed fixed predecessor");
+        drop(initial);
+        drop(initial_builder);
+        drop(log_store);
+        drop(state_machine);
+
+        std::fs::remove_file(&old_path).expect("remove sealed fixed predecessor");
+        std::fs::write(&old_path, b"untrusted old fixed snapshot")
+            .expect("write corrupt unsealed fixed predecessor");
+        assert!(matches!(
+            opc_fs_verity_sys::measure(
+                std::fs::File::open(&old_path)
+                    .expect("open unsealed fixed predecessor")
+                    .as_fd()
+            ),
+            Err(opc_fs_verity_sys::Error::Measure(error))
+                if error.raw_os_error() == Some(libc::ENODATA)
+        ));
+
+        let connection = rusqlite::Connection::open(&database).expect("open old fixed database");
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE legacy_recovery AS \
+                 SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                        pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+                 FROM consensus_operator_recovery; \
+                 DROP TABLE consensus_operator_recovery; \
+                 CREATE TABLE consensus_operator_recovery ( \
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+                    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0), \
+                    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0), \
+                    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32), \
+                    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch), \
+                    pending_plan_digest BLOB CHECK ( \
+                        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32 \
+                    ), \
+                    watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0), \
+                    CHECK ( \
+                        (pending_epoch IS NULL AND pending_plan_digest IS NULL) \
+                        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL) \
+                    ), \
+                    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch) \
+                 ); \
+                 INSERT INTO consensus_operator_recovery \
+                    (singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                     pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) \
+                 SELECT singleton, configuration_epoch, recovery_epoch, last_plan_digest, \
+                        pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor \
+                 FROM legacy_recovery; \
+                 DROP TABLE legacy_recovery;",
+            )
+            .expect("install exact released cursor-only recovery schema");
+        drop(connection);
+
+        let members = fixed_raw_read_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open legacy fixed backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_directory.clone(),
+            identity(1),
+            members.clone(),
+            fixed_raw_read_bindings(&members),
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(PlacementResiliencePolicy::AllowReducedResilience),
+        )
+        .await
+        .expect("initialize exact legacy fixed source");
+        let lease = acquire_snapshot_directory_lease(&backend, &snapshot_directory)
+            .await
+            .expect("acquire legacy fixed snapshot lease");
+        let mut portable_attempt = core.clone();
+        portable_attempt.snapshot_integrity = SnapshotIntegrityPolicy::PortableVerified;
+        assert_eq!(
+            SessionConsensusStorageError::RecoveryRequired,
+            validate_and_clean_snapshot_directory(&portable_attempt, Some(&lease))
+                .await
+                .expect_err("finish strict reseed before changing integrity policy")
+        );
+        assert_eq!(
+            b"untrusted old fixed snapshot",
+            std::fs::read(&old_path)
+                .expect("refused policy change preserves predecessor")
+                .as_slice()
+        );
+        validate_and_clean_snapshot_directory(&core, Some(&lease))
+            .await
+            .expect("validate exact unsealed legacy selection");
+        inject_legacy_fixed_snapshot_reseed_candidate_process_loss(
+            core.snapshot_dir.as_ref().clone(),
+        );
+        assert!(
+            reseed_legacy_fixed_snapshot_from_authoritative_database(&core, Arc::clone(&lease))
+                .await
+                .is_err(),
+            "simulated stop interrupts after candidate rename and directory fsync"
+        );
+        let candidate_file_name = {
+            let conn = core.conn.lock().await;
+            consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, core.storage_identity)
+                .expect("read reseed journal after simulated stop")
+                .expect("reseed journal remains after simulated stop")
+                .candidate_file_name
+                .expect("journal retains exact renamed candidate name")
+        };
+        let candidate_path = snapshot_directory.join(&candidate_file_name);
+        assert!(
+            candidate_path.is_file(),
+            "renamed candidate survives simulated stop"
+        );
+        opc_fs_verity_sys::measure_exact_profile(
+            std::fs::File::open(&candidate_path)
+                .expect("open renamed candidate")
+                .as_fd(),
+        )
+        .expect("renamed candidate is sealed before its metadata commit");
+        drop(core);
+        drop(lease);
+        drop(backend);
+
+        let backend = SqliteSessionBackend::open(&database).expect("reopen crashed fixed backend");
+        let reopened = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_directory.clone(),
+            identity(1),
+            members.clone(),
+            fixed_raw_read_bindings(&members),
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(PlacementResiliencePolicy::AllowReducedResilience),
+        )
+        .await
+        .expect("reopen exact legacy source after candidate crash");
+        let lease = acquire_snapshot_directory_lease(&backend, &snapshot_directory)
+            .await
+            .expect("reacquire fixed snapshot lease after candidate crash");
+        validate_and_clean_snapshot_directory(&reopened, Some(&lease))
+            .await
+            .expect("preflight reclaims the journal-bound sealed orphan candidate");
+        assert!(
+            !candidate_path.exists(),
+            "successful preflight reclaims the found sealed candidate"
+        );
+        {
+            let conn = reopened.conn.lock().await;
+            assert!(
+                consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, reopened.storage_identity)
+                    .expect("read retained reseed journal after found candidate reclaim")
+                    .expect("old selected source remains eligible for one retry")
+                    .candidate_file_name
+                    .is_none(),
+                "found candidate reclaim clears only its exact reservation"
+            );
+        }
+
+        // Model the other crash-recovery outcome: a previously renamed
+        // candidate is already absent when a retry opens the retained
+        // namespace. Reserve that exact missing name, then prove the marker
+        // survives a failed directory sync before a later retry clears it.
+        let absent_candidate_file_name = "snapshot-00000000-0000-4000-8000-0000000000b2.opc";
+        {
+            let conn = reopened.conn.lock().await;
+            assert!(
+                consensus::reserve_legacy_fixed_snapshot_reseed_candidate_sync(
+                    &conn,
+                    reopened.storage_identity,
+                    absent_candidate_file_name,
+                )
+                .expect("reserve exact missing candidate"),
+                "the completed found-candidate reclaim leaves the one-time marker retryable"
+            );
+        }
+        fail_retained_namespace_sync_for_test(&lease.namespace);
+        assert!(matches!(
+            validate_and_clean_snapshot_directory(&reopened, Some(&lease)).await,
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+        {
+            let conn = reopened.conn.lock().await;
+            assert_eq!(
+                consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, reopened.storage_identity)
+                    .expect("read retained reseed journal after failed namespace sync")
+                    .expect("sync failure retains exact candidate reservation")
+                    .candidate_file_name
+                    .as_deref(),
+                Some(absent_candidate_file_name),
+                "an ENOENT candidate cannot clear its reservation before directory fsync"
+            );
+        }
+        validate_and_clean_snapshot_directory(&reopened, Some(&lease))
+            .await
+            .expect("preflight acknowledges absent candidate only after a durable directory sync");
+        {
+            let conn = reopened.conn.lock().await;
+            assert!(
+                consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, reopened.storage_identity)
+                    .expect("read retained reseed journal")
+                    .expect("old selected source remains eligible for one retry")
+                    .candidate_file_name
+                    .is_none(),
+                "preflight clears only the consumed candidate reservation"
+            );
+        }
+        assert!(
+            reseed_legacy_fixed_snapshot_from_authoritative_database(&reopened, Arc::clone(&lease))
+                .await
+                .expect("reseed retry succeeds"),
+            "retry rebuilds the successor solely from durable DB/log state"
+        );
+        validate_and_clean_snapshot_directory(&reopened, Some(&lease))
+            .await
+            .expect("validate rebuilt sealed successor");
+        let successor_name = {
+            let conn = reopened.conn.lock().await;
+            let current = consensus::read_current_snapshot_sync(&conn, reopened.storage_identity)
+                .expect("read reseeded current snapshot")
+                .expect("reseeded current snapshot");
+            assert!(
+                consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, reopened.storage_identity)
+                    .expect("read cleared reseed journal")
+                    .is_none(),
+                "successor metadata switch atomically drops the reseed journal"
+            );
+            current.1
+        };
+        assert_ne!(
+            old_file_name, successor_name,
+            "retry selects a new sealed successor"
+        );
+        assert!(
+            !old_path.exists(),
+            "old unsealed source is reclaimed after success"
+        );
+        assert!(
+            snapshot_directory.join(successor_name).is_file(),
+            "reseed retry publishes a sealed successor"
+        );
+        assert!(
+            !old_bytes.is_empty(),
+            "fixture started from a real sealed selected snapshot"
         );
     }
 
@@ -10715,8 +11676,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prepublication_descriptor_scan_does_not_block_consensus_reads_or_writes() {
+        prepublication_scan_preserves_consensus_progress(SnapshotIntegrityPolicy::FsVerity).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn portable_prepublication_descriptor_scan_does_not_block_consensus_reads_or_writes() {
+        prepublication_scan_preserves_consensus_progress(SnapshotIntegrityPolicy::PortableVerified)
+            .await;
+    }
+
+    async fn prepublication_scan_preserves_consensus_progress(policy: SnapshotIntegrityPolicy) {
         let directory = FixedRawReadStoreFixture::new();
-        let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let (_, mut state_machine, _) =
+            open_fixed_raw_read_store_with_integrity(&directory, None, policy).await;
         state_machine
             .apply([fixed_initial_membership_entry()])
             .await
@@ -10781,8 +11754,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_fixed_prepublication_scan_retains_snapshot_worker_ownership() {
+        cancelled_prepublication_scan_retains_snapshot_worker(SnapshotIntegrityPolicy::FsVerity)
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_portable_prepublication_scan_retains_snapshot_worker_ownership() {
+        cancelled_prepublication_scan_retains_snapshot_worker(
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+    }
+
+    async fn cancelled_prepublication_scan_retains_snapshot_worker(
+        policy: SnapshotIntegrityPolicy,
+    ) {
         let directory = FixedRawReadStoreFixture::new();
-        let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let (_, mut state_machine, _) =
+            open_fixed_raw_read_store_with_integrity(&directory, None, policy).await;
         state_machine
             .apply([fixed_initial_membership_entry()])
             .await

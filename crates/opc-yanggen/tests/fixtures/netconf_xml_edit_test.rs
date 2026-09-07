@@ -1,8 +1,11 @@
 #![allow(unused_mut)]
 
 use generated_test::netconf_xml_edit::applicator;
+use generated_test::schema_registry::registry;
 use generated_test::types::*;
+use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::{EditConfigNode, EditOperation, NetconfEditError, NetconfXmlEditApplicator, NodeKind};
+use opc_netconf_server::{parse_edit_config_xml_with_limits, EditDefaultOperation};
 use std::collections::BTreeMap;
 
 fn leaf(schema_path: &'static str, operation: EditOperation, value: &str) -> EditConfigNode {
@@ -46,6 +49,20 @@ fn list_entry(
 
 fn empty_system() -> System {
     System::default()
+}
+
+fn apply_xml(
+    running: &System,
+    xml: &str,
+    default_operation: EditDefaultOperation,
+) -> Result<System, NetconfEditError> {
+    let edit = parse_edit_config_xml_with_limits(
+        xml,
+        registry(),
+        default_operation,
+        &MgmtLimits::default(),
+    )?;
+    applicator().apply_edit_config(running, &edit)
 }
 
 #[test]
@@ -707,4 +724,332 @@ fn replace_root_resets_whole_config() {
     );
     let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
     assert_eq!(candidate.hostname, LeafPresence::Explicit("new".to_string()));
+}
+
+#[test]
+fn real_xml_full_root_replace_from_no_config_preserves_leaf_list_entries() {
+    let no_config_sentinel = empty_system();
+    let candidate = apply_xml(
+        &no_config_sentinel,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" nc:operation="replace" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0">
+                <ex:servers>apn-beta</ex:servers>
+                <ex:servers>apn-alpha</ex:servers>
+                <ex:tags>41</ex:tags>
+                <ex:tags>42</ex:tags>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect("full root replacement must accept schema-valid leaf-lists");
+
+    assert_eq!(
+        candidate.servers,
+        vec!["apn-beta".to_string(), "apn-alpha".to_string()]
+    );
+    assert_eq!(candidate.tags, vec![41, 42]);
+    assert!(candidate.hostname.is_absent());
+    assert_eq!(
+        no_config_sentinel,
+        empty_system(),
+        "building the replacement candidate must not mutate the no-config sentinel"
+    );
+}
+
+#[test]
+fn real_xml_enclosing_replace_resets_leaf_list_collection() {
+    let mut running = empty_system();
+    running.servers = vec!["old-apn".to_string(), "retired-apn".to_string()];
+    running.tags = vec![9];
+    let before = running.clone();
+
+    let candidate = apply_xml(
+        &running,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0" nc:operation="replace">
+                <ex:servers>apn-alpha</ex:servers>
+                <ex:servers>apn-beta</ex:servers>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect("an enclosing replace must rebuild leaf-list state from XML siblings");
+
+    assert_eq!(
+        candidate.servers,
+        vec!["apn-alpha".to_string(), "apn-beta".to_string()]
+    );
+    assert!(candidate.tags.is_empty());
+    assert_eq!(running, before, "successful XML edits build a separate candidate");
+}
+
+#[test]
+fn real_xml_leaf_list_operations_are_schema_typed_and_ordered() {
+    let mut running = empty_system();
+    running.servers = vec!["apn-alpha".to_string(), "apn-beta".to_string()];
+
+    let created = apply_xml(
+        &running,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0">
+                <ex:servers nc:operation="create">apn-gamma</ex:servers>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect("create must append a new leaf-list value");
+    assert_eq!(
+        created.servers,
+        vec![
+            "apn-alpha".to_string(),
+            "apn-beta".to_string(),
+            "apn-gamma".to_string(),
+        ]
+    );
+
+    let merged = apply_xml(
+        &created,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example">
+                <ex:servers>apn-gamma</ex:servers>
+                <ex:servers>apn-delta</ex:servers>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect("merge must preserve an existing value and add a distinct one");
+    assert_eq!(
+        merged.servers,
+        vec![
+            "apn-alpha".to_string(),
+            "apn-beta".to_string(),
+            "apn-gamma".to_string(),
+            "apn-delta".to_string(),
+        ]
+    );
+
+    let entry_replaced = apply_xml(
+        &merged,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0">
+                <ex:servers nc:operation="replace">apn-delta</ex:servers>
+                <ex:servers nc:operation="replace">apn-epsilon</ex:servers>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect("entry replace must preserve unrelated leaf-list values and upsert a new entry");
+    assert_eq!(
+        entry_replaced.servers,
+        vec![
+            "apn-alpha".to_string(),
+            "apn-beta".to_string(),
+            "apn-gamma".to_string(),
+            "apn-delta".to_string(),
+            "apn-epsilon".to_string(),
+        ]
+    );
+
+    let deleted = apply_xml(
+        &entry_replaced,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0">
+                <ex:servers nc:operation="delete">apn-delta</ex:servers>
+                <ex:servers nc:operation="remove">absent-entry</ex:servers>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect("delete and idempotent remove must use leaf-list value identity");
+    assert_eq!(
+        deleted.servers,
+        vec![
+            "apn-alpha".to_string(),
+            "apn-beta".to_string(),
+            "apn-gamma".to_string(),
+            "apn-epsilon".to_string(),
+        ]
+    );
+
+    let err = apply_xml(
+        &deleted,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0">
+                <ex:servers nc:operation="create">apn-epsilon</ex:servers>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect_err("create must reject an existing leaf-list value");
+    assert!(matches!(
+        err,
+        NetconfEditError::OperationNotSupported {
+            operation: EditOperation::Create,
+            kind: NodeKind::LeafList,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn real_xml_leaf_list_rejects_semantic_duplicates_and_invalid_values() {
+    let mut running = empty_system();
+    running.tags = vec![9];
+    let before = running.clone();
+
+    let duplicate = apply_xml(
+        &running,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0" nc:operation="replace">
+                <ex:tags>007</ex:tags>
+                <ex:tags>7</ex:tags>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect_err("duplicate typed leaf-list values must fail closed");
+    assert!(matches!(duplicate, NetconfEditError::InvalidValue { .. }));
+    assert_eq!(running, before, "failed XML edits must not mutate running state");
+
+    let none_and_merge_duplicate = apply_xml(
+        &running,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0">
+                <ex:tags>007</ex:tags>
+                <ex:tags nc:operation="merge">7</ex:tags>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::None,
+    )
+    .expect_err("default-operation none must not bypass typed duplicate validation");
+    assert!(matches!(none_and_merge_duplicate, NetconfEditError::InvalidValue { .. }));
+    assert_eq!(
+        running, before,
+        "a rejected none-plus-mutation request must not mutate running state"
+    );
+
+    let invalid = apply_xml(
+        &running,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example">
+                <ex:tags>not-a-uint16</ex:tags>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect_err("invalid leaf-list values must fail before candidate construction");
+    assert!(matches!(invalid, NetconfEditError::InvalidValue { .. }));
+    assert_eq!(running, before, "invalid XML must not mutate running state");
+
+    let unsupported = apply_xml(
+        &running,
+        r#"<config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <ex:system xmlns:ex="urn:example">
+                <ex:custom-tags>opaque</ex:custom-tags>
+            </ex:system>
+        </config>"#,
+        EditDefaultOperation::Merge,
+    )
+    .expect_err("custom leaf-list element types remain fail-closed");
+    assert!(matches!(
+        unsupported,
+        NetconfEditError::UnsupportedShape {
+            kind: NodeKind::LeafList,
+            ..
+        }
+    ));
+    assert_eq!(running, before, "unsupported XML must not mutate running state");
+}
+
+#[test]
+fn generated_leaf_list_rejects_invalid_normalized_shapes_and_duplicate_running_state() {
+    let mut duplicate_running = empty_system();
+    duplicate_running.servers = vec!["apn-duplicate".to_string(), "apn-duplicate".to_string()];
+    let duplicate_before = duplicate_running.clone();
+    let duplicate_running_err = applicator()
+        .apply_edit_config(
+            &duplicate_running,
+            &container(
+                "/ex:system",
+                EditOperation::Merge,
+                vec![leaf(
+                    "/ex:system/ex:servers",
+                    EditOperation::Merge,
+                    "apn-new",
+                )],
+            ),
+        )
+        .expect_err("a mutation must refuse a duplicate running leaf-list collection");
+    assert!(matches!(
+        duplicate_running_err,
+        NetconfEditError::InvalidValue {
+            path: "/ex:system/ex:servers"
+        }
+    ));
+    assert_eq!(
+        duplicate_running, duplicate_before,
+        "rejecting duplicate running state must not mutate the caller's config"
+    );
+
+    let invalid_value = container(
+        "/ex:system",
+        EditOperation::Merge,
+        vec![EditConfigNode {
+            schema_path: "/ex:system/ex:servers",
+            operation: EditOperation::Merge,
+            value: None,
+            children: Vec::new(),
+            list_keys: BTreeMap::new(),
+        }],
+    );
+    let invalid_value_err = applicator()
+        .apply_edit_config(&empty_system(), &invalid_value)
+        .expect_err("a normalized leaf-list entry without a value is invalid");
+    assert!(matches!(
+        invalid_value_err,
+        NetconfEditError::InvalidValue {
+            path: "/ex:system/ex:servers"
+        }
+    ));
+
+    let invalid_children = container(
+        "/ex:system",
+        EditOperation::Merge,
+        vec![EditConfigNode {
+            schema_path: "/ex:system/ex:servers",
+            operation: EditOperation::Merge,
+            value: Some("apn-value".to_string()),
+            children: vec![leaf(
+                "/ex:system/ex:hostname",
+                EditOperation::Merge,
+                "not-a-child",
+            )],
+            list_keys: BTreeMap::new(),
+        }],
+    );
+    let invalid_children_err = applicator()
+        .apply_edit_config(&empty_system(), &invalid_children)
+        .expect_err("a normalized leaf-list entry cannot have child nodes");
+    assert!(matches!(invalid_children_err, NetconfEditError::MalformedXml));
+
+    let invalid_keys = container(
+        "/ex:system",
+        EditOperation::Merge,
+        vec![EditConfigNode {
+            schema_path: "/ex:system/ex:servers",
+            operation: EditOperation::Merge,
+            value: Some("apn-value".to_string()),
+            children: Vec::new(),
+            list_keys: BTreeMap::from([("bogus".to_string(), "entry".to_string())]),
+        }],
+    );
+    let invalid_keys_err = applicator()
+        .apply_edit_config(&empty_system(), &invalid_keys)
+        .expect_err("a normalized leaf-list entry cannot carry list keys");
+    assert!(matches!(
+        invalid_keys_err,
+        NetconfEditError::KeyOnNonList {
+            path: "/ex:system/ex:servers"
+        }
+    ));
 }

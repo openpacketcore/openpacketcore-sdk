@@ -1,3 +1,12 @@
+/// Redaction-safe marker for JSON encoding and decoding failures.
+///
+/// Converting a [`serde_json::Error`] into [`ProtocolError`] deliberately
+/// discards it because serde diagnostics can contain peer-controlled wire
+/// values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("serialization error")]
+pub struct SerializationFailure;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("frame too large: {0} bytes")]
@@ -14,10 +23,16 @@ pub enum ProtocolError {
     UnexpectedResponse,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Serialization(#[from] SerializationFailure),
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
+}
+
+impl From<serde_json::Error> for ProtocolError {
+    fn from(_error: serde_json::Error) -> Self {
+        Self::Serialization(SerializationFailure)
+    }
 }
 
 /// Preserve TLS failure categories when `tokio-rustls` reports through its
@@ -113,7 +128,65 @@ fn tls_error_is_authentication(error: &tokio_rustls::rustls::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use std::sync::Arc;
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    struct PeerWireFields {
+        sequence: u64,
+        enabled: bool,
+        mode: PeerWireMode,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    enum PeerWireMode {
+        Known,
+    }
+
+    #[test]
+    fn serialization_diagnostics_do_not_disclose_hostile_wire_values() {
+        let cases: &[(&[u8], &str)] = &[
+            (
+                br#"{"sequence":"peer-numeric-sensitive-sentinel","enabled":true,"mode":"Known"}"#,
+                "peer-numeric-sensitive-sentinel",
+            ),
+            (
+                br#"{"sequence":1,"enabled":"peer-bool-sensitive-sentinel","mode":"Known"}"#,
+                "peer-bool-sensitive-sentinel",
+            ),
+            (
+                br#"{"sequence":1,"enabled":true,"mode":"peer-enum-sensitive-sentinel"}"#,
+                "peer-enum-sensitive-sentinel",
+            ),
+        ];
+
+        for (payload, sentinel) in cases {
+            let source = serde_json::from_slice::<PeerWireFields>(payload)
+                .expect_err("hostile wire type must be rejected");
+            assert!(
+                source.to_string().contains(sentinel),
+                "fixture must exercise serde_json's value-echoing error shape"
+            );
+
+            let error = ProtocolError::from(source);
+            assert!(matches!(&error, ProtocolError::Serialization(_)));
+            let diagnostics = [error.to_string(), format!("{error:?}")];
+            for diagnostic in diagnostics {
+                assert!(
+                    !diagnostic.contains(sentinel),
+                    "ProtocolError diagnostic leaked peer input: {diagnostic}"
+                );
+            }
+            if let Some(source) = std::error::Error::source(&error) {
+                assert!(
+                    !source.to_string().contains(sentinel),
+                    "ProtocolError source leaked peer input: {source}"
+                );
+            }
+        }
+    }
 
     fn wrapped_rustls_error(error: tokio_rustls::rustls::Error) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::InvalidData, error)

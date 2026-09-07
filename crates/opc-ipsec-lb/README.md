@@ -694,8 +694,10 @@ or numeric-only grant cannot be recovered as if it carried destination and
 kernel-counter authority. Finish an in-flight legacy transition with the old
 SDK or rekey and begin a fresh transition; there is no unsafe compatibility
 conversion.
-Session-store birth records use an empty plaintext metadata payload; successful
-promotions replace it with versioned transition-ID/fingerprint metadata.
+IKE and shard session-store birth records use an empty plaintext metadata
+payload; ESP birth records use crate-private, transition-bound pending metadata
+and are invisible to SA owner reads until activation. Successful promotions
+replace either birth form with versioned transition-ID/fingerprint metadata.
 Ownership records with an expiry, an arbitrary payload, or any mismatched
 key/type/owner/fence metadata fail closed.
 
@@ -715,22 +717,26 @@ and §1.4 describes retiring SAs by SPI through INFORMATIONAL Delete payloads.)
 
 Use `RePinCoordinator::activate` for both cases:
 
-1. Create the authoritative session-store birth record for the exact
+1. Build an `OwnershipActivationRequest` with `new_esp`/`new_ike`: the exact
+   ownership key, a fresh `OwnershipTransitionId::generate()?`, this node's
+   `ClusterNode`, and the steering rule naming the owner shard. There are no
+   resume, outbound-IV, counter, or anti-replay parameters, because nothing is
+   being resumed.
+2. Create the authoritative session-store birth record for the exact
    `SessionOwnershipKey`, owned by this node. Activation is a promotion, never
-   an upsert; a missing record fails closed with `NotFound`. Build the record
-   with `SessionStoreOwnershipFencer::birth_record` rather than by hand — it
-   fixes the crate-private ownership state type, `StateClass::AuthoritativeSession`,
-   generation 1, no expiry, and the empty plaintext metadata payload, none of
-   which are nameable from the public API. A hand-rolled record fails closed at
-   `activate` with
+   an upsert; a missing record fails closed with `NotFound`. An ESP record must
+   be built with `SessionStoreOwnershipFencer::pending_activation_birth_record`
+   rather than by hand: it fixes the crate-private ownership state type,
+   transition binding, `StateClass::AuthoritativeSession`, generation 1, and no
+   expiry. A hand-rolled record fails closed at `activate` with
    `InvalidConfig { field: "session_store.state_type", reason: "ownership record state type mismatch" }`.
    The full sequence, using the same `SessionOwnershipKeyResolver` the fencer
    was built with:
 
    ```rust,ignore
-   let key = keyspace.scoped_sa_key(&ownership_key)?;
+   let key = keyspace.scoped_sa_key(&request.ownership_key())?;
    let lease = store.acquire(&key, owner_id, ttl).await?;
-   let record = fencer.birth_record(&key, &cluster_node, &lease)?;
+   let record = fencer.pending_activation_birth_record(&request, &lease)?;
    store
        .compare_and_set(CompareAndSet {
            key,
@@ -742,13 +748,9 @@ Use `RePinCoordinator::activate` for both cases:
    store.release(lease).await?;
    ```
 
-   Shard-owner records use the same call with
-   `SessionOwnershipKeyResolver::shard_key`.
-2. Build an `OwnershipActivationRequest` with `new_esp`/`new_ike`: the exact
-   ownership key, a fresh `OwnershipTransitionId::generate()?`, this node's
-   `ClusterNode`, and the steering rule naming the owner shard. There are no
-   resume, outbound-IV, counter, or anti-replay parameters, because nothing is
-   being resumed.
+   IKE compatibility callers and shard-owner records retain
+   `birth_record`; the latter use `SessionOwnershipKeyResolver::shard_key`.
+   ESP activation deliberately does not accept that unbound legacy form.
 3. Call `activate`. The `OwnershipActivationAuthority` — implemented by
    `SessionStoreOwnershipFencer` — mints the generation from the store's own
    per-key monotonic fence and returns it in an opaque

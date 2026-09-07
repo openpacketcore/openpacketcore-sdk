@@ -3167,6 +3167,14 @@ pub(crate) fn session_consumer_change(
 pub enum SessionConsumerRejection {
     /// Cluster/configuration/epoch differs from the live quorum scope.
     ScopeMismatch,
+    /// The authenticated Hello named a different exact state-voter topology.
+    ///
+    /// This is intentionally distinct from [`Self::Unauthorized`]: a peer
+    /// can prove the caller's identity yet reject its expected node, voter
+    /// count, or roster commitment after an authority cutover. Clients must
+    /// stop an activated exact-roster handle rather than rotate it as a
+    /// transient credential failure.
+    TopologyMismatch,
     /// The typed request violated a fixed contract bound.
     MalformedRequest,
     /// The mTLS identity is not authorized as a consumer.

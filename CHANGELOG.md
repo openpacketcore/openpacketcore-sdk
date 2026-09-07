@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Redaction-safe Child-SA KEYMAT nonce diagnostics — `opc-ipsec-xfrm`:**
+  `Ikev2ChildSaKeyMaterialError::KeyDerivation` now retains an
+  `Ikev2ChildSaKeyMaterialDiagnostic`: a closed snapshot containing the stable
+  KDF code and, only for allowlisted initiator/responder invalid-nonce errors,
+  a closed role plus observed length. Arbitrary source labels, nonce bytes, and
+  key material are neither retained nor rendered; outer stable error code and
+  bounded `Display` output are unchanged. Compatibility note: downstream
+  matches must change the `KeyDerivation` payload from
+  `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
+
 ### Added
+- **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
+  workload scopes select separate bpffs roots and local writer locks. An
+  explicit stopped-generation reset reclaims only the unbound current IPv4
+  interface graph, including recognized partial pin sets, while refusing live
+  writers, foreign program references and permanent selector history. Cleanup
+  is local to the node; no resident agent or cluster API is introduced.
+- **Explicit portable fixed-quorum snapshot integrity — `opc-session-store`:**
+  adds an explicit `PortableVerified` policy with bounded descriptor-pinned
+  verified reads for transport, SQLite installation, restart, and offline
+  recovery. Fixed membership, placement, fencing, and the snapshot envelope
+  remain unchanged. Existing fixed-quorum openers retain strict fs-verity and
+  now reject unavailable sealing support during admission. Recovery plans and
+  workflows authenticate the policy; omitted legacy fields remain strict.
+  Older strict readers cannot reopen new unsealed snapshots. See ADR 0020 and
+  issue #771 for qualification and rollout constraints.
+- **Redaction-safe SCTP connect progress snapshots — `opc-sctp`:** additive
+  handle/future connect APIs expose only the furthest monotonic connector
+  stage (socket/options/bind/remote submission/connect completion/readiness/
+  `SO_ERROR`/established) for raw SCTP and every unprotected Diameter
+  production constructor, including the independent inbound/outbound PPID
+  policy entry point. The handle survives completion, failure, and future
+  cancellation, but it contains no addresses, topology, peer identity, errno,
+  packet values, or subscriber data. `connectx` is reported only as one remote
+  set submission and outcome; no per-path attempt is claimed. Existing connect
+  APIs and PPID/notification behavior are unchanged.
 - **Create-only absent-predecessor protected roster — `opc-session-net`,
   `opc-session-store`:** adds an independent Profile V2 for the case where the
   authoritative session row must not exist before admission. The exact
@@ -67,6 +103,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded reclaim, fixed diagnostics, and a real three-voter 13-cut mTLS
   matrix preserve the two-remote-mutation hot path without exposing raw
   consensus or creating per-subscriber resources.
+- **Finite S2b Create Session Response F-TEID receive policy —
+  `opc-proto-gtpv2c`:**
+  `S2bCreateSessionResponseReceivePolicy` and the one-shot
+  `decode_create_session_response_summary_with_receive_policy` let callers
+  independently add standardized S5/S8 PGW control type 7 and user-plane type
+  5 to the strict default S2b role sets `{32}` and `{33}`. The copied finite
+  policy binds ProcedureAware first-occurrence validation to typed projection;
+  existing decode/projection APIs and canonical builders remain strict, and
+  errors and Debug output remain value-free.
 - **Durable grouped XFRM object roster transaction — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
   and the opt-in migration constructor
@@ -643,6 +688,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Modelling grouped-IE flag bits remains deferred.
 
 ### Changed
+- **Strict-default IKEv2 nonce validation with initial-exchange compatibility — `opc-proto-ikev2`, `opc-ipsec-xfrm` (breaking):**
+  parent IKE-SA and IKE-SA-rekey KDFs now reject nonce inputs below the selected
+  PRF half-key floor by default. The explicit `Ikev2InitialExchangeNoncePolicy`
+  opt-in and paired `derive_ike_sa_init_key_material_with_nonce_policy`,
+  `derive_initial_child_sa_key_material`, and
+  `derive_initial_child_sa_xfrm_keys` APIs support only a 16-octet initiator
+  nonce with PRF-HMAC-SHA2-512 for the coupled initial IKE SA and mandatory
+  initial Child SA. The initial-Child helpers take no new-DH input, so they
+  cannot derive PFS or replacement Child SAs; generic `CREATE_CHILD_SA` and
+  IKE-SA-rekey derivation remain strict. The SDK's 16..=256-octet nonce cap is
+  a bounded-input policy; RFC 7296 section 2.10 supplies the protocol nonce
+  requirements. The policy, errors, and diagnostics do not retain or render
+  nonce or key bytes.
 - **Prepared protected atomic transitions — `opc-session-store` (breaking):**
   `SessionBackend` now separates `prepare_fenced_transition` from execution and
   status and adds typed `NotTransmitted`/`OutcomeUnknown` execution errors.

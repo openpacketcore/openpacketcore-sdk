@@ -1,10 +1,11 @@
-//! Narrow safe access to SQLite's main-file movement probe.
+//! Narrow safe SQLite descriptor controls and verified snapshot I/O.
 //!
 //! SQLite owns the VFS file handle behind a [`rusqlite::Connection`].  This
-//! crate contains the sole audited raw-handle call required to ask that VFS
-//! whether its main database file has moved.  It exposes neither the handle
-//! nor any file name, and fails closed when the pinned SQLite build does not
-//! implement the opcode.
+//! crate contains the audited raw-handle calls required to inspect admitted
+//! descriptor identity. It also owns ADR 0020's explicitly selected read-only
+//! snapshot VFS; cryptographic verification remains in its safe source. No
+//! borrowed SQLite handle is exposed, no process-default VFS is changed, and
+//! unsupported controls fail closed.
 
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
@@ -24,7 +25,12 @@ use std::time::Duration;
 
 use rusqlite::{ffi, Connection};
 
-/// Failure from the SQLite main-file movement probe.
+#[cfg(target_os = "linux")]
+mod verified_snapshot;
+#[cfg(target_os = "linux")]
+pub use verified_snapshot::{RegisteredSnapshot, VerifiedSnapshotSource};
+
+/// Failure from a SQLite descriptor control or verified snapshot registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileControlError;
 
@@ -544,6 +550,11 @@ fn duplicate_sqlite_file_descriptor(
 ) -> Result<std::fs::File, FileControlError> {
     if sqlite_file_has_moved(connection, database)? {
         return Err(FileControlError);
+    }
+    if opcode == ffi::SQLITE_FCNTL_FILE_POINTER {
+        if let Some(file) = verified_snapshot::duplicate_descriptor(connection, database)? {
+            return Ok(file);
+        }
     }
     let mut vfs_name: *mut libc::c_char = std::ptr::null_mut();
     // SAFETY: SQLite allocates `vfs_name` for this documented file-control

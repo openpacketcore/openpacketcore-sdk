@@ -899,23 +899,43 @@ floor and otherwise fails closed. Fences, lease credentials, application
 sequence, request outcomes, and logical time move together with the
 authoritative state-machine image.
 
-The fixed-immutable authority profile additionally requires Linux fs-verity on
-the snapshot filesystem. The SDK closes all writable aliases, reopens the
-final inode read-only with `O_NOFOLLOW`, enables the fixed v1/SHA-256/4 KiB
-profile with no salt or signature, and only then performs the bounded envelope
-scan outside the primary SQLite lock. Metadata publication remeasures the
-sealed inode in constant time. Build, install, startup, and offline recovery
-fail closed when the filesystem does not support that exact profile or when a
-fixed snapshot is unsealed; a byte-identical mutable replacement is not valid
-fixed-profile evidence. Dynamic authority retains bounded corruption
-detection and does not claim kernel-enforced immutability.
+Fixed membership is independent of the local snapshot integrity mechanism.
+Use `open_fixed_durable_quorum_with_snapshot_integrity(..., policy)` to select
+one explicitly:
 
-This is not an online repair or upgrade path. An existing pre-fixed or
-unsealed metadata-referenced artifact is never sealed, repaired, or accepted
-automatically on open. Preserve it and perform the reviewed offline
-reseed/recovery/migration procedure before reopening; retrying startup, editing
-snapshot metadata, or copying in a byte-identical replacement does not satisfy
-the fixed-profile boundary.
+- `SnapshotIntegrityPolicy::PortableVerified` captures a process-owned SHA-256
+  block index from the exact pinned descriptor, then verifies every block
+  consumed by transport, extraction, and a non-default read-only SQLite VFS.
+  It works on ordinary supported Linux filesystems without fs-verity. Same-inode
+  writes or truncation cannot substitute changed bytes after validation.
+- `SnapshotIntegrityPolicy::FsVerity` retains the strict v1/SHA-256/4 KiB kernel
+  seal with no salt or signature. Admission probes the selected filesystem
+  before starting Raft. Unavailable capability returns
+  `SnapshotIntegrityUnavailable`; there is no automatic portable fallback.
+  Existing `open_fixed_durable_quorum` and its clock-injected variant select
+  this strict policy for compatibility.
+
+Both policies preserve the envelope format, expected checksum, descriptor and
+namespace fences, membership, placement, publication transaction, and recovery
+checks. Portable indexing runs on a blocking worker outside the primary SQLite
+lock. Blocks range from 64 KiB to 2 MiB, with at most 16 MiB of digests per image;
+clones share the index and verified cache. A process-wide 128 MiB reservation
+bounds indices, capture/cache replacement buffers, and pending transport reads.
+Exhaustion fails closed before allocating more verification work. It is not a
+whole-snapshot memory copy, chmod guarantee, or hash-then-reopen sequence.
+Dynamic authority retains its existing bounded corruption detection and does
+not claim either fixed snapshot protection.
+
+Explicit portable selection can read existing sealed images, but an old strict
+reader cannot reopen newly written unsealed snapshots. A rollout or rollback
+must retain compatible readers or use a separately reviewed offline conversion
+on capable storage. Neither policy repairs snapshots, changes durable authority,
+or accepts a replacement merely because its bytes match. Offline administrators
+must explicitly select the same policy using
+`LegacyForkRecovery::with_snapshot_integrity`; the plan and workflow authenticate
+that selection, and resume/finalization reject a policy mismatch. Legacy plans
+without the field retain their exact strict meaning and serialization. See
+[ADR 0020](../../docs/adr/0020-portable-verified-consensus-snapshots.md).
 
 Runbook: keep traffic and ownership publication closed unless readiness is
 `Ready`. During `catching_up` or `awaiting_quorum`, restore authenticated peer

@@ -908,18 +908,31 @@ epoch-derived and do not include the fixed-profile or placement-policy binding.
 `ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
 where descriptor-pinned SQLite snapshots are available; other platforms MUST
 return `FixedQuorumUnsupportedPlatform` before durable initialization.
-Linux alone is insufficient for the fixed profile: the snapshot filesystem
-MUST support the exact fs-verity v1 profile (SHA-256, 4 KiB block size, no salt,
-and no signature). Build, installation, startup, and recovery MUST reject an
-unsupported filesystem or an unsealed fixed-profile artifact before it can be
-accepted as durable state. The dynamic profile remains available without this
-fixed artifact requirement, but MUST retain its bounded corruption detection
-and fail closed on invalid snapshot evidence.
-This is not an online migration: an existing pre-fixed or unsealed
-metadata-referenced artifact is not auto-sealed, auto-repaired, or accepted on
-open. Operators MUST preserve it and use the reviewed offline
-reseed/recovery/migration procedure before reopening; a startup retry,
-metadata edit, or byte-identical replacement does not cross this boundary.
+The local snapshot integrity mechanism is an explicit construction policy,
+independent of fixed membership and placement. The legacy opener selects
+`SnapshotIntegrityPolicy::FsVerity`: the filesystem MUST support the exact
+v1/SHA-256/4 KiB profile with no salt or signature, and admission MUST probe it
+before starting Raft. Build, installation, startup, and recovery MUST reject an
+unsealed artifact under that policy. It MUST NOT silently fall back.
+
+The additive `open_fixed_durable_quorum_with_snapshot_integrity` opener also
+admits `PortableVerified` on supported ordinary Linux filesystems. As specified
+in [ADR 0020](../adr/0020-portable-verified-consensus-snapshots.md), every consumed
+snapshot byte, including SQLite reads, MUST pass through owned buffers verified
+against one retained, bounded, process-owned digest index. A full checksum scan
+followed by unchecked descriptor I/O, mmap, or reopening a pathname MUST NOT
+qualify. Indexing MUST occur outside the primary SQLite lock. Existing envelope,
+authoritative checksum, descriptor/namespace identity, and publication fences
+remain mandatory. The dynamic profile retains its bounded corruption detection
+without claiming either fixed snapshot protection.
+
+Portable selection MAY consume an existing sealed image but MUST NOT repair or
+rewrite it during admission. An old strict reader MUST reject a newly written
+unsealed image; rollback requires a compatible reader or a separately qualified
+explicit offline conversion on capable storage. Recovery plans and resumable
+workflows MUST authenticate the selected policy; omitted legacy fields retain
+strict semantics and canonical bytes. Membership, placement, snapshot wire
+format, and destructive-confirmation requirements are unchanged.
 Fixed membership does not authorize dynamic membership transitions, a second
 consensus engine, a controller feed, or a new packet-core protocol path.
 `try_from_fixed_durable_quorum_with_authenticated_placement` may additionally
@@ -2047,6 +2060,63 @@ material epoch. Authorized endpoint, leader, topology, TLS-leaf, server, and
 provider/key rotation can therefore use the same durable journal path, key,
 and volume. This does not claim host failover, host/volume-loss recovery,
 journal replication, or a second consensus transition.
+
+`SessionConsumerPreparedFencedTransitionBackend` is the public protected V1
+prepared fenced-transition facade for that wrapper. Its
+`persistent_exact_voter_prewarm_roster` constructor consumes the complete set
+of persistent clients for one scope, activates and prewarms every V1 physical
+voter internally, and returns an opaque roster value. Only the facade's
+local-AEAD and remote-sealing constructors can consume that value; neither a
+raw physical backend nor a dispatchable voter value leaves the net crate. A
+partial roster or any non-V1 voter fails activation. The facade rejects an
+incomplete, duplicate, or differently authenticated/bound roster and
+canonicalizes admitted voters by node ordinal; caller input order is not
+authority. For every
+caller-stable `FencedTransitionRequestId`, the router derives the same origin
+from the authenticated scope, canonical roster, and ID. It uses the existing
+V1 `fenced_transition` operation only. It is not #702's V2 receipt-history
+protocol or `FencedTransitionV2PreparedJournal`, and grants neither activation
+or readiness-probe authority nor a new quorum, replication, membership, or
+consensus authority.
+
+`ProtectedFencedTransitionBackend` is a sealed, methodless marker; it has no
+`SessionBackend` supertrait. `EncryptingSessionBackend` and
+`RemoteSealingSessionBackend` implement it around inner types that separately
+implement `SessionBackend`. Therefore the router composes directly over the real
+`SessionConsumerFencedTransitionBackend` and MUST NOT grant that physical
+adapter synthetic lease authority. The existing
+`SessionConsumerPreparedCheckpointBackend` remains the distinct complete
+protected-session path for prepared CAS and lease APIs, which require
+`ProtectedSessionBackend` and `SessionLeaseManager`.
+
+Preparation retains the exact outer protected journal token privately in a
+move-only affine handle. The sealed boundary MUST NOT expose a dispatchable
+physical prepared token. The router revalidates that exact outer token before
+every physical mutation and receipt-status attempt and derives only its
+authenticated-consumer request view; it MUST NOT reconstruct the request or
+replace the retained token with current provider/key state. Mutation starts at
+the deterministic origin and visits the
+canonical voter roster. It MAY advance to another voter only after a proven
+pre-dispatch `NotTransmitted` result. Cancellation during the pre-dispatch
+setup is safe and retryable because no application bytes can cross the
+transport boundary. After dispatch begins, a possible send, including
+`OutcomeUnknown`, or cancellation is ambiguous and MUST permanently make the
+handle receipt-only; it MUST NOT regain mutation authority.
+`BeforeCallWrite(SessionConsumerClientError::Scope)` is a terminal topology
+authority revocation and MUST be returned as rejected
+`StoreError::TopologyAuthorityRevoked`; it MUST NOT be downgraded to a generic
+`NotTransmitted` result or trigger successor mutation dispatch.
+
+Receipt status is read-only. A single status call uses the next deterministic
+canonical successor voter. A status-until-terminal call repeats bounded
+canonical-roster passes under the single immutable caller absolute deadline,
+with every physical attempt additionally capped by the prepared
+physical-attempt budget. It can end with a deadline; `NotFound`, unavailable,
+or a per-attempt deadline remains nonterminal while outer budget remains. None
+is proof that a delayed mutation cannot commit. A terminal receipt is cached
+locally. Restart recovery returns only the status-only
+`SessionConsumerRecoveredFencedTransitionStatus` handle; it deliberately has
+no execute authority, even if the recovered token is otherwise valid.
 
 Journal provisioning and reopening are distinct. A deployment MUST call
 `PreparedFencedTransitionJournal::create_new` exactly once for a missing path

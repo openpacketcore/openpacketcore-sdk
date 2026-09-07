@@ -8,10 +8,15 @@
 //!
 //! # Protected checkpoint consumption
 //!
-//! Prepared checkpoint requests are obtained only from an SDK-owned
-//! [`ProtectedSessionBackend`] wrapper. The returned affine request captures
-//! its exact scope, caller request ID, sealed mutation, and deadline budget;
-//! only the net-owned consumer composite can turn it into an execution handle.
+//! Prepared CAS and lease checkpoint requests are obtained only from an
+//! SDK-owned [`ProtectedSessionBackend`] wrapper. Protected fenced transitions
+//! use the narrower sealed [`ProtectedFencedTransitionBackend`] marker. It
+//! deliberately exposes neither a [`SessionBackend`] nor a physical request,
+//! so a consumer adapter cannot claim synthetic lease authority or lower a
+//! recovered handle into a replayable mutation. The returned affine request
+//! captures its exact scope, caller request ID, sealed mutation, and deadline
+//! budget; only the net-owned consumer composite can turn it into an execution
+//! handle.
 //! Prepared is local type-state, never a wire or server authorization marker.
 //!
 //! ```compile_fail
@@ -116,7 +121,7 @@ pub use backend::{
     PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
     PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError,
     PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
-    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError,
+    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedFencedTransitionBackend,
     ProtectedRosterEstablishedSuccessor, ProtectedSelectorLedgerBase, ProtectedSessionBackend,
     RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
     ReplicationOp, ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor,
@@ -157,9 +162,10 @@ pub use consensus::{
     SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-    PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
-    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionTopologyTransportAdmissionError, SnapshotIntegrityPolicy,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,
+    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,

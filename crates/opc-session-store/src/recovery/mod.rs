@@ -883,6 +883,11 @@ pub enum RecoveryDecisionBasis {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RecoveryPlanBody {
     version: u16,
+    #[serde(
+        default = "crate::SnapshotIntegrityPolicy::legacy",
+        skip_serializing_if = "crate::SnapshotIntegrityPolicy::is_legacy"
+    )]
+    snapshot_integrity: crate::SnapshotIntegrityPolicy,
     identity: SessionConsensusIdentity,
     expected_members: BTreeSet<SessionConsensusNodeId>,
     basis: RecoveryDecisionBasis,
@@ -922,6 +927,11 @@ impl fmt::Debug for RecoveryPlan {
 }
 
 impl RecoveryPlan {
+    /// Snapshot integrity policy authenticated by this recovery plan.
+    pub const fn snapshot_integrity_policy(&self) -> crate::SnapshotIntegrityPolicy {
+        self.body.snapshot_integrity
+    }
+
     /// Exact plan digest used for operator confirmation and idempotency.
     pub const fn plan_digest(&self) -> RecoveryDigest {
         self.plan_digest
@@ -1052,6 +1062,9 @@ impl RecoveryExecutionReport {
 /// fail-closed rather than being retried as ordinary consensus lag.
 fn map_live_terminal_recovery_handoff_error(error: SessionConsensusStorageError) -> RecoveryError {
     match error {
+        SessionConsensusStorageError::SnapshotIntegrityUnavailable => {
+            RecoveryError::FileOperationFailed
+        }
         SessionConsensusStorageError::BackendUnavailable => RecoveryError::ConsensusUnavailable,
         SessionConsensusStorageError::UnsupportedPlatform
         | SessionConsensusStorageError::RecoveryRequired
@@ -1175,6 +1188,7 @@ pub struct LegacyForkRecovery<A, S, O> {
     audit: S,
     observer: O,
     integrity_key: RecoveryIntegrityKey,
+    snapshot_integrity: crate::SnapshotIntegrityPolicy,
 }
 
 impl<A, S, O> fmt::Debug for LegacyForkRecovery<A, S, O> {
@@ -1197,7 +1211,19 @@ where
             audit,
             observer,
             integrity_key,
+            snapshot_integrity: crate::SnapshotIntegrityPolicy::FsVerity,
         }
+    }
+
+    /// Select the fixed-quorum snapshot policy for this recovery campaign.
+    ///
+    /// The choice is authenticated in its plan and workflow and must agree
+    /// when executing/resuming. The default preserves the legacy strict
+    /// fs-verity contract. Portable reads retain the same descriptor, content,
+    /// membership, and destructive-confirmation checks.
+    pub fn with_snapshot_integrity(mut self, policy: crate::SnapshotIntegrityPolicy) -> Self {
+        self.snapshot_integrity = policy;
+        self
     }
 
     /// Inspect all drained replicas and produce a deterministic no-mutation plan.
@@ -1288,6 +1314,7 @@ where
                     identity,
                     expected_members: &expected_members,
                     limits,
+                    snapshot_integrity: self.snapshot_integrity,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1455,6 +1482,7 @@ where
             .unwrap_or(0);
         let body = RecoveryPlanBody {
             version: RECOVERY_PLAN_VERSION,
+            snapshot_integrity: self.snapshot_integrity,
             identity,
             expected_members,
             basis,
@@ -1495,6 +1523,9 @@ where
         limits: RecoveryLimits,
     ) -> Result<RecoveryExecutionReport, RecoveryError> {
         verify_plan(&self.integrity_key, plan)?;
+        if plan.body.snapshot_integrity != self.snapshot_integrity {
+            return Err(RecoveryError::StalePlan);
+        }
         validate_confirmation(plan, confirmation)?;
         let scope = RecoveryAuthorizationScope {
             action: RecoveryAction::ResetReplicas,
@@ -1688,6 +1719,13 @@ where
         #[cfg(test)] failpoint: Option<RecoveryFinalizeFailpoint>,
     ) -> Result<RecoveryExecutionReport, RecoveryError> {
         verify_plan(&self.integrity_key, plan)?;
+        if plan.body.snapshot_integrity != self.snapshot_integrity
+            || store
+                .snapshot_integrity_policy()
+                .is_some_and(|policy| policy != self.snapshot_integrity)
+        {
+            return Err(RecoveryError::StalePlan);
+        }
         validate_confirmation(plan, confirmation)?;
         let scope = RecoveryAuthorizationScope {
             action: RecoveryAction::Finalize,
