@@ -35,6 +35,9 @@ use opc_types::{NetworkFunctionKind, TenantId};
 
 const SERVER_REPLICA: u16 = 2;
 
+static LIFECYCLE_RETIREMENT_METRICS_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 struct TestPki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
@@ -525,6 +528,7 @@ async fn assert_paused_direct_lifecycle_wiring(endpoint: LifecycleEndpoint, limi
 
 #[tokio::test]
 async fn paused_time_client_wiring_retires_for_age_local_and_peer_leaf_expiry() {
+    let _guard = LIFECYCLE_RETIREMENT_METRICS_TEST_LOCK.lock().await;
     for limit in [
         LifecycleLimit::MaximumAge,
         LifecycleLimit::LocalLeafExpiry,
@@ -536,6 +540,7 @@ async fn paused_time_client_wiring_retires_for_age_local_and_peer_leaf_expiry() 
 
 #[tokio::test]
 async fn paused_time_server_wiring_retires_for_age_local_and_peer_leaf_expiry() {
+    let _guard = LIFECYCLE_RETIREMENT_METRICS_TEST_LOCK.lock().await;
     for limit in [
         LifecycleLimit::MaximumAge,
         LifecycleLimit::LocalLeafExpiry,
@@ -955,6 +960,7 @@ async fn assert_real_mtls_leaf_expiry_reconnects(short_local_leaf: bool) {
 
 #[tokio::test]
 async fn real_mtls_local_and_peer_leaf_expiry_force_exact_reauthentication() {
+    let _guard = LIFECYCLE_RETIREMENT_METRICS_TEST_LOCK.lock().await;
     assert_real_mtls_leaf_expiry_reconnects(true).await;
     assert_real_mtls_leaf_expiry_reconnects(false).await;
 }
