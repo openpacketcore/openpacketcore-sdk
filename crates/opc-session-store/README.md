@@ -883,6 +883,11 @@ every use. The existing statement cache capacity is unchanged. The immutable
 V2 protocol digest is computed once; every persisted receipt and request
 binding is still verified.
 
+Membership projection loading shares complete layout, certificate, history and
+scope validation within one SQLite read transaction. An autocommit caller gets
+a read transaction for that load; an existing caller transaction retains its
+ownership. Each later load validates the current durable state again.
+
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal
 submission remains `BackendUnavailable`. Once `client_write_ff` accepts the

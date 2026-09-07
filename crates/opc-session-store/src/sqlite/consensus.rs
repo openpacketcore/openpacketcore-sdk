@@ -18379,25 +18379,15 @@ pub(crate) fn fenced_transition_activation_matches_scope_sync(
     scope_identity: SessionConsensusIdentity,
     voters: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<bool> {
-    if fenced_transition_receipt_ledger_layout_sync(conn)?
-        != FencedTransitionReceiptLedgerLayout::Activated
-    {
-        return Ok(false);
-    }
-    if scope_identity.cluster_id() != storage_identity.cluster_id() || voters.is_empty() {
-        return Ok(false);
-    }
-    let Some((certificate_scope, certificate_voters)) =
-        read_fenced_transition_activation_certificate_sync(conn, storage_identity, false)?
-    else {
-        return Ok(false);
-    };
-    Ok(certificate_scope == scope_identity
-        && fenced_transition_activation_voter_set_digest_matches_scope(
-            certificate_voters,
-            scope_identity,
-            voters,
-        ))
+    let layout = fenced_transition_receipt_ledger_layout_sync(conn)?;
+    fenced_transition_v1_scope_activations_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+        layout,
+    )
+    .map(|(fenced_transition, _)| fenced_transition)
 }
 
 /// Return whether the existing immutable certificate is specifically the
@@ -18409,20 +18399,49 @@ pub(crate) fn protected_roster_profile_activation_matches_scope_sync(
     scope_identity: SessionConsensusIdentity,
     voters: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<bool> {
-    if fenced_transition_receipt_ledger_layout_sync(conn)?
-        != FencedTransitionReceiptLedgerLayout::Activated
+    let layout = fenced_transition_receipt_ledger_layout_sync(conn)?;
+    fenced_transition_v1_scope_activations_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+        layout,
+    )
+    .map(|(_, protected_roster)| protected_roster)
+}
+
+/// Derive both V1 proofs from the same fully decoded certificate. Projection
+/// loading supplies a full layout check from its current SQLite transaction;
+/// standalone probes above each obtain their own fresh layout check.
+fn fenced_transition_v1_scope_activations_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+    layout: FencedTransitionReceiptLedgerLayout,
+) -> io::Result<(bool, bool)> {
+    if layout != FencedTransitionReceiptLedgerLayout::Activated
         || scope_identity.cluster_id() != storage_identity.cluster_id()
         || voters.is_empty()
     {
-        return Ok(false);
+        return Ok((false, false));
     }
     let Some((certificate_scope, certificate_voters)) =
         read_fenced_transition_activation_certificate_sync(conn, storage_identity, false)?
     else {
-        return Ok(false);
+        return Ok((false, false));
     };
-    Ok(certificate_scope == scope_identity
-        && certificate_voters == protected_roster_profile_voter_set_digest(scope_identity, voters))
+    Ok((
+        certificate_scope == scope_identity
+            && fenced_transition_activation_voter_set_digest_matches_scope(
+                certificate_voters,
+                scope_identity,
+                voters,
+            ),
+        certificate_scope == scope_identity
+            && certificate_voters
+                == protected_roster_profile_voter_set_digest(scope_identity, voters),
+    ))
 }
 
 type ProtectedRosterV2ActivationCertificate = (SessionConsensusIdentity, [u8; 32], [u8; 32]);
@@ -19243,6 +19262,33 @@ pub(crate) fn fenced_transition_v2_activation_matches_scope_sync(
         return Ok(false);
     }
     let history = read_fenced_transition_v2_history_row_in_sync(conn, storage_identity, false)?;
+    fenced_transition_v2_activation_matches_history_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+        profile_digest,
+        &history,
+    )
+}
+
+/// The caller fully validates the V2 layout and history row before entering
+/// here. Projection reuses that row only within its current read transaction.
+fn fenced_transition_v2_activation_matches_history_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+    profile_digest: [u8; 32],
+    history: &FencedTransitionV2HistoryRow,
+) -> io::Result<bool> {
+    if scope_identity.cluster_id() != storage_identity.cluster_id()
+        || voters.is_empty()
+        || !fenced_transition_v2_payload_cap_matches_local_storage()
+        || profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest()
+    {
+        return Ok(false);
+    }
     let Some((certificate_scope, certificate_voters, certificate_profile)) =
         read_fenced_transition_v2_activation_certificate_in_sync(conn, storage_identity, false)?
     else {
@@ -23481,10 +23527,35 @@ impl MembershipLogProjection {
         storage_identity: SessionConsensusIdentity,
         allow_published_684_recovery_layout: bool,
     ) -> io::Result<Self> {
+        // A projection may reuse fully validated rows only while they belong
+        // to one SQLite snapshot. Append and fixed-authority raw reads already
+        // hold a transaction; dynamic/recovery readers acquire one just for
+        // this load. No validation result survives into a later load.
+        if conn.is_autocommit() {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)
+                .map_err(db_error)?;
+            let projection = Self::load_in_transaction(
+                &tx,
+                storage_identity,
+                allow_published_684_recovery_layout,
+            )?;
+            tx.commit().map_err(db_error)?;
+            return Ok(projection);
+        }
+        Self::load_in_transaction(conn, storage_identity, allow_published_684_recovery_layout)
+    }
+
+    fn load_in_transaction(
+        conn: &Connection,
+        storage_identity: SessionConsensusIdentity,
+        allow_published_684_recovery_layout: bool,
+    ) -> io::Result<Self> {
+        debug_assert!(!conn.is_autocommit());
         let (application_sequence, _, logical_time, _) = read_machine_sync(conn, storage_identity)?;
         let scope = read_membership_scope_sync(conn, storage_identity)?;
+        let fenced_receipt_layout = fenced_transition_receipt_ledger_layout_sync(conn)?;
         let (fenced_receipt_ledger_has_commitments, projected_fenced_receipt_count) =
-            match fenced_transition_receipt_ledger_layout_sync(conn)? {
+            match fenced_receipt_layout {
                 FencedTransitionReceiptLedgerLayout::Activated => {
                     (true, fenced_transition_receipt_count_sync(conn)?)
                 }
@@ -23500,18 +23571,13 @@ impl MembershipLogProjection {
                     ));
                 }
             };
-        let fenced_transition_scope_activated = fenced_transition_activation_matches_scope_sync(
-            conn,
-            storage_identity,
-            scope.current_identity,
-            &scope.current_members,
-        )?;
-        let protected_roster_profile_scope_activated =
-            protected_roster_profile_activation_matches_scope_sync(
+        let (fenced_transition_scope_activated, protected_roster_profile_scope_activated) =
+            fenced_transition_v1_scope_activations_sync(
                 conn,
                 storage_identity,
                 scope.current_identity,
                 &scope.current_members,
+                fenced_receipt_layout,
             )?;
         let protected_roster_profile_v2_scope_activated =
             protected_roster_profile_v2_activation_matches_scope_sync(
@@ -23523,24 +23589,38 @@ impl MembershipLogProjection {
         let (projected_v2_history, projected_v2_scope_activated) =
             match fenced_transition_v2_ledger_layout_sync(conn)? {
                 FencedTransitionV2LedgerLayout::Absent => (None, false),
-                FencedTransitionV2LedgerLayout::Activated => (
-                    Some(read_fenced_transition_v2_history_row_in_sync(
+                FencedTransitionV2LedgerLayout::Activated => {
+                    let history = read_fenced_transition_v2_history_row_in_sync(
                         conn,
                         storage_identity,
                         false,
-                    )?),
-                    fenced_transition_v2_activation_matches_scope_sync(
+                    )?;
+                    let activated = fenced_transition_v2_activation_matches_history_sync(
                         conn,
                         storage_identity,
                         scope.current_identity,
                         &scope.current_members,
                         crate::fenced_transition::fenced_transition_v2_profile_digest(),
-                    )?,
-                ),
+                        &history,
+                    )?;
+                    (Some(history), activated)
+                }
             };
+        let membership = read_membership_unchecked_sync(conn, storage_identity)?;
+        if !is_pristine_membership(&membership)
+            || read_applied_sync(conn, storage_identity)?.is_some()
+        {
+            let log_index = membership
+                .log_id()
+                .ok_or_else(|| {
+                    invalid_data("session consensus membership log identity is missing")
+                })?
+                .index;
+            validate_membership_for_log(&membership, &scope, log_index)?;
+        }
         Ok(Self {
             scope,
-            membership: read_membership_sync(conn, storage_identity)?,
+            membership,
             projected_bound_requests: BTreeSet::new(),
             projected_fenced_receipt_count,
             fenced_receipt_ledger_has_commitments,
@@ -64497,6 +64577,149 @@ BEGIN IMMEDIATE;
                 result.expect_err(case).kind(),
                 io::ErrorKind::InvalidData,
                 "{case}",
+            );
+        }
+    }
+
+    #[test]
+    fn membership_projection_load_uses_one_current_sqlite_snapshot() {
+        let directory = tempfile::tempdir().expect("projection database directory");
+        let path = directory.path().join("projection.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("projection backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        activate_v2_ledger_fixture(&conn);
+        let writer = std::sync::Mutex::new(Connection::open(&path).expect("independent writer"));
+        let changed = Arc::new(AtomicBool::new(false));
+        let observed_changed = Arc::clone(&changed);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "consensus_fenced_transition_v2_history",
+                    ..
+                }
+            ) && !observed_changed.swap(true, Ordering::SeqCst)
+            {
+                assert_eq!(
+                    writer
+                        .lock()
+                        .expect("writer lock")
+                        .execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+                        .expect("commit concurrent certificate removal"),
+                    1,
+                );
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+        let projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load the snapshot that preceded the concurrent write");
+        conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        assert!(
+            changed.load(Ordering::SeqCst),
+            "writer must run during load"
+        );
+        assert!(projection.projected_v2_scope_activated);
+        assert!(conn.is_autocommit(), "load must release its read snapshot");
+        assert!(
+            !MembershipLogProjection::load(&conn, identity(), false)
+                .expect("next load must read the committed removal")
+                .projected_v2_scope_activated,
+        );
+
+        conn.execute_batch(
+            "CREATE TRIGGER unexpected_projection_activation_trigger \
+             AFTER INSERT ON consensus_fenced_transition_v2_activation BEGIN SELECT 1; END;",
+        )
+        .expect("introduce hostile schema after a successful load");
+        assert_eq!(
+            MembershipLogProjection::load(&conn, identity(), false)
+                .err()
+                .expect("next load must reject changed schema")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(
+            conn.is_autocommit(),
+            "failed load must release its snapshot"
+        );
+    }
+
+    #[test]
+    fn membership_projection_load_preserves_the_callers_transaction() {
+        let backend = SqliteSessionBackend::in_memory().expect("projection backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        activate_v2_ledger_fixture(&conn);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("caller's transaction");
+        tx.execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+            .expect("uncommitted certificate removal");
+        assert!(
+            !MembershipLogProjection::load(&tx, identity(), false)
+                .expect("load must observe caller's writes")
+                .projected_v2_scope_activated,
+        );
+        assert!(!conn.is_autocommit(), "load must not commit its caller");
+        tx.rollback().expect("caller rolls back");
+        assert!(
+            MembershipLogProjection::load(&conn, identity(), false)
+                .expect("read rolled-back certificate")
+                .projected_v2_scope_activated,
+        );
+    }
+
+    #[test]
+    #[ignore = "release-profile membership query cost diagnosis for SDK-741"]
+    fn membership_projection_query_cost_diagnostic() {
+        let backend = SqliteSessionBackend::in_memory().expect("diagnostic backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        activate_v2_ledger_fixture(&conn);
+        for capacity in [0, 16, 32, 64] {
+            conn.flush_prepared_statement_cache();
+            conn.set_prepared_statement_cache_capacity(capacity);
+            let selects = Arc::new(AtomicUsize::new(0));
+            let observed_selects = Arc::clone(&selects);
+            conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(context.action, rusqlite::hooks::AuthAction::Select) {
+                    observed_selects.fetch_add(1, Ordering::Relaxed);
+                }
+                rusqlite::hooks::Authorization::Allow
+            }));
+            for _ in 0..16 {
+                let projection = MembershipLogProjection::load(&conn, identity(), false)
+                    .expect("warm exact projection queries");
+                assert!(projection.projected_v2_scope_activated);
+            }
+            selects.store(0, Ordering::Relaxed);
+            let mut samples = Vec::with_capacity(4_096);
+            for _ in 0..4_096 {
+                let started = Instant::now();
+                std::hint::black_box(
+                    MembershipLogProjection::load(&conn, identity(), false)
+                        .expect("fully validate current projection"),
+                );
+                samples.push(started.elapsed());
+            }
+            let total = samples.iter().sum::<Duration>();
+            samples.sort_unstable();
+            eprintln!(
+                "sdk-741 membership component: cache_capacity={capacity} samples={} select_authorizations={} total_us={} p50_ns={} p99_ns={} p999_ns={}",
+                samples.len(),
+                selects.load(Ordering::Relaxed),
+                total.as_micros(),
+                samples[2_047].as_nanos(),
+                samples[4_055].as_nanos(),
+                samples[4_091].as_nanos(),
             );
         }
     }
