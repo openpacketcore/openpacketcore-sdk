@@ -2544,6 +2544,28 @@ struct ConsensusStorageShutdownCompletion {
     runtime_write_handoff_pending: AtomicBool,
 }
 
+// Shared by all stores and runtimes in this SDK instance, including closed
+// stores whose scheduler jobs have not retired. Each admission can queue at
+// most one replacement worker and one completion marker. This cap bounds those
+// jobs independently of store churn; exhaustion keeps the existing inline path.
+const MAX_RUNTIME_WRITE_HANDOFFS: usize = 64;
+static RUNTIME_WRITE_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
+
+// This unique admission deliberately has no Drop refund. A lost or cancelled
+// marker cannot prove that its replacement worker left the runtime queue.
+struct RuntimeWriteHandoff {
+    completion: Arc<ConsensusStorageShutdownCompletion>,
+}
+
+impl RuntimeWriteHandoff {
+    fn complete(self) {
+        RUNTIME_WRITE_HANDOFFS.fetch_sub(1, Ordering::AcqRel);
+        self.completion
+            .runtime_write_handoff_pending
+            .store(false, Ordering::Release);
+    }
+}
+
 /// Observation that every Openraft-owned SQLite storage handle has exited.
 #[derive(Clone)]
 pub(crate) struct ConsensusStorageShutdownObserver(Arc<ConsensusStorageShutdownCompletion>);
@@ -2589,7 +2611,7 @@ impl ConsensusStorageShutdownGuard {
         Self(None)
     }
 
-    fn try_admit_runtime_write_handoff(&self) -> Option<Arc<ConsensusStorageShutdownCompletion>> {
+    fn try_admit_runtime_write_handoff(&self) -> Option<RuntimeWriteHandoff> {
         let completion = self.0.as_ref()?;
         if !completion.runtime_write_handoff.load(Ordering::Acquire) {
             return None;
@@ -2598,7 +2620,22 @@ impl ConsensusStorageShutdownGuard {
             .runtime_write_handoff_pending
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        Some(Arc::clone(completion))
+        if RUNTIME_WRITE_HANDOFFS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < MAX_RUNTIME_WRITE_HANDOFFS).then(|| admitted + 1)
+            })
+            .is_err()
+        {
+            // No scheduler job has been submitted for this reservation, so
+            // only this failed admission may release its tracker immediately.
+            completion
+                .runtime_write_handoff_pending
+                .store(false, Ordering::Release);
+            return None;
+        }
+        Some(RuntimeWriteHandoff {
+            completion: Arc::clone(completion),
+        })
     }
 
     fn observer(&self) -> Option<ConsensusStorageShutdownObserver> {
@@ -4020,7 +4057,9 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
 /// the queue. This bounds pending scheduler work to one replacement plus one
 /// marker per store, including while the pool is saturated. Other writes stay
 /// inline. The marker owns only the tracker, never SQLite or an owner guard.
-/// Cancellation of the marker retires admission instead of releasing it early.
+/// A shared 64-admission cap also bounds this SDK instance to 128 queued jobs
+/// across all stores and runtimes, including trackers for closed stores.
+/// Cancellation retires both admissions instead of releasing either early.
 fn run_admitted_sqlite_write<R>(
     shutdown_guard: &ConsensusStorageShutdownGuard,
     operation: impl FnOnce() -> R,
@@ -4051,14 +4090,12 @@ fn run_admitted_sqlite_write<R>(
 
 fn enqueue_runtime_write_handoff_completion(
     runtime: &tokio::runtime::Handle,
-    completion: Arc<ConsensusStorageShutdownCompletion>,
+    completion: RuntimeWriteHandoff,
 ) -> tokio::task::JoinHandle<()> {
     runtime.spawn_blocking(move || {
         // Only execution rearms admission. Dropping a rejected or cancelled
         // closure leaves the reservation retired without blocking cleanup.
-        completion
-            .runtime_write_handoff_pending
-            .store(false, Ordering::Release);
+        completion.complete();
     })
 }
 
@@ -9822,7 +9859,113 @@ mod tests {
     }
 
     #[test]
+    fn admitted_sqlite_handoff_bounds_closed_trackers_across_runtimes() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_handoff_bounds_closed_trackers_across_runtimes",
+        ) {
+            return;
+        }
+
+        let mut retained_by_case = Vec::new();
+        for lifetimes in [256, 512] {
+            let fixtures = [
+                AdmittedSqliteHandoffFixture::new(),
+                AdmittedSqliteHandoffFixture::new(),
+            ];
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut releases = Vec::new();
+            let mut tasks = Vec::new();
+            for fixture in &fixtures {
+                let entered_tx = entered_tx.clone();
+                let (release, start) = std::sync::mpsc::channel();
+                releases.push(release);
+                tasks.push(fixture.runtime().spawn(async move {
+                    entered_tx.send(()).expect("signal a ready runtime caller");
+                    start
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release both concurrent runtime callers");
+                    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+                    let mut trackers = Vec::new();
+                    for _ in 0..lifetimes / 2 {
+                        let owner = ConsensusStorageShutdownGuard::tracked();
+                        let observer = owner.observer().expect("tracked caller");
+                        observer.enable_runtime_write_handoff();
+                        trackers.push(Arc::downgrade(&observer.0));
+                        let caller = std::thread::current().id();
+                        run_admitted_sqlite_write(&owner, || {
+                            assert_eq!(std::thread::current().id(), caller);
+                            calls.set(calls.get() + 1);
+                        });
+                        drop(owner);
+                        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+                        assert!(futures_util::FutureExt::now_or_never(observer.wait()).is_some());
+                        drop(observer);
+                    }
+                    assert_eq!(calls.get(), lifetimes / 2);
+                    trackers
+                }));
+            }
+            for _ in &fixtures {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("both runtime callers are ready");
+            }
+            for release in releases {
+                release.send(()).expect("start the concurrent callers");
+            }
+            let mut trackers = Vec::new();
+            for (fixture, task) in fixtures.iter().zip(tasks) {
+                trackers.extend(
+                    fixture
+                        .runtime()
+                        .block_on(task)
+                        .expect("join completed owner lifetimes"),
+                );
+            }
+            let retained = trackers
+                .iter()
+                .filter(|tracker| tracker.strong_count() != 0)
+                .count();
+            for fixture in fixtures {
+                fixture.close();
+            }
+            assert!(trackers.iter().all(|tracker| tracker.strong_count() == 0));
+            retained_by_case.push(retained);
+            eprintln!("admitted SQLite closed trackers: lifetimes={lifetimes} retained_while_blocked={retained} retained_after_drain=0 runtimes_stopped=2");
+        }
+        // Each case has completed all SQL owners, drained both pools, and
+        // stopped every runtime thread before evaluating the aggregate bound.
+        // The second case also proves that ordinary retirement restores it.
+        assert_eq!(retained_by_case, [64, 64]);
+    }
+
+    fn run_admitted_sqlite_resource_case_in_child(test_name: &str) -> bool {
+        const CHILD_CASE: &str = "OPC_SESSION_STORE_ADMITTED_SQLITE_RESOURCE_CHILD";
+        if std::env::var(CHILD_CASE).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let test = format!("consensus::storage::tests::{test_name}");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([&test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_CASE, test_name)
+            .output()
+            .expect("run isolated handoff resource case");
+        assert!(
+            output.status.success(),
+            "isolated handoff resource case failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    #[test]
     fn admitted_sqlite_handoff_cancelled_marker_retires_admission() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_handoff_cancelled_marker_retires_admission",
+        ) {
+            return;
+        }
         let fixture = AdmittedSqliteHandoffFixture::new();
         let owner = ConsensusStorageShutdownGuard::tracked();
         let observer = owner.observer().expect("tracked handoff owner");
@@ -9867,10 +10010,17 @@ mod tests {
             .runtime_write_handoff_pending
             .load(Ordering::Acquire));
         assert_eq!(Arc::strong_count(&observer.0), 1);
+        drop(observer);
+        assert_eq!(RUNTIME_WRITE_HANDOFFS.load(Ordering::Acquire), 1);
     }
 
     #[test]
     fn admitted_sqlite_handoff_shutdown_before_marker_retires_admission() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_handoff_shutdown_before_marker_retires_admission",
+        ) {
+            return;
+        }
         let mut fixture = AdmittedSqliteHandoffFixture::new();
         let owner = ConsensusStorageShutdownGuard::tracked();
         let observer = owner.observer().expect("tracked shutdown owner");
@@ -9930,6 +10080,8 @@ mod tests {
             .runtime_write_handoff_pending
             .load(Ordering::Acquire));
         assert_eq!(Arc::strong_count(&observer.0), 1);
+        drop(observer);
+        assert_eq!(RUNTIME_WRITE_HANDOFFS.load(Ordering::Acquire), 1);
     }
 
     fn exercise_admitted_sqlite_handoff_marker(panic_first: bool) {

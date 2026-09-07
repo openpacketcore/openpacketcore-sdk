@@ -37,7 +37,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 postcard = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync", "io-util", "fs", "rt"] }
+# The bounded SQLite scheduler handoff relies on the validated blocking-pool
+# FIFO retirement order. Enforce it for SDK consumers, whose lockfile is their
+# own; upgrades require the handoff queue/lifetime matrix to be revalidated.
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "io-util", "fs", "rt"] }
 tracing = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }

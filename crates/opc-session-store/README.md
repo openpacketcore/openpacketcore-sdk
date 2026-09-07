@@ -879,14 +879,25 @@ Each store admits one runtime handoff until a completion marker runs in the
 same blocking pool. Pending scheduler work is bounded to one replacement-worker
 job and one marker; other writes execute inline while admission is occupied.
 The marker holds only bookkeeping, with no SQLite connection, transaction or
-storage owner guard. A queued marker can outlive the store's SQLite owners, so
-aggregate pending work depends on all retained store trackers, including those
-for closed stores. This is not an absolute process-wide bound under store churn.
-If runtime shutdown cancels the marker, handoff admission retires and further
-calls remain inline. This bound uses the pinned Tokio blocking
-pool's FIFO dequeue order; it requires revalidation when that dependency changes.
-The runtime's configured thread cap is unchanged.
-Independent progress still depends on available runtime capacity.
+storage owner guard. One static counter shared by all stores and runtimes in
+this SDK instance admits at most 64 handoffs, bounding this change to 128 queued
+replacement and marker jobs even across concurrent opens, shutdown and reopen.
+That accounting survives SQLite owner exit. Only marker execution returns its
+capacity; exhausted callers complete their original SQL inline without waiting
+for a scheduler slot. Running pool jobs remain subject to the existing runtime
+thread caps, separately from this queued-work bound.
+
+If cancellation or runtime shutdown prevents a marker from executing, its store
+reservation and its shared capacity retire for the lifetime of this SDK
+instance. There is no destructor refund or blocking cleanup. Retiring all 64
+slots disables the handoff optimization and keeps writes inline. Independent
+progress therefore still depends on available runtime capacity.
+
+This retirement proof uses Tokio 1.53.1's FIFO blocking-pool dequeue order.
+The SDK manifest requires that exact crates.io version for consuming applications,
+independently of this repository's lockfile, with the original runtime features.
+An upgrade or dependency source override requires revalidating the actual
+helper's queue, owner-lifetime, panic, cancellation and runtime-shutdown matrix.
 
 Snapshot copy and compaction share the store's primary-writer pressure signal.
 An existing 32 ms foreground pause earns a 32 ms snapshot work turn before
