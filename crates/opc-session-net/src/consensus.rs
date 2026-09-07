@@ -969,24 +969,24 @@ struct ConsensusConnectionLaneState {
     changed: Arc<Notify>,
     reaper_started: AtomicBool,
     in_flight: Semaphore,
-    /// Level-triggered signal that the cached-connection reaper has emptied
-    /// this lane. Published as a watch because the async `connection` mutex
-    /// cannot be polled from `watch::Receiver::wait_for`'s synchronous
-    /// predicate; the reaper publishes the edge directly so tests park on the
-    /// transition instead of spin-yielding (which stalls a `start_paused`
-    /// clock).
-    emptied: tokio::sync::watch::Sender<bool>,
+    /// Test-only notification when the reaper clears this lane. Waiters
+    /// recheck the current connection so an earlier retirement cannot satisfy
+    /// a wait after the lane has been reused.
+    #[cfg(test)]
+    retired_for_test: tokio::sync::watch::Sender<()>,
 }
 
 impl ConsensusConnectionLaneState {
     fn new() -> Self {
-        let (emptied, _) = tokio::sync::watch::channel(false);
+        #[cfg(test)]
+        let (retired_for_test, _) = tokio::sync::watch::channel(());
         Self {
             connection: Mutex::new(None),
             changed: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
             in_flight: Semaphore::new(1),
-            emptied,
+            #[cfg(test)]
+            retired_for_test,
         }
     }
 }
@@ -1189,6 +1189,8 @@ async fn reap_cached_consensus_connection(
                             )
                             .await;
                     }
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 if consensus_connection_idle_expired(connection, now) {
@@ -1198,7 +1200,8 @@ async fn reap_cached_consensus_connection(
                     let retired = cached.take();
                     drop(cached);
                     drop(retired);
-                    lane_state.emptied.send_replace(true);
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 Some(
@@ -9502,20 +9505,25 @@ mod tests {
 
     /// Waits until the cached-connection reaper empties `lane`.
     ///
-    /// Parks on the lane's monotonic `emptied` latch (never reset to `false`)
-    /// instead of spin-yielding, so a `start_paused` clock can auto-advance
-    /// while the reaper runs. Callers must not re-populate the lane and then
-    /// wait again: the latch stays set, so a second wait returns immediately.
+    /// Subscribe before inspecting the connection to avoid a lost wakeup.
+    /// Recheck after every retirement notification, including when this lane
+    /// was used by an earlier connection. Parking lets a paused clock advance.
     async fn wait_for_cached_lane_to_empty(
         pool: &ConsensusConnectionPool,
         lane: ConsensusConnectionLane,
     ) {
-        let mut emptied = pool.lane(lane).emptied.subscribe();
+        let lane = pool.lane(lane);
+        let mut retired = lane.retired_for_test.subscribe();
         tokio::time::timeout(Duration::from_secs(1), async move {
-            emptied
-                .wait_for(|was_emptied| *was_emptied)
-                .await
-                .expect("lane emptied watch channel must outlive the waiter");
+            loop {
+                if lane.connection.lock().await.is_none() {
+                    return;
+                }
+                retired
+                    .changed()
+                    .await
+                    .expect("lane retirement watch channel must outlive the waiter");
+            }
         })
         .await
         .expect("cached consensus lane retirement");
