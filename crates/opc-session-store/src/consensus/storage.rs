@@ -2541,6 +2541,7 @@ struct ConsensusStorageShutdownCompletion {
     active_owners: AtomicUsize,
     notify: tokio::sync::Notify,
     runtime_write_handoff: AtomicBool,
+    runtime_write_handoff_pending: AtomicBool,
 }
 
 /// Observation that every Openraft-owned SQLite storage handle has exited.
@@ -2580,6 +2581,7 @@ impl ConsensusStorageShutdownGuard {
             active_owners: AtomicUsize::new(1),
             notify: tokio::sync::Notify::new(),
             runtime_write_handoff: AtomicBool::new(false),
+            runtime_write_handoff_pending: AtomicBool::new(false),
         })))
     }
 
@@ -2587,10 +2589,16 @@ impl ConsensusStorageShutdownGuard {
         Self(None)
     }
 
-    fn runtime_write_handoff_enabled(&self) -> bool {
-        self.0
-            .as_ref()
-            .is_some_and(|completion| completion.runtime_write_handoff.load(Ordering::Acquire))
+    fn try_admit_runtime_write_handoff(&self) -> Option<Arc<ConsensusStorageShutdownCompletion>> {
+        let completion = self.0.as_ref()?;
+        if !completion.runtime_write_handoff.load(Ordering::Acquire) {
+            return None;
+        }
+        completion
+            .runtime_write_handoff_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Arc::clone(completion))
     }
 
     fn observer(&self) -> Option<ConsensusStorageShutdownObserver> {
@@ -4005,19 +4013,53 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
 /// A current-thread runtime has no worker to hand off, so retain inline behavior
 /// there (and when called without a Tokio runtime). Startup recovery also stays
 /// inline until both write handles belong to the spawned Openraft tasks.
+///
+/// Each store admits at most one handoff until a completion marker runs in the
+/// same blocking pool. The pinned Tokio pool dequeues jobs in FIFO order, so
+/// running that marker proves its preceding replacement-worker job has left
+/// the queue. This bounds pending scheduler work to one replacement plus one
+/// marker per store, including while the pool is saturated. Other writes stay
+/// inline. The marker owns only the tracker, never SQLite or an owner guard.
+/// Cancellation of the marker retires admission instead of releasing it early.
 fn run_admitted_sqlite_write<R>(
     shutdown_guard: &ConsensusStorageShutdownGuard,
     operation: impl FnOnce() -> R,
 ) -> R {
-    if shutdown_guard.runtime_write_handoff_enabled()
-        && tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
-            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        })
-    {
+    let Some(runtime) = tokio::runtime::Handle::try_current()
+        .ok()
+        .filter(|runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    else {
+        return operation();
+    };
+    let Some(completion) = shutdown_guard.try_admit_runtime_write_handoff() else {
+        return operation();
+    };
+
+    // Preserve an operation panic after accounting for any queued replacement
+    // worker. Releasing admission while unwinding would allow that queue to grow.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tokio::task::block_in_place(operation)
-    } else {
-        operation()
+    }));
+    drop(enqueue_runtime_write_handoff_completion(
+        &runtime, completion,
+    ));
+    match result {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+fn enqueue_runtime_write_handoff_completion(
+    runtime: &tokio::runtime::Handle,
+    completion: Arc<ConsensusStorageShutdownCompletion>,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn_blocking(move || {
+        // Only execution rearms admission. Dropping a rejected or cancelled
+        // closure leaves the reservation retired without blocking cleanup.
+        completion
+            .runtime_write_handoff_pending
+            .store(false, Ordering::Release);
+    })
 }
 
 impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
@@ -9767,6 +9809,279 @@ mod tests {
         tokio::spawn(async { assert_admitted_sqlite_write_borrowed_scope() })
             .await
             .expect("join synchronous caller scope");
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_keeps_one_marker_under_pool_pressure() {
+        exercise_admitted_sqlite_handoff_marker(false);
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_panic_preserves_marker_ownership() {
+        exercise_admitted_sqlite_handoff_marker(true);
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_cancelled_marker_retires_admission() {
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked handoff owner");
+        observer.enable_runtime_write_handoff();
+        let completion = owner
+            .try_admit_runtime_write_handoff()
+            .expect("admit one controlled handoff");
+        let (marker,) = fixture
+            .runtime()
+            .block_on(fixture.runtime().spawn(async move {
+                tokio::task::block_in_place(|| ());
+                // Return the queued handle to the controlling thread so it
+                // can cancel the marker before releasing the blocking slot.
+                (enqueue_runtime_write_handoff_completion(
+                    &tokio::runtime::Handle::current(),
+                    completion,
+                ),)
+            }))
+            .expect("queue the exact production marker behind the held pool");
+        marker.abort();
+        fixture.close();
+        assert!(futures_util::FutureExt::now_or_never(marker)
+            .expect("the drained marker is complete")
+            .expect_err("the queued marker was cancelled")
+            .is_cancelled());
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+
+        // Production handles stay in their original Openraft runtime. Even
+        // moving this private fixture to another runtime must not rearm a
+        // cancelled completion marker and admit more compensation jobs.
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = fixture.exercise(owner, false, false);
+        drop(owner);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+        fixture.runtime().block_on(observer.wait());
+        fixture.close();
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&observer.0), 1);
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_shutdown_before_marker_retires_admission() {
+        let mut fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked shutdown owner");
+        observer.enable_runtime_write_handoff();
+        let operation_owner = owner.child();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let task = fixture.runtime().spawn(async move {
+            let value = run_admitted_sqlite_write(&operation_owner, || {
+                entered_tx
+                    .send(())
+                    .expect("signal admitted synchronous turn");
+                resume_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release synchronous turn after shutdown begins");
+                1
+            });
+            returned_tx
+                .send(value)
+                .expect("report exact completed turn");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("synchronous turn holds the calling worker");
+        fixture
+            .runtime
+            .take()
+            .expect("live runtime before shutdown")
+            .shutdown_timeout(Duration::ZERO);
+        resume_tx.send(()).expect("release the admitted turn");
+        assert_eq!(
+            returned_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("synchronous result survives runtime shutdown"),
+            1
+        );
+        fixture.close();
+        if let Err(error) =
+            futures_util::FutureExt::now_or_never(task).expect("the old runtime task exited")
+        {
+            assert!(error.is_cancelled());
+        }
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = fixture.exercise(owner, false, false);
+        drop(owner);
+        fixture.runtime().block_on(observer.wait());
+        fixture.close();
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&observer.0), 1);
+    }
+
+    fn exercise_admitted_sqlite_handoff_marker(panic_first: bool) {
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked handoff owner");
+        observer.enable_runtime_write_handoff();
+        let owner = fixture.exercise(owner, true, panic_first);
+        drop(owner);
+        // The pending marker holds bookkeeping only, never a SQLite owner.
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+        fixture.runtime().block_on(observer.wait());
+        fixture.close();
+        assert!(!observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&observer.0), 1);
+    }
+
+    struct AdmittedSqliteHandoffFixture {
+        runtime: Option<tokio::runtime::Runtime>,
+        blocker: Option<tokio::task::JoinHandle<bool>>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        stopped: std::sync::mpsc::Receiver<std::thread::ThreadId>,
+    }
+
+    impl AdmittedSqliteHandoffFixture {
+        fn new() -> Self {
+            let (stopped_tx, stopped) = std::sync::mpsc::channel();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .on_thread_stop(move || {
+                    let _ = stopped_tx.send(std::thread::current().id());
+                })
+                .build()
+                .expect("create isolated handoff runtime");
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let blocker = runtime.spawn_blocking(move || {
+                entered_tx.send(()).expect("signal occupied blocking slot");
+                // Cleanup fallback only: success requires an explicit release.
+                release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            });
+            let fixture = Self {
+                runtime: Some(runtime),
+                blocker: Some(blocker),
+                release: Some(release),
+                stopped,
+            };
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the only blocking slot is occupied");
+            fixture
+        }
+
+        fn runtime(&self) -> &tokio::runtime::Runtime {
+            self.runtime.as_ref().expect("live fixture runtime")
+        }
+
+        fn exercise(
+            &self,
+            owner: ConsensusStorageShutdownGuard,
+            expect_new_marker: bool,
+            panic_first: bool,
+        ) -> ConsensusStorageShutdownGuard {
+            self.runtime()
+                .block_on(self.runtime().spawn(async move {
+                    let tracker = owner.observer().expect("tracked fixture writes").0;
+                    let expected_references =
+                        Arc::strong_count(&tracker) + usize::from(expect_new_marker);
+                    let caller = std::thread::current().id();
+                    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+                    for index in 0..256 {
+                        let operation = || {
+                            assert_eq!(std::thread::current().id(), caller);
+                            calls.set(calls.get() + 1);
+                            if panic_first && index == 0 {
+                                panic!("controlled admitted SQLite panic");
+                            }
+                        };
+                        if panic_first && index == 0 {
+                            let failure =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    run_admitted_sqlite_write(&owner, operation)
+                                }))
+                                .expect_err("the original panic must propagate");
+                            assert_eq!(
+                                failure.downcast_ref::<&str>(),
+                                Some(&"controlled admitted SQLite panic")
+                            );
+                        } else {
+                            run_admitted_sqlite_write(&owner, operation);
+                        }
+                        assert!(tracker
+                            .runtime_write_handoff_pending
+                            .load(Ordering::Acquire));
+                        assert_eq!(Arc::strong_count(&tracker), expected_references);
+                    }
+                    assert_eq!(calls.get(), 256, "each inline operation executes once");
+                    owner
+                }))
+                .expect("join synchronous caller under pool pressure")
+        }
+
+        fn close(mut self) {
+            self.release
+                .take()
+                .expect("owned blocking release")
+                .send(())
+                .expect("explicitly release the blocking slot");
+            if self.runtime.is_some() {
+                let blocker = self.blocker.take().expect("owned blocking task");
+                assert!(self
+                    .runtime()
+                    .block_on(blocker)
+                    .expect("join owned blocker"));
+                self.runtime()
+                    .block_on(self.runtime().spawn_blocking(|| ()))
+                    .expect("drain the SDK completion marker");
+                self.runtime
+                    .take()
+                    .expect("drained runtime")
+                    .shutdown_timeout(Duration::from_secs(2));
+            }
+            let first = self
+                .stopped
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first owned runtime thread exited");
+            let second = self
+                .stopped
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second owned runtime thread exited");
+            assert_ne!(first, second);
+            if let Some(blocker) = self.blocker.take() {
+                assert!(futures_util::FutureExt::now_or_never(blocker)
+                    .expect("exited blocking task is complete")
+                    .expect("join exited blocking task"));
+            }
+        }
+    }
+
+    impl Drop for AdmittedSqliteHandoffFixture {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(runtime) = self.runtime.take() {
+                runtime.shutdown_timeout(Duration::from_secs(2));
+            }
+        }
     }
 
     fn assert_admitted_sqlite_write_borrowed_scope() {

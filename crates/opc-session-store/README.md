@@ -865,15 +865,28 @@ replenished or permanently retires that permit. This prevents a write-held
 SQLite connection from globally serializing unrelated acceptance reads without
 creating a connection, task, or pool entry per caller or subscriber.
 
-After Openraft startup recovery finishes, log and state-machine writes mark
+After Openraft startup recovery finishes, log and state-machine writes may mark
 their synchronous SQLite turn as blocking after acquiring the existing writer
-and connection guards. On a multi-thread Tokio runtime this lets other runnable
-tasks progress while the
-calling thread completes the transaction and its full row checks. The write
-is never detached from its caller, and ordinary one-row frontier decoding
-stays inline. Cancellation cannot release an admitted transaction's guards
-early or replay its work. Startup recovery, including on a caller's LocalSet,
-and current-thread runtimes retain inline execution.
+and connection guards. On a multi-thread Tokio runtime, an admitted handoff can
+let other runnable tasks progress while the calling thread completes the
+transaction and its full row checks. The write is never detached from its
+caller, and ordinary one-row frontier decoding stays inline. Cancellation
+cannot release an admitted transaction's guards early or replay its work.
+Startup recovery, including on a caller's LocalSet, and current-thread runtimes
+retain inline execution.
+
+Each store admits one runtime handoff until a completion marker runs in the
+same blocking pool. Pending scheduler work is bounded to one replacement-worker
+job and one marker; other writes execute inline while admission is occupied.
+The marker holds only bookkeeping, with no SQLite connection, transaction or
+storage owner guard. A queued marker can outlive the store's SQLite owners, so
+aggregate pending work depends on all retained store trackers, including those
+for closed stores. This is not an absolute process-wide bound under store churn.
+If runtime shutdown cancels the marker, handoff admission retires and further
+calls remain inline. This bound uses the pinned Tokio blocking
+pool's FIFO dequeue order; it requires revalidation when that dependency changes.
+The runtime's configured thread cap is unchanged.
+Independent progress still depends on available runtime capacity.
 
 Snapshot copy and compaction share the store's primary-writer pressure signal.
 An existing 32 ms foreground pause earns a 32 ms snapshot work turn before
