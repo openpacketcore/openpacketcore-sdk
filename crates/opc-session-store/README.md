@@ -888,6 +888,14 @@ scope validation within one SQLite read transaction. An autocommit caller gets
 a read transaction for that load; an existing caller transaction retains its
 ownership. Each later load validates the current durable state again.
 
+Full snapshot replication-log audits keep SQLite reads on the caller thread
+and decode bounded batches with at most eight workers, 4,096 rows and 16 MiB
+of encoded row data. Every row still receives the complete typed, sequence,
+transaction-ID, TTL, payload and envelope checks. Workers are joined in source
+order, including on rejection or failed spawn. Small audits stay inline;
+legacy rows wider than the batch budget are fully validated individually after
+earlier buffered rows finish. No encoded-row acceptance limit is added.
+
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal
 submission remains `BackendUnavailable`. Once `client_write_ff` accepts the

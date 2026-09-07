@@ -34889,63 +34889,330 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
 
     validate_lease_state_sync(conn)?;
 
+    validate_sealed_replication_log_sync(conn)
+}
+
+struct EncodedSealedReplicationAuditRow {
+    sequence: i64,
+    tx_id: Option<String>,
+    encoded: String,
+}
+
+fn validate_sealed_replication_audit_row(
+    stored_sequence: i64,
+    stored_tx_id: Option<&str>,
+    encoded: &str,
+    expected: u64,
+) -> io::Result<u64> {
+    let stored_sequence = checked_u64(stored_sequence)?;
+    let stored_tx_id: ReplicationTxId = stored_tx_id
+        .ok_or_else(|| invalid_data("persisted session replication transaction ID is invalid"))?
+        .try_into()
+        .map_err(|_| invalid_data("persisted session replication transaction ID is invalid"))?;
+    let entry: ReplicationEntry = serde_json::from_str(encoded)
+        .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+    if stored_sequence != expected || entry.sequence != stored_sequence {
+        return Err(invalid_data(
+            "persisted session replication log is not contiguous",
+        ));
+    }
+    if entry.tx_id != stored_tx_id {
+        return Err(invalid_data(
+            "persisted session replication transaction ID is inconsistent",
+        ));
+    }
+    entry
+        .validate()
+        .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+    validate_sealed_replication_op(&entry.op)?;
+    expected
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session replication sequence exhausted"))
+}
+
+fn validate_sealed_replication_audit_rows(
+    rows: &[EncodedSealedReplicationAuditRow],
+    mut expected: u64,
+) -> io::Result<u64> {
+    for row in rows {
+        expected = validate_sealed_replication_audit_row(
+            row.sequence,
+            row.tx_id.as_deref(),
+            &row.encoded,
+            expected,
+        )?;
+    }
+    Ok(expected)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct SealedReplicationAuditStatsForTest {
+    maximum_rows: usize,
+    maximum_encoded_bytes: usize,
+    maximum_workers: usize,
+    oversized_inline_rows: usize,
+    spawned_workers: usize,
+    joined_workers: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEALED_REPLICATION_AUDIT_STATS: std::cell::Cell<SealedReplicationAuditStatsForTest> =
+        const { std::cell::Cell::new(SealedReplicationAuditStatsForTest {
+            maximum_rows: 0, maximum_encoded_bytes: 0, maximum_workers: 0,
+            oversized_inline_rows: 0, spawned_workers: 0, joined_workers: 0,
+        }) };
+    static SEALED_REPLICATION_AUDIT_FAULTS: std::cell::Cell<DurableLogAuditFaultsForTest> =
+        const { std::cell::Cell::new(DurableLogAuditFaultsForTest::NONE) };
+}
+
+#[cfg(test)]
+fn record_sealed_replication_audit_stats(
+    update: impl FnOnce(&mut SealedReplicationAuditStatsForTest),
+) {
+    SEALED_REPLICATION_AUDIT_STATS.with(|stats| {
+        let mut observed = stats.get();
+        update(&mut observed);
+        stats.set(observed);
+    });
+}
+
+fn validate_sealed_replication_audit_batch_with_parallelism(
+    rows: &[EncodedSealedReplicationAuditRow],
+    expected: u64,
+    available_parallelism: usize,
+) -> io::Result<u64> {
+    let workers = durable_log_audit_worker_count(rows.len(), available_parallelism);
+    #[cfg(test)]
+    record_sealed_replication_audit_stats(|stats| {
+        stats.maximum_workers = stats.maximum_workers.max(workers);
+    });
+    if workers == 1 {
+        return validate_sealed_replication_audit_rows(rows, expected);
+    }
+    let rows_per_worker = rows.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(workers)
+            .map_err(|_| io::Error::other("session replication audit allocation failed"))?;
+        let mut spawn_error = None;
+        for (worker_index, chunk) in rows.chunks(rows_per_worker).enumerate() {
+            #[cfg(test)]
+            if SEALED_REPLICATION_AUDIT_FAULTS
+                .with(|faults| faults.get().spawn_failure_worker == Some(worker_index))
+            {
+                spawn_error = Some(invalid_data(
+                    "session replication audit worker spawn failed",
+                ));
+                break;
+            }
+            #[cfg(test)]
+            let panic_worker = SEALED_REPLICATION_AUDIT_FAULTS
+                .with(|faults| faults.get().panic_worker == Some(worker_index));
+            let offset = worker_index * rows_per_worker;
+            let handle = std::thread::Builder::new()
+                .spawn_scoped(scope, move || {
+                    #[cfg(test)]
+                    if panic_worker {
+                        panic!("injected sealed replication audit worker failure");
+                    }
+                    // A later chunk's arithmetic failure is returned in source
+                    // order, after all earlier chunks have been checked.
+                    let expected = u64::try_from(offset)
+                        .ok()
+                        .and_then(|offset| expected.checked_add(offset))
+                        .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+                    validate_sealed_replication_audit_rows(chunk, expected)
+                })
+                .map_err(|_| invalid_data("session replication audit worker spawn failed"));
+            match handle {
+                Ok(handle) => {
+                    handles.push(handle);
+                    #[cfg(test)]
+                    record_sealed_replication_audit_stats(|stats| stats.spawned_workers += 1);
+                }
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut next = expected;
+        let mut first_error = None;
+        // Join every owned worker even after rejection or failed later spawn.
+        // Full row checks and failures retain the original source ordering.
+        for handle in handles {
+            let result = handle
+                .join()
+                .map_err(|_| invalid_data("session replication audit worker failed"));
+            #[cfg(test)]
+            record_sealed_replication_audit_stats(|stats| stats.joined_workers += 1);
+            match result {
+                Ok(Ok(chunk_next)) if first_error.is_none() => next = chunk_next,
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) | Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else if let Some(error) = spawn_error {
+            Err(error)
+        } else {
+            Ok(next)
+        }
+    })
+}
+
+fn finish_sealed_replication_audit_batch(
+    rows: &mut Vec<EncodedSealedReplicationAuditRow>,
+    encoded_bytes: &mut usize,
+    expected: &mut u64,
+) -> io::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    record_sealed_replication_audit_stats(|stats| {
+        stats.maximum_rows = stats.maximum_rows.max(rows.len());
+        stats.maximum_encoded_bytes = stats.maximum_encoded_bytes.max(*encoded_bytes);
+    });
+    *expected = if rows.len() < DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS {
+        // Small snapshots stay inline without even querying OS CPU capacity.
+        validate_sealed_replication_audit_rows(rows, *expected)?
+    } else {
+        validate_sealed_replication_audit_batch_with_parallelism(
+            rows,
+            *expected,
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        )?
+    };
+    rows.clear();
+    *encoded_bytes = 0;
+    Ok(())
+}
+
+fn validate_sealed_replication_log_sync(conn: &Connection) -> io::Result<()> {
     let mut stmt = conn
         .prepare(
-            r#"
-            SELECT sequence,
-                   CASE
-                       WHEN typeof(tx_id) = 'text'
-                        AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2
-                       THEN tx_id
-                   END,
-                   entry_json
-            FROM session_replication_log
-            ORDER BY sequence ASC
-            "#,
+            "SELECT sequence, CASE WHEN typeof(tx_id) = 'text' \
+             AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2 THEN tx_id END, \
+             entry_json FROM session_replication_log ORDER BY sequence ASC",
         )
         .map_err(db_error)?;
-    let rows = stmt
-        .query_map(
-            params![REPLICATION_TX_ID_MIN_BYTES, REPLICATION_TX_ID_MAX_BYTES],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
+    let mut rows = stmt
+        .query(params![
+            REPLICATION_TX_ID_MIN_BYTES,
+            REPLICATION_TX_ID_MAX_BYTES
+        ])
         .map_err(db_error)?;
     let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
         .checked_add(1)
         .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
-    for row in rows {
-        let (stored_sequence, stored_tx_id, encoded) = row.map_err(db_error)?;
-        let stored_sequence = checked_u64(stored_sequence)?;
-        let stored_tx_id: ReplicationTxId = stored_tx_id
-            .ok_or_else(|| invalid_data("persisted session replication transaction ID is invalid"))?
-            .try_into()
-            .map_err(|_| invalid_data("persisted session replication transaction ID is invalid"))?;
-        let entry: ReplicationEntry = serde_json::from_str(&encoded)
-            .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
-        if stored_sequence != expected || entry.sequence != stored_sequence {
-            return Err(invalid_data(
-                "persisted session replication log is not contiguous",
-            ));
+    let mut buffered = Vec::new();
+    let mut encoded_bytes = 0;
+    loop {
+        let row = match rows.next().map_err(db_error) {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(error) => {
+                finish_sealed_replication_audit_batch(
+                    &mut buffered,
+                    &mut encoded_bytes,
+                    &mut expected,
+                )?;
+                return Err(error);
+            }
+        };
+        let next = (|| {
+            let sequence = row.get::<_, i64>(0).map_err(db_error)?;
+            let tx_id = row.get::<_, Option<String>>(1).map_err(db_error)?;
+            // Borrow SQLite's current text before allocating a copy. This keeps
+            // an arbitrarily wide legacy row out of every parallel buffer.
+            // as_str retains String's TEXT/valid-UTF-8 column contract.
+            let encoded = row
+                .get_ref(2)
+                .map_err(db_error)?
+                .as_str()
+                .map_err(|_| db_error(rusqlite::Error::InvalidQuery))?;
+            Ok::<_, io::Error>((sequence, tx_id, encoded))
+        })();
+        let (sequence, tx_id, encoded) = match next {
+            Ok(row) => row,
+            Err(error) => {
+                finish_sealed_replication_audit_batch(
+                    &mut buffered,
+                    &mut encoded_bytes,
+                    &mut expected,
+                )?;
+                return Err(error);
+            }
+        };
+        if buffered.len() == DURABLE_LOG_AUDIT_BATCH_ROWS
+            || encoded.len() > DURABLE_LOG_AUDIT_BATCH_BYTES - encoded_bytes
+        {
+            finish_sealed_replication_audit_batch(
+                &mut buffered,
+                &mut encoded_bytes,
+                &mut expected,
+            )?;
         }
-        if entry.tx_id != stored_tx_id {
-            return Err(invalid_data(
-                "persisted session replication transaction ID is inconsistent",
-            ));
+        if encoded.len() > DURABLE_LOG_AUDIT_BATCH_BYTES {
+            // The published journal has no encoded-row ceiling. Preserve its
+            // acceptance by fully decoding one oversized row inline, after all
+            // earlier buffered rows and before reading any later row.
+            #[cfg(test)]
+            record_sealed_replication_audit_stats(|stats| stats.oversized_inline_rows += 1);
+            expected = validate_sealed_replication_audit_row(
+                sequence,
+                tx_id.as_deref(),
+                encoded,
+                expected,
+            )?;
+            continue;
         }
-        entry
-            .validate()
-            .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
-        validate_sealed_replication_op(&entry.op)?;
-        expected = expected
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+        let buffered_row = (|| {
+            if buffered.len() == buffered.capacity() {
+                let remaining = DURABLE_LOG_AUDIT_BATCH_ROWS - buffered.len();
+                let growth = buffered.capacity().max(8).min(remaining);
+                buffered
+                    .try_reserve_exact(growth)
+                    .map_err(|_| io::Error::other("session replication audit allocation failed"))?;
+            }
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(encoded.len())
+                .map_err(|_| io::Error::other("session replication audit allocation failed"))?;
+            owned.push_str(encoded);
+            Ok::<_, io::Error>(EncodedSealedReplicationAuditRow {
+                sequence,
+                tx_id,
+                encoded: owned,
+            })
+        })();
+        match buffered_row {
+            Ok(row) => {
+                encoded_bytes += row.encoded.len();
+                buffered.push(row);
+            }
+            Err(error) => {
+                finish_sealed_replication_audit_batch(
+                    &mut buffered,
+                    &mut encoded_bytes,
+                    &mut expected,
+                )?;
+                return Err(error);
+            }
+        }
     }
+    finish_sealed_replication_audit_batch(&mut buffered, &mut encoded_bytes, &mut expected)?;
     let observed_head = expected
         .checked_sub(1)
         .ok_or_else(|| invalid_data("session replication sequence underflow"))?;
@@ -64786,6 +65053,415 @@ BEGIN IMMEDIATE;
         measure("available_parallelism", || {
             let _ = std::hint::black_box(std::thread::available_parallelism());
         });
+    }
+
+    fn sealed_audit_fixture_row(sequence: u64) -> EncodedSealedReplicationAuditRow {
+        let entry = ReplicationEntry {
+            sequence,
+            tx_id: format!("sealed-audit-{sequence}")
+                .try_into()
+                .expect("fixture ID"),
+            op: ReplicationOp::DeleteFenced {
+                key: key(),
+                owner: OwnerId::new("sealed-audit-owner").expect("fixture owner"),
+                fence: crate::FenceToken::new(1),
+            },
+            timestamp: timestamp(1),
+        };
+        EncodedSealedReplicationAuditRow {
+            sequence: i64::try_from(sequence).expect("fixture SQLite sequence"),
+            tx_id: Some(entry.tx_id.as_str().to_owned()),
+            encoded: serde_json::to_string(&entry).expect("fixture row"),
+        }
+    }
+
+    fn sealed_audit_fixture(start: u64, count: usize, row_bytes: usize) -> SqliteSessionBackend {
+        let backend = SqliteSessionBackend::in_memory().expect("sealed audit fixture");
+        {
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("fixture schema");
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("fixture transaction");
+            for offset in 0..count {
+                let mut row = sealed_audit_fixture_row(start + u64::try_from(offset).unwrap());
+                if row_bytes > row.encoded.len() {
+                    row.encoded
+                        .extend(std::iter::repeat_n(' ', row_bytes - row.encoded.len()));
+                }
+                tx.execute(
+                    "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        row.sequence,
+                        row.tx_id,
+                        row.encoded,
+                        timestamp(1).to_string()
+                    ],
+                )
+                .expect("persist audit fixture row");
+            }
+            tx.execute(
+                "UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = ?1",
+                [i64::try_from(start - 1).unwrap()],
+            )
+            .expect("fixture cursor floor");
+            tx.execute(
+                "UPDATE consensus_machine SET watch_sequence = ?1",
+                [i64::try_from(start - 1 + u64::try_from(count).unwrap()).unwrap()],
+            )
+            .expect("fixture cursor head");
+            tx.commit().expect("commit fixture");
+        }
+        backend
+    }
+
+    fn assert_sealed_audit_matches_serial(conn: &Connection, case: &str) -> bool {
+        let serial = sealed_replication_log_serial_reference(conn)
+            .map_err(|error| (error.kind(), error.to_string()));
+        let actual =
+            validate_sealed_state_sync(conn).map_err(|error| (error.kind(), error.to_string()));
+        assert_eq!(actual, serial, "case {case}");
+        actual.is_ok()
+    }
+
+    #[test]
+    fn sealed_replication_audit_matches_serial_acceptance_and_corruption_order() {
+        for (case, mutation) in [
+            ("valid", "SELECT 1"),
+            ("gap", "DELETE FROM session_replication_log WHERE sequence = 65"),
+            ("negative-sequence", "UPDATE session_replication_log SET sequence = -1 WHERE sequence = 1"),
+            ("empty-id", "UPDATE session_replication_log SET tx_id = '' WHERE sequence = 65"),
+            ("wide-id", "UPDATE session_replication_log SET tx_id = printf('%0130d', 1) WHERE sequence = 65"),
+            ("blob-id", "UPDATE session_replication_log SET tx_id = X'3132' WHERE sequence = 65"),
+            ("different-id", "UPDATE session_replication_log SET tx_id = 'different' WHERE sequence = 65"),
+            ("malformed-json", "UPDATE session_replication_log SET entry_json = '{' WHERE sequence = 65"),
+            ("blob-json", "UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 65"),
+            ("invalid-utf8", "UPDATE session_replication_log SET entry_json = CAST(X'ff' AS TEXT) WHERE sequence = 65"),
+            ("wrong-inner-sequence", "UPDATE session_replication_log SET entry_json = json_set(entry_json, '$.sequence', 66) WHERE sequence = 65"),
+            ("head-drift", "UPDATE consensus_machine SET watch_sequence = 129"),
+            ("floor-drift", "UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = 1"),
+            ("row-error-before-fetch-error", "UPDATE session_replication_log SET entry_json = '{' WHERE sequence = 2; UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 127"),
+            ("fetch-error-before-row-error", "UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 2; UPDATE session_replication_log SET entry_json = '{' WHERE sequence = 127"),
+            ("scalar-error-before-later-fetch-error", "UPDATE session_replication_log SET sequence = -1 WHERE sequence = 1; UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 127"),
+        ] {
+            let backend = sealed_audit_fixture(1, 128, 0);
+            let conn = backend.conn.blocking_lock();
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON").expect("hostile fixture");
+            conn.execute_batch(mutation).expect("mutate fixture");
+            assert_eq!(assert_sealed_audit_matches_serial(&conn, case), case == "valid");
+        }
+        for (start, count) in [(1, 0), (19, 128), (i64::MAX as u64 - 127, 128)] {
+            let backend = sealed_audit_fixture(start, count, 0);
+            let conn = backend.conn.blocking_lock();
+            assert!(assert_sealed_audit_matches_serial(
+                &conn,
+                "valid retained range"
+            ));
+        }
+    }
+
+    #[test]
+    fn sealed_replication_audit_keeps_full_ttl_structure_payload_and_envelope_checks() {
+        let mut unsealed = sealed_record_for_key(key(), 64 * 1024);
+        unsealed.payload = crate::EncryptedSessionPayload::new(b"unsealed".as_slice());
+        let mut different_key = key();
+        different_key.stable_id = Bytes::from_static(b"different-sealed-audit-key")
+            .try_into()
+            .expect("fixture key");
+        for op in [
+            ReplicationOp::RefreshTtl {
+                key: key(),
+                owner: OwnerId::new("sealed-audit-owner").unwrap(),
+                fence: crate::FenceToken::new(1),
+                ttl: Duration::from_secs(1),
+                expires_at: timestamp(30),
+            },
+            ReplicationOp::Batch {
+                ops: (0..crate::backend::MAX_REPLICATION_OPERATIONS_PER_ENTRY)
+                    .map(|_| ReplicationOp::Batch { ops: Vec::new() })
+                    .collect(),
+            },
+            sealed_replication_cas(key(), key(), 1_048_577),
+            sealed_replication_cas(key(), different_key, 64 * 1024),
+            ReplicationOp::CompareAndSet {
+                key: key(),
+                expected_generation: None,
+                credential_id: 1,
+                guard_expires_at: timestamp(1),
+                new_record: unsealed,
+            },
+        ] {
+            let backend = sealed_audit_fixture(1, 128, 0);
+            let conn = backend.conn.blocking_lock();
+            let mut entry: ReplicationEntry =
+                serde_json::from_str(&sealed_audit_fixture_row(65).encoded).expect("typed fixture");
+            entry.op = op;
+            conn.execute(
+                "UPDATE session_replication_log SET entry_json = ?1 WHERE sequence = 65",
+                [serde_json::to_string(&entry).expect("hostile typed row")],
+            )
+            .expect("replace operation");
+            assert!(!assert_sealed_audit_matches_serial(
+                &conn,
+                "full operation validation"
+            ));
+        }
+    }
+
+    #[test]
+    fn sealed_replication_audit_bounds_encoded_batches_and_preserves_wide_legacy_rows() {
+        for (count, row_bytes) in [
+            (DURABLE_LOG_AUDIT_BATCH_ROWS + 65, 0),
+            (128, DURABLE_LOG_AUDIT_BATCH_BYTES / 64),
+        ] {
+            let backend = sealed_audit_fixture(1, count, row_bytes);
+            let conn = backend.conn.blocking_lock();
+            SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+            assert!(assert_sealed_audit_matches_serial(
+                &conn,
+                "bounded full scan"
+            ));
+            let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+            assert!(stats.maximum_rows <= DURABLE_LOG_AUDIT_BATCH_ROWS);
+            assert!(stats.maximum_encoded_bytes <= DURABLE_LOG_AUDIT_BATCH_BYTES);
+            assert!(stats.maximum_workers <= DURABLE_LOG_AUDIT_WORKERS);
+            assert_eq!(stats.spawned_workers, stats.joined_workers);
+            if row_bytes == 0 {
+                assert_eq!(stats.maximum_rows, DURABLE_LOG_AUDIT_BATCH_ROWS);
+            } else {
+                assert_eq!(stats.maximum_encoded_bytes, DURABLE_LOG_AUDIT_BATCH_BYTES);
+            }
+        }
+        let backend = sealed_audit_fixture(1, 129, 0);
+        let conn = backend.conn.blocking_lock();
+        let mut wide = sealed_audit_fixture_row(65).encoded;
+        wide.extend(std::iter::repeat_n(' ', DURABLE_LOG_AUDIT_BATCH_BYTES + 1));
+        conn.execute(
+            "UPDATE session_replication_log SET entry_json = ?1 WHERE sequence = 65",
+            [wide],
+        )
+        .expect("legacy-compatible wide JSON with trailing whitespace");
+        SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+        assert!(assert_sealed_audit_matches_serial(
+            &conn,
+            "oversized legacy row"
+        ));
+        let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+        assert_eq!(stats.oversized_inline_rows, 1);
+        assert_eq!(stats.maximum_rows, 64);
+        assert!(stats.maximum_encoded_bytes < DURABLE_LOG_AUDIT_BATCH_BYTES);
+        assert_eq!(stats.spawned_workers, stats.joined_workers);
+        conn.execute(
+            "UPDATE session_replication_log SET tx_id = 'different' WHERE sequence = 65",
+            [],
+        )
+        .expect("corrupt wide row binding");
+        assert!(!assert_sealed_audit_matches_serial(
+            &conn,
+            "wide row remains fully checked"
+        ));
+    }
+
+    fn with_sealed_replication_audit_faults<T>(
+        faults: DurableLogAuditFaultsForTest,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(DurableLogAuditFaultsForTest);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SEALED_REPLICATION_AUDIT_FAULTS.with(|faults| faults.set(self.0));
+            }
+        }
+        let previous = SEALED_REPLICATION_AUDIT_FAULTS.with(|current| current.replace(faults));
+        let _reset = Reset(previous);
+        run()
+    }
+
+    #[test]
+    fn sealed_replication_audit_joins_workers_on_row_spawn_and_panic_failure() {
+        for (spawn_failure_worker, panic_worker, corrupt_first, expected_error, expected_workers) in [
+            (
+                Some(3),
+                None,
+                false,
+                "session replication audit worker spawn failed",
+                3,
+            ),
+            (
+                None,
+                Some(3),
+                false,
+                "session replication audit worker failed",
+                8,
+            ),
+            (
+                Some(5),
+                Some(2),
+                false,
+                "session replication audit worker failed",
+                5,
+            ),
+            (
+                Some(3),
+                None,
+                true,
+                "persisted session replication entry is invalid",
+                3,
+            ),
+            (
+                None,
+                Some(3),
+                true,
+                "persisted session replication entry is invalid",
+                8,
+            ),
+        ] {
+            let mut rows = (1..=128).map(sealed_audit_fixture_row).collect::<Vec<_>>();
+            if corrupt_first {
+                rows[0].encoded = "{".to_owned();
+            }
+            SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+            let error = with_sealed_replication_audit_faults(
+                DurableLogAuditFaultsForTest {
+                    spawn_failure_worker,
+                    panic_worker,
+                },
+                || validate_sealed_replication_audit_batch_with_parallelism(&rows, 1, 64),
+            )
+            .expect_err("no partial audit can be accepted");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected_error);
+            let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+            assert_eq!(stats.spawned_workers, expected_workers);
+            assert_eq!(stats.joined_workers, expected_workers);
+            assert_eq!(stats.maximum_workers, DURABLE_LOG_AUDIT_WORKERS);
+        }
+    }
+
+    #[test]
+    fn sealed_replication_audit_keeps_small_ranges_inline() {
+        let rows = vec![sealed_audit_fixture_row(1)];
+        SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+        let next = with_sealed_replication_audit_faults(
+            DurableLogAuditFaultsForTest {
+                spawn_failure_worker: Some(0),
+                panic_worker: Some(0),
+            },
+            || validate_sealed_replication_audit_batch_with_parallelism(&rows, 1, 64),
+        )
+        .expect("one row never starts a worker");
+        assert_eq!(next, 2);
+        let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+        assert_eq!(stats.spawned_workers, 0);
+        assert_eq!(stats.joined_workers, 0);
+    }
+
+    // Retain the original serial snapshot journal audit as an independent
+    // acceptance/error-order oracle for the bounded audit implementation.
+    fn sealed_replication_log_serial_reference(conn: &Connection) -> io::Result<()> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sequence, CASE WHEN typeof(tx_id) = 'text' \
+                 AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2 THEN tx_id END, \
+                 entry_json FROM session_replication_log ORDER BY sequence ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(
+                params![REPLICATION_TX_ID_MIN_BYTES, REPLICATION_TX_ID_MAX_BYTES],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(db_error)?;
+        let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+        for row in rows {
+            let (stored_sequence, stored_tx_id, encoded) = row.map_err(db_error)?;
+            let stored_sequence = checked_u64(stored_sequence)?;
+            let stored_tx_id: ReplicationTxId = stored_tx_id
+                .ok_or_else(|| {
+                    invalid_data("persisted session replication transaction ID is invalid")
+                })?
+                .try_into()
+                .map_err(|_| {
+                    invalid_data("persisted session replication transaction ID is invalid")
+                })?;
+            let entry: ReplicationEntry = serde_json::from_str(&encoded)
+                .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+            if stored_sequence != expected || entry.sequence != stored_sequence {
+                return Err(invalid_data(
+                    "persisted session replication log is not contiguous",
+                ));
+            }
+            if entry.tx_id != stored_tx_id {
+                return Err(invalid_data(
+                    "persisted session replication transaction ID is inconsistent",
+                ));
+            }
+            entry
+                .validate()
+                .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+            validate_sealed_replication_op(&entry.op)?;
+            expected = expected
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+        }
+        let observed_head = expected
+            .checked_sub(1)
+            .ok_or_else(|| invalid_data("session replication sequence underflow"))?;
+        if table_exists(conn, "consensus_machine").map_err(db_error)? {
+            let watch_sequence: i64 = conn
+                .query_row(
+                    "SELECT watch_sequence FROM consensus_machine WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if checked_u64(watch_sequence)? != observed_head {
+                return Err(invalid_data(
+                    "session replication cursor does not match the persisted log",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "release-profile read-only sealed snapshot audit diagnosis for SDK-741"]
+    fn sealed_snapshot_replication_audit_cost_diagnostic() {
+        let path = std::env::var_os("OPC_741_SNAPSHOT_AUDIT_SOURCE")
+            .expect("explicit immutable qualification snapshot fixture");
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open immutable snapshot read-only");
+        let (rows, encoded_bytes, maximum_row_bytes): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(entry_json AS BLOB))), 0), \
+                 COALESCE(MAX(length(CAST(entry_json AS BLOB))), 0) \
+                 FROM session_replication_log",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("count the bounded fixture dimensions");
+        for iteration in 0..3 {
+            let started = Instant::now();
+            validate_sealed_state_sync(&conn).expect("full current sealed-state validation");
+            let full_us = started.elapsed().as_micros();
+            let started = Instant::now();
+            sealed_replication_log_serial_reference(&conn)
+                .expect("original full typed serial replication validation");
+            let serial_replication_us = started.elapsed().as_micros();
+            eprintln!(
+                "sdk-741 sealed snapshot component: iteration={iteration} rows={rows} \
+                 encoded_bytes={encoded_bytes} maximum_row_bytes={maximum_row_bytes} \
+                 full_us={full_us} serial_replication_us={serial_replication_us}",
+            );
+        }
     }
 
     #[test]
