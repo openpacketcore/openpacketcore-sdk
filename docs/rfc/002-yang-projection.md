@@ -430,6 +430,65 @@ Patch application MUST:
 - Track changed paths for NACM and audit.
 - Avoid mutating `running`; only `candidate` may be modified.
 
+### 12.1 Bounded NETCONF Leaf-List Edits
+
+The schema-backed XML parser represents each leaf-list XML element as one
+`EditConfigNode` with a scalar value. The existing request-byte, XML-depth,
+attribute, value-byte, and addressed-node limits apply; every leaf-list entry
+counts as a node. Generated applicators group entries by schema path within
+one parent instance, parse their declared scalar types, and use typed value
+identity for uniqueness and entry operations. A leafref uses its target type.
+Numeric lexical aliases therefore identify the same entry.
+
+The mutating entry semantics follow [RFC 7950 section 7.7.9](https://www.rfc-editor.org/rfc/rfc7950.html#section-7.7.9)
+and [RFC 6241 section 7.2](https://www.rfc-editor.org/rfc/rfc6241.html#section-7.2):
+
+| Operation on a leaf-list entry | Result |
+| --- | --- |
+| `merge` / `replace` | Add an absent value; retain an existing value and unrelated entries. |
+| `create` | Add an absent value; return `data-exists` if it exists. |
+| `delete` | Delete an existing value; return `data-missing` if absent. |
+| `remove` | Delete an existing value; an absent value is a no-op. |
+
+Inherited `default-operation=none` retains the existing validation-only
+leaf-list behavior without editing the collection. This bounded profile does
+not currently enforce RFC 6241's `data-missing` requirement for absent context
+under `none`.
+
+Replacing an enclosing root, container, or keyed list entry rebuilds that
+subtree from its defaults and the supplied XML. This replaces its leaf-list
+collections, including clearing omitted collections. Newly added values retain
+XML order. The current bounded profile rejects explicit YANG `insert`/`value`
+position attributes rather than ignoring them.
+
+Configuration leaf-list values must be unique (RFC 7950 section 7.7). The SDK
+also rejects multiple edits to the same typed entry in one request, including
+conflicting operations and a `none` entry combined with a mutation. RFC 6241
+leaves repeated operations on one conceptual node undefined; this profile
+rejects them with `InvalidValue`. Repeated singleton parents and repeated typed
+list keys are rejected as well, so splitting leaf-list edits across repeated
+parent elements cannot evade the check. Sets are scoped to each parent:
+distinct APNs may contain the same candidate values. Collection checks use
+ordered sets rather than quadratic scans.
+
+The generated applicator constructs a separate candidate. The NETCONF service
+and `ConfigBus` retain generated validation, NACM checks over changed paths,
+audit, and persist-before-publish ordering. A rejected running edit changes
+neither the running snapshot nor commit history. A rejected candidate edit
+retains the previously staged candidate. Errors contain no entry or key values.
+Unsupported shapes retain `UnsupportedShape` in the generated API; bindings
+without an edit hook retain `operation-not-supported`. Scalar/shape errors
+remain `invalid-value`, envelope limit errors remain `too-big`, and config-bus
+semantic-validation failures retain their existing classification.
+
+The executable service fixture is
+`crates/opc-yanggen/tests/fixtures/netconf_leaf_list_service_test.rs`, compiled
+with freshly generated model, renderer, parser/applicator binding, diff, and
+validation code by `tests/netconf_xml_edit.rs`. It covers full-root recovery
+with multiple leafref values nested under keyed APNs through the public framed
+NETCONF session and actual config-bus submission. Its datastore is an SDK mock;
+this is not evidence of a downstream product's durable recovery or deployment.
+
 ## 13. Secret and Redaction Metadata
 
 The generator MUST mark fields as secret when indicated by:

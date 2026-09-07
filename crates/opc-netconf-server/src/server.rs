@@ -5786,33 +5786,14 @@ where
             .build_edit_config_candidate(snapshot.config.as_ref(), request)
         {
             Ok(candidate) => candidate,
-            Err(EditConfigError::Unsupported) => {
+            Err(error) => {
+                let error = edit_config_rpc_error(error);
                 return self
                     .edit_config_failure_reply(
                         &context,
                         kind,
-                        audit_failed("operation-not-supported"),
-                        RpcError::operation_not_supported(),
-                    )
-                    .await;
-            }
-            Err(EditConfigError::InvalidValue) => {
-                return self
-                    .edit_config_failure_reply(
-                        &context,
-                        kind,
-                        audit_failed("invalid-value"),
-                        RpcError::invalid_value(),
-                    )
-                    .await;
-            }
-            Err(EditConfigError::Failed { .. }) => {
-                return self
-                    .edit_config_failure_reply(
-                        &context,
-                        kind,
-                        audit_failed("operation-failed"),
-                        RpcError::operation_failed(),
+                        audit_failed(error.classification.tag.as_str()),
+                        error,
                     )
                     .await;
             }
@@ -6084,33 +6065,14 @@ where
             .build_edit_config_candidate(&base.config, request)
         {
             Ok(candidate) => candidate,
-            Err(EditConfigError::Unsupported) => {
+            Err(error) => {
+                let error = edit_config_rpc_error(error);
                 return self
                     .edit_config_failure_reply(
                         context,
                         kind,
-                        audit_failed("operation-not-supported"),
-                        RpcError::operation_not_supported(),
-                    )
-                    .await;
-            }
-            Err(EditConfigError::InvalidValue) => {
-                return self
-                    .edit_config_failure_reply(
-                        context,
-                        kind,
-                        audit_failed("invalid-value"),
-                        RpcError::invalid_value(),
-                    )
-                    .await;
-            }
-            Err(EditConfigError::Failed { .. }) => {
-                return self
-                    .edit_config_failure_reply(
-                        context,
-                        kind,
-                        audit_failed("operation-failed"),
-                        RpcError::operation_failed(),
+                        audit_failed(error.classification.tag.as_str()),
+                        error,
                     )
                     .await;
             }
@@ -6227,33 +6189,14 @@ where
         };
         let candidate = match self.binding.build_edit_config_candidate(&base, request) {
             Ok(candidate) => candidate,
-            Err(EditConfigError::Unsupported) => {
+            Err(error) => {
+                let error = edit_config_rpc_error(error);
                 return self
                     .edit_config_failure_reply(
                         context,
                         kind,
-                        audit_failed("operation-not-supported"),
-                        RpcError::operation_not_supported(),
-                    )
-                    .await;
-            }
-            Err(EditConfigError::InvalidValue) => {
-                return self
-                    .edit_config_failure_reply(
-                        context,
-                        kind,
-                        audit_failed("invalid-value"),
-                        RpcError::invalid_value(),
-                    )
-                    .await;
-            }
-            Err(EditConfigError::Failed { .. }) => {
-                return self
-                    .edit_config_failure_reply(
-                        context,
-                        kind,
-                        audit_failed("operation-failed"),
-                        RpcError::operation_failed(),
+                        audit_failed(error.classification.tag.as_str()),
+                        error,
                     )
                     .await;
             }
@@ -7490,6 +7433,16 @@ fn audit_denied(reason: &'static str) -> AuditOutcome {
 )]
 fn audit_failed(reason: &'static str) -> AuditOutcome {
     AuditOutcome::failed(reason).expect("static NETCONF audit reason code")
+}
+
+fn edit_config_rpc_error(error: EditConfigError) -> RpcError {
+    match error {
+        EditConfigError::Unsupported => RpcError::operation_not_supported(),
+        EditConfigError::InvalidValue => RpcError::invalid_value(),
+        EditConfigError::DataExists => RpcError::data_exists(),
+        EditConfigError::DataMissing => RpcError::data_missing(),
+        EditConfigError::Failed { .. } => RpcError::operation_failed(),
+    }
 }
 
 #[cfg(test)]
