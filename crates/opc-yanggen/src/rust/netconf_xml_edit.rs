@@ -166,6 +166,8 @@ fn apply_children_fn(
 
     let mut leaf_list_group_arms = TokenStream::new();
     let mut leaf_list_apply_stmts = TokenStream::new();
+    let mut list_key_sets = TokenStream::new();
+    let mut singleton_paths = Vec::new();
     let mut arms = TokenStream::new();
     for child_path in &node.child_paths {
         let Some(child) = nodes_by_path.get(child_path) else {
@@ -175,6 +177,9 @@ fn apply_children_fn(
         let field_ident = format_ident!("{}", to_snake_case(child_name));
         let is_sensitive = is_sensitive_node(child);
         let child_path_lit = &child.path;
+        if matches!(child.kind, SchemaNodeKind::Leaf | SchemaNodeKind::Container) {
+            singleton_paths.push(child_path_lit);
+        }
 
         let arm = match child.kind {
             SchemaNodeKind::Leaf => {
@@ -328,9 +333,18 @@ fn apply_children_fn(
             }
             SchemaNodeKind::List => {
                 let list_fn_ident = format_ident!("apply_{}", path_to_snake(&child.path));
+                let key_set = if child.key_leaves.is_empty() {
+                    TokenStream::new()
+                } else {
+                    let keys_ident = format_ident!("{}_edit_keys", path_to_snake(&child.path));
+                    list_key_sets.extend(quote! {
+                        let mut #keys_ident = std::collections::BTreeSet::new();
+                    });
+                    quote! { , &mut #keys_ident }
+                };
                 quote! {
                     #child_path_lit => {
-                        #list_fn_ident(child, &mut value.#field_ident)?;
+                        #list_fn_ident(child, &mut value.#field_ident #key_set)?;
                     }
                 }
             }
@@ -382,11 +396,34 @@ fn apply_children_fn(
         }
     };
 
+    let check_singletons = if singleton_paths.is_empty() {
+        TokenStream::new()
+    } else {
+        quote! {
+            // RFC 6241 section 7.2 leaves repeated operations on one
+            // conceptual node undefined. Reject them before applying children;
+            // otherwise repeated containers can bypass leaf-list grouping.
+            let mut singletons = std::collections::BTreeSet::new();
+            for child in children {
+                match child.schema_path {
+                    #(#singleton_paths)|* => {
+                        if !singletons.insert(child.schema_path) {
+                            return Err(NetconfEditError::InvalidValue { path: child.schema_path });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
     Ok(quote! {
         fn #fn_ident(
             children: &[EditConfigNode],
             value: &mut #type_ident,
         ) -> Result<(), NetconfEditError> {
+            #check_singletons
+            #list_key_sets
             #leaf_list_grouping
             for child in children {
                 match child.schema_path {
@@ -706,6 +743,7 @@ fn apply_list_fn(
         fn #fn_ident(
             node: &EditConfigNode,
             map: &mut std::collections::BTreeMap<#key_type, #entry_type_ident>,
+            edit_keys: &mut std::collections::BTreeSet<#key_type>,
         ) -> Result<(), NetconfEditError> {
             if node.schema_path != #path {
                 return Err(NetconfEditError::UnknownPath(node.schema_path.to_string()));
@@ -721,6 +759,13 @@ fn apply_list_fn(
                         key: key.clone(),
                     });
                 }
+            }
+            // Key identity must be checked after parsing: distinct XML
+            // spellings can address the same typed list entry. A separate
+            // set for each sibling list prevents repeated parents from
+            // hiding duplicate or conflicting leaf-list entry operations.
+            if !edit_keys.insert(parsed_key.clone()) {
+                return Err(NetconfEditError::InvalidValue { path: node.schema_path });
             }
             match node.operation {
                 EditOperation::Delete => {

@@ -182,6 +182,18 @@ ordering for every NETCONF operation.
 
 ## Status And Limits
 
+Schema-backed leaf-list edits support multiple values under containers and
+keyed lists, including complete root replacements. Entry operations use typed
+value identity; repeated values, conflicting edits, and repeated parents fail
+before publication. See [RFC 002's edit contract](../../docs/rfc/002-yang-projection.md#121-bounded-netconf-leaf-list-edits)
+for operation semantics, bounds, and the generated service regression fixture.
+
+Source migration: exhaustive matches on `EditConfigError` must handle the
+additive `DataExists` and `DataMissing` variants. The default generated binding
+maps supported leaf-list `create`/`delete` existence failures to these RFC-defined
+responses across running, candidate, and startup edits. Existing unsupported,
+invalid-value, and internal-failure variants keep their classifications.
+
 Implemented scope:
 
 - NETCONF 1.0 and 1.1 framing.
