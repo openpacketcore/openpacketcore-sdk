@@ -10,6 +10,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use opc_session_store::SnapshotIntegrityPolicy;
 use opc_session_testkit::qualification::{
     qualification_concurrent_state_type, read_bounded_json_line, write_json_line,
     QualificationConcurrentBatchOutcome, QualificationConcurrentBatchSlot,
@@ -186,6 +187,10 @@ fn write_configs(root: &Path, addresses: &[SocketAddr]) -> Vec<PathBuf> {
                 workspace_directory: root.to_path_buf(),
                 database_path: node_directory.join("session.sqlite"),
                 snapshot_directory: node_directory.join("snapshots"),
+                snapshot_integrity: Some(SnapshotIntegrityPolicy::PortableVerified),
+                snapshot_root_directory: None,
+                snapshot_root_device: None,
+                snapshot_root_inode: None,
                 operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
                 transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
             };
@@ -199,6 +204,28 @@ fn write_configs(root: &Path, addresses: &[SocketAddr]) -> Vec<PathBuf> {
             path
         })
         .collect()
+}
+
+#[test]
+fn control_configs_reject_the_release_only_external_snapshot_namespace() {
+    let workspace = tempfile::tempdir().expect("create control configuration workspace");
+    let addresses = reserve_addresses(3);
+    let config_path = write_configs(workspace.path(), &addresses)
+        .into_iter()
+        .next()
+        .expect("first control configuration");
+    let mut config: QualificationNodeConfig =
+        serde_json::from_slice(&fs::read(config_path).expect("read control configuration"))
+            .expect("decode control configuration");
+    let snapshot_root = workspace.path().join("external-fs-verity-campaign");
+    config.snapshot_root_directory = Some(snapshot_root.clone());
+    config.snapshot_root_device = Some(1);
+    config.snapshot_root_inode = Some(2);
+    config.snapshot_directory = snapshot_root.join("node-0");
+    assert!(
+        config.validate().is_err(),
+        "the plaintext control path must not accept release-only snapshot authority"
+    );
 }
 
 fn write_fleet_control_configs(
@@ -238,6 +265,10 @@ fn write_fleet_control_configs(
             workspace_directory: node_directory.clone(),
             database_path: node_directory.join("session.sqlite"),
             snapshot_directory: node_directory.join("snapshots"),
+            snapshot_integrity: Some(SnapshotIntegrityPolicy::PortableVerified),
+            snapshot_root_directory: None,
+            snapshot_root_device: None,
+            snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         };

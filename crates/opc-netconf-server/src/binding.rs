@@ -722,7 +722,7 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
         let applicator = self
             .generated_xml_edit_applicator()
             .ok_or(EditConfigError::Unsupported)?;
-        let edit = crate::edit_xml::parse_edit_config_xml(
+        let edit = crate::edit_xml::parse_edit_config_xml_from_bounded_envelope(
             &request.config_xml,
             self.schema_registry(),
             request.default_operation,

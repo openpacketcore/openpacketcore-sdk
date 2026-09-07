@@ -344,8 +344,9 @@ backend dispatch and may return the typed response. The new public error
 variants require external exhaustive matches. Protocol v4 introduced their
 private fixed-width DTOs in error revision 1; current v5 error revision 9
 retains those encodings and adds bounded expiry-preflight and
-topology-authority outcomes. It rejects error-revision-8 or older peers during the exact
-handshake. Operators must audit legacy
+topology-authority outcomes. The exact direct v5 profile is wire-schema
+revision 7/error-set revision 9; every non-current direct profile combination is
+rejected during the exact handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
 clamped or rewritten. Replicated deadline validation permits at most one
@@ -430,21 +431,163 @@ This is payload-envelope encryption, not full-database encryption. Membership,
 indexes, routing fields, owners, fences, timestamps, and envelope key IDs remain
 visible unless a separate approved storage layer protects them.
 
+### Persistent consumer transport (#695)
+
+#695 extends only the existing least-authority `SessionQuorumConsumer` application
+boundary. `StatelessSessionConsumerClient` remains a public,
+source-compatible production/compatibility fresh-authentication typed
+least-authority surface required by #649, #688, and #691; it is neither hidden,
+deprecated, nor test-only. `PersistentSessionConsumerClient` is a bounded SDK
+fixed-pool primitive; it does not establish an ePDG deployment, latency, or
+production-SLO claim. General consumer ingress uses `opc-session-consumer/1`
+revision 6, ordinary fenced ingress uses `opc-session-consumer/2` revision 5,
+and opted-in protected-roster ingress uses `opc-session-consumer/3` revision
+5. A roster-enabled listener deliberately advertises all three concurrently;
+there is no coordinated no-coexistence cutover claim. Voter-to-voter traffic is
+separately `opc-session-consensus/2` revision 5. Revision-6 private JSON DTO
+bytes, including the complete
+sequence-plus-nonce correlation envelope, are canonical; reordered or otherwise
+noncanonical encodings, aliases, omissions, and unknown fields fail closed. This
+boundary remains separate from consensus and the quarantined
+legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
+replication, snapshot, rebuild, membership, or admin API. Revision 4 retains
+#696's generic one-record atomic fenced-transition capability, observation,
+execution, and exact status, and adds exact retained status recovery for
+ordinary acquire, renew, and release; it does not include product composition
+or ePDG-specific semantics.
+
+Before V1 is activated for the exact current consensus voter scope, capability,
+observation, status, and first-transition admission require fresh authenticated
+V1 replies from every exact voter; a Raft quorum is not mixed-version proof,
+and an unavailable or incompatible voter fails closed. The first authorized
+transition after that proof carries internal scope identity and a canonical
+voter-set commitment in its same single user command/application position. Its
+atomic apply installs receipt/effects, the one-way persistent schema-version
+downgrade fence, and an optional single-row exact-current-scope certificate,
+without another user mutation or log position. These are durable admission
+fields, not public consumer-wire fields. Once committed, ordinary linearizable
+Raft quorum availability serves capability, observation, execution, and status;
+leader or minority loss does not re-probe every voter.
+
+Topology cutover deletes the old certificate only: the schema fence and receipt
+bindings remain, and the successor scope requires a fresh every-voter proof and
+its first activating or recovery transition. Stable request ID/body recovery
+survives that rollover. The exact #684 layout is empty Prepared state and safe
+for predecessor readers until activation. Activated databases, snapshots, and
+recovery preserve the fence and receipts plus any exact-current certificate;
+snapshots never regress Activated to Prepared or erase/substitute a same-scope
+certificate. A legitimately unactivated successor scope may have no
+certificate pending its new proof. Exact predecessor binaries reject the
+higher schema fence. An
+offline pre-V1 minority is not safe to catch up simply because it did not
+acknowledge activation: the persistent fence prevents an old reader from
+silently omitting activated snapshot state.
+
+The public consumer request ID is byte-identical to the nested transition ID.
+The quorum adapter's internal receipt ID is domain-separated by authenticated
+consumer identity, stable cluster identity, and public ID; it excludes the
+body and changing configuration epoch, while the receipt binds the complete
+canonical body. The current exact scope is enforced under the activation
+lifecycle above, so an authorized successor recovers across rollover and a
+revoked predecessor cannot observe the receipt. There is no separate
+`BindConsumerRequest` or log entry. `FencedTransitionStorageExhausted` is a
+retained, body-bound deterministic no-effect result after ordinary
+stale-fence/CAS/lease admission;
+consumer revision 4 introduced it and revision 5 retains it as a closed
+`StorageExhausted` error inside
+`Recorded` status. Frozen legacy session-net v5 maps it fail-closed as an
+unknown capability without changing its wire enum.
+
+Request connections are deliberately sequential: a nonzero connection-local
+monotonic `u32` sequence never wraps and is paired with a fresh unpredictable
+UUID nonce serialized after the complete request. The server admits the next
+sequence and the client requires the exact composite response correlation. A
+lane retires after at most 4,096 calls and permits only one in-flight call. This
+is required for cancellation, pre-staged/late-response isolation, and exact
+write-position ambiguity. The fair request pool defaults
+to four connections (at most 16 configured), with 64 pending calls by default,
+256 absolutely, and a 250 ms queue wait/age limit. Two reserved Watch transport
+slots (at most 16 configured) are separate from request capacity, but the typed
+tenant/NF consumer Watch does not acquire them. An establishment is
+limited to 1,500 ms and at most two pre-write attempts; resolution happens only
+on establishment/re-establishment. One pool-wide gate serializes every cold
+request and rolling-prewarm setup after bounded physical admission.
+Setup failures and proven cached-lane losses publish one shared exponential
+backoff plus at most 25 ms jitter; the
+first floor is 50 ms by default and all waits are clipped to their logical
+deadline. Existing 5-second idle,
+10-second operation, 16 MiB frame, 256 listener-connection, and TLS lifecycle
+bounds are retained; consumer shutdown drain is at most 5 seconds.
+Exactly one pool-wide maintenance task autonomously removes cached lanes at the
+earliest idle/lifecycle deadline. An accepted material epoch schedules cached
+lanes on stable, directed authenticated-edge deadlines within the bounded
+rotation jitter; they remain reusable before their deadline and retire at it.
+Explicit generation changes invalidate cached lanes immediately, while every
+fresh handshake must still match the exact current generation and epoch at its
+final publication sample. TLS supplies only one fixed-domain, fixed-range
+consumer jitter duration; it exposes no edge-key object, caller-selected digest
+range, identity, or digest bytes to callers or diagnostics.
+Task cardinality does not scale with lanes, subscribers, or records. A rejected
+same-epoch publication does not retire a healthy lane.
+
+Each stateless clone lineage has family-specific fail-fast request admission:
+general `/1` and an opted-in protected-roster `/3` clone share 16 `/1`-family
+connections, while ordinary fenced `/2` has an independent 16. This bounds the
+lineage at 32 request connections without allowing either family to starve the
+other. Ordinary persistent `/1` and `/2` share aggregate width and may reclaim
+an idle opposite-protocol lane. A protected `/3` pool is a distinct opted-in
+profile; it cannot relabel an ordinary retained lane and does not admit
+ordinary `/1` or `/2` operations. The retained 16 Watch transport permits are
+not admitted by typed tenant/NF consumer calls:
+`open_watch` rejects locally with stable `Unsupported` before resolution or
+cursor exposure. Independent stateless constructors create independent logical
+clients, just as independent persistent constructors do.
+
+The complete operation timeout is validated as greater than zero and no greater
+than 10 seconds. The configured idle bound (at most 5 seconds) caps every
+active partial frame on client bootstrap and unary reads without being reset by
+partial bytes. Each discarded checked-out request lane has exactly one
+reconnect/replacement accounting outcome. Concurrent shutdown calls advance a
+monotonic phase only (running, draining, then forced) and cannot regress it.
+
+Only `NotTransmitted` may automatically retry, with an identical request ID and
+body. A possibly written call is `OutcomeUnknown`, evicts its lane, and is never
+replayed. Positive ciphertext writes are observed below TLS, so an outer TLS
+error cannot hide an accepted prefix; no positive lower or outer write remains
+exactly `NotTransmitted`. Prewarm rolling-refreshes every configured lane through
+resolver/TCP/TLS/Hello and preserves prior refreshed plus unprocessed healthy
+capacity if a later replacement fails. Prewarm/readiness proves authenticated
+transport capacity only, never quorum or product readiness. Diagnostics are fixed and nonidentifying (setup
+phase, pool wait, active/maximum/idle, reuse/reconnect,
+queue/in-flight/oldest-age, and bounded outcome class); they exclude endpoints,
+identities, scopes, credentials, keys, payloads, request/correlation IDs,
+owners, and fences. Readiness deliberately becomes false while a request lane
+is leased; reserved Watch transport slots are non-gating. Performance evidence is
+synthetic only and makes no ePDG production-SLO claim. Its warm accept/reuse
+checks gate only the synthetic transport method; elapsed samples are
+non-gating. The revision-2 persistent-consumer qualification contract is v7;
+the published v6 profile remains the unchanged revision-1 contract. Revision 5
+retains that bounded transport, the revision-3 atomic-transition evidence, and
+revision-4 retained lease status, then adds causal correlation, below-TLS write
+observation, fresh rolling prewarm, and serialized cold recovery.
+
 ### Legacy backend and restore transport (protocol v5)
 
 The opt-in `opc-session-net` protocol v5 carries validated restore-scan
 requests and pages to individual remote replicas. It admits only the
 `DurableOpaqueV1` page profile; offset cursors from the local fake are rejected
-and can never become remote restore evidence. Backend pages are capped at
-1,024 records, 4 MiB of payload, and 4,096 examined live candidates plus one
+and can never become remote restore evidence. Backend pages sent over
+session-net are capped at 1,024 records, 2,096,128 bytes of wire payload, and
+4,096 examined live candidates plus one
 lookahead. Narrow scopes may therefore return an empty advancing page. The
 cursor is an AES-256-GCM-SIV ciphertext that confidentially and
 authentically binds the composite seek key, backend epoch, record revision,
 logical time, scope, and progress. A modified, stale, or cross-scope cursor
 fails typed and restarts from page one. A server never fabricates a replacement
-cursor while fitting a wire frame; an encoded page that cannot fit returns
-`RestoreScanResponseTooLarge` so the caller can retry the same cursor with a
-smaller record limit.
+cursor while fitting a wire frame and never trims or rewrites records or the
+cursor. An encoded page that cannot fit returns
+`RestoreScanResponseTooLarge`. The SDK does not automatically retry or alter
+the limit; a caller may retry the same cursor with a smaller record limit.
 
 Every production participant is created with an opaque authenticated TLS
 config and a binding derived from one immutable `SessionReplicationManifest`.
@@ -499,8 +642,8 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 6, error-set revision 9, a 4 MiB restore
-payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
+profile pins wire-schema revision 7, error-set revision 9, a 2,096,128-byte
+restore wire-payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and
 depth-16/256-node replication trees. Revision 2 also pins
@@ -514,9 +657,9 @@ Error-set revision 4 adds checked replication-log range overflow, page-limit,
 and compacted-cursor outcomes; revision 5 adds non-CAS backend and lease
 ambiguity outcomes; revision 6 adds bounded-watch catch-up; revision 7 adds
 absolute-record-expiry rejection; and revision 8 adds the bounded
-expiry-preflight limit outcome. A revision-4/error-revision-7 or older peer is
-therefore
-incompatible.
+expiry-preflight limit outcome. The exact direct v5 profile is wire-schema
+revision 7/error-set revision 9; every non-current direct profile combination is
+therefore incompatible and requires a coordinated drained stop/upgrade/start.
 
 Every forwarding wrapper and authenticated CAS/batch dispatcher obtains the
 payload-free expiry-authority verdict before idempotency admission, cache
@@ -528,19 +671,27 @@ unchanged.
 
 Every server response and watch item is fully bounded-encoded before a length
 prefix is emitted. Common non-pageable and complete-page successes use one
-bounded encode without a sizing preflight. An oversized pageable direct attempt
-emits no prefix; bounded logarithmic sizing probes and the final encode share
-one absolute deadline established before the first encode/probe and continuing
-through prefix, payload, and flush. Lazy exact-length boxed chunks are not
+bounded encode without a sizing preflight. For a replication-log page, an
+oversized pageable direct attempt emits no prefix; bounded logarithmic sizing
+probes and the final encode share one absolute deadline established before the
+first encode/probe and continuing
+through prefix, payload, and flush. Restore pages are validated as whole
+backend results and are never transport-shaped. Lazy exact-length boxed chunks are not
 coalesced and retained encoded-JSON
 byte storage stays within the limit; metadata and allocator slab/RSS overhead
 remain separate. Storage/sizing sinks check deadline and server-abort
 cancellation cooperatively between serializer writes/chunks. Tokio cannot
 preempt one synchronous serializer callback, whose input remains bounded by the
 profile. Expiry closes the connection and returns the handler/connection permit.
-Get/CAS records and positional batch vectors are never truncated. Restore may
-return a complete cursor-correct prefix; replication-log reads return the
-largest complete contiguous-sequence prefix that fits. Watch cannot skip an
+Get/CAS records and positional batch vectors are never truncated. Restore
+backends may independently return shorter cursor-correct pages under their
+count, payload, or work budgets; transport validates each complete page against
+the fixed wire cap and negotiated frame and never trims or rewrites it.
+An oversize restore page returns typed `RestoreScanResponseTooLarge` when
+representable or closes. The SDK does not automatically retry that page; a
+caller may retry the same cursor with a smaller record limit. Replication-log
+reads return the largest complete
+contiguous-sequence prefix that fits. Watch cannot skip an
 oversized entry; it emits a fixed SDK-owned error when representable and ends,
 or closes immediately. A fixed fallback that itself cannot fit also causes a
 fail-closed close. Rejected nested entries keep iterative disposal and bounded
@@ -553,8 +704,9 @@ byte-array expansion, and equal escaping/metadata headroom. The advertised
 maximum can perform a real write/read round trip under unequal limits. It
 is zero at the exact 8 KiB minimum; payload-bearing traffic requires a larger
 frame. The 1 MiB default advertises 130,048 bytes; the 16 MiB ceiling advertises
-2,096,128, and SQLite's full 1 MiB limit requires at least 8,396,800 frame
-bytes. A 16 MiB setting is recommended for that profile. This is per frame: at
+2,096,128. The wire ceiling is intentionally below standalone SQLite's local
+4 MiB + 64 KiB stored-envelope restore capacity, which is not a session-net
+wire capability. This is per frame: at
 the default 128 connection slots, concurrent ceiling-sized encodes can retain
 about 2 GiB before metadata/TLS/runtime overhead. The aggregate scales with
 `with_max_connections`, so aggregate limiting and resource/soak evidence remain
@@ -601,10 +753,12 @@ redundantly presented root bounds the deadline, while a root present only in a
 trust bundle is not independently scanned. Production SVID chains should omit
 the trust anchor. #163 retires retained connections on coherent material-epoch
 or explicit reauthentication changes, ends transport waits and releases
-connection slots by the hard deadline, and reconnects watches from the exact
-delivered cursor. Root removal is a trust-anchor cutover and material change,
-not an expiry deadline. A bounded supervised mutation may still finish later;
-its outcome remains typed ambiguous and must not be automatically retried.
+connection slots by the hard deadline. The consumer Watch API does not admit
+the global replication cursor for tenant/NF-scoped grants, so it makes no
+production reconnect claim until an identity-and-scope-bound cursor exists.
+Root removal is a trust-anchor cutover and material change, not an expiry
+deadline. A bounded supervised mutation may still finish later; its outcome
+remains typed ambiguous and must not be automatically retried.
 
 Short-lived SVID expiry is the bounded same-issuer
 credential-compromise/revocation response. Rotation and reauthentication do
@@ -795,7 +949,9 @@ implement a second quorum algorithm.
   config TCP deadline or credential path.
 
 The observed-leader evidence closes only that foundation gap. The profile
-remains `experimental` and `qualification_complete = false`. A single-host
+remains `experimental`; an external exact-head V9 record is
+`qualification_complete:true` only after its complete gate succeeds and all
+strict artifacts validate. This document records no such result. A single-host
 three- and five-process component core now exercises atomic projected-SVID
 trust/leaf/intermediate/root rotation and rollback with production lifecycle
 defaults, affected-path reauthentication, all-path fleet cutovers, durable
@@ -806,3 +962,42 @@ or independent release evidence. Broader crash-point/partition/restart and expir
 concurrent batch/watch/restore histories, drain/reconnect deadlines, resource
 limits, soak, production payload-key operation, supported platforms, and signed
 candidate-release evidence remain under #164/#143 and related gates.
+
+The closed V9 contract uses schema digest
+`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
+It binds canonical absolute producer Cargo-target, external evidence-root, and
+owner-private fs-verity snapshot-base paths, the root-derived pair directory,
+domain-separated commitments for those raw paths, and the snapshot-base
+device/inode. It separately binds the exact normalized absolute Cargo
+invocation alias, canonical backing executable path, and backing-content
+SHA-256 and executable mode. The alias (for example a rustup-managed
+`.../cargo` spelling), not the backing path, is `argv[0]` followed by 14
+canonical tail arguments; the normalized recorded vector has 15 elements
+beginning `cargo`, and the POSIX-escaped environment-prefixed reproduction
+command executes that alias. Bound paths reject control
+characters and NUL; standard POSIX single-quote escaping is covered only by its
+exact regression and is not a general shell-injection claim.
+The V1/V9 pair still has only `batch-release-gate-v1.json` and
+`persistent-consumer-v9.json`. Its symmetric pair run-ID uses the v4 domain,
+canonical V1, existing provenance/invocation fields, and canonical full V9
+claims preimage with only `run_id_sha256` replaced by `sha256:` plus 64 zeroes;
+it does not hash final self-containing V9 bytes. The command digest orders
+backing path, alias, backing-content SHA-256, u16-BE executable mode, then
+argv. Run-ID v4 binds 20 ordered provenance strings: the prior 16 ending alias,
+backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`, plus
+the fs-verity snapshot path, commitment, device, and inode. It then binds
+u16-BE mode before the existing
+V1/V9/argv/recipe/canonical-V1/claims-preimage material. The wrapper consumes
+it with a fresh, distinct target.
+Python retains the exact nofollow private lease inode via
+`/proc/<wrapper-pid>/fd/<fd>` for the direct child without raw-FD inheritance;
+Rust opens/locks that procfd inode and revalidates procfd, parent, name, and
+path before mkdir, publication, and completion, closing the A-to-B split-lock
+seam. This remains synthetic SDK evidence, not an execution/completion claim
+or an ePDG production claim.
+
+After each loss/restart, the protected `/3` pool is rebound to a
+readiness-proven live leader. Its foreign-tenant bracket is exactly three
+per-voter non-oracular `Unavailable` observations. Only `NotFound` and backend
+`Unavailable` receipt status are retryable; typed rejection and durable
+negative receipt outcomes are terminal for the retained request body.

@@ -105,7 +105,9 @@ pub enum HandoverError {
     /// A different handover transaction owns the in-flight phase. Two
     /// concurrent handover attempts collided; the one holding `active` wins
     /// and the `received` transaction should be abandoned or aborted.
-    #[error("handover transaction conflict: active transaction is {active:?}, but received {received:?}")]
+    #[error(
+        "handover transaction conflict: active transaction is {active:?}, but received {received:?}"
+    )]
     TransactionConflict {
         /// Transaction recorded in the stored phase.
         active: HandoverTxId,
@@ -129,7 +131,9 @@ pub enum HandoverError {
     /// record was last written under — a newer owner has been fenced in.
     /// The caller must stop writing this session; acquiring a fresh lease
     /// (and re-reading) is the only way forward.
-    #[error("fencing token mismatch: provided fence {provided} is lower than or equal to current fence {current}")]
+    #[error(
+        "fencing token mismatch: provided fence {provided} is lower than or equal to current fence {current}"
+    )]
     FencingMismatch {
         /// Fence token from the caller's lease.
         provided: FenceToken,

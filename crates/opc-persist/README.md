@@ -51,6 +51,11 @@ accepted single-replica profile.
   compares the payload-free projected transaction/version with the canonical
   local SQLite state-machine head, and repeats the same-term Openraft barrier.
   Every return path releases the drained permits.
+- `ConsensusConfigStore::open_local_authority_projection` keeps that same
+  cohort held around a consumer-owned, payload-free projection callback, then
+  rechecks term and exact durable head before opening local writes. It is the
+  product-neutral leader-open seam for a live config projection; it adds no
+  consensus or leader tracker.
 - `ApprovedLegacyConfigRecovery` is the explicit offline admission object for
   replacing nonempty legacy authority with one exact applied snapshot.
 - `SecurityPolicyService` and `SqliteSecurityPolicyService` stage, validate,

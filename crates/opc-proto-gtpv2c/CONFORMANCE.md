@@ -168,7 +168,13 @@ failures and must cover at least these rules:
   1/interface type 32, and Bearer Context for accepted responses (Cause 16/17).
   The control endpoint requires a non-zero TEID and at least one address;
   instance-0 Sender F-TEID is unexpected on this S2b response profile and is
-  discarded. Rejected responses may expose Cause-only summaries.
+  discarded. Rejected responses may expose Cause-only summaries. The explicit
+  one-shot receive policy may independently add only S5/S8 PGW control type 7
+  and PGW user-plane type 5 to the strict role sets `{32}` and `{33}`. The
+  policy is copied for one decode and binds validation and typed projection to
+  the same first retained role occurrence. It cannot admit arbitrary interface
+  values or affect another profile; no-policy APIs and canonical builders stay
+  strict S2b and emit only control type 32 and user-plane type 33.
 - S2b Modify Bearer Request is the UE-initiated IPsec tunnel-update profile.
   It requires a non-zero header TEID but no mandatory IE. WLAN Location
   Information (TWAN Identifier instance 0) and WLAN Location Timestamp (TWAN
@@ -245,7 +251,11 @@ failures and must cover at least these rules:
   grouped scope is retained, later occurrences are ignored, and bounded
   `S2bReceiveDiagnostics` records only type, instance, scope/depth, first
   offset, and a saturated duplicate count. A malformed or semantically invalid
-  first value remains an error and cannot be repaired by a later value.
+  first value remains an error and cannot be repaired by a later value. For
+  Create Session Response nested F-TEIDs, this rule applies per `(type,
+  instance)` singleton key: distinct table-defined instances remain eligible
+  for their distinct roles, while a later duplicate at the same instance can
+  never repair the retained first occurrence.
 - ProcedureAware receive classifies every crate-known typed/control IE key
   against one message grammar keyed by procedure, direction, and exact
   enclosing Bearer Context instance before decoding its value. Unexpected

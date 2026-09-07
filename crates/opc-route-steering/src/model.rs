@@ -231,7 +231,13 @@ pub struct RuleMismatch {
     pub kernel_semantics: bool,
 }
 
-/// Bounded evidence for resident rules sharing the requested family/priority key.
+/// Bounded evidence for resident rules that are not proven disjoint from the
+/// requested family/priority key.
+///
+/// The built-in Linux backend excludes only fully representable,
+/// ownership-tagged, source-only siblings in the same table whose non-wildcard
+/// source prefixes are provably disjoint. Every other same-family/priority
+/// resident remains collision evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleConflict {
     resident: RuleRequest,
@@ -295,6 +301,11 @@ pub enum RouteReadback {
 }
 
 /// Typed result of reading back a rule's address-family/priority key.
+///
+/// The built-in Linux backend treats a fully representable,
+/// ownership-tagged, source-only rule in the same table with a provably
+/// disjoint non-wildcard source prefix as outside this key. It remains
+/// fail-closed for all other same-family/priority residents.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleReadback {

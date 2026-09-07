@@ -239,6 +239,7 @@ fn build_input() -> CanonicalInput {
             kind: SchemaNodeKind::LeafList,
             config: true,
             type_ref: Some(TypeRef::String),
+            ordered_by: Some("user".to_string()),
             source: source.clone(),
             ..Default::default()
         },
@@ -353,8 +354,10 @@ pub type CustomTag = String;
     let types_path = workspace_dir.join("crates/opc-types");
     let data_gov_path = workspace_dir.join("crates/opc-data-governance");
     let mgmt_schema_path = workspace_dir.join("crates/opc-mgmt-schema");
+    let mgmt_limits_path = workspace_dir.join("crates/opc-mgmt-limits");
     let redaction_path = workspace_dir.join("crates/opc-redaction");
     let gnmi_server_path = workspace_dir.join("crates/opc-gnmi-server");
+    let netconf_server_path = workspace_dir.join("crates/opc-netconf-server");
 
     let time_version = common::locked_version(&workspace_dir, "time");
 
@@ -373,16 +376,20 @@ opc-config-model = {{ path = "{}" }}
 opc-types = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
 opc-mgmt-schema = {{ path = "{}" }}
+opc-mgmt-limits = {{ path = "{}" }}
 opc-redaction = {{ path = "{}" }}
 opc-gnmi-server = {{ path = "{}" }}
+opc-netconf-server = {{ path = "{}" }}
 "#,
         time_version,
         config_model_path.display(),
         types_path.display(),
         data_gov_path.display(),
         mgmt_schema_path.display(),
+        mgmt_limits_path.display(),
         redaction_path.display(),
         gnmi_server_path.display(),
+        netconf_server_path.display(),
     );
     fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();
 

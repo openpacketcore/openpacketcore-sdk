@@ -43,11 +43,13 @@ use crate::protocol::{
     ensure_restore_scan_success_frame_fits_until as ensure_restore_scan_success_frame_fits_until_controlled,
     get_result_matches_key, negotiate_response_frame_size, read_authenticated_request_frame_within,
     read_frame_within, read_request_frame, session_op_results_match_expectations,
-    validate_request_payload_limit, write_frame_bounded_until_cancellable, BootstrapHello,
-    BootstrapHelloAck, BootstrapRequest, BootstrapResponse, HelloRejectReason, InboundRequest,
-    Request, Response, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
-    MAX_HANDSHAKE_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
-    MIN_NEGOTIATED_FRAME_SIZE, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
+    validate_request_payload_limit, validate_restore_scan_wire_payload_bytes,
+    write_frame_bounded_until_cancellable, BootstrapHello, BootstrapHelloAck, BootstrapRequest,
+    BootstrapResponse, HelloRejectReason, InboundRequest, Request, Response, CONTRACT_VERSION,
+    CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
+    MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES, MIN_NEGOTIATED_FRAME_SIZE,
+    MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES,
+    SESSION_NET_ALPN,
 };
 
 /// Handle to a running [`SessionReplicationServer`].
@@ -1161,6 +1163,16 @@ fn bounded_restore_scan_response(
             cancellation,
         );
     }
+    if validate_restore_scan_wire_payload_bytes(&page.records).is_err() {
+        return bounded_restore_scan_error_response(
+            StoreError::RestoreScanResponseTooLarge {
+                max_bytes: RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES,
+            },
+            max_response_frame_size,
+            deadline,
+            cancellation,
+        );
+    }
 
     match ensure_restore_scan_success_frame_fits_until(
         &page,
@@ -1190,7 +1202,12 @@ fn validate_dispatched_restore_page(
             "legacy_remote_restore_scan".to_string(),
         ));
     }
-    page.validate_for_request(dispatched_request)
+    page.validate_for_request(dispatched_request)?;
+    validate_restore_scan_wire_payload_bytes(&page.records).map_err(|_| {
+        StoreError::RestoreScanResponseTooLarge {
+            max_bytes: RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES,
+        }
+    })
 }
 
 fn bounded_restore_scan_error_response(
@@ -4879,6 +4896,21 @@ mod tests {
                 "legacy_remote_restore_scan".to_string()
             ))
         );
+
+        let mut over_wire_cap = RestoreScanPage::new(
+            vec![restore_record(
+                b"one-byte-over-v5-wire-cap",
+                crate::protocol::RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES + 1,
+            )],
+            0,
+            None,
+        );
+        over_wire_cap.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+        assert!(matches!(
+            validate_dispatched_restore_page(&over_wire_cap, &RestoreScanRequest::all(1)),
+            Err(StoreError::RestoreScanResponseTooLarge { max_bytes })
+                if max_bytes == crate::protocol::RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES
+        ));
     }
 
     #[test]
@@ -4899,6 +4931,34 @@ mod tests {
             Response::ScanRestoreRecords(Err(StoreError::RestoreScanResponseTooLarge {
                 max_bytes: MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE
             }))
+        ));
+    }
+
+    #[test]
+    fn restore_page_one_byte_over_the_v5_wire_cap_is_rejected_before_serialization() {
+        let request = RestoreScanRequest::all(1);
+        let page = RestoreScanPage::new(
+            vec![restore_record(
+                b"one-byte-over-v5-wire-cap",
+                crate::protocol::RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES + 1,
+            )],
+            0,
+            None,
+        );
+
+        let response = bounded_restore_scan_response(
+            Ok(page),
+            &request,
+            crate::protocol::MAX_NEGOTIATED_FRAME_SIZE,
+            response_write_deadline(std::time::Duration::from_secs(1)).expect("deadline"),
+            &TEST_NOT_CANCELLED,
+        )
+        .expect("typed rejection");
+        assert!(matches!(
+            response,
+            Response::ScanRestoreRecords(Err(StoreError::RestoreScanResponseTooLarge {
+                max_bytes
+            })) if max_bytes == crate::protocol::RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES
         ));
     }
 

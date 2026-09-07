@@ -132,6 +132,10 @@ const ROLE_CONFLICT_TERMINAL: &str = "roster-conflict-terminal-677";
 const RECORD_BODY_BYTES: usize = 912;
 const ACTOR_INCARNATION_RANGE: std::ops::Range<usize> = 64..80;
 const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-record-v1\0";
+const JOURNAL_NAME: &str = "journal";
+const JOURNAL_HEADER_BYTES: usize = 80;
+const EPOCH_BODY_BYTES: usize = JOURNAL_HEADER_BYTES - 32;
+const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-epoch-v1\0";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1047,9 +1051,47 @@ fn read_recovery_handle(path: &Path) -> io::Result<XfrmObjectRosterRecoveryHandl
     Ok(XfrmObjectRosterRecoveryHandle::from_bytes(encoded))
 }
 
-/// Count the durable roster records the store still retains, excluding its
-/// control record and epoch witnesses.
-fn retained_record_count(store_root: &Path) -> TestResult<usize> {
+/// Authenticate one fixed-size durable roster frame with the real proof key.
+fn authenticate_record_frame(
+    encoded: &[u8; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES],
+    key: &[u8; 32],
+) -> TestResult {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|_| io::Error::other("construct roster record authenticator"))?;
+    mac.update(RECORD_AUTH_DOMAIN);
+    mac.update(&encoded[..RECORD_BODY_BYTES]);
+    mac.verify_slice(&encoded[RECORD_BODY_BYTES..])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid roster record tag"))?;
+    Ok(())
+}
+
+fn authenticate_journal_header(encoded: &[u8], key: &[u8; 32]) -> TestResult {
+    if encoded.len() != JOURNAL_HEADER_BYTES
+        || encoded[..8] != *b"OPCXRSE1"
+        || encoded[8..10] != 1_u16.to_be_bytes()
+        || encoded[10..16].iter().any(|byte| *byte != 0)
+        || encoded[40..EPOCH_BODY_BYTES].iter().any(|byte| *byte != 0)
+        || encoded[16..32].iter().all(|byte| *byte == 0)
+        || encoded[32..40].iter().all(|byte| *byte == 0)
+    {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "invalid roster journal header").into(),
+        );
+    }
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|_| io::Error::other("construct roster journal authenticator"))?;
+    mac.update(EPOCH_AUTH_DOMAIN);
+    mac.update(&encoded[..EPOCH_BODY_BYTES]);
+    mac.verify_slice(&encoded[EPOCH_BODY_BYTES..])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid roster journal tag"))?;
+    Ok(())
+}
+
+/// Count authenticated durable roster frames, excluding only the store's
+/// control and epoch witnesses. A journal header alone is not a frame; every
+/// complete frame after it is retained durable state and makes a zero-residue
+/// assertion fail.
+fn retained_record_count(store_root: &Path, key: &[u8; 32]) -> TestResult<usize> {
     let mut count = 0_usize;
     for entry in fs::read_dir(store_root)? {
         let entry = entry?;
@@ -1060,7 +1102,82 @@ fn retained_record_count(store_root: &Path) -> TestResult<usize> {
         if name == "control" || name.starts_with("epoch-") {
             continue;
         }
-        count += 1;
+        let path = entry.path();
+        let path_metadata = fs::symlink_metadata(&path)?;
+        if name != JOURNAL_NAME {
+            // An unknown residual entry remains observable as residue even if
+            // it is not a record frame the test can authenticate.
+            if path_metadata.len() != XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES as u64 {
+                count += 1;
+                continue;
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+                .open(&path)?;
+            let descriptor_metadata = file.metadata()?;
+            if descriptor_metadata.dev() != path_metadata.dev()
+                || descriptor_metadata.ino() != path_metadata.ino()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable roster record identity changed while opening",
+                )
+                .into());
+            }
+            let mut encoded = [0_u8; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES];
+            file.read_exact(&mut encoded)?;
+            authenticate_record_frame(&encoded, key)?;
+            count += 1;
+            continue;
+        }
+        if !path_metadata.file_type().is_file()
+            || path_metadata.mode() & 0o7777 != 0o600
+            || path_metadata.nlink() != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable roster journal metadata is invalid",
+            )
+            .into());
+        }
+        let length = usize::try_from(path_metadata.len())?;
+        if length < JOURNAL_HEADER_BYTES
+            || !(length - JOURNAL_HEADER_BYTES)
+                .is_multiple_of(XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable roster journal frame layout is invalid",
+            )
+            .into());
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+            .open(&path)?;
+        let descriptor_metadata = file.metadata()?;
+        if descriptor_metadata.dev() != path_metadata.dev()
+            || descriptor_metadata.ino() != path_metadata.ino()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable roster journal identity changed while opening",
+            )
+            .into());
+        }
+        let mut bytes = vec![0_u8; length];
+        file.read_exact(&mut bytes)?;
+        authenticate_journal_header(&bytes[..JOURNAL_HEADER_BYTES], key)?;
+        let (frames, remainder) =
+            bytes[JOURNAL_HEADER_BYTES..].as_chunks::<XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES>();
+        if !remainder.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid roster frame").into());
+        }
+        for frame in frames {
+            authenticate_record_frame(frame, key)?;
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -1086,38 +1203,119 @@ fn authenticated_wrong_incarnation_record(
     Ok(encoded)
 }
 
-/// Rewrite the actor incarnation of the single retained record whose name
-/// begins with `phase_prefix`, then re-authenticate it with the real proof key.
+/// Rewrite the actor incarnation of the exact retained record named by
+/// `handle`, then re-authenticate it with the real proof key.
 ///
-/// The rewrite is MAC-valid on purpose: a tampering test only proves the tag
-/// works, while this proves the binding checks run even when the tag verifies.
-fn poison_record_incarnation(store_root: &Path, phase_prefix: &str, key: &[u8; 32]) -> TestResult {
+/// The record may be a legacy phase-named file or a complete frame in the
+/// append journal. The rewrite is MAC-valid on purpose: a tampering test only
+/// proves the tag works, while this proves the binding checks see a real
+/// current frame.
+fn poison_record_incarnation(
+    store_root: &Path,
+    handle: &XfrmObjectRosterRecoveryHandle,
+    key: &[u8; 32],
+) -> TestResult {
     let mut matching = Vec::new();
+    let target = handle.to_bytes();
     for entry in fs::read_dir(store_root)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name
             .to_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 store entry"))?;
-        if name.starts_with(phase_prefix) {
-            matching.push(entry.path());
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file()
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1
+        {
+            continue;
+        }
+        if name == JOURNAL_NAME {
+            let length = usize::try_from(metadata.len())?;
+            if length < JOURNAL_HEADER_BYTES
+                || !(length - JOURNAL_HEADER_BYTES)
+                    .is_multiple_of(XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable roster journal frame layout is invalid",
+                )
+                .into());
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+                .open(&path)?;
+            let descriptor_metadata = file.metadata()?;
+            if descriptor_metadata.dev() != metadata.dev()
+                || descriptor_metadata.ino() != metadata.ino()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable roster journal identity changed while opening",
+                )
+                .into());
+            }
+            let mut bytes = vec![0_u8; length];
+            file.read_exact(&mut bytes)?;
+            let (frames, remainder) = bytes[JOURNAL_HEADER_BYTES..]
+                .as_chunks::<XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES>();
+            if !remainder.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable roster journal frame layout is invalid",
+                )
+                .into());
+            }
+            for (index, frame) in frames.iter().enumerate() {
+                if *frame == target {
+                    matching.push((
+                        path.clone(),
+                        u64::try_from(
+                            JOURNAL_HEADER_BYTES + index * XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+                        )?,
+                        metadata.len(),
+                    ));
+                }
+            }
+        } else if metadata.len() == XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES as u64 {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+                .open(&path)?;
+            let descriptor_metadata = file.metadata()?;
+            if descriptor_metadata.dev() != metadata.dev()
+                || descriptor_metadata.ino() != metadata.ino()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable roster record identity changed while opening",
+                )
+                .into());
+            }
+            let mut encoded = [0_u8; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES];
+            file.read_exact(&mut encoded)?;
+            if encoded == target {
+                matching.push((path, 0, metadata.len()));
+            }
         }
     }
     if matching.len() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "expected exactly one retained durable roster record",
+            "expected exactly one retained durable roster frame",
         )
         .into());
     }
-    let record_path = matching
+    let (record_path, offset, expected_length) = matching
         .pop()
-        .ok_or_else(|| io::Error::other("durable roster record disappeared"))?;
+        .ok_or_else(|| io::Error::other("durable roster frame disappeared"))?;
     let path_metadata = fs::symlink_metadata(&record_path)?;
     if !path_metadata.file_type().is_file()
         || path_metadata.mode() & 0o7777 != 0o600
         || path_metadata.nlink() != 1
-        || path_metadata.len() != XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES as u64
+        || path_metadata.len() != expected_length
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1142,9 +1340,10 @@ fn poison_record_incarnation(store_root: &Path, phase_prefix: &str, key: &[u8; 3
         .into());
     }
     let mut encoded = [0_u8; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES];
+    file.seek(io::SeekFrom::Start(offset))?;
     file.read_exact(&mut encoded)?;
     let poisoned = authenticated_wrong_incarnation_record(encoded, key)?;
-    file.rewind()?;
+    file.seek(io::SeekFrom::Start(offset))?;
     file.write_all(&poisoned)?;
     file.sync_all()?;
 
@@ -1157,7 +1356,7 @@ fn poison_record_incarnation(store_root: &Path, phase_prefix: &str, key: &[u8; 3
     if !final_metadata.file_type().is_file()
         || final_metadata.mode() & 0o7777 != 0o600
         || final_metadata.nlink() != 1
-        || final_metadata.len() != XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES as u64
+        || final_metadata.len() != expected_length
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1916,7 +2115,10 @@ fn applied_unfinalized_roster_adopts_every_member_without_deleting_anything() ->
         remove_member(&backend, ordinal)??;
     }
     assert_no_roster_members(fixture.namespace_a())?;
-    assert_eq!(retained_record_count(&fixture.store_path())?, 0);
+    assert_eq!(
+        retained_record_count(&fixture.store_path(), &proof_key_bytes(&fixture.token))?,
+        0
+    );
 
     // The namespace and the store are cleanly reusable afterwards.
     let reuse_group = group_id(&fixture.token, 0x5a)?;
@@ -2266,7 +2468,7 @@ fn poisoned_actor_incarnation_fails_closed_and_deletes_nothing() -> TestResult {
 
     poison_record_incarnation(
         &fixture.store_path(),
-        "applied-",
+        &handle,
         &proof_key_bytes(&fixture.token),
     )?;
 

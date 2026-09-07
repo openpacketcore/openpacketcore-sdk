@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-persistent-consumer-head-evidence/v8",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_kind",
+    "experimental",
+    "qualification_complete",
+    "source_revision",
+    "source_tree",
+    "source_tree_status",
+    "execution",
+    "measurements",
+    "privacy"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-persistent-consumer-head-evidence/v8" },
+    "evidence_kind": { "const": "persistent-consumer-wire-binding" },
+    "experimental": { "const": true },
+    "qualification_complete": { "const": false },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "source_tree": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "source_tree_status": { "enum": ["clean", "dirty_unqualified"] },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_type",
+        "consumer_profile_path",
+        "transport_revision",
+        "authenticated_route"
+      ],
+      "properties": {
+        "client_type": { "const": "PersistentSessionConsumerClient" },
+        "consumer_profile_path": { "const": "protocol.persistent_consumer" },
+        "transport_revision": { "const": 5 },
+        "authenticated_route": { "const": "authenticated-mtls-persistent" }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "members",
+        "authenticated_setup_successes",
+        "warm_reused_calls"
+      ],
+      "properties": {
+        "members": { "enum": [3, 5] },
+        "authenticated_setup_successes": { "type": "integer", "minimum": 48 },
+        "warm_reused_calls": { "type": "integer", "minimum": 1000 }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixed_labels_only", "identifying_values_recorded"],
+      "properties": {
+        "fixed_labels_only": { "const": true },
+        "identifying_values_recorded": { "const": false }
+      }
+    }
+  }
+}

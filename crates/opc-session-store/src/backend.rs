@@ -17,16 +17,33 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     capability::BackendCapabilities,
+    consensus::types::validate_fenced_transition_v2_batch,
     error::{LeaseError, StoreError},
+    fenced_transition::{
+        AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionMutation,
+        FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2Capability,
+        FencedTransitionV2Effect, FencedTransitionV2HistoryState, FencedTransitionV2Request,
+        FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionLookup,
+        PreparedFencedTransitionProtection,
+    },
+    fenced_transition_journal::{
+        FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
+        PreparedFencedTransitionJournal,
+    },
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, Generation, OwnerId, SessionKey},
-    record::{EncryptedSessionPayload, StoredSessionRecord},
+    record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord},
     restore::{RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest},
     topology::{ReplicaId, ReplicaTlsIdentity},
     ttl::{
         checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
         validate_stored_record_expiry_profile,
     },
+};
+use crate::{
+    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerScope, SessionConsumerStoreError,
 };
 
 /// Per-watcher buffer size for replication watch streams.
@@ -401,6 +418,17 @@ pub fn validate_record_expiry_preflights_at(
 }
 
 impl SessionOp {
+    /// Validate every caller-supplied lease guard carried by this operation.
+    pub(crate) fn validate_lease_guards(&self) -> Result<(), StoreError> {
+        match self {
+            Self::CompareAndSet(op) => op.lease.validate_profile(),
+            Self::DeleteFenced { lease } | Self::RefreshTtl { lease, .. } => {
+                lease.validate_profile()
+            }
+            Self::Get { .. } => Ok(()),
+        }
+    }
+
     /// Validate every caller-supplied TTL carried by this operation.
     ///
     /// Adapters should preflight an entire batch before performing any slot so
@@ -459,6 +487,7 @@ pub fn validate_session_ops_at(
 /// coordinator must still call [`validate_session_ops_at`] with its own clock.
 pub fn validate_session_ops_profile(ops: &[SessionOp]) -> Result<(), StoreError> {
     validate_session_ops_ttls(ops)?;
+    ops.iter().try_for_each(SessionOp::validate_lease_guards)?;
     ops.iter()
         .try_for_each(SessionOp::validate_record_expiry_profile)
 }
@@ -487,7 +516,7 @@ pub enum SessionOpResult {
 /// The Openraft state machine emits this application journal only after commit;
 /// caches, watches, and restore consumers use it as a domain cursor. It is not
 /// a second election or consensus log.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicationEntry {
     /// 1-based, gap-free committed application position. Local adapters reject
     /// entries that would create a gap or diverge from an already-applied
@@ -503,6 +532,12 @@ pub struct ReplicationEntry {
     /// ordering authority is `sequence`, never this timestamp — no wall-clock
     /// last-writer-wins.
     pub timestamp: Timestamp,
+}
+
+impl fmt::Debug for ReplicationEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReplicationEntry(<redacted>)")
+    }
 }
 
 impl ReplicationEntry {
@@ -875,7 +910,7 @@ pub fn validate_replication_page_owned(
 /// during replay: in particular the fence token (so a replica can reject
 /// stale-owner mutations exactly as the original backend would) and, for
 /// lease operations, the credential id that ties guards to lease entries.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReplicationOp {
     /// Replay of a fenced compare-and-set write.
     CompareAndSet {
@@ -964,12 +999,95 @@ pub enum ReplicationOp {
         /// is deactivated.
         credential_id: u64,
     },
+    /// Replay of the one protected-roster `Established` materialization.
+    ///
+    /// The protected roster preserves immutable admission provenance at the
+    /// original fence while a recovery successor can commit the terminal at a
+    /// higher live fence.  Generic CAS replay cannot represent that split:
+    /// its replacement record intentionally retains the original owner/fence.
+    /// This operation therefore carries the exact admitted raw row and the
+    /// current lease authority separately.  It deliberately contains no
+    /// roster identifier, registration, terminal body, or proof material.
+    ProtectedRosterEstablished {
+        /// Exact key whose admission-reserved authoritative row is consumed.
+        key: SessionKey,
+        /// Complete authoritative row observed at admission.  Replay requires
+        /// byte-for-byte equality, including its original provenance.
+        expected_record: StoredSessionRecord,
+        /// Explicit Established-only materialization; an aborted terminal is
+        /// never represented in the replication journal.
+        successor: Box<ProtectedRosterEstablishedSuccessor>,
+        /// Current authenticated execution owner, which may differ from the
+        /// immutable `expected_record.owner` after a fenced takeover.
+        owner: OwnerId,
+        /// Current authenticated execution fence and persistent floor.
+        fence: FenceToken,
+        /// Credential of the active execution lease.
+        credential_id: u64,
+        /// Exact issuance time of the execution lease.
+        guard_acquired_at: Timestamp,
+        /// Exact expiry of the execution lease.
+        guard_expires_at: Timestamp,
+    },
     /// Replay of a batch: the nested ops are applied sequentially and the
     /// first failure aborts the rest of the batch replay.
     Batch {
         /// Mutations in original submission order.
         ops: Vec<ReplicationOp>,
     },
+    /// Replay of an Established protected-roster creation from exact absence.
+    ///
+    /// This append-only variant preserves the existing present-predecessor
+    /// journal encoding. Replay authenticates the current lease and requires
+    /// the row to remain absent before inserting the exact generation-one
+    /// terminal record.
+    ProtectedRosterEstablishedCreate {
+        /// Exact key whose absence was reserved at admission.
+        key: SessionKey,
+        /// Exact immutable-provenance generation-one record to create.
+        record: StoredSessionRecord,
+        /// Current authenticated execution owner.
+        owner: OwnerId,
+        /// Current authenticated execution fence and persistent floor.
+        fence: FenceToken,
+        /// Credential of the active execution lease.
+        credential_id: u64,
+        /// Exact issuance time of the execution lease.
+        guard_acquired_at: Timestamp,
+        /// Exact expiry of the execution lease.
+        guard_expires_at: Timestamp,
+    },
+}
+
+/// The only legal session-record effects of a protected-roster Established
+/// terminal.  This is intentionally separate from a generic optional record:
+/// a terminal `NoOp` must compare the exact admitted record without violating
+/// the ordinary monotonic-generation rule, while `Delete` must retain the
+/// authenticated fence floor.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProtectedRosterEstablishedSuccessor {
+    /// Install this exact authoritative successor.
+    Put {
+        /// Exact immutable-provenance successor to install after the CAS.
+        record: Box<StoredSessionRecord>,
+    },
+    /// Delete the exact admitted row while retaining the execution fence.
+    Delete,
+    /// Retain the exact admitted row; this is an Established terminal whose
+    /// materialization deliberately does not advance its generation.
+    NoOp,
+}
+
+impl fmt::Debug for ProtectedRosterEstablishedSuccessor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProtectedRosterEstablishedSuccessor(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ReplicationOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReplicationOp(<redacted>)")
+    }
 }
 
 impl ReplicationOp {
@@ -1056,6 +1174,19 @@ impl ReplicationOp {
                 Self::CompareAndSet { new_record, .. } => {
                     validate_stored_record_expiry_at(new_record, reference_timestamp)?;
                 }
+                Self::ProtectedRosterEstablished {
+                    expected_record,
+                    successor,
+                    ..
+                } => {
+                    validate_stored_record_expiry_at(expected_record, reference_timestamp)?;
+                    if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
+                        validate_stored_record_expiry_at(record, reference_timestamp)?;
+                    }
+                }
+                Self::ProtectedRosterEstablishedCreate { record, .. } => {
+                    validate_stored_record_expiry_at(record, reference_timestamp)?;
+                }
                 Self::Batch { ops } => pending.extend(ops),
                 Self::DeleteFenced { .. } | Self::ReleaseLease { .. } => {}
             }
@@ -1101,6 +1232,54 @@ where
                     credential_id,
                     guard_expires_at,
                     new_record: transform_record(new_record).await?,
+                });
+            }
+            ReplicationTransformWork::Visit(ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            }) => {
+                // This is an exact durable CAS, not a public payload
+                // projection. Encryption and remote sealing are generally
+                // randomized, so independently re-wrapping its expected
+                // record (or successor) would make the exact replica row
+                // impossible to match. Preserve the opaque protected pair
+                // byte-for-byte through all generic wrapper transforms.
+                transformed.push(ReplicationOp::ProtectedRosterEstablished {
+                    key,
+                    expected_record,
+                    successor,
+                    owner,
+                    fence,
+                    credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
+                });
+            }
+            ReplicationTransformWork::Visit(ReplicationOp::ProtectedRosterEstablishedCreate {
+                key,
+                record,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            }) => {
+                // The record is the exact terminal materialization already
+                // sealed into consensus and must not be independently wrapped.
+                transformed.push(ReplicationOp::ProtectedRosterEstablishedCreate {
+                    key,
+                    record,
+                    owner,
+                    fence,
+                    credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
                 });
             }
             ReplicationTransformWork::Visit(ReplicationOp::Batch { ops }) => {
@@ -1190,6 +1369,24 @@ where
 /// result returns [`StoreError::BackendOperationOutcomeUnavailable`]. No async
 /// wrapper may detach unbounded blocking work; a blocking adapter must use a
 /// bounded queue/worker set and retain ownership until the worker exits.
+///
+/// # V1 fenced-transition extension boundary
+///
+/// The V1 fenced-transition hooks remain implementable so a product can
+/// provide a complete local or independently transported store backend. Such
+/// an implementation owns its physical transport and recovery contract; it
+/// is not authority to lower an SDK-owned affine consumer handle. In
+/// particular, the authenticated session-consumer crate does not expose its
+/// physical V1 adapter, and its public one-voter clients reject the V1
+/// `FencedTransition` and `FencedTransitionStatus` wire operations before
+/// connection setup. The only SDK route to those consumer operations is its
+/// opaque activated exact-roster facade.
+///
+/// This distinction is necessary because Rust cannot grant only the net crate
+/// access to a public store extension trait. Applications that implement
+/// these hooks directly are trusted backend implementations and must not
+/// represent that composition as the consumer facade's all-voter, affine
+/// no-replay guarantee.
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
     /// Process-local instance root declared by this backend adapter.
@@ -1268,6 +1465,261 @@ pub trait SessionBackend: Send + Sync {
 
     /// Retrieve a record by key.
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError>;
+
+    /// Freshly observe one record together with its durable per-key fence.
+    ///
+    /// This is the preparation read for an atomic fenced acquire. Backends
+    /// must keep the default unless they can return both values from one
+    /// authority-consistent read without allocating the next fence.
+    async fn observe_fenced_transition(
+        &self,
+        _key: &SessionKey,
+    ) -> Result<crate::fenced_transition::FencedTransitionObservation, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v1".into(),
+        ))
+    }
+
+    /// Advertise the exact atomic-transition contract supported end to end.
+    ///
+    /// This is separate from the legacy capability bitmap because independent
+    /// fencing, CAS, TTL, and batch bits cannot establish one combined
+    /// linearization point. Adapters fail closed unless they can prove the
+    /// exact version across every layer they traverse.
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<crate::fenced_transition::AtomicFencedTransitionCapability>, StoreError>
+    {
+        Ok(None)
+    }
+
+    /// Declare that this layer preserves protected record bytes unchanged.
+    ///
+    /// Protection wrappers require this explicit composition witness from
+    /// their inner backend before advertising or preparing the atomic
+    /// transition contract. A raw physical backend returns `true`; a
+    /// transparent adapter forwards its inner value. Payload-transforming
+    /// adapters retain the fail-closed default so nesting protection wrappers
+    /// cannot double-seal a request or expose an inner envelope as plaintext.
+    #[doc(hidden)]
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        false
+    }
+
+    /// Accept the exact raw V1 token emitted by this physical backend.
+    ///
+    /// This synchronous, local predicate is a composition boundary for
+    /// protected fenced transitions. It must not expose caller, marker, or
+    /// parser detail and must not perform provider, transport, readback, clock,
+    /// lock, or durable I/O. A capable raw backend returns `true` only when
+    /// `prepared` has its expected physical marker and becomes a valid
+    /// unprotected request after that marker is removed. Wrappers deliberately
+    /// retain the default so protected layers cannot become physical
+    /// boundaries for one another.
+    #[doc(hidden)]
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        _prepared: &PreparedFencedTransition,
+    ) -> bool {
+        false
+    }
+
+    /// Locally authenticate the exact protected V1 token before a consumer
+    /// reserves transport capacity for it.
+    ///
+    /// This is a deliberately narrow SDK-internal admission hook. The default
+    /// fails closed, and only SDK-owned sealing wrappers override it. An
+    /// override must validate the exact durable outer journal token and its
+    /// protection locally; it must not perform provider, capability, physical
+    /// backend, or transport I/O, and it must not expose an unprotected token.
+    /// Execute and status retain their own immediately-before-dispatch
+    /// validation as the final effect boundary.
+    #[doc(hidden)]
+    async fn preflight_protected_fenced_transition_token(
+        &self,
+        _prepared: &PreparedFencedTransition,
+    ) -> Result<(), StoreError> {
+        Err(unsupported_protected_fenced_transition())
+    }
+
+    /// Validate and retain the exact physical request that execute and status
+    /// must reuse.
+    ///
+    /// Raw V1 backends return a serializable token but make no restart-recovery
+    /// promise. A protected production path must prepare through a V2 outer
+    /// wrapper with an SDK durable journal; that wrapper runs expiry preflight,
+    /// seals a create/update body exactly once, and journals the complete
+    /// physical token before returning. Backends fail closed by default. A
+    /// capable unprotected backend may use
+    /// [`crate::PreparedFencedTransition::from_unprotected_request`] at its
+    /// exact physical admission boundary.
+    async fn prepare_fenced_transition(
+        &self,
+        _request: crate::fenced_transition::FencedTransitionRequest,
+    ) -> Result<crate::fenced_transition::PreparedFencedTransition, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v1".into(),
+        ))
+    }
+
+    /// Recover the exact durably prepared request for one caller-stable ID.
+    ///
+    /// `Absent` concerns only the SDK prepared-request journal and never
+    /// proves exclusion from a consensus log. Backends fail closed unless
+    /// they own a durable recovery boundary for this exact composition.
+    async fn recover_prepared_fenced_transition(
+        &self,
+        _request_id: crate::fenced_transition::FencedTransitionRequestId,
+    ) -> Result<crate::fenced_transition::PreparedFencedTransitionLookup, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v2".into(),
+        ))
+    }
+
+    /// Commit one prepared exact-key lease acquire/renew and one same-record
+    /// mutation at a single durable linearization point.
+    ///
+    /// Independent CAS, fencing, batch, and TTL capabilities do not imply
+    /// this contract. This method never prepares or reseals a request;
+    /// retries borrow the identical caller-retained token. Unsupported
+    /// adapters fail closed by default.
+    async fn fenced_transition(
+        &self,
+        _prepared: &crate::fenced_transition::PreparedFencedTransition,
+    ) -> Result<
+        crate::fenced_transition::FencedTransitionOutcome,
+        crate::fenced_transition::FencedTransitionExecuteError,
+    > {
+        Err(
+            crate::fenced_transition::FencedTransitionExecuteError::Rejected(
+                StoreError::CapabilityNotSupported("atomic_fenced_transition_v1".into()),
+            ),
+        )
+    }
+
+    /// Read the exact retained result bound to a complete transition request.
+    /// Status is read-only and never replays the operation under another ID.
+    async fn fenced_transition_status(
+        &self,
+        _prepared: &crate::fenced_transition::PreparedFencedTransition,
+    ) -> Result<crate::fenced_transition::FencedTransitionStatus, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v1".into(),
+        ))
+    }
+
+    /// Advertise the explicit epoch-fenced V2 receipt-history contract.
+    ///
+    /// This is intentionally separate from [`Self::fenced_transition_capability`].
+    /// A caller using the original V1 API must never be upgraded to V2 merely
+    /// because a backend also implements it.
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<crate::fenced_transition::FencedTransitionV2Capability>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
+
+    /// Read the active V2 receipt-history state.
+    ///
+    /// This exposes only the bounded public state needed to select a V2
+    /// request epoch; retirement and reclaim authority remain internal to the
+    /// consensus implementation.
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2HistoryState, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
+
+    /// Commit one explicit V2 atomic transition.
+    ///
+    /// V2 has its own full request-ID commitment and bounded, non-absorbing
+    /// history contract. It is never selected by the V1 method above.
+    async fn fenced_transition_v2(
+        &self,
+        _request: crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
+
+    /// Execute one V2 transition while preserving whether it crossed the
+    /// backend effect boundary.
+    ///
+    /// The conservative default preserves the legacy V2 result but never
+    /// reports `NotTransmitted`, because the older `Result` API did not carry
+    /// enough evidence to prove that distinction. V1 is intentionally not
+    /// adapted through this V2-only boundary.
+    async fn fenced_transition_v2_effect(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
+        let request_id = request.request_id();
+        match self.fenced_transition_v2(request).await {
+            Ok(outcome) => FencedTransitionV2Effect::Resolved(Ok(outcome)),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                FencedTransitionV2Effect::OutcomeUnknown {
+                    request_ids: vec![request_id],
+                }
+            }
+            Err(error) => FencedTransitionV2Effect::Resolved(Err(error)),
+        }
+    }
+
+    /// Coalesce ordered, independent V2 transitions into one physical backend
+    /// operation. Each item retains its own conditional result; this is not a
+    /// caller-visible all-or-nothing transaction.
+    async fn fenced_transition_v2_batch(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        validate_fenced_transition_v2_batch(&requests)?;
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2_batch".into(),
+        ))
+    }
+
+    /// Execute a V2 batch while preserving its effect-boundary result.
+    ///
+    /// Legacy V2 implementations retain their existing batch result inside
+    /// `Resolved`; they never receive a synthetic `NotTransmitted` proof.
+    /// `OutcomeUnknown` names every exact V2 identity that must remain
+    /// recoverable after an ambiguous legacy batch failure.
+    async fn fenced_transition_v2_batch_effect(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> FencedTransitionV2Effect<
+        Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError>,
+    > {
+        if let Err(error) = validate_fenced_transition_v2_batch(&requests) {
+            return FencedTransitionV2Effect::Resolved(Err(error));
+        }
+        let request_ids = requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect();
+        match self.fenced_transition_v2_batch(requests).await {
+            Ok(outcomes) => FencedTransitionV2Effect::Resolved(Ok(outcomes)),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                FencedTransitionV2Effect::OutcomeUnknown { request_ids }
+            }
+            Err(error) => FencedTransitionV2Effect::Resolved(Err(error)),
+        }
+    }
+
+    /// Recover the exact status of one complete V2 transition body.
+    async fn fenced_transition_v2_status(
+        &self,
+        _request: &crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2Status, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
 
     /// Atomically compare the current generation and write the new record if it
     /// matches. Implementations MUST require a current [`LeaseGuard`] and MUST
@@ -1529,12 +1981,12 @@ fn protected_payload_scope_commitment(namespace: &str) -> Option<[u8; 32]> {
     Some(digest.finalize().into())
 }
 
-/// SDK-owned sealing boundary for protected session backends.
+/// SDK-owned sealing boundary for protected fenced transitions.
 ///
 /// This deliberately remains crate-private: product adapters compose under
 /// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`] instead of
 /// asserting their own payload-protection authority.
-pub(crate) mod protected_session_backend_seal {
+pub(crate) mod protected_fenced_transition_backend_seal {
     pub trait Sealed {
         fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]>;
     }
@@ -1546,29 +1998,78 @@ pub(crate) mod protected_session_backend_seal {
 /// This trait is sealed. Third-party stores compose underneath
 /// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`]; remote seal
 /// providers continue to compose through the latter wrapper. They cannot mint
-/// a protected selector authority by implementing this trait themselves.
+/// a protected fenced-transition authority by implementing this trait
+/// themselves.
+///
+/// The marker intentionally has no [`SessionBackend`] supertrait and no
+/// dispatchable-token accessor. A protected consumer must retain the physical
+/// backend privately; adding either capability here would let an external
+/// caller lower an affine, receipt-only recovery handle into a replayable
+/// physical transition.
 ///
 /// ```compile_fail
-/// use opc_session_store::ProtectedSessionBackend;
+/// use opc_session_store::ProtectedFencedTransitionBackend;
 ///
 /// struct ProductBackend;
 ///
 /// // Fails: the SDK-owned sealed supertrait is not externally nameable.
-/// impl ProtectedSessionBackend for ProductBackend {}
+/// impl ProtectedFencedTransitionBackend for ProductBackend {}
 /// ```
-pub trait ProtectedSessionBackend:
-    SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
+///
+/// ```compile_fail
+/// use opc_session_store::{PreparedFencedTransition, ProtectedFencedTransitionBackend};
+///
+/// fn cannot_lower<B: ProtectedFencedTransitionBackend>(
+///     backend: &B,
+///     prepared: &PreparedFencedTransition,
+/// ) {
+///     let _ = backend.fenced_transition(prepared);
+/// }
+/// ```
+pub trait ProtectedFencedTransitionBackend:
+    protected_fenced_transition_backend_seal::Sealed
 {
 }
 
-impl<B> ProtectedSessionBackend for B where
-    B: SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
+/// Product-neutral proof that a backend supports the complete protected
+/// session-store surface, including lease authority and prepared CAS.
+///
+/// For the narrower authenticated-consumer fenced-transition composition use
+/// [`ProtectedFencedTransitionBackend`]. That boundary is a marker only:
+/// the net-owned affine consumer retains its physical [`SessionBackend`]
+/// privately, so it cannot be used to claim lease authority or lower an
+/// affine recovery handle into a replayable request.
+#[async_trait]
+pub trait ProtectedSessionBackend:
+    ProtectedFencedTransitionBackend + SessionBackend + SessionLeaseManager
 {
+    /// Create one caller-provided-ID affine acquire request before any
+    /// physical mutation poll. Implementations are restricted to SDK sealing
+    /// wrappers.
+    fn prepare_acquire_with_id(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquireRequest, PreparedLeaseAcquirePrepareError>;
+
+    /// Run the wrapper-owned expiry preflight and seal exactly one logical CAS
+    /// body into an affine local request.
+    async fn prepare_compare_and_set(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSetRequest, PreparedCompareAndSetPrepareError>;
 }
 
 pub(crate) fn protected_payload_scope_commitment_for<B>(backend: &B) -> Option<[u8; 32]>
 where
-    B: ProtectedSessionBackend + ?Sized,
+    B: ProtectedFencedTransitionBackend + ?Sized,
 {
     backend.protected_payload_scope_commitment()
 }
@@ -1710,12 +2211,320 @@ impl std::fmt::Debug for BackendPeerBinding {
     }
 }
 
+/// Maximum duration of one physical prepared checkpoint attempt.
+pub const PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT: Duration = Duration::from_millis(250);
+
+/// Immutable caller-owned checkpoint time budget captured before dispatch.
+#[derive(Clone, Copy)]
+pub struct PreparedCheckpointBudget {
+    original_deadline: tokio::time::Instant,
+    physical_attempt_timeout: Duration,
+}
+
+impl PreparedCheckpointBudget {
+    /// Capture an original outer deadline and one shorter physical-attempt cap.
+    pub fn new(
+        original_deadline: tokio::time::Instant,
+        physical_attempt_timeout: Duration,
+    ) -> Result<Self, PreparedCheckpointBudgetError> {
+        if physical_attempt_timeout.is_zero()
+            || physical_attempt_timeout > PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT
+        {
+            return Err(PreparedCheckpointBudgetError);
+        }
+        Ok(Self {
+            original_deadline,
+            physical_attempt_timeout,
+        })
+    }
+
+    /// Return the immutable deadline for the entire logical attempt.
+    pub const fn original_deadline(self) -> tokio::time::Instant {
+        self.original_deadline
+    }
+    /// Return the maximum duration of any one physical attempt.
+    pub const fn physical_attempt_timeout(self) -> Duration {
+        self.physical_attempt_timeout
+    }
+}
+
+impl fmt::Debug for PreparedCheckpointBudget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedCheckpointBudget(<redacted>)")
+    }
+}
+
+/// Invalid physical-attempt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("prepared checkpoint physical attempt budget is invalid")]
+pub struct PreparedCheckpointBudgetError;
+
+/// Opaque, process-local request produced only after the SDK-owned wrapper
+/// has completed preflight and sealed exactly one CAS body. It intentionally
+/// carries no wire marker: the consumer sees the same ordinary request shape
+/// as every other authenticated mutation.
+///
+/// ```compile_fail
+/// use opc_session_store::PreparedCompareAndSetRequest;
+///
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<PreparedCompareAndSetRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_store::PreparedCompareAndSetRequest;
+///
+/// fn requires_deserialize<T: serde::de::DeserializeOwned>() {}
+/// requires_deserialize::<PreparedCompareAndSetRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_store::{PreparedCompareAndSetRequest, SessionConsumerRequest};
+///
+/// fn cannot_reconstruct(request: SessionConsumerRequest) -> PreparedCompareAndSetRequest {
+///     request.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_store::PreparedCompareAndSetRequest;
+///
+/// let _ = PreparedCompareAndSetRequest::new();
+/// ```
+pub struct PreparedCompareAndSetRequest {
+    request: SessionConsumerRequest,
+    budget: PreparedCheckpointBudget,
+}
+
+impl PreparedCompareAndSetRequest {
+    fn new(
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Self {
+        Self {
+            request: SessionConsumerRequest::new(
+                scope,
+                request_id,
+                SessionConsumerOperation::CompareAndSet {
+                    op: Box::new(operation),
+                },
+            ),
+            budget,
+        }
+    }
+
+    /// Consume this affine request for one local consumer-router handoff.
+    ///
+    /// The returned request is intentionally ordinary and has no replacement
+    /// scope, request ID, body, or budget input.
+    #[must_use]
+    pub fn into_consumer_request(self) -> (SessionConsumerRequest, PreparedCheckpointBudget) {
+        (self.request, self.budget)
+    }
+}
+
+impl fmt::Debug for PreparedCompareAndSetRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedCompareAndSetRequest(<redacted>)")
+    }
+}
+
+/// Redacted terminal result for an exact prepared CAS request.
+///
+/// This deliberately projects no row payload: checkpoint recovery needs only
+/// whether the exact mutation applied, conflicted, or was deterministically
+/// rejected by the authoritative consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedCompareAndSetOutcome {
+    /// The exact request was applied.
+    Applied,
+    /// The exact request lost its compare-and-set predicate.
+    Conflict,
+    /// The exact request reached the authority and was deterministically rejected.
+    Rejected(SessionConsumerStoreError),
+}
+
+/// Read-only receipt projection for one prepared CAS request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedCompareAndSetStatus {
+    /// The authoritative outcome ledger has an exact terminal result.
+    Recorded(PreparedCompareAndSetOutcome),
+    /// The request ID is bound to a different request body.
+    RequestConflict,
+    /// No exact outcome was present at the completed read barrier.
+    NotFound,
+}
+
+/// Synchronous local failure while sealing a prepared CAS request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedCompareAndSetPrepareError {
+    #[error("prepared compare-and-set request is invalid")]
+    InvalidRequest,
+    #[error("prepared compare-and-set was not transmitted")]
+    NotTransmitted,
+    #[error("prepared compare-and-set consumer authority is unavailable")]
+    Unavailable,
+}
+
+/// Redacted effect classification from a one-shot prepared CAS dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedCompareAndSetExecuteError {
+    #[error("prepared compare-and-set was not transmitted")]
+    NotTransmitted,
+    #[error("prepared compare-and-set outcome is unknown")]
+    OutcomeUnknown,
+    #[error("prepared compare-and-set topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared compare-and-set is unavailable")]
+    Unavailable,
+    #[error("prepared compare-and-set was already executed")]
+    AlreadyExecuted,
+}
+
+/// Failure to make one prepared-CAS receipt observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedCompareAndSetStatusError {
+    #[error("prepared compare-and-set has not been executed")]
+    NotExecuted,
+    #[error("prepared compare-and-set receipt deadline is invalid")]
+    Deadline,
+    #[error("prepared compare-and-set topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared compare-and-set receipt is unavailable")]
+    Unavailable,
+}
+
+/// Opaque, process-local exact lease-acquire request produced by an SDK-owned
+/// protected wrapper. It is affine and cannot be reconstructed from an
+/// ordinary consumer request.
+///
+/// ```compile_fail
+/// use opc_session_store::PreparedLeaseAcquireRequest;
+///
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<PreparedLeaseAcquireRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_store::PreparedLeaseAcquireRequest;
+///
+/// fn requires_deserialize<T: serde::de::DeserializeOwned>() {}
+/// requires_deserialize::<PreparedLeaseAcquireRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_store::{PreparedLeaseAcquireRequest, SessionConsumerRequest};
+///
+/// fn cannot_reconstruct(request: SessionConsumerRequest) -> PreparedLeaseAcquireRequest {
+///     request.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_store::PreparedLeaseAcquireRequest;
+///
+/// let _ = PreparedLeaseAcquireRequest::new();
+/// ```
+pub struct PreparedLeaseAcquireRequest {
+    request: SessionConsumerRequest,
+    budget: PreparedCheckpointBudget,
+}
+
+impl PreparedLeaseAcquireRequest {
+    fn new(
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Self {
+        Self {
+            request: SessionConsumerRequest::new(
+                scope,
+                request_id,
+                SessionConsumerOperation::AcquireLease { key, owner, ttl },
+            ),
+            budget,
+        }
+    }
+
+    /// Consume this affine request for one local consumer-router handoff.
+    #[must_use]
+    pub fn into_consumer_request(self) -> (SessionConsumerRequest, PreparedCheckpointBudget) {
+        (self.request, self.budget)
+    }
+}
+
+impl fmt::Debug for PreparedLeaseAcquireRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedLeaseAcquireRequest(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedLeaseAcquirePrepareError {
+    #[error("prepared lease acquire request is invalid")]
+    InvalidRequest,
+    #[error("prepared lease acquire was not transmitted")]
+    NotTransmitted,
+    #[error("prepared lease acquire consumer authority is unavailable")]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedLeaseAcquireExecuteError {
+    #[error("prepared lease acquire was not transmitted")]
+    NotTransmitted,
+    #[error("prepared lease acquire outcome is unknown")]
+    OutcomeUnknown,
+    #[error("prepared lease acquire request conflicts with its retained request identity")]
+    RequestConflict,
+    #[error("prepared lease acquire was deterministically rejected: {0}")]
+    Rejected(LeaseError),
+    #[error("prepared lease acquire topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared lease acquire is unavailable")]
+    Unavailable,
+    #[error("prepared lease acquire was already executed")]
+    AlreadyExecuted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedLeaseAcquireStatusError {
+    #[error("prepared lease acquire has not been executed")]
+    NotExecuted,
+    #[error("prepared lease receipt deadline is invalid")]
+    Deadline,
+    #[error("prepared lease receipt topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared lease receipt is unavailable")]
+    Unavailable,
+}
+
 /// Session-backend wrapper that encrypts payloads before persistence and
 /// decrypts them on reads using `opc-crypto` / `opc-key`.
 pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
     inner: Arc<B>,
     provider: Arc<P>,
     backend_namespace: Arc<str>,
+    fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
+    fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
+    fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
 }
 
 impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
@@ -1724,6 +2533,9 @@ impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
             inner: Arc::clone(&self.inner),
             provider: Arc::clone(&self.provider),
             backend_namespace: Arc::clone(&self.backend_namespace),
+            fenced_transition_journal: self.fenced_transition_journal.clone(),
+            fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
+            fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
         }
     }
 }
@@ -1741,7 +2553,49 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
             inner,
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
+            fenced_transition_journal: None,
+            fenced_transition_v2_journal: None,
+            fenced_transition_v2_journal_scope: None,
         }
+    }
+
+    /// Enable V2 atomic transitions with an SDK-owned durable prepared-request
+    /// journal. The journal must be reopened with the same path and integrity
+    /// key when this wrapper is reconstructed.
+    #[must_use]
+    pub fn with_fenced_transition_journal(
+        mut self,
+        journal: Arc<PreparedFencedTransitionJournal>,
+    ) -> Self {
+        self.fenced_transition_journal = Some(journal);
+        self
+    }
+
+    /// Enable epoch-fenced V2 transitions with their separate durable
+    /// plaintext-ID-to-sealed-body journal. This path is deliberately
+    /// independent of the permanent capped V1 prepared-request journal.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal(
+        mut self,
+        journal: Arc<FencedTransitionV2PreparedJournal>,
+    ) -> Self {
+        self.fenced_transition_v2_journal = Some(journal);
+        self
+    }
+
+    /// Bind the V2 prepared journal to one stable backend authority.
+    ///
+    /// Provision the same scope after restart. Prefer
+    /// [`FencedTransitionV2JournalScope::for_consensus_cluster`] for a
+    /// consensus-backed inner store; do not use a rotatable sealing-key or
+    /// provider endpoint as this value.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal_scope(
+        mut self,
+        scope: FencedTransitionV2JournalScope,
+    ) -> Self {
+        self.fenced_transition_v2_journal_scope = Some(scope);
+        self
     }
 
     /// The key provider used to resolve the tenant's active session key for
@@ -1755,12 +2609,32 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
     pub fn backend_namespace(&self) -> &str {
         &self.backend_namespace
     }
+
+    /// Create a provided-ID affine acquire request synchronously before any
+    /// transport poll. The returned request owns the supplied scope.
+    pub fn prepare_acquire_with_id(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquireRequest, PreparedLeaseAcquirePrepareError> {
+        validate_session_ttl(ttl).map_err(|_| PreparedLeaseAcquirePrepareError::InvalidRequest)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedLeaseAcquirePrepareError::NotTransmitted);
+        }
+        Ok(PreparedLeaseAcquireRequest::new(
+            scope, request_id, key, owner, ttl, budget,
+        ))
+    }
 }
 
 impl<B, P> EncryptingSessionBackend<B, P>
 where
     B: SessionBackend + ?Sized,
-    P: KeyProvider + ?Sized,
+    P: KeyProvider + ?Sized + 'static,
 {
     async fn encrypt_record(
         &self,
@@ -1792,6 +2666,51 @@ where
             .await?;
         record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
         Ok(record)
+    }
+
+    /// Seal one CAS body exactly once, then create its opaque volatile
+    /// consumer token before any mutation dispatch. A seal failure is a
+    /// known-not-transmitted result; no token is returned to replay.
+    pub async fn prepare_compare_and_set(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSetRequest, PreparedCompareAndSetPrepareError> {
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        let preflight = RecordExpiryPreflight::from_record(&operation.new_record);
+        tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.inner
+                .preflight_record_expiry(std::slice::from_ref(&preflight)),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        let sealed_record = tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.encrypt_record(operation.new_record),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        Ok(PreparedCompareAndSetRequest::new(
+            scope,
+            request_id,
+            CompareAndSet {
+                key: operation.key,
+                lease: operation.lease,
+                expected_generation: operation.expected_generation,
+                new_record: sealed_record,
+            },
+            budget,
+        ))
     }
 
     async fn decrypt_optional_record(
@@ -1869,6 +2788,268 @@ fn batch_result_shape_error(contains_dispatched_mutation: bool) -> StoreError {
     }
 }
 
+fn unsupported_fenced_transition() -> StoreError {
+    StoreError::CapabilityNotSupported("atomic_fenced_transition_v1".into())
+}
+
+fn unsupported_protected_fenced_transition() -> StoreError {
+    StoreError::CapabilityNotSupported("atomic_fenced_transition_v2".into())
+}
+
+fn require_fenced_transition_journal(
+    journal: Option<&Arc<PreparedFencedTransitionJournal>>,
+) -> Result<&Arc<PreparedFencedTransitionJournal>, StoreError> {
+    journal.ok_or_else(unsupported_protected_fenced_transition)
+}
+
+fn unsupported_protected_fenced_transition_v2_history() -> StoreError {
+    StoreError::CapabilityNotSupported("atomic_fenced_transition_epoch_history_v2".into())
+}
+
+fn require_fenced_transition_v2_journal(
+    journal: Option<&Arc<FencedTransitionV2PreparedJournal>>,
+) -> Result<&Arc<FencedTransitionV2PreparedJournal>, StoreError> {
+    journal.ok_or_else(unsupported_protected_fenced_transition_v2_history)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProtectedFencedTransitionV2JournalMode {
+    LocalAead,
+    RemoteSeal,
+}
+
+impl ProtectedFencedTransitionV2JournalMode {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::LocalAead => 1,
+            Self::RemoteSeal => 2,
+        }
+    }
+}
+
+pub(crate) fn protected_fenced_transition_v2_journal_scope<B>(
+    backend: &B,
+    configured_scope: Option<FencedTransitionV2JournalScope>,
+    backend_namespace: &str,
+    mode: ProtectedFencedTransitionV2JournalMode,
+) -> Result<[u8; 32], StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    let payload_scope = protected_payload_scope_commitment(backend_namespace)
+        .ok_or_else(unsupported_protected_fenced_transition_v2_history)?;
+    // A caller can make a cluster scope explicit.  Authenticated peer
+    // adapters also expose a fixed backend scope, which preserves existing
+    // source callers while still failing closed for standalone backends that
+    // provide neither authority.
+    let backend_scope = configured_scope
+        .map(|scope| *scope.as_bytes())
+        .or_else(|| {
+            backend
+                .peer_binding()
+                .map(|binding| *binding.scope().as_bytes())
+        })
+        .ok_or_else(unsupported_protected_fenced_transition_v2_history)?;
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-store/protected-v2-journal/wrapper-scope/v1\0");
+    digest.update([mode.tag()]);
+    digest.update(backend_scope);
+    digest.update(payload_scope);
+    Ok(digest.finalize().into())
+}
+
+fn require_fenced_transition_v2_caller_plaintext(
+    request: &FencedTransitionV2Request,
+) -> Result<(), StoreError> {
+    if request
+        .mutation()
+        .record()
+        .is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::Plaintext)
+    {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition_v2_history())
+    }
+}
+
+struct ProtectedFencedTransitionV2Batch {
+    requests: Vec<FencedTransitionV2Request>,
+    request_slots: Vec<usize>,
+    outcomes: Vec<Option<Result<FencedTransitionOutcome, StoreError>>>,
+}
+
+impl ProtectedFencedTransitionV2Batch {
+    fn prepare(requests: Vec<FencedTransitionV2Request>) -> Result<Self, StoreError> {
+        validate_fenced_transition_v2_batch(&requests)?;
+        let mut valid_requests = Vec::with_capacity(requests.len());
+        let mut request_slots = Vec::with_capacity(requests.len());
+        let mut outcomes = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        for (slot, request) in requests.into_iter().enumerate() {
+            match request.validate() {
+                Ok(()) => {
+                    require_fenced_transition_v2_caller_plaintext(&request)?;
+                    request_slots.push(slot);
+                    valid_requests.push(request);
+                }
+                Err(StoreError::FencedTransitionRequestConflict) => {
+                    outcomes[slot] = Some(Err(StoreError::FencedTransitionRequestConflict));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Self {
+            requests: valid_requests,
+            request_slots,
+            outcomes,
+        })
+    }
+
+    fn merge(
+        mut self,
+        dispatched: Vec<Result<FencedTransitionOutcome, StoreError>>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        if dispatched.len() != self.request_slots.len() {
+            return Err(StoreError::BackendUnavailable(
+                "protected fenced-transition V2 batch result unavailable".into(),
+            ));
+        }
+        for (slot, outcome) in self.request_slots.into_iter().zip(dispatched) {
+            self.outcomes[slot] = Some(outcome);
+        }
+        self.outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    StoreError::BackendUnavailable(
+                        "protected fenced-transition V2 batch result unavailable".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+fn require_fenced_transition_v2_physical_envelope(
+    request: &FencedTransitionV2Request,
+) -> Result<(), StoreError> {
+    if request
+        .mutation()
+        .record()
+        .is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::EnvelopeV1)
+    {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition_v2_history())
+    }
+}
+
+async fn require_fenced_transition_v2_capability<B>(backend: &B) -> Result<(), StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    require_fenced_transition_physical_boundary(backend)?;
+    match backend.fenced_transition_v2_capability().await? {
+        Some(FencedTransitionV2Capability::V2) => Ok(()),
+        _ => Err(unsupported_protected_fenced_transition_v2_history()),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProtectedFencedTransitionV2Epoch {
+    Active,
+    Replay,
+}
+
+fn classify_protected_fenced_transition_v2_epoch(
+    request: &FencedTransitionV2Request,
+    history: &FencedTransitionV2HistoryState,
+) -> Result<ProtectedFencedTransitionV2Epoch, StoreError> {
+    let epoch = request.request_id().epoch();
+    if history
+        .retired_through()
+        .is_some_and(|floor| epoch <= floor)
+    {
+        return Err(StoreError::FencedTransitionHistoryEpochRetired);
+    }
+    if history.active_epoch() == Some(epoch) {
+        return Ok(ProtectedFencedTransitionV2Epoch::Active);
+    }
+    if history.retired_through().is_none_or(|floor| epoch > floor)
+        && history.active_epoch().is_some_and(|active| epoch < active)
+    {
+        return Ok(ProtectedFencedTransitionV2Epoch::Replay);
+    }
+    Err(StoreError::FencedTransitionHistoryEpochNotActive)
+}
+
+/// A protected V2 wrapper is the sole caller-to-physical payload boundary.
+/// Create and update bodies must therefore be the exact caller-facing
+/// plaintext representation before any capability, expiry, provider, inner,
+/// or journal work occurs.
+fn require_fenced_transition_caller_plaintext(
+    request: &FencedTransitionRequest,
+) -> Result<(), StoreError> {
+    if request
+        .mutation()
+        .record()
+        .is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::Plaintext)
+    {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition())
+    }
+}
+
+/// The inner V1 physical boundary may only return the sealed representation
+/// for a protected V2 observation. This intentionally does not reuse legacy
+/// migration decoding, which remains available on the general read surface.
+fn require_fenced_transition_physical_envelope(
+    record: Option<&StoredSessionRecord>,
+) -> Result<(), StoreError> {
+    if record.is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::EnvelopeV1) {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition())
+    }
+}
+
+fn require_fenced_transition_physical_boundary<B>(backend: &B) -> Result<(), StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    if backend.fenced_transition_preserves_protected_payloads() {
+        Ok(())
+    } else {
+        Err(unsupported_fenced_transition())
+    }
+}
+
+fn require_fenced_transition_physical_token<B>(
+    backend: &B,
+    prepared: &PreparedFencedTransition,
+) -> Result<(), StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    require_fenced_transition_physical_boundary(backend)?;
+    if backend.fenced_transition_accepts_prepared_physical_token(prepared) {
+        Ok(())
+    } else {
+        Err(unsupported_fenced_transition())
+    }
+}
+
+async fn require_fenced_transition_capability<B>(backend: &B) -> Result<(), StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    require_fenced_transition_physical_boundary(backend)?;
+    match backend.fenced_transition_capability().await? {
+        Some(AtomicFencedTransitionCapability::V1) => Ok(()),
+        _ => Err(unsupported_fenced_transition()),
+    }
+}
+
 #[async_trait]
 impl<B, P> SessionBackend for EncryptingSessionBackend<B, P>
 where
@@ -1887,6 +3068,9 @@ where
         self.inner.restore_scan_cursor_profile()
     }
 
+    /// The returned value limit describes the envelope bytes accepted by the
+    /// inner store. It is not a plaintext admission promise: local and remote
+    /// sealing add variable, authenticated envelope metadata before dispatch.
     async fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities().await
     }
@@ -1905,6 +3089,501 @@ where
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let record = self.inner.get(key).await?;
         self.decrypt_optional_record(record).await
+    }
+
+    async fn observe_fenced_transition(
+        &self,
+        key: &SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        if protected_payload_scope_commitment(self.backend_namespace()).is_none() {
+            return Err(unsupported_protected_fenced_transition());
+        }
+        require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?
+            .health_check()
+            .await?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
+        let observation = self.inner.observe_fenced_transition(key).await?;
+        require_fenced_transition_physical_envelope(observation.record())?;
+        let record = self
+            .decrypt_optional_record(observation.record().cloned())
+            .await?;
+        FencedTransitionObservation::new(record, observation.current_fence())
+    }
+
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        if protected_payload_scope_commitment(self.backend_namespace()).is_none() {
+            return Ok(None);
+        }
+        let Some(journal) = self.fenced_transition_journal.as_ref() else {
+            return Ok(None);
+        };
+        journal.health_check().await?;
+        if !self.inner.fenced_transition_preserves_protected_payloads() {
+            return Ok(None);
+        }
+        match self.inner.fenced_transition_capability().await? {
+            Some(AtomicFencedTransitionCapability::V1) => {
+                Ok(Some(AtomicFencedTransitionCapability::V2))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn preflight_protected_fenced_transition_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<(), StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
+    }
+
+    async fn prepare_fenced_transition(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        request.validate()?;
+        require_fenced_transition_caller_plaintext(&request)?;
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
+        journal.ensure_absent(request.request_id()).await?;
+        if let Some(record) = request.mutation().record() {
+            let preflight = RecordExpiryPreflight::from_record(record);
+            self.inner
+                .preflight_record_expiry(std::slice::from_ref(&preflight))
+                .await?;
+        }
+
+        let (request_id, lease, mutation) = request.into_parts();
+        let mutation = match mutation {
+            FencedTransitionMutation::Create { record } => {
+                FencedTransitionMutation::create(self.encrypt_record(*record).await?)
+            }
+            FencedTransitionMutation::Update {
+                expected_generation,
+                record,
+            } => FencedTransitionMutation::update(
+                expected_generation,
+                self.encrypt_record(*record).await?,
+            ),
+            FencedTransitionMutation::Delete {
+                expected_generation,
+            } => FencedTransitionMutation::delete(expected_generation),
+            FencedTransitionMutation::RefreshTtl {
+                expected_generation,
+                ttl,
+            } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+        };
+        let protected_request = FencedTransitionRequest::new(request_id, lease, mutation)?;
+        let inner = self
+            .inner
+            .prepare_fenced_transition(protected_request)
+            .await?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        let prepared = inner.with_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+            scope_commitment,
+        })?;
+        journal.insert(&prepared).await?;
+        Ok(prepared)
+    }
+
+    async fn recover_prepared_fenced_transition(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<PreparedFencedTransitionLookup, StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        match journal.lookup(request_id).await? {
+            PreparedFencedTransitionLookup::Found(prepared) => {
+                let inner = prepared.without_outer_protection(
+                    PreparedFencedTransitionProtection::LocalAeadV1 { scope_commitment },
+                )?;
+                require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+                Ok(PreparedFencedTransitionLookup::Found(prepared))
+            }
+            PreparedFencedTransitionLookup::Absent => Ok(PreparedFencedTransitionLookup::Absent),
+        }
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let stored = match journal.require_exact(prepared).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Err(FencedTransitionExecuteError::NotTransmitted),
+            Err(_) => return Err(FencedTransitionExecuteError::NotTransmitted),
+        };
+        let inner = stored
+            .without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+                scope_commitment,
+            })
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_capability(self.inner.as_ref())
+            .await
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let request_id = stored.request_id();
+        match self.inner.fenced_transition(&inner).await {
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: inner_id,
+            }) if inner_id != request_id => {
+                Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
+            }
+            result => result,
+        }
+    }
+
+    async fn fenced_transition_status(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionStatus, StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
+        self.inner.fenced_transition_status(&inner).await
+    }
+
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
+        let Ok(journal_scope) = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        ) else {
+            return Ok(None);
+        };
+        let Some(journal) = self.fenced_transition_v2_journal.as_ref() else {
+            return Ok(None);
+        };
+        journal.ensure_scope(journal_scope).await?;
+        // This explicit capability probe is the deliberate full journal
+        // integrity boundary. Per-operation lookup/bind paths use their
+        // bounded authenticated point checks instead of rescanning the whole
+        // bounded retained-epoch journal.
+        journal.health_check(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        Ok(Some(FencedTransitionV2Capability::V2))
+    }
+
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<FencedTransitionV2HistoryState, StoreError> {
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        Ok(history)
+    }
+
+    async fn fenced_transition_v2(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        request.validate()?;
+        require_fenced_transition_v2_caller_plaintext(&request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_id = request.request_id();
+        let effect_guard = journal.lock_effect_boundary(&[outer_id]).await?;
+        let physical = match journal.lookup(journal_scope, outer_id).await? {
+            Some(stored) => {
+                classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                (stored, false)
+            }
+            None => {
+                if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                    != ProtectedFencedTransitionV2Epoch::Active
+                {
+                    return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                }
+                let mutation = match request.mutation().clone() {
+                    FencedTransitionMutation::Create { record } => {
+                        FencedTransitionMutation::create(self.encrypt_record(*record).await?)
+                    }
+                    FencedTransitionMutation::Update {
+                        expected_generation,
+                        record,
+                    } => FencedTransitionMutation::update(
+                        expected_generation,
+                        self.encrypt_record(*record).await?,
+                    ),
+                    FencedTransitionMutation::Delete {
+                        expected_generation,
+                    } => FencedTransitionMutation::delete(expected_generation),
+                    FencedTransitionMutation::RefreshTtl {
+                        expected_generation,
+                        ttl,
+                    } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                };
+                let sealed = FencedTransitionV2Request::new(
+                    outer_id.epoch(),
+                    outer_id.nonce(),
+                    request.lease().clone(),
+                    mutation,
+                )?;
+                require_fenced_transition_v2_physical_envelope(&sealed)?;
+                let binding = journal
+                    .bind_or_lookup_with_created(journal_scope, outer_id, &sealed)
+                    .await?;
+                (binding.request().clone(), binding.was_created())
+            }
+        };
+        require_fenced_transition_v2_physical_envelope(&physical.0)?;
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_effect(physical.0.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                if physical.1 {
+                    journal
+                        .remove_if_exact(journal_scope, outer_id, &physical.0)
+                        .await?;
+                }
+                Err(error)
+            }
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => result,
+        }
+    }
+
+    async fn fenced_transition_v2_batch(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        let mut batch = ProtectedFencedTransitionV2Batch::prepare(requests)?;
+        if batch.requests.is_empty() {
+            return batch.merge(Vec::new());
+        }
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_ids = batch
+            .requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+        let effect_guard = journal.lock_effect_boundary(&outer_ids).await?;
+        let mut physical = journal
+            .lookup_batch(journal_scope, outer_ids.clone())
+            .await?;
+        let mut missing_indices = Vec::new();
+        let mut missing = Vec::new();
+        for (index, request) in batch.requests.drain(..).enumerate() {
+            let outer_id = request.request_id();
+            match &physical[index] {
+                Some(_) => {
+                    classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                }
+                None => {
+                    if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                        != ProtectedFencedTransitionV2Epoch::Active
+                    {
+                        return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                    }
+                    let mutation = match request.mutation().clone() {
+                        FencedTransitionMutation::Create { record } => {
+                            FencedTransitionMutation::create(self.encrypt_record(*record).await?)
+                        }
+                        FencedTransitionMutation::Update {
+                            expected_generation,
+                            record,
+                        } => FencedTransitionMutation::update(
+                            expected_generation,
+                            self.encrypt_record(*record).await?,
+                        ),
+                        FencedTransitionMutation::Delete {
+                            expected_generation,
+                        } => FencedTransitionMutation::delete(expected_generation),
+                        FencedTransitionMutation::RefreshTtl {
+                            expected_generation,
+                            ttl,
+                        } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                    };
+                    let sealed = FencedTransitionV2Request::new(
+                        outer_id.epoch(),
+                        outer_id.nonce(),
+                        request.lease().clone(),
+                        mutation,
+                    )?;
+                    require_fenced_transition_v2_physical_envelope(&sealed)?;
+                    missing_indices.push(index);
+                    missing.push((outer_id, sealed));
+                }
+            }
+        }
+        let bound = if missing.is_empty() {
+            Vec::new()
+        } else {
+            journal
+                .bind_or_lookup_batch_with_created(journal_scope, missing)
+                .await?
+        };
+        if bound.len() != missing_indices.len() {
+            return Err(StoreError::BackendUnavailable(
+                "protected fenced-transition V2 journal unavailable".into(),
+            ));
+        }
+        let mut created = vec![false; physical.len()];
+        for (index, binding) in missing_indices.into_iter().zip(bound) {
+            created[index] = binding.was_created();
+            physical[index] = Some(binding.request().clone());
+        }
+        let mut prepared = Vec::with_capacity(physical.len());
+        for physical in physical {
+            let physical = physical.ok_or_else(|| {
+                StoreError::BackendUnavailable(
+                    "protected fenced-transition V2 journal unavailable".into(),
+                )
+            })?;
+            require_fenced_transition_v2_physical_envelope(&physical)?;
+            prepared.push(physical);
+        }
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_batch_effect(prepared.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                let cleanup = created
+                    .into_iter()
+                    .zip(outer_ids)
+                    .zip(&prepared)
+                    .filter(|((created, _), _)| *created)
+                    .map(|((_, outer_id), physical)| (outer_id, physical.clone()))
+                    .collect();
+                journal
+                    .remove_batch_if_exact(journal_scope, cleanup)
+                    .await?;
+                Err(error)
+            }
+            // The effect API may name a subset only when it can prove all
+            // other items were not transmitted. Until that stronger contract
+            // exists, retain every batch mapping conservatively.
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => batch.merge(result?),
+        }
+    }
+
+    async fn fenced_transition_v2_status(
+        &self,
+        request: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        if let Err(error) = request.validate() {
+            return if matches!(error, StoreError::FencedTransitionRequestConflict) {
+                Ok(FencedTransitionV2Status::RequestConflict)
+            } else {
+                Err(error)
+            };
+        }
+        require_fenced_transition_v2_caller_plaintext(request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let epoch = match classify_protected_fenced_transition_v2_epoch(request, &history) {
+            Ok(epoch) => epoch,
+            Err(StoreError::FencedTransitionHistoryEpochRetired) => {
+                return Ok(FencedTransitionV2Status::Retired);
+            }
+            Err(StoreError::FencedTransitionHistoryEpochNotActive) => {
+                return Ok(FencedTransitionV2Status::EpochNotActive);
+            }
+            Err(error) => return Err(error),
+        };
+        match journal.lookup(journal_scope, request.request_id()).await? {
+            Some(physical) => {
+                require_fenced_transition_v2_physical_envelope(&physical)?;
+                self.inner.fenced_transition_v2_status(&physical).await
+            }
+            None if epoch == ProtectedFencedTransitionV2Epoch::Active => {
+                Ok(FencedTransitionV2Status::NotFound)
+            }
+            None => Ok(FencedTransitionV2Status::EpochNotActive),
+        }
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -2165,13 +3844,55 @@ where
     }
 }
 
-impl<B, P> protected_session_backend_seal::Sealed for EncryptingSessionBackend<B, P>
+impl<B, P> protected_fenced_transition_backend_seal::Sealed for EncryptingSessionBackend<B, P>
 where
-    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    B: SessionBackend + ?Sized + 'static,
     P: KeyProvider + ?Sized + 'static,
 {
     fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
         protected_payload_scope_commitment(self.backend_namespace())
+    }
+}
+
+#[async_trait]
+impl<B, P> ProtectedFencedTransitionBackend for EncryptingSessionBackend<B, P>
+where
+    B: SessionBackend + Send + Sync + ?Sized + 'static,
+    P: KeyProvider + Send + Sync + ?Sized + 'static,
+{
+}
+
+#[async_trait]
+impl<B, P> ProtectedSessionBackend for EncryptingSessionBackend<B, P>
+where
+    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    P: KeyProvider + Send + Sync + ?Sized + 'static,
+{
+    fn prepare_acquire_with_id(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquireRequest, PreparedLeaseAcquirePrepareError> {
+        EncryptingSessionBackend::prepare_acquire_with_id(
+            self, scope, request_id, key, owner, ttl, budget,
+        )
+    }
+
+    async fn prepare_compare_and_set(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSetRequest, PreparedCompareAndSetPrepareError> {
+        EncryptingSessionBackend::prepare_compare_and_set(
+            self, scope, request_id, operation, budget,
+        )
+        .await
     }
 }
 
@@ -2187,11 +3908,26 @@ where
 /// normally off the hot path) and one KMS round-trip per unseal (each restored
 /// session during failover), adding KMS latency and a KMS availability
 /// dependency to restore.
-#[derive(Clone)]
 pub struct RemoteSealingSessionBackend<B: ?Sized, S: ?Sized> {
     inner: Arc<B>,
     provider: Arc<S>,
     backend_namespace: Arc<str>,
+    fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
+    fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
+    fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
+}
+
+impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            provider: Arc::clone(&self.provider),
+            backend_namespace: Arc::clone(&self.backend_namespace),
+            fenced_transition_journal: self.fenced_transition_journal.clone(),
+            fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
+            fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
+        }
+    }
 }
 
 impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
@@ -2202,7 +3938,49 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
             inner,
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
+            fenced_transition_journal: None,
+            fenced_transition_v2_journal: None,
+            fenced_transition_v2_journal_scope: None,
         }
+    }
+
+    /// Enable V2 atomic transitions with an SDK-owned durable prepared-request
+    /// journal. The journal must be reopened with the same path and integrity
+    /// key when this wrapper is reconstructed.
+    #[must_use]
+    pub fn with_fenced_transition_journal(
+        mut self,
+        journal: Arc<PreparedFencedTransitionJournal>,
+    ) -> Self {
+        self.fenced_transition_journal = Some(journal);
+        self
+    }
+
+    /// Enable epoch-fenced V2 transitions with their separate durable
+    /// plaintext-ID-to-sealed-body journal. This path is deliberately
+    /// independent of the permanent capped V1 prepared-request journal.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal(
+        mut self,
+        journal: Arc<FencedTransitionV2PreparedJournal>,
+    ) -> Self {
+        self.fenced_transition_v2_journal = Some(journal);
+        self
+    }
+
+    /// Bind the V2 prepared journal to one stable backend authority.
+    ///
+    /// Provision the same scope after restart. Prefer
+    /// [`FencedTransitionV2JournalScope::for_consensus_cluster`] for a
+    /// consensus-backed inner store; do not use a rotatable sealing-key or
+    /// provider endpoint as this value.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal_scope(
+        mut self,
+        scope: FencedTransitionV2JournalScope,
+    ) -> Self {
+        self.fenced_transition_v2_journal_scope = Some(scope);
+        self
     }
 
     /// The remote seal provider used for payload seal/unseal.
@@ -2214,12 +3992,32 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
     pub fn backend_namespace(&self) -> &str {
         &self.backend_namespace
     }
+
+    /// Create a provided-ID affine acquire request synchronously before any
+    /// transport poll. The returned request owns the supplied scope.
+    pub fn prepare_acquire_with_id(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquireRequest, PreparedLeaseAcquirePrepareError> {
+        validate_session_ttl(ttl).map_err(|_| PreparedLeaseAcquirePrepareError::InvalidRequest)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedLeaseAcquirePrepareError::NotTransmitted);
+        }
+        Ok(PreparedLeaseAcquireRequest::new(
+            scope, request_id, key, owner, ttl, budget,
+        ))
+    }
 }
 
 impl<B, S> RemoteSealingSessionBackend<B, S>
 where
     B: SessionBackend + ?Sized,
-    S: RemoteSealProvider + ?Sized,
+    S: RemoteSealProvider + ?Sized + 'static,
 {
     async fn seal_record(
         &self,
@@ -2251,6 +4049,50 @@ where
             .await?;
         record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
         Ok(record)
+    }
+
+    /// Seal one CAS body exactly once through the configured remote sealer,
+    /// then create its opaque volatile consumer token before dispatch.
+    pub async fn prepare_compare_and_set(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSetRequest, PreparedCompareAndSetPrepareError> {
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        let preflight = RecordExpiryPreflight::from_record(&operation.new_record);
+        tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.inner
+                .preflight_record_expiry(std::slice::from_ref(&preflight)),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        let sealed_record = tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.seal_record(operation.new_record),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        Ok(PreparedCompareAndSetRequest::new(
+            scope,
+            request_id,
+            CompareAndSet {
+                key: operation.key,
+                lease: operation.lease,
+                expected_generation: operation.expected_generation,
+                new_record: sealed_record,
+            },
+            budget,
+        ))
     }
 
     async fn unseal_optional_record(
@@ -2331,6 +4173,9 @@ where
         self.inner.restore_scan_cursor_profile()
     }
 
+    /// The returned value limit describes the sealed bytes accepted by the
+    /// inner store. Remote providers choose envelope metadata, so it must not
+    /// be interpreted as an equal plaintext payload limit.
     async fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities().await
     }
@@ -2349,6 +4194,497 @@ where
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let record = self.inner.get(key).await?;
         self.unseal_optional_record(record).await
+    }
+
+    async fn observe_fenced_transition(
+        &self,
+        key: &SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        if protected_payload_scope_commitment(self.backend_namespace()).is_none() {
+            return Err(unsupported_protected_fenced_transition());
+        }
+        require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?
+            .health_check()
+            .await?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
+        let observation = self.inner.observe_fenced_transition(key).await?;
+        require_fenced_transition_physical_envelope(observation.record())?;
+        let record = self
+            .unseal_optional_record(observation.record().cloned())
+            .await?;
+        FencedTransitionObservation::new(record, observation.current_fence())
+    }
+
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        if protected_payload_scope_commitment(self.backend_namespace()).is_none() {
+            return Ok(None);
+        }
+        let Some(journal) = self.fenced_transition_journal.as_ref() else {
+            return Ok(None);
+        };
+        journal.health_check().await?;
+        if !self.inner.fenced_transition_preserves_protected_payloads() {
+            return Ok(None);
+        }
+        match self.inner.fenced_transition_capability().await? {
+            Some(AtomicFencedTransitionCapability::V1) => {
+                Ok(Some(AtomicFencedTransitionCapability::V2))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn preflight_protected_fenced_transition_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<(), StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
+    }
+
+    async fn prepare_fenced_transition(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        request.validate()?;
+        require_fenced_transition_caller_plaintext(&request)?;
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
+        journal.ensure_absent(request.request_id()).await?;
+        if let Some(record) = request.mutation().record() {
+            let preflight = RecordExpiryPreflight::from_record(record);
+            self.inner
+                .preflight_record_expiry(std::slice::from_ref(&preflight))
+                .await?;
+        }
+
+        let (request_id, lease, mutation) = request.into_parts();
+        let mutation = match mutation {
+            FencedTransitionMutation::Create { record } => {
+                FencedTransitionMutation::create(self.seal_record(*record).await?)
+            }
+            FencedTransitionMutation::Update {
+                expected_generation,
+                record,
+            } => FencedTransitionMutation::update(
+                expected_generation,
+                self.seal_record(*record).await?,
+            ),
+            FencedTransitionMutation::Delete {
+                expected_generation,
+            } => FencedTransitionMutation::delete(expected_generation),
+            FencedTransitionMutation::RefreshTtl {
+                expected_generation,
+                ttl,
+            } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+        };
+        let protected_request = FencedTransitionRequest::new(request_id, lease, mutation)?;
+        let inner = self
+            .inner
+            .prepare_fenced_transition(protected_request)
+            .await?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        let prepared = inner.with_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+            scope_commitment,
+        })?;
+        journal.insert(&prepared).await?;
+        Ok(prepared)
+    }
+
+    async fn recover_prepared_fenced_transition(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<PreparedFencedTransitionLookup, StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        match journal.lookup(request_id).await? {
+            PreparedFencedTransitionLookup::Found(prepared) => {
+                let inner = prepared.without_outer_protection(
+                    PreparedFencedTransitionProtection::RemoteSealV1 { scope_commitment },
+                )?;
+                require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+                Ok(PreparedFencedTransitionLookup::Found(prepared))
+            }
+            PreparedFencedTransitionLookup::Absent => Ok(PreparedFencedTransitionLookup::Absent),
+        }
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let stored = match journal.require_exact(prepared).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Err(FencedTransitionExecuteError::NotTransmitted),
+            Err(_) => return Err(FencedTransitionExecuteError::NotTransmitted),
+        };
+        let inner = stored
+            .without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+                scope_commitment,
+            })
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_capability(self.inner.as_ref())
+            .await
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let request_id = stored.request_id();
+        match self.inner.fenced_transition(&inner).await {
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: inner_id,
+            }) if inner_id != request_id => {
+                Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
+            }
+            result => result,
+        }
+    }
+
+    async fn fenced_transition_status(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionStatus, StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
+        self.inner.fenced_transition_status(&inner).await
+    }
+
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
+        let Ok(journal_scope) = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        ) else {
+            return Ok(None);
+        };
+        let Some(journal) = self.fenced_transition_v2_journal.as_ref() else {
+            return Ok(None);
+        };
+        journal.ensure_scope(journal_scope).await?;
+        journal.health_check(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        Ok(Some(FencedTransitionV2Capability::V2))
+    }
+
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<FencedTransitionV2HistoryState, StoreError> {
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        Ok(history)
+    }
+
+    async fn fenced_transition_v2(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        request.validate()?;
+        require_fenced_transition_v2_caller_plaintext(&request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_id = request.request_id();
+        let effect_guard = journal.lock_effect_boundary(&[outer_id]).await?;
+        let physical = match journal.lookup(journal_scope, outer_id).await? {
+            Some(stored) => {
+                classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                (stored, false)
+            }
+            None => {
+                if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                    != ProtectedFencedTransitionV2Epoch::Active
+                {
+                    return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                }
+                let mutation = match request.mutation().clone() {
+                    FencedTransitionMutation::Create { record } => {
+                        FencedTransitionMutation::create(self.seal_record(*record).await?)
+                    }
+                    FencedTransitionMutation::Update {
+                        expected_generation,
+                        record,
+                    } => FencedTransitionMutation::update(
+                        expected_generation,
+                        self.seal_record(*record).await?,
+                    ),
+                    FencedTransitionMutation::Delete {
+                        expected_generation,
+                    } => FencedTransitionMutation::delete(expected_generation),
+                    FencedTransitionMutation::RefreshTtl {
+                        expected_generation,
+                        ttl,
+                    } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                };
+                let sealed = FencedTransitionV2Request::new(
+                    outer_id.epoch(),
+                    outer_id.nonce(),
+                    request.lease().clone(),
+                    mutation,
+                )?;
+                require_fenced_transition_v2_physical_envelope(&sealed)?;
+                let binding = journal
+                    .bind_or_lookup_with_created(journal_scope, outer_id, &sealed)
+                    .await?;
+                (binding.request().clone(), binding.was_created())
+            }
+        };
+        require_fenced_transition_v2_physical_envelope(&physical.0)?;
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_effect(physical.0.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                if physical.1 {
+                    journal
+                        .remove_if_exact(journal_scope, outer_id, &physical.0)
+                        .await?;
+                }
+                Err(error)
+            }
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => result,
+        }
+    }
+
+    async fn fenced_transition_v2_batch(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        let mut batch = ProtectedFencedTransitionV2Batch::prepare(requests)?;
+        if batch.requests.is_empty() {
+            return batch.merge(Vec::new());
+        }
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_ids = batch
+            .requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+        let effect_guard = journal.lock_effect_boundary(&outer_ids).await?;
+        let mut physical = journal
+            .lookup_batch(journal_scope, outer_ids.clone())
+            .await?;
+        let mut missing_indices = Vec::new();
+        let mut missing = Vec::new();
+        for (index, request) in batch.requests.drain(..).enumerate() {
+            let outer_id = request.request_id();
+            match &physical[index] {
+                Some(_) => {
+                    classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                }
+                None => {
+                    if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                        != ProtectedFencedTransitionV2Epoch::Active
+                    {
+                        return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                    }
+                    let mutation = match request.mutation().clone() {
+                        FencedTransitionMutation::Create { record } => {
+                            FencedTransitionMutation::create(self.seal_record(*record).await?)
+                        }
+                        FencedTransitionMutation::Update {
+                            expected_generation,
+                            record,
+                        } => FencedTransitionMutation::update(
+                            expected_generation,
+                            self.seal_record(*record).await?,
+                        ),
+                        FencedTransitionMutation::Delete {
+                            expected_generation,
+                        } => FencedTransitionMutation::delete(expected_generation),
+                        FencedTransitionMutation::RefreshTtl {
+                            expected_generation,
+                            ttl,
+                        } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                    };
+                    let sealed = FencedTransitionV2Request::new(
+                        outer_id.epoch(),
+                        outer_id.nonce(),
+                        request.lease().clone(),
+                        mutation,
+                    )?;
+                    require_fenced_transition_v2_physical_envelope(&sealed)?;
+                    missing_indices.push(index);
+                    missing.push((outer_id, sealed));
+                }
+            }
+        }
+        let bound = if missing.is_empty() {
+            Vec::new()
+        } else {
+            journal
+                .bind_or_lookup_batch_with_created(journal_scope, missing)
+                .await?
+        };
+        if bound.len() != missing_indices.len() {
+            return Err(StoreError::BackendUnavailable(
+                "protected fenced-transition V2 journal unavailable".into(),
+            ));
+        }
+        let mut created = vec![false; physical.len()];
+        for (index, binding) in missing_indices.into_iter().zip(bound) {
+            created[index] = binding.was_created();
+            physical[index] = Some(binding.request().clone());
+        }
+        let mut prepared = Vec::with_capacity(physical.len());
+        for physical in physical {
+            let physical = physical.ok_or_else(|| {
+                StoreError::BackendUnavailable(
+                    "protected fenced-transition V2 journal unavailable".into(),
+                )
+            })?;
+            require_fenced_transition_v2_physical_envelope(&physical)?;
+            prepared.push(physical);
+        }
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_batch_effect(prepared.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                let cleanup = created
+                    .into_iter()
+                    .zip(outer_ids)
+                    .zip(&prepared)
+                    .filter(|((created, _), _)| *created)
+                    .map(|((_, outer_id), physical)| (outer_id, physical.clone()))
+                    .collect();
+                journal
+                    .remove_batch_if_exact(journal_scope, cleanup)
+                    .await?;
+                Err(error)
+            }
+            // The effect API may name a subset only when it can prove all
+            // other items were not transmitted. Until that stronger contract
+            // exists, retain every batch mapping conservatively.
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => batch.merge(result?),
+        }
+    }
+
+    async fn fenced_transition_v2_status(
+        &self,
+        request: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        if let Err(error) = request.validate() {
+            return if matches!(error, StoreError::FencedTransitionRequestConflict) {
+                Ok(FencedTransitionV2Status::RequestConflict)
+            } else {
+                Err(error)
+            };
+        }
+        require_fenced_transition_v2_caller_plaintext(request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let epoch = match classify_protected_fenced_transition_v2_epoch(request, &history) {
+            Ok(epoch) => epoch,
+            Err(StoreError::FencedTransitionHistoryEpochRetired) => {
+                return Ok(FencedTransitionV2Status::Retired);
+            }
+            Err(StoreError::FencedTransitionHistoryEpochNotActive) => {
+                return Ok(FencedTransitionV2Status::EpochNotActive);
+            }
+            Err(error) => return Err(error),
+        };
+        match journal.lookup(journal_scope, request.request_id()).await? {
+            Some(physical) => {
+                require_fenced_transition_v2_physical_envelope(&physical)?;
+                self.inner.fenced_transition_v2_status(&physical).await
+            }
+            None if epoch == ProtectedFencedTransitionV2Epoch::Active => {
+                Ok(FencedTransitionV2Status::NotFound)
+            }
+            None => Ok(FencedTransitionV2Status::EpochNotActive),
+        }
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -2611,9 +4947,9 @@ where
     }
 }
 
-impl<B, S> protected_session_backend_seal::Sealed for RemoteSealingSessionBackend<B, S>
+impl<B, S> protected_fenced_transition_backend_seal::Sealed for RemoteSealingSessionBackend<B, S>
 where
-    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    B: SessionBackend + ?Sized + 'static,
     S: RemoteSealProvider + ?Sized + 'static,
 {
     fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
@@ -2621,13 +4957,67 @@ where
     }
 }
 
+#[async_trait]
+impl<B, S> ProtectedFencedTransitionBackend for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + Send + Sync + ?Sized + 'static,
+    S: RemoteSealProvider + Send + Sync + ?Sized + 'static,
+{
+}
+
+#[async_trait]
+impl<B, S> ProtectedSessionBackend for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    S: RemoteSealProvider + Send + Sync + ?Sized + 'static,
+{
+    fn prepare_acquire_with_id(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquireRequest, PreparedLeaseAcquirePrepareError> {
+        RemoteSealingSessionBackend::prepare_acquire_with_id(
+            self, scope, request_id, key, owner, ttl, budget,
+        )
+    }
+
+    async fn prepare_compare_and_set(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSetRequest, PreparedCompareAndSetPrepareError> {
+        RemoteSealingSessionBackend::prepare_compare_and_set(
+            self, scope, request_id, operation, budget,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod protected_session_backend_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use opc_key::{KeyError, KeyHandle, KeyId, KeyPurpose};
+
+    use crate::{
+        fake::FakeSessionBackend, model::SessionKeyType, EncryptedSessionPayload, StateClass,
+        StateType,
+    };
 
     #[test]
     fn only_sdk_owned_protection_wrappers_satisfy_the_sealed_authority_bound() {
         fn assert_protected<B: ProtectedSessionBackend>() {}
+        fn assert_object_safe(_: &dyn ProtectedSessionBackend) {}
+
+        let _ = assert_object_safe;
 
         assert_protected::<
             EncryptingSessionBackend<crate::fake::FakeSessionBackend, opc_key::MemoryKeyProvider>,
@@ -2638,6 +5028,246 @@ mod protected_session_backend_tests {
                 opc_key::MemoryRemoteSealProvider,
             >,
         >();
+    }
+
+    struct ControlledPreflightBackend {
+        delay: Option<Duration>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionBackend for ControlledPreflightBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::minimal()
+        }
+
+        async fn preflight_record_expiry(
+            &self,
+            _preflights: &[RecordExpiryPreflight],
+        ) -> Result<(), StoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.delay {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
+            Ok(())
+        }
+
+        async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn compare_and_set(
+            &self,
+            _op: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            Err(StoreError::CasConflict)
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
+    struct NeverReadyKeyProvider(AtomicUsize);
+
+    #[async_trait]
+    impl KeyProvider for NeverReadyKeyProvider {
+        async fn get_active_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyHandle, KeyError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<KeyHandle, KeyError>>().await
+        }
+
+        async fn get_key_by_id(&self, _key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+            std::future::pending::<Result<KeyHandle, KeyError>>().await
+        }
+
+        async fn rotate_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyId, KeyError> {
+            std::future::pending::<Result<KeyId, KeyError>>().await
+        }
+    }
+
+    async fn prepared_test_operation() -> CompareAndSet {
+        let backend = FakeSessionBackend::new();
+        let key = SessionKey {
+            tenant: TenantId::new("prepared-deadline-test").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-deadline-test")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("prepared-deadline-owner").expect("test owner");
+        let lease = backend
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .expect("test lease");
+        CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: lease.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("prepared-deadline-test"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new([0x51]),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_roster_replication_cas_is_opaque_to_randomized_wrappers() {
+        let operation = prepared_test_operation().await;
+        let lease = operation.lease.clone();
+        let expected_record = operation.new_record;
+        let op = ReplicationOp::ProtectedRosterEstablished {
+            key: expected_record.key.clone(),
+            expected_record,
+            successor: Box::new(ProtectedRosterEstablishedSuccessor::NoOp),
+            owner: lease.owner().clone(),
+            fence: lease.fence(),
+            credential_id: lease.credential_id(),
+            guard_acquired_at: lease.acquired_at(),
+            guard_expires_at: lease.expires_at(),
+        };
+        let original = op.clone();
+        let transforms = Arc::new(AtomicUsize::new(0));
+        let observed = transforms.clone();
+        let transformed = transform_replication_op(op, move |record| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                // A randomized encrypt/seal wrapper would produce a different
+                // envelope here. The protected exact-CAS operation must never
+                // call this transform for either immutable record.
+                Ok(record)
+            }
+        })
+        .await
+        .expect("protected roster transform succeeds");
+
+        assert_eq!(transformed, original);
+        assert_eq!(transforms.load(Ordering::SeqCst), 0);
+    }
+
+    fn prepared_scope() -> SessionConsumerScope {
+        SessionConsumerScope::new(crate::SessionConsensusIdentity::new(
+            crate::SessionConsensusClusterId::from_bytes([0x81; 32]),
+            crate::SessionConsensusConfigurationId::from_bytes([0x82; 32]),
+            crate::SessionConsensusConfigurationEpoch::new(1).expect("non-zero epoch"),
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepared_cas_preflight_and_seal_share_one_original_deadline() {
+        let pending_preflight = Arc::new(ControlledPreflightBackend {
+            delay: None,
+            calls: AtomicUsize::new(0),
+        });
+        let never_key = Arc::new(NeverReadyKeyProvider::default());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let protected = EncryptingSessionBackend::new(
+            Arc::clone(&pending_preflight),
+            Arc::clone(&never_key),
+            "prepared-deadline-test",
+        );
+        let future = protected.prepare_compare_and_set(
+            prepared_scope(),
+            SessionConsumerRequestId::from_bytes([0x51; 16]),
+            prepared_test_operation().await,
+            PreparedCheckpointBudget::new(deadline, Duration::from_millis(25))
+                .expect("explicit physical cap"),
+        );
+        tokio::pin!(future);
+        std::future::poll_fn(|context| match future.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => {
+                panic!("never-ready preflight returned early: {result:?}")
+            }
+        })
+        .await;
+        assert_eq!(pending_preflight.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            never_key.0.load(Ordering::SeqCst),
+            0,
+            "preflight precedes KMS"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            future.await,
+            Err(PreparedCompareAndSetPrepareError::NotTransmitted)
+        ));
+        assert_eq!(never_key.0.load(Ordering::SeqCst), 0);
+
+        let delayed_preflight = Arc::new(ControlledPreflightBackend {
+            delay: Some(Duration::from_millis(75)),
+            calls: AtomicUsize::new(0),
+        });
+        let never_key = Arc::new(NeverReadyKeyProvider::default());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let protected = EncryptingSessionBackend::new(
+            Arc::clone(&delayed_preflight),
+            Arc::clone(&never_key),
+            "prepared-deadline-test",
+        );
+        let future = protected.prepare_compare_and_set(
+            prepared_scope(),
+            SessionConsumerRequestId::from_bytes([0x52; 16]),
+            prepared_test_operation().await,
+            PreparedCheckpointBudget::new(deadline, Duration::from_millis(50))
+                .expect("explicit physical cap"),
+        );
+        tokio::pin!(future);
+        std::future::poll_fn(|context| match future.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => {
+                panic!("delayed preflight returned early: {result:?}")
+            }
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(76)).await;
+        // This future is deliberately retained by the caller rather than
+        // spawned: poll it once after the preflight timer fires so sealing
+        // reaches the never-ready KMS provider under the *same* deadline.
+        std::future::poll_fn(|context| match future.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => {
+                panic!("KMS unexpectedly completed before the original deadline: {result:?}")
+            }
+        })
+        .await;
+        assert_eq!(delayed_preflight.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            never_key.0.load(Ordering::SeqCst),
+            1,
+            "KMS starts after preflight"
+        );
+        tokio::time::advance(Duration::from_millis(24)).await;
+        assert!(matches!(
+            future.await,
+            Err(PreparedCompareAndSetPrepareError::NotTransmitted)
+        ));
     }
 }
 

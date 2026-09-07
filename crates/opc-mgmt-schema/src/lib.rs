@@ -874,7 +874,7 @@ pub enum EditOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetconfEditError {
     /// A schema shape the current generated edit applicator cannot mutate
-    /// correctly (e.g. leaf-list, keyless list, custom typedef, choice/case).
+    /// correctly (e.g. keyless list, custom typedef, choice/case).
     UnsupportedShape {
         /// Schema-node path that triggered the rejection.
         path: &'static str,
@@ -993,7 +993,7 @@ pub struct EditConfigNode {
     pub schema_path: &'static str,
     /// Edit operation to apply to this node.
     pub operation: EditOperation,
-    /// Leaf value, if this is a leaf node.
+    /// Leaf or leaf-list-entry value, if this is a scalar node.
     pub value: Option<String>,
     /// Child nodes (containers, list entries, non-key leaf children).
     pub children: Vec<EditConfigNode>,
