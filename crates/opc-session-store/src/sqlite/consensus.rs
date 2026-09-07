@@ -3767,14 +3767,10 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
 //
 // The primary writer's unchanged 1,000-page automatic checkpoint remains the
 // resource and durability fallback. This lane is only an optimization, so its
-// fixed durable-write cadence handles sparse transactions. Wide V2 batches
-// can cross the page fallback before 64 writes, so an independent page-write
-// budget requests the same coalescing worker halfway to that fallback. This
-// is advisory headroom, not a page bound: one large transaction, a busy reader,
-// or a delayed worker can still require the unchanged primary fallback.
+// fixed durable-write cadence is deliberately much smaller than that fallback
+// in the least-dense one-WAL-page-per-write case, without claiming a page
+// bound for larger bounded transactions.
 const PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH: u64 = 64;
-const PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH: u64 =
-    super::SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES as u64 / 2;
 /// Physical pruning is deliberately bounded independently of the logical
 /// Openraft purge acknowledgement.  The floor is durable before this lane is
 /// signalled, so a cancelled or failed turn may retain disk space but can
@@ -5277,7 +5273,6 @@ pub(crate) struct ProactiveCheckpointLane {
     /// A bounded, store-scoped countdown. It is never an accumulating write
     /// counter, so wraparound cannot turn a busy store into per-write work.
     durable_writes_until_signal: AtomicU64,
-    page_writes_until_signal: AtomicU64,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
@@ -5330,7 +5325,6 @@ impl ProactiveCheckpointLane {
             stop,
             stopping: AtomicBool::new(false),
             durable_writes_until_signal: AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH),
-            page_writes_until_signal: AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH),
             active_interrupt: Mutex::new(None),
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
@@ -5364,17 +5358,12 @@ impl ProactiveCheckpointLane {
     /// work after it expires is `try_send`: a full lane already retains one
     /// pending checkpoint, and a stopped lane is ignored. No accepted
     /// response awaits checkpoint work.
-    pub(crate) fn signal(&self, written_pages: Option<u32>) {
+    pub(crate) fn signal(&self) {
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
         if matches!(
-            schedule_proactive_checkpoint_ticket(
-                &self.durable_writes_until_signal,
-                &self.page_writes_until_signal,
-                written_pages,
-                &self.sender,
-            ),
+            schedule_proactive_checkpoint_ticket(&self.durable_writes_until_signal, &self.sender),
             ProactiveCheckpointTicket::Enqueued
         ) {
             if let Some(diagnostics) = &self.diagnostics {
@@ -5387,8 +5376,6 @@ impl ProactiveCheckpointLane {
     pub(crate) fn reset_durable_write_budget_for_test(&self) {
         self.durable_writes_until_signal
             .store(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH, Ordering::Release);
-        self.page_writes_until_signal
-            .store(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH, Ordering::Release);
     }
 
     #[cfg(feature = "test-vfs")]
@@ -5478,28 +5465,6 @@ enum ProactiveCheckpointTicket {
     Closed,
 }
 
-fn consume_proactive_checkpoint_page_write_budget(budget: &AtomicU64, pages: u32) -> bool {
-    if pages == 0 {
-        return false;
-    }
-    let pages = u64::from(pages);
-    let mut remaining = budget.load(Ordering::Relaxed);
-    loop {
-        let expired = pages >= remaining;
-        // A single wide commit requests at most one ticket. Its excess never
-        // accumulates into a retry queue or causes per-write catch-up work.
-        let next = if expired {
-            PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH
-        } else {
-            remaining - pages
-        };
-        match budget.compare_exchange_weak(remaining, next, Ordering::AcqRel, Ordering::Relaxed) {
-            Ok(_) => return expired,
-            Err(observed) => remaining = observed,
-        }
-    }
-}
-
 /// The exact `wal_checkpoint(PASSIVE)` outcome relevant to diagnostics.
 ///
 /// SQLite reports a zero busy column when it made whatever progress was
@@ -5512,22 +5477,17 @@ enum ProactivePassiveCheckpointDisposition {
     Incomplete,
 }
 
-/// Schedule one ticket when either bounded write cadence expires.
+/// Schedule one ticket only when the fixed durable-write cadence expires.
 ///
-/// Resetting each expired budget before the nonblocking send means a full
-/// channel still retains its one existing ticket while the next bounded batch
+/// Resetting the bounded cadence before the nonblocking send means a full
+/// channel still retains its one existing ticket while the next fixed batch
 /// starts. That avoids retry tasks or an accumulating queue after a worker
 /// falls behind.
 fn schedule_proactive_checkpoint_ticket(
     budget: &AtomicU64,
-    page_budget: &AtomicU64,
-    written_pages: Option<u32>,
     sender: &tokio::sync::mpsc::Sender<()>,
 ) -> ProactiveCheckpointTicket {
-    let write_cadence_expired = consume_proactive_checkpoint_durable_write_budget(budget);
-    let page_cadence_expired = written_pages
-        .is_some_and(|pages| consume_proactive_checkpoint_page_write_budget(page_budget, pages));
-    if !write_cadence_expired && !page_cadence_expired {
+    if !consume_proactive_checkpoint_durable_write_budget(budget) {
         return ProactiveCheckpointTicket::BelowCadence;
     }
     match sender.try_send(()) {
@@ -6044,9 +6004,9 @@ impl SqliteConsensusCore {
     }
 
     /// Request non-blocking PASSIVE checkpoint work after a primary commit.
-    pub(crate) fn signal_proactive_checkpoint(&self, conn: &Connection) {
+    pub(crate) fn signal_proactive_checkpoint(&self) {
         if let Some(lane) = &self.proactive_checkpoint_lane {
-            lane.signal(opc_sqlite_file_control_sys::take_page_write_count(conn).ok());
+            lane.signal();
         }
     }
 
@@ -6336,12 +6296,6 @@ impl SqliteConsensusCore {
                     )
                 })
                 .transpose()?;
-            if proactive_checkpoint_lane.is_some() {
-                // Exclude schema/open work from the first durable-write hint.
-                // An unavailable statistic keeps the fixed event cadence and
-                // primary automatic checkpoint fallback fully operational.
-                let _ = opc_sqlite_file_control_sys::take_page_write_count(&conn);
-            }
             let consensus_log_prune_lane =
                 if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
                     database_file
@@ -35802,8 +35756,20 @@ fn pinned_snapshot_uri(
 // A child unit-test process enables the feature-gated safe VFS registration in
 // `opc-sqlite-file-control-sys` and flips this local selector.  Production
 // never builds or selects that VFS.
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+thread_local! {
+    static SNAPSHOT_TEST_MAIN_SYNC_VFS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(all(test, target_os = "linux"))]
 fn snapshot_test_vfs_uri_parameter() -> String {
+    #[cfg(feature = "test-vfs")]
+    if SNAPSHOT_TEST_MAIN_SYNC_VFS.with(std::cell::Cell::get) {
+        return format!(
+            "&vfs={}",
+            opc_sqlite_file_control_sys::TEST_MAIN_SYNC_BLOCK_VFS_NAME
+        );
+    }
     if SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.load(Ordering::Acquire) {
         format!(
             "&vfs={}",
@@ -36697,6 +36663,16 @@ fn compact_pinned_snapshot_database_with_pacer_sync(
         snapshot_compaction_attached_extent_sync(&destination)?;
         let schema = read_snapshot_compaction_schema_sync(&destination)?;
         validate_snapshot_compaction_table_keys_sync(&destination, &schema)?;
+        // This descriptor is still private staging. Commit its complete
+        // schema and data once, rather than syncing each intermediate table
+        // and schema object. The existing page cap and per-table extent
+        // checks apply inside the transaction; the caller still syncs and
+        // validates the completed inode before sealing or publication. With
+        // journal_mode=OFF an error may leave partial staging bytes, whose
+        // pin remains owned by the caller and is discarded on any failure.
+        let copy_transaction =
+            Transaction::new_unchecked(&destination, TransactionBehavior::Deferred)
+                .map_err(db_error)?;
         for object in schema.iter().filter(|object| object.kind == "table") {
             destination.execute_batch(&object.sql).map_err(db_error)?;
             snapshot_database_extent_sync(&destination)?;
@@ -36735,6 +36711,8 @@ fn compact_pinned_snapshot_database_with_pacer_sync(
             .pragma_update(None, "user_version", settings.user_version)
             .map_err(db_error)?;
         validate_snapshot_compaction_foreign_keys_sync(&destination)?;
+        snapshot_database_extent_sync(&destination)?;
+        copy_transaction.commit().map_err(db_error)?;
         snapshot_database_extent_sync(&destination)?;
         verify_pinned_snapshot_descriptor(compacted, &destination)?;
         Ok(())
@@ -42944,18 +42922,17 @@ mod tests {
     #[test]
     fn proactive_checkpoint_full_lane_retains_one_ticket_across_threshold_resets() {
         let budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
-        let page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
 
         for _ in 1..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH {
             assert_eq!(
-                schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
+                schedule_proactive_checkpoint_ticket(&budget, &sender),
                 ProactiveCheckpointTicket::BelowCadence,
                 "no ticket is queued before the exact threshold"
             );
         }
         assert_eq!(
-            schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
+            schedule_proactive_checkpoint_ticket(&budget, &sender),
             ProactiveCheckpointTicket::Enqueued,
             "the exact threshold queues the worker's active ticket"
         );
@@ -42967,13 +42944,13 @@ mod tests {
 
         for _ in 1..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH {
             assert_eq!(
-                schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
+                schedule_proactive_checkpoint_ticket(&budget, &sender),
                 ProactiveCheckpointTicket::BelowCadence,
                 "the next fixed cadence remains below its threshold"
             );
         }
         assert_eq!(
-            schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
+            schedule_proactive_checkpoint_ticket(&budget, &sender),
             ProactiveCheckpointTicket::Enqueued,
             "one pending ticket is retained while the worker is active"
         );
@@ -42985,13 +42962,13 @@ mod tests {
 
         for _ in 1..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH {
             assert_eq!(
-                schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
+                schedule_proactive_checkpoint_ticket(&budget, &sender),
                 ProactiveCheckpointTicket::BelowCadence,
                 "the full lane still consumes the next fixed cadence"
             );
         }
         assert_eq!(
-            schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender),
+            schedule_proactive_checkpoint_ticket(&budget, &sender),
             ProactiveCheckpointTicket::Full,
             "a full capacity-one lane does not enqueue a second pending ticket"
         );
@@ -43009,130 +42986,6 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty),
             "no second pending ticket is retained"
-        );
-    }
-
-    #[test]
-    fn proactive_checkpoint_page_budget_is_bounded_and_independent_of_sparse_write_cadence() {
-        let write_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
-        let page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let page_batch = u32::try_from(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH).expect("page batch");
-        assert_eq!(
-            schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, Some(0), &sender),
-            ProactiveCheckpointTicket::BelowCadence,
-        );
-        assert_eq!(page_budget.load(Ordering::Acquire), u64::from(page_batch));
-        assert_eq!(
-            schedule_proactive_checkpoint_ticket(
-                &write_budget,
-                &page_budget,
-                Some(page_batch - 1),
-                &sender,
-            ),
-            ProactiveCheckpointTicket::BelowCadence,
-        );
-        assert_eq!(page_budget.load(Ordering::Acquire), 1);
-        assert_eq!(
-            schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, Some(1), &sender),
-            ProactiveCheckpointTicket::Enqueued,
-            "wide commits wake the lane before the sparse-write cadence",
-        );
-        assert_eq!(
-            write_budget.load(Ordering::Acquire),
-            PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH - 3
-        );
-        assert_eq!(page_budget.load(Ordering::Acquire), u64::from(page_batch));
-        assert_eq!(
-            schedule_proactive_checkpoint_ticket(
-                &write_budget,
-                &page_budget,
-                Some(u32::MAX),
-                &sender,
-            ),
-            ProactiveCheckpointTicket::Full,
-            "an arbitrarily large hint retains only the one pending ticket",
-        );
-        assert_eq!(page_budget.load(Ordering::Acquire), u64::from(page_batch));
-        assert_eq!(receiver.try_recv(), Ok(()));
-        assert_eq!(
-            receiver.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        );
-        for _ in 4..PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH - 1 {
-            assert_eq!(
-                schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, None, &sender),
-                ProactiveCheckpointTicket::BelowCadence,
-                "an unavailable statistic preserves the existing write cadence",
-            );
-        }
-        assert_eq!(
-            schedule_proactive_checkpoint_ticket(&write_budget, &page_budget, None, &sender),
-            ProactiveCheckpointTicket::Enqueued,
-        );
-        drop(receiver);
-        assert_eq!(
-            schedule_proactive_checkpoint_ticket(
-                &write_budget,
-                &page_budget,
-                Some(page_batch),
-                &sender,
-            ),
-            ProactiveCheckpointTicket::Closed,
-            "a stopped lane still receives no retry task",
-        );
-    }
-
-    #[test]
-    fn proactive_checkpoint_page_statistic_matches_real_wal_frames_and_resets_without_writes() {
-        let directory = tempfile::tempdir().expect("page statistic directory");
-        let path = directory.path().join("page-statistic.sqlite");
-        let conn = Connection::open(&path).expect("page statistic writer");
-        apply_pragma_profile(&conn, false, true).expect("production WAL profile");
-        conn.execute_batch(
-            "CREATE TABLE page_fixture(value BLOB); PRAGMA wal_checkpoint(TRUNCATE)",
-        )
-        .expect("page statistic schema");
-        opc_sqlite_file_control_sys::take_page_write_count(&conn).expect("reset setup pages");
-        conn.execute("INSERT INTO page_fixture VALUES (zeroblob(524288))", [])
-            .expect("commit wide WAL transaction");
-        let page_size: u64 = conn
-            .query_row("PRAGMA page_size", [], |row| row.get(0))
-            .expect("actual WAL page size");
-        let wal_path = directory.path().join("page-statistic.sqlite-wal");
-        let wal_before = std::fs::read(&wal_path).expect("committed WAL bytes");
-        let main_before = std::fs::read(&path).expect("main before statistic");
-        let frames = (u64::try_from(wal_before.len()).expect("WAL length") - 32) / (page_size + 24);
-        assert!(frames > 1 && frames < 1_000);
-        assert_eq!(
-            u64::from(
-                opc_sqlite_file_control_sys::take_page_write_count(&conn).expect("page count")
-            ),
-            frames,
-            "the safe counter reports the actual wide commit's WAL page frames",
-        );
-        assert_eq!(
-            opc_sqlite_file_control_sys::take_page_write_count(&conn).expect("reset count"),
-            0
-        );
-        assert_eq!(
-            std::fs::read(&wal_path).expect("WAL after statistic"),
-            wal_before
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("main after statistic"),
-            main_before
-        );
-        assert!(conn.is_autocommit());
-        assert_eq!(
-            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i32>(0))
-                .expect("synchronous"),
-            3
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i32>(0))
-                .expect("fallback"),
-            1_000
         );
     }
 
@@ -43630,6 +43483,143 @@ mod tests {
                 .expect("read untouched compacted descriptor")
                 .len(),
             "C+1 input is rejected before compaction writes the target"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg(feature = "test-vfs")]
+    fn private_snapshot_compaction_commits_once_and_rejects_failed_copies() {
+        use opc_sqlite_file_control_sys::{block_test_main_sync, install_test_main_sync_block_vfs};
+
+        const CHILD: &str = "OPC_SESSION_STORE_TEST_COMPACTION_SYNC_VFS";
+        const TEST_NAME: &str = "sqlite::consensus::tests::private_snapshot_compaction_commits_once_and_rejects_failed_copies";
+        // The sync fault controller is process-global. Keep both its failure
+        // injection and exact physical callback counts isolated from peers.
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/proc/self/exe")
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated compaction sync regression");
+            assert!(status.success(), "isolated compaction regression succeeds");
+            return;
+        }
+        install_test_main_sync_block_vfs().expect("register compaction sync VFS");
+        let directory = tempfile::tempdir().expect("compaction regression directory");
+        let source_path = directory.path().join("source.sqlite");
+        let source = create_pinned_snapshot_database(&source_path).expect("private source pin");
+        let source_connection = open_pinned_snapshot_database(&source).expect("source connection");
+        source_connection
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE); \
+                 CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL \
+                     REFERENCES parent(id), payload BLOB NOT NULL); \
+                 CREATE INDEX child_parent ON child(parent_id); \
+                 INSERT INTO parent VALUES (1, 'retained'); \
+                 INSERT INTO child VALUES (2, 1, zeroblob(4096)); \
+                 CREATE TRIGGER child_insert AFTER INSERT ON child BEGIN \
+                     UPDATE parent SET value = 'trigger-ran' WHERE id = NEW.parent_id; END; \
+                 PRAGMA application_id = 18437; PRAGMA user_version = 42;",
+            )
+            .expect("seed keyed tables, index, foreign key and post-copy trigger");
+        let expected_schema =
+            schema_manifest_in_sync(&source_connection, false).expect("source schema");
+        drop(source_connection);
+        let source_before = std::fs::read(&source_path).expect("source bytes before copy");
+        SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.set(true));
+        let compacted = create_pinned_snapshot_database(&directory.path().join("success.sqlite"))
+            .expect("private compacted pin");
+        let mut syncs = block_test_main_sync();
+        syncs.release();
+        compact_pinned_snapshot_database_sync(&source, &compacted).expect("complete logical copy");
+        assert_eq!(
+            1,
+            syncs.main_sync_count(),
+            "one completed image commit sync"
+        );
+        assert_eq!(0, syncs.wal_sync_count(), "private staging has no WAL");
+        let compacted_connection =
+            open_pinned_snapshot_database(&compacted).expect("read completed compacted image");
+        assert_eq!(
+            expected_schema,
+            schema_manifest_in_sync(&compacted_connection, false).expect("compacted schema")
+        );
+        assert_eq!(
+            (1_i64, "retained".to_owned(), 2_i64, 4_096_i64),
+            compacted_connection
+                .query_row(
+                    "SELECT parent.id, parent.value, child.id, length(child.payload) \
+                     FROM parent JOIN child ON child.parent_id = parent.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("retained values and keys; copy does not execute the trigger")
+        );
+        for (pragma, expected) in [("application_id", 18_437), ("user_version", 42)] {
+            assert_eq!(
+                expected,
+                compacted_connection
+                    .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+                    .expect("copied header metadata")
+            );
+        }
+        validate_snapshot_compaction_foreign_keys_sync(&compacted_connection)
+            .expect("retained foreign key remains valid");
+        assert!(
+            compacted_connection.is_autocommit(),
+            "copy committed before return"
+        );
+        drop(compacted_connection);
+
+        let failed_path = directory.path().join("failed-sync.sqlite");
+        let failed = create_pinned_snapshot_database(&failed_path).expect("failed-copy pin");
+        let worker_source = source.try_clone().expect("duplicate source descriptor");
+        let mut failure = block_test_main_sync();
+        let worker = std::thread::spawn(move || {
+            SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.set(true));
+            let result = compact_pinned_snapshot_database_sync(&worker_source, &failed);
+            (result, failed)
+        });
+        let observed = failure.wait_until_main_sync(Duration::from_secs(2));
+        failure.fail_and_release();
+        let (result, failed) = worker.join().expect("join the failed commit worker");
+        assert!(observed, "final image commit reaches real main-file xSync");
+        assert!(
+            result.is_err(),
+            "failed commit cannot return a compacted image"
+        );
+        drop(failed);
+        assert!(
+            !failed_path.exists(),
+            "failed staging pin owns exact cleanup"
+        );
+        assert!(
+            source_before == std::fs::read(&source_path).expect("source after failed sync"),
+            "successful and failed copies leave source bytes unchanged"
+        );
+
+        let source_connection = open_pinned_snapshot_database(&source).expect("corruption fixture");
+        source_connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable source enforcement only to construct an invalid fixture");
+        source_connection
+            .execute("DELETE FROM parent", [])
+            .expect("make an orphan while source FK enforcement is disabled");
+        drop(source_connection);
+        let rejected_path = directory.path().join("rejected.sqlite");
+        let rejected = create_pinned_snapshot_database(&rejected_path).expect("rejected-copy pin");
+        let error = compact_pinned_snapshot_database_sync(&source, &rejected)
+            .expect_err("complete foreign-key validation still rejects the source");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(
+            "session consensus compacted snapshot foreign key check failed",
+            error.to_string()
+        );
+        drop(rejected);
+        assert!(
+            !rejected_path.exists(),
+            "invalid staging pin owns exact cleanup"
         );
     }
 
@@ -65164,148 +65154,6 @@ BEGIN IMMEDIATE;
 
     #[test]
     #[ignore = "release-profile component cost diagnosis for SDK-741"]
-    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
-    fn wide_v2_checkpoint_cadence_cost_diagnostic() {
-        use opc_sqlite_file_control_sys::{
-            block_test_main_sync, install_test_main_sync_block_vfs, TEST_MAIN_SYNC_BLOCK_VFS_NAME,
-        };
-
-        install_test_main_sync_block_vfs().expect("register diagnostic sync VFS");
-        let directory = tempfile::tempdir().expect("checkpoint diagnostic directory");
-        let backend = SqliteSessionBackend::open_with_vfs_for_test(
-            directory.path().join("wide-v2.sqlite"),
-            TEST_MAIN_SYNC_BLOCK_VFS_NAME,
-        )
-        .expect("open production writer through sync observation VFS");
-        let conn = backend.conn.blocking_lock();
-        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
-        append_logs_sync(&conn, identity(), &[membership_entry()]).expect("append membership");
-        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
-            .expect("apply membership");
-        activate_v2_ledger_fixture(&conn);
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .expect("drain setup WAL before measuring writes");
-        assert_eq!(
-            conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i32>(0))
-                .expect("unchanged writer threshold"),
-            1_000,
-        );
-        let mut observation = block_test_main_sync();
-        // Count the real VFS callbacks without injecting any delay or error.
-        observation.release();
-        let _ = opc_sqlite_file_control_sys::take_page_write_count(&conn)
-            .expect("reset diagnostic setup page count");
-        let budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
-        let page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
-        let hint_write_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH);
-        let hint_page_budget = AtomicU64::new(PROACTIVE_CHECKPOINT_PAGE_WRITE_BATCH);
-        let (hint_sender, _hint_receiver) = tokio::sync::mpsc::channel(1);
-        let mut first_page_hint_ticket = None;
-        let mut total_written_pages = 0_u64;
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let mut first_foreground_checkpoint = None;
-        let mut first_proactive_ticket = None;
-        let mut durable_writes = 0;
-        let mut commit_durations = Vec::new();
-        for batch in 0_u8..22 {
-            let requests = (0_u8..8)
-                .map(|item| {
-                    let nonce = batch * 8 + item + 1;
-                    let mut record_key = key();
-                    record_key.stable_id = Bytes::from(vec![nonce; 16])
-                        .try_into()
-                        .expect("distinct fixture key");
-                    let record = sealed_record_for_key(record_key.clone(), 1_024);
-                    let lease = FencedTransitionLease::acquire(
-                        record_key,
-                        record.owner.clone(),
-                        crate::FenceToken::new(0),
-                        Duration::from_secs(300),
-                    )
-                    .expect("fixture lease");
-                    FencedTransitionV2Request::new(
-                        FencedTransitionV2HistoryEpoch::new(1).expect("fixture epoch"),
-                        crate::fenced_transition::FencedTransitionV2CallerNonce::from_bytes(
-                            [nonce; 16],
-                        ),
-                        lease,
-                        FencedTransitionMutation::create(record),
-                    )
-                    .expect("eight distinct valid V2 create requests")
-                })
-                .collect();
-            let entry =
-                fenced_transition_v2_batch_entry(u64::from(batch) + 1, requests, timestamp(1));
-            for stage in ["append", "commit-index", "apply"] {
-                let syncs_before = observation.main_sync_count();
-                let started = Instant::now();
-                match stage {
-                    "append" => append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
-                        .expect("append full V2 batch"),
-                    "commit-index" => save_committed_sync(&conn, identity(), Some(entry.log_id))
-                        .expect("persist committed batch index"),
-                    "apply" => {
-                        let applied = apply_entries_sync(
-                            &conn,
-                            identity(),
-                            &backend.caps,
-                            vec![entry.clone()],
-                        )
-                        .expect("apply full V2 batch");
-                        assert!(matches!(
-                            applied.responses.as_slice(),
-                            [SessionConsensusResponse {
-                                result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
-                                ..
-                            }] if outcomes.len() == 8 && outcomes.iter().all(Result::is_ok)
-                        ));
-                    }
-                    _ => unreachable!("fixed diagnostic stages"),
-                }
-                let elapsed = started.elapsed();
-                durable_writes += 1;
-                let checkpointed = observation.main_sync_count() > syncs_before;
-                if checkpointed {
-                    first_foreground_checkpoint.get_or_insert(durable_writes);
-                }
-                let pages = opc_sqlite_file_control_sys::take_page_write_count(&conn)
-                    .expect("read exact committed page count");
-                total_written_pages += u64::from(pages);
-                let hint = schedule_proactive_checkpoint_ticket(
-                    &hint_write_budget,
-                    &hint_page_budget,
-                    Some(pages),
-                    &hint_sender,
-                );
-                if hint == ProactiveCheckpointTicket::Enqueued {
-                    first_page_hint_ticket.get_or_insert(durable_writes);
-                }
-                let ticket =
-                    schedule_proactive_checkpoint_ticket(&budget, &page_budget, None, &sender);
-                if ticket == ProactiveCheckpointTicket::Enqueued {
-                    first_proactive_ticket.get_or_insert(durable_writes);
-                }
-                commit_durations.push((stage, checkpointed, elapsed.as_micros()));
-            }
-        }
-        eprintln!(
-            "sdk-741 checkpoint component: batch_items=8 payload_bytes=1024 durable_writes={durable_writes} first_foreground_checkpoint={first_foreground_checkpoint:?} first_proactive_ticket={first_proactive_ticket:?} first_page_hint_ticket={first_page_hint_ticket:?} total_written_pages={total_written_pages} main_syncs={} wal_syncs={} stages={commit_durations:?}",
-            observation.main_sync_count(),
-            observation.wal_sync_count(),
-        );
-        assert!(first_foreground_checkpoint.is_some());
-        assert!(
-            first_page_hint_ticket.expect("page ticket")
-                < first_foreground_checkpoint.expect("foreground checkpoint")
-        );
-        assert_eq!(
-            first_proactive_ticket,
-            Some(PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH)
-        );
-    }
-
-    #[test]
-    #[ignore = "release-profile component cost diagnosis for SDK-741"]
     fn durable_v2_log_decode_cost_diagnostic() {
         fn measure(stage: &str, mut work: impl FnMut()) {
             let mut samples = Vec::with_capacity(4_096);
@@ -65743,6 +65591,80 @@ BEGIN IMMEDIATE;
             }
         }
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "release-profile private snapshot compaction diagnosis for SDK-741"]
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    fn private_snapshot_compaction_cost_diagnostic() {
+        use opc_sqlite_file_control_sys::{block_test_main_sync, install_test_main_sync_block_vfs};
+
+        let source_path = std::env::var_os("OPC_741_SNAPSHOT_AUDIT_SOURCE")
+            .expect("explicit immutable diagnostic snapshot source");
+        let root = std::env::var_os("OPC_741_COMPACTION_DIRECTORY")
+            .expect("explicit disk-backed diagnostic workspace");
+        install_test_main_sync_block_vfs().expect("register diagnostic sync observation VFS");
+        struct RestoreVfs(bool);
+        impl Drop for RestoreVfs {
+            fn drop(&mut self) {
+                SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.set(self.0));
+            }
+        }
+        let _restore =
+            RestoreVfs(SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.replace(true)));
+        let directory =
+            tempfile::tempdir_in(root).expect("private compaction diagnostic directory");
+        for iteration in 0..3 {
+            let raw = create_pinned_snapshot_database(&directory.path().join("raw.sqlite"))
+                .expect("create owned raw snapshot descriptor");
+            let mut input = std::fs::File::open(&source_path).expect("read immutable source");
+            let mut output = raw.file();
+            let copied_bytes = io::copy(&mut input, &mut output).expect("copy to owned raw image");
+            raw.file()
+                .sync_all()
+                .expect("sync raw fixture before measurement");
+            let raw = raw
+                .refresh_identity()
+                .expect("pin copied raw content identity");
+            let compacted =
+                create_pinned_snapshot_database(&directory.path().join("compact.sqlite"))
+                    .expect("create owned empty compacted descriptor");
+            let mut syncs = block_test_main_sync();
+            syncs.release();
+            let started = Instant::now();
+            compact_pinned_snapshot_database_sync(&raw, &compacted)
+                .expect("run the actual private snapshot compactor");
+            let compact_elapsed = started.elapsed();
+            let main_syncs = syncs.main_sync_count();
+            let wal_syncs = syncs.wal_sync_count();
+            let sync_started = Instant::now();
+            compacted
+                .file()
+                .sync_all()
+                .expect("unchanged explicit final file sync");
+            let final_sync_elapsed = sync_started.elapsed();
+            let raw_connection = open_pinned_snapshot_database(&raw).expect("read raw schema");
+            let compacted_connection =
+                open_pinned_snapshot_database(&compacted).expect("read compacted schema");
+            assert_eq!(
+                schema_manifest_in_sync(&raw_connection, false).expect("full raw schema"),
+                schema_manifest_in_sync(&compacted_connection, false)
+                    .expect("full compacted schema")
+            );
+            validate_sealed_state_sync(&compacted_connection)
+                .expect("full compacted row validation");
+            let journal_rows: i64 = compacted_connection
+                .query_row("SELECT count(*) FROM session_replication_log", [], |row| {
+                    row.get(0)
+                })
+                .expect("count copied journal rows");
+            eprintln!(
+                "sdk-741 private compaction: iteration={iteration} source_bytes={copied_bytes} output_bytes={} journal_rows={journal_rows} compaction_us={} main_syncs={main_syncs} wal_syncs={wal_syncs} explicit_final_sync_us={}",
+                compacted.file().metadata().expect("output length").len(),
+                compact_elapsed.as_micros(),
+                final_sync_elapsed.as_micros(),
+            );
+        }
     }
 
     #[test]

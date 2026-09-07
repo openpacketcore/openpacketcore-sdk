@@ -872,6 +872,12 @@ SQLite progress callback. Snapshot startup also yields the physical-prune
 writer before reserving its legacy reseed candidate, using the same writer
 handoff as append and apply.
 
+Private snapshot compaction commits its schema and copied rows together. The
+same writer page cap and per-table extent checks remain active throughout the
+copy. A failed copy discards its owned staging inode; a successful copy still
+receives the final file sync, complete validation, sealing and publication
+checks before it becomes a snapshot.
+
 Durable V2 batches still undergo complete typed decoding and exact comparison
 with their canonical JSON encoding. For the fixed batch shape, optionally
 inside one authority envelope, that byte comparison also proves the complete
@@ -887,13 +893,6 @@ Membership projection loading shares complete layout, certificate, history and
 scope validation within one SQLite read transaction. An autocommit caller gets
 a read transaction for that load; an existing caller transaction retains its
 ownership. Each later load validates the current durable state again.
-
-The coalescing background checkpoint lane also observes pages written by each
-successful primary commit. Wide transactions can request its single worker
-after half the primary writer's 1,000-page fallback, while the existing
-64-write cadence still handles sparse writes or unavailable page statistics.
-The bounded page counter is only a scheduling hint: the primary automatic
-checkpoint, EXTRA synchronization, and all WAL/workspace limits are unchanged.
 
 Full snapshot replication-log audits keep SQLite reads on the caller thread
 and decode bounded batches with at most eight workers, 4,096 rows and 16 MiB

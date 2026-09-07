@@ -7,12 +7,6 @@ the bundled Unix VFS. The file-control opcodes are limited to
 `SQLITE_FCNTL_HAS_MOVED`, `SQLITE_FCNTL_VFSNAME`,
 `SQLITE_FCNTL_FILE_POINTER`, and `SQLITE_FCNTL_JOURNAL_POINTER`.
 
-One fixed `SQLITE_DBSTATUS_CACHE_WRITE` query also reads and resets the
-connection's dirty-page write count for background checkpoint scheduling.
-This bounded advisory result performs no database I/O and changes no hooks or
-checkpoint settings. Counter overflow or I/O errors can make it incomplete;
-durability, admission and resource bounds never depend on this statistic.
-
 ADR 0020 additionally permits one non-default, read-only snapshot VFS on
 Linux. Its safe `RegisteredSnapshot` handle binds an opaque process-local URI
 to an owned `VerifiedSnapshotSource`. Every SQLite read goes through that

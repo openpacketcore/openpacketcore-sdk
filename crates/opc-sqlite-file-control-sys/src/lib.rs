@@ -34,35 +34,6 @@ pub use verified_snapshot::{RegisteredSnapshot, VerifiedSnapshotSource};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileControlError;
 
-/// Read and reset this connection's advisory dirty-page write counter.
-///
-/// SQLite counts pages written to WAL in WAL mode, across the connection's
-/// attached databases. This fixed status query performs no database I/O and
-/// does not install a hook or change automatic checkpointing. The counter is
-/// finite and may be incomplete after an I/O failure, so it must never decide
-/// durability, admission, or a resource limit. It is only a scheduling hint.
-pub fn take_page_write_count(connection: &Connection) -> Result<u32, FileControlError> {
-    let mut current = 0_i32;
-    let mut high_water = 0_i32;
-    // SAFETY: the connection owns a live SQLite handle for this synchronous
-    // borrow. SQLite writes two integers to these valid local pointers. The
-    // fixed opcode only reads/resets connection-local pager statistics; no
-    // borrowed handle or callback escapes this call.
-    let result = unsafe {
-        ffi::sqlite3_db_status(
-            connection.handle(),
-            ffi::SQLITE_DBSTATUS_CACHE_WRITE,
-            &mut current,
-            &mut high_water,
-            1,
-        )
-    };
-    if result != ffi::SQLITE_OK || high_water != 0 {
-        return Err(FileControlError);
-    }
-    u32::try_from(current).map_err(|_| FileControlError)
-}
-
 /// The name of the test-only VFS that fails SQLite unnamed temporary opens.
 ///
 /// This is available only with the `test-vfs` feature.  It is deliberately a
