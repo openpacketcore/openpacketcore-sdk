@@ -49,7 +49,8 @@ pub use collection::{
 pub use error::{RouteSteeringError, RouteSteeringFailureClass};
 pub use linux::{
     LinuxOwnedRouteRuleCollectionLimits, LinuxRouteReadbackLimits, LinuxRouteSteeringBackend,
-    LinuxRouteSteeringBackendConfig, LinuxRuleProtocolCapability, LINUX_ROUTE_STEERING_PROTOCOL,
+    LinuxRouteSteeringBackendConfig, LinuxRouteSteeringUrgentIntent, LinuxRuleProtocolCapability,
+    OwnedRouteRuleReconcilePlan, OwnedRouteRuleReconcileStep, LINUX_ROUTE_STEERING_PROTOCOL,
 };
 pub use mock::{MockFailurePoint, MockObservation, MockOperation, MockRouteSteeringBackend};
 pub use model::{
