@@ -3240,6 +3240,7 @@ impl ConsensusSessionStore {
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        storage_shutdown.enable_runtime_write_handoff();
         let admitted = Arc::new(AtomicBool::new(false));
         let raft_handler = SessionRaftRpcHandler::new_fixed_durable_quorum(
             raft.clone(),
@@ -3471,6 +3472,7 @@ impl ConsensusSessionStore {
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        storage_shutdown.enable_runtime_write_handoff();
         let raft_handler =
             SessionRaftRpcHandler::new(raft.clone(), peer_directory.clone(), local_node_id);
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());

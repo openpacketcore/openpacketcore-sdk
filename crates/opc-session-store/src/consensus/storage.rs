@@ -2540,6 +2540,7 @@ impl SqliteConsensusLogStore {
 struct ConsensusStorageShutdownCompletion {
     active_owners: AtomicUsize,
     notify: tokio::sync::Notify,
+    runtime_write_handoff: AtomicBool,
 }
 
 /// Observation that every Openraft-owned SQLite storage handle has exited.
@@ -2547,6 +2548,14 @@ struct ConsensusStorageShutdownCompletion {
 pub(crate) struct ConsensusStorageShutdownObserver(Arc<ConsensusStorageShutdownCompletion>);
 
 impl ConsensusStorageShutdownObserver {
+    /// Enable scheduler handoff only after `Raft::new` has finished recovery
+    /// and moved both write handles into its Tokio-spawned engine tasks.
+    /// Startup itself may run on the caller's LocalSet, where block_in_place
+    /// is forbidden even when the underlying runtime is multi-threaded.
+    pub(crate) fn enable_runtime_write_handoff(&self) {
+        self.0.runtime_write_handoff.store(true, Ordering::Release);
+    }
+
     pub(crate) async fn wait(&self) {
         loop {
             if self.0.active_owners.load(Ordering::Acquire) == 0 {
@@ -2570,11 +2579,18 @@ impl ConsensusStorageShutdownGuard {
         Self(Some(Arc::new(ConsensusStorageShutdownCompletion {
             active_owners: AtomicUsize::new(1),
             notify: tokio::sync::Notify::new(),
+            runtime_write_handoff: AtomicBool::new(false),
         })))
     }
 
     const fn detached() -> Self {
         Self(None)
+    }
+
+    fn runtime_write_handoff_enabled(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|completion| completion.runtime_write_handoff.load(Ordering::Acquire))
     }
 
     fn observer(&self) -> Option<ConsensusStorageShutdownObserver> {
@@ -3981,6 +3997,29 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     }
 }
 
+/// Marks an already serialized synchronous write as blocking for Tokio's
+/// multi-thread scheduler. SQLite, its full row decoders, and the transaction
+/// remain on the calling thread; this does not submit a detached storage job.
+/// Callers acquire all async admission/connection guards before entering and
+/// retain them until the synchronous transaction returns, including on error.
+/// A current-thread runtime has no worker to hand off, so retain inline behavior
+/// there (and when called without a Tokio runtime). Startup recovery also stays
+/// inline until both write handles belong to the spawned Openraft tasks.
+fn run_admitted_sqlite_write<R>(
+    shutdown_guard: &ConsensusStorageShutdownGuard,
+    operation: impl FnOnce() -> R,
+) -> R {
+    if shutdown_guard.runtime_write_handoff_enabled()
+        && tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        })
+    {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
+    }
+}
+
 impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     type LogReader = Self;
 
@@ -4020,15 +4059,17 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::save_vote_with_authority_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                vote,
-            )
+            run_admitted_sqlite_write(&self.shutdown_guard, || {
+                consensus::save_vote_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    vote,
+                )
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error));
         if result.is_ok() {
@@ -4060,15 +4101,17 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::save_committed_with_authority_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                committed,
-            )
+            run_admitted_sqlite_write(&self.shutdown_guard, || {
+                consensus::save_committed_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    committed,
+                )
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
         if result.is_ok() {
@@ -4107,16 +4150,18 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::append_logs_with_authority_and_diagnostics_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                &entries,
-                self.core.diagnostics.as_deref(),
-            )
+            run_admitted_sqlite_write(&self.shutdown_guard, || {
+                consensus::append_logs_with_authority_and_diagnostics_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &entries,
+                    self.core.diagnostics.as_deref(),
+                )
+            })
         };
         match result {
             Ok(()) => {
@@ -4141,7 +4186,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            (|| -> io::Result<()> {
+            run_admitted_sqlite_write(&self.shutdown_guard, || -> io::Result<()> {
                 ensure_recovery_terminal_allows_log_compaction(&self.core, &conn)
                     .map_err(|_| io::Error::other("operator recovery blocks log truncation"))?;
                 consensus::truncate_logs_with_authority_sync(
@@ -4153,7 +4198,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                     self.core.fixed_placement_policy,
                     &log_id,
                 )
-            })()
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error));
         if result.is_ok() {
@@ -4172,7 +4217,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            (|| -> io::Result<()> {
+            run_admitted_sqlite_write(&self.shutdown_guard, || -> io::Result<()> {
                 ensure_recovery_terminal_allows_log_compaction(&self.core, &conn)
                     .map_err(|_| io::Error::other("operator recovery blocks log purge"))?;
                 if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable
@@ -4198,7 +4243,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                         &log_id,
                     )
                 }
-            })()
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error));
         if result.is_ok() {
@@ -4314,17 +4359,19 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             };
             let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
-            let applied = consensus::apply_entries_with_authority_and_diagnostics_sync(
-                &conn,
-                self.core.storage_identity,
-                &self.core.caps,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                entries,
-                self.core.diagnostics.as_deref(),
-            )
+            let applied = run_admitted_sqlite_write(&self.shutdown_guard, || {
+                consensus::apply_entries_with_authority_and_diagnostics_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    &self.core.caps,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    entries,
+                    self.core.diagnostics.as_deref(),
+                )
+            })
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
             if applies_membership {
                 let membership = consensus::read_membership_sync(&conn, self.core.storage_identity)
@@ -9690,6 +9737,235 @@ mod tests {
             },
             database,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_commit_allows_independent_runtime_progress() {
+        exercise_admitted_sqlite_commit(false, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_commit_retains_ownership_after_cancellation() {
+        exercise_admitted_sqlite_commit(true, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_commit_error_rolls_back_before_releasing_ownership() {
+        exercise_admitted_sqlite_commit(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn admitted_sqlite_write_supports_current_thread_borrowed_scope() {
+        assert_admitted_sqlite_write_borrowed_scope();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_write_stays_on_the_multi_thread_caller() {
+        tokio::spawn(async { assert_admitted_sqlite_write_borrowed_scope() })
+            .await
+            .expect("join synchronous caller scope");
+    }
+
+    fn assert_admitted_sqlite_write_borrowed_scope() {
+        let shutdown = ConsensusStorageShutdownGuard::tracked();
+        shutdown
+            .observer()
+            .expect("tracked write owner")
+            .enable_runtime_write_handoff();
+        let caller = std::thread::current().id();
+        let value = std::rc::Rc::new(std::cell::Cell::new(0));
+        run_admitted_sqlite_write(&shutdown, || {
+            assert_eq!(std::thread::current().id(), caller);
+            value.set(1);
+        });
+        assert_eq!(value.get(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_write_cancelled_before_connection_never_commits() {
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "cancelled writer initial membership",
+        )
+        .await;
+        log_store
+            .blocking_append([blank_entry(1)])
+            .await
+            .expect("append the uncommitted next row");
+        shutdown.enable_runtime_write_handoff();
+        let conn = state_machine.core.conn.lock().await;
+        let mut pending = Box::pin(log_store.save_committed(Some(log_id(1))));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(conn.is_autocommit(), "no transaction was submitted");
+        assert_eq!(
+            consensus::read_committed_sync(&conn, state_machine.core.storage_identity)
+                .expect("read retained committed frontier"),
+            Some(log_id(0))
+        );
+        drop(conn);
+        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+            lane.shutdown().await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_startup_recovery_supports_local_set() {
+        use futures_util::FutureExt;
+
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let _shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "local recovery initial membership",
+        )
+        .await;
+        append_and_commit(
+            &mut log_store,
+            [blank_entry(1)],
+            "local recovery unapplied row",
+        )
+        .await;
+        let local = tokio::task::LocalSet::new();
+        let recovery = std::panic::AssertUnwindSafe(local.run_until(async {
+            opc_consensus::engine::StorageHelper::new(&mut log_store, &mut state_machine)
+                .get_initial_state()
+                .await
+        }))
+        .catch_unwind()
+        .await;
+        let applied = state_machine.applied_state().await;
+        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+            lane.shutdown().await;
+        }
+        recovery
+            .expect("Openraft startup must not panic on the caller's LocalSet")
+            .expect("Openraft startup recovers the unapplied row");
+        assert_eq!(
+            applied.expect("read recovered applied frontier").0,
+            Some(log_id(1))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_admitted_sqlite_commit(cancel_admitted: bool, reject_commit: bool) {
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "runtime progress initial membership",
+        )
+        .await;
+        log_store
+            .blocking_append([blank_entry(1)])
+            .await
+            .expect("append one exact frontier advance");
+        shutdown.enable_runtime_write_handoff();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_progress = Arc::clone(&made_progress);
+        let commits = Arc::new(AtomicUsize::new(0));
+        let observed_commits = Arc::clone(&commits);
+        let mut entered_tx = Some(entered_tx);
+        state_machine
+            .core
+            .conn
+            .lock()
+            .await
+            .commit_hook(Some(move || {
+                observed_commits.fetch_add(1, Ordering::Relaxed);
+                if let Some(entered_tx) = entered_tx.take() {
+                    let _ = entered_tx.send(());
+                    // The timeout only releases a broken implementation so the
+                    // test can join every task; success requires an independent
+                    // task to respond while this real transaction is still held.
+                    observed_progress.store(
+                        progress_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                        Ordering::Relaxed,
+                    );
+                }
+                reject_commit
+            }));
+        let commit = tokio::spawn(async move { log_store.save_committed(Some(log_id(1))).await });
+        let abort_commit = commit.abort_handle();
+        let observer_core = state_machine.core.clone();
+        let observer = tokio::spawn(async move {
+            entered_rx
+                .await
+                .expect("the admitted transaction reaches commit");
+            if cancel_admitted {
+                abort_commit.abort();
+            }
+            assert!(
+                observer_core.conn.try_lock().is_err(),
+                "the original caller still owns the primary connection"
+            );
+            let _ = progress_tx.send(());
+        });
+        let commit_result = commit.await;
+        state_machine
+            .core
+            .conn
+            .lock()
+            .await
+            .commit_hook(None::<fn() -> bool>);
+        let observer_result = observer.await;
+        let (committed, autocommit) = {
+            let conn = state_machine.core.conn.lock().await;
+            (
+                consensus::read_committed_sync(&conn, state_machine.core.storage_identity),
+                conn.is_autocommit(),
+            )
+        };
+        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+            lane.shutdown().await;
+        }
+        match commit_result {
+            Ok(result) if reject_commit => assert!(result.is_err()),
+            Ok(result) => result.expect("the original commit succeeds"),
+            Err(error) => assert!(cancel_admitted && error.is_cancelled()),
+        }
+        observer_result.expect("join independent runtime observer");
+        assert_eq!(
+            committed.expect("read exact committed frontier"),
+            Some(log_id(u64::from(!reject_commit)))
+        );
+        assert!(autocommit, "the transaction has completed before returning");
+        assert_eq!(commits.load(Ordering::Relaxed), 1, "no replayed commit");
+        assert!(
+            made_progress.load(Ordering::Relaxed),
+            "an admitted synchronous SQLite commit must not strand unrelated runtime work"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn track_admitted_sqlite_fixture(
+        log_store: &mut SqliteConsensusLogStore,
+        state_machine: &mut SqliteConsensusStateMachine,
+    ) -> ConsensusStorageShutdownObserver {
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked fixture write owners");
+        state_machine.shutdown_guard = owner.child();
+        log_store.shutdown_guard = owner;
+        observer
     }
 
     #[cfg(target_os = "linux")]

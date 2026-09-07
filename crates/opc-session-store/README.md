@@ -865,6 +865,16 @@ replenished or permanently retires that permit. This prevents a write-held
 SQLite connection from globally serializing unrelated acceptance reads without
 creating a connection, task, or pool entry per caller or subscriber.
 
+After Openraft startup recovery finishes, log and state-machine writes mark
+their synchronous SQLite turn as blocking after acquiring the existing writer
+and connection guards. On a multi-thread Tokio runtime this lets other runnable
+tasks progress while the
+calling thread completes the transaction and its full row checks. The write
+is never detached from its caller, and ordinary one-row frontier decoding
+stays inline. Cancellation cannot release an admitted transaction's guards
+early or replay its work. Startup recovery, including on a caller's LocalSet,
+and current-thread runtimes retain inline execution.
+
 Snapshot copy and compaction share the store's primary-writer pressure signal.
 An existing 32 ms foreground pause earns a 32 ms snapshot work turn before
 another pause, so sustained traffic cannot repeatedly charge a pause at every
