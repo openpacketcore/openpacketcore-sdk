@@ -793,9 +793,12 @@ impl SessionMembershipAdmission {
         let pending_engine_catchup = match family {
             ConsensusRpcFamily::Vote => pending_voting_admitted,
             ConsensusRpcFamily::AppendEntries
+            | ConsensusRpcFamily::AppendEntriesRoster
             | ConsensusRpcFamily::InstallSnapshot
             | ConsensusRpcFamily::TopologyAdmissionBarrier => true,
-            ConsensusRpcFamily::ForwardMutation | ConsensusRpcFamily::ReadBarrier => false,
+            ConsensusRpcFamily::ForwardMutation
+            | ConsensusRpcFamily::ForwardRosterMutation
+            | ConsensusRpcFamily::ReadBarrier => false,
             _ => false,
         };
         // Once joint membership is durably committed, the predecessor
@@ -808,7 +811,9 @@ impl SessionMembershipAdmission {
         let predecessor_application_authority_revoked = pending_voting_admitted
             && matches!(
                 family,
-                ConsensusRpcFamily::ForwardMutation | ConsensusRpcFamily::ReadBarrier
+                ConsensusRpcFamily::ForwardMutation
+                    | ConsensusRpcFamily::ForwardRosterMutation
+                    | ConsensusRpcFamily::ReadBarrier
             );
         let current_admitted = current_matches && !predecessor_application_authority_revoked;
         if !(current_admitted || pending_matches && pending_engine_catchup) {
@@ -1240,6 +1245,7 @@ mod tests {
         );
         for family in [
             ConsensusRpcFamily::ForwardMutation,
+            ConsensusRpcFamily::ForwardRosterMutation,
             ConsensusRpcFamily::ReadBarrier,
         ] {
             assert_eq!(
@@ -1259,6 +1265,7 @@ mod tests {
         for family in [
             ConsensusRpcFamily::Vote,
             ConsensusRpcFamily::AppendEntries,
+            ConsensusRpcFamily::AppendEntriesRoster,
             ConsensusRpcFamily::InstallSnapshot,
             ConsensusRpcFamily::TopologyAdmissionBarrier,
         ] {

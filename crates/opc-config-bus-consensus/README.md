@@ -11,20 +11,28 @@ The production composition deliberately puts encryption above this crate:
 ```rust,ignore
 use std::sync::Arc;
 
-use opc_config_bus::{ConfigAuthorityPort, EncryptingManagedDatastore};
-use opc_config_bus_consensus::RaftManagedDatastore;
+use opc_config_bus::{ConfigBus, EncryptingManagedDatastore};
+use opc_config_bus_consensus::{ConsensusConfigBusProjection, RaftManagedDatastore};
 
 // `consensus_store` was opened with a config-specific identity, voter set,
 // SQLite path, snapshot directory, peers, and listener distinct from session
 // consensus. Install `consensus_store.rpc_handler()` and initialize it first.
-let durable = Arc::new(RaftManagedDatastore::<MyConfig>::new(Arc::new(
-    consensus_store,
-)));
-let authority: Arc<dyn ConfigAuthorityPort> = Arc::new(durable.config_authority());
+let durable = Arc::new(RaftManagedDatastore::<MyConfig>::new_local_authority(
+    Arc::new(consensus_store),
+));
 let managed = EncryptingManagedDatastore::new(Arc::clone(&durable), key_provider);
 
-// Build ConfigBus from `managed`, then install the same `authority` on both
-// the gNMI and NETCONF server cores with `with_config_authority(...)`.
+let bus = Arc::new(ConfigBus::restore_or_new(initial_config, managed.clone(), authorizer).await?);
+let projection = ConsensusConfigBusProjection::new(
+    Arc::clone(&bus),
+    managed,
+    durable.config_authority(),
+);
+
+// On local leader election, do not open gNMI or NETCONF writes until this
+// succeeds. It rebuilds this same live bus from the local applied head and
+// proves authority for that exact head through the same consensus store.
+projection.reconcile_and_open().await?;
 ```
 
 `RaftManagedDatastore<C>` implements only
@@ -32,6 +40,10 @@ let managed = EncryptingManagedDatastore::new(Arc::clone(&durable), key_provider
 owns a `KeyProvider`; Openraft therefore receives authenticated ciphertext,
 lineage/lifecycle metadata, a digest-only replay index, and a product-neutral
 redacted root audit marker.
+
+Authoritative buses use `RaftManagedDatastore::new_local_authority`, which
+rejects a mutation after deposition instead of forwarding it. The existing
+`new` constructor retains forwarding for non-authoritative SDK clients.
 
 `RaftManagedDatastore::config_authority()` returns a
 `ConsensusConfigAuthority` over that exact `ConsensusConfigStore`. The adapter
@@ -51,6 +63,15 @@ proposal permits on every return path. When the canonical store is empty, an
 empty bootstrap head may attempt only a `Write` so the genesis commit can be
 created; `LinearizableRead` remains unavailable because no durable content yet
 proves that every pod bootstrapped the same payload.
+
+`ConsensusConfigBusProjection` is the authoritative leader-open composition.
+It binds the existing `ConfigBus` worker to `ConsensusConfigAuthority` and the
+same locally applied committed-revision source. Reconciliation is serialized
+with submit and confirmed-commit expiry, validates the complete publishable
+head before the atomic snapshot swap, replaces subscriber deltas with one
+bounded resync marker, and restores the persisted confirmed-commit timer. A
+missing, fenced, invalid, regressing, or no-longer-authoritative head leaves
+the old projection unchanged and keeps writes closed.
 
 It also implements the explicit
 `CommittedRevisionSource<SealedConfig<C>>` trust marker. Its committed-head,

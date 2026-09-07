@@ -8,12 +8,14 @@ description = "Chaos and failure testing testkit for OpenPacketCore session repl
 [features]
 default = []
 foundation-insecure = ["opc-session-net/insecure-test"]
+consumer-fixture = ["dep:rcgen", "dep:rustls-pki-types"]
 
 [dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-session-net = { path = "../opc-session-net", version = "0.2.0", default-features = false }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
@@ -30,9 +32,14 @@ time = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 zeroize = { workspace = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
+rcgen = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 
 [dev-dependencies]
-opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
+# These integration tests compile under the default (no-fixture) feature set.
+# Keep the fixture's production-only dependencies optional above, while making
+# the test-only certificate helpers available to Cargo's default test target.
 rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 
@@ -48,6 +55,11 @@ required-features = ["foundation-insecure"]
 name = "qualification_control_socket"
 path = "tests/qualification_control_socket.rs"
 required-features = ["foundation-insecure"]
+
+[[test]]
+name = "authenticated_consumer_fixture_public_api"
+path = "tests/authenticated_consumer_fixture_public_api.rs"
+required-features = ["consumer-fixture"]
 
 [lints]
 workspace = true

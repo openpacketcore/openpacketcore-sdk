@@ -450,6 +450,26 @@ fn clear_observation_flow_scratch() {
     }
 }
 
+/// Return whether this retained graph is allowed to affect a packet at all.
+///
+/// The loader holds this gate at a distinct even incarnation while a terminal
+/// successor is being proven.  The tc links must already exist at that point:
+/// their exact program identity is part of the broker-authenticated successor
+/// receipt.  Passing an skb unchanged here therefore keeps those linked
+/// programs traffic-inert until the exact durable admission activation write.
+/// Missing, zero, and even values all fail open only in the narrow tc sense
+/// (`TC_ACT_OK`): they never classify, drop, redirect, mutate, or publish.
+#[inline(always)]
+fn traffic_gate_allows_packet_effects() -> bool {
+    let Some(gate_ptr) = GTPU_OBS_GATE.get_ptr(GTPU_TRAFFIC_OBSERVATION_GATE_INDEX) else {
+        return false;
+    };
+    // SAFETY: the gate is a live array value written only by the loader. A
+    // volatile load prevents compiler reuse across the classifier boundary.
+    let gate = unsafe { core::ptr::read_volatile(gate_ptr) };
+    gate != 0 && gate & 1 == 1
+}
+
 /// Enter the observation publication critical section for one exact loader
 /// gate incarnation. The per-CPU scratch remains nonzero until after the ring
 /// record is submitted, allowing userspace to prove every old producer has
@@ -2898,6 +2918,9 @@ fn handle_grouped_downlink_ipv4(
 
 #[classifier]
 pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32 {
+    if !traffic_gate_allows_packet_effects() {
+        return TC_ACT_OK;
+    }
     let mark = packet_mark(&ctx);
     let Ok(eth_proto) = ctx.load::<u16>(12) else {
         return non_encapsulation_action(mark);
@@ -2923,6 +2946,9 @@ pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn opc_gtpu_downlink(mut ctx: TcContext) -> i32 {
+    if !traffic_gate_allows_packet_effects() {
+        return TC_ACT_OK;
+    }
     let Ok(ether_type) = ctx.load::<u16>(12) else {
         return TC_ACT_OK;
     };
@@ -5550,6 +5576,57 @@ mod tests {
         let authority_decoded = false;
         assert!(!authority_decoded);
         assert!(!grouped_index_permits_v5_fallback(index_was_retained));
+    }
+
+    #[test]
+    fn successor_traffic_gate_passes_packets_before_exact_activation() {
+        // A host unit test cannot execute a loaded tc classifier, so prove the
+        // actual classifier-root contract directly: every disabled successor
+        // incarnation returns before its first packet read, authority lookup,
+        // redirect, drop, or packet mutation. The loader can activate only an
+        // odd incarnation after the broker has admitted the exact receipt.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        for (classifier, terminator, first_packet_read) in [
+            (
+                "pub fn opc_gtpu_uplink(mut ctx: TcContext)",
+                "#[classifier]\npub fn opc_gtpu_downlink",
+                "let mark = packet_mark(&ctx);",
+            ),
+            (
+                "pub fn opc_gtpu_downlink(mut ctx: TcContext)",
+                "/// Uplink: inner IPv4 packet",
+                "let Ok(ether_type) = ctx.load::<u16>(12)",
+            ),
+        ] {
+            let (_, root) = source
+                .split_once(classifier)
+                .expect("tc classifier root is present");
+            let (root, _) = root
+                .split_once(terminator)
+                .expect("tc classifier root has a bounded body");
+            let root = root
+                .trim_start()
+                .strip_prefix('{')
+                .expect("classifier body begins after its signature")
+                .trim_start();
+            assert!(root.starts_with("if !traffic_gate_allows_packet_effects()"));
+            let first_effect = root
+                .find(first_packet_read)
+                .expect("packet-processing body is present");
+            let gate = &root[..first_effect];
+            assert!(gate.contains("return TC_ACT_OK;"));
+            assert!(!gate.contains("bpf_redirect"));
+            assert!(!gate.contains("TC_ACT_SHOT"));
+            assert!(!gate.contains("bpf_skb_"));
+        }
+
+        // Missing, zero, and every even retained incarnation are inert; the
+        // one activation transition is a distinct odd value.
+        let gate = |value: u64| value != 0 && value & 1 == 1;
+        assert!(!gate(0));
+        assert!(!gate(2));
+        assert!(gate(3));
+        assert!(!gate(4));
     }
 
     #[test]

@@ -249,6 +249,9 @@ impl std::error::Error for FencedUdpChannelError {}
 ///
 /// Returns a redaction-safe stage error while retaining an exact unreleased
 /// lease whenever safe release was not proven.
+// The public error carries the exact unreleased lease required for conservative
+// expiry handling; boxing it would change the established error API.
+#[allow(clippy::result_large_err)]
 pub async fn run_fenced_udp_guardian<A>(
     mut socket: FencedUdpSocket,
     authority: &A,
@@ -389,6 +392,8 @@ where
         .map_err(FencedUdpGuardianError::Retirement)
 }
 
+// This helper preserves the guardian error's exact unreleased lease evidence.
+#[allow(clippy::result_large_err)]
 async fn retire_with_operational_error<A>(
     mut socket: FencedUdpSocket,
     authority: &A,

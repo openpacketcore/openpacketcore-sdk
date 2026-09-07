@@ -3976,7 +3976,8 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         StoreError::StaleFence
         | StoreError::LeaseHeld
         | StoreError::LeaseExpired
-        | StoreError::CasConflict => {
+        | StoreError::CasConflict
+        | StoreError::SessionRecordReserved => {
             IpsecLbError::ownership_conflict("session re-pin journal write is contended")
         }
         StoreError::TopologyAuthorityRevoked => IpsecLbError::ownership_conflict(
@@ -3998,6 +3999,24 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
                 "session re-pin journal mutation outcome is unavailable",
             ),
         ),
+        StoreError::FencedTransitionOutcomeUnknown | StoreError::FencedTransitionRequestExpired => {
+            IpsecLbError::io(
+                "session_repin_fenced_transition",
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "session re-pin journal fenced transition outcome is unavailable",
+                ),
+            )
+        }
+        StoreError::FencedTransitionRequestConflict => IpsecLbError::invalid_config(
+            "session_repin.fenced_transition",
+            "session re-pin journal fenced transition identity was reused",
+        ),
+        StoreError::FencedTransitionHistoryFull
+        | StoreError::FencedTransitionRetentionExhausted
+        | StoreError::FencedTransitionStorageExhausted
+        | StoreError::FencedTransitionHistoryEpochRetired
+        | StoreError::FencedTransitionHistoryEpochNotActive => IpsecLbError::Unsupported,
         StoreError::InvalidSessionTtl => IpsecLbError::invalid_config(
             "session_repin.ttl",
             "session re-pin journal TTL is invalid",
@@ -4044,6 +4063,7 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tokio::sync::Notify;
@@ -4078,11 +4098,65 @@ mod tests {
     }
 
     #[test]
-    fn topology_authority_revocation_maps_to_ownership_conflict() {
-        assert!(matches!(
-            map_store_error(StoreError::TopologyAuthorityRevoked),
-            IpsecLbError::OwnershipConflict { .. }
-        ));
+    fn topology_authority_and_roster_reservation_map_to_ownership_conflict() {
+        for error in [
+            StoreError::TopologyAuthorityRevoked,
+            StoreError::SessionRecordReserved,
+        ] {
+            assert!(matches!(
+                map_store_error(error),
+                IpsecLbError::OwnershipConflict { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn fenced_transition_errors_preserve_ambiguity_and_definite_rejections() {
+        for (error, expected) in [
+            (
+                StoreError::FencedTransitionRequestConflict,
+                IpsecLbError::invalid_config(
+                    "session_repin.fenced_transition",
+                    "session re-pin journal fenced transition identity was reused",
+                ),
+            ),
+            (
+                StoreError::FencedTransitionOutcomeUnknown,
+                IpsecLbError::io(
+                    "session_repin_fenced_transition",
+                    io::Error::new(io::ErrorKind::ConnectionAborted, "outcome unavailable"),
+                ),
+            ),
+            (
+                StoreError::FencedTransitionRequestExpired,
+                IpsecLbError::io(
+                    "session_repin_fenced_transition",
+                    io::Error::new(io::ErrorKind::ConnectionAborted, "outcome unavailable"),
+                ),
+            ),
+            (
+                StoreError::FencedTransitionHistoryFull,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionRetentionExhausted,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochRetired,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochNotActive,
+                IpsecLbError::Unsupported,
+            ),
+        ] {
+            assert_eq!(map_store_error(error), expected);
+        }
     }
 
     const SESSION_SA_COUNT: usize = 4;

@@ -1733,9 +1733,12 @@ impl ServingNetwork {
 
 /// Fully Qualified Tunnel Endpoint Identifier IE (type 87).
 ///
+/// Collection identity and total ordering use the exact lexicographic tuple
+/// `(interface_type, teid, IPv4 presence/value, IPv6 presence/value)`.
+///
 /// @spec 3GPP TS29274 R18 8.22
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-FTEID-001
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FullyQualifiedTeid {
     /// Six-bit GTPv2-C interface type.
     pub interface_type: u8,

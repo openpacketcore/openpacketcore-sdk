@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use opc_consensus::DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_redaction::metrics::METRICS;
 use opc_session_net::protocol::{
@@ -21,8 +22,9 @@ use opc_session_net::{
 use opc_session_store::fake::FakeSessionBackend;
 use opc_session_store::{
     QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, SessionBackend, SessionConsensusPeer, SessionConsensusRpcFamily,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    ReplicaId, ReplicaTlsIdentity, SessionBackend, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse,
 };
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder,
@@ -460,7 +462,7 @@ async fn generic_unsigned_eof_remains_a_failure(
     );
 }
 
-async fn consensus_client_retries_authenticated_bootstrap_retirement(
+async fn consensus_client_defers_authenticated_bootstrap_retirement_to_later_call(
     pki: &TestPki,
     manifest: &Arc<SessionReplicationManifest>,
 ) {
@@ -552,10 +554,27 @@ async fn consensus_client_retries_authenticated_bootstrap_retirement(
     let before = MetricSnapshot::capture();
 
     assert_eq!(
+        peer.call(request.clone()).await,
+        Err(SessionConsensusPeerError::Unavailable),
+        "the authenticated no-Call receipt reports pre-Call unavailability"
+    );
+    assert_eq!(
+        peer.call(request.clone()).await,
+        Err(SessionConsensusPeerError::Unavailable),
+        "the immediate same-epoch call cannot reach the fixed boundary and remains promptly NotTransmitted"
+    );
+    assert_eq!(
+        MetricSnapshot::capture().since(before).attempts,
+        1,
+        "the inside-window call starts no second physical setup"
+    );
+    tokio::time::sleep(DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL).await;
+    assert_eq!(
         peer.call(request).await,
         Ok(SessionConsensusWireResponse {
             result: Ok(b"consensus-bootstrap-retry".to_vec()),
-        })
+        }),
+        "a genuinely later call may recover through a fresh setup"
     );
     assert_eq!(server.await.expect("consensus retry server"), 1);
     let delta = MetricSnapshot::capture().since(before);
@@ -564,6 +583,137 @@ async fn consensus_client_retries_authenticated_bootstrap_retirement(
     assert_eq!(
         (delta.material_retirements, delta.explicit_retirements),
         (0, 0)
+    );
+    delta.assert_no_failures();
+}
+
+async fn consensus_client_material_epoch_successor_bypasses_authenticated_retirement_gate(
+    pki: &TestPki,
+    manifest: &Arc<SessionReplicationManifest>,
+) {
+    let (_server_source, server_config) = pki.server_source(SERVER_REPLICA);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind consensus material-successor listener");
+    let address = listener
+        .local_addr()
+        .expect("consensus material-successor address");
+    let server = tokio::spawn(async move {
+        let mut application_calls = 0;
+        for attempt in 0..2 {
+            let mut tls = accept_tls(&listener, &server_config, SESSION_CONSENSUS_ALPN).await;
+            let hello: serde_json::Value = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read consensus material-successor Hello");
+            if attempt == 0 {
+                write_frame(&mut tls, &serde_json::json!({"Rejected": "Rejected"}))
+                    .await
+                    .expect("write authenticated retirement control");
+                continue;
+            }
+            let hello = &hello["Hello"];
+            write_frame(
+                &mut tls,
+                &serde_json::json!({
+                    "Accepted": {
+                        "transport_revision": hello["transport_revision"].clone(),
+                        "contract_profile": hello["contract_profile"].clone(),
+                        "identity": hello["identity"].clone(),
+                        "server_node_id": hello["expected_server_node_id"].clone(),
+                        "accepted_sender_node_id": hello["sender_node_id"].clone(),
+                        "handshake_nonce": hello["handshake_nonce"].clone(),
+                        "accepted_response_frame_size": hello["requested_response_frame_size"].clone(),
+                        "server_request_frame_size": opc_session_net::MAX_NEGOTIATED_FRAME_SIZE as u32,
+                    }
+                }),
+            )
+            .await
+            .expect("write material-successor acknowledgement");
+            let call: serde_json::Value = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read material-successor consensus call");
+            let call = &call["Call"];
+            application_calls += 1;
+            write_frame(
+                &mut tls,
+                &serde_json::json!({
+                    "Call": {
+                        "call_id": call["call_id"].clone(),
+                        "response": {"result": {"Ok": call["request"]["payload"].clone()}},
+                    }
+                }),
+            )
+            .await
+            .expect("write material-successor response");
+        }
+        application_calls
+    });
+    let (client_source, client_config) = pki.client_source(CLIENT_REPLICA);
+    let binding = manifest
+        .bind_local(replica_id(CLIENT_REPLICA))
+        .expect("client binding")
+        .bind_remote(replica_id(SERVER_REPLICA))
+        .expect("remote binding");
+    let identity = binding.consensus_identity();
+    let remote_node_id = binding.remote_consensus_node_id();
+    let request = SessionConsensusWireRequest::try_new(
+        identity,
+        binding.local_consensus_node_id(),
+        SessionConsensusRpcFamily::Vote,
+        b"material-epoch-successor".to_vec(),
+    )
+    .expect("bounded material-successor request");
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        binding,
+        resolver(address),
+        client_config.clone(),
+        Some(Duration::from_secs(2)),
+    )
+    .with_connection_lifecycle(lifecycle_policy());
+    let before = MetricSnapshot::capture();
+
+    assert_eq!(
+        peer.call(request.clone()).await,
+        Err(SessionConsensusPeerError::Unavailable),
+        "the old authenticated material epoch reports pre-Call unavailability after retirement"
+    );
+    assert_eq!(MetricSnapshot::capture().since(before).attempts, 1);
+    let old_epoch = client_config.material_status().epoch();
+    client_source.send_replace(Some(pki.identity_state(CLIENT_REPLICA)));
+    wait_for_material_epoch(|| client_config.material_status(), old_epoch).await;
+    assert_eq!(
+        identity, request.identity,
+        "authority remains exact across material rotation"
+    );
+    assert_eq!(
+        remote_node_id,
+        manifest
+            .bind_local(replica_id(CLIENT_REPLICA))
+            .expect("same local binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("same remote binding")
+            .remote_consensus_node_id(),
+        "peer identity remains exact across material rotation"
+    );
+    assert_eq!(
+        peer.call(request).await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"material-epoch-successor".to_vec()),
+        }),
+        "a newer authenticated material epoch bypasses the old retirement gate immediately"
+    );
+    assert_eq!(
+        server.await.expect("consensus material-successor server"),
+        1,
+        "the successor receives exactly one Openraft Call"
+    );
+    let delta = MetricSnapshot::capture().since(before);
+    assert_eq!((delta.attempts, delta.successes), (2, 2));
+    assert_eq!((delta.reconnect_attempts, delta.reconnect_failures), (1, 0));
+    assert_eq!(
+        (delta.material_retirements, delta.explicit_retirements),
+        (0, 0),
+        "only TLS material changed; the old rejected bootstrap has no cached lane retirement"
     );
     delta.assert_no_failures();
 }
@@ -633,8 +783,20 @@ async fn consensus_partial_retirement_control_eof_remains_a_failure(
     .with_connection_lifecycle(lifecycle_policy());
     let before = MetricSnapshot::capture();
 
-    assert!(peer.call(request).await.is_err());
-    server.await.expect("partial consensus retirement server");
+    assert_eq!(
+        peer.call(request.clone()).await,
+        Err(SessionConsensusPeerError::Unavailable),
+        "the partial authenticated bootstrap frame terminates this logical call"
+    );
+    assert_eq!(
+        peer.call(request).await,
+        Err(SessionConsensusPeerError::Protocol),
+        "a genuinely later call observes the complete protocol rejection"
+    );
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("partial consensus retirement server timeout")
+        .expect("partial consensus retirement server");
     let delta = MetricSnapshot::capture().since(before);
     assert_eq!(delta.attempts, 2);
     assert!(delta.transport_failures >= 1);
@@ -821,7 +983,12 @@ fn authenticated_pre_hello_rotation_is_explicit_bounded_and_metric_clean() {
         let manifest = manifest();
 
         generic_client_retries_authenticated_bootstrap_retirement(&pki, &manifest).await;
-        consensus_client_retries_authenticated_bootstrap_retirement(&pki, &manifest).await;
+        consensus_client_defers_authenticated_bootstrap_retirement_to_later_call(&pki, &manifest)
+            .await;
+        consensus_client_material_epoch_successor_bypasses_authenticated_retirement_gate(
+            &pki, &manifest,
+        )
+        .await;
         generic_unsigned_eof_remains_a_failure(&pki, &manifest).await;
         consensus_partial_retirement_control_eof_remains_a_failure(&pki, &manifest).await;
         assert_generic_server_pre_hello_rotation(&pki, &manifest, RotationRace::Material).await;

@@ -32,7 +32,10 @@ use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::backend::{CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp};
+use crate::backend::{
+    CompareAndSet, CompareAndSetResult, ProtectedRosterEstablishedSuccessor, ReplicationEntry,
+    ReplicationOp,
+};
 use crate::capability::BackendCapabilities;
 use crate::clock::Clock;
 use crate::error::{LeaseError, StoreError};
@@ -2133,9 +2136,49 @@ fn collect_cache_changes(
             ReplicationOp::DeleteFenced { key, .. } if namespace.owns_session_key(key) => {
                 changes.push(CacheChange::Remove(namespace.opaque_key(key)?));
             }
+            ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                ..
+            } if namespace.owns_session_key(key) => {
+                if &expected_record.key != key {
+                    return Err(FencedOwnershipError::InvalidRecord);
+                }
+                match &**successor {
+                    ProtectedRosterEstablishedSuccessor::Put { record } => {
+                        if &record.key != key {
+                            return Err(FencedOwnershipError::InvalidRecord);
+                        }
+                        changes.push(CacheChange::Upsert(
+                            decode_record(namespace, record)?.public,
+                        ));
+                    }
+                    ProtectedRosterEstablishedSuccessor::Delete => {
+                        changes.push(CacheChange::Remove(namespace.opaque_key(key)?));
+                    }
+                    ProtectedRosterEstablishedSuccessor::NoOp => {
+                        changes.push(CacheChange::Upsert(
+                            decode_record(namespace, expected_record)?.public,
+                        ));
+                    }
+                }
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. }
+                if namespace.owns_session_key(key) =>
+            {
+                if &record.key != key || record.generation != crate::Generation::new(1) {
+                    return Err(FencedOwnershipError::InvalidRecord);
+                }
+                changes.push(CacheChange::Upsert(
+                    decode_record(namespace, record)?.public,
+                ));
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::CompareAndSet { .. }
             | ReplicationOp::DeleteFenced { .. }
+            | ReplicationOp::ProtectedRosterEstablished { .. }
+            | ReplicationOp::ProtectedRosterEstablishedCreate { .. }
             | ReplicationOp::RefreshTtl { .. }
             | ReplicationOp::AcquireLease { .. }
             | ReplicationOp::RenewLease { .. }

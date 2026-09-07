@@ -35,7 +35,9 @@ fn decode_hex(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0);
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect()
 }

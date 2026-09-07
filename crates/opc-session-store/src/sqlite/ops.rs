@@ -20,12 +20,13 @@ use crate::{
     restore::{
         restore_record_retained_bytes_from_lengths, RestoreScanCursor, RestoreScanPage,
         RestoreScanRequest, RestoreScanScope, RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES,
-        RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
-        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_SQLITE_VM_STEPS,
-        RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
+        RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+        RESTORE_SCAN_MAX_SQLITE_VM_STEPS, RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
     },
     ttl::{checked_session_deadline, validate_stored_record_expiry_at},
 };
+
+use super::RestoreScanValidationProfile;
 
 const RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL: i32 = 1_000;
 const RESTORE_SCAN_TENANT_MAX_BYTES: usize = 128;
@@ -121,6 +122,28 @@ pub(crate) fn persisted_u64(value: i64) -> Result<u64, StoreError> {
         .map_err(|_| StoreError::Serialization("persisted session integer is negative".to_string()))
 }
 
+pub(crate) fn persisted_session_key(
+    tenant_str: String,
+    nf_kind_str: String,
+    key_type_str: String,
+    stable_id: Vec<u8>,
+) -> Result<SessionKey, StoreError> {
+    let tenant = opc_types::TenantId::new(tenant_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let nf_kind = opc_types::NetworkFunctionKind::new(nf_kind_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let key_type = SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
+    let stable_id = crate::StableId::try_from(stable_id).map_err(|_| {
+        StoreError::Serialization("persisted stable session identifier is invalid".into())
+    })?;
+    Ok(SessionKey {
+        tenant,
+        nf_kind,
+        key_type,
+        stable_id,
+    })
+}
+
 pub(crate) fn sqlite_u64(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value)
         .map_err(|_| StoreError::Serialization("session integer exceeds SQLite range".to_string()))
@@ -145,6 +168,14 @@ pub(crate) fn format_rfc3339_normalized(ts: Timestamp) -> String {
         odt.second(),
         odt.nanosecond()
     )
+}
+
+/// Parse the exact normalized timestamp representation used for persisted
+/// lease authority. `None` is reserved for migrated pre-acquisition rows.
+pub(crate) fn persisted_normalized_timestamp(value: Option<String>) -> Option<Timestamp> {
+    let value = value?;
+    let timestamp = Timestamp::from_str(value.as_str()).ok()?;
+    (format_rfc3339_normalized(timestamp) == value).then_some(timestamp)
 }
 
 pub(crate) fn initialize_restore_scan_metadata_sync(conn: &Connection) -> Result<(), StoreError> {
@@ -324,7 +355,7 @@ pub(crate) fn validate_fenced_mutation_sync(
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT active, credential_id, owner, fence, guard_expires_at
+            SELECT active, credential_id, owner, fence, acquired_at, guard_expires_at
             FROM leases
             WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
             "#,
@@ -345,14 +376,17 @@ pub(crate) fn validate_fenced_mutation_sync(
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-    let Some((active, credential_id, owner_str, fence, guard_expires_at_str)) = row else {
+    let Some((active, credential_id, owner_str, fence, acquired_at_str, guard_expires_at_str)) =
+        row
+    else {
         return Err(StoreError::StaleFence);
     };
 
@@ -372,10 +406,13 @@ pub(crate) fn validate_fenced_mutation_sync(
         return Err(StoreError::StaleFence);
     }
 
-    let guard_expires_at = opc_types::Timestamp::from_str(guard_expires_at_str.as_str())
-        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+    let guard_expires_at =
+        persisted_normalized_timestamp(Some(guard_expires_at_str)).ok_or(StoreError::StaleFence)?;
+    let acquired_at = persisted_normalized_timestamp(acquired_at_str)
+        .filter(|acquired_at| *acquired_at <= guard_expires_at)
+        .ok_or(StoreError::StaleFence)?;
 
-    if guard_expires_at != lease.expires_at() {
+    if guard_expires_at != lease.expires_at() || acquired_at != lease.acquired_at() {
         return Err(StoreError::StaleFence);
     }
 
@@ -423,6 +460,18 @@ pub(crate) fn get_sync(
     conn: &Connection,
     key: &SessionKey,
     now: Timestamp,
+) -> Result<Option<StoredSessionRecord>, StoreError> {
+    Ok(get_raw_sync(conn, key)?.filter(|record| !record.is_expired_at(now)))
+}
+
+/// Read and hydrate the exact stored session row without applying logical TTL.
+///
+/// This is an internal persistence primitive for callers that must compare a
+/// durable raw pre-state. It deliberately does not prune or otherwise mutate
+/// the database, and an expired row is returned as present.
+pub(crate) fn get_raw_sync(
+    conn: &Connection,
+    key: &SessionKey,
 ) -> Result<Option<StoredSessionRecord>, StoreError> {
     let mut stmt = conn
         .prepare(
@@ -482,7 +531,7 @@ pub(crate) fn get_sync(
         _ => {
             return Err(StoreError::Serialization(format!(
                 "unknown state class: {state_class_str}"
-            )))
+            )));
         }
     };
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
@@ -513,7 +562,7 @@ pub(crate) fn get_sync(
         _ => {
             return Err(StoreError::Serialization(format!(
                 "unknown payload encoding: {encoding}"
-            )))
+            )));
         }
     };
 
@@ -528,12 +577,7 @@ pub(crate) fn get_sync(
         payload,
     };
 
-    let result = if record.is_expired_at(now) {
-        None
-    } else {
-        Some(record)
-    };
-    Ok(result)
+    Ok(Some(record))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -577,7 +621,7 @@ impl RestoreScanCandidate {
             _ => {
                 return Err(StoreError::Serialization(
                     "persisted session timestamp is invalid".into(),
-                ))
+                ));
             }
         };
         Ok(Self {
@@ -709,7 +753,7 @@ fn restore_scan_row_budget(row: &Row<'_>) -> Result<RestoreScanRowBudget, StoreE
         _ => {
             return Err(StoreError::Serialization(
                 "persisted session timestamp is invalid".into(),
-            ))
+            ));
         }
     };
     let payload_bytes = usize::try_from(restore_scan_integer(row, 10)?).map_err(|_| {
@@ -777,7 +821,7 @@ pub(crate) fn scan_restore_records_sync(
     now: Timestamp,
     cancellation: Arc<AtomicBool>,
     operation_deadline: std::time::Instant,
-    prune_expired: bool,
+    profile: RestoreScanValidationProfile,
 ) -> Result<RestoreScanPage, StoreError> {
     request.validate()?;
     let _progress_guard =
@@ -785,7 +829,7 @@ pub(crate) fn scan_restore_records_sync(
     if cancellation.load(Ordering::Acquire) {
         return Err(StoreError::RestoreScanWorkBudgetExceeded);
     }
-    if prune_expired {
+    if profile.is_standalone() {
         prune_sync(conn, now)?;
     }
     let (backend_epoch, snapshot_revision, cursor_key) = read_restore_scan_state_sync(conn)?;
@@ -863,10 +907,17 @@ pub(crate) fn scan_restore_records_sync(
         let previous_last_examined_key = last_examined_key.clone();
 
         if candidate.matches_scope(&request.scope) {
-            if row_budget.payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            let max_payload_bytes = profile.max_payload_bytes();
+            if row_budget.payload_bytes > max_payload_bytes {
+                if profile == RestoreScanValidationProfile::Consensus {
+                    return Err(StoreError::PayloadTooLarge {
+                        actual: row_budget.payload_bytes,
+                        max: max_payload_bytes,
+                    });
+                }
                 if examined_count == 0 && candidates.is_empty() {
                     return Err(StoreError::RestoreScanResponseTooLarge {
-                        max_bytes: RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+                        max_bytes: max_payload_bytes,
                     });
                 }
                 has_more = true;
@@ -875,7 +926,7 @@ pub(crate) fn scan_restore_records_sync(
             let next_payload_bytes = payload_bytes
                 .checked_add(row_budget.payload_bytes)
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-            if next_payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            if next_payload_bytes > max_payload_bytes {
                 has_more = true;
                 break;
             }
@@ -940,7 +991,9 @@ pub(crate) fn scan_restore_records_sync(
         if cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= operation_deadline {
             return Err(StoreError::RestoreScanWorkBudgetExceeded);
         }
-        records.push(candidate.load_record(conn)?);
+        let record = candidate.load_record(conn)?;
+        profile.validate_record(&record)?;
+        records.push(record);
     }
 
     if cancellation.load(Ordering::Acquire) {
@@ -991,12 +1044,7 @@ pub(crate) fn stored_record_from_row(
     payload_bytes: Vec<u8>,
     encoding: i64,
 ) -> Result<StoredSessionRecord, StoreError> {
-    let tenant = opc_types::TenantId::new(tenant_str)
-        .map_err(|err| StoreError::Serialization(err.to_string()))?;
-    let nf_kind = opc_types::NetworkFunctionKind::new(nf_kind_str)
-        .map_err(|err| StoreError::Serialization(err.to_string()))?;
-    let key_type =
-        crate::SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
+    let key = persisted_session_key(tenant_str, nf_kind_str, key_type_str, stable_id)?;
     let owner = persisted_owner_id(owner_str)?;
     let state_class = state_class_from_str(&state_class_str)?;
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
@@ -1010,14 +1058,7 @@ pub(crate) fn stored_record_from_row(
     let payload = payload_from_row(payload_bytes, encoding)?;
 
     Ok(StoredSessionRecord {
-        key: SessionKey {
-            tenant,
-            nf_kind,
-            key_type,
-            stable_id: crate::StableId::try_from(stable_id).map_err(|_| {
-                StoreError::Serialization("persisted stable session identifier is invalid".into())
-            })?,
-        },
+        key,
         generation: Generation::new(persisted_u64(generation)?),
         owner,
         fence: FenceToken::new(persisted_u64(fence)?),
@@ -1117,6 +1158,55 @@ pub(crate) fn insert_or_replace_record_sync(
     Ok(())
 }
 
+/// Insert one authoritative row only when its exact key remains absent.
+///
+/// Protected-roster terminal creation uses this after an in-transaction
+/// absence comparison. Unlike the ordinary upsert helper, a violated absence
+/// predicate remains a no-effect conflict and can never overwrite a row.
+pub(crate) fn insert_record_if_absent_sync(
+    conn: &Connection,
+    record: &StoredSessionRecord,
+) -> Result<(), StoreError> {
+    let expires_at_str = record.expires_at.map(format_rfc3339_normalized);
+    let encoding_val = match record.payload.encoding() {
+        SessionPayloadEncoding::Plaintext => 0,
+        SessionPayloadEncoding::LegacyPlaintext => 1,
+        SessionPayloadEncoding::EnvelopeV1 => 2,
+        SessionPayloadEncoding::Unclassified => 3,
+    };
+
+    let inserted = conn
+        .execute(
+            r#"
+            INSERT INTO session_records (
+                tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                record.key.tenant.as_str(),
+                record.key.nf_kind.as_str(),
+                record.key.key_type.to_string(),
+                record.key.stable_id.as_ref(),
+                sqlite_u64(record.generation.get())?,
+                record.owner.as_str(),
+                sqlite_u64(record.fence.get())?,
+                record.state_class.to_string(),
+                record.state_type.as_str(),
+                expires_at_str,
+                record.payload.as_bytes(),
+                encoding_val,
+            ],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("session create conflict".into()))?;
+    if inserted != 1 {
+        return Err(StoreError::BackendUnavailable(
+            "session create conflict".into(),
+        ));
+    }
+    advance_restore_scan_revision_sync(conn)?;
+    Ok(())
+}
+
 pub(crate) fn insert_or_replace_fence_sync(
     conn: &Connection,
     key: &SessionKey,
@@ -1143,7 +1233,7 @@ pub(crate) fn insert_or_replace_fence_sync(
 
 pub(crate) fn compare_and_set_sync(
     conn: &Connection,
-    op: CompareAndSet,
+    op: &CompareAndSet,
     caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<CompareAndSetResult, StoreError> {
@@ -1306,6 +1396,79 @@ pub(crate) fn refresh_ttl_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    #[test]
+    fn raw_get_returns_logically_expired_row_without_deleting_it() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session_records (
+                tenant TEXT NOT NULL,
+                nf_kind TEXT NOT NULL,
+                key_type TEXT NOT NULL,
+                stable_id BLOB NOT NULL,
+                generation INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                fence INTEGER NOT NULL,
+                state_class TEXT NOT NULL,
+                state_type TEXT NOT NULL,
+                expires_at TEXT,
+                payload BLOB NOT NULL,
+                encoding INTEGER NOT NULL,
+                PRIMARY KEY (tenant, nf_kind, key_type, stable_id)
+            );
+            "#,
+        )
+        .expect("session table");
+        let key = SessionKey {
+            tenant: TenantId::from_static("raw-get-tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"raw-get-key")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let expires_at =
+            Timestamp::from_str("2026-08-25T00:00:00.000000000Z").expect("expiry timestamp");
+        conn.execute(
+            "INSERT INTO session_records \
+             (tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding) \
+             VALUES (?1, ?2, ?3, ?4, 7, 'raw-get-owner', 9, 'authoritative-session', 'raw-get-state', ?5, X'0102', 0)",
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+                format_rfc3339_normalized(expires_at),
+            ],
+        )
+        .expect("expired row");
+
+        let raw = get_raw_sync(&conn, &key)
+            .expect("raw read")
+            .expect("raw row remains present");
+        assert_eq!(raw.key, key);
+        assert_eq!(raw.generation, Generation::new(7));
+        assert_eq!(raw.fence, FenceToken::new(9));
+        assert_eq!(raw.expires_at, Some(expires_at));
+
+        let logical_time =
+            Timestamp::from_str("2026-08-25T00:00:00.000000001Z").expect("logical timestamp");
+        assert_eq!(
+            get_sync(&conn, &key, logical_time).expect("logical read"),
+            None
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("raw row count"),
+            1,
+            "neither raw nor logical get physically prunes the expired row"
+        );
+    }
 
     #[test]
     fn restore_continuation_uses_primary_key_range_search() {

@@ -1,7 +1,7 @@
 //! Product-neutral authority gate for consensus-backed config servers.
 
 use async_trait::async_trait;
-use opc_types::{ConfigVersion, TxId};
+use opc_types::{ConfigVersion, Timestamp, TxId};
 use thiserror::Error;
 
 /// Maximum encoded leader-hint length accepted at the management boundary.
@@ -105,6 +105,56 @@ pub enum ConfigAuthorityOutcome {
     Unavailable,
 }
 
+/// Result of one authoritative in-place projection rebuild.
+///
+/// The worker keeps this payload-free metadata private to its control path;
+/// it uses the deadline to replace its existing commit-confirmed expiry timer
+/// only after the authority owner has completed its final proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigProjectionPublication {
+    head: ConfigProjectionHead,
+    pending_confirmed_deadline: Option<Timestamp>,
+}
+
+impl ConfigProjectionPublication {
+    /// Builds publication metadata for an already rebuilt live projection.
+    pub const fn new(
+        head: ConfigProjectionHead,
+        pending_confirmed_deadline: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            head,
+            pending_confirmed_deadline,
+        }
+    }
+
+    /// Returns the exact transaction/version head now in the live slot.
+    pub const fn head(self) -> ConfigProjectionHead {
+        self.head
+    }
+
+    /// Returns the recovered confirmed-commit expiry deadline, if one exists.
+    pub const fn pending_confirmed_deadline(self) -> Option<Timestamp> {
+        self.pending_confirmed_deadline
+    }
+}
+
+/// Worker-owned operation that rebuilds and atomically publishes one live
+/// authoritative projection.
+///
+/// Only an authority port invokes this callback. Keeping it boxed and owned by
+/// the config-bus worker prevents an external caller cancellation from
+/// detaching publication from the store-owned leader-open admission guard.
+#[async_trait]
+pub trait ConfigProjectionRebuilder: Send {
+    /// Rebuilds from the locally applied committed source and publishes only
+    /// when that source exactly matches `expected`.
+    async fn rebuild(
+        self: Box<Self>,
+        expected: ConfigProjectionHead,
+    ) -> Result<ConfigProjectionPublication, crate::StoreError>;
+}
+
 /// Injected writer-of-record gate shared by management protocol servers.
 ///
 /// Consensus consumers adapt their engine-owned linearizability outcome to
@@ -122,6 +172,19 @@ pub trait ConfigAuthorityPort: Send + Sync {
         operation: ConfigAuthorityOperation,
         projection: ConfigProjectionHead,
     ) -> ConfigAuthorityOutcome;
+
+    /// Runs a worker-owned live-projection rebuild while this port retains its
+    /// own local-authority proof through publication and final verification.
+    ///
+    /// Implementations that cannot provide a cancellation-safe held proof
+    /// leave the default fail-closed result in place. This additive method
+    /// preserves existing mutation-only authority ports.
+    async fn reconcile_local_projection(
+        &self,
+        _rebuild: Box<dyn ConfigProjectionRebuilder>,
+    ) -> Result<ConfigProjectionPublication, ConfigAuthorityOutcome> {
+        Err(ConfigAuthorityOutcome::Unavailable)
+    }
 }
 
 #[cfg(test)]

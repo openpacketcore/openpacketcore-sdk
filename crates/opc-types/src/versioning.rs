@@ -134,7 +134,7 @@ impl FromStr for SchemaDigest {
         let value = validate_hex("schema digest", value, 64)?;
         let mut bytes = [0_u8; 32];
 
-        for (idx, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (idx, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let high = hex_nibble("schema digest", chunk[0])?;
             let low = hex_nibble("schema digest", chunk[1])?;
             bytes[idx] = (high << 4) | low;

@@ -24,12 +24,12 @@ fn fixture_nibble(value: u8) -> u8 {
 }
 
 fn decode_hex_fixture(value: &str) -> Vec<u8> {
-    let mut chunks = value.as_bytes().chunks_exact(2);
+    let (chunks, remainder) = value.as_bytes().as_chunks::<2>();
     let bytes = chunks
-        .by_ref()
+        .iter()
         .map(|pair| (fixture_nibble(pair[0]) << 4) | fixture_nibble(pair[1]))
         .collect::<Vec<_>>();
-    assert!(chunks.remainder().is_empty(), "odd fixture hex length");
+    assert!(remainder.is_empty(), "odd fixture hex length");
     bytes
 }
 

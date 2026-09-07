@@ -2548,12 +2548,8 @@ fn traffic_selector_is_covered(
         return false;
     }
 
-    numeric_covers.sort_unstable_by_key(|cover| {
-        cover
-            .ports
-            .numeric_bounds()
-            .map_or((u16::MAX, u16::MAX), |(start, end)| (start, end))
-    });
+    numeric_covers
+        .sort_unstable_by_key(|cover| cover.ports.numeric_bounds().unwrap_or((u16::MAX, u16::MAX)));
     address_checkpoints.sort_unstable();
     address_checkpoints.dedup();
 

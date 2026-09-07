@@ -314,6 +314,59 @@ its vote/log/commit/application/membership state from SQLite and resumes
 through its normal recovery path. Keep readiness false until the fresh
 linearizable probe succeeds.
 
+For a fixed-immutable quorum, the snapshot directory must remain on a Linux
+filesystem with the fixed fs-verity v1/SHA-256/4 KiB profile available. Every
+referenced snapshot must retain its kernel seal across restart. Copying the
+same bytes to an unsealed inode, moving the directory to an unsupported
+filesystem, or leaving a writable alias open is a fail-closed storage error,
+not a rebootstrap or checksum-repair condition.
+
+#### Snapshot namespace trust contract
+
+The snapshot directory is a private SDK namespace. On Linux, admission retains
+an `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` directory descriptor;
+its `fstat` owner must be the service process's effective UID and
+`mode & 022` must be zero. The SDK rejects an insecure pre-existing directory,
+creates a missing namespace as `0700`, and creates artifacts as `0600`.
+Post-admission snapshot work is directory-FD-relative, so replacement of the
+parent pathname cannot redirect the admitted namespace work.
+
+Deploy cooperative SDK writers under one dedicated service UID and let the SDK
+leases serialize them. Use a private parent directory and do not share that UID
+with untrusted workloads. POSIX ACLs must not restore group-class write access:
+the ACL group-class mask as well as the mode must remain non-writable. Owner or
+mode mismatch fails closed.
+
+This is not a defense against `root`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, a
+non-cooperating same-eUID process, or a writable retained directory alias.
+Do not infer universal unlink-by-FD behavior or privileged-attacker resistance
+from the retained descriptor; those actors are outside this storage trust
+contract.
+
+This is also an explicit upgrade boundary for fixed-profile databases created
+before fs-verity enforcement. The new release does not silently seal an
+existing unsealed referenced snapshot at startup or accept it as an offline
+recovery source. Before starting the new binary, a product-owned, separately
+reviewed offline migration must:
+
+1. drain traffic and stop every old-version process and writable file alias;
+2. preserve a coherent rollback copy, then authenticate the fixed authority
+   profile and the exact current snapshot name, length, envelope checksum, and
+   database reference using the old release's durable state;
+3. hold that exact regular inode by a read-only descriptor, record its device
+   and inode, enable only fs-verity v1/SHA-256/4 KiB with no salt or signature,
+   measure the same descriptor, and prove the pathname still resolves to the
+   recorded inode; and
+4. start the complete upgraded voter set and require startup validation plus a
+   fresh linearizable readiness probe before restoring traffic.
+
+There is no generic SDK auto-migration command for this boundary. A missing or
+ambiguous authority profile, a reference/envelope mismatch, an unsupported
+filesystem, a changed inode, or any sealing/measurement error leaves the node
+closed. Restore the coherent rollback set or execute a separately approved
+reseed from authenticated authority; never copy the bytes to a mutable inode,
+edit snapshot metadata, or weaken fixed-profile admission.
+
 On open, the adapter first verifies any snapshot referenced by durable state.
 It then scans at most 8,192 directory entries and removes only recognized
 interrupted receive/build/install/promote, approved-recovery, SQLite-sidecar,
@@ -394,7 +447,7 @@ an `expiry - 30 seconds` soft boundary, followed by complete hard-deadline drain
 and source/controller `LastGoodExpired`; survivors continue canary progress and
 a valid long-lived leaf restores the affected member in the same process. The
 replacement proof uses the schedule-bound
-`member-scoped-reauth-settled-baseline/v3` checkpoint: its 86-second clock and
+`member-scoped-reauth-settled-baseline/v4` checkpoint: its 86-second clock and
 60-second two-stage server tail begin at the atomic projected-data rename, and
 a final 2.5-second outbound-ledger quiet tail completes the horizon. A
 prepublication common-key pulse plus 13-second observation checkpoints requires
@@ -402,8 +455,10 @@ one active key to advance on every survivor observer and conservatively bounds
 that pulse's worst-case actual event gap to 26 seconds. An independent 26-second
 checkpoint requires every active key on every observer and cannot be reset by a
 faster key. Each survivor may record at most one rejoin availability episode;
-it must recover within that 26-second SLO and settle before the clean baseline,
-and a second or late episode fails closed. Fault-era new-attempt and reconnect
+its consecutive typed retry outcomes remain separately bounded by the
+unchanged eight-outcome ceiling. It must recover within that 26-second SLO and
+settle before the clean baseline, and a second or late episode fails closed.
+Fault-era new-attempt and reconnect
 deltas remain inside the fixed 85/161 per-node bound (ordinary 24/40, fifteen
 five-second refresh rounds over four/eight incident paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved

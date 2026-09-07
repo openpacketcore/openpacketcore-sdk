@@ -10285,31 +10285,29 @@ mod tests {
         crate::session::SessionOwnershipKeyspace,
     >;
 
-    /// Write the authoritative birth record through the public helper, so this
-    /// test also proves `birth_record` produces a record `activate` accepts.
-    async fn seed_activation_birth_record(
+    /// Write the transition-bound ESP birth record through the public helper.
+    async fn seed_pending_activation_birth_record(
         store: &opc_session_store::FakeSessionBackend,
         fencer: &StoreFencer,
-        key: &SessionOwnershipKey,
-        owner: &str,
+        request: &crate::OwnershipActivationRequest,
     ) {
         use crate::session::SessionOwnershipKeyResolver;
         use opc_session_store::{SessionBackend, SessionLeaseManager};
 
         let session_key = activation_keyspace()
-            .scoped_sa_key(key)
+            .scoped_sa_key(&request.ownership_key())
             .expect("scoped SA key");
         let lease = store
             .acquire(
                 &session_key,
-                opc_session_store::OwnerId::new(owner).expect("valid owner"),
+                opc_session_store::OwnerId::new(request.owner().as_str()).expect("valid owner"),
                 std::time::Duration::from_secs(60),
             )
             .await
             .expect("birth lease");
         let record = fencer
-            .birth_record(&session_key, &crate::ClusterNode::new(owner), &lease)
-            .expect("birth record");
+            .pending_activation_birth_record(request, &lease)
+            .expect("pending birth record");
         assert_eq!(
             store
                 .compare_and_set(opc_session_store::CompareAndSet {
@@ -10347,7 +10345,7 @@ mod tests {
         let store = opc_session_store::FakeSessionBackend::new();
         let fencer =
             crate::session::SessionStoreOwnershipFencer::new(store.clone(), activation_keyspace());
-        seed_activation_birth_record(&store, &fencer, &key, "owner-a").await;
+        seed_pending_activation_birth_record(&store, &fencer, &request).await;
 
         let coordinator = RePinCoordinator::new(
             backend.clone(),
@@ -10431,7 +10429,7 @@ mod tests {
         let store = opc_session_store::FakeSessionBackend::new();
         let fencer =
             crate::session::SessionStoreOwnershipFencer::new(store.clone(), activation_keyspace());
-        seed_activation_birth_record(&store, &fencer, &key, "owner-a").await;
+        seed_pending_activation_birth_record(&store, &fencer, &request).await;
 
         let ownership = activation_ownership_source();
         let coordinator = RePinCoordinator::new(
@@ -10855,7 +10853,7 @@ mod tests {
         let store = opc_session_store::FakeSessionBackend::new();
         let fencer =
             crate::session::SessionStoreOwnershipFencer::new(store.clone(), activation_keyspace());
-        seed_activation_birth_record(&store, &fencer, &key, "owner-a").await;
+        seed_pending_activation_birth_record(&store, &fencer, &request).await;
         let scoped = activation_keyspace()
             .scoped_sa_key(&key)
             .expect("scoped SA key");

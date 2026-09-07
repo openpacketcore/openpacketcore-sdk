@@ -13,6 +13,7 @@ keywords = ["json-schema", "validation", "5g", "cnf"]
 categories = ["data-structures", "parser-implementations"]
 
 [dependencies]
+regex = "1.12.4"
 serde_json = { workspace = true }
 
 [lints]

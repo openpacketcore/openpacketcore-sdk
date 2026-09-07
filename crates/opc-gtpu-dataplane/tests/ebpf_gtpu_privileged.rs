@@ -65,6 +65,10 @@ use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
     reassembly_commit_authorizes_graph, CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest,
+    CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryAuthority,
+    CurrentEbpfGraphRecoveryAuthorityCurrentness, CurrentEbpfGraphRecoveryCommitment,
+    CurrentEbpfGraphRecoveryCurrentnessGuard, CurrentEbpfGraphRecoveryHostCommitments,
+    CurrentEbpfGraphRecoveryIntent, CurrentEbpfGraphRecoveryOperationId,
     CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryRefusal,
     CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof, DrainedV2TeardownOutcome,
     DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
@@ -145,6 +149,7 @@ use opc_session_store::{
     SqliteSessionBackend,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
+use sha2::{Digest, Sha256};
 
 sockopt_impl!(
     UdpEspInUdp,
@@ -424,6 +429,281 @@ struct TestNet {
     pin_root: PathBuf,
     pin_root_identity: TestOwnedDirectoryIdentity,
     nft_table: String,
+}
+
+struct WorkloadTestScope {
+    scope: opc_gtpu_dataplane::EbpfWorkloadScope,
+    identity: TestOwnedDirectoryIdentity,
+}
+
+impl WorkloadTestScope {
+    fn new() -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.workload-cleanup-test.v1");
+        digest.update(std::process::id().to_be_bytes());
+        digest.update(
+            PRIVILEGED_TEST_SEQ
+                .fetch_add(1, Ordering::Relaxed)
+                .to_be_bytes(),
+        );
+        let scope = opc_gtpu_dataplane::EbpfWorkloadScope::new(digest.finalize().into())
+            .expect("nonzero test scope");
+        let identity = create_test_owned_private_directory_tree(
+            &scope.bpffs_pin_root(),
+            "create isolated workload test scope",
+        );
+        Self { scope, identity }
+    }
+}
+
+impl Drop for WorkloadTestScope {
+    fn drop(&mut self) {
+        assert!(remove_owned_test_directory(
+            &self.scope.bpffs_pin_root(),
+            self.identity
+        ));
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn workload_cleanup_excludes_live_writer_and_preserves_neighbor_scope(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let net = TestNet::provision();
+    let first = WorkloadTestScope::new();
+    let neighbor = WorkloadTestScope::new();
+    let owner = EbpfGtpuDataplaneBackend::for_workload(first.scope);
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner
+        .create_device(request.clone())
+        .await
+        .expect("create scoped owner");
+    owner
+        .install_pdp_context_classified(session_context(device.ifindex))
+        .await
+        .expect("populate scoped owner");
+
+    // Co-located workloads may use the same interface name in separate netns.
+    // Their programs remain globally visible while their pin scopes differ.
+    let neighbor_scope = neighbor.scope;
+    let (neighbor_owner, neighbor_device, neighbor_filters) = in_netns(&net.auth_ns, move || {
+        run("ip", &["link", "add", "s2bu", "type", "dummy"]);
+        run("ip", &["link", "set", "s2bu", "up"]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let owner = EbpfGtpuDataplaneBackend::for_workload(neighbor_scope);
+            let mut request = CreateGtpDeviceRequest::new("s2bu");
+            request.bind_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 1));
+            let device = owner
+                .create_device(request)
+                .await
+                .expect("create neighboring scope in separate netns");
+            let filters = [tc_filters("ingress"), tc_filters("egress")];
+            (owner, device, filters)
+        })
+    });
+    let neighbor_pin = neighbor
+        .scope
+        .bpffs_pin_root()
+        .join("s2bu")
+        .join(MAP_UPLINK_FAR);
+    let neighbor_id = MapInfo::from_pin(&neighbor_pin)?.id();
+    let pin_dir = first.scope.bpffs_pin_root().join("s2bu");
+    let before = pin_directory_listing(&pin_dir);
+    let filters_before = [tc_filters("ingress"), tc_filters("egress")];
+    let replacement = EbpfGtpuDataplaneBackend::for_workload(first.scope);
+    assert!(matches!(
+        replacement.reset_workload_graph(first.scope, "s2bu").await,
+        Err(opc_gtpu_dataplane::GtpuError::RetryRequired {
+            operation: "ebpf_workload_cleanup_writer_busy",
+        })
+    ));
+    assert_eq!(pin_directory_listing(&pin_dir), before);
+    assert_eq!(
+        [tc_filters("ingress"), tc_filters("egress")],
+        filters_before
+    );
+    assert!(EbpfGtpuDataplaneBackend::new()
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .is_err());
+
+    // A process restart retains its netns. Cleanup must fence the old hooks
+    // before deleting even a populated graph, then allow fresh attachment.
+    drop(owner);
+    let control_root = first.scope.bpffs_pin_root().join("GTPU_RECONCILER_LOCKS");
+    let control_name = fs::read_dir(&control_root)?
+        .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_owned())
+        .find_map(|name| name.strip_suffix("-operation-v1").map(str::to_owned))
+        .expect("current namespace operation lock");
+    let authority_marker = control_root
+        .join(control_name)
+        .join(format!("SELECTOR_AUTHORITY_V1_{}", "a".repeat(64)));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&authority_marker)?;
+    assert!(replacement
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .is_err());
+    assert!(authority_marker.is_dir());
+    assert_eq!(pin_directory_listing(&pin_dir), before);
+    assert_eq!(
+        [tc_filters("ingress"), tc_filters("egress")],
+        filters_before
+    );
+    fs::remove_dir(authority_marker)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match replacement.reset_workload_graph(first.scope, "s2bu").await {
+            Ok(()) => break,
+            Err(GtpuError::RetryRequired {
+                operation: "ebpf_workload_cleanup_program_references",
+            }) => {
+                // Kernel program destruction may lag the last tc detach.
+                // The graph must stay pinned until that reference is gone.
+                assert!(!tc_filters("ingress").contains("opc_gtpu"));
+                assert!(!tc_filters("egress").contains("opc_gtpu"));
+                assert_eq!(pin_directory_listing(&pin_dir), before);
+                assert!(
+                    Instant::now() < deadline,
+                    "detached programs must eventually retire"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("same-namespace cleanup failed: {error:?}"),
+        }
+    }
+    assert!(!pin_dir.exists());
+    assert_eq!(MapInfo::from_pin(&neighbor_pin)?.id(), neighbor_id);
+    assert_eq!(
+        in_netns(&net.auth_ns, || [
+            tc_filters("ingress"),
+            tc_filters("egress")
+        ]),
+        neighbor_filters
+    );
+    let fresh = replacement
+        .create_device(request)
+        .await
+        .expect("create fresh graph after reset");
+    replacement
+        .remove_device(&fresh)
+        .await
+        .expect("orderly graph teardown");
+    replacement
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .expect("verify graph absence after teardown");
+    replacement
+        .reset_workload_graph(first.scope, "s2bu")
+        .await
+        .expect("repeat empty cleanup");
+    in_netns(&net.auth_ns, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            neighbor_owner
+                .remove_device(&neighbor_device)
+                .await
+                .expect("remove neighbor graph");
+            neighbor_owner
+                .reset_workload_graph(neighbor_scope, "s2bu")
+                .await
+                .expect("verify neighbor absence");
+        });
+    });
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn workload_cleanup_refuses_old_netns_and_foreign_pins_then_reclaims_partial_graph(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let net = TestNet::provision();
+    let scoped = WorkloadTestScope::new();
+    run("ip", &["link", "set", "s2bu", "netns", &net.pgw_ns]);
+    let scope = scoped.scope;
+    in_netns(&net.pgw_ns, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let owner = EbpfGtpuDataplaneBackend::for_workload(scope);
+            let mut request = CreateGtpDeviceRequest::new("s2bu");
+            request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+            owner
+                .create_device(request)
+                .await
+                .expect("create graph in old network namespace");
+            drop(owner);
+        });
+    });
+    let pin_dir = scoped.scope.bpffs_pin_root().join("s2bu");
+    let before = pin_directory_listing(&pin_dir);
+    let replacement = EbpfGtpuDataplaneBackend::for_workload(scoped.scope);
+
+    // Interface absence in the new namespace cannot prove the old pod dead.
+    assert!(replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&pin_dir), before);
+    run("ip", &["-n", &net.pgw_ns, "link", "del", "s2bu"]);
+
+    // Reject an unknown leaf before changing any recognized pins.
+    let foreign = pin_dir.join("FOREIGN_PIN");
+    MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR))?.pin(&foreign)?;
+    let foreign_before = pin_directory_listing(&pin_dir);
+    assert!(replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&pin_dir), foreign_before);
+    fs::remove_file(foreign)?;
+
+    let original_far = MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR))?;
+    fs::remove_file(pin_dir.join(MAP_UPLINK_FAR))?;
+    MapData::from_pin(pin_dir.join(MAP_CONFIG))?.pin(pin_dir.join(MAP_UPLINK_FAR))?;
+    let wrong_abi_before = pin_directory_listing(&pin_dir);
+    assert!(replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await
+        .is_err());
+    assert_eq!(pin_directory_listing(&pin_dir), wrong_abi_before);
+    fs::remove_file(pin_dir.join(MAP_UPLINK_FAR))?;
+    original_far.pin(pin_dir.join(MAP_UPLINK_FAR))?;
+
+    // A killed cleanup can leave an arbitrary recognized subset. The next
+    // startup must inventory it afresh, including when its interface is gone.
+    for name in [MAP_UPLINK_FAR, MAP_UPLINK_DSCP, MAP_CONFIG] {
+        fs::remove_file(pin_dir.join(name))?;
+    }
+    replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    assert!(!pin_dir.exists());
+    replacement
+        .reset_workload_graph(scoped.scope, "s2bu")
+        .await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7435,6 +7715,54 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
 
 const SELECTED_SOURCE_PORT: u16 = 40_000;
 
+struct PrivilegedCurrentEbpfGraphRecoveryCurrentnessGuard;
+
+impl CurrentEbpfGraphRecoveryCurrentnessGuard
+    for PrivilegedCurrentEbpfGraphRecoveryCurrentnessGuard
+{
+    fn verify_current(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn privileged_current_ebpf_graph_recovery_request(
+    pin_namespace: &str,
+    replacement_device: Option<GtpDevice>,
+) -> opc_gtpu_dataplane::CurrentEbpfGraphRecoveryAuthorizedRequest {
+    let commitment = |byte| CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+    let authority = CurrentEbpfGraphRecoveryAuthority::new(
+        commitment(0xa1),
+        commitment(0xa2),
+        std::num::NonZeroU64::new(1).unwrap(),
+        CurrentEbpfGraphRecoveryOperationId::new([0xa3; 16]).unwrap(),
+        CurrentEbpfGraphRecoveryHostCommitments::new(
+            commitment(0xa4),
+            commitment(0xa5),
+            commitment(0xa6),
+        ),
+        Box::new(PrivilegedCurrentEbpfGraphRecoveryCurrentnessGuard),
+    );
+    let intent = CurrentEbpfGraphRecoveryIntent::new(
+        pin_namespace,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    let intent = match replacement_device {
+        Some(device) => intent.with_replacement_device(device),
+        None => intent,
+    };
+
+    intent.into_request_with_authority(authority)
+}
+
 #[tokio::test]
 // The serial guard is deliberately held for the entire test body; see
 // PRIVILEGED_TEST_LOCK.
@@ -10001,22 +10329,44 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
     let old_device = owner.create_device(create).await?;
     let pin_dir = net.pin_root.join("s2bu");
     let recovery = EbpfGtpuDataplaneBackend::with_config(config.clone());
-    let request = CurrentEbpfGraphRecoveryRequest::new(
+    let legacy_request = CurrentEbpfGraphRecoveryRequest::new(
         "s2bu",
         CurrentEbpfGraphWriterProof::previous_writer_stopped(),
     )
     .with_replacement_device(old_device.clone());
+    let legacy_pins_before = pin_directory_listing(&pin_dir);
 
     assert_eq!(
         recovery
-            .recover_orphaned_current_ebpf_graph(request)
+            .recover_orphaned_current_ebpf_graph(legacy_request)
+            .await?,
+        CurrentEbpfGraphRecoveryOutcome::Refused(
+            CurrentEbpfGraphRecoveryRefusal::AuthorityRequired
+        ),
+        "the legacy recovery entrypoint must not authorize mutation"
+    );
+    assert!(
+        pin_dir.is_dir(),
+        "the legacy authority refusal must preserve every pin"
+    );
+    assert_eq!(
+        pin_directory_listing(&pin_dir),
+        legacy_pins_before,
+        "the legacy authority refusal must not alter pinned graph entries"
+    );
+
+    assert_eq!(
+        recovery
+            .recover_orphaned_current_ebpf_graph_with_authority(
+                privileged_current_ebpf_graph_recovery_request("s2bu", Some(old_device.clone())),
+            )
             .await?,
         CurrentEbpfGraphRecoveryOutcome::Refused(CurrentEbpfGraphRecoveryRefusal::ActiveOwner),
         "the live backend's host-global namespace lease must fence recovery"
     );
     assert!(
         pin_dir.is_dir(),
-        "a refused recovery must preserve every pin"
+        "an active-owner refusal must preserve every pin"
     );
 
     // Releasing the stable namespace lease is not sufficient while the old
@@ -10024,12 +10374,18 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
     // replacement, so ActiveOwner is proven by the complete loaded-program
     // map-reference scan rather than by the lease or replacement hook check.
     drop(owner);
+    let retained = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let retained_device = retained.resolve_device("s2bu").await?;
+    assert_eq!(
+        retained_device.ifindex, old_device.ifindex,
+        "ordinary retained-current adoption must accept its exact paired operation lock"
+    );
+    drop(retained);
     assert_eq!(
         recovery
-            .recover_orphaned_current_ebpf_graph(CurrentEbpfGraphRecoveryRequest::new(
-                "s2bu",
-                CurrentEbpfGraphWriterProof::previous_writer_stopped(),
-            ))
+            .recover_orphaned_current_ebpf_graph_with_authority(
+                privileged_current_ebpf_graph_recovery_request("s2bu", None),
+            )
             .await?,
         CurrentEbpfGraphRecoveryOutcome::Refused(CurrentEbpfGraphRecoveryRefusal::ActiveOwner),
         "surviving loaded programs that reference the pinned graph must fence recovery"
@@ -10056,24 +10412,133 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
         name: "s2bu-repl".to_string(),
         ifindex: replacement_ifindex,
     };
-    let request = || {
-        CurrentEbpfGraphRecoveryRequest::new(
-            "s2bu",
-            CurrentEbpfGraphWriterProof::previous_writer_stopped(),
-        )
-        .with_replacement_device(replacement.clone())
-    };
+    let request =
+        || privileged_current_ebpf_graph_recovery_request("s2bu", Some(replacement.clone()));
 
     assert_eq!(
         recovery
-            .recover_orphaned_current_ebpf_graph(request())
+            .recover_orphaned_current_ebpf_graph_with_authority(request())
             .await?,
         CurrentEbpfGraphRecoveryOutcome::Removed
     );
     assert!(!pin_dir.exists());
+    let terminal = recovery
+        .inspect_current_ebpf_graph_terminal(request())
+        .await?;
+    let transfer = match terminal {
+        opc_gtpu_dataplane::CurrentEbpfGraphRecoveryTerminalInspectionOutcome::Authenticated(
+            transfer,
+        ) => transfer,
+        other => panic!(
+            "the native current terminal must remain reachable through its paired operation lock: {other:?}"
+        ),
+    };
+    assert_ne!(
+        transfer.predecessor_basis_commitment_bytes(),
+        [0; 32],
+        "the authenticated native terminal must expose a broker-stable predecessor basis"
+    );
+    let control_root = net.pin_root.join("GTPU_RECONCILER_LOCKS");
+    let terminal_inventory = pin_directory_listing(&control_root);
+    let native_leaf = terminal_inventory
+        .iter()
+        .find(|entry| {
+            entry.len() == 64 && terminal_inventory.contains(&format!("{entry}-operation-v1"))
+        })
+        .expect("native terminal retains one exactly paired current leaf")
+        .clone();
+    let terminal_pin = control_root
+        .join(&native_leaf)
+        .join("GTPU_CURRENT_RECOVERY_TERMINAL_V1");
+    let terminal_metadata = fs::symlink_metadata(&terminal_pin)?;
+
     assert_eq!(
         recovery
-            .recover_orphaned_current_ebpf_graph(request())
+            .inspect_current_ebpf_graph_terminal(
+                privileged_current_ebpf_graph_recovery_request(
+                    "s2bu-disjoint",
+                    Some(replacement.clone()),
+                ),
+            )
+            .await?,
+        opc_gtpu_dataplane::CurrentEbpfGraphRecoveryTerminalInspectionOutcome::NoAuthenticatedTerminal,
+        "a valid tenant-A native terminal must not block pristine tenant-B inspection"
+    );
+    assert_eq!(
+        pin_directory_listing(&control_root),
+        terminal_inventory,
+        "disjoint pristine inspection must not create or alter shared-root authority"
+    );
+    assert!(!net.pin_root.join("s2bu-disjoint").exists());
+
+    let legacy_digest = Sha256::digest(b"s2bu");
+    let legacy_leaf_name = legacy_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let surviving_legacy_leaf = control_root.join(legacy_leaf_name);
+    // Ordinary serving now retains its exact historical exclusion beside the
+    // native terminal. Replace that owned one-child reservation with the
+    // synthetic foreign legacy leaf below, so this assertion still exercises
+    // an ambiguous target authority rather than the current writer's marker.
+    let ordinary_exclusion_marker =
+        surviving_legacy_leaf.join("GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1");
+    if ordinary_exclusion_marker.is_dir() {
+        fs::remove_dir(&ordinary_exclusion_marker)?;
+        fs::remove_dir(&surviving_legacy_leaf)?;
+    }
+    fs::DirBuilder::new()
+        .mode(0o755)
+        .create(&surviving_legacy_leaf)?;
+    let commitment = |byte| CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+    let transferred_authority = CurrentEbpfGraphRecoveryAuthority::new(
+        commitment(0xb1),
+        transfer.predecessor_basis_commitment(),
+        std::num::NonZeroU64::new(2).unwrap(),
+        CurrentEbpfGraphRecoveryOperationId::new([0xb3; 16]).unwrap(),
+        CurrentEbpfGraphRecoveryHostCommitments::new(
+            commitment(0xa4),
+            commitment(0xa5),
+            commitment(0xa6),
+        ),
+        Box::new(PrivilegedCurrentEbpfGraphRecoveryCurrentnessGuard),
+    );
+    let transfer_request = CurrentEbpfGraphRecoveryIntent::new(
+        "s2bu",
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    )
+    .with_replacement_device(replacement.clone())
+    .with_drain_proof(CurrentEbpfGraphDrainProof::sessions_and_traffic_drained())
+    .into_terminal_transfer_request(transfer, transferred_authority);
+    assert_eq!(
+        recovery
+            .transfer_current_ebpf_graph_terminal(transfer_request)
+            .await?
+            .outcome(),
+        CurrentEbpfGraphRecoveryOutcome::Refused(
+            CurrentEbpfGraphRecoveryRefusal::TerminalTransferMismatch
+        ),
+        "a target legacy-authority survivor must fence native terminal transfer"
+    );
+    let terminal_after_refusal = fs::symlink_metadata(&terminal_pin)?;
+    assert_eq!(
+        (terminal_after_refusal.dev(), terminal_after_refusal.ino()),
+        (terminal_metadata.dev(), terminal_metadata.ino()),
+        "ambiguous root authority must leave the terminal pin unchanged"
+    );
+    fs::remove_dir(&surviving_legacy_leaf)?;
+    assert_eq!(
+        recovery
+            .inspect_current_ebpf_graph_terminal(request())
+            .await?,
+        opc_gtpu_dataplane::CurrentEbpfGraphRecoveryTerminalInspectionOutcome::Authenticated(
+            transfer
+        ),
+        "removing only the synthetic ambiguity must reveal the original authenticated WAL"
+    );
+    assert_eq!(
+        recovery
+            .recover_orphaned_current_ebpf_graph_with_authority(request())
             .await?,
         CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
     );

@@ -188,6 +188,52 @@ pub enum StoreError {
         /// Maximum encoded response size accepted by the caller.
         max_bytes: usize,
     },
+    /// A fenced-transition identity is already durably bound to another
+    /// canonical request body. Nothing was mutated.
+    #[error("fenced transition request identity was reused")]
+    FencedTransitionRequestConflict,
+    /// A fenced transition may have crossed its consensus proposal boundary,
+    /// but its exact result was not confirmed. Callers MUST use exact status
+    /// with the retained identity/body and MUST NOT replay under a new ID.
+    #[error("fenced transition outcome is unknown")]
+    FencedTransitionOutcomeUnknown,
+    /// The durable identity/body binding remains, but its exact-result
+    /// recovery window elapsed. Historical replay remains closed.
+    #[error("fenced transition result retention expired")]
+    FencedTransitionRequestExpired,
+    /// The permanent fenced-transition receipt ledger reached its fixed
+    /// protocol capacity. No request body was applied or durably bound.
+    #[error("fenced transition request history is full")]
+    FencedTransitionHistoryFull,
+    /// The committed logical clock is too close to its representable maximum
+    /// to retain a newly bound exact result for the protocol's full window.
+    /// The request remains unbound and no lease or record effect occurred.
+    #[error("fenced transition result retention horizon is exhausted")]
+    FencedTransitionRetentionExhausted,
+    /// SQLite's signed persistent counters cannot represent the next atomic
+    /// fenced-transition effect. The request is durably recorded as a fixed
+    /// deterministic rejection so an exact retry can recover this result.
+    #[error("fenced transition storage counter is exhausted")]
+    FencedTransitionStorageExhausted,
+    /// A V2 fenced-transition request named an epoch that has been retired or
+    /// closed. Retirement is terminal: callers must not retry that identity
+    /// in the closed epoch, even after its receipt rows are reclaimed.
+    ///
+    /// New wire-visible variants are append-only so every pre-V2 postcard
+    /// discriminant remains unchanged.
+    #[error("fenced transition history epoch is retired")]
+    FencedTransitionHistoryEpochRetired,
+    /// A V2 fenced-transition request named an epoch that is not the active
+    /// epoch. This is a deterministic no-effect result while an active epoch
+    /// has not yet opened or a closed epoch is being reclaimed; it is distinct
+    /// from terminal retirement and from active-epoch capacity exhaustion.
+    #[error("fenced transition history epoch is not active")]
+    FencedTransitionHistoryEpochNotActive,
+    /// A protected roster owns the exact session-record pre-state, so only
+    /// that roster's terminal transaction may replace or delete it. This
+    /// fixed error carries no key, tenant, owner, or reservation metadata.
+    #[error("session record is reserved by a protected roster")]
+    SessionRecordReserved,
 }
 
 /// Error type for lease operations.
@@ -266,7 +312,257 @@ pub enum CapabilityError {
 
 #[cfg(test)]
 mod tests {
+    use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Serialize};
+
     use super::*;
+
+    #[derive(Clone, Serialize, Deserialize)]
+    enum LegacyStoreError684 {
+        NotFound,
+        StaleFence,
+        CasConflict,
+        CasIdempotencyConflict,
+        CasIdempotencyOutcomeUnavailable,
+        BackendOperationOutcomeUnavailable,
+        TopologyAuthorityRevoked,
+        CapabilityNotSupported(String),
+        BackendUnavailable(String),
+        InvalidKey(String),
+        InvalidReplicationSequence,
+        InvalidReplicationLogRange,
+        ReplicationLogPageTooLarge { requested: usize, max: usize },
+        ReplicationLogCursorCompacted { resume_from: u64 },
+        ReplicationWatchCatchUpRequired,
+        ReplicationOperationLimitExceeded,
+        InvalidSessionTtl,
+        InvalidRecordExpiry,
+        RecordExpiryPreflightLimitExceeded,
+        LeaseHeld,
+        LeaseExpired,
+        Crypto(String),
+        Serialization(String),
+        PayloadTooLarge { actual: usize, max: usize },
+        InvalidRestoreScanRequest(String),
+        InvalidRestoreScanResponse(String),
+        RestoreScanPageTooLarge { requested: usize, max: usize },
+        RestoreScanCursorStale,
+        RestoreScanWorkBudgetExceeded,
+        RestoreScanResponseTooLarge { max_bytes: usize },
+    }
+
+    fn assert_postcard_cross_decode<T, U>(label: &str, current: T, legacy: U)
+    where
+        T: Serialize + DeserializeOwned,
+        U: Serialize + DeserializeOwned,
+    {
+        let current_bytes =
+            opc_consensus::encode_bounded(&current).expect("current postcard encoding");
+        let legacy_bytes =
+            opc_consensus::encode_bounded(&legacy).expect("legacy postcard encoding");
+        assert_eq!(current_bytes, legacy_bytes, "{label}: encoding changed");
+        opc_consensus::decode_bounded::<U>(&current_bytes).expect("legacy decode of current bytes");
+        opc_consensus::decode_bounded::<T>(&legacy_bytes).expect("current decode of legacy bytes");
+    }
+
+    #[test]
+    fn schema_v1_legacy_store_error_postcard_parity() {
+        macro_rules! parity {
+            ($name:literal, $current:expr, $legacy:expr) => {
+                assert_postcard_cross_decode($name, $current, $legacy)
+            };
+        }
+
+        parity!(
+            "NotFound",
+            StoreError::NotFound,
+            LegacyStoreError684::NotFound
+        );
+        parity!(
+            "StaleFence",
+            StoreError::StaleFence,
+            LegacyStoreError684::StaleFence
+        );
+        parity!(
+            "CasConflict",
+            StoreError::CasConflict,
+            LegacyStoreError684::CasConflict
+        );
+        parity!(
+            "CasIdempotencyConflict",
+            StoreError::CasIdempotencyConflict,
+            LegacyStoreError684::CasIdempotencyConflict
+        );
+        parity!(
+            "CasIdempotencyOutcomeUnavailable",
+            StoreError::CasIdempotencyOutcomeUnavailable,
+            LegacyStoreError684::CasIdempotencyOutcomeUnavailable
+        );
+        parity!(
+            "BackendOperationOutcomeUnavailable",
+            StoreError::BackendOperationOutcomeUnavailable,
+            LegacyStoreError684::BackendOperationOutcomeUnavailable
+        );
+        parity!(
+            "TopologyAuthorityRevoked",
+            StoreError::TopologyAuthorityRevoked,
+            LegacyStoreError684::TopologyAuthorityRevoked
+        );
+        parity!(
+            "CapabilityNotSupported",
+            StoreError::CapabilityNotSupported("capability".into()),
+            LegacyStoreError684::CapabilityNotSupported("capability".into())
+        );
+        parity!(
+            "BackendUnavailable",
+            StoreError::BackendUnavailable("backend".into()),
+            LegacyStoreError684::BackendUnavailable("backend".into())
+        );
+        parity!(
+            "InvalidKey",
+            StoreError::InvalidKey("key".into()),
+            LegacyStoreError684::InvalidKey("key".into())
+        );
+        parity!(
+            "InvalidReplicationSequence",
+            StoreError::InvalidReplicationSequence,
+            LegacyStoreError684::InvalidReplicationSequence
+        );
+        parity!(
+            "InvalidReplicationLogRange",
+            StoreError::InvalidReplicationLogRange,
+            LegacyStoreError684::InvalidReplicationLogRange
+        );
+        parity!(
+            "ReplicationLogPageTooLarge",
+            StoreError::ReplicationLogPageTooLarge {
+                requested: 3,
+                max: 2,
+            },
+            LegacyStoreError684::ReplicationLogPageTooLarge {
+                requested: 3,
+                max: 2,
+            }
+        );
+        parity!(
+            "ReplicationLogCursorCompacted",
+            StoreError::ReplicationLogCursorCompacted { resume_from: 4 },
+            LegacyStoreError684::ReplicationLogCursorCompacted { resume_from: 4 }
+        );
+        parity!(
+            "ReplicationWatchCatchUpRequired",
+            StoreError::ReplicationWatchCatchUpRequired,
+            LegacyStoreError684::ReplicationWatchCatchUpRequired
+        );
+        parity!(
+            "ReplicationOperationLimitExceeded",
+            StoreError::ReplicationOperationLimitExceeded,
+            LegacyStoreError684::ReplicationOperationLimitExceeded
+        );
+        parity!(
+            "InvalidSessionTtl",
+            StoreError::InvalidSessionTtl,
+            LegacyStoreError684::InvalidSessionTtl
+        );
+        parity!(
+            "InvalidRecordExpiry",
+            StoreError::InvalidRecordExpiry,
+            LegacyStoreError684::InvalidRecordExpiry
+        );
+        parity!(
+            "RecordExpiryPreflightLimitExceeded",
+            StoreError::RecordExpiryPreflightLimitExceeded,
+            LegacyStoreError684::RecordExpiryPreflightLimitExceeded
+        );
+        parity!(
+            "LeaseHeld",
+            StoreError::LeaseHeld,
+            LegacyStoreError684::LeaseHeld
+        );
+        parity!(
+            "LeaseExpired",
+            StoreError::LeaseExpired,
+            LegacyStoreError684::LeaseExpired
+        );
+        parity!(
+            "Crypto",
+            StoreError::Crypto("crypto".into()),
+            LegacyStoreError684::Crypto("crypto".into())
+        );
+        parity!(
+            "Serialization",
+            StoreError::Serialization("serialization".into()),
+            LegacyStoreError684::Serialization("serialization".into())
+        );
+        parity!(
+            "PayloadTooLarge",
+            StoreError::PayloadTooLarge { actual: 3, max: 2 },
+            LegacyStoreError684::PayloadTooLarge { actual: 3, max: 2 }
+        );
+        parity!(
+            "InvalidRestoreScanRequest",
+            StoreError::InvalidRestoreScanRequest("request".into()),
+            LegacyStoreError684::InvalidRestoreScanRequest("request".into())
+        );
+        parity!(
+            "InvalidRestoreScanResponse",
+            StoreError::InvalidRestoreScanResponse("response".into()),
+            LegacyStoreError684::InvalidRestoreScanResponse("response".into())
+        );
+        parity!(
+            "RestoreScanPageTooLarge",
+            StoreError::RestoreScanPageTooLarge {
+                requested: 3,
+                max: 2,
+            },
+            LegacyStoreError684::RestoreScanPageTooLarge {
+                requested: 3,
+                max: 2,
+            }
+        );
+        parity!(
+            "RestoreScanCursorStale",
+            StoreError::RestoreScanCursorStale,
+            LegacyStoreError684::RestoreScanCursorStale
+        );
+        parity!(
+            "RestoreScanWorkBudgetExceeded",
+            StoreError::RestoreScanWorkBudgetExceeded,
+            LegacyStoreError684::RestoreScanWorkBudgetExceeded
+        );
+        parity!(
+            "RestoreScanResponseTooLarge",
+            StoreError::RestoreScanResponseTooLarge { max_bytes: 2 },
+            LegacyStoreError684::RestoreScanResponseTooLarge { max_bytes: 2 }
+        );
+
+        // These variants were appended after the published schema-v1 enum.
+        // They intentionally have no legacy counterpart: every preexisting
+        // ordinal above must continue to cross-decode unchanged.
+        for appended in [
+            StoreError::FencedTransitionStorageExhausted,
+            StoreError::SessionRecordReserved,
+        ] {
+            let encoded = opc_consensus::encode_bounded(&appended)
+                .expect("appended StoreError postcard encoding");
+            assert!(opc_consensus::decode_bounded::<LegacyStoreError684>(&encoded).is_err());
+            assert_eq!(
+                opc_consensus::decode_bounded::<StoreError>(&encoded)
+                    .expect("current StoreError round trip"),
+                appended
+            );
+        }
+    }
+
+    #[test]
+    fn session_record_reserved_error_is_fixed_and_redaction_safe() {
+        let error = StoreError::SessionRecordReserved;
+        assert_eq!(
+            error.to_string(),
+            "session record is reserved by a protected roster"
+        );
+        assert_eq!(format!("{error:?}"), "SessionRecordReserved");
+    }
 
     #[test]
     fn topology_authority_revocation_is_permanent_lease_loss() {

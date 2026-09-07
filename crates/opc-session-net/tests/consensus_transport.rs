@@ -1091,7 +1091,7 @@ impl RotatingConsensusFleet {
                     outcome,
                     Err(
                         SessionConsensusPeerError::Authentication
-                            | SessionConsensusPeerError::Timeout
+                            | SessionConsensusPeerError::Unavailable
                     )
                 ),
                 "new-only server trust must reject the removed old issuer before application admission: source={source}, target={target}, outcome={outcome:?}"
@@ -2412,9 +2412,9 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
         .allow_any_trusted_peer()
         .build_authenticated_client_config()
         .expect("rotating consensus client config");
-    // This case verifies that both lanes are replaced by each epoch. Cached
-    // jitter is covered separately with paused time; keep it at zero here so
-    // the replacement assertion has no wall-clock sampling race.
+    // This case verifies both lanes at the idle reuse boundary and through
+    // each material epoch. Cached jitter is covered separately with paused
+    // time; keep it at zero here so rotation replacement has no sampling race.
     let immediate_rotation = ConnectionLifecyclePolicy::try_new(
         Duration::from_secs(60),
         Duration::from_secs(2),
@@ -2448,13 +2448,34 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
     assert_consensus_call_pair(&peer, &manifest, b"initial-primary", b"initial-overflow").await;
     assert_eq!(resolutions.load(Ordering::SeqCst), 2);
 
+    let reuse_limit = DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit();
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit - Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert_consensus_call_pair(&peer, &manifest, b"inside-primary", b"inside-overflow").await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "each cached lane remains reusable just inside the shared idle limit"
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit).await;
+    tokio::time::resume();
+    assert_consensus_call_pair(&peer, &manifest, b"limit-primary", b"limit-overflow").await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        4,
+        "both cached lanes reconnect at the exact shared idle boundary"
+    );
+
     reauthentication
         .request_reauthentication()
         .expect("request explicit consensus reauthentication");
     assert_consensus_call_pair(&peer, &manifest, b"explicit-primary", b"explicit-overflow").await;
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
-        4,
+        6,
         "one explicit generation change must replace both established lanes"
     );
 
@@ -2464,10 +2485,10 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
     assert_consensus_call_pair(&peer, &manifest, b"material-primary", b"material-overflow").await;
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
-        6,
+        8,
         "one admitted material epoch change must replace both established lanes"
     );
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 6);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 10);
 
     handle.abort_and_wait().await;
 }
@@ -2778,7 +2799,7 @@ async fn both_consensus_lanes_rotate_across_real_mtls_trust_cutover() {
     assert!(
         matches!(
             old_client_outcome,
-            Err(SessionConsensusPeerError::Authentication | SessionConsensusPeerError::Timeout)
+            Err(SessionConsensusPeerError::Authentication | SessionConsensusPeerError::Unavailable)
         ),
         "new-only server trust must reject the removed old client chain: {old_client_outcome:?}"
     );
@@ -3153,6 +3174,103 @@ async fn cached_dead_consensus_socket_is_evicted_before_a_fresh_reconnect() {
 }
 
 #[tokio::test]
+async fn consensus_idle_reuse_limit_evicts_before_the_server_idle_trap_without_replay() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-idle-reuse-limit", 11, 1);
+    let handler = Arc::new(CountingEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus idle-reuse listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    );
+    let reuse_limit = DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit();
+
+    assert!(peer
+        .call(request(&manifest, 1, b"initial".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit - Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert!(peer
+        .call(request(&manifest, 1, b"inside-limit".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "a just-inside cached use must not reconnect"
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit).await;
+    tokio::time::resume();
+    assert!(peer
+        .call(request(&manifest, 1, b"at-limit".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "at the profile-derived limit the cached lane must be evicted before dispatch"
+    );
+
+    // This is the production-shaped cadence: the server has already retired
+    // the fresh cached socket before the next lease retry. The client must
+    // still resolve/TCP/mTLS/bootstrap before writing this request, rather
+    // than discovering EOF after a potentially transmitted call.
+    tokio::time::pause();
+    tokio::time::advance(
+        DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout() + Duration::from_millis(250),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"after-server-idle".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"after-server-idle".to_vec()),
+        })
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        3,
+        "the post-idle call must establish a fresh authenticated lane before its first byte"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        4,
+        "each request is handled exactly once; transport never replays a possibly written call"
+    );
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn cached_consensus_connection_retires_at_the_finite_soft_lifecycle_bound() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-cached-lifetime", 12, 1);
@@ -3280,10 +3398,23 @@ async fn correlated_unavailable_response_reuses_the_authenticated_connection() {
             })
         );
     }
+    tokio::time::pause();
+    tokio::time::advance(
+        DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit() - Duration::from_secs(1),
+    )
+    .await;
+    tokio::time::resume();
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"refreshed-unavailable".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Err(SessionConsensusPeerError::Unavailable),
+        })
+    );
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
         1,
-        "a complete correlated Unavailable response must not create a TLS reconnect storm"
+        "a complete correlated Unavailable response refreshes the idle epoch without a TLS reconnect storm"
     );
 
     server.abort_and_wait().await;

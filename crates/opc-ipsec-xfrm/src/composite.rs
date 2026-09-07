@@ -431,6 +431,9 @@ where
 ///
 /// Returns [`XfrmBidirectionalInstallError`] with outcome evidence preserving
 /// both the failed composite result and any rollback failure.
+// The public error preserves both directional outcomes and rollback evidence;
+// boxing it would change this established API.
+#[allow(clippy::result_large_err)]
 pub async fn install_bidirectional_sa_policy_with_rollback<B>(
     backend: &B,
     requests: [XfrmCompositeInstallRequest; 2],

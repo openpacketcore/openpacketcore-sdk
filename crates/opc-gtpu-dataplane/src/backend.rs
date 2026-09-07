@@ -4,15 +4,26 @@ use async_trait::async_trait;
 use std::io;
 
 use crate::model::{
-    CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome,
-    CurrentEbpfGraphRecoveryRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRequest, GtpDevice,
-    GtpPdpContext, GtpuCapability, GtpuIpFamilyCapabilities, GtpuProbe,
-    GtpuSessionAttachmentSelector, GtpuSessionGroup, GtpuSessionGroupReadback,
+    CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest,
+    CurrentEbpfGraphRecoveryAuthorizedRequest, CurrentEbpfGraphRecoveryOutcome,
+    CurrentEbpfGraphRecoveryReceipt, CurrentEbpfGraphRecoveryRefusal,
+    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphRecoverySuccessorAdmissionOutcome,
+    CurrentEbpfGraphRecoverySuccessorAdmissionRequest,
+    CurrentEbpfGraphRecoverySuccessorInspectionOutcome,
+    CurrentEbpfGraphRecoverySuccessorInspectionRequest,
+    CurrentEbpfGraphRecoveryTerminalAdmissionOutcome,
+    CurrentEbpfGraphRecoveryTerminalAdmissionRequest,
+    CurrentEbpfGraphRecoveryTerminalInspectionOutcome,
+    CurrentEbpfGraphRecoveryTerminalTransferRequest, DrainedV2TeardownOutcome,
+    DrainedV2TeardownRequest, GtpDevice, GtpPdpContext, GtpuCapability, GtpuIpFamilyCapabilities,
+    GtpuProbe, GtpuSessionAttachmentSelector, GtpuSessionGroup, GtpuSessionGroupReadback,
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
-    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, PdpContextInstallOutcome,
-    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
-    RemovePdpContextRequest,
+    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector,
+    HistoricalEbpfGraphRecoveryInspectionOutcome, HistoricalEbpfGraphRecoveryInspectionRequest,
+    HistoricalEbpfGraphRecoveryReceipt, HistoricalEbpfGraphRecoveryRequest,
+    PdpContextInstallOutcome, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpLiveWriterProof, PdpLiveWriterRemovalRequest,
+    PdpRestartRecoveryRequest, RemovePdpContextRequest,
 };
 use crate::tft_classifier::{
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
@@ -439,8 +450,168 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         &self,
         _request: CurrentEbpfGraphRecoveryRequest,
     ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
+        Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+            CurrentEbpfGraphRecoveryRefusal::AuthorityRequired,
+        ))
+    }
+
+    /// Recover one orphaned current-schema eBPF graph under a freshly live
+    /// external node-fence authority.
+    ///
+    /// The request is affine: retry only the cloneable intent with a newly
+    /// acquired authority/guard. Implementations must persist the complete
+    /// binding in the proof record and invoke its asynchronous currentness
+    /// guard around every irreversible proof, pin, and directory effect.
+    async fn recover_orphaned_current_ebpf_graph_with_authority(
+        &self,
+        _request: CurrentEbpfGraphRecoveryAuthorizedRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
-            feature: "current_ebpf_graph_recovery",
+            feature: "current_ebpf_graph_recovery_authority",
+        })
+    }
+
+    /// Recover one current graph and return a typed terminal receipt.
+    ///
+    /// Adapters that do not implement a durable current-terminal WAL inherit
+    /// a deliberately nonterminal receipt: callers must never infer terminal
+    /// absence from the legacy outcome alone.
+    async fn recover_orphaned_current_ebpf_graph_with_authority_receipt(
+        &self,
+        request: CurrentEbpfGraphRecoveryAuthorizedRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryReceipt, GtpuError> {
+        let authority = request.authority_binding();
+        let outcome = self
+            .recover_orphaned_current_ebpf_graph_with_authority(request)
+            .await?;
+        Ok(CurrentEbpfGraphRecoveryReceipt::nonterminal(
+            authority, outcome,
+        ))
+    }
+
+    /// Read and authenticate one graph-free retained current-terminal WAL
+    /// without changing bpffs, hooks, maps, or authority records.
+    ///
+    /// The affine request proves a fresh live target exclusion for the whole
+    /// inspection. A successful result is only a broker-durable predecessor;
+    /// mutation requires a later call to
+    /// [`Self::transfer_current_ebpf_graph_terminal`] with a separately fresh
+    /// affine authority. `NoAuthenticatedTerminal` is never an absence proof.
+    async fn inspect_current_ebpf_graph_terminal(
+        &self,
+        _request: CurrentEbpfGraphRecoveryAuthorizedRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryTerminalInspectionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_terminal_inspection",
+        })
+    }
+
+    /// Reauthenticate one exact retained successor under its unchanged live
+    /// authority without changing bpffs, hooks, maps, or authority records.
+    ///
+    /// An authenticated result binds the complete sealed WAL plus its consumed
+    /// predecessor receipt and exact typed ordinary-create target. It is not a
+    /// target-absence proof and cannot transfer or replace authority; a later
+    /// broker-durable admission remains mandatory.
+    async fn inspect_current_ebpf_graph_successor(
+        &self,
+        _request: CurrentEbpfGraphRecoverySuccessorInspectionRequest,
+    ) -> Result<CurrentEbpfGraphRecoverySuccessorInspectionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_successor_inspection",
+        })
+    }
+
+    /// Reauthenticate one broker-durable sealed-successor receipt under a
+    /// separately fresh guard for the identical authority binding.
+    ///
+    /// Successful admission retires only the authenticated successor and
+    /// terminal authority leaves after effect-adjacent graph/currentness
+    /// revalidation. A same-process exact successor is activated only after
+    /// that admission; an exact already-active retry is read-only and returns
+    /// `AlreadyFinalized` without rewriting its traffic gate. A fresh process
+    /// has no loaded activation handle, so successful reauthentication returns
+    /// `GtpuError::RetryRequired` for the ordinary typed-create target before
+    /// the retained graph can become usable.
+    async fn admit_current_ebpf_graph_successor(
+        &self,
+        _request: CurrentEbpfGraphRecoverySuccessorAdmissionRequest,
+    ) -> Result<CurrentEbpfGraphRecoverySuccessorAdmissionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_successor_admission",
+        })
+    }
+
+    /// Authenticate and transfer a retained current-terminal WAL to a new
+    /// affine authority without deleting the WAL.
+    ///
+    /// The request carries an exact prior binding and receipt commitment from
+    /// the external retired-state broker. Implementations must refuse a
+    /// missing, malformed, graph-present, wrong-target, or mismatched WAL;
+    /// neither a legacy `Removed` outcome nor a pristine observation can be
+    /// converted into a transferable terminal.
+    async fn transfer_current_ebpf_graph_terminal(
+        &self,
+        _request: CurrentEbpfGraphRecoveryTerminalTransferRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_terminal_transfer",
+        })
+    }
+
+    /// Acknowledge one exact authenticated current terminal after the caller
+    /// has durably committed its receipt in the external recovery broker.
+    ///
+    /// This is deliberately separate from recovery and transfer: neither can
+    /// admit ordinary graph creation merely by reaching a terminal kernel
+    /// state or returning a response. Implementations must reauthenticate the
+    /// sole graph-free authority pin under a fresh affine authority and must
+    /// not mutate bpffs while admitting it. Admission is process-local and
+    /// one-shot; a restart or failed creation requires another durable-broker
+    /// acknowledgement.
+    async fn admit_current_ebpf_graph_terminal(
+        &self,
+        _request: CurrentEbpfGraphRecoveryTerminalAdmissionRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryTerminalAdmissionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_terminal_admission",
+        })
+    }
+
+    /// Recover one positively identified orphaned historical eBPF graph.
+    ///
+    /// This maintenance-only contract is separate from ordinary startup and
+    /// current-schema recovery. Implementations must authenticate the named
+    /// frozen graph and its legacy authority layout, acquire the legacy and
+    /// current host-global authority domains in their fixed order, and retain
+    /// durable recovery proof until both graph and legacy authority retirement
+    /// are terminal. Cancellation before the implementation admits its worker
+    /// must be no-effect. After worker admission, the operation is supervised
+    /// to completion and an exact authority-bound retry retrieves its durable
+    /// result. Existing implementations fail closed.
+    async fn recover_orphaned_historical_ebpf_graph(
+        &self,
+        _request: HistoricalEbpfGraphRecoveryRequest,
+    ) -> Result<HistoricalEbpfGraphRecoveryReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "historical_ebpf_graph_recovery",
+        })
+    }
+
+    /// Inspect one exact detached shipped-25 graph without mutating bpffs,
+    /// maps, hooks, roots, or authority leaves.
+    ///
+    /// The returned commitment is computed by the SDK from the locked live
+    /// graph and is intended to be bound into a freshly acquired external
+    /// provenance attestation before the affine recovery authority is built.
+    /// A different graph, map-ID set, graph inode, replacement identity, or
+    /// attachment state must not produce a reusable inspection result.
+    async fn inspect_orphaned_historical_ebpf_graph(
+        &self,
+        _request: HistoricalEbpfGraphRecoveryInspectionRequest,
+    ) -> Result<HistoricalEbpfGraphRecoveryInspectionOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "historical_ebpf_graph_inspection",
         })
     }
 
@@ -1210,9 +1381,9 @@ mod tests {
         );
         assert!(matches!(
             backend.recover_orphaned_current_ebpf_graph(request).await,
-            Err(GtpuError::UnsupportedFeature {
-                feature: "current_ebpf_graph_recovery"
-            })
+            Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::AuthorityRequired
+            ))
         ));
 
         let retired_drain_request =

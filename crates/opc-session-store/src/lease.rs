@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use opc_types::Timestamp;
 
 use crate::{
-    error::LeaseError,
+    error::{LeaseError, StoreError},
     model::{FenceToken, OwnerId, SessionKey},
 };
 
@@ -98,6 +98,19 @@ impl LeaseGuard {
     /// use it to reject renewal responses that silently replace credentials.
     pub fn credential_id(&self) -> u64 {
         self.credential_id
+    }
+
+    /// Validate the time-independent structure of a deserialized guard.
+    ///
+    /// Construction inside this crate already enforces these invariants, but
+    /// authenticated consumer requests deserialize the public DTO before a
+    /// backend sees it.  Rechecking here prevents a forged wire value from
+    /// reaching any lease or mutation effect boundary.
+    pub(crate) fn validate_profile(&self) -> Result<(), StoreError> {
+        if self.fence.get() == 0 || self.credential_id == 0 || self.expires_at < self.acquired_at {
+            return Err(StoreError::InvalidKey("invalid lease guard".into()));
+        }
+        Ok(())
     }
 }
 
