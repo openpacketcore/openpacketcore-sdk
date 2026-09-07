@@ -58,4 +58,4 @@ if [[ "${license_hex}" != "${expected_license_hex}" ]]; then
   exit 1
 fi
 
-echo "verified ${object}: license contains exact Dual MIT/GPL\\0 bytes"
+printf 'verified %s: license contains exact Dual MIT/GPL\\0 bytes\n' "${object}"
