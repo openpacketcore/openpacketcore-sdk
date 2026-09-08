@@ -4335,7 +4335,9 @@ struct ConsensusLogPruneActiveInterrupt {
 pub(crate) struct ConsensusLogPruneLane {
     sender: tokio::sync::mpsc::Sender<()>,
     stop: tokio::sync::watch::Sender<bool>,
-    stopping: AtomicBool,
+    // The active SQLite turn must retain shutdown cancellation between VM
+    // statements, where a one-shot sqlite3_interrupt can have no effect.
+    stopping: Arc<AtomicBool>,
     degraded: AtomicBool,
     /// One writer turn owns this from its pre-publication recheck through its
     /// SQLite transaction rollback or commit. Primary writers hold an owned
@@ -4386,7 +4388,7 @@ impl ConsensusLogPruneLane {
         let lane = Arc::new(Self {
             sender,
             stop,
-            stopping: AtomicBool::new(false),
+            stopping: Arc::new(AtomicBool::new(false)),
             degraded: AtomicBool::new(false),
             turn_ownership: Arc::new(tokio::sync::Mutex::new(())),
             interrupt_delivery: Arc::new(Mutex::new(())),
@@ -4642,6 +4644,7 @@ async fn run_consensus_log_prune_lane(
         let source_for_turn = Arc::clone(&source);
         let expected_members_for_turn = expected_members.clone();
         let expected_bindings_for_turn = expected_bindings.clone();
+        let stopping = Arc::clone(&lane.stopping);
         let primary_writers = Arc::clone(&lane.primary_writers);
         let interrupt_delivery = Arc::clone(&lane.interrupt_delivery);
         #[cfg(all(test, target_os = "linux"))]
@@ -4662,6 +4665,7 @@ async fn run_consensus_log_prune_lane(
                 &expected_bindings_for_turn,
                 fixed_placement_policy,
                 ConsensusLogPruneTurnControl {
+                    stopping,
                     primary_writers: Arc::clone(&primary_writers),
                     interrupt_delivery: Arc::clone(&interrupt_delivery),
                     preemption_requested: Arc::clone(&preemption_requested),
@@ -4854,6 +4858,7 @@ async fn wait_consensus_log_prune_pacing(
 }
 
 struct ConsensusLogPruneTurnControl {
+    stopping: Arc<AtomicBool>,
     primary_writers: Arc<AtomicUsize>,
     interrupt_delivery: Arc<Mutex<()>>,
     preemption_requested: Arc<AtomicBool>,
@@ -4861,10 +4866,12 @@ struct ConsensusLogPruneTurnControl {
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
 
-/// Interrupt every SQLite VM step in a prune turn once a primary writer has
-/// announced itself. The lane publishes the connection interrupt handle
-/// before entering this scope; this callback closes the interval where that
+/// Interrupt every SQLite VM step in a prune turn after shutdown or primary
+/// preemption. The lane publishes the connection interrupt handle before
+/// entering this scope; these persistent flags close the interval where that
 /// cross-thread interrupt arrives with no VDBE active and SQLite clears it.
+/// Cleanup removes this callback before rollback, so a retained stop cannot
+/// prevent the transaction from returning its writer ownership.
 struct ConsensusLogPruneProgressGuard<'a> {
     conn: &'a Connection,
 }
@@ -4872,6 +4879,7 @@ struct ConsensusLogPruneProgressGuard<'a> {
 impl<'a> ConsensusLogPruneProgressGuard<'a> {
     fn install(
         conn: &'a Connection,
+        stopping: Arc<AtomicBool>,
         primary_writers: Arc<AtomicUsize>,
         observed_preemption: Arc<AtomicBool>,
         #[cfg(all(test, target_os = "linux"))] turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
@@ -4879,6 +4887,9 @@ impl<'a> ConsensusLogPruneProgressGuard<'a> {
         conn.progress_handler(
             1,
             Some(move || {
+                if stopping.load(Ordering::Acquire) {
+                    return true;
+                }
                 let preempt = primary_writers.load(Ordering::Acquire) != 0;
                 if preempt {
                     #[cfg(all(test, target_os = "linux"))]
@@ -4917,6 +4928,7 @@ fn prune_consensus_log_turn_sync(
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
     let progress = ConsensusLogPruneProgressGuard::install(
         conn,
+        Arc::clone(&control.stopping),
         Arc::clone(&control.primary_writers),
         Arc::clone(&control.preemption_requested),
         #[cfg(all(test, target_os = "linux"))]
@@ -44954,6 +44966,7 @@ mod tests {
         let observed_preemption = Arc::new(AtomicBool::new(false));
         let guard = ConsensusLogPruneProgressGuard::install(
             &conn,
+            Arc::new(AtomicBool::new(false)),
             Arc::clone(&primary_writers),
             Arc::clone(&observed_preemption),
             #[cfg(all(test, target_os = "linux"))]
@@ -51742,6 +51755,48 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_lane_shutdown_cancels_active_turn_and_reopen_drains_backlog() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            true,
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_shutdown_between_statements_does_not_require_a_primary_writer() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            false,
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_shutdown_before_delete_preserves_backlog_without_a_primary() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            false,
+            ConsensusLogPruneTurnGatePoint::BeforeDelete,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_shutdown_before_commit_rolls_back_without_a_primary() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            false,
+            ConsensusLogPruneTurnGatePoint::BeforeCommit,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_consensus_log_prune_shutdown_cancels_and_reopens(
+        with_waiting_primary: bool,
+        point: ConsensusLogPruneTurnGatePoint,
+    ) {
         let directory = tempfile::tempdir().expect("prune shutdown directory");
         let source_path = directory.path().join("prune-shutdown.sqlite");
         let backend =
@@ -51814,8 +51869,7 @@ mod tests {
             .expect("pin prune shutdown primary descriptor"),
         );
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
-        let gate =
-            ConsensusLogPruneTurnGateForTest::install_before_authority_read(directory.path());
+        let gate = ConsensusLogPruneTurnGateForTest::install_at(directory.path(), point);
         let lane = ConsensusLogPruneLane::start(
             Arc::clone(&pinned),
             None,
@@ -51847,7 +51901,7 @@ mod tests {
         );
 
         let shutdown_lane = Arc::clone(&lane);
-        let shutdown = tokio::spawn(async move {
+        let mut shutdown = tokio::spawn(async move {
             shutdown_lane.shutdown().await;
         });
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -51858,19 +51912,38 @@ mod tests {
         .await
         .expect("shutdown publishes stop before joining the active worker");
 
-        let primary_lane = Arc::clone(&lane);
-        let primary_preemption =
-            tokio::spawn(async move { primary_lane.request_primary_preemption().await });
-        tokio::task::yield_now().await;
-        assert!(
-            !primary_preemption.is_finished(),
-            "a stopping primary still waits for the prune writer transaction to roll back",
-        );
+        let primary_preemption = with_waiting_primary.then(|| {
+            let primary_lane = Arc::clone(&lane);
+            tokio::spawn(async move { primary_lane.request_primary_preemption().await })
+        });
+        if let Some(preemption) = &primary_preemption {
+            tokio::task::yield_now().await;
+            assert!(
+                !preemption.is_finished(),
+                "a stopping primary still waits for the prune writer transaction to roll back",
+            );
+        } else {
+            assert_eq!(lane.primary_writers_for_test(), 0);
+        }
         gate.release();
-        let primary_guard = tokio::time::timeout(Duration::from_secs(1), primary_preemption)
-            .await
-            .expect("primary preemption waits for the interrupted prune rollback")
-            .expect("join primary preemption after shutdown");
+        let primary_guard = match primary_preemption {
+            Some(preemption) => Some(
+                tokio::time::timeout(Duration::from_secs(1), preemption)
+                    .await
+                    .expect("primary preemption waits for the interrupted prune rollback")
+                    .expect("join primary preemption after shutdown"),
+            ),
+            None => {
+                // In this variant shutdown is the sole source of cancellation.
+                // Join it before probing SQLite so the probe cannot supply
+                // the foreground pressure that would hide a lost interrupt.
+                tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
+                    .await
+                    .expect("shutdown joins without a primary preemption")
+                    .expect("shutdown task completes without a primary preemption");
+                None
+            }
+        };
         let primary_writer =
             Connection::open(pinned.path()).expect("open primary writer after shutdown preemption");
         apply_pragma_profile(&primary_writer, false, true)
@@ -51888,10 +51961,12 @@ mod tests {
             .commit()
             .expect("commit primary write after prune rollback/autocommit");
         drop(primary_guard);
-        tokio::time::timeout(Duration::from_secs(1), shutdown)
-            .await
-            .expect("shutdown joins the interrupted real worker within the bounded budget")
-            .expect("shutdown task completes");
+        if with_waiting_primary {
+            tokio::time::timeout(Duration::from_secs(1), shutdown)
+                .await
+                .expect("shutdown joins the interrupted real worker within the bounded budget")
+                .expect("shutdown task completes");
+        }
 
         let stopped = diagnostics.snapshot();
         assert_eq!(stopped.consensus_log_prune_permanent_failures, 0);
