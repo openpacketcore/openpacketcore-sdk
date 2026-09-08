@@ -923,6 +923,39 @@ every use. The existing statement cache capacity is unchanged. The immutable
 V2 protocol digest is computed once; every persisted receipt and request
 binding is still verified.
 
+A range read can retain its completely audited highest row for one later read
+within that invocation. The later read still fetches the complete SQL tuple and
+checks its epoch before comparing all three stored integers and every encoded
+byte. A typed match moves the audited entry into the original decoder result
+position; all range, leader, membership, projection and batching checks retain
+their original order. The entry then has the ordinary consumer/output lifetime.
+A mismatch destroys the retained raw and decoded values before falling back to
+the full decoder. Ordinary highest-row queries and append replay retain their
+separate full audits; transaction ownership and visibility are unchanged.
+
+Typed retention accepts only a Normal V2 batch with 1–8 requests, directly or
+inside one authority envelope, whose raw Vec capacity is at most 32 KiB. Its
+checked charge includes actual request Vec, String and payload Vec capacities,
+all retained boxes, aligned payload Arc control/value storage per occurrence,
+and fixed ownership and conversion storage. Each StableId backing is replaced
+sequentially by an exact-length boxed copy of its existing bytes, avoiding
+retention of oversized or sliced external backing. The accounting also reserves
+identifier promotion storage and one extra conversion transient. This accounting
+uses the pinned bytes 1.12.1 representation and must be revalidated on upgrade.
+
+The mode is selected before one nonwaiting reservation against a shared 4 MiB
+charged budget per linked SDK copy. Typed retention is limited to 256 KiB per
+owner. Ineligible typed rows can retain only their raw canonical proof, limited
+to 32 KiB raw capacity and 64 KiB charged storage, or use the full decoder.
+Reservation contention falls through without a second attempt. On the tested
+x86_64 layout, raw mode charges at most 32,928 bytes; each empty owner occupies
+88 bytes and the fixed budget object occupies 16 bytes. With E active proofs
+among N live owners, the additional accounted capacity is at most
+4 MiB + 88 × (N − E) + 16 bytes. There is no global owner-count limit. Baseline
+SQL/decoder/output allocations, compiler stack frames, allocator rounding and
+metadata, RSS, and separately linked SDK copies are outside that capacity bound.
+The existing 16 MiB row acceptance limit is unchanged.
+
 Logical purge reuses its complete current-floor row audit within the same
 transaction when proving the next floor and applied frontier. Any applied tail
 beyond that first scan is fully decoded before publication. Exact marker,

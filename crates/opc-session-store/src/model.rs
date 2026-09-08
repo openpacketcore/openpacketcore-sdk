@@ -326,6 +326,10 @@ impl StateClass {
 pub struct StateType(String);
 
 impl StateType {
+    pub(crate) fn allocation_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Maximum UTF-8 encoded length accepted by [`StateType::new`].
     pub const MAX_BYTES: usize = STATE_TYPE_MAX_BYTES;
 
@@ -405,6 +409,10 @@ impl<'de> Deserialize<'de> for StateType {
 pub struct CustomSessionKeyType(String);
 
 impl CustomSessionKeyType {
+    pub(crate) fn allocation_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Maximum UTF-8 encoded length accepted by
     /// [`CustomSessionKeyType::new`].
     pub const MAX_BYTES: usize = SESSION_KEY_TYPE_MAX_BYTES;
@@ -641,6 +649,45 @@ pub struct SessionKey {
 }
 
 impl SessionKey {
+    // The retained identifier is normalized before it can leave the capture
+    // guard. bytes 1.12.1 takes an exact Box<[u8]> directly; additionally charge
+    // its three-word Shared promotion allocation even though reuse never clones
+    // or slices the normalized Bytes. The inline handles are charged by their
+    // containing request/record, separately from these backing allocations.
+    pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
+        let custom = match &self.key_type {
+            SessionKeyType::Other(value) => value.allocation_capacity(),
+            SessionKeyType::SubscriberContext
+            | SessionKeyType::PduSession
+            | SessionKeyType::TeidMapping
+            | SessionKeyType::PfcpSeid
+            | SessionKeyType::HandoverTransaction => 0,
+        };
+        self.tenant
+            .allocation_capacity()
+            .checked_add(self.nf_kind.allocation_capacity())?
+            .checked_add(custom)?
+            .checked_add(StableId::MAX_BYTES)?
+            .checked_add(std::mem::size_of::<[usize; 3]>())
+    }
+
+    pub(crate) fn log_row_reuse_normalization_bytes() -> Option<usize> {
+        // At most one extra backing and its concrete conversion temporaries
+        // exist at a time. Compiler stack frames are not a capacity/RSS claim.
+        StableId::MAX_BYTES
+            .checked_add(std::mem::size_of::<Box<[u8]>>())?
+            .checked_add(std::mem::size_of::<Bytes>())?
+            .checked_add(std::mem::size_of::<&[u8]>())
+    }
+
+    pub(crate) fn normalize_log_row_reuse_backing(&mut self) {
+        // Reserve the complete row charge before calling this method. Public
+        // StableId construction permits oversized/sliced external owners, so
+        // retaining the old Bytes based only on its length would be unbounded.
+        // Assignment releases that reference immediately, without cloning it.
+        self.stable_id.0 = Bytes::from(Box::<[u8]>::from(self.stable_id.0.as_ref()));
+    }
+
     pub(crate) fn canonical_digest_input(&self) -> Vec<u8> {
         let key_type = self.key_type.as_str();
         let mut out = Vec::with_capacity(
@@ -743,6 +790,10 @@ impl fmt::Display for Generation {
 pub struct OwnerId(String);
 
 impl OwnerId {
+    pub(crate) fn allocation_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Maximum UTF-8 encoded length accepted by [`OwnerId::new`].
     pub const MAX_BYTES: usize = OWNER_ID_MAX_BYTES;
 
@@ -916,6 +967,73 @@ mod tests {
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
     use proptest::prelude::*;
+
+    #[test]
+    fn log_row_reuse_preparation_key_and_string_capacities_include_slack() {
+        fn slack(value: &str, capacity: usize) -> String {
+            let mut string = String::with_capacity(capacity);
+            string.push_str(value);
+            string
+        }
+        let owner = OwnerId::new(slack("test-owner", 8192)).unwrap();
+        let state = StateType::new(slack("test-state", 4096)).unwrap();
+        let custom = CustomSessionKeyType::new(slack("test-custom", 2048)).unwrap();
+        assert_eq!(owner.allocation_capacity(), 8192);
+        assert_eq!(state.allocation_capacity(), 4096);
+        assert_eq!(custom.allocation_capacity(), 2048);
+        let mut key = test_key();
+        key.key_type = SessionKeyType::Other(custom);
+        let expected = key.tenant.allocation_capacity()
+            + key.nf_kind.allocation_capacity()
+            + 2048
+            + StableId::MAX_BYTES
+            + std::mem::size_of::<[usize; 3]>();
+        assert_eq!(key.log_row_reuse_allocation_bytes(), Some(expected));
+    }
+
+    #[test]
+    fn log_row_reuse_preparation_normalizes_shared_oversized_identifier_owners() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct ExternalOwner {
+            bytes: Box<[u8]>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl AsRef<[u8]> for ExternalOwner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for ExternalOwner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for width in [StableId::MIN_BYTES, 32, StableId::MAX_BYTES] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let external = Bytes::from_owner(ExternalOwner {
+                bytes: vec![7; 1024 * 1024].into_boxed_slice(),
+                drops: Arc::clone(&drops),
+            });
+            let mut first = test_key();
+            first.stable_id = StableId::new(external.slice(129..129 + width)).unwrap();
+            let mut second = first.clone();
+            drop(external);
+            let before = serde_json::to_vec(&first).unwrap();
+            let old_pointer = first.stable_id.as_ptr();
+            first.normalize_log_row_reuse_backing();
+            assert_ne!(first.stable_id.as_ptr(), old_pointer);
+            assert!(first.stable_id.0.is_unique());
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert!(serde_json::to_vec(&first).unwrap() == before);
+            second.normalize_log_row_reuse_backing();
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(second.stable_id.0.is_unique());
+            assert_ne!(first.stable_id.as_ptr(), second.stable_id.as_ptr());
+            assert!(serde_json::to_vec(&second).unwrap() == before);
+        }
+    }
 
     fn test_key() -> SessionKey {
         SessionKey {

@@ -398,6 +398,26 @@ impl<'de> serde::Deserialize<'de> for EncryptedSessionPayload {
 }
 
 impl EncryptedSessionPayload {
+    #[cfg(test)]
+    pub(crate) fn log_row_reuse_test_weak_bytes(&self) -> std::sync::Weak<Zeroizing<Vec<u8>>> {
+        Arc::downgrade(&self.bytes)
+    }
+
+    pub(crate) fn log_row_reuse_arc_allocation_bytes() -> Option<usize> {
+        // ArcInner contains two atomic counts followed by the value. Account
+        // for alignment between and after them, not just the Arc handle.
+        let counts = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+        let value = std::alloc::Layout::new::<Zeroizing<Vec<u8>>>();
+        let (layout, _) = counts.extend(value).ok()?;
+        Some(layout.pad_to_align().size())
+    }
+
+    pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
+        self.bytes
+            .capacity()
+            .checked_add(Self::log_row_reuse_arc_allocation_bytes()?)
+    }
+
     /// Construct caller-facing plaintext payload bytes.
     ///
     /// This is intended for data above the persistence boundary before
@@ -914,6 +934,35 @@ mod tests {
     };
     use serde::{de, Deserialize};
     use std::sync::Arc;
+
+    #[test]
+    fn log_row_reuse_preparation_payload_charge_includes_capacity_and_arc() {
+        use super::{EncryptedSessionPayload, SessionPayloadEncoding};
+        let mut backing = Vec::with_capacity(65536);
+        backing.extend_from_slice(&[1, 2, 3]);
+        let capacity = backing.capacity();
+        let payload =
+            EncryptedSessionPayload::from_vec_unchecked(backing, SessionPayloadEncoding::Plaintext);
+        let allocation = EncryptedSessionPayload::log_row_reuse_arc_allocation_bytes().unwrap();
+        assert!(
+            allocation
+                >= std::mem::size_of::<zeroize::Zeroizing<Vec<u8>>>()
+                    + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+        );
+        assert_eq!(
+            payload.log_row_reuse_allocation_bytes(),
+            Some(capacity + allocation)
+        );
+        let shared = payload.clone();
+        assert!(Arc::ptr_eq(&payload.bytes, &shared.bytes));
+        assert_eq!(
+            shared.log_row_reuse_allocation_bytes(),
+            Some(capacity + allocation)
+        );
+        assert_eq!(Arc::strong_count(&payload.bytes), 2);
+        drop(shared);
+        assert_eq!(Arc::strong_count(&payload.bytes), 1);
+    }
 
     struct BytesOnlyDeserializer<'a>(&'a [u8]);
 

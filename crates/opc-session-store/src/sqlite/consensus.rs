@@ -22890,7 +22890,7 @@ fn validate_exact_fenced_transition_v2_log_json(
     }
     // A batch, optionally under its one authority envelope, serializes only
     // fixed-field structs/enums, strings, integers and byte arrays. Its typed
-    // decoder has already traversed and authenticated every request. Exact
+    // decoder has already traversed every request structurally. Exact
     // equality with that complete serialization also proves every original
     // key, value, order and delimiter: ignored or duplicate fields, escaped
     // alternatives and trailing JSON cannot survive this comparison. Parsing
@@ -22927,6 +22927,8 @@ fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeC
     if bytes.is_empty() || bytes.len() > SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES {
         return Err(invalid_data("session consensus log entry size is invalid"));
     }
+    #[cfg(test)]
+    log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::TypedDecode);
     let entry: Entry<SessionRaftTypeConfig> = decode_json(bytes)?;
     let typed_v2 = log_entry_contains_fenced_transition_v2(&entry);
     let raw_v2 = !typed_v2
@@ -22939,11 +22941,12 @@ fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeC
 }
 
 // These are optional retention limits, not durable-row acceptance limits.
-// A proof owns the original encoded allocation only; the first typed Entry
-// still drops at the highest-row helper's return. In particular, a byte-length
-// estimate must not stand in for the capacities hidden inside a decoded Entry.
+// A narrow typed proof also owns one completely audited Entry. Every nested
+// capacity and the normalized identifier backing are charged before retention;
+// other eligible batches retain only the original encoded allocation.
 const LOG_ROW_REUSE_MAX_RAW_CAPACITY: usize = 32 * 1024;
 const LOG_ROW_REUSE_MAX_RETAINED_BYTES: usize = 64 * 1024;
+const LOG_ROW_REUSE_MAX_TYPED_BYTES: usize = 256 * 1024;
 const LOG_ROW_REUSE_AGGREGATE_BYTES: usize = 4 * 1024 * 1024;
 
 struct LogRowRetentionBudget {
@@ -22962,6 +22965,8 @@ impl LogRowRetentionBudget {
     fn try_reserve(&self, bytes: usize) -> Option<LogRowRetentionPermit<'_>> {
         let used = self.used.load(Ordering::Acquire);
         let next = used.checked_add(bytes).filter(|next| *next <= self.limit)?;
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::BeforeReservationCas);
         // One attempt only. Even ordinary reservation contention uses the
         // original decoder; this optional optimization never waits or retries.
         self.used
@@ -22991,16 +22996,34 @@ static LOG_ROW_RETENTION_BUDGET: LogRowRetentionBudget =
     LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
 
 struct LogRowCanonicalProof<'budget> {
-    // Field destruction order is part of the resource contract: free these
-    // bytes before the final permit returns their capacity. No Clone or early
-    // permit refund is permitted, and no decoded value survives in this proof.
+    // Field destruction order is part of the resource contract. On mismatch or
+    // abandonment, both allocations die before refund. A hit instead MOVES the
+    // Entry into the original decoder result position, deallocates its empty
+    // Box, then frees these extra bytes before refund. That Entry thereafter
+    // has the original consumer/output lifetime; no detached clone survives.
     encoded: Vec<u8>,
+    #[cfg(test)]
+    _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+    entry: Option<Box<Entry<SessionRaftTypeConfig>>>,
+    #[cfg(test)]
+    _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
     epoch: i64,
     term: i64,
     index: i64,
+    _permit: LogRowRetentionPermit<'budget>,
+}
+
+// Construction owns the original decoder result and encoded buffer before any
+// new allocation. Declaration order keeps both ahead of the permit on unwind.
+// The final proof will box the normalized Entry to keep empty owners small.
+struct LogRowPendingProof<'budget> {
+    encoded: Vec<u8>,
     #[cfg(test)]
     _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
-    _permit: LogRowRetentionPermit<'budget>,
+    entry: Option<Entry<SessionRaftTypeConfig>>,
+    #[cfg(test)]
+    _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
+    permit: LogRowRetentionPermit<'budget>,
 }
 
 struct LogRowReadReuse<'budget> {
@@ -23023,12 +23046,53 @@ impl<'budget> LogRowReadReuse<'budget> {
             return None;
         }
         // Account for the containing owner and a moved proof's fixed storage
-        // conservatively in addition to the actual Vec capacity. There are no
-        // copied bytes or retained decoded allocations.
+        // conservatively in addition to the actual Vec capacity. Raw mode has
+        // no copied bytes or retained decoded allocations.
         encoded_capacity
             .checked_add(std::mem::size_of::<Self>())?
             .checked_add(std::mem::size_of::<LogRowCanonicalProof<'budget>>())
             .filter(|bytes| *bytes <= LOG_ROW_REUSE_MAX_RETAINED_BYTES)
+    }
+
+    fn typed_retained_bytes(
+        encoded_capacity: usize,
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> Option<usize> {
+        let EntryPayload::Normal(command) = &entry.payload else {
+            return None;
+        };
+        let (intent, authorization_bytes) = match &command.intent {
+            SessionMutationIntent::Authorized { mutation, .. } => (
+                mutation.as_ref(),
+                std::mem::size_of::<SessionMutationIntent>(),
+            ),
+            intent => (intent, 0),
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+            return None;
+        };
+        if !(1..=8).contains(&requests.len()) {
+            return None;
+        }
+        // Include the final owner, a moved proof, the pending construction
+        // guard, Box<Entry>, a full Entry move at transfer, the temporary Box
+        // handle and one sequential identifier conversion. These are concrete
+        // capacity/layout terms, not compiler frames or allocator/RSS bounds.
+        let mut bytes = Self::retained_bytes(encoded_capacity)?
+            .checked_add(std::mem::size_of::<LogRowPendingProof<'budget>>())?
+            .checked_add(std::mem::size_of::<Entry<SessionRaftTypeConfig>>().checked_mul(2)?)?
+            .checked_add(std::mem::size_of::<Option<Box<Entry<SessionRaftTypeConfig>>>>())?
+            .checked_add(crate::SessionKey::log_row_reuse_normalization_bytes()?)?
+            .checked_add(authorization_bytes)?
+            .checked_add(Self::request_allocation_bytes(requests.capacity())?)?;
+        for request in requests {
+            bytes = bytes.checked_add(request.log_row_reuse_allocation_bytes()?)?;
+        }
+        (bytes <= LOG_ROW_REUSE_MAX_TYPED_BYTES).then_some(bytes)
+    }
+
+    fn request_allocation_bytes(capacity: usize) -> Option<usize> {
+        capacity.checked_mul(std::mem::size_of::<crate::FencedTransitionV2Request>())
     }
 
     fn capture_after_full_audit(
@@ -23037,38 +23101,114 @@ impl<'budget> LogRowReadReuse<'budget> {
         term: i64,
         index: i64,
         encoded: Vec<u8>,
-        entry: &Entry<SessionRaftTypeConfig>,
+        entry: Entry<SessionRaftTypeConfig>,
     ) {
         let first_attempt = !std::mem::replace(&mut self.capture_attempted, true);
-        let retained_bytes = Self::retained_bytes(encoded.capacity()).filter(|_| {
-            first_attempt && log_entry_has_exact_fenced_transition_v2_batch_shape(entry)
-        });
+        if !first_attempt || !log_entry_has_exact_fenced_transition_v2_batch_shape(&entry) {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Ineligible);
+            return;
+        }
+        // Select typed/raw/fallback before the single CAS. In particular a
+        // failed typed reservation cannot attempt another, smaller raw charge.
+        let typed_bytes = Self::typed_retained_bytes(encoded.capacity(), &entry);
+        let retained_bytes = typed_bytes.or_else(|| Self::retained_bytes(encoded.capacity()));
         let Some(retained_bytes) = retained_bytes else {
             #[cfg(test)]
             log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Ineligible);
             return;
+        };
+        // Drop an ineligible decoded value before reservation, including any
+        // externally supplied backing's destructor. The raw path retains none.
+        let entry = if typed_bytes.is_some() {
+            Some(entry)
+        } else {
+            drop(entry);
+            None
         };
         let Some(permit) = self.budget.try_reserve(retained_bytes) else {
             #[cfg(test)]
             log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::BudgetFallback);
             return;
         };
-        self.proof = Some(LogRowCanonicalProof {
-            encoded,
-            epoch,
-            term,
-            index,
+        if let Some(entry) = entry {
+            // Construct this guard without any fallible operation after the
+            // reservation. It owns raw and decoded allocations before the
+            // first normalization, Box allocation or test-only unwind hook.
+            let mut pending = LogRowPendingProof {
+                encoded,
+                #[cfg(test)]
+                _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+                entry: Some(entry),
+                #[cfg(test)]
+                _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
+                permit,
+            };
             #[cfg(test)]
-            _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
-            _permit: permit,
-        });
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Reserved);
+            let Some(Entry {
+                payload: EntryPayload::Normal(command),
+                ..
+            }) = pending.entry.as_mut()
+            else {
+                return;
+            };
+            let intent = match &mut command.intent {
+                SessionMutationIntent::Authorized { mutation, .. } => mutation.as_mut(),
+                intent => intent,
+            };
+            let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+                return;
+            };
+            for request in requests {
+                request.normalize_log_row_reuse_backing();
+                #[cfg(test)]
+                log_row_reuse_test_observer::note(
+                    log_row_reuse_test_observer::Event::NormalizedRequest,
+                );
+            }
+            // This local is declared after the guard, so an unwind after
+            // boxing drops it before the guard refunds its permit. The final
+            // field moves below are infallible and retain the same order.
+            let entry = pending.entry.take().map(Box::new);
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::BoxedEntry);
+            self.proof = Some(LogRowCanonicalProof {
+                encoded: pending.encoded,
+                #[cfg(test)]
+                _after_bytes: pending._after_bytes,
+                entry,
+                #[cfg(test)]
+                _after_entry: pending._after_entry,
+                epoch,
+                term,
+                index,
+                _permit: pending.permit,
+            });
+        } else {
+            self.proof = Some(LogRowCanonicalProof {
+                encoded,
+                #[cfg(test)]
+                _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+                entry: None,
+                #[cfg(test)]
+                _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
+                epoch,
+                term,
+                index,
+                _permit: permit,
+            });
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Reserved);
+        }
         #[cfg(test)]
         log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Captured);
     }
 
     // Call only at the original decoder position, after field conversions and
-    // epoch validation. Exact fresh bytes prove only the prior pure canonical
-    // audit; typed decoding and every consumer-specific validation still run.
+    // epoch validation. Exact fresh bytes prove the prior full audit. Typed
+    // mode moves its Entry here; raw mode repeats typed decoding. Every original
+    // consumer-specific validation still runs at the call site in both modes.
     fn decode(
         &mut self,
         epoch: i64,
@@ -23081,20 +23221,37 @@ impl<'budget> LogRowReadReuse<'budget> {
             .as_ref()
             .is_some_and(|proof| proof.index == index)
         {
-            let matches = self.proof.as_ref().is_some_and(|proof| {
-                proof.epoch == epoch
-                    && proof.term == term
-                    && proof.index == index
-                    && proof.encoded == encoded
-            });
-            // Consume on a same-index match or mismatch. Bytes are destroyed
-            // before their permit is refunded, and before the later decode.
-            drop(self.proof.take());
+            let Some(mut proof) = self.proof.take() else {
+                return decode_consensus_log_entry(encoded);
+            };
+            let matches = proof.epoch == epoch
+                && proof.term == term
+                && proof.index == index
+                && proof.encoded == encoded;
             if matches {
+                if let Some(entry) = proof.entry.take().map(|entry| *entry) {
+                    #[cfg(test)]
+                    log_row_reuse_test_observer::note(
+                        log_row_reuse_test_observer::Event::TypedTransfer,
+                    );
+                    // The Box is already deallocated. This destroys only the
+                    // extra raw/proof ownership, then refunds. `entry` is now
+                    // the ordinary consumer result, never a surviving clone.
+                    drop(proof);
+                    #[cfg(test)]
+                    log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Hit);
+                    return Ok(entry);
+                }
+                drop(proof);
                 #[cfg(test)]
                 log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Hit);
+                #[cfg(test)]
+                log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::TypedDecode);
                 return decode_json(encoded);
             }
+            // Mismatch consumes both raw and decoded allocations before the
+            // permit refund and before entering the unchanged full decoder.
+            drop(proof);
             #[cfg(test)]
             log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::TupleFallback);
         }
@@ -25049,6 +25206,10 @@ fn replay_unapplied_log_prefix_with_reuse_sync(
             Some(reuse) => reuse.decode(epoch, term, index, &encoded)?,
             None => decode_consensus_log_entry(&encoded)?,
         };
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(
+            log_row_reuse_test_observer::Event::PrefixContiguityCheck,
+        );
         if entry.log_id.index != expected
             || checked_u64(index)? != expected
             || checked_u64(term)? != entry.log_id.leader_id.term
@@ -25058,12 +25219,18 @@ fn replay_unapplied_log_prefix_with_reuse_sync(
             ));
         }
         if let Some(previous) = previous_log.as_ref() {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(
+                log_row_reuse_test_observer::Event::PrefixLeaderCheck,
+            );
             ensure_log_id_not_after(
                 previous,
                 &entry.log_id,
                 "persisted session consensus unapplied log leader ordering regressed",
             )?;
         }
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::PrefixProjection);
         projection.project(conn, &entry, storage_identity)?;
         expected = expected
             .checked_add(1)
@@ -26310,12 +26477,13 @@ fn last_log_with_optional_capture_sync(
     if let EntryPayload::Normal(command) = &entry.payload {
         validate_command_for_log(command, identity)?;
     }
+    let log_id = entry.log_id;
     if let Some(reuse) = reuse {
-        reuse.capture_after_full_audit(epoch, term, index, encoded, &entry);
+        reuse.capture_after_full_audit(epoch, term, index, encoded, entry);
     }
     #[cfg(test)]
     log_row_reuse_test_observer::after_highest_audit(conn);
-    Ok(Some(entry.log_id))
+    Ok(Some(log_id))
 }
 
 pub(crate) fn read_log_range_sync(
@@ -26568,6 +26736,8 @@ fn read_log_range_with_batch_and_reuse_sync(
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, identity)?;
         let entry = reuse.decode(epoch, term, index, &encoded)?;
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeLogIdCheck);
         validate_log_id(&entry.log_id)?;
         if checked_u64(term)? != entry.log_id.leader_id.term
             || checked_u64(index)? != entry.log_id.index
@@ -26580,12 +26750,16 @@ fn read_log_range_with_batch_and_reuse_sync(
         {
             expected_log_index = entry.log_id.index;
         }
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeContiguityCheck);
         if entry.log_id.index != expected_log_index {
             return Err(invalid_data(
                 "persisted session consensus log range contains a hole",
             ));
         }
         if let Some(previous) = previous_log.as_ref() {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeLeaderCheck);
             if entry.log_id.leader_id.term < previous.leader_id.term
                 || (entry.log_id.leader_id.term == previous.leader_id.term
                     && entry.log_id.leader_id != previous.leader_id)
@@ -26596,6 +26770,8 @@ fn read_log_range_with_batch_and_reuse_sync(
             }
         }
         let log_id = entry.log_id;
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeProjection);
         match applied_index {
             Some(applied_through) if entry.log_id.index <= applied_through => {
                 validate_applied_entry_for_membership_scope(
@@ -26607,6 +26783,8 @@ fn read_log_range_with_batch_and_reuse_sync(
             }
             _ => projection.project(conn, &entry, identity)?,
         }
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeBatchDecision);
         let decision = batch
             .as_mut()
             .map(|batch| {
@@ -41129,21 +41307,38 @@ mod log_row_reuse_test_observer {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Event {
         FullDecode,
+        TypedDecode,
+        BeforeReservationCas,
+        Reserved,
+        NormalizedRequest,
+        BoxedEntry,
         Captured,
         Hit,
+        TypedTransfer,
         TupleFallback,
         Ineligible,
         BudgetFallback,
         HighestAudit,
         AfterBytesDrop,
+        AfterEntrySlotDrop,
         Refund,
+        PrefixContiguityCheck,
+        PrefixLeaderCheck,
+        PrefixProjection,
+        RangeLogIdCheck,
+        RangeContiguityCheck,
+        RangeLeaderCheck,
+        RangeProjection,
+        RangeBatchDecision,
     }
 
     type AfterHighestAudit = Box<dyn FnOnce(&Connection)>;
+    type AfterEvent = (Event, usize, Box<dyn FnOnce()>);
 
     struct Observation {
         events: Vec<Event>,
         after_highest_audit: Option<AfterHighestAudit>,
+        after_event: Option<AfterEvent>,
     }
 
     thread_local! {
@@ -41151,12 +41346,24 @@ mod log_row_reuse_test_observer {
     }
 
     pub(super) fn note(event: Event) {
-        OBSERVATION.with(|state| {
+        let hook = OBSERVATION.with(|state| {
             if let Some(observation) = state.borrow_mut().as_mut() {
                 assert!(observation.events.len() < 256, "bounded test observation");
                 observation.events.push(event);
+                if let Some((wanted, remaining, _)) = observation.after_event.as_mut() {
+                    if *wanted == event {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            return observation.after_event.take().map(|(_, _, hook)| hook);
+                        }
+                    }
+                }
             }
+            None
         });
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(super) fn after_highest_audit(conn: &Connection) {
@@ -41180,6 +41387,17 @@ mod log_row_reuse_test_observer {
         }
     }
 
+    // This observes destruction of the slot after its Option<Entry/Box<Entry>>
+    // field. TypedTransfer distinguishes a moved value from one dropped here.
+    // It is zero-sized so observations do not change the charged type layouts.
+    pub(super) struct AfterEntrySlotDrop;
+
+    impl Drop for AfterEntrySlotDrop {
+        fn drop(&mut self) {
+            note(Event::AfterEntrySlotDrop);
+        }
+    }
+
     pub(super) struct Scope(bool);
 
     impl Scope {
@@ -41189,6 +41407,7 @@ mod log_row_reuse_test_observer {
                 *state.borrow_mut() = Some(Observation {
                     events: Vec::with_capacity(256),
                     after_highest_audit: None,
+                    after_event: None,
                 });
             });
             Self(true)
@@ -41203,9 +41422,25 @@ mod log_row_reuse_test_observer {
             });
         }
 
+        pub(super) fn after_event(
+            &self,
+            event: Event,
+            occurrence: usize,
+            hook: impl FnOnce() + 'static,
+        ) {
+            assert!(occurrence > 0);
+            OBSERVATION.with(|state| {
+                let mut state = state.borrow_mut();
+                let observation = state.as_mut().expect("active observation");
+                assert!(observation.after_event.is_none());
+                observation.after_event = Some((event, occurrence, Box::new(hook)));
+            });
+        }
+
         pub(super) fn finish(mut self) -> Vec<Event> {
             let observation = OBSERVATION.with(|state| state.borrow_mut().take().unwrap());
             assert!(observation.after_highest_audit.is_none(), "test hook ran");
+            assert!(observation.after_event.is_none(), "event hook ran");
             self.0 = false;
             observation.events
         }
@@ -41845,9 +42080,14 @@ mod tests {
             log_row_reuse_event_count(events, Event::AfterBytesDrop)
         );
         assert_eq!(captured, log_row_reuse_event_count(events, Event::Refund));
+        assert_eq!(
+            captured,
+            log_row_reuse_event_count(events, Event::AfterEntrySlotDrop)
+        );
         for (index, event) in events.iter().enumerate() {
             if *event == Event::AfterBytesDrop {
-                assert_eq!(events.get(index + 1), Some(&Event::Refund));
+                assert_eq!(events.get(index + 1), Some(&Event::AfterEntrySlotDrop));
+                assert_eq!(events.get(index + 2), Some(&Event::Refund));
             }
         }
     }
@@ -41976,7 +42216,7 @@ mod tests {
     }
 
     #[test]
-    fn log_row_reuse_removes_only_the_later_full_decode_in_each_overlap() {
+    fn log_row_reuse_removes_later_typed_and_canonical_decode_but_runs_consumer_checks() {
         use log_row_reuse_test_observer::{Event, Scope};
         for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
             let directory = tempfile::tempdir().unwrap();
@@ -42018,6 +42258,36 @@ mod tests {
                         original_decodes - expected_hits
                     );
                     assert_eq!(
+                        log_row_reuse_event_count(&events, Event::TypedDecode),
+                        original_decodes - expected_hits
+                    );
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::TypedTransfer),
+                        expected_hits
+                    );
+                    let prefix_checks = if shape == "prefix_last" { 3 } else { 0 };
+                    for check in [
+                        Event::PrefixContiguityCheck,
+                        Event::PrefixLeaderCheck,
+                        Event::PrefixProjection,
+                    ] {
+                        assert_eq!(log_row_reuse_event_count(&events, check), prefix_checks);
+                    }
+                    for check in [
+                        Event::RangeLogIdCheck,
+                        Event::RangeContiguityCheck,
+                        Event::RangeProjection,
+                        Event::RangeBatchDecision,
+                    ] {
+                        assert_eq!(log_row_reuse_event_count(&events, check), expected.len());
+                    }
+                    // These fixtures have no purge predecessor. The original
+                    // range loop compares leaders only from its second row.
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::RangeLeaderCheck),
+                        expected.len().saturating_sub(1)
+                    );
+                    assert_eq!(
                         log_row_reuse_event_count(&events, Event::HighestAudit),
                         usize::from(shape != "empty")
                     );
@@ -42029,7 +42299,10 @@ mod tests {
                         serde_json::json!({
                             "type": "decode_counts", "payload": payload.name(), "shape": shape,
                             "enabled": enabled, "full_decodes": original_decodes - expected_hits,
-                            "hits": expected_hits,
+                            "typed_decodes": original_decodes - expected_hits,
+                            "hits": expected_hits, "typed_transfers": expected_hits,
+                            "prefix_check_sets": prefix_checks, "range_check_sets": expected.len(),
+                            "range_leader_checks": expected.len().saturating_sub(1),
                         })
                     );
                 }
@@ -42514,6 +42787,869 @@ mod tests {
     }
 
     #[test]
+    fn log_row_reuse_nine_request_raw_mode_and_unsupported_shapes_remain_decoded() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let requests = (0..9)
+            .map(|slot| {
+                let create = sdk741_component_request(Sdk741Payload::Create, 4, slot, None);
+                FencedTransitionV2Request::new(
+                    create.request_id().epoch(),
+                    crate::fenced_transition::FencedTransitionV2CallerNonce::from_bytes(
+                        (slot as u128 + 1).to_be_bytes(),
+                    ),
+                    create.lease().clone(),
+                    FencedTransitionMutation::delete(Generation::new(1)),
+                )
+                .unwrap()
+            })
+            .collect();
+        let entry = fenced_transition_v2_batch_entry(4, requests, timestamp(4));
+        let encoded = encode_json(&entry).unwrap();
+        assert!(encoded.capacity() <= LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+        let audited = decode_consensus_log_entry(&encoded).unwrap();
+        assert!(audited == entry);
+        if let EntryPayload::Normal(command) = &audited.payload {
+            validate_command_for_log(command, identity()).unwrap();
+        }
+        assert!(LogRowReadReuse::typed_retained_bytes(encoded.capacity(), &audited).is_none());
+        let charge = LogRowReadReuse::retained_bytes(encoded.capacity()).unwrap();
+        let budget = LogRowRetentionBudget::new(charge);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let scope = Scope::new();
+        reuse.capture_after_full_audit(
+            epoch_i64(identity()).unwrap(),
+            1,
+            4,
+            encoded.clone(),
+            audited,
+        );
+        assert!(reuse.proof.as_ref().unwrap().entry.is_none());
+        assert_eq!(
+            budget.used.load(Ordering::Acquire),
+            LogRowReadReuse::retained_bytes(encoded.len()).unwrap()
+        );
+        assert!(
+            reuse
+                .decode(epoch_i64(identity()).unwrap(), 1, 4, &encoded)
+                .unwrap()
+                == entry
+        );
+        drop(reuse);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 0);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 0);
+        assert_eq!(
+            log_row_reuse_event_count(&events, Event::NormalizedRequest),
+            0
+        );
+        for entry in [
+            blank_entry(4),
+            membership_entry_at(4, vec![expected_members()], expected_members()),
+        ] {
+            let encoded = encode_json(&entry).unwrap();
+            let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+            let mut reuse = LogRowReadReuse::new(&budget);
+            let scope = Scope::new();
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                encoded.clone(),
+                entry.clone(),
+            );
+            assert!(reuse.proof.is_none());
+            assert!(
+                reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &encoded)
+                    .unwrap()
+                    == entry
+            );
+            drop(reuse);
+            let events = scope.finish();
+            assert_eq!(log_row_reuse_event_count(&events, Event::Ineligible), 1);
+            assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 1);
+            assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 1);
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    fn log_row_reuse_requests(
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> &Vec<FencedTransitionV2Request> {
+        let EntryPayload::Normal(command) = &entry.payload else {
+            panic!("normal test entry")
+        };
+        let intent = match &command.intent {
+            SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+            intent => intent,
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+            panic!("batch test entry")
+        };
+        requests
+    }
+
+    fn log_row_reuse_requests_mut(
+        entry: &mut Entry<SessionRaftTypeConfig>,
+    ) -> &mut Vec<FencedTransitionV2Request> {
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            panic!("normal test entry")
+        };
+        let intent = match &mut command.intent {
+            SessionMutationIntent::Authorized { mutation, .. } => mutation.as_mut(),
+            intent => intent,
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+            panic!("batch test entry")
+        };
+        requests
+    }
+
+    fn log_row_reuse_weak_payloads(
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> Vec<std::sync::Weak<zeroize::Zeroizing<Vec<u8>>>> {
+        log_row_reuse_requests(entry)
+            .iter()
+            .filter_map(|request| request.mutation().record())
+            .map(|record| record.payload.log_row_reuse_test_weak_bytes())
+            .collect()
+    }
+
+    fn log_row_reuse_edit_request(
+        entry: &mut Entry<SessionRaftTypeConfig>,
+        index: usize,
+        edit: impl FnOnce(&mut FencedTransitionLease, &mut FencedTransitionMutation),
+    ) {
+        let request = &log_row_reuse_requests(entry)[index];
+        let id = request.request_id();
+        let mut lease = request.lease().clone();
+        let mut mutation = request.mutation().clone();
+        edit(&mut lease, &mut mutation);
+        log_row_reuse_requests_mut(entry)[index] =
+            FencedTransitionV2Request::from_parts(id, lease, mutation).unwrap();
+    }
+
+    #[test]
+    fn log_row_reuse_cas_race_falls_through_without_retrying_in_raw_mode() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        let entry = decode_consensus_log_entry(&canonical).unwrap();
+        let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+        let between_load_and_cas = Arc::new(std::sync::Barrier::new(2));
+        let reservation_live = Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Barrier::new(2);
+        let scope = Scope::new();
+        let before = Arc::clone(&between_load_and_cas);
+        let live = Arc::clone(&reservation_live);
+        scope.after_event(Event::BeforeReservationCas, 1, move || {
+            before.wait();
+            live.wait();
+        });
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                between_load_and_cas.wait();
+                let competing_permit = budget.try_reserve(1).unwrap();
+                reservation_live.wait();
+                release.wait();
+                drop(competing_permit);
+            });
+            let mut reuse = LogRowReadReuse::new(&budget);
+            reuse.capture_after_full_audit(epoch_i64(identity()).unwrap(), 1, 4, canonical, entry);
+            let retained = reuse.proof.is_some();
+            let used = budget.used.load(Ordering::Acquire);
+            drop(reuse);
+            // Release the real competing owner before test assertions can unwind.
+            release.wait();
+            assert!(!retained);
+            assert_eq!(used, 1);
+        });
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let events = scope.finish();
+        assert_eq!(
+            log_row_reuse_event_count(&events, Event::BeforeReservationCas),
+            1
+        );
+        assert_eq!(log_row_reuse_event_count(&events, Event::BudgetFallback), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Reserved), 0);
+    }
+
+    fn log_row_reuse_external_identifier_backing(
+        entry: &mut Entry<SessionRaftTypeConfig>,
+        drops: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    ) {
+        struct ExternalOwner {
+            bytes: Box<[u8]>,
+            drops: Arc<AtomicUsize>,
+            panic_on_drop: bool,
+        }
+        impl AsRef<[u8]> for ExternalOwner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for ExternalOwner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    !self.panic_on_drop,
+                    "controlled external identifier destructor unwind"
+                );
+            }
+        }
+        let mut backing = vec![0; 1024 * 1024].into_boxed_slice();
+        let lengths: Vec<_> = log_row_reuse_requests(entry)
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let value = &request.lease().key().stable_id;
+                backing[index * 64..index * 64 + value.len()].copy_from_slice(value);
+                value.len()
+            })
+            .collect();
+        let shared = Bytes::from_owner(ExternalOwner {
+            bytes: backing,
+            drops,
+            panic_on_drop,
+        });
+        for (index, len) in lengths.into_iter().enumerate() {
+            let stable_id =
+                crate::StableId::new(shared.slice(index * 64..index * 64 + len)).unwrap();
+            log_row_reuse_edit_request(entry, index, |lease, mutation| {
+                match lease {
+                    FencedTransitionLease::Acquire { key, .. } => key.stable_id = stable_id.clone(),
+                    FencedTransitionLease::Renew { lease, .. } => {
+                        let mut key = lease.key().clone();
+                        key.stable_id = stable_id.clone();
+                        *lease = crate::LeaseGuard::new(
+                            key,
+                            lease.owner().clone(),
+                            lease.fence(),
+                            lease.acquired_at(),
+                            lease.expires_at(),
+                            lease.credential_id(),
+                        );
+                    }
+                }
+                match mutation {
+                    FencedTransitionMutation::Create { record }
+                    | FencedTransitionMutation::Update { record, .. } => {
+                        record.key.stable_id = stable_id;
+                    }
+                    _ => unreachable!(),
+                }
+            });
+        }
+        // All sixteen occurrences now own this one oversized external backing.
+        drop(shared);
+    }
+
+    #[test]
+    fn log_row_reuse_normalization_releases_all_shared_external_backing_and_unwinds() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            let canonical = encode_json(&fixture.entries[4]).unwrap();
+            for panic_on_drop in [false, true] {
+                let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+                let drops = Arc::new(AtomicUsize::new(0));
+                log_row_reuse_external_identifier_backing(
+                    &mut entry,
+                    Arc::clone(&drops),
+                    panic_on_drop,
+                );
+                assert!(encode_json(&entry).unwrap() == canonical);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                let weak = log_row_reuse_weak_payloads(&entry);
+                let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+                let scope = Scope::new();
+                let observed_drops = Arc::clone(&drops);
+                let observed_budget = Arc::clone(&budget);
+                let observed_weak = weak.clone();
+                scope.after_event(Event::Refund, 1, move || {
+                    assert_eq!(observed_drops.load(Ordering::SeqCst), 1);
+                    assert_eq!(observed_budget.used.load(Ordering::Acquire), 0);
+                    assert!(observed_weak
+                        .iter()
+                        .all(|payload| payload.strong_count() == usize::from(!panic_on_drop)));
+                });
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut reuse = LogRowReadReuse::new(&budget);
+                    reuse.capture_after_full_audit(
+                        epoch_i64(identity()).unwrap(),
+                        1,
+                        4,
+                        canonical.clone(),
+                        entry,
+                    );
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    let result = reuse
+                        .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                        .unwrap();
+                    assert!(encode_json(&result).unwrap() == canonical);
+                    for request in log_row_reuse_requests(&result) {
+                        request.validate().unwrap();
+                    }
+                }));
+                assert_eq!(unwind.is_err(), panic_on_drop);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+                assert_eq!(budget.used.load(Ordering::Acquire), 0);
+                let events = scope.finish();
+                assert_eq!(log_row_reuse_event_count(&events, Event::Refund), 1);
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::TypedTransfer),
+                    usize::from(!panic_on_drop)
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::NormalizedRequest),
+                    if panic_on_drop { 7 } else { 8 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_transferred_payload_drops_on_real_consumer_error_and_unwind() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for prefix in [false, true] {
+            for panic_consumer in [false, true] {
+                let backend = sdk741_seed_case(
+                    directory.path(),
+                    &format!("typed-consumer-{prefix}-{panic_consumer}"),
+                    &fixture,
+                    3,
+                );
+                let conn = backend.conn.blocking_lock();
+                conn.execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+                    .unwrap();
+                let entry = decode_consensus_log_entry(&canonical).unwrap();
+                let weak = log_row_reuse_weak_payloads(&entry);
+                let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+                let scope = Scope::new();
+                let observed_budget = Arc::clone(&budget);
+                let observed_weak = weak.clone();
+                let checkpoint = if prefix {
+                    Event::PrefixProjection
+                } else {
+                    Event::RangeProjection
+                };
+                scope.after_event(checkpoint, 1, move || {
+                    assert_eq!(observed_budget.used.load(Ordering::Acquire), 0);
+                    assert!(observed_weak
+                        .iter()
+                        .all(|payload| payload.strong_count() == 1));
+                    assert!(!panic_consumer, "controlled original consumer unwind");
+                });
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut reuse = LogRowReadReuse::new(&budget);
+                    // Supply the same fully audited candidate before entering
+                    // the real consumer; its highest helper cannot recapture.
+                    reuse.capture_after_full_audit(
+                        epoch_i64(identity()).unwrap(),
+                        1,
+                        4,
+                        canonical.clone(),
+                        entry,
+                    );
+                    let result = read_log_range_with_batch_and_reuse_sync(
+                        &conn,
+                        identity(),
+                        if prefix { 5 } else { 4 },
+                        Some(6),
+                        Some(8),
+                        true,
+                        LogRangeRecoveryProfile::Strict,
+                        &mut reuse,
+                    );
+                    assert_eq!(log_row_reuse_error(result),
+                        "projected fenced transition V2 batch lacks an exact activation certificate");
+                }));
+                assert_eq!(unwind.is_err(), panic_consumer);
+                assert_eq!(budget.used.load(Ordering::Acquire), 0);
+                assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+                let events = scope.finish();
+                assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 1);
+                assert_eq!(log_row_reuse_event_count(&events, checkpoint), 1);
+                log_row_reuse_assert_closed(&events);
+                assert!(conn.is_autocommit());
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_actual_string_capacity_enforces_exact_typed_boundary() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for excess in [0, 1] {
+            let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+            // Normalize only the test's incidental String clone capacities
+            // before calculating the exact remaining room for one owner.
+            log_row_reuse_edit_request(&mut entry, 0, |_, _| {});
+            let owner = log_row_reuse_requests(&entry)[0].lease().owner();
+            let owner_value = owner.as_str().to_owned();
+            let original_capacity = owner.allocation_capacity();
+            let before = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+            let owner_capacity =
+                LOG_ROW_REUSE_MAX_TYPED_BYTES - before + original_capacity + excess;
+            log_row_reuse_edit_request(&mut entry, 0, |lease, _| {
+                let FencedTransitionLease::Acquire { owner, .. } = lease else {
+                    panic!("acquire fixture")
+                };
+                let mut backing = String::with_capacity(owner_capacity);
+                backing.push_str(&owner_value);
+                *owner = OwnerId::new(backing).unwrap();
+                assert_eq!(owner.allocation_capacity(), owner_capacity);
+            });
+            assert!(encode_json(&entry).unwrap() == canonical);
+            assert_eq!(
+                LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry),
+                (excess == 0).then_some(LOG_ROW_REUSE_MAX_TYPED_BYTES),
+            );
+            let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_MAX_TYPED_BYTES);
+            let mut reuse = LogRowReadReuse::new(&budget);
+            let scope = Scope::new();
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry,
+            );
+            assert_eq!(reuse.proof.as_ref().unwrap().entry.is_some(), excess == 0);
+            assert_eq!(
+                budget.used.load(Ordering::Acquire),
+                if excess == 0 {
+                    LOG_ROW_REUSE_MAX_TYPED_BYTES
+                } else {
+                    LogRowReadReuse::retained_bytes(canonical.len()).unwrap()
+                }
+            );
+            assert!(
+                reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                    .unwrap()
+                    == fixture.entries[4]
+            );
+            drop(reuse);
+            let events = scope.finish();
+            log_row_reuse_assert_closed(&events);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::TypedTransfer),
+                usize::from(excess == 0)
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::TypedDecode),
+                excess
+            );
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_payload_and_record_string_slack_are_in_the_full_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for field in ["payload", "owner", "state_type"] {
+            let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+            log_row_reuse_edit_request(&mut entry, 0, |_, _| {});
+            let record = log_row_reuse_requests(&entry)[0]
+                .mutation()
+                .record()
+                .unwrap();
+            let original_allocation = match field {
+                "payload" => {
+                    record.payload.log_row_reuse_allocation_bytes().unwrap()
+                        - EncryptedSessionPayload::log_row_reuse_arc_allocation_bytes().unwrap()
+                }
+                "owner" => record.owner.allocation_capacity(),
+                "state_type" => record.state_type.allocation_capacity(),
+                _ => unreachable!(),
+            };
+            let before = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+            let capacity = 65536;
+            log_row_reuse_edit_request(&mut entry, 0, |_, mutation| {
+                let FencedTransitionMutation::Create { record } = mutation else {
+                    panic!("create fixture")
+                };
+                match field {
+                    "payload" => {
+                        let mut bytes = Vec::with_capacity(capacity);
+                        bytes.extend_from_slice(record.payload.as_bytes());
+                        record.payload = EncryptedSessionPayload::try_from_vec_with_encoding(
+                            bytes,
+                            record.payload.encoding(),
+                        )
+                        .unwrap();
+                    }
+                    "owner" => {
+                        let mut value = String::with_capacity(capacity);
+                        value.push_str(record.owner.as_str());
+                        record.owner = OwnerId::new(value).unwrap();
+                    }
+                    "state_type" => {
+                        let mut value = String::with_capacity(capacity);
+                        value.push_str(record.state_type.as_str());
+                        record.state_type = crate::StateType::new(value).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let after = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+            assert_eq!(after - before, capacity - original_allocation);
+            assert!(encode_json(&entry).unwrap() == canonical);
+            assert!(after <= LOG_ROW_REUSE_MAX_TYPED_BYTES);
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_authorized_box_and_all_lease_mutation_variants_are_accounted() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            for mutation_kind in ["record", "delete", "refresh"] {
+                if mutation_kind == "refresh" && matches!(payload, Sdk741Payload::Create) {
+                    continue; // Refresh requires a committed renewal credential.
+                }
+                let original = &log_row_reuse_requests(&fixture.entries[4])[0];
+                let mutation = match mutation_kind {
+                    "record" => original.mutation().clone(),
+                    "delete" => FencedTransitionMutation::delete(Generation::new(1)),
+                    "refresh" => FencedTransitionMutation::refresh_ttl(
+                        Generation::new(1),
+                        Duration::from_secs(30),
+                    )
+                    .unwrap(),
+                    _ => unreachable!(),
+                };
+                let request = FencedTransitionV2Request::new(
+                    original.request_id().epoch(),
+                    original.request_id().nonce(),
+                    original.lease().clone(),
+                    mutation,
+                )
+                .unwrap();
+                let mut entry = fenced_transition_v2_batch_entry(4, vec![request], timestamp(4));
+                let before =
+                    LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY, &entry)
+                        .unwrap();
+                let EntryPayload::Normal(command) = &mut entry.payload else {
+                    unreachable!()
+                };
+                command.intent = SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(),
+                    mutation: Box::new(std::mem::replace(
+                        &mut command.intent,
+                        SessionMutationIntent::AdvanceLogicalTime,
+                    )),
+                };
+                validate_command_for_log(command, identity()).unwrap();
+                let after =
+                    LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY, &entry)
+                        .unwrap();
+                assert_eq!(after - before, std::mem::size_of::<SessionMutationIntent>());
+                let canonical = encode_json(&entry).unwrap();
+                assert!(decode_consensus_log_entry(&canonical).unwrap() == entry);
+                let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+                let mut reuse = LogRowReadReuse::new(&budget);
+                let scope = Scope::new();
+                reuse.capture_after_full_audit(
+                    epoch_i64(identity()).unwrap(),
+                    1,
+                    4,
+                    canonical.clone(),
+                    entry,
+                );
+                let result = reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                    .unwrap();
+                assert!(encode_json(&result).unwrap() == canonical);
+                for request in log_row_reuse_requests(&result) {
+                    request.validate().unwrap();
+                }
+                drop(reuse);
+                let events = scope.finish();
+                log_row_reuse_assert_closed(&events);
+                assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 1);
+                assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_charges_request_slack_and_selects_mode_before_one_reservation() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+        let before = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+        let old_capacity = log_row_reuse_requests(&entry).capacity();
+        log_row_reuse_requests_mut(&mut entry).reserve_exact(32);
+        let new_capacity = log_row_reuse_requests(&entry).capacity();
+        let after = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+        assert_eq!(
+            after - before,
+            (new_capacity - old_capacity) * std::mem::size_of::<FencedTransitionV2Request>()
+        );
+        assert!(encode_json(&entry).unwrap() == canonical);
+        // The raw charge would fit. Once typed mode was chosen, budget denial
+        // must still fall directly through with no second reservation.
+        let raw_charge = LogRowReadReuse::retained_bytes(canonical.len()).unwrap();
+        assert!(after > raw_charge);
+        let budget = LogRowRetentionBudget::new(raw_charge);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let scope = Scope::new();
+        reuse.capture_after_full_audit(
+            epoch_i64(identity()).unwrap(),
+            1,
+            4,
+            canonical.clone(),
+            entry,
+        );
+        assert!(reuse.proof.is_none());
+        let events = scope.finish();
+        assert_eq!(log_row_reuse_event_count(&events, Event::BudgetFallback), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Reserved), 0);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        // Actual Vec slack over the typed bound chooses raw BEFORE its CAS.
+        let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+        log_row_reuse_requests_mut(&mut entry).reserve_exact(1024);
+        assert!(LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).is_none());
+        let budget = LogRowRetentionBudget::new(raw_charge);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let scope = Scope::new();
+        reuse.capture_after_full_audit(
+            epoch_i64(identity()).unwrap(),
+            1,
+            4,
+            canonical.clone(),
+            entry,
+        );
+        assert!(reuse.proof.as_ref().unwrap().entry.is_none());
+        assert_eq!(budget.used.load(Ordering::Acquire), raw_charge);
+        assert!(
+            reuse
+                .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                .unwrap()
+                == fixture.entries[4]
+        );
+        drop(reuse);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 0);
+        assert!(LogRowReadReuse::request_allocation_bytes(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn log_row_reuse_typed_payload_lifetime_distinguishes_transfer_from_destruction() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for outcome in ["transfer", "mismatch", "unused"] {
+            let entry = decode_consensus_log_entry(&canonical).unwrap();
+            let weak = log_row_reuse_weak_payloads(&entry);
+            assert_eq!(weak.len(), 8);
+            assert!(weak.iter().all(|payload| payload.strong_count() == 1));
+            let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+            let mut reuse = LogRowReadReuse::new(&budget);
+            let scope = Scope::new();
+            let observed_weak = weak.clone();
+            let observed_budget = Arc::clone(&budget);
+            scope.after_event(Event::Refund, 1, move || {
+                assert_eq!(observed_budget.used.load(Ordering::Acquire), 0);
+                assert!(observed_weak
+                    .iter()
+                    .all(|payload| payload.strong_count() == usize::from(outcome == "transfer")));
+            });
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry,
+            );
+            assert!(weak.iter().all(|payload| payload.strong_count() == 1));
+            let result = match outcome {
+                "transfer" => Some(
+                    reuse
+                        .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                        .unwrap(),
+                ),
+                "mismatch" => Some(
+                    reuse
+                        .decode(epoch_i64(identity()).unwrap(), 2, 4, &canonical)
+                        .unwrap(),
+                ),
+                "unused" => None,
+                _ => unreachable!(),
+            };
+            drop(reuse);
+            if let Some(result) = &result {
+                assert!(*result == fixture.entries[4]);
+            }
+            assert!(weak
+                .iter()
+                .all(|payload| payload.strong_count() == usize::from(outcome == "transfer")));
+            drop(result);
+            assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+            let events = scope.finish();
+            log_row_reuse_assert_closed(&events);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::TypedTransfer),
+                usize::from(outcome == "transfer")
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                usize::from(outcome == "mismatch")
+            );
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_construction_and_transfer_unwind_drop_allocations_before_refund() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for (event, occurrence) in [
+            (Event::Reserved, 1),
+            (Event::NormalizedRequest, 1),
+            (Event::NormalizedRequest, 8),
+            (Event::BoxedEntry, 1),
+            (Event::Captured, 1),
+            (Event::TypedTransfer, 1),
+            (Event::Hit, 1),
+        ] {
+            let entry = decode_consensus_log_entry(&canonical).unwrap();
+            let weak = log_row_reuse_weak_payloads(&entry);
+            let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+            let scope = Scope::new();
+            let observed_budget = Arc::clone(&budget);
+            scope.after_event(event, occurrence, move || {
+                assert_eq!(
+                    observed_budget.used.load(Ordering::Acquire) == 0,
+                    event == Event::Hit
+                );
+                panic!("controlled typed ownership unwind");
+            });
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut reuse = LogRowReadReuse::new(&budget);
+                reuse.capture_after_full_audit(
+                    epoch_i64(identity()).unwrap(),
+                    1,
+                    4,
+                    canonical.clone(),
+                    entry,
+                );
+                let _entry = reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                    .unwrap();
+            }));
+            assert!(unwind.is_err());
+            assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            let events = scope.finish();
+            assert_eq!(log_row_reuse_event_count(&events, Event::Reserved), 1);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Refund), 1);
+            let bytes = events
+                .iter()
+                .position(|event| *event == Event::AfterBytesDrop)
+                .unwrap();
+            let slot = events
+                .iter()
+                .position(|event| *event == Event::AfterEntrySlotDrop)
+                .unwrap();
+            let refund = events
+                .iter()
+                .position(|event| *event == Event::Refund)
+                .unwrap();
+            assert!(bytes < slot && slot < refund);
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_preparation_complete_layout_and_checked_charge() {
+        use std::mem::size_of;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let entry = &fixture.entries[4];
+        let encoded = encode_json(entry).unwrap();
+        let charge = LogRowReadReuse::typed_retained_bytes(encoded.capacity(), entry).unwrap();
+        assert!(charge <= LOG_ROW_REUSE_MAX_TYPED_BYTES);
+        assert!(LogRowReadReuse::typed_retained_bytes(usize::MAX, entry).is_none());
+        assert!(LogRowReadReuse::request_allocation_bytes(usize::MAX).is_none());
+        assert!(
+            LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY + 1, entry)
+                .is_none()
+        );
+        let owner_bytes = size_of::<LogRowReadReuse<'_>>();
+        let proof_bytes = size_of::<LogRowCanonicalProof<'_>>();
+        let raw_maximum = LogRowReadReuse::retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY).unwrap();
+        assert_eq!(
+            raw_maximum,
+            LOG_ROW_REUSE_MAX_RAW_CAPACITY + owner_bytes + proof_bytes
+        );
+        assert!(raw_maximum <= LOG_ROW_REUSE_MAX_RETAINED_BYTES);
+        assert!(owner_bytes <= 128);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            (
+                owner_bytes,
+                proof_bytes,
+                size_of::<LogRowPendingProof<'_>>()
+            ),
+            (88, 72, 368)
+        );
+        assert_eq!(LOG_ROW_REUSE_MAX_TYPED_BYTES, 256 * 1024);
+        assert_eq!(LOG_ROW_REUSE_AGGREGATE_BYTES, 4 * 1024 * 1024);
+        eprintln!(
+            "SDK741_TYPED_REUSE {}",
+            serde_json::json!({
+                "type": "complete_layout",
+                "owner_bytes": owner_bytes,
+                "proof_bytes": proof_bytes,
+                "pending_bytes": size_of::<LogRowPendingProof<'_>>(),
+                "permit_bytes": size_of::<LogRowRetentionPermit<'_>>(),
+                "budget_bytes": size_of::<LogRowRetentionBudget>(),
+                "entry_bytes": size_of::<Entry<SessionRaftTypeConfig>>(),
+                "entry_box_option_bytes": size_of::<Option<Box<Entry<SessionRaftTypeConfig>>>>(),
+                "authorization_box_bytes": size_of::<SessionMutationIntent>(),
+                "request_bytes": size_of::<crate::FencedTransitionV2Request>(),
+                "record_bytes": size_of::<crate::StoredSessionRecord>(),
+                "key_bytes": size_of::<crate::SessionKey>(),
+                "normalization_transient_bytes": crate::SessionKey::log_row_reuse_normalization_bytes().unwrap(),
+                "identifier_backing_per_occurrence": crate::StableId::MAX_BYTES,
+                "identifier_promotion_bytes": size_of::<[usize; 3]>(),
+                "payload_arc_bytes": crate::EncryptedSessionPayload::log_row_reuse_arc_allocation_bytes().unwrap(),
+                "raw_capacity_limit": LOG_ROW_REUSE_MAX_RAW_CAPACITY,
+                "raw_maximum_actual_charge": raw_maximum,
+                "raw_charge_limit": LOG_ROW_REUSE_MAX_RETAINED_BYTES,
+                "typed_charge_limit": LOG_ROW_REUSE_MAX_TYPED_BYTES,
+                "aggregate_charged_limit": LOG_ROW_REUSE_AGGREGATE_BYTES,
+                "fixture_raw_capacity": encoded.capacity(),
+                "fixture_typed_charge": charge,
+            })
+        );
+    }
+
+    #[test]
     fn log_row_reuse_charges_capacity_and_consumes_at_most_once() {
         use log_row_reuse_test_observer::{Event, Scope};
         let directory = tempfile::tempdir().unwrap();
@@ -42528,7 +43664,7 @@ mod tests {
             let mut encoded = Vec::with_capacity(capacity);
             encoded.extend_from_slice(&canonical);
             assert_eq!(encoded.capacity(), capacity);
-            let expected_charge = LogRowReadReuse::retained_bytes(encoded.capacity());
+            let expected_charge = LogRowReadReuse::typed_retained_bytes(encoded.capacity(), entry);
             let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
             let mut reuse = LogRowReadReuse::new(&budget);
             assert!(decode_consensus_log_entry(&encoded).unwrap() == *entry);
@@ -42541,7 +43677,13 @@ mod tests {
             )
             .unwrap();
             let scope = Scope::new();
-            reuse.capture_after_full_audit(epoch_i64(identity()).unwrap(), 1, 4, encoded, entry);
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                encoded,
+                entry.clone(),
+            );
             assert_eq!(
                 budget.used.load(Ordering::Acquire),
                 expected_charge.unwrap_or(0)
@@ -42561,7 +43703,7 @@ mod tests {
                 1,
                 4,
                 canonical.clone(),
-                entry,
+                entry.clone(),
             );
             assert!(reuse.proof.is_none());
             drop(reuse);
@@ -42637,7 +43779,8 @@ mod tests {
         let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
         let entry = &fixture.entries[4];
         let canonical = encode_json(entry).unwrap();
-        let charge = LogRowReadReuse::retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY).unwrap();
+        let charge =
+            LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY, entry).unwrap();
         let budget = LogRowRetentionBudget::new(charge * 2);
         let ready = std::sync::Barrier::new(9);
         let release = std::sync::Barrier::new(9);
@@ -42653,7 +43796,7 @@ mod tests {
                         1,
                         4,
                         bytes,
-                        entry,
+                        entry.clone(),
                     );
                     if reuse.proof.is_some() {
                         retained.fetch_add(1, Ordering::AcqRel);
@@ -42682,7 +43825,7 @@ mod tests {
                 1,
                 4,
                 canonical.clone(),
-                entry,
+                entry.clone(),
             );
             assert!(reuse.proof.is_some());
             panic!("controlled retained-owner unwind");

@@ -1443,6 +1443,47 @@ pub struct FencedTransitionV2Request {
 }
 
 impl FencedTransitionV2Request {
+    pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
+        let lease = match &self.lease {
+            FencedTransitionLease::Acquire { key, owner, .. } => key
+                .log_row_reuse_allocation_bytes()?
+                .checked_add(owner.allocation_capacity())?,
+            FencedTransitionLease::Renew { lease, .. } => lease.log_row_reuse_allocation_bytes()?,
+        };
+        match &self.mutation {
+            FencedTransitionMutation::Create { record }
+            | FencedTransitionMutation::Update { record, .. } => lease
+                .checked_add(std::mem::size_of::<StoredSessionRecord>())?
+                .checked_add(record.key.log_row_reuse_allocation_bytes()?)?
+                .checked_add(record.owner.allocation_capacity())?
+                .checked_add(record.state_type.allocation_capacity())?
+                // Sharing is deliberately charged per occurrence; no uniqueness
+                // assumption or payload clone is needed for this upper bound.
+                .checked_add(record.payload.log_row_reuse_allocation_bytes()?),
+            FencedTransitionMutation::Delete { .. }
+            | FencedTransitionMutation::RefreshTtl { .. } => Some(lease),
+        }
+    }
+
+    pub(crate) fn normalize_log_row_reuse_backing(&mut self) {
+        match &mut self.lease {
+            FencedTransitionLease::Acquire { key, .. } => {
+                key.normalize_log_row_reuse_backing();
+            }
+            FencedTransitionLease::Renew { lease, .. } => {
+                lease.normalize_log_row_reuse_backing();
+            }
+        }
+        match &mut self.mutation {
+            FencedTransitionMutation::Create { record }
+            | FencedTransitionMutation::Update { record, .. } => {
+                record.key.normalize_log_row_reuse_backing();
+            }
+            FencedTransitionMutation::Delete { .. }
+            | FencedTransitionMutation::RefreshTtl { .. } => {}
+        }
+    }
+
     /// Construct a new self-authenticating V2 request.
     ///
     /// Reusing the same `epoch` and `nonce` with the same lease and mutation
