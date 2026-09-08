@@ -3587,64 +3587,549 @@ async fn fixed_quorum_public_v2_batch_effect_outcome_unknown_does_not_seed_warm_
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn fixed_quorum_public_v2_batch_effect_stale_warm_hint_fails_closed_before_proposal() {
-    let directory = tempfile::tempdir().expect("fixed-quorum stale effect warm-route directory");
-    let start = Timestamp::from_offset_datetime(
-        time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
-            .expect("fixed-quorum stale effect warm-route start"),
-    );
-    let clock = Arc::new(MutableClock::new(start));
-    let (stores, database_paths, _, _) = fixed_cluster(directory.path(), clock).await;
-    let leader = ready_leader(&stores).await;
-    let store = &stores[leader];
-    let provider = sealing_provider();
-    let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+// These controls belong only to the activation fault fixtures. The ordinary
+// loopback peer, including its use by ignored qualification workloads, is
+// unchanged. Capability/read-barrier calls still reach the real handler while
+// this selected follower's AppendEntries calls wait before delivery.
+#[cfg(feature = "test-control")]
+#[derive(Debug)]
+struct ActivationFixtureReplicationGate {
+    released: tokio::sync::watch::Sender<bool>,
+    entered: AtomicUsize,
+    entered_notify: tokio::sync::Notify,
+}
 
-    let activation_key = key(0);
-    let activation_observation = store
-        .observe_fenced_transition(&activation_key)
-        .await
-        .expect("effect activation observation");
-    let activation_request = create_request(
-        0,
-        epoch,
-        activation_key,
-        activation_observation.current_fence(),
-        &provider,
-    )
-    .await;
-    assert!(matches!(
-        SessionBackend::fenced_transition_v2_batch_effect(store, vec![activation_request]).await,
-        FencedTransitionV2Effect::Resolved(Ok(_))
-    ));
+#[cfg(feature = "test-control")]
+#[derive(Debug)]
+struct ActivationFixtureGatedHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+    gate: Arc<ActivationFixtureReplicationGate>,
+}
 
-    let batch_key = key(1);
-    let batch_observation = store
-        .observe_fenced_transition(&batch_key)
-        .await
-        .expect("stale effect warm-route batch observation");
-    let batch = vec![
-        create_request(
-            1,
-            epoch,
-            batch_key,
-            batch_observation.current_fence(),
-            &provider,
-        )
-        .await,
-    ];
-    for database_path in &database_paths {
-        let connection = rusqlite::Connection::open(database_path)
-            .expect("open fixed voter database for stale effect route");
-        connection
-            .execute(
-                "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
-                [],
-            )
-            .expect("remove fixed V2 activation certificate");
+#[cfg(feature = "test-control")]
+#[async_trait]
+impl SessionConsensusRpcHandler for ActivationFixtureGatedHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::AppendEntries {
+            let mut released = self.gate.released.subscribe();
+            if !*released.borrow_and_update() {
+                self.gate.entered.fetch_add(1, Ordering::SeqCst);
+                self.gate.entered_notify.notify_one();
+                while !*released.borrow_and_update() {
+                    released
+                        .changed()
+                        .await
+                        .expect("activation fixture release owner");
+                }
+            }
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
+#[cfg(feature = "test-control")]
+struct ActivationFixtureReplicationHold {
+    gate: Arc<ActivationFixtureReplicationGate>,
+}
+
+#[cfg(feature = "test-control")]
+impl ActivationFixtureReplicationHold {
+    async fn install(
+        stores: &[ConsensusSessionStore],
+        peers: &[Arc<ScopedLoopbackPeer>],
+        leader: usize,
+        delayed: usize,
+    ) -> Self {
+        assert_ne!(leader, delayed, "only a nonleader may be delayed");
+        let (released, _) = tokio::sync::watch::channel(false);
+        let hold = Self {
+            gate: Arc::new(ActivationFixtureReplicationGate {
+                released,
+                entered: AtomicUsize::new(0),
+                entered_notify: tokio::sync::Notify::new(),
+            }),
+        };
+        let mut installed = 0;
+        for peer in peers {
+            if peer.node_id == stores[delayed].status().node_id {
+                peer.install(Arc::new(ActivationFixtureGatedHandler {
+                    inner: stores[delayed].rpc_handler(),
+                    gate: Arc::clone(&hold.gate),
+                }))
+                .await;
+                installed += 1;
+            }
+        }
+        assert_eq!(
+            installed,
+            VOTERS - 1,
+            "hold every incoming path to one voter"
+        );
+        hold
     }
 
+    async fn wait_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.gate.entered.load(Ordering::SeqCst) == 0 {
+                self.gate.entered_notify.notified().await;
+            }
+        })
+        .await
+        .expect("selected follower receives held replication");
+    }
+
+    fn release(&self) {
+        self.gate.released.send_replace(true);
+    }
+}
+
+#[cfg(feature = "test-control")]
+impl Drop for ActivationFixtureReplicationHold {
+    fn drop(&mut self) {
+        // A cancelled/panicking fixture must never strand an inbound call.
+        self.release();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ActivationFixtureCertificate {
+    storage_configuration_epoch: u64,
+    scope_configuration_id: Vec<u8>,
+    scope_configuration_epoch: u64,
+    voter_set_digest: Vec<u8>,
+    profile_digest: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActivationFixtureVoterState {
+    voter_index: usize,
+    database_path: PathBuf,
+    status: SessionConsensusStatus,
+    passive_progress: String,
+    engine_running: bool,
+    schema_version: u64,
+    storage_cluster_id: Vec<u8>,
+    storage_configuration_id: Vec<u8>,
+    storage_configuration_epoch: u64,
+    scope_configuration_id: Vec<u8>,
+    scope_configuration_epoch: u64,
+    scope_voters: BTreeSet<SessionConsensusNodeId>,
+    application_authority_epoch: u64,
+    application_authority_voters: BTreeSet<SessionConsensusNodeId>,
+    durable_committed: Option<opc_consensus::engine::LogId<SessionConsensusNodeId>>,
+    durable_applied: Option<opc_consensus::engine::LogId<SessionConsensusNodeId>>,
+    v2_tables: [bool; 3],
+    certificate_count: Option<u64>,
+    certificate: Option<ActivationFixtureCertificate>,
+    history_profile_digest: Option<Vec<u8>>,
+}
+
+fn activation_fixture_voter_state(
+    voter_index: usize,
+    store: &ConsensusSessionStore,
+    database_path: &Path,
+) -> Result<ActivationFixtureVoterState, String> {
+    use opc_session_store::test_support::ConsensusEngineStateForTest;
+    use rusqlite::OptionalExtension;
+
+    let observe = || -> Result<ActivationFixtureVoterState, Box<dyn std::error::Error>> {
+        let progress = consensus_local_durable_progress_for_test(store);
+        let status = store.status();
+        let connection = rusqlite::Connection::open_with_flags(
+            database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(Duration::ZERO)?;
+        // All durable fields below share one snapshot. The transaction and
+        // connection are dropped before the caller can yield or poll again.
+        let tx = connection.unchecked_transaction()?;
+        let (schema_version, storage_cluster_id, storage_configuration_id, storage_epoch) = tx
+            .query_row(
+                "SELECT schema_version, cluster_id, configuration_id, configuration_epoch \
+                 FROM consensus_identity WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, u64>(3)?)),
+            )?;
+        let (scope_id, scope_epoch, scope_voters, authority_epoch, authority_voters) = tx
+            .query_row(
+            "SELECT current_configuration_id, current_configuration_epoch, current_members_json, \
+                 application_authority_epoch, application_authority_members_json \
+                 FROM consensus_membership_scope WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            },
+        )?;
+        let read_position = |table| -> Result<_, Box<dyn std::error::Error>> {
+            let row = tx.query_row(
+                &format!("SELECT configuration_epoch, term, log_index, log_id_json FROM {table} WHERE singleton = 1"),
+                [],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?,
+                           row.get::<_, u64>(2)?, row.get::<_, Vec<u8>>(3)?)),
+            ).optional()?;
+            let Some((epoch, term, index, bytes)) = row else {
+                return Ok(None);
+            };
+            let id: opc_consensus::engine::LogId<SessionConsensusNodeId> =
+                serde_json::from_slice(&bytes)?;
+            if epoch != storage_epoch || term != id.leader_id.term || index != id.index {
+                return Err("inconsistent durable Raft log position".into());
+            }
+            Ok(Some(id))
+        };
+        let mut v2_tables = [false; 3];
+        for (present, table) in v2_tables.iter_mut().zip([
+            "consensus_fenced_transition_v2_receipts",
+            "consensus_fenced_transition_v2_activation",
+            "consensus_fenced_transition_v2_history",
+        ]) {
+            *present = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+        }
+        let certificate_count = if v2_tables[1] {
+            Some(tx.query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_transition_v2_activation",
+                [],
+                |row| row.get(0),
+            )?)
+        } else {
+            None
+        };
+        let certificate = if v2_tables[1] {
+            tx.query_row(
+                "SELECT storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, \
+                 voter_set_digest, profile_digest FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+                [], |row| Ok(ActivationFixtureCertificate {
+                    storage_configuration_epoch: row.get(0)?, scope_configuration_id: row.get(1)?,
+                    scope_configuration_epoch: row.get(2)?, voter_set_digest: row.get(3)?, profile_digest: row.get(4)?,
+                }),
+            ).optional()?
+        } else {
+            None
+        };
+        let history_profile_digest = if v2_tables[2] {
+            tx.query_row("SELECT profile_digest FROM consensus_fenced_transition_v2_history WHERE singleton = 1", [], |row| row.get(0)).optional()?
+        } else {
+            None
+        };
+        Ok(ActivationFixtureVoterState {
+            voter_index,
+            database_path: database_path.to_path_buf(),
+            status,
+            passive_progress: format!("{progress:?}"),
+            engine_running: progress.engine_state == ConsensusEngineStateForTest::Running,
+            schema_version,
+            storage_cluster_id,
+            storage_configuration_id,
+            storage_configuration_epoch: storage_epoch,
+            scope_configuration_id: scope_id,
+            scope_configuration_epoch: scope_epoch,
+            scope_voters: serde_json::from_slice(&scope_voters)?,
+            application_authority_epoch: authority_epoch,
+            application_authority_voters: serde_json::from_slice(&authority_voters)?,
+            durable_committed: read_position("consensus_committed")?,
+            durable_applied: read_position("consensus_applied")?,
+            v2_tables,
+            certificate_count,
+            certificate,
+            history_profile_digest,
+        })
+    };
+    observe().map_err(|error| {
+        format!(
+            "voter {voter_index}, database {}: {error}",
+            database_path.display()
+        )
+    })
+}
+
+fn activation_fixture_states(
+    stores: &[ConsensusSessionStore],
+    database_paths: &[PathBuf],
+) -> Result<Vec<ActivationFixtureVoterState>, String> {
+    assert_eq!(stores.len(), VOTERS);
+    assert_eq!(database_paths.len(), VOTERS);
+    let observations = stores
+        .iter()
+        .zip(database_paths)
+        .enumerate()
+        .map(|(index, (store, path))| {
+            let expected = fixed_topology(index, members(), PlacementResiliencePolicy::default())
+                .local_consensus_node_id()
+                .expect("fixed fixture node identity");
+            if store.status().node_id != expected {
+                return Err(format!(
+                    "voter slot {index} does not match its exact topology"
+                ));
+            }
+            activation_fixture_voter_state(index, store, path)
+        })
+        .collect::<Vec<_>>();
+    if observations.iter().any(Result::is_err) {
+        return Err(format!(
+            "activation fixture observation failed: {observations:#?}"
+        ));
+    }
+    observations.into_iter().collect()
+}
+
+const ACTIVATION_FIXTURE_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct ActivationFixtureRequirement {
+    committed_position: opc_consensus::engine::LogId<SessionConsensusNodeId>,
+    identity: ConsensusIdentity,
+    voters: BTreeSet<SessionConsensusNodeId>,
+    certificate: ActivationFixtureCertificate,
+}
+
+impl ActivationFixtureRequirement {
+    // Call only after checking every setup operation's exact successful
+    // outcome. The local applied pointer anchors a committed Raft position;
+    // neither application_sequence nor an uncommitted last_log_index does.
+    fn after_successful_setup(
+        stores: &[ConsensusSessionStore],
+        database_paths: &[PathBuf],
+        leader: usize,
+    ) -> Self {
+        let states = activation_fixture_states(stores, database_paths)
+            .expect("capture successful setup's durable position");
+        let committed_position = states[leader]
+            .durable_applied
+            .expect("successful setup has a locally applied Raft position");
+        assert!(states[leader]
+            .durable_committed
+            .is_some_and(|position| position >= committed_position
+                && position.index >= committed_position.index));
+        let identity = fixed_identity(&members(), PlacementResiliencePolicy::default());
+        let voters = states
+            .iter()
+            .map(|state| state.status.node_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(voters.len(), VOTERS);
+        // Derive the expected certificate from the known fixed fixture, not
+        // by treating a certificate copied from one voter as the oracle.
+        let mut digest = Sha256::new();
+        digest.update(b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0");
+        digest.update(identity.cluster_id().as_bytes());
+        digest.update(identity.configuration_id().as_bytes());
+        digest.update(identity.configuration_epoch().get().to_be_bytes());
+        for voter in &voters {
+            digest.update(voter.get().to_be_bytes());
+        }
+        assert_eq!(
+            fenced_transition_v2_profile_digest(),
+            FIXED_V2_PROFILE_DIGEST
+        );
+        Self {
+            committed_position,
+            identity,
+            voters,
+            certificate: ActivationFixtureCertificate {
+                storage_configuration_epoch: identity.configuration_epoch().get(),
+                scope_configuration_id: identity.configuration_id().as_bytes().to_vec(),
+                scope_configuration_epoch: identity.configuration_epoch().get(),
+                voter_set_digest: digest.finalize().to_vec(),
+                profile_digest: FIXED_V2_PROFILE_DIGEST.to_vec(),
+            },
+        }
+    }
+
+    fn voter_ready(&self, state: &ActivationFixtureVoterState) -> Result<bool, &'static str> {
+        if !state.engine_running {
+            return Err("voter engine stopped before fault injection");
+        }
+        if state.storage_cluster_id.as_slice() != self.identity.cluster_id().as_bytes().as_slice()
+            || state.storage_configuration_id.as_slice()
+                != self.identity.configuration_id().as_bytes().as_slice()
+            || state.storage_configuration_epoch != self.identity.configuration_epoch().get()
+            || state.scope_configuration_id.as_slice()
+                != self.identity.configuration_id().as_bytes().as_slice()
+            || state.scope_configuration_epoch != self.identity.configuration_epoch().get()
+            || state.scope_voters != self.voters
+            || state.application_authority_epoch != self.identity.configuration_epoch().get()
+            || state.application_authority_voters != self.voters
+        {
+            return Err("voter storage/application-authority tuple differs from the fixture");
+        }
+        let Some(applied) = state.durable_applied else {
+            return Ok(false);
+        };
+        if applied.index < self.committed_position.index {
+            return Ok(false);
+        }
+        // A voter that has durably applied the bound entry must already have
+        // its schema and exact certificate from that same apply transaction.
+        // Waiting cannot repair a missing or mismatched post-apply tuple.
+        if applied < self.committed_position
+            || (applied.index == self.committed_position.index
+                && applied != self.committed_position)
+            || !state
+                .durable_committed
+                .is_some_and(|position| position >= applied && position.index >= applied.index)
+            || state.schema_version != 3
+            || state.v2_tables != [true; 3]
+            || state.certificate_count != Some(1)
+            || state.certificate.as_ref() != Some(&self.certificate)
+            || state.history_profile_digest.as_ref() != Some(&self.certificate.profile_digest)
+        {
+            return Err("applied voter lacks its exact durable V2 activation certificate");
+        }
+        Ok(state
+            .status
+            .applied_index
+            .is_some_and(|index| index >= self.committed_position.index))
+    }
+
+    async fn wait(
+        &self,
+        stores: &[ConsensusSessionStore],
+        database_paths: &[PathBuf],
+        timeout: Duration,
+    ) -> Result<Vec<ActivationFixtureVoterState>, String> {
+        assert!(!timeout.is_zero() && timeout <= ACTIVATION_FIXTURE_SETUP_TIMEOUT);
+        let deadline = Instant::now() + timeout;
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            let states = activation_fixture_states(stores, database_paths)?;
+            let readiness = states
+                .iter()
+                .map(|state| self.voter_ready(state))
+                .collect::<Vec<_>>();
+            if readiness.iter().any(Result::is_err) {
+                return Err(format!("activation prerequisite rejected at {:?}: {readiness:?}; final voters: {states:#?}", self.committed_position));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "activation prerequisite deadline at {:?}; final voters: {states:#?}",
+                    self.committed_position
+                ));
+            }
+            if readiness.iter().all(|ready| *ready == Ok(true)) {
+                return Ok(states);
+            }
+            // This timer schedules observations of a state predicate. It
+            // neither submits work nor makes an elapsed delay count as ready.
+            if tokio::time::timeout_at(deadline, poll.tick())
+                .await
+                .is_err()
+            {
+                return Err(format!(
+                    "activation prerequisite deadline at {:?}; final voters: {states:#?}",
+                    self.committed_position
+                ));
+            }
+        }
+    }
+}
+
+type ActivationFixtureEffect =
+    FencedTransitionV2Effect<Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError>>;
+
+fn assert_activation_fixture_item_success(
+    request: &FencedTransitionV2Request,
+    effect: ActivationFixtureEffect,
+) {
+    let FencedTransitionV2Effect::Resolved(Ok(outcomes)) = effect else {
+        panic!("fixture activation must resolve one successful item");
+    };
+    assert_eq!(outcomes.len(), 1, "exactly one fixture activation item");
+    assert_exact_qualified_v2_success(
+        request,
+        outcomes[0]
+            .as_ref()
+            .expect("fixture activation inner item success"),
+    );
+}
+
+fn inject_activation_fixture_fault(database_path: &Path, fault: usize) {
+    let connection =
+        rusqlite::Connection::open(database_path).expect("open exact voter for fault injection");
+    let (changed, injected) = match fault {
+        0 => {
+            let changed = connection
+                .execute(
+                    "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+                    [],
+                )
+                .expect("remove the proven V2 activation certificate");
+            let remaining: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_fenced_transition_v2_activation",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("verify effective activation removal");
+            (changed, remaining == 0)
+        }
+        1 => {
+            let changed = connection
+                .execute(
+                    "UPDATE consensus_operator_recovery \
+                 SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
+                 WHERE singleton = 1",
+                    [],
+                )
+                .expect("activate fixed operator recovery latch");
+            let injected: bool = connection.query_row(
+                "SELECT pending_epoch = recovery_epoch + 1 AND pending_plan_digest = zeroblob(32) \
+                 FROM consensus_operator_recovery WHERE singleton = 1", [], |row| row.get(0),
+            ).expect("verify effective operator recovery latch");
+            (changed, injected)
+        }
+        2 => {
+            let previous: u64 = connection.query_row(
+                "SELECT application_authority_epoch FROM consensus_membership_scope WHERE singleton = 1", [], |row| row.get(0),
+            ).expect("observe original application authority");
+            let changed = connection
+                .execute(
+                    "UPDATE consensus_membership_scope \
+                 SET application_authority_epoch = application_authority_epoch + 1 \
+                 WHERE singleton = 1",
+                    [],
+                )
+                .expect("persist fixed application-authority scope drift");
+            let actual: u64 = connection.query_row(
+                "SELECT application_authority_epoch FROM consensus_membership_scope WHERE singleton = 1", [], |row| row.get(0),
+            ).expect("verify effective application-authority drift");
+            (
+                changed,
+                actual
+                    == previous
+                        .checked_add(1)
+                        .expect("fixture authority epoch headroom"),
+            )
+        }
+        _ => unreachable!("the bounded fault matrix has exactly three entries"),
+    };
+    assert_eq!(
+        changed, 1,
+        "each intended voter fault must affect exactly one row"
+    );
+    assert!(
+        injected,
+        "the intended durable voter fault must be observable"
+    );
+}
+
+async fn assert_stale_activation_effect_rejected(
+    stores: &[ConsensusSessionStore],
+    leader: usize,
+    batch: Vec<FencedTransitionV2Request>,
+) {
+    let store = &stores[leader];
     let before_logs = stores
         .iter()
         .map(|voter| voter.status().last_log_index)
@@ -3669,10 +4154,88 @@ async fn fixed_quorum_public_v2_batch_effect_stale_warm_hint_fails_closed_before
         .iter()
         .map(|voter| voter.status().last_log_index)
         .collect::<Vec<_>>();
-    assert_eq!(
-        after_logs, before_logs,
-        "a stale typed-effect warm hint must fail at the atomic acceptance boundary before proposal"
+    assert_eq!(after_logs, before_logs,
+        "a stale typed-effect warm hint must fail at the atomic acceptance boundary before proposal");
+}
+
+async fn with_activation_fixture_cleanup(
+    stores: &[ConsensusSessionStore],
+    peers: &[Arc<ScopedLoopbackPeer>],
+    experiment: impl Future<Output = ()>,
+) {
+    let result = std::panic::AssertUnwindSafe(experiment)
+        .catch_unwind()
+        .await;
+    shutdown_fixed_cluster(stores, peers).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_quorum_public_v2_batch_effect_stale_warm_hint_fails_closed_before_proposal() {
+    let directory = tempfile::tempdir().expect("fixed-quorum stale effect warm-route directory");
+    let start = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
+            .expect("fixed-quorum stale effect warm-route start"),
     );
+    let clock = Arc::new(MutableClock::new(start));
+    let (stores, database_paths, _, peers) = fixed_cluster(directory.path(), clock).await;
+    with_activation_fixture_cleanup(&stores, &peers, async {
+        let leader = ready_leader(&stores).await;
+        let store = &stores[leader];
+        let provider = sealing_provider();
+        let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+
+        let activation_key = key(0);
+        let activation_observation = store
+            .observe_fenced_transition(&activation_key)
+            .await
+            .expect("effect activation observation");
+        let activation_request = create_request(
+            0,
+            epoch,
+            activation_key,
+            activation_observation.current_fence(),
+            &provider,
+        )
+        .await;
+        assert_activation_fixture_item_success(
+            &activation_request,
+            SessionBackend::fenced_transition_v2_batch_effect(
+                store,
+                vec![activation_request.clone()],
+            )
+            .await,
+        );
+
+        let batch_key = key(1);
+        let batch_observation = store
+            .observe_fenced_transition(&batch_key)
+            .await
+            .expect("stale effect warm-route batch observation");
+        let batch = vec![
+            create_request(
+                1,
+                epoch,
+                batch_key,
+                batch_observation.current_fence(),
+                &provider,
+            )
+            .await,
+        ];
+        let prerequisite =
+            ActivationFixtureRequirement::after_successful_setup(&stores, &database_paths, leader);
+        prerequisite
+            .wait(&stores, &database_paths, ACTIVATION_FIXTURE_SETUP_TIMEOUT)
+            .await
+            .expect("every exact voter has applied activation before any fault write");
+        for database_path in &database_paths {
+            inject_activation_fixture_fault(database_path, 0);
+        }
+        assert_stale_activation_effect_rejected(&stores, leader, batch).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3690,141 +4253,583 @@ async fn fixed_quorum_public_v2_stale_warm_hint_fails_closed_before_proposal() {
                 .expect("fixed-quorum stale warm-route start"),
         );
         let clock = Arc::new(MutableClock::new(start));
-        let (stores, database_paths, _, _) = fixed_cluster(directory.path(), clock).await;
-        let leader = ready_leader(&stores).await;
-        let store = &stores[leader];
-        let provider = sealing_provider();
-        let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+        let (stores, database_paths, _, peers) = fixed_cluster(directory.path(), clock).await;
+        with_activation_fixture_cleanup(&stores, &peers, async {
+            let leader = ready_leader(&stores).await;
+            let store = &stores[leader];
+            let provider = sealing_provider();
+            let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
 
-        // A definitive public singleton success is the only way to seed this
-        // store's later public-batch routing hint.
-        let activation_key = key(0);
-        let activation_observation = store
-            .observe_fenced_transition(&activation_key)
-            .await
-            .expect("public singleton activation observation");
-        store
-            .fenced_transition_v2(
-                create_request(
-                    0,
-                    epoch,
-                    activation_key,
-                    activation_observation.current_fence(),
-                    &provider,
-                )
-                .await,
-            )
-            .await
-            .expect("public singleton activation seeds the batch route");
-
-        // Even with that local hint set, a public singleton must retain the
-        // cold admission path rather than using the later batch route.
-        let singleton_key = key(1);
-        let singleton_observation = store
-            .observe_fenced_transition(&singleton_key)
-            .await
-            .expect("public singleton after warming observation");
-        let before_singleton = store.diagnostic_snapshot();
-        store
-            .fenced_transition_v2(
-                create_request(
-                    1,
-                    epoch,
-                    singleton_key,
-                    singleton_observation.current_fence(),
-                    &provider,
-                )
-                .await,
-            )
-            .await
-            .expect("public singleton after warming remains cold");
-        let after_singleton = store.diagnostic_snapshot();
-        assert_eq!(
-            after_singleton.public_raw_v2_cold_admissions
-                - before_singleton.public_raw_v2_cold_admissions,
-            1,
-            "a public singleton after warming must retain cold admission: {fault_name}"
-        );
-
-        let batch_key = key(2);
-        let batch_observation = store
-            .observe_fenced_transition(&batch_key)
-            .await
-            .expect("stale warm-route batch observation");
-        let batch = vec![
-            create_request(
-                2,
+            // A definitive public singleton success is the only way to seed
+            // this store's later public-batch routing hint.
+            let activation_key = key(0);
+            let activation_observation = store
+                .observe_fenced_transition(&activation_key)
+                .await
+                .expect("public singleton activation observation");
+            let activation_request = create_request(
+                0,
                 epoch,
-                batch_key,
-                batch_observation.current_fence(),
+                activation_key,
+                activation_observation.current_fence(),
                 &provider,
             )
-            .await,
-        ];
+            .await;
+            let activation_outcome = store
+                .fenced_transition_v2(activation_request.clone())
+                .await
+                .expect("public singleton activation seeds the batch route");
+            assert_exact_qualified_v2_success(&activation_request, &activation_outcome);
 
-        // Every exact voter must independently lose the same durable proof.
-        // The local hint remains set, so the public batch must reach its
-        // uncached fixed-quorum acceptance boundary and fail before proposal.
-        for database_path in &database_paths {
-            let connection =
-                rusqlite::Connection::open(database_path).expect("open fixed voter database");
-            match fault {
-                0 => {
-                    connection
-                        .execute(
-                            "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
-                            [],
-                        )
-                        .expect("remove fixed V2 activation certificate");
+            // Even with that local hint set, a public singleton must retain
+            // the cold admission path rather than the later batch route.
+            let singleton_key = key(1);
+            let singleton_observation = store
+                .observe_fenced_transition(&singleton_key)
+                .await
+                .expect("public singleton after warming observation");
+            let singleton_request = create_request(
+                1,
+                epoch,
+                singleton_key,
+                singleton_observation.current_fence(),
+                &provider,
+            )
+            .await;
+            let before_singleton = store.diagnostic_snapshot();
+            let singleton_outcome = store
+                .fenced_transition_v2(singleton_request.clone())
+                .await
+                .expect("public singleton after warming remains cold");
+            assert_exact_qualified_v2_success(&singleton_request, &singleton_outcome);
+            let after_singleton = store.diagnostic_snapshot();
+            assert_eq!(
+                after_singleton.public_raw_v2_cold_admissions
+                    - before_singleton.public_raw_v2_cold_admissions,
+                1,
+                "a public singleton after warming must retain cold admission: {fault_name}"
+            );
+
+            let batch_key = key(2);
+            let batch_observation = store
+                .observe_fenced_transition(&batch_key)
+                .await
+                .expect("stale warm-route batch observation");
+            let batch = vec![
+                create_request(
+                    2,
+                    epoch,
+                    batch_key,
+                    batch_observation.current_fence(),
+                    &provider,
+                )
+                .await,
+            ];
+            let prerequisite = ActivationFixtureRequirement::after_successful_setup(
+                &stores,
+                &database_paths,
+                leader,
+            );
+            prerequisite
+                .wait(&stores, &database_paths, ACTIVATION_FIXTURE_SETUP_TIMEOUT)
+                .await
+                .expect("all successful singleton setup is applied before any fault write");
+
+            // Every exact voter independently loses the same proven durable
+            // prerequisite. The warm hint still reaches uncached acceptance.
+            for database_path in &database_paths {
+                inject_activation_fixture_fault(database_path, fault);
+            }
+            let before_batch_logs = stores
+                .iter()
+                .map(|voter| voter.status().last_log_index)
+                .collect::<Vec<_>>();
+            let before_batch = store.diagnostic_snapshot();
+            assert!(
+                store.fenced_transition_v2_batch(batch).await.is_err(),
+                "a stale public warm hint must fail closed after {fault_name}"
+            );
+            let after_batch = store.diagnostic_snapshot();
+            assert_eq!(
+                after_batch.public_raw_v2_cold_admissions
+                    - before_batch.public_raw_v2_cold_admissions,
+                0,
+                "a stale warm route must not fall back to generic V2 admission: {fault_name}"
+            );
+            assert_eq!(
+                after_batch.public_raw_v2_history_reads - before_batch.public_raw_v2_history_reads,
+                0,
+                "a stale warm route must not reread generic V2 history: {fault_name}"
+            );
+            let after_batch_logs = stores
+                .iter()
+                .map(|voter| voter.status().last_log_index)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                after_batch_logs, before_batch_logs,
+                "a stale public warm hint must fail before any Openraft proposal: {fault_name}"
+            );
+        })
+        .await;
+    }
+}
+
+// Only the two controlled activation regressions use this pristine fixture.
+// The shared constructor and its callers retain their ordinary election
+// profile. Here initialize_cluster's canonical member starts the one existing
+// bootstrap campaign, independently of automatic ticker-driven elections.
+#[cfg(feature = "test-control")]
+struct ActivationFixtureCanonicalCluster {
+    stores: Vec<ConsensusSessionStore>,
+    database_paths: Vec<PathBuf>,
+    snapshot_paths: Vec<PathBuf>,
+    topologies: Vec<ValidatedQuorumTopology>,
+    peers: Vec<Arc<ScopedLoopbackPeer>>,
+    node_ids: Vec<SessionConsensusNodeId>,
+    leader: usize,
+    followers: [usize; VOTERS - 1],
+    phase: &'static str,
+}
+
+#[cfg(feature = "test-control")]
+impl ActivationFixtureCanonicalCluster {
+    fn pristine(directory: &Path) -> Self {
+        let placement_policy = PlacementResiliencePolicy::default();
+        let members = members();
+        let identity = fixed_identity(&members, placement_policy);
+        let topologies = (0..VOTERS)
+            .map(|index| fixed_topology(index, members.clone(), placement_policy))
+            .collect::<Vec<_>>();
+        let node_ids = topologies
+            .iter()
+            .map(|topology| topology.local_consensus_node_id().expect("fixture node ID"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            node_ids.iter().copied().collect::<BTreeSet<_>>().len(),
+            VOTERS
+        );
+        let leader = node_ids
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, node_id)| **node_id)
+            .expect("canonical fixture bootstrap member")
+            .0;
+        let followers = (0..VOTERS)
+            .filter(|index| *index != leader)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("exactly two distinct fixture followers");
+        let database_paths = (0..VOTERS)
+            .map(|index| directory.join(format!("voter-{index}.sqlite")))
+            .collect::<Vec<_>>();
+        let snapshot_paths = (0..VOTERS)
+            .map(|index| directory.join(format!("snapshots-{index}")))
+            .collect::<Vec<_>>();
+        assert!(database_paths
+            .iter()
+            .chain(&snapshot_paths)
+            .all(|path| !path.exists()));
+        let mut peers = Vec::new();
+        for source in 0..VOTERS {
+            for (target, node_id) in node_ids.iter().copied().enumerate() {
+                if source != target {
+                    peers.push(Arc::new(ScopedLoopbackPeer::new(source, node_id, identity)));
                 }
-                1 => {
-                    connection
-                        .execute(
-                            "UPDATE consensus_operator_recovery \
-                             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-                             WHERE singleton = 1",
-                            [],
-                        )
-                        .expect("activate fixed operator recovery latch");
-                }
-                2 => {
-                    connection
-                        .execute(
-                            "UPDATE consensus_membership_scope \
-                             SET application_authority_epoch = application_authority_epoch + 1 \
-                             WHERE singleton = 1",
-                            [],
-                        )
-                        .expect("persist fixed application-authority scope drift");
-                }
-                _ => unreachable!("the bounded fault matrix has exactly three entries"),
             }
         }
+        Self {
+            stores: Vec::with_capacity(VOTERS),
+            database_paths,
+            snapshot_paths,
+            topologies,
+            peers,
+            node_ids,
+            leader,
+            followers,
+            phase: "pristine",
+        }
+    }
 
-        let before_batch_logs = stores
-            .iter()
-            .map(|voter| voter.status().last_log_index)
-            .collect::<Vec<_>>();
-        let before_batch = store.diagnostic_snapshot();
-        assert!(
-            store.fenced_transition_v2_batch(batch).await.is_err(),
-            "a stale public warm hint must fail closed after {fault_name}"
-        );
-        let after_batch = store.diagnostic_snapshot();
-        assert_eq!(
-            after_batch.public_raw_v2_cold_admissions - before_batch.public_raw_v2_cold_admissions,
-            0,
-            "a stale warm route must not fall back to generic V2 admission: {fault_name}"
-        );
-        let after_batch_logs = stores
-            .iter()
-            .map(|voter| voter.status().last_log_index)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            after_batch_logs, before_batch_logs,
-            "a stale public warm hint must fail before any Openraft proposal: {fault_name}"
+    fn diagnostics(&self) -> serde_json::Value {
+        let voters = self.node_ids.iter().enumerate().map(|(index, node_id)| {
+            match self.stores.get(index) {
+                Some(store) => serde_json::json!({
+                    "slot": index, "expected_node_id": node_id, "opened": true,
+                    "status": store.status(),
+                    "passive_progress": format!("{:?}", consensus_local_durable_progress_for_test(store)),
+                    "durable": activation_fixture_voter_state(index, store, &self.database_paths[index]),
+                }),
+                None => serde_json::json!({
+                    "slot": index, "expected_node_id": node_id, "opened": false,
+                    "database_path": self.database_paths[index],
+                }),
+            }
+        }).collect::<Vec<_>>();
+        serde_json::json!({
+            "phase": self.phase, "leader_slot": self.leader,
+            "expected_leader_id": self.node_ids[self.leader],
+            "follower_slots": self.followers,
+            "expected_follower_ids": self.followers.map(|index| self.node_ids[index]),
+            "voters": voters,
+        })
+    }
+
+    fn record(&self, event: &str, detail: serde_json::Value) {
+        eprintln!(
+            "ACTIVATION_FIXTURE_BOOTSTRAP {}",
+            serde_json::json!({
+                "event": event, "detail": detail, "fixture": self.diagnostics(),
+            })
         );
     }
+
+    fn failure(&self, message: &str) -> String {
+        format!("{message}; final fixture: {}", self.diagnostics())
+    }
+
+    async fn initialize(&mut self, clock: Arc<dyn Clock>) -> Result<(), String> {
+        self.phase = "open_voters";
+        self.record("construction_started", serde_json::Value::Null);
+        for source in 0..VOTERS {
+            let peers = self
+                .peers
+                .iter()
+                .filter(|peer| peer.source_index == source)
+                .map(|peer| {
+                    let handle: Arc<dyn SessionConsensusPeer> = peer.clone();
+                    (peer.node_id, handle)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let backend = SqliteSessionBackend::open(&self.database_paths[source])
+                .map_err(|error| self.failure(&format!("open SQLite voter {source}: {error}")))?;
+            let store =
+                ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
+                    self.topologies[source].clone(),
+                    backend,
+                    &self.snapshot_paths[source],
+                    peers,
+                    Arc::clone(&clock),
+                    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                    opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
+                )
+                .await
+                .map_err(|error| self.failure(&format!("open fixed voter {source}: {error}")))?;
+            // No await, peer installation or initialize call may precede this
+            // switch after opening the pristine engine.
+            store.set_automatic_election_for_test(false);
+            self.stores.push(store);
+            assert_eq!(self.stores[source].status().node_id, self.node_ids[source]);
+            self.record(
+                "voter_opened_elections_disabled",
+                serde_json::json!({"slot": source}),
+            );
+        }
+        self.phase = "install_peers";
+        for peer in &self.peers {
+            let target = self
+                .node_ids
+                .iter()
+                .position(|node_id| *node_id == peer.node_id)
+                .expect("exact fixture peer target");
+            peer.install(self.stores[target].rpc_handler()).await;
+        }
+        self.phase = "initialize_cluster";
+        self.record("canonical_initialization_started", serde_json::Value::Null);
+        let deadline = Instant::now() + ACTIVATION_FIXTURE_SETUP_TIMEOUT;
+        let results = tokio::time::timeout_at(
+            deadline,
+            futures_util::future::join_all(
+                self.stores
+                    .iter()
+                    .map(ConsensusSessionStore::initialize_cluster),
+            ),
+        )
+        .await
+        .map_err(|_| self.failure("canonical initialization deadline"))?;
+        self.record(
+            "canonical_initialization_returned",
+            serde_json::json!({
+                "results": results.iter().map(|result| format!("{result:?}")).collect::<Vec<_>>(),
+            }),
+        );
+        if results.iter().any(Result::is_err) {
+            return Err(self.failure(&format!("canonical initialization failed: {results:?}")));
+        }
+        self.phase = "canonical_bootstrap_readiness";
+        self.wait_for_bootstrap().await?;
+        self.phase = "activation_regression";
+        Ok(())
+    }
+
+    async fn wait_for_bootstrap(&self) -> Result<(), String> {
+        let deadline = Instant::now() + ACTIVATION_FIXTURE_SETUP_TIMEOUT;
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            let reports = tokio::time::timeout_at(
+                deadline,
+                futures_util::future::join_all(
+                    self.stores
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                ),
+            )
+            .await
+            .map_err(|_| self.failure("canonical readiness probe deadline"))?;
+            let states = activation_fixture_states(&self.stores, &self.database_paths)
+                .map_err(|error| self.failure(&error))?;
+            if states.iter().any(|state| !state.engine_running) {
+                return Err(self.failure("canonical bootstrap engine stopped"));
+            }
+            if Instant::now() >= deadline {
+                return Err(self.failure(&format!("canonical readiness deadline: {reports:?}")));
+            }
+            let bound = states[self.leader].durable_applied;
+            let same_leader = states.iter().all(|state| {
+                state.status.admitted
+                    && state.status.leader_id == Some(self.node_ids[self.leader])
+                    && state.status.term == states[self.leader].status.term
+            });
+            let all_applied = bound.is_some_and(|bound| {
+                states.iter().all(|state| {
+                    state
+                        .durable_applied
+                        .is_some_and(|applied| applied >= bound && applied.index >= bound.index)
+                        && state.durable_committed.is_some_and(|committed| {
+                            committed >= bound && committed.index >= bound.index
+                        })
+                        && state
+                            .status
+                            .applied_index
+                            .is_some_and(|index| index >= bound.index)
+                })
+            });
+            if reports.iter().all(|report| report.is_ready()) && same_leader && all_applied {
+                self.record("canonical_bootstrap_ready", serde_json::json!({
+                    "bound": bound, "readiness": reports.iter().map(|report| format!("{report:?}")).collect::<Vec<_>>(),
+                    "voters": states,
+                }));
+                return Ok(());
+            }
+            // Poll a state predicate under the one fixed readiness deadline;
+            // elapsed time alone cannot make the fixture ready.
+            tokio::time::timeout_at(deadline, poll.tick())
+                .await
+                .map_err(|_| self.failure(&format!("canonical readiness deadline: {reports:?}")))?;
+        }
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn with_canonical_activation_fixture(
+    directory: &Path,
+    clock: Arc<dyn Clock>,
+    experiment: impl std::ops::AsyncFnOnce(&ActivationFixtureCanonicalCluster),
+) {
+    let mut fixture = ActivationFixtureCanonicalCluster::pristine(directory);
+    // The constructor and assertions share one unwind boundary. Every opened
+    // store stays in this owner even when a later open/initialize step fails.
+    let result = std::panic::AssertUnwindSafe(async {
+        fixture
+            .initialize(clock)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        experiment(&fixture).await;
+    })
+    .catch_unwind()
+    .await;
+    if result.is_err() {
+        fixture.record("construction_or_assertion_failed", serde_json::Value::Null);
+    }
+    fixture.phase = "shutdown";
+    let cleanup =
+        std::panic::AssertUnwindSafe(shutdown_fixed_cluster(&fixture.stores, &fixture.peers))
+            .catch_unwind()
+            .await;
+    fixture.record(
+        "owned_cleanup_finished",
+        serde_json::json!({"success": cleanup.is_ok()}),
+    );
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    if let Err(panic) = cleanup {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn activation_fixture_delayed_setup(
+    fixture: &ActivationFixtureCanonicalCluster,
+    delayed: usize,
+) -> (
+    ActivationFixtureReplicationHold,
+    ActivationFixtureRequirement,
+    Vec<FencedTransitionV2Request>,
+) {
+    let stores = &fixture.stores;
+    let database_paths = &fixture.database_paths;
+    let peers = &fixture.peers;
+    let leader = fixture.leader;
+    assert!(fixture.followers.contains(&delayed));
+    assert_eq!(stores[leader].status().node_id, fixture.node_ids[leader]);
+    fixture.record(
+        "activation_setup_started",
+        serde_json::json!({"delayed": delayed}),
+    );
+    let provider = sealing_provider();
+    let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+    let activation_key = key(0);
+    let observation = stores[leader]
+        .observe_fenced_transition(&activation_key)
+        .await
+        .expect("controlled fixture activation observation");
+    let request = create_request(
+        0,
+        epoch,
+        activation_key,
+        observation.current_fence(),
+        &provider,
+    )
+    .await;
+    let hold = ActivationFixtureReplicationHold::install(stores, peers, leader, delayed).await;
+    let effect =
+        SessionBackend::fenced_transition_v2_batch_effect(&stores[leader], vec![request.clone()])
+            .await;
+    assert_activation_fixture_item_success(&request, effect);
+    hold.wait_entered().await;
+    let batch_key = key(1);
+    let observation = stores[leader]
+        .observe_fenced_transition(&batch_key)
+        .await
+        .expect("controlled fixture later batch observation");
+    let batch =
+        vec![create_request(1, epoch, batch_key, observation.current_fence(), &provider).await];
+    let prerequisite =
+        ActivationFixtureRequirement::after_successful_setup(stores, database_paths, leader);
+    let states = activation_fixture_states(stores, database_paths).expect("held voter state");
+    assert!(states[delayed]
+        .durable_applied
+        .is_some_and(|id| id.index < prerequisite.committed_position.index));
+    assert_eq!(states[delayed].v2_tables, [false; 3]);
+    assert_eq!(prerequisite.voter_ready(&states[delayed]), Ok(false));
+    eprintln!(
+        "ACTIVATION_FIXTURE_REGRESSION {}",
+        serde_json::json!({
+            "phase": "activation_succeeded_while_follower_held", "leader": leader, "delayed": delayed,
+            "bound": prerequisite.committed_position, "voters": &states,
+        })
+    );
+    (hold, prerequisite, batch)
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_quorum_public_v2_activation_fault_fixture_waits_for_each_follower() {
+    let mut expected_roles = None;
+    let mut exercised_followers = BTreeSet::new();
+    for follower_case in 0..VOTERS - 1 {
+        let directory = tempfile::tempdir().expect("delayed activation fixture directory");
+        let start = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("fixture logical time"),
+        );
+        with_canonical_activation_fixture(directory.path(), Arc::new(MutableClock::new(start)), async |fixture| {
+            let stores = &fixture.stores;
+            let database_paths = &fixture.database_paths;
+            let leader = fixture.leader;
+            let delayed = fixture.followers[follower_case];
+            let roles = (fixture.node_ids[leader], fixture.followers.map(|index| fixture.node_ids[index]));
+            if let Some(expected) = expected_roles {
+                assert_eq!(roles, expected, "fresh fixtures retain the same canonical leader and exact two followers");
+            } else {
+                expected_roles = Some(roles);
+            }
+            let (hold, prerequisite, batch) = activation_fixture_delayed_setup(fixture, delayed).await;
+            let fault_writes_started = AtomicUsize::new(0);
+            let guarded_fault = async {
+                let ready = prerequisite.wait(stores, database_paths, ACTIVATION_FIXTURE_SETUP_TIMEOUT).await?;
+                for path in database_paths {
+                    fault_writes_started.fetch_add(1, Ordering::SeqCst);
+                    inject_activation_fixture_fault(path, 0);
+                }
+                assert_stale_activation_effect_rejected(stores, leader, batch).await;
+                Ok::<_, String>(ready)
+            };
+            tokio::pin!(guarded_fault);
+            assert!(futures_util::poll!(guarded_fault.as_mut()).is_pending(), "setup must wait for the held voter");
+            assert_eq!(fault_writes_started.load(Ordering::SeqCst), 0, "no fault write before all-voter readiness");
+            let held = activation_fixture_states(stores, database_paths).expect("state while setup waits");
+            assert_eq!(held[delayed].v2_tables, [false; 3]);
+            assert_eq!(prerequisite.voter_ready(&held[delayed]), Ok(false));
+            eprintln!("ACTIVATION_FIXTURE_REGRESSION {}", serde_json::json!({
+                "phase": "fault_injection_pending", "leader": leader, "delayed": delayed, "fault_writes_started": 0,
+                "bound": prerequisite.committed_position, "voters": &held,
+            }));
+            // Exercise the guard's release-on-drop path as well as its
+            // protection against failure/cancellation leaving a parked call.
+            drop(hold);
+            let ready = guarded_fault.await.expect("release establishes the actual prerequisite before effective fault injection");
+            assert!(ready.iter().all(|state| prerequisite.voter_ready(state) == Ok(true)));
+            assert_eq!(fault_writes_started.load(Ordering::SeqCst), VOTERS);
+            assert!(exercised_followers.insert(fixture.node_ids[delayed]), "each exact follower is exercised once");
+            eprintln!("ACTIVATION_FIXTURE_REGRESSION {}", serde_json::json!({
+                "phase": "released_and_original_negative_checks_passed", "leader": leader, "delayed": delayed,
+                "fault_writes_started": VOTERS, "bound": prerequisite.committed_position, "ready_voters": &ready,
+            }));
+        }).await;
+    }
+    let (leader, followers) = expected_roles.expect("both pristine follower cases ran");
+    assert_eq!(exercised_followers, BTreeSet::from(followers));
+    assert_eq!(exercised_followers.len(), VOTERS - 1);
+    assert!(!exercised_followers.contains(&leader));
+    eprintln!(
+        "ACTIVATION_FIXTURE_REGRESSION {}",
+        serde_json::json!({
+            "phase": "both_exact_followers_exercised", "leader_node_id": leader,
+            "follower_node_ids": exercised_followers,
+        })
+    );
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_quorum_public_v2_activation_fault_fixture_timeout_prevents_fault_injection() {
+    let directory = tempfile::tempdir().expect("activation fixture timeout directory");
+    let start = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("fixture logical time"),
+    );
+    with_canonical_activation_fixture(directory.path(), Arc::new(MutableClock::new(start)), async |fixture| {
+        let stores = &fixture.stores;
+        let database_paths = &fixture.database_paths;
+        let delayed = fixture.followers[0];
+        let (hold, prerequisite, _batch) = activation_fixture_delayed_setup(fixture, delayed).await;
+        let before = activation_fixture_states(stores, database_paths).expect("pre-deadline voter state");
+        let fault_writes_started = AtomicUsize::new(0);
+        let guarded_fault = async {
+            // A one-second test setup deadline is below the same ten-second
+            // maximum; no production operation or protocol deadline changes.
+            prerequisite.wait(stores, database_paths, Duration::from_secs(1)).await?;
+            for path in database_paths {
+                fault_writes_started.fetch_add(1, Ordering::SeqCst);
+                inject_activation_fixture_fault(path, 0);
+            }
+            Ok::<_, String>(())
+        };
+        let failure = guarded_fault.await.expect_err("incomplete setup must expire before any fault write");
+        assert!(failure.starts_with("activation prerequisite deadline"), "{failure}");
+        assert_eq!(fault_writes_started.load(Ordering::SeqCst), 0);
+        let after = activation_fixture_states(stores, database_paths).expect("terminal held voter state");
+        assert_eq!(prerequisite.voter_ready(&after[delayed]), Ok(false));
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(new.v2_tables, old.v2_tables);
+            assert_eq!(new.certificate_count, old.certificate_count);
+            assert_eq!(new.certificate, old.certificate);
+        }
+        eprintln!("ACTIVATION_FIXTURE_REGRESSION {}", serde_json::json!({
+            "phase": "deadline_prevented_all_fault_writes", "leader": fixture.leader, "delayed": delayed, "fault_writes_started": 0,
+            "bound": prerequisite.committed_position, "final_voters": &after, "failure": failure,
+        }));
+        drop(hold);
+    }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
