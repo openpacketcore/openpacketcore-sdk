@@ -444,6 +444,23 @@ pub fn consensus_local_wal_costs_for_test(
         .transpose()
 }
 
+/// Enable the explicit volatile-memory performance experiment on one native
+/// voter. Real quorum replication and state-machine application remain active;
+/// storage completion no longer promises cold-crash durability. The existing
+/// bounded background WAL, snapshots and retention backpressure still run.
+/// Ordinary production construction never enables this test-control mode.
+#[cfg(target_os = "linux")]
+pub fn enable_volatile_memory_performance_experiment_for_test(
+    store: &ConsensusSessionStore,
+) -> std::io::Result<()> {
+    store
+        .inner
+        .private_wal
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("volatile experiment requires native WAL storage"))?
+        .enable_volatile_memory_experiment_for_test()
+}
+
 /// Wait until the engine has purged beyond an isolated follower's previously
 /// applied index. This is test-only evidence that healing must use the real
 /// InstallSnapshot RPC rather than ordinary log replay.

@@ -1243,7 +1243,7 @@ impl Wal {
                     .ok_or_else(|| invalid_data("native application owner missing"))?;
                 native.log.require_committed_entries(
                     &native.business,
-                    state.durable_committed,
+                    state.committed_for_application(),
                     entries,
                 )?;
                 native.business.capture_application()
@@ -1287,7 +1287,7 @@ impl Wal {
                 // on every pass, including metadata-only predecessor retries.
                 native.log.require_committed_entries(
                     &native.business,
-                    state.durable_committed,
+                    state.committed_for_application(),
                     entries,
                 )?;
                 prepared.is_current(&native.business)

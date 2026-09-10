@@ -33,6 +33,8 @@ mod native_basis;
 pub(crate) mod owner;
 mod record;
 pub(crate) mod snapshot;
+#[cfg(feature = "test-control")]
+mod volatile_experiment;
 
 use record::{Decoder, Record, MAX_FRAGMENT};
 
@@ -496,6 +498,8 @@ struct State {
     native_install_pending: bool,
     native_operations: usize,
     native_sql_fallbacks: u64,
+    #[cfg(feature = "test-control")]
+    volatile_experiment: Option<volatile_experiment::Observation>,
     queue: VecDeque<Request>,
     outstanding: usize,
     outstanding_bytes: usize,
@@ -538,6 +542,14 @@ pub(crate) struct Wal {
 }
 
 impl State {
+    fn committed_for_application(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        #[cfg(feature = "test-control")]
+        if self.volatile_experiment.is_some() {
+            return self.native.as_ref().and_then(|native| native.log.committed);
+        }
+        self.durable_committed
+    }
+
     fn recovered(
         binding: Binding,
         conn: Connection,
@@ -567,6 +579,8 @@ impl State {
             native_install_pending: false,
             native_operations: 0,
             native_sql_fallbacks: 0,
+            #[cfg(feature = "test-control")]
+            volatile_experiment: None,
             queue: VecDeque::new(),
             outstanding: 0,
             outstanding_bytes: 0,
@@ -978,6 +992,8 @@ impl Wal {
         state.history_bytes += charge;
         state.outstanding += 1;
         state.outstanding_bytes += charge;
+        #[cfg(feature = "test-control")]
+        let completion = volatile_experiment::complete_admission(&mut state, completion, sequence);
         state.queue.push_back(Request {
             sequence,
             record,

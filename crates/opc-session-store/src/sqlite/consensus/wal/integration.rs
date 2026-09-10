@@ -500,7 +500,7 @@ impl Wal {
                 "reclaim_io_maximum_us": state.checkpoint_costs.native_reclaim_io_maximum.as_micros(),
             },
         });
-        serde_json::json!({
+        let observation = serde_json::json!({
             "scope": "current_writer_incarnation",
             "native_memory": state.native.is_some(),
             "native_live_sql_fallbacks": state.native_sql_fallbacks,
@@ -535,7 +535,10 @@ impl Wal {
             "cache_validation": state.cache_validation_costs.json(),
             "cache_read": state.cache_read_costs.json(),
             "application": state.application_costs.json(),
-        })
+        });
+        #[cfg(feature = "test-control")]
+        let observation = super::volatile_experiment::observe(state, observation);
+        observation
     }
 
     pub(crate) fn integration_observations(&self) -> io::Result<serde_json::Value> {

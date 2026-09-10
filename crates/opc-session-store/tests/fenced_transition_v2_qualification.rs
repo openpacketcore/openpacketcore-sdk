@@ -12867,6 +12867,16 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
     .expect("canonical bounded-scale fs-verity snapshot root");
     let (stores, _, _, peer_slots) =
         fixed_cluster_with_snapshot_root(directory.path(), &snapshot_root, clock).await;
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("OPC_SESSION_VOLATILE_PERFORMANCE_EXPERIMENT").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        for store in &stores {
+            opc_session_store::test_support::enable_volatile_memory_performance_experiment_for_test(store)
+                .expect("enable explicitly requested volatile benchmark voter");
+        }
+        eprintln!("sdk-741 volatile experiment: durability=waived real_quorum=true real_apply=true background_wal=true snapshots=unchanged cold_restart_qualification=false");
+    }
     let ingress_store = &stores[ready_leader(&stores).await];
     let provider = sealing_provider();
     let transient_retries = AtomicU64::new(0);
