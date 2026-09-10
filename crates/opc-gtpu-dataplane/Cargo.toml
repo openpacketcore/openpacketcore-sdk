@@ -42,6 +42,8 @@ rustix = { version = "1", features = ["fs", "process", "time"] }
 nix = { workspace = true, features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
+# SDK-owned encrypted mTLS/fixed-voter regression fixture; test-only workspace code.
+opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0", features = ["consumer-fixture"] }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

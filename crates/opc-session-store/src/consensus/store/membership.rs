@@ -1442,6 +1442,8 @@ impl ConsensusSessionStore {
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
             storage_shutdown,
+            #[cfg(target_os = "linux")]
+            private_wal: None,
             terminal_recovery_handoff_consumer,
             #[cfg(test)]
             terminal_recovery_gate_checks: AtomicU64::new(0),

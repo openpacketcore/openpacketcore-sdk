@@ -1443,6 +1443,18 @@ pub struct FencedTransitionV2Request {
 }
 
 impl FencedTransitionV2Request {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_for_native_read(&self) -> std::io::Result<Self> {
+        // The original durable-log decoder has already admitted the complete
+        // row. Preserve even a conflicting body/ID exactly: from_parts would
+        // run business validation and change that existing log vocabulary.
+        Ok(Self {
+            request_id: self.request_id,
+            lease: crate::consensus::native::owned::transition_lease(&self.lease)?,
+            mutation: crate::consensus::native::owned::transition_mutation(&self.mutation)?,
+        })
+    }
+
     pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
         let lease = match &self.lease {
             FencedTransitionLease::Acquire { key, owner, .. } => key

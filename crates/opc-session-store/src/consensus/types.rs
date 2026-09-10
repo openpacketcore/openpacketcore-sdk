@@ -32,6 +32,10 @@ use crate::lease::LeaseGuard;
 use crate::model::{FenceToken, Generation, OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
 
+#[cfg(target_os = "linux")]
+#[path = "types_native_roster.rs"]
+mod native_roster;
+
 pub use opc_consensus::{
     ConsensusClusterId as SessionConsensusClusterId,
     ConsensusConfigurationEpoch as SessionConsensusConfigurationEpoch,
@@ -214,7 +218,8 @@ pub(crate) fn fenced_transition_voter_set_digest(
 // exact V2 ingress, provenance, proof, and evidence carriers above.
 #[cfg(test)]
 pub(crate) use tests::{
-    roster_v2_aborted_persistence_fixture, roster_v2_persistence_fixture,
+    roster_v2_aborted_persistence_fixture, roster_v2_aborted_persistence_fixture_for_history,
+    roster_v2_fresh_wal_persistence_fixture, roster_v2_persistence_fixture,
     RosterV2PersistenceFixture,
 };
 
@@ -3432,6 +3437,38 @@ pub(crate) mod tests {
     }
 
     fn roster_v2_persistence_fixture_for_phase(phase: Phase) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_binding(phase, [0x91; 16], 1)
+    }
+
+    pub(crate) fn roster_v2_aborted_persistence_fixture_for_history(
+        roster_id: [u8; 16],
+        epoch: u64,
+    ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_binding(Phase::Aborted, roster_id, epoch)
+    }
+
+    fn roster_v2_persistence_fixture_for_binding(
+        phase: Phase,
+        roster_id: [u8; 16],
+        epoch: u64,
+    ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_authority(phase, roster_id, epoch, FenceToken::new(9), 10)
+    }
+
+    pub(crate) fn roster_v2_fresh_wal_persistence_fixture(
+        phase: Phase,
+    ) -> RosterV2PersistenceFixture {
+        // Formation, the first real lease, and profile activation precede Q1.
+        roster_v2_persistence_fixture_for_authority(phase, [0x91; 16], 3, FenceToken::new(1), 1)
+    }
+
+    fn roster_v2_persistence_fixture_for_authority(
+        phase: Phase,
+        roster_id: [u8; 16],
+        epoch: u64,
+        fence: FenceToken,
+        credential_id: u64,
+    ) -> RosterV2PersistenceFixture {
         let key = SessionKey {
             tenant: TenantId::from_static("v2-wire-tag-tenant"),
             nf_kind: NetworkFunctionKind::smf(),
@@ -3439,7 +3476,6 @@ pub(crate) mod tests {
             stable_id: StableId::new(Bytes::from_static(b"v2-wire-tag-key")).expect("V2 stable ID"),
         };
         let owner = OwnerId::new("v2-wire-tag-owner").expect("V2 owner");
-        let fence = FenceToken::new(9);
         let state_type = StateType::from_static("v2-wire-tag");
         let envelope_key_id = KeyId::new("v2-wire-tag-envelope").expect("V2 envelope key ID");
         let session_key_digest = crate::hex::encode_lower(&key.digest());
@@ -3467,7 +3503,7 @@ pub(crate) mod tests {
         .expect("V2 terminal checkpoint envelope");
         let proposal = AdmissionProposal::new(
             Profile::v2(),
-            RosterId::from_bytes([0x91; 16]).expect("V2 roster ID"),
+            RosterId::from_bytes(roster_id).expect("V2 roster ID"),
             (0..FRESH_ROSTER_MEMBERS)
                 .map(|ordinal| {
                     Member::new(
@@ -3495,7 +3531,7 @@ pub(crate) mod tests {
             Generation::new(1),
         )
         .expect("V2 admission");
-        let authority = roster_digest_authority(&admission, 10, 1, 61);
+        let authority = roster_digest_authority(&admission, credential_id, 1, 61);
         let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).expect("V2 root key");
         let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).expect("V2 ingress key");
         let executor_key = SigningKey::from_bytes((&[0x98; 32]).into()).expect("V2 executor key");
@@ -3560,8 +3596,8 @@ pub(crate) mod tests {
         )
         .expect("V2 provenance");
 
-        let binding = admission.binding_key(1).expect("V2 binding");
-        let registration_request_id = RequestId::bind(1, &admission).expect("V2 request ID");
+        let binding = admission.binding_key(epoch).expect("V2 binding");
+        let registration_request_id = RequestId::bind(epoch, &admission).expect("V2 request ID");
         let registration = BackendRegistration::from_consensus_parts(
             roster_registration_handle(binding),
             registration_request_id,

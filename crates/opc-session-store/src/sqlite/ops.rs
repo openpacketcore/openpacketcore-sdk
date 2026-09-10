@@ -302,23 +302,69 @@ pub(crate) fn rotate_restore_scan_epoch_sync(conn: &Connection) -> Result<(), St
 }
 
 pub(crate) fn rotate_restore_scan_incarnation_sync(conn: &Connection) -> Result<(), StoreError> {
-    let epoch = *uuid::Uuid::new_v4().as_bytes();
-    let mut cursor_key = Zeroizing::new([0_u8; 32]);
-    SysRng
-        .try_fill_bytes(cursor_key.as_mut())
-        .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
-    let changed = conn
+    RestoreScanIncarnation::new()?.rotate_sync(conn)
+}
+
+/// One destination-local choice shared by the two images of a WAL install.
+/// The key is serialized only in a database image, never in a proof or log.
+#[derive(Clone)]
+pub(crate) struct RestoreScanIncarnation {
+    epoch: [u8; 16],
+    cursor_key: Zeroizing<[u8; 32]>,
+}
+
+impl RestoreScanIncarnation {
+    pub(crate) fn new() -> Result<Self, StoreError> {
+        let epoch = *uuid::Uuid::new_v4().as_bytes();
+        let mut cursor_key = Zeroizing::new([0_u8; 32]);
+        SysRng.try_fill_bytes(cursor_key.as_mut()).map_err(|_| {
+            StoreError::BackendUnavailable("session restore metadata failed".into())
+        })?;
+        Ok(Self { epoch, cursor_key })
+    }
+
+    /// Only the WAL's hash-verified proposed image may supply a replay choice.
+    pub(crate) fn from_installed_sync(conn: &Connection) -> Result<Self, StoreError> {
+        let (epoch, _, cursor_key) = read_restore_scan_state_sync(conn)?;
+        Ok(Self { epoch, cursor_key })
+    }
+
+    /// The native base image stores this fixed local choice outside its
+    /// comparison context. Reading it grants no snapshot install authority.
+    pub(crate) fn native_image(&self) -> Zeroizing<[u8; 48]> {
+        let mut image = Zeroizing::new([0; 48]);
+        image[..16].copy_from_slice(&self.epoch);
+        image[16..].copy_from_slice(self.cursor_key.as_slice());
+        image
+    }
+
+    pub(crate) fn from_native_image(image: &[u8]) -> Result<Self, StoreError> {
+        if image.len() != 48 || image[..16] == [0; 16] || image[16..] == [0; 32] {
+            return Err(StoreError::Serialization(
+                "session restore metadata is invalid".into(),
+            ));
+        }
+        let mut epoch = [0; 16];
+        epoch.copy_from_slice(&image[..16]);
+        let mut cursor_key = Zeroizing::new([0; 32]);
+        cursor_key.copy_from_slice(&image[16..]);
+        Ok(Self { epoch, cursor_key })
+    }
+
+    pub(crate) fn rotate_sync(&self, conn: &Connection) -> Result<(), StoreError> {
+        let changed = conn
         .execute(
             "UPDATE restore_scan_state SET epoch = ?1, cursor_key = ?2, revision = revision + 1 WHERE singleton = 1 AND revision < ?3",
-            params![epoch.as_slice(), cursor_key.as_slice(), i64::MAX],
+            params![self.epoch.as_slice(), self.cursor_key.as_slice(), i64::MAX],
         )
         .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
-    if changed != 1 {
-        return Err(StoreError::BackendUnavailable(
-            "session restore metadata exhausted".into(),
-        ));
+        if changed != 1 {
+            return Err(StoreError::BackendUnavailable(
+                "session restore metadata exhausted".into(),
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn prune_sync(conn: &Connection, now: Timestamp) -> Result<(), StoreError> {
@@ -582,14 +628,14 @@ pub(crate) fn get_raw_sync(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RestoreScanRowBudget {
+pub(crate) struct RestoreScanRowBudget {
     examined_metadata_bytes: usize,
     retained_record_bytes: usize,
     payload_bytes: usize,
 }
 
-struct RestoreScanCandidate {
-    key: SessionKey,
+pub(crate) struct RestoreScanCandidate {
+    pub(crate) key: SessionKey,
     generation: Generation,
     owner: OwnerId,
     fence: FenceToken,
@@ -783,15 +829,35 @@ fn restore_scan_row_budget(row: &Row<'_>) -> Result<RestoreScanRowBudget, StoreE
     let _ = state_class_from_str(state_class)?;
     let _ = restore_scan_integer(row, 11)?;
 
+    restore_scan_budget_from_lengths(
+        [
+            tenant.len(),
+            nf_kind.len(),
+            key_type.len(),
+            stable_id.len(),
+            owner.len(),
+            state_class.len(),
+            state_type.len(),
+        ],
+        expires_at_bytes,
+        payload_bytes,
+    )
+}
+
+fn restore_scan_budget_from_lengths(
+    lengths: [usize; 7],
+    expires_at_bytes: usize,
+    payload_bytes: usize,
+) -> Result<RestoreScanRowBudget, StoreError> {
     let examined_metadata_bytes = [
         std::mem::size_of::<RestoreScanCandidate>(),
-        tenant.len(),
-        nf_kind.len(),
-        key_type.len(),
-        stable_id.len(),
-        owner.len(),
-        state_class.len(),
-        state_type.len(),
+        lengths[0],
+        lengths[1],
+        lengths[2],
+        lengths[3],
+        lengths[4],
+        lengths[5],
+        lengths[6],
         expires_at_bytes,
     ]
     .into_iter()
@@ -801,12 +867,12 @@ fn restore_scan_row_budget(row: &Row<'_>) -> Result<RestoreScanRowBudget, StoreE
         return Err(StoreError::RestoreScanWorkBudgetExceeded);
     }
     let retained_record_bytes = restore_record_retained_bytes_from_lengths(
-        tenant.len(),
-        nf_kind.len(),
-        key_type.len(),
-        stable_id.len(),
-        owner.len(),
-        state_type.len(),
+        lengths[0],
+        lengths[1],
+        lengths[2],
+        lengths[3],
+        lengths[4],
+        lengths[6],
         payload_bytes,
     )?;
     Ok(RestoreScanRowBudget {
@@ -816,63 +882,170 @@ fn restore_scan_row_budget(row: &Row<'_>) -> Result<RestoreScanRowBudget, StoreE
     })
 }
 
-pub(crate) fn scan_restore_records_sync(
-    conn: &Connection,
-    request: RestoreScanRequest,
-    now: Timestamp,
-    cancellation: Arc<AtomicBool>,
-    operation_deadline: std::time::Instant,
-    profile: RestoreScanValidationProfile,
-) -> Result<RestoreScanPage, StoreError> {
-    request.validate()?;
-    let _progress_guard =
-        install_restore_scan_progress_budget(conn, Arc::clone(&cancellation), operation_deadline);
-    if cancellation.load(Ordering::Acquire) {
-        return Err(StoreError::RestoreScanWorkBudgetExceeded);
-    }
-    if profile.is_standalone() {
-        prune_sync(conn, now)?;
-    }
-    let (backend_epoch, snapshot_revision, cursor_key) = read_restore_scan_state_sync(conn)?;
-    let (seek_key, examined_position, snapshot_time) = match request.cursor {
-        Some(cursor) => {
-            let (cursor_epoch, cursor_revision, snapshot_time, seek_key, examined_position) =
-                cursor.authenticated_parts(&request.scope, &cursor_key)?;
-            if cursor_epoch != backend_epoch || cursor_revision != snapshot_revision {
-                return Err(StoreError::RestoreScanCursorStale);
-            }
-            (Some(seek_key), examined_position, snapshot_time)
+#[cfg(target_os = "linux")]
+impl RestoreScanRow for &StoredSessionRecord {
+    fn budget(&self) -> Result<RestoreScanRowBudget, StoreError> {
+        if self.key.tenant.as_str().len() > RESTORE_SCAN_TENANT_MAX_BYTES
+            || self.key.nf_kind.as_str().len() > RESTORE_SCAN_NF_KIND_MAX_BYTES
+            || self.owner.as_str().len() > OWNER_ID_MAX_BYTES
+            || self.state_type.as_str().len() > STATE_TYPE_MAX_BYTES
+        {
+            return Err(StoreError::RestoreScanWorkBudgetExceeded);
         }
-        None => (None, 0_u64, now),
-    };
-    let query_limit = RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE
-        .checked_add(1)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-    let snapshot_time_text = format_rfc3339_normalized(snapshot_time);
-    let mut stmt = conn
-        .prepare(if seek_key.is_some() {
-            RESTORE_SCAN_SEEK_PAGE_SQL
-        } else {
-            RESTORE_SCAN_FIRST_PAGE_SQL
-        })
-        .map_err(restore_scan_sqlite_error)?;
-    let mut rows = match seek_key.as_ref() {
-        Some(seek_key) => stmt.query(named_params! {
-            ":snapshot_time": snapshot_time_text,
-            ":seek_tenant": seek_key.tenant.as_str(),
-            ":seek_nf_kind": seek_key.nf_kind.as_str(),
-            ":seek_key_type": seek_key.key_type.as_str(),
-            ":seek_stable_id": seek_key.stable_id.as_ref(),
-            ":query_limit": query_limit,
-        }),
-        None => stmt.query(named_params! {
-            ":snapshot_time": snapshot_time_text,
-            ":query_limit": query_limit,
-        }),
+        restore_scan_budget_from_lengths(
+            [
+                self.key.tenant.as_str().len(),
+                self.key.nf_kind.as_str().len(),
+                self.key.key_type.as_str().len(),
+                self.key.stable_id.as_bytes().len(),
+                self.owner.as_str().len(),
+                self.state_class.to_string().len(),
+                self.state_type.as_str().len(),
+            ],
+            self.expires_at
+                .map_or(0, |time| format_rfc3339_normalized(time).len()),
+            self.payload.len(),
+        )
     }
-    .map_err(restore_scan_sqlite_error)?;
 
+    fn candidate(&self, budget: RestoreScanRowBudget) -> Result<RestoreScanCandidate, StoreError> {
+        Ok(RestoreScanCandidate {
+            key: self.key.clone(),
+            generation: self.generation,
+            owner: self.owner.clone(),
+            fence: self.fence,
+            state_class: self.state_class,
+            state_type: self.state_type.clone(),
+            expires_at: self.expires_at,
+            payload_bytes: budget.payload_bytes,
+            encoding: match self.payload.encoding() {
+                SessionPayloadEncoding::Plaintext => 0,
+                SessionPayloadEncoding::LegacyPlaintext => 1,
+                SessionPayloadEncoding::EnvelopeV1 => 2,
+                SessionPayloadEncoding::Unclassified => 3,
+            },
+        })
+    }
+}
+
+/// A streaming row lends its metadata until the selector accepts its budget.
+/// The payload is only copied after the complete page selection succeeds.
+pub(crate) trait RestoreScanRow {
+    fn budget(&self) -> Result<RestoreScanRowBudget, StoreError>;
+    fn candidate(&self, budget: RestoreScanRowBudget) -> Result<RestoreScanCandidate, StoreError>;
+}
+
+pub(crate) trait RestoreScanSource {
+    type Row<'a>: RestoreScanRow
+    where
+        Self: 'a;
+    fn next_row(&mut self) -> Result<Option<Self::Row<'_>>, StoreError>;
+}
+
+impl RestoreScanRow for &Row<'_> {
+    fn budget(&self) -> Result<RestoreScanRowBudget, StoreError> {
+        restore_scan_row_budget(self)
+    }
+    fn candidate(&self, budget: RestoreScanRowBudget) -> Result<RestoreScanCandidate, StoreError> {
+        RestoreScanCandidate::from_row(self, budget)
+    }
+}
+
+impl<'stmt> RestoreScanSource for rusqlite::Rows<'stmt> {
+    type Row<'a>
+        = &'a Row<'stmt>
+    where
+        Self: 'a;
+    fn next_row(&mut self) -> Result<Option<Self::Row<'_>>, StoreError> {
+        self.next().map_err(restore_scan_sqlite_error)
+    }
+}
+
+pub(crate) struct RestoreScanSelection {
+    pub(crate) candidates: Vec<RestoreScanCandidate>,
+    pub(crate) examined_count: usize,
+    pub(crate) excluded_count: usize,
+    pub(crate) last_examined_key: Option<SessionKey>,
+    pub(crate) has_more: bool,
+}
+
+pub(crate) struct RestoreScanPosition {
+    pub(crate) seek_key: Option<SessionKey>,
+    examined_position: u64,
+    pub(crate) snapshot_time: Timestamp,
+}
+
+impl RestoreScanIncarnation {
+    pub(crate) fn scan_position(
+        &self,
+        request: &RestoreScanRequest,
+        revision: u64,
+        now: Timestamp,
+    ) -> Result<RestoreScanPosition, StoreError> {
+        let (seek_key, examined_position, snapshot_time) = match request.cursor.as_ref() {
+            Some(cursor) => {
+                let (epoch, cursor_revision, snapshot_time, key, examined) =
+                    cursor.authenticated_parts(&request.scope, &self.cursor_key)?;
+                if epoch != self.epoch || cursor_revision != revision {
+                    return Err(StoreError::RestoreScanCursorStale);
+                }
+                (Some(key), examined, snapshot_time)
+            }
+            None => (None, 0, now),
+        };
+        Ok(RestoreScanPosition {
+            seek_key,
+            examined_position,
+            snapshot_time,
+        })
+    }
+}
+
+impl RestoreScanSelection {
+    pub(crate) fn finish(
+        self,
+        mut records: Vec<StoredSessionRecord>,
+        scope: &RestoreScanScope,
+        incarnation: &RestoreScanIncarnation,
+        snapshot_revision: u64,
+        position: RestoreScanPosition,
+    ) -> Result<RestoreScanPage, StoreError> {
+        let examined_count_u64 = u64::try_from(self.examined_count)
+            .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?;
+        let next_position = position
+            .examined_position
+            .checked_add(examined_count_u64)
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        let next_cursor = if self.has_more {
+            let last_examined_key = self.last_examined_key.ok_or_else(|| {
+                StoreError::BackendUnavailable("session restore scan made no progress".into())
+            })?;
+            Some(RestoreScanCursor::durable(
+                &incarnation.cursor_key,
+                incarnation.epoch,
+                snapshot_revision,
+                position.snapshot_time,
+                scope,
+                &last_examined_key,
+                next_position,
+            )?)
+        } else {
+            None
+        };
+        records.sort_by(crate::restore::compare_restore_records);
+        Ok(RestoreScanPage::new_durable(
+            records,
+            self.excluded_count,
+            next_cursor,
+        ))
+    }
+}
+
+pub(crate) fn select_restore_scan_candidates(
+    request: &RestoreScanRequest,
+    profile: RestoreScanValidationProfile,
+    rows: &mut impl RestoreScanSource,
+) -> Result<RestoreScanSelection, StoreError> {
     let mut candidates = Vec::with_capacity(request.limit.min(64));
     let mut payload_bytes = 0_usize;
     let mut retained_page_bytes = std::mem::size_of::<RestoreScanPage>();
@@ -883,13 +1056,13 @@ pub(crate) fn scan_restore_records_sync(
     let mut last_examined_key = None;
     loop {
         if examined_count == RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE {
-            has_more = rows.next().map_err(restore_scan_sqlite_error)?.is_some();
+            has_more = rows.next_row()?.is_some();
             break;
         }
-        let Some(row) = rows.next().map_err(restore_scan_sqlite_error)? else {
+        let Some(row) = rows.next_row()? else {
             break;
         };
-        let row_budget = restore_scan_row_budget(row)?;
+        let row_budget = row.budget()?;
         let next_examined_metadata_bytes = examined_metadata_bytes
             .checked_add(row_budget.examined_metadata_bytes)
             .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
@@ -900,8 +1073,9 @@ pub(crate) fn scan_restore_records_sync(
             has_more = true;
             break;
         }
-        let candidate = RestoreScanCandidate::from_row(row, row_budget)?;
+        let candidate = row.candidate(row_budget)?;
         let candidate_key = candidate.key.clone();
+        drop(row);
         let previous_candidates = candidates.len();
         let previous_examined_count = examined_count;
         let previous_excluded_count = excluded_count;
@@ -960,7 +1134,7 @@ pub(crate) fn scan_restore_records_sync(
             .checked_add(cursor_bytes)
             .is_none_or(|bytes| bytes > RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES)
         {
-            let more_rows = rows.next().map_err(restore_scan_sqlite_error)?.is_some();
+            let more_rows = rows.next_row()?.is_some();
             if more_rows {
                 candidates.truncate(previous_candidates);
                 examined_count = previous_examined_count;
@@ -979,16 +1153,76 @@ pub(crate) fn scan_restore_records_sync(
         if candidates.len() == request.limit
             || examined_count == RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE
         {
-            has_more = rows.next().map_err(restore_scan_sqlite_error)?.is_some();
+            has_more = rows.next_row()?.is_some();
             break;
         }
     }
 
+    Ok(RestoreScanSelection {
+        candidates,
+        examined_count,
+        excluded_count,
+        last_examined_key,
+        has_more,
+    })
+}
+
+pub(crate) fn scan_restore_records_sync(
+    conn: &Connection,
+    request: RestoreScanRequest,
+    now: Timestamp,
+    cancellation: Arc<AtomicBool>,
+    operation_deadline: std::time::Instant,
+    profile: RestoreScanValidationProfile,
+) -> Result<RestoreScanPage, StoreError> {
+    request.validate()?;
+    let _progress_guard =
+        install_restore_scan_progress_budget(conn, Arc::clone(&cancellation), operation_deadline);
+    if cancellation.load(Ordering::Acquire) {
+        return Err(StoreError::RestoreScanWorkBudgetExceeded);
+    }
+    if profile.is_standalone() {
+        prune_sync(conn, now)?;
+    }
+    let (epoch, snapshot_revision, cursor_key) = read_restore_scan_state_sync(conn)?;
+    let incarnation = RestoreScanIncarnation { epoch, cursor_key };
+    let position = incarnation.scan_position(&request, snapshot_revision, now)?;
+    let seek_key = position.seek_key.as_ref();
+    let query_limit = RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+    let snapshot_time_text = format_rfc3339_normalized(position.snapshot_time);
+    let mut stmt = conn
+        .prepare(if seek_key.is_some() {
+            RESTORE_SCAN_SEEK_PAGE_SQL
+        } else {
+            RESTORE_SCAN_FIRST_PAGE_SQL
+        })
+        .map_err(restore_scan_sqlite_error)?;
+    let mut rows = match seek_key.as_ref() {
+        Some(seek_key) => stmt.query(named_params! {
+            ":snapshot_time": snapshot_time_text,
+            ":seek_tenant": seek_key.tenant.as_str(),
+            ":seek_nf_kind": seek_key.nf_kind.as_str(),
+            ":seek_key_type": seek_key.key_type.as_str(),
+            ":seek_stable_id": seek_key.stable_id.as_ref(),
+            ":query_limit": query_limit,
+        }),
+        None => stmt.query(named_params! {
+            ":snapshot_time": snapshot_time_text,
+            ":query_limit": query_limit,
+        }),
+    }
+    .map_err(restore_scan_sqlite_error)?;
+
+    let mut selection = select_restore_scan_candidates(&request, profile, &mut rows)?;
+
     drop(rows);
     drop(stmt);
 
-    let mut records = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
+    let mut records = Vec::with_capacity(selection.candidates.len());
+    for candidate in std::mem::take(&mut selection.candidates) {
         if cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= operation_deadline {
             return Err(StoreError::RestoreScanWorkBudgetExceeded);
         }
@@ -1001,33 +1235,13 @@ pub(crate) fn scan_restore_records_sync(
         return Err(StoreError::RestoreScanWorkBudgetExceeded);
     }
 
-    let examined_count_u64 =
-        u64::try_from(examined_count).map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?;
-    let next_position = examined_position
-        .checked_add(examined_count_u64)
-        .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-    let next_cursor = if has_more {
-        let last_examined_key = last_examined_key.ok_or_else(|| {
-            StoreError::BackendUnavailable("session restore scan made no progress".into())
-        })?;
-        Some(RestoreScanCursor::durable(
-            &cursor_key,
-            backend_epoch,
-            snapshot_revision,
-            snapshot_time,
-            &request.scope,
-            &last_examined_key,
-            next_position,
-        )?)
-    } else {
-        None
-    };
-    records.sort_by(crate::restore::compare_restore_records);
-    Ok(RestoreScanPage::new_durable(
+    selection.finish(
         records,
-        excluded_count,
-        next_cursor,
-    ))
+        &request.scope,
+        &incarnation,
+        snapshot_revision,
+        position,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

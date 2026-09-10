@@ -1795,6 +1795,8 @@ impl ConsensusStoreDiagnosticCounters {
 struct ConsensusSessionStoreInner {
     raft: SessionRaft,
     storage_shutdown: storage::ConsensusStorageShutdownObserver,
+    #[cfg(target_os = "linux")]
+    private_wal: Option<Arc<crate::sqlite::consensus::wal::Wal>>,
     terminal_recovery_handoff_consumer: storage::LiveTerminalRecoveryHandoffConsumer,
     #[cfg(test)]
     terminal_recovery_gate_checks: AtomicU64,
@@ -1892,6 +1894,17 @@ async fn shutdown_consensus_session_store(
     #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
     if let Some(gate) = raft_shutdown_gate_for_store(&inner) {
         gate.wait_before_raft_shutdown().await;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(wal) = inner.private_wal.as_ref() {
+        let raft_result = inner
+            .raft
+            .shutdown()
+            .await
+            .map_err(|_| consensus_unavailable());
+        inner.storage_shutdown.wait().await;
+        wal.shutdown().map_err(|_| consensus_unavailable())?;
+        return raft_result;
     }
     inner
         .raft
@@ -3222,6 +3235,8 @@ impl ConsensusSessionStore {
                 snapshot_integrity,
             )
             .await?;
+        #[cfg(target_os = "linux")]
+        let private_wal = log_store.private_wal();
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let terminal_recovery_handoff_consumer =
@@ -3296,6 +3311,8 @@ impl ConsensusSessionStore {
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
             storage_shutdown,
+            #[cfg(target_os = "linux")]
+            private_wal,
             terminal_recovery_handoff_consumer,
             #[cfg(test)]
             terminal_recovery_gate_checks: AtomicU64::new(0),
@@ -3454,6 +3471,8 @@ impl ConsensusSessionStore {
                 roster_attestation_trust_root.clone(),
             )
             .await?;
+        #[cfg(target_os = "linux")]
+        let private_wal = log_store.private_wal();
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let terminal_recovery_handoff_consumer =
@@ -3514,6 +3533,8 @@ impl ConsensusSessionStore {
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
             storage_shutdown,
+            #[cfg(target_os = "linux")]
+            private_wal,
             terminal_recovery_handoff_consumer,
             #[cfg(test)]
             terminal_recovery_gate_checks: AtomicU64::new(0),
@@ -25201,3 +25222,6 @@ mod membership_tests {
 
 #[cfg(test)]
 mod encryption_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod sequential_wal_sdk_tests;

@@ -1370,6 +1370,36 @@ async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_an
         "reopened fixed quorum RPC path must recover durable traffic authority"
     );
     shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    {
+        drop(reopened);
+        drop(reopened_paths);
+
+        // Keep the acknowledged database while removing only its required native
+        // namespace. Ordinary reopening must refuse, preserving the old history
+        // instead of silently selecting a fresh empty generation.
+        let native_directory = directory.path().join("fixed-voter-0.sqlite.native-wal");
+        let retained_directory = directory.path().join("retained-native-voter-0");
+        std::fs::rename(&native_directory, &retained_directory)
+            .expect("retain acknowledged native namespace under a different name");
+        let root_before = std::fs::read(retained_directory.join("ROOT"))
+            .expect("retain acknowledged native ROOT");
+        let refused =
+            reopen_single_fixed_voter_for_test(directory.path(), directory.path(), 0).await;
+        assert!(
+            refused.is_err(),
+            "selected database must reject a missing native namespace"
+        );
+        assert!(
+            !native_directory.exists(),
+            "refusal must not create another native generation"
+        );
+        assert_eq!(
+            root_before,
+            std::fs::read(retained_directory.join("ROOT"))
+                .expect("retained native ROOT remains readable")
+        );
+    }
 }
 
 #[tokio::test]

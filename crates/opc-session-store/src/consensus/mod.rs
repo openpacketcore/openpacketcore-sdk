@@ -4,6 +4,8 @@
 //! and state-machine boundaries. No Openraft type is part of the documented
 //! stable public session-store API or the authenticated session-net contract.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod native;
 pub mod network;
 pub(crate) mod raft_adapter;
 pub(crate) mod snapshot;

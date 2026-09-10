@@ -35,6 +35,28 @@ impl VerificationMemory {
         Self::reserve_from(&VERIFICATION_BYTES, bytes, PROCESS_VERIFICATION_BYTES)
     }
 
+    /// Release only scratch which its owner has already destroyed. This
+    /// cannot acquire memory, transfer a reservation, or exceed the original
+    /// process cap. The remaining allocation keeps this same counter owner.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) -> io::Result<()> {
+        let released = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| io::Error::other("verification reservation cannot grow by shrinking"))?;
+        self.bytes = bytes;
+        self.counter.fetch_sub(released, Ordering::AcqRel);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_for_test(
+        counter: &'static AtomicUsize,
+        bytes: usize,
+        limit: usize,
+    ) -> io::Result<Self> {
+        Self::reserve_from(counter, bytes, limit)
+    }
+
     fn reserve_from(counter: &'static AtomicUsize, bytes: usize, limit: usize) -> io::Result<Self> {
         counter
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -354,6 +376,31 @@ mod tests {
         assert_eq!(30, USED.load(Ordering::Acquire));
         drop(second);
         assert_eq!(0, USED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn native_verification_reservation_shrinking_preserves_live_charge_through_unwind() {
+        static USED: AtomicUsize = AtomicUsize::new(0);
+        let result = std::panic::catch_unwind(|| {
+            let mut owner = VerificationMemory::reserve_from(&USED, 90, 100).unwrap();
+            owner.shrink_to(30).unwrap();
+            assert_eq!(USED.load(Ordering::Acquire), 30);
+            assert!(owner.shrink_to(31).is_err());
+            assert_eq!(
+                USED.load(Ordering::Acquire),
+                30,
+                "failed growth does not change accounting"
+            );
+            let replacement = VerificationMemory::reserve_from(&USED, 70, 100).unwrap();
+            assert!(VerificationMemory::reserve_from(&USED, 1, 100).is_err());
+            drop(replacement);
+            assert_eq!(USED.load(Ordering::Acquire), 30);
+            panic!("release retained copy charge on unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(USED.load(Ordering::Acquire), 0);
+        drop(VerificationMemory::reserve_from(&USED, 100, 100).unwrap());
+        assert_eq!(USED.load(Ordering::Acquire), 0);
     }
 
     #[test]

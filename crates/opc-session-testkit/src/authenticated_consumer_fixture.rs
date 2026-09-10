@@ -12,7 +12,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -35,10 +35,11 @@ use opc_session_store::{
     PreparedFencedTransitionJournalKey, RecordExpiryPreflight, RestoreScanCursorProfile,
     RestoreScanPage, RestoreScanRequest, SessionBackend, SessionConsumerAuthorization,
     SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
-    SessionConsumerChange, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerRoster,
-    SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerVoterAuthority,
-    SessionKey, SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer, StoreError,
+    SessionConsumerChange, SessionConsumerOperation, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerRoster, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerTenantNfScope, SessionConsumerVoterAuthority, SessionKey, SessionLeaseManager,
+    SessionOp, SessionOpResult, SessionQuorumConsumer, StateClass, StateType, StoreError,
     StoredSessionRecord,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
@@ -181,14 +182,19 @@ impl<P: ?Sized> fmt::Debug for AuthenticatedPreparedFencedTransitionFixtureGener
 struct FixtureGeneralConsumerBackend {
     clients: Arc<[PersistentSessionConsumerClient]>,
     next_client: Arc<AtomicUsize>,
+    ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
 }
 
 impl FixtureGeneralConsumerBackend {
-    fn new(clients: Vec<PersistentSessionConsumerClient>) -> Self {
+    fn new(
+        clients: Vec<PersistentSessionConsumerClient>,
+        ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
+    ) -> Self {
         debug_assert_eq!(clients.len(), FIXTURE_VOTER_COUNT);
         Self {
             clients: Arc::from(clients),
             next_client: Arc::new(AtomicUsize::new(0)),
+            ordinary_cas_fault,
         }
     }
 
@@ -234,6 +240,7 @@ pub struct AuthenticatedPreparedFencedTransitionFixture {
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
     general_consumer_counters: Arc<FixtureGeneralConsumerCounters>,
+    ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
     listeners: Vec<SessionQuorumConsumerServerHandle>,
     _journal_directory: tempfile::TempDir,
     journal_path: PathBuf,
@@ -252,6 +259,434 @@ pub struct AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
     forced_fenced_transition_status_misses: usize,
     general_mutation_calls: usize,
     general_compare_and_set_calls: usize,
+}
+
+/// Fixed, nonidentifying evidence from one ordinary CAS response-loss fault.
+///
+/// Request correlation compares the complete encrypted CAS body, its original
+/// ID, and the exact consumer scope internally. No authority or payload value
+/// is returned. Array slots identify only the fixture's three private voters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuthenticatedOrdinaryCasResponseLossEvidence {
+    /// The authenticated handler received the exact client request.
+    pub request_correlated: bool,
+    /// The real consensus service returned CAS Success before suppression.
+    pub durable_success: bool,
+    /// The actual client returned OutcomeUnknown for that same request ID.
+    pub client_outcome_unknown: bool,
+    /// Server supervision dropped the suppressed-response future at timeout.
+    pub suppressed_response_finished: bool,
+    /// Physical dispatches of the original exact CAS, including any replay.
+    pub target_cas_dispatches: usize,
+    /// All ordinary mutation dispatches for the captured namespace key.
+    pub namespace_mutation_dispatches: usize,
+    /// All CAS dispatches for that key, including a different request ID.
+    pub namespace_cas_dispatches: usize,
+    /// Genuine durable read responses equal to the full encrypted replacement.
+    pub exact_readbacks: [usize; FIXTURE_VOTER_COUNT],
+    /// Exact-key read responses deliberately made unavailable, per voter.
+    pub unavailable_readbacks: [usize; FIXTURE_VOTER_COUNT],
+    /// Genuine exact read responses delivered after releasing the gate.
+    pub delivered_exact_readbacks: usize,
+    /// Real read responses still owned by a pending delivery gate.
+    pub pending_readback_responses: usize,
+    /// A request/result mismatch or unexpected real backend failure occurred.
+    pub failed: bool,
+}
+
+/// Fixed failure category for ordinary CAS fault setup or evidence collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("ordinary CAS response-loss evidence unavailable")]
+pub struct AuthenticatedOrdinaryCasResponseLossError;
+
+/// Owned control for one ordinary committed-CAS lost-success/timeout fault.
+///
+/// The real server withholds only a successful exact CAS response until the
+/// unchanged transport deadline. It never manufactures OutcomeUnknown. The
+/// next matching durable reads are held across all three listeners. Dropping
+/// this control makes held reads unavailable; existing listener supervision
+/// owns and bounds the suppressed response without an additional task.
+pub struct AuthenticatedOrdinaryCasResponseLoss {
+    gate: Arc<FixtureOrdinaryCasGate>,
+}
+
+impl fmt::Debug for AuthenticatedOrdinaryCasResponseLoss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedOrdinaryCasResponseLoss(<redacted>)")
+    }
+}
+
+impl AuthenticatedOrdinaryCasResponseLoss {
+    /// Await real committed success, the same client's unknown outcome, and
+    /// an exact durable read stopped before its response reaches the caller.
+    /// The test owner must supply its existing functional containment bound.
+    pub async fn wait_for_pending_readback(
+        &self,
+    ) -> Result<
+        AuthenticatedOrdinaryCasResponseLossEvidence,
+        AuthenticatedOrdinaryCasResponseLossError,
+    > {
+        loop {
+            let changed = self.gate.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let evidence = self.evidence();
+            if evidence.failed {
+                return Err(AuthenticatedOrdinaryCasResponseLossError);
+            }
+            if evidence.durable_success
+                && evidence.client_outcome_unknown
+                && evidence.suppressed_response_finished
+                && evidence.pending_readback_responses != 0
+            {
+                return Ok(evidence);
+            }
+            changed.await;
+        }
+    }
+
+    /// Release genuine exact read responses, or keep all matching reads
+    /// unavailable through poison/successor cleanup. This does not replay CAS.
+    pub fn release_readback(&self, exact: bool) {
+        self.gate.release_readback(exact);
+    }
+
+    /// Return a coherent fixed-value snapshot without touching transport.
+    pub fn evidence(&self) -> AuthenticatedOrdinaryCasResponseLossEvidence {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evidence
+    }
+
+    /// Verify released readback behavior on each existing private voter pool.
+    ///
+    /// These supplementary authenticated reads compare the real encrypted
+    /// row internally and return only fixed evidence. They do not dispatch a
+    /// mutation, fabricate a receipt, expose a key, or mint selector authority.
+    /// Public selector operations remain responsible for protected decryption
+    /// and acceptance. The owner must bound this diagnostic future.
+    pub async fn verify_released_readback_on_all_voters(
+        &self,
+        exact: bool,
+    ) -> Result<
+        AuthenticatedOrdinaryCasResponseLossEvidence,
+        AuthenticatedOrdinaryCasResponseLossError,
+    > {
+        let (clients, expected) = {
+            let state = self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.readback != Some(exact)
+                || state.evidence.failed
+                || !state.evidence.client_outcome_unknown
+            {
+                return Err(AuthenticatedOrdinaryCasResponseLossError);
+            }
+            let target = state
+                .target
+                .as_ref()
+                .ok_or(AuthenticatedOrdinaryCasResponseLossError)?;
+            (
+                Arc::clone(&target.clients),
+                target.operation.new_record.clone(),
+            )
+        };
+        for (voter, client) in clients.iter().enumerate() {
+            let before = self.evidence();
+            let observed = client.get(expected.key.clone()).await;
+            let after = self.evidence();
+            let result_matches = if exact {
+                matches!(observed, Ok(Some(record)) if record == expected)
+            } else {
+                matches!(observed, Err(StoreError::BackendUnavailable(_)))
+                    && after.unavailable_readbacks[voter] > before.unavailable_readbacks[voter]
+            };
+            if !result_matches
+                || after.failed
+                || after.exact_readbacks[voter] <= before.exact_readbacks[voter]
+            {
+                return Err(AuthenticatedOrdinaryCasResponseLossError);
+            }
+        }
+        Ok(self.evidence())
+    }
+}
+
+impl Drop for AuthenticatedOrdinaryCasResponseLoss {
+    fn drop(&mut self) {
+        self.gate.release_readback(false);
+    }
+}
+
+#[derive(Default)]
+struct FixtureOrdinaryCasFault {
+    active: Mutex<Option<Weak<FixtureOrdinaryCasGate>>>,
+}
+
+impl FixtureOrdinaryCasFault {
+    fn active(&self) -> Option<Arc<FixtureOrdinaryCasGate>> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+}
+
+struct FixtureOrdinaryCasGate {
+    tenant_nf: SessionConsumerTenantNfScope,
+    state_type: StateType,
+    state: Mutex<FixtureOrdinaryCasState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct FixtureOrdinaryCasState {
+    target: Option<FixtureOrdinaryCasTarget>,
+    evidence: AuthenticatedOrdinaryCasResponseLossEvidence,
+    readback: Option<bool>,
+}
+
+struct FixtureOrdinaryCasTarget {
+    scope: SessionConsumerScope,
+    request_id: SessionConsumerRequestId,
+    operation: CompareAndSet,
+    clients: Arc<[PersistentSessionConsumerClient]>,
+}
+
+struct FixtureOrdinaryCasPending<'a> {
+    gate: &'a FixtureOrdinaryCasGate,
+    readback: bool,
+}
+
+impl Drop for FixtureOrdinaryCasPending<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.readback {
+            state.evidence.pending_readback_responses =
+                state.evidence.pending_readback_responses.saturating_sub(1);
+        } else {
+            state.evidence.suppressed_response_finished = true;
+        }
+        drop(state);
+        self.gate.changed.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FixtureOrdinaryCasCall {
+    Mutation,
+    Readback,
+    Other,
+}
+
+impl FixtureOrdinaryCasGate {
+    fn select_client_request(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: &CompareAndSet,
+        clients: Arc<[PersistentSessionConsumerClient]>,
+    ) -> bool {
+        if operation.key.tenant != *self.tenant_nf.tenant()
+            || operation.key.nf_kind != *self.tenant_nf.nf_kind()
+            || operation.new_record.state_type != self.state_type
+            || operation.new_record.state_class != StateClass::AuthoritativeSession
+            || operation.expected_generation.is_none()
+        {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.target.is_some() || state.readback.is_some() {
+            return false;
+        }
+        state.target = Some(FixtureOrdinaryCasTarget {
+            scope,
+            request_id,
+            operation: operation.clone(),
+            clients,
+        });
+        true
+    }
+
+    fn observe_client_result(
+        &self,
+        scope: SessionConsumerScope,
+        request_id: SessionConsumerRequestId,
+        operation: &CompareAndSet,
+        result: &Result<CompareAndSetResult, SessionConsumerMutationError>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let same_request = state.target.as_ref().is_some_and(|target| {
+            target.scope == scope
+                && target.request_id == request_id
+                && target.operation == *operation
+        });
+        if same_request
+            && state.evidence.durable_success
+            && matches!(result, Err(SessionConsumerMutationError::OutcomeUnknown { request_id: observed }) if *observed == request_id)
+        {
+            state.evidence.client_outcome_unknown = true;
+        } else {
+            state.evidence.failed = true;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn observe_server_request(&self, request: &SessionConsumerRequest) -> FixtureOrdinaryCasCall {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(target) = state.target.as_ref() else {
+            return FixtureOrdinaryCasCall::Other;
+        };
+        if request.scope() != target.scope {
+            return FixtureOrdinaryCasCall::Other;
+        }
+        let key = match request.operation() {
+            SessionConsumerOperation::CompareAndSet { op } => &op.key,
+            SessionConsumerOperation::Get { key }
+            | SessionConsumerOperation::AcquireLease { key, .. } => key,
+            SessionConsumerOperation::RenewLease { lease, .. }
+            | SessionConsumerOperation::ReleaseLease { lease }
+            | SessionConsumerOperation::DeleteFenced { lease }
+            | SessionConsumerOperation::RefreshTtl { lease, .. } => lease.key(),
+            _ => return FixtureOrdinaryCasCall::Other,
+        };
+        if key != &target.operation.key {
+            return FixtureOrdinaryCasCall::Other;
+        }
+        if matches!(request.operation(), SessionConsumerOperation::Get { .. }) {
+            return if state.evidence.durable_success {
+                FixtureOrdinaryCasCall::Readback
+            } else {
+                FixtureOrdinaryCasCall::Other
+            };
+        }
+        let same_request = request.request_id() == target.request_id;
+        let same_body = matches!(request.operation(), SessionConsumerOperation::CompareAndSet { op } if **op == target.operation);
+        state.evidence.namespace_mutation_dispatches = state
+            .evidence
+            .namespace_mutation_dispatches
+            .saturating_add(1);
+        if matches!(
+            request.operation(),
+            SessionConsumerOperation::CompareAndSet { .. }
+        ) {
+            state.evidence.namespace_cas_dispatches =
+                state.evidence.namespace_cas_dispatches.saturating_add(1);
+        }
+        if same_request {
+            if !same_body {
+                state.evidence.failed = true;
+                self.changed.notify_waiters();
+                return FixtureOrdinaryCasCall::Other;
+            }
+            state.evidence.request_correlated = true;
+            state.evidence.target_cas_dispatches =
+                state.evidence.target_cas_dispatches.saturating_add(1);
+            FixtureOrdinaryCasCall::Mutation
+        } else {
+            FixtureOrdinaryCasCall::Other
+        }
+    }
+
+    fn observe_committed_success(&self, response: &SessionConsumerResponse) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let success = matches!(
+            response,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success))
+        );
+        if success && state.evidence.request_correlated && !state.evidence.durable_success {
+            state.evidence.durable_success = true;
+        } else {
+            state.evidence.failed = true;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        success
+    }
+
+    async fn gate_readback(
+        &self,
+        voter: usize,
+        response: SessionConsumerResponse,
+    ) -> SessionConsumerResponse {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let exact = state.target.as_ref().is_some_and(|target| {
+                matches!(&response, SessionConsumerResponse::Get(Ok(Some(record))) if *record == target.operation.new_record)
+            });
+            if !exact {
+                state.evidence.failed = true;
+                self.changed.notify_waiters();
+                return SessionConsumerResponse::Get(Err(SessionConsumerStoreError::Unavailable));
+            }
+            state.evidence.exact_readbacks[voter] =
+                state.evidence.exact_readbacks[voter].saturating_add(1);
+            state.evidence.pending_readback_responses =
+                state.evidence.pending_readback_responses.saturating_add(1);
+        }
+        let _pending = FixtureOrdinaryCasPending {
+            gate: self,
+            readback: true,
+        };
+        self.changed.notify_waiters();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(exact) = state.readback {
+                    if exact {
+                        state.evidence.delivered_exact_readbacks =
+                            state.evidence.delivered_exact_readbacks.saturating_add(1);
+                        return response;
+                    }
+                    state.evidence.unavailable_readbacks[voter] =
+                        state.evidence.unavailable_readbacks[voter].saturating_add(1);
+                    return SessionConsumerResponse::Get(Err(
+                        SessionConsumerStoreError::Unavailable,
+                    ));
+                }
+            }
+            changed.await;
+        }
+    }
+
+    fn release_readback(&self, exact: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .readback = Some(exact);
+        self.changed.notify_waiters();
+    }
 }
 
 impl AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
@@ -506,10 +941,16 @@ impl SessionBackend for FixtureGeneralConsumerBackend {
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
-        self.client()
-            .compare_and_set_with_id(SessionConsumerRequestId::new(), &op)
-            .await
-            .map_err(fixture_mutation_error)
+        let client = self.client();
+        let request_id = SessionConsumerRequestId::new();
+        let fault = self.ordinary_cas_fault.active().filter(|gate| {
+            gate.select_client_request(client.scope(), request_id, &op, Arc::clone(&self.clients))
+        });
+        let result = client.compare_and_set_with_id(request_id, &op).await;
+        if let Some(fault) = fault {
+            fault.observe_client_result(client.scope(), request_id, &op, &result);
+        }
+        result.map_err(fixture_mutation_error)
     }
 
     async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
@@ -613,10 +1054,33 @@ impl AuthenticatedPreparedFencedTransitionFixture {
     pub async fn start(
         scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
     ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
+        Self::start_with_authority(scopes, false).await
+    }
+
+    /// Start the sealed consumer lab with immutable fixed durable authority.
+    ///
+    /// Consumer sockets use real mTLS and every voter has a distinct file-backed
+    /// database. Raft peers remain in-process, placement explicitly allows reduced
+    /// resilience, and snapshots use `PortableVerified`. This constructor does
+    /// not qualify physical failure domains or strict fs-verity snapshots.
+    pub async fn start_fixed_durable(
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+    ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
+        Self::start_with_authority(scopes, true).await
+    }
+
+    async fn start_with_authority(
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+        fixed: bool,
+    ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
         let client_identity = SpiffeId::new(FIXTURE_CLIENT_SPIFFE)
             .expect("fixture client SPIFFE is a complete workload identity");
         let grant = SessionConsumerAuthorizationGrant::try_new(client_identity, scopes)?;
-        let cluster = ConsensusTestCluster::start(FIXTURE_VOTER_COUNT).await;
+        let cluster = if fixed {
+            ConsensusTestCluster::start_fixed_durable().await
+        } else {
+            ConsensusTestCluster::start(FIXTURE_VOTER_COUNT).await
+        };
         let roster = cluster.consumer_roster().clone();
         debug_assert_eq!(roster.voter_count(), FIXTURE_VOTER_COUNT);
         let pki = FixturePki::new();
@@ -624,6 +1088,7 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         let lose_next_fenced_transition_response = Arc::new(AtomicBool::new(false));
         let fenced_transition_status_misses_remaining = Arc::new(AtomicUsize::new(0));
         let general_consumer_counters = Arc::new(FixtureGeneralConsumerCounters::default());
+        let ordinary_cas_fault = Arc::new(FixtureOrdinaryCasFault::default());
 
         let store_indexes = (0..FIXTURE_VOTER_COUNT)
             .map(|index| (cluster.store(index).status().node_id, index))
@@ -641,6 +1106,8 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                 Arc::new(cluster.store(store_index).consumer_service()),
                 lose_next_fenced_transition_response.clone(),
                 fenced_transition_status_misses_remaining.clone(),
+                Arc::clone(&ordinary_cas_fault),
+                voters.len(),
             ));
             let (listener, address) =
                 start_fixture_listener(&pki, &roster, &grant, &authority, service.clone()).await?;
@@ -678,6 +1145,7 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             lose_next_fenced_transition_response,
             fenced_transition_status_misses_remaining,
             general_consumer_counters,
+            ordinary_cas_fault,
             listeners,
             _journal_directory: journal_directory,
             journal_path,
@@ -745,7 +1213,10 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         let general_backend = AuthenticatedPreparedFencedTransitionFixtureGeneralBackend {
             inner: Arc::new(
                 EncryptingSessionBackend::new(
-                    Arc::new(FixtureGeneralConsumerBackend::new(clients)),
+                    Arc::new(FixtureGeneralConsumerBackend::new(
+                        clients,
+                        Arc::clone(&self.ordinary_cas_fault),
+                    )),
                     Arc::clone(&provider),
                     backend_namespace.to_string(),
                 )
@@ -763,6 +1234,63 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                 journal,
             },
         })
+    }
+
+    /// Open an opaque general backend that retains the SDK's sealed payload
+    /// protection proof, for public protected selector-namespace tests.
+    ///
+    /// Unlike the accounting facade returned by `open_local_aead_pair`, this
+    /// value can enter APIs requiring `ProtectedSessionBackend`. It is the same
+    /// SDK-owned local AEAD wrapper, with the same required exact-voter readiness
+    /// activation. Its physical clients and cryptographic material stay private.
+    pub async fn open_protected_local_aead<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+    ) -> Result<
+        impl opc_session_store::ProtectedSessionBackend + Clone + 'static,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        let pair = self
+            .open_local_aead_pair(provider, backend_namespace)
+            .await?;
+        Ok(pair.general_backend.inner.as_ref().clone())
+    }
+
+    /// Hold the next ordinary authoritative update in the exact tenant/NF and
+    /// state-type scope after its real consensus success. Call only after
+    /// provisioning and the test's precise pre-CAS phase gate: creation CAS,
+    /// other record types, leases, prepared transitions, and consensus traffic
+    /// cannot consume this fault. The first matching client request privately
+    /// fixes its complete encrypted body, key, ID, and consensus scope.
+    ///
+    /// This is a lost-success/unchanged-transport-timeout case, not an injected
+    /// socket EOF. One live control per fixture prevents cross-test arming.
+    pub fn hold_next_ordinary_cas_response(
+        &self,
+        tenant_nf: SessionConsumerTenantNfScope,
+        state_type: StateType,
+    ) -> Result<AuthenticatedOrdinaryCasResponseLoss, AuthenticatedOrdinaryCasResponseLossError>
+    {
+        let mut active = self
+            .ordinary_cas_fault
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(AuthenticatedOrdinaryCasResponseLossError);
+        }
+        let gate = Arc::new(FixtureOrdinaryCasGate {
+            tenant_nf,
+            state_type,
+            state: Mutex::new(FixtureOrdinaryCasState::default()),
+            changed: tokio::sync::Notify::new(),
+        });
+        *active = Some(Arc::downgrade(&gate));
+        Ok(AuthenticatedOrdinaryCasResponseLoss { gate })
     }
 
     fn open_journal(
@@ -934,6 +1462,9 @@ impl AuthenticatedPreparedFencedTransitionFixture {
 
 impl Drop for AuthenticatedPreparedFencedTransitionFixture {
     fn drop(&mut self) {
+        if let Some(fault) = self.ordinary_cas_fault.active() {
+            fault.release_readback(false);
+        }
         for listener in &self.listeners {
             listener.abort();
         }
@@ -977,6 +1508,8 @@ struct FixtureConsumer {
     fenced_transition_calls: AtomicUsize,
     fenced_transition_status_calls: AtomicUsize,
     forced_fenced_transition_status_misses: AtomicUsize,
+    ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
+    voter: usize,
 }
 
 impl FixtureConsumer {
@@ -984,6 +1517,8 @@ impl FixtureConsumer {
         inner: Arc<dyn SessionQuorumConsumer>,
         lose_next_fenced_transition_response: Arc<AtomicBool>,
         fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
+        ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
+        voter: usize,
     ) -> Self {
         Self {
             inner,
@@ -992,6 +1527,8 @@ impl FixtureConsumer {
             fenced_transition_calls: AtomicUsize::new(0),
             fenced_transition_status_calls: AtomicUsize::new(0),
             forced_fenced_transition_status_misses: AtomicUsize::new(0),
+            ordinary_cas_fault,
+            voter,
         }
     }
 }
@@ -1003,6 +1540,12 @@ impl SessionQuorumConsumer for FixtureConsumer {
         authorization: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
+        let ordinary_fault = self.ordinary_cas_fault.active();
+        let ordinary_call = ordinary_fault
+            .as_ref()
+            .map_or(FixtureOrdinaryCasCall::Other, |gate| {
+                gate.observe_server_request(&request)
+            });
         let fenced_transition = matches!(
             request.operation(),
             opc_session_store::SessionConsumerOperation::FencedTransition { .. }
@@ -1019,6 +1562,25 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let response = self.inner.execute(authorization, request).await;
+        if let Some(gate) = ordinary_fault {
+            match ordinary_call {
+                FixtureOrdinaryCasCall::Mutation if gate.observe_committed_success(&response) => {
+                    // Keep the actual successful response below the ordinary
+                    // server boundary until its unchanged bounded deadline.
+                    // Only the production client/server can classify timeout
+                    // as OutcomeUnknown. No replacement receipt is invented.
+                    let _pending = FixtureOrdinaryCasPending {
+                        gate: &gate,
+                        readback: false,
+                    };
+                    std::future::pending::<SessionConsumerResponse>().await;
+                }
+                FixtureOrdinaryCasCall::Readback => {
+                    return gate.gate_readback(self.voter, response).await;
+                }
+                FixtureOrdinaryCasCall::Mutation | FixtureOrdinaryCasCall::Other => {}
+            }
+        }
         if fenced_transition_status
             && matches!(
                 &response,

@@ -398,6 +398,14 @@ impl<'de> serde::Deserialize<'de> for EncryptedSessionPayload {
 }
 
 impl EncryptedSessionPayload {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_for_native_read(&self) -> Self {
+        // Preserve every already decoded byte and encoding tag while giving
+        // the caller an independent zeroizing allocation. This is a copy,
+        // not another admission or a shared Arc into decoder scratch.
+        Self::from_vec_unchecked(self.as_bytes().to_vec(), self.encoding)
+    }
+
     #[cfg(test)]
     pub(crate) fn log_row_reuse_test_weak_bytes(&self) -> std::sync::Weak<Zeroizing<Vec<u8>>> {
         Arc::downgrade(&self.bytes)
