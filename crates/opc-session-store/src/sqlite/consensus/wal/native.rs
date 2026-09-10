@@ -796,6 +796,22 @@ impl Wal {
         {
             return Err(invalid_data("native snapshot generation differs"));
         }
+        #[cfg(feature = "test-control")]
+        if state.volatile_experiment.is_some() {
+            // The original snapshot worker already wrote and authenticated the
+            // fs-verity candidate. Publish its validated resident metadata here;
+            // no WAL drain, CURRENT selection or disk wait owns this mutex.
+            state
+                .native
+                .as_mut()
+                .ok_or_else(|| invalid_data("volatile snapshot owner missing"))?
+                .business
+                .set_current_snapshot(candidate.clone())?;
+            state.authority.frozen_applied = candidate.0.last_log_id;
+            volatile_experiment::snapshot_published(&mut state);
+            self.shared.ready.notify_all();
+            return Ok(());
+        }
         state.native_snapshot_pending = Some(candidate.clone());
         state.checkpoint_requested = true;
         self.shared.ready.notify_all();
@@ -1326,6 +1342,11 @@ impl Wal {
                     return Err(error);
                 }
             };
+            #[cfg(feature = "test-control")]
+            if state.volatile_experiment.is_some() {
+                volatile_experiment::dirty(&mut state);
+                self.shared.ready.notify_all();
+            }
             state.application_costs.lock_wait += lock_wait;
             state.application_costs.preflight += preflight;
             state.application_costs.native_apply += apply;

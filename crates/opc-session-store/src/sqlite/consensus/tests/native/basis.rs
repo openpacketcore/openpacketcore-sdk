@@ -678,3 +678,69 @@ fn native_basis_hard_retention_waits_without_re_admission_during_preparation() {
     );
     reopened.shutdown().unwrap();
 }
+
+#[cfg(feature = "test-control")]
+#[test]
+fn volatile_experiment_keeps_ack_apply_and_checkpoint_live_while_writer_is_blocked() {
+    let gate = Gate::new(Point::BeforeNativeGenerationAppend, 1);
+    let fixture = Fixture::with_control(Limits::default(), gate.control());
+    let initial = fenced_transition_v2_request(0xEA, 1, "volatile-independent-initial");
+    fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
+    let original_selector = selected(&fixture);
+    fixture
+        .wal
+        .enable_volatile_memory_experiment_for_test()
+        .unwrap();
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let release = Release(Arc::clone(&gate));
+    gate.entered();
+    // Cross both inherited limits with a writer physically held before I/O.
+    // No disk progress or elapsed-time assumption can explain these returns.
+    for _ in 0..1_200 {
+        fixture
+            .wal
+            .submit(Operation::Barrier)
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    let request = sdk741_component_request(Sdk741Payload::Create, 2, 0, None);
+    let entries = [fenced_transition_v2_entry(2, request.clone(), timestamp(2))];
+    fixture.parity(&entries);
+    fixture.wal.checkpoint().unwrap();
+    assert!(matches!(
+        status(&fixture.wal, &request),
+        FencedTransitionV2Status::Recorded(_)
+    ));
+    assert!(fixture
+        .wal
+        .submit(Operation::Committed(Some(log_id(99_999))))
+        .is_err());
+    let during = fixture.wal.integration_cost_snapshot().unwrap();
+    let observation = &during["volatile_experiment"];
+    assert!(observation["acknowledged_requests"].as_u64().unwrap() > 1_200);
+    assert_eq!(observation["background_captures"], 0);
+    assert_eq!(observation["foreground_background_capacity_waits"], 0);
+    assert_eq!(observation["outstanding_pre_activation_wal_requests"], 0);
+    assert_eq!(observation["resident_applied_index"], 2);
+    assert!(observation["captured_generation"].is_u64());
+    assert_eq!(selected(&fixture), original_selector);
+    drop(release);
+    until(|| {
+        let value = fixture.wal.integration_cost_snapshot().unwrap();
+        let value = &value["volatile_experiment"];
+        assert!(value["background_error"].is_null(), "{value}");
+        value["generation"] == value["persisted_generation"]
+    });
+    assert_eq!(selected(&fixture), original_selector);
+    assert!(matches!(
+        status(&fixture.wal, &request),
+        FencedTransitionV2Status::Recorded(_)
+    ));
+    fixture.wal.shutdown().unwrap();
+}

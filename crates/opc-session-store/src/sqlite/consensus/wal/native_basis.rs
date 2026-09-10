@@ -52,7 +52,7 @@ fn pointer_covers(
 }
 
 pub(super) fn needed(state: &State, disk: &Disk, limits: Limits) -> bool {
-    if state.native_basis_active || state.snapshot.is_some() {
+    if state.volatile_mode() || state.native_basis_active || state.snapshot.is_some() {
         return false;
     }
     if state.checkpoint_requested
@@ -117,6 +117,61 @@ impl Owner {
             worker: None,
             relocations: None,
         }
+    }
+
+    /// Experimental after-image persistence: no WAL cut selection, resident
+    /// relocation or foreground progress dependency. All work is detached.
+    #[cfg(feature = "test-control")]
+    pub(super) fn persist_volatile(
+        &mut self,
+        changes: crate::consensus::native::NativeChanges,
+        binding: Binding,
+        generation: u64,
+        sequence: u64,
+        control: &IoControl,
+    ) -> io::Result<u64> {
+        if self.worker.is_some() || self.relocations.is_some() {
+            return Err(invalid_data("volatile writer has an earlier basis owner"));
+        }
+        let selected = self
+            .selected
+            .as_mut()
+            .ok_or_else(|| invalid_data("volatile generation owner missing"))?;
+        let previous = selected.append.current();
+        let identity = previous.identity();
+        let epoch = identity
+            .checkpoint_epoch
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("volatile generation epoch exhausted"))?;
+        let mut cut = Sha256::new();
+        cut.update(b"OPC-volatile-experiment-unselected-after-images-v1\0");
+        cut.update(binding.digest()?);
+        cut.update(generation.to_le_bytes());
+        cut.update(sequence.to_le_bytes());
+        let delta = crate::consensus::native::generation::PreparedDelta::prepare(
+            previous,
+            &selected.version,
+            epoch,
+            sequence,
+            cut.finalize().into(),
+            changes,
+            &|| Ok(()),
+        )?;
+        if identity
+            .length
+            .checked_add(delta.payload_bytes())
+            .and_then(|bytes| bytes.checked_add(identity.block_bytes as u64))
+            .is_none_or(|bytes| bytes > volatile_experiment::MAX_GENERATION_BYTES)
+        {
+            return Err(io::Error::other(
+                "volatile background generation byte bound reached",
+            ));
+        }
+        (control.hook)(Point::BeforeNativeGenerationAppend)?;
+        let source = delta.append(&mut selected.append, &|| Ok(()))?;
+        (control.hook)(Point::AfterNativeGenerationAppend)?;
+        selected.version = delta.target_version();
+        Ok(source.identity().length)
     }
 
     pub(super) fn has_relocations(&self) -> bool {

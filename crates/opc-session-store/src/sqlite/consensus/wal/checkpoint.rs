@@ -416,6 +416,14 @@ impl Wal {
         if state.status != Status::Running {
             return Err(io::Error::other("private WAL checkpoint owner is fenced"));
         }
+        #[cfg(feature = "test-control")]
+        if state.volatile_experiment.is_some() {
+            // Diagnostic-only request: mark a new coalesced generation without
+            // claiming a selected durable basis or joining background I/O.
+            volatile_experiment::dirty(&mut state);
+            self.shared.ready.notify_all();
+            return Ok(state.checkpoint_epoch);
+        }
         let epoch = state.checkpoint_epoch;
         let native_target = if self.binding.native {
             Some(native_basis::Target::requested(&state)?)

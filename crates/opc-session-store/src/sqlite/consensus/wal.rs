@@ -542,6 +542,14 @@ pub(crate) struct Wal {
 }
 
 impl State {
+    fn volatile_mode(&self) -> bool {
+        #[cfg(feature = "test-control")]
+        if self.volatile_experiment.is_some() {
+            return true;
+        }
+        false
+    }
+
     fn committed_for_application(&self) -> Option<LogId<SessionConsensusNodeId>> {
         #[cfg(feature = "test-control")]
         if self.volatile_experiment.is_some() {
@@ -905,6 +913,10 @@ impl Wal {
         let encode = submitted.elapsed();
         let lock_started = Instant::now();
         let mut state = lock_state(&self.shared)?;
+        #[cfg(feature = "test-control")]
+        if state.volatile_experiment.is_some() {
+            return volatile_experiment::admit(self, &mut state, &operation, completion, charge);
+        }
         loop {
             while ((!self.binding.native && state.checkpoint_requested)
                 || state.snapshot.is_some()
@@ -919,23 +931,6 @@ impl Wal {
             }
             if state.status != Status::Running {
                 return Err(io::Error::other("private WAL writer is fenced"));
-            }
-            #[cfg(feature = "test-control")]
-            if checkpoint_on_retention
-                && volatile_experiment::queue_is_full(&state, &self.limits, charge)
-            {
-                // Early volatile acknowledgments can outrun the bounded
-                // background writer. Retain this original operation and its
-                // completion before projection instead of presenting temporary
-                // queue pressure to OpenRaft as a terminal storage failure.
-                let wait_started = Instant::now();
-                state = self
-                    .shared
-                    .ready
-                    .wait(state)
-                    .map_err(|_| io::Error::other("volatile WAL capacity wait poisoned"))?;
-                volatile_experiment::capacity_waited(&mut state, wait_started.elapsed());
-                continue;
             }
             let retained_capacity_exhausted = state.sequence.saturating_sub(state.base_sequence)
                 >= self.limits.history_count as u64
@@ -1009,8 +1004,6 @@ impl Wal {
         state.history_bytes += charge;
         state.outstanding += 1;
         state.outstanding_bytes += charge;
-        #[cfg(feature = "test-control")]
-        let completion = volatile_experiment::complete_admission(&mut state, completion, sequence);
         state.queue.push_back(Request {
             sequence,
             record,
@@ -1472,6 +1465,7 @@ fn write_loop_body(
         (control.hook)(Point::BeforeGroup)?;
         let mut state = lock_state(&shared)?;
         while state.queue.is_empty()
+            && !state.volatile_mode()
             && (if binding.native {
                 !basis.has_relocations()
                     && !state.native_basis_ready
@@ -1491,6 +1485,16 @@ fn write_loop_body(
                 .map_err(|_| io::Error::other("private WAL wait poisoned"))?;
         }
         ensure_readable(&state)?;
+        #[cfg(feature = "test-control")]
+        if state.volatile_experiment.is_some()
+            && state.queue.is_empty()
+            && state.outstanding == 0
+            && !state.native_basis_active
+            && !basis.has_relocations()
+        {
+            drop(state);
+            return volatile_experiment::write_loop(&shared, basis, binding, control);
+        }
         if binding.native && state.native_basis_ready {
             drop(state);
             let prepared = basis

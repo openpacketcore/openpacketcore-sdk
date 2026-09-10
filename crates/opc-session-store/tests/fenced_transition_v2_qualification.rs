@@ -12875,7 +12875,7 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
             opc_session_store::test_support::enable_volatile_memory_performance_experiment_for_test(store)
                 .expect("enable explicitly requested volatile benchmark voter");
         }
-        eprintln!("sdk-741 volatile experiment: durability=waived real_quorum=true real_apply=true background_wal=true snapshots=unchanged cold_restart_qualification=false");
+        eprintln!("sdk-741 volatile experiment: durability=waived real_quorum=true real_apply=true background_wal=false background_coalesced_native_generations=true snapshots=unchanged cold_restart_qualification=false");
     }
     let ingress_store = &stores[ready_leader(&stores).await];
     let provider = sealing_provider();
