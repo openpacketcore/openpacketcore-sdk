@@ -14382,3 +14382,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         RELEASE_EVIDENCE_EXISTING_ARTIFACT_VALIDATION_RECIPE,
     );
 }
+
+#[cfg(target_os = "linux")]
+#[path = "fenced_transition_v2_qualification/volatile_scale.rs"]
+mod volatile_scale;

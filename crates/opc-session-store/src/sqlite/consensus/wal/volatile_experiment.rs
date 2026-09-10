@@ -7,14 +7,17 @@
 //! four times per second. The journal/scratch share the unchanged process-wide
 //! 128 MiB reservation; no request-count queue exists. Resident rows retain the
 //! native table/count/value bounds and are never evicted by this experiment.
-//! Background generations are capped at 2 GiB per voter. They are verified
+//! Background generations are capped at 8 GiB per voter (below the original
+//! per-voter database ceiling), covering the complete 1.01M workload. They are verified
 //! after-image bytes, deliberately NOT a selected production recovery cut.
 //! Original fs-verity snapshot creation remains asynchronous and unchanged.
 
 use super::*;
 
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(250);
-pub(super) const MAX_GENERATION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// The bounded measurement produced about437 MiB per98,496 outcomes. Eight
+// GiB provides finite space for the original1.01M workload and its preload.
+pub(super) const MAX_GENERATION_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 pub(super) struct Observation {
     activation_sequence: u64,
