@@ -10,14 +10,18 @@
 //! This models volatile acknowledgments with background persistence; it is
 //! not a claim that all file/lock dependencies have disappeared.
 
-use super::{invalid_data, lock_state, Completion, State, Status, Wal};
+use super::{invalid_data, lock_state, Completion, Limits, State, Status, Wal};
 use std::io;
+use std::time::Duration;
 
 pub(super) struct Observation {
     activation_sequence: u64,
     acknowledged_requests: u64,
     maximum_outstanding_requests: usize,
     maximum_outstanding_bytes: usize,
+    capacity_waits: u64,
+    capacity_wait: Duration,
+    maximum_capacity_wait: Duration,
 }
 
 impl Wal {
@@ -36,8 +40,26 @@ impl Wal {
             acknowledged_requests: 0,
             maximum_outstanding_requests: state.outstanding,
             maximum_outstanding_bytes: state.outstanding_bytes,
+            capacity_waits: 0,
+            capacity_wait: Duration::ZERO,
+            maximum_capacity_wait: Duration::ZERO,
         });
         Ok(())
+    }
+}
+
+pub(super) fn queue_is_full(state: &State, limits: &Limits, charge: usize) -> bool {
+    state.volatile_experiment.is_some()
+        && (state.outstanding >= limits.outstanding
+            || (state.outstanding != 0
+                && state.outstanding_bytes.saturating_add(charge) > limits.outstanding_bytes))
+}
+
+pub(super) fn capacity_waited(state: &mut State, elapsed: Duration) {
+    if let Some(observation) = &mut state.volatile_experiment {
+        observation.capacity_waits += 1;
+        observation.capacity_wait += elapsed;
+        observation.maximum_capacity_wait = observation.maximum_capacity_wait.max(elapsed);
     }
 }
 
@@ -76,6 +98,9 @@ pub(super) fn observe(state: &State, mut value: serde_json::Value) -> serde_json
         "outstanding_bytes": state.outstanding_bytes,
         "maximum_outstanding_requests": observation.maximum_outstanding_requests,
         "maximum_outstanding_bytes": observation.maximum_outstanding_bytes,
+        "background_capacity_waits": observation.capacity_waits,
+        "background_capacity_wait_us": observation.capacity_wait.as_micros(),
+        "background_capacity_wait_maximum_us": observation.maximum_capacity_wait.as_micros(),
         "resident_committed_index": state.native.as_ref().and_then(|native| native.log.committed).map(|id| id.index),
         "durable_committed_index": state.durable_committed.map(|id| id.index),
         "resident_applied_index": state.native.as_ref().and_then(|native| native.business.applied()).map(|id| id.index),

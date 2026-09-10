@@ -920,6 +920,23 @@ impl Wal {
             if state.status != Status::Running {
                 return Err(io::Error::other("private WAL writer is fenced"));
             }
+            #[cfg(feature = "test-control")]
+            if checkpoint_on_retention
+                && volatile_experiment::queue_is_full(&state, &self.limits, charge)
+            {
+                // Early volatile acknowledgments can outrun the bounded
+                // background writer. Retain this original operation and its
+                // completion before projection instead of presenting temporary
+                // queue pressure to OpenRaft as a terminal storage failure.
+                let wait_started = Instant::now();
+                state = self
+                    .shared
+                    .ready
+                    .wait(state)
+                    .map_err(|_| io::Error::other("volatile WAL capacity wait poisoned"))?;
+                volatile_experiment::capacity_waited(&mut state, wait_started.elapsed());
+                continue;
+            }
             let retained_capacity_exhausted = state.sequence.saturating_sub(state.base_sequence)
                 >= self.limits.history_count as u64
                 || state
@@ -1777,6 +1794,10 @@ fn write_loop_body(
         let callback_delay = callback_started.elapsed();
         state.outstanding -= count;
         state.outstanding_bytes -= charge;
+        #[cfg(feature = "test-control")]
+        if state.volatile_experiment.is_some() {
+            shared.ready.notify_all();
+        }
         let observation = FlushObservation {
             first,
             last,
