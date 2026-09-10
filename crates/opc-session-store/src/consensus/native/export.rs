@@ -6,10 +6,27 @@ use super::*;
 use crate::sqlite::{consensus as sql, ops};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
-fn db(error: rusqlite::Error) -> io::Error {
-    io::Error::other(error)
+// Keep diagnostic output limited to fixed source locations and error codes;
+// SQLite messages and StoreError payloads may contain session data.
+macro_rules! db {
+    ($error:expr) => {{
+        let error: rusqlite::Error = $error;
+        #[cfg(feature = "test-control")]
+        eprintln!(
+            "native_snapshot_export_sqlite_failure line={} variant={:?} extended_code={:?}",
+            line!(),
+            std::mem::discriminant(&error),
+            error.sqlite_error().map(|code| code.extended_code),
+        );
+        io::Error::other(error)
+    }};
 }
 fn store(error: StoreError) -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "native_snapshot_export_store_failure variant={:?}",
+        std::mem::discriminant(&error),
+    );
     io::Error::other(error)
 }
 fn json(value: &impl Serialize) -> io::Result<Vec<u8>> {
@@ -111,8 +128,10 @@ impl NativeStorage {
         }
         let epoch = i64::try_from(state.identity.configuration_epoch().get())
             .map_err(|_| invalid("native export configuration epoch exceeds SQLite range"))?;
-        conn.pragma_update(None, "query_only", false).map_err(db)?;
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db)?;
+        conn.pragma_update(None, "query_only", false)
+            .map_err(|error| db!(error))?;
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(|error| db!(error))?;
         for (key, value) in &state.keys {
             check()?;
             if let Some(record) = &value.record {
@@ -122,19 +141,19 @@ impl NativeStorage {
                 ops::insert_or_replace_fence_sync(&tx, key, value.fence).map_err(store)?;
             }
             if let Some(lease) = &value.lease {
-                tx.execute("INSERT INTO leases (tenant,nf_kind,key_type,stable_id,active,credential_id,owner,fence,expires_at_unix_ms,guard_expires_at,acquired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![key.tenant.as_str(),key.nf_kind.as_str(),key.key_type.to_string(),key.stable_id.as_ref(),lease.active,lease.credential_id,lease.owner.as_str(),lease.fence.get(),lease.expires_at_unix_ms,ops::format_rfc3339_normalized(lease.guard_expires_at),lease.acquired_at.map(ops::format_rfc3339_normalized)]).map_err(db)?;
+                tx.execute("INSERT INTO leases (tenant,nf_kind,key_type,stable_id,active,credential_id,owner,fence,expires_at_unix_ms,guard_expires_at,acquired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![key.tenant.as_str(),key.nf_kind.as_str(),key.key_type.to_string(),key.stable_id.as_ref(),lease.active,lease.credential_id,lease.owner.as_str(),lease.fence.get(),lease.expires_at_unix_ms,ops::format_rfc3339_normalized(lease.guard_expires_at),lease.acquired_at.map(ops::format_rfc3339_normalized)]).map_err(|error| db!(error))?;
             }
         }
         tx.execute(
             "UPDATE lease_globals SET val = ?1 WHERE key = 'next_fence'",
             [frontiers.next_fence],
         )
-        .map_err(db)?;
+        .map_err(|error| db!(error))?;
         tx.execute(
             "UPDATE lease_globals SET val = ?1 WHERE key = 'next_credential_id'",
             [frontiers.next_credential],
         )
-        .map_err(db)?;
+        .map_err(|error| db!(error))?;
         if let Some(origin) = &state.snapshot_origin {
             origin.incarnation().rotate_sync(&tx).map_err(store)?;
         }
@@ -142,9 +161,9 @@ impl NativeStorage {
             "UPDATE restore_scan_state SET revision = ?1 WHERE singleton = 1",
             [frontiers.restore_revision],
         )
-        .map_err(db)?;
-        tx.execute("UPDATE consensus_machine SET application_sequence=?1,last_digest=?2,logical_time=?3,watch_sequence=?4 WHERE singleton=1 AND configuration_epoch=?5", params![frontiers.sequence,frontiers.digest.as_bytes().as_slice(),frontiers.logical_time.map(ops::format_rfc3339_normalized),frontiers.watch_sequence,epoch]).map_err(db)?;
-        tx.execute("INSERT OR REPLACE INTO consensus_membership (singleton,configuration_epoch,membership_json) VALUES (1,?1,?2)", params![epoch,json(&frontiers.membership)?]).map_err(db)?;
+        .map_err(|error| db!(error))?;
+        tx.execute("UPDATE consensus_machine SET application_sequence=?1,last_digest=?2,logical_time=?3,watch_sequence=?4 WHERE singleton=1 AND configuration_epoch=?5", params![frontiers.sequence,frontiers.digest.as_bytes().as_slice(),frontiers.logical_time.map(ops::format_rfc3339_normalized),frontiers.watch_sequence,epoch]).map_err(|error| db!(error))?;
+        tx.execute("INSERT OR REPLACE INTO consensus_membership (singleton,configuration_epoch,membership_json) VALUES (1,?1,?2)", params![epoch,json(&frontiers.membership)?]).map_err(|error| db!(error))?;
         let committed = if purpose == Purpose::InstallBase {
             self.log.committed
         } else {
@@ -162,7 +181,7 @@ impl NativeStorage {
             ("consensus_purged", purged),
         ] {
             if let Some(pointer) = pointer {
-                tx.execute(&format!("INSERT OR REPLACE INTO {table} (singleton,configuration_epoch,term,log_index,log_id_json) VALUES (1,?1,?2,?3,?4)"),params![epoch,pointer.leader_id.term,pointer.index,json(&pointer)?]).map_err(db)?;
+                tx.execute(&format!("INSERT OR REPLACE INTO {table} (singleton,configuration_epoch,term,log_index,log_id_json) VALUES (1,?1,?2,?3,?4)"),params![epoch,pointer.leader_id.term,pointer.index,json(&pointer)?]).map_err(|error| db!(error))?;
             }
         }
         for entry in self.log.entries.values().filter(|entry| {
@@ -173,15 +192,15 @@ impl NativeStorage {
         }) {
             check()?;
             let bytes = entry.read_bytes(state.identity, &state.members, check)?;
-            tx.execute("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)",params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(db)?;
+            tx.execute("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)",params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(|error| db!(error))?;
         }
         if preserve_origin {
             if let Some((meta, name, checksum, length)) = &frontiers.current_snapshot {
-                tx.execute("INSERT INTO consensus_snapshot (singleton,configuration_epoch,meta_json,file_name,checksum,byte_length) VALUES (1,?1,?2,?3,?4,?5)",params![epoch,json(meta)?,name,checksum.as_slice(),length]).map_err(db)?;
+                tx.execute("INSERT INTO consensus_snapshot (singleton,configuration_epoch,meta_json,file_name,checksum,byte_length) VALUES (1,?1,?2,?3,?4,?5)",params![epoch,json(meta)?,name,checksum.as_slice(),length]).map_err(|error| db!(error))?;
             }
         }
         if let Some(vote) = self.log.vote {
-            tx.execute("INSERT OR REPLACE INTO consensus_vote (singleton,configuration_epoch,term,node_id,vote_json) VALUES (1,?1,?2,?3,?4)",params![epoch,vote.leader_id.term,vote.leader_id.voted_for().map(|node| node.get()),json(&vote)?]).map_err(db)?;
+            tx.execute("INSERT OR REPLACE INTO consensus_vote (singleton,configuration_epoch,term,node_id,vote_json) VALUES (1,?1,?2,?3,?4)",params![epoch,vote.leader_id.term,vote.leader_id.voted_for().map(|node| node.get()),json(&vote)?]).map_err(|error| db!(error))?;
         }
         if let Some(activation) = &frontiers.v1_activation {
             sql::activate_fenced_transition_scope_with_voter_digest_sync(
@@ -202,7 +221,7 @@ impl NativeStorage {
                 crate::consensus::verified_snapshot::VerificationMemory::reserve(encoding_bytes)?;
             match &**receipt {
                 NativeGenericReceipt::Ordinary(receipt) => {
-                    tx.execute("INSERT INTO consensus_request_outcomes (request_id,configuration_epoch,payload_digest,response_json) VALUES (?1,?2,?3,?4)",params![id.as_bytes().as_slice(),epoch,receipt.payload_digest.as_slice(),json(&receipt.response)?]).map_err(db)?;
+                    tx.execute("INSERT INTO consensus_request_outcomes (request_id,configuration_epoch,payload_digest,response_json) VALUES (?1,?2,?3,?4)",params![id.as_bytes().as_slice(),epoch,receipt.payload_digest.as_slice(),json(&receipt.response)?]).map_err(|error| db!(error))?;
                 }
                 NativeGenericReceipt::FencedV1(receipt) => {
                     let until = ops::format_rfc3339_normalized(receipt.retained_until);
@@ -220,7 +239,7 @@ impl NativeStorage {
                             sql::fenced_transition_receipt_response_digest(binding, response)
                         })
                         .transpose()?;
-                    tx.execute("INSERT INTO consensus_fenced_transition_receipts (request_id,configuration_epoch,payload_digest,retained_until,binding_digest,response_json,response_digest) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![id.as_bytes().as_slice(),epoch,receipt.payload_digest.as_slice(),until,binding.as_slice(),encoded,response_digest.as_ref().map(|digest| digest.as_slice())]).map_err(db)?;
+                    tx.execute("INSERT INTO consensus_fenced_transition_receipts (request_id,configuration_epoch,payload_digest,retained_until,binding_digest,response_json,response_digest) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![id.as_bytes().as_slice(),epoch,receipt.payload_digest.as_slice(),until,binding.as_slice(),encoded,response_digest.as_ref().map(|digest| digest.as_slice())]).map_err(|error| db!(error))?;
                 }
             }
         }
@@ -241,9 +260,9 @@ impl NativeStorage {
                 (FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - history.reclaim_remaining()) as u64
             });
             let remaining = reclaim.map(|_| history.reclaim_remaining() as u64);
-            tx.execute("UPDATE consensus_fenced_transition_v2_history SET active_epoch=?1,retired_through_epoch=?2,generation=?3,current_bound_count=?4,reclaimed_entries=?5,reclaim_epoch=?6,reclaim_cursor_ordinal=?7,reclaim_remaining=?8 WHERE singleton=1",params![history.active_epoch().ok_or_else(|| invalid("native cold export active epoch missing"))?.get(),history.retired_through().map_or(0,|epoch| epoch.get()),history.generation(),history.bound_entries() as u64,history.reclaimed_entries(),reclaim,cursor,remaining]).map_err(db)?;
+            tx.execute("UPDATE consensus_fenced_transition_v2_history SET active_epoch=?1,retired_through_epoch=?2,generation=?3,current_bound_count=?4,reclaimed_entries=?5,reclaim_epoch=?6,reclaim_cursor_ordinal=?7,reclaim_remaining=?8 WHERE singleton=1",params![history.active_epoch().ok_or_else(|| invalid("native cold export active epoch missing"))?.get(),history.retired_through().map_or(0,|epoch| epoch.get()),history.generation(),history.bound_entries() as u64,history.reclaimed_entries(),reclaim,cursor,remaining]).map_err(|error| db!(error))?;
             let ordered = OrderedReceipts::new(state, check)?;
-            let mut insert = tx.prepare("INSERT INTO consensus_fenced_transition_v2_receipts (request_id,history_epoch,ordinal,configuration_epoch,payload_digest,retained_until,binding_digest,response_json,response_digest) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)").map_err(db)?;
+            let mut insert = tx.prepare("INSERT INTO consensus_fenced_transition_v2_receipts (request_id,history_epoch,ordinal,configuration_epoch,payload_digest,retained_until,binding_digest,response_json,response_digest) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)").map_err(|error| db!(error))?;
             for &(id, receipt) in &ordered.rows {
                 check()?;
                 // This exporter owns an immutable snapshot capture outside
@@ -295,7 +314,7 @@ impl NativeStorage {
                         encoded,
                         response_digest.as_ref().map(|digest| digest.as_slice())
                     ])
-                    .map_err(db)?;
+                    .map_err(|error| db!(error))?;
             }
         }
         for entry in &state.notifications {
@@ -312,7 +331,7 @@ impl NativeStorage {
                 })?;
             let _encoding_memory =
                 crate::consensus::verified_snapshot::VerificationMemory::reserve(encoding_bytes)?;
-            tx.execute("INSERT INTO session_replication_log (sequence,tx_id,entry_json,timestamp) VALUES (?1,?2,?3,?4)",params![entry.sequence,entry.tx_id.as_str(),serde_json::to_string(entry).map_err(io::Error::other)?,ops::format_rfc3339_normalized(entry.timestamp)]).map_err(db)?;
+            tx.execute("INSERT INTO session_replication_log (sequence,tx_id,entry_json,timestamp) VALUES (?1,?2,?3,?4)",params![entry.sequence,entry.tx_id.as_str(),serde_json::to_string(entry).map_err(io::Error::other)?,ops::format_rfc3339_normalized(entry.timestamp)]).map_err(|error| db!(error))?;
         }
         if frontiers.roster_v1_namespace {
             sql::roster_snapshot::activate_v1(&tx)?;
@@ -353,8 +372,9 @@ impl NativeStorage {
         sql::validate_protected_roster_recovery_state_sync(&tx, state.identity)
             .map_err(|_| invalid("native snapshot exported roster recovery validation failed"))?;
         check()?;
-        tx.commit().map_err(db)?;
-        conn.pragma_update(None, "query_only", true).map_err(db)?;
+        tx.commit().map_err(|error| db!(error))?;
+        conn.pragma_update(None, "query_only", true)
+            .map_err(|error| db!(error))?;
         check()
     }
 }

@@ -20794,11 +20794,24 @@ pub(crate) fn checked_positive_u64(value: i64) -> io::Result<u64> {
     Ok(value)
 }
 
+#[cfg_attr(feature = "test-control", track_caller)]
 pub(crate) fn invalid_data(message: &'static str) -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "consensus_validation_failure source={} reason={}",
+        std::panic::Location::caller(),
+        message,
+    );
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn db_error(_error: rusqlite::Error) -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "session_consensus_sqlite_failure variant={:?} extended_code={:?}",
+        std::mem::discriminant(&_error),
+        _error.sqlite_error().map(|code| code.extended_code),
+    );
     io::Error::other("session consensus SQLite operation failed")
 }
 

@@ -13,6 +13,12 @@ enum ScalePersistence {
     Async,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScaleWorkload {
+    Original,
+    PreloadDiagnostic,
+}
+
 impl ScalePersistence {
     fn label(self) -> &'static str {
         match self {
@@ -111,7 +117,11 @@ async fn original_workload_preserves_rates_tails_and_limits() {
         Some(std::ffi::OsStr::new("1")),
         "original volatile scale requires explicit experimental activation",
     );
-    run_original_scale(ScalePersistence::VolatileExperiment).await;
+    run_original_scale(
+        ScalePersistence::VolatileExperiment,
+        ScaleWorkload::Original,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -123,11 +133,23 @@ async fn public_async_original_workload_preserves_rates_tails_and_limits() {
         "public Async scale requires its explicit qualification controller",
     );
     assert!(std::env::var_os("OPC_SESSION_VOLATILE_PERFORMANCE_EXPERIMENT").is_none());
-    run_original_scale(ScalePersistence::Async).await;
+    run_original_scale(ScalePersistence::Async, ScaleWorkload::Original).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "public Async bounded reproduction of the original 50,000-operation preload"]
+async fn public_async_original_preload_diagnostic() {
+    assert_eq!(
+        std::env::var_os("OPC_SESSION_ASYNC_PRELOAD_DIAGNOSTIC").as_deref(),
+        Some(std::ffi::OsStr::new("required")),
+        "preload diagnosis requires its explicit controller",
+    );
+    assert!(std::env::var_os("OPC_SESSION_VOLATILE_PERFORMANCE_EXPERIMENT").is_none());
+    run_original_scale(ScalePersistence::Async, ScaleWorkload::PreloadDiagnostic).await;
 }
 
 #[allow(clippy::assertions_on_constants)]
-async fn run_original_scale(persistence: ScalePersistence) {
+async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorkload) {
     let mode_label = persistence.label();
     let build_profile = require_release_qualification_profile();
     let quiet_host_monitor =
@@ -193,6 +215,33 @@ async fn run_original_scale(persistence: ScalePersistence) {
     let production_maintenance_counters = ProductionMaintenanceCounters::default();
     let matched_workload_outcomes = Arc::new(AtomicU64::new(0));
     let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+    // Observe only after an original operation has failed. These scalar
+    // diagnostics neither dispatch another mutation nor extend its deadline.
+    let report_preload_failure = |stage: &str, chunk_start: usize, chunk_end: usize| {
+        eprintln!(
+            "sdk-741 {mode_label} original scale preload failure: {}",
+            serde_json::json!({
+                "mode": persistence.evidence_mode(),
+                "workload": format!("{workload:?}"),
+                "phase": "preload", "stage": stage,
+                "chunk_start": chunk_start, "chunk_end_exclusive": chunk_end,
+                "total_exact_outcomes": matched_workload_outcomes.load(Ordering::Relaxed),
+                "elapsed_ms": started.elapsed().as_millis(),
+                "effect_counters": effect_counters.snapshot(),
+                "read_backend_unavailable_retries": transient_retries.load(Ordering::Relaxed),
+                "voter_status": stores.iter().map(|store| format!("{:?}", store.status())).collect::<Vec<_>>(),
+                "voter_diagnostics": stores.iter().map(|store| format!("{:?}", store.diagnostic_snapshot())).collect::<Vec<_>>(),
+                "voter_wal_costs": stores.iter().map(|store| {
+                    match opc_session_store::test_support::consensus_local_wal_costs_for_test(store) {
+                        Ok(costs) => serde_json::json!(costs),
+                        Err(_) => serde_json::json!({"observation_unavailable": true}),
+                    }
+                }).collect::<Vec<_>>(),
+                "voter_persistence": voter_persistence_observations(&stores),
+                "peak_rss_kib": process_peak_rss_kib(),
+            })
+        );
+    };
 
     assert_eq!(
         QUALIFICATION_RELEASE_TRANSITIONS, 1_010_000,
@@ -222,6 +271,7 @@ async fn run_original_scale(persistence: ScalePersistence) {
         ingress_store.observe_fenced_transition(&first_key)
     })
     .await
+    .inspect_err(|_| report_preload_failure("singleton_fence_observation", 0, 1))
     .expect("singleton activation fence observation");
     let first_request = create_request(
         0,
@@ -238,6 +288,7 @@ async fn run_original_scale(persistence: ScalePersistence) {
         &effect_counters,
     )
     .await
+    .inspect_err(|failure| report_preload_failure(failure.stage.as_str(), 0, 1))
     .expect("singleton V2 activation effect must converge")
     .into_iter()
     .next()
@@ -256,6 +307,9 @@ async fn run_original_scale(persistence: ScalePersistence) {
                 ingress_store.observe_fenced_transition(&session_key)
             })
             .await
+            .inspect_err(|_| {
+                report_preload_failure("preload_fence_observation", chunk_start, chunk_end)
+            })
             .expect("preload batch fence observation");
             requests.push(
                 create_request(
@@ -275,6 +329,9 @@ async fn run_original_scale(persistence: ScalePersistence) {
             &effect_counters,
         )
         .await
+        .inspect_err(|failure| {
+            report_preload_failure(failure.stage.as_str(), chunk_start, chunk_end)
+        })
         .expect("preload bounded V2 batch effect must converge");
         assert_eq!(outcomes.len(), requests.len());
         for (request, outcome) in requests.into_iter().zip(outcomes) {
@@ -283,8 +340,56 @@ async fn run_original_scale(persistence: ScalePersistence) {
             matched_workload_outcomes.fetch_add(1, Ordering::Relaxed);
             sessions.push((request, outcome));
         }
+        if workload == ScaleWorkload::PreloadDiagnostic && chunk_start / 4096 != chunk_end / 4096 {
+            eprintln!(
+                "sdk-741 public async preload diagnostic progress: {}",
+                serde_json::json!({
+                    "total_exact_outcomes": matched_workload_outcomes.load(Ordering::Relaxed),
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "voter_persistence": voter_persistence_observations(&stores),
+                })
+            );
+        }
     }
     assert_eq!(sessions.len(), QUALIFICATION_SESSIONS);
+    if workload == ScaleWorkload::PreloadDiagnostic {
+        assert_eq!(
+            matched_workload_outcomes.load(Ordering::Relaxed),
+            QUALIFICATION_SESSIONS as u64,
+        );
+        eprintln!("sdk-741 public async preload diagnostic: all {QUALIFICATION_SESSIONS} exact preload results matched; beginning owned shutdown");
+        let persistence_observations = voter_persistence_observations(&stores);
+        let costs = volatile_voter_costs(&stores);
+        let effect_snapshot = effect_counters.snapshot();
+        let elapsed_ms = started.elapsed().as_millis();
+        shutdown_fixed_cluster(&stores, &peer_slots).await;
+        drop(stores);
+        drop(peer_slots);
+        let quiet_host = quiet_host_monitor
+            .finish()
+            .expect("original preload diagnostic quiet-host interval");
+        eprintln!(
+            "sdk-741 public async preload diagnostic summary: {}",
+            serde_json::json!({
+                "mode": "public_async_original_preload_diagnostic_not_performance_qualification",
+                "total_exact_outcomes": matched_workload_outcomes.load(Ordering::Relaxed),
+                "preload_operations": QUALIFICATION_SESSIONS,
+                "batch_deadline_ms": QUALIFICATION_RELEASE_BATCH_DEADLINE.as_millis(),
+                "preload_elapsed_ms": elapsed_ms,
+                "effect_counters": effect_snapshot,
+                "read_backend_unavailable_retries": transient_retries.load(Ordering::Relaxed),
+                "voter_persistence_before_shutdown": persistence_observations,
+                "voter_wal_costs_before_shutdown": costs,
+                "peak_rss_kib": process_peak_rss_kib(), "quiet_host": quiet_host,
+                "performance_qualified": false, "cold_restart_qualification": false,
+            })
+        );
+        assert_eq!(transient_retries.load(Ordering::Relaxed), 0);
+        assert_eq!(effect_snapshot.not_transmitted_retries, 0);
+        assert_eq!(effect_snapshot.outcome_unknown_batches, 0);
+        assert_eq!(effect_snapshot.resolved_after_deadline, 0);
+        return;
+    }
     let mut representatives = vec![sessions[0].clone()];
     let mut active_epoch = first_epoch;
     let mut active_entries = QUALIFICATION_SESSIONS;

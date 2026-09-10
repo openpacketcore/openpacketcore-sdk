@@ -393,7 +393,16 @@ struct Log {
     payload: Payload,
 }
 
+#[cfg(test)]
 pub(super) fn log_scratch(bytes: &[u8]) -> io::Result<usize> {
+    log_scratch_checked(bytes, &|| Ok(()))
+}
+
+pub(super) fn log_scratch_checked(
+    bytes: &[u8],
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<usize> {
+    check()?;
     if bytes.is_empty()
         || bytes.len() > crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES
     {
@@ -403,12 +412,13 @@ pub(super) fn log_scratch(bytes: &[u8]) -> io::Result<usize> {
         // serde_json's escaped-string scratch is the only growable preflight
         // buffer. Charge its old/new Vec growth before creating the parser.
         // IgnoredAny skips arbitrary legacy metadata without retaining it.
-        let _memory = VerificationMemory::reserve(
+        let _memory = scratch::LogMemory::reserve(
             bytes
                 .len()
                 .checked_mul(3)
                 .and_then(|bytes| bytes.checked_add(METADATA))
                 .ok_or_else(|| invalid("native generation JSON preflight overflow"))?,
+            check,
         )?;
         let mut decoder = serde_json::Deserializer::from_slice(bytes);
         let log = Log::deserialize(&mut decoder)

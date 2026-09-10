@@ -444,7 +444,14 @@ struct NativeDelta<'a> {
     notifications: Vec<ReplicationEntry>,
 }
 
+#[cfg_attr(feature = "test-control", track_caller)]
 fn invalid(message: &'static str) -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "native_validation_failure source={} reason={}",
+        std::panic::Location::caller(),
+        message,
+    );
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 

@@ -1294,6 +1294,8 @@ where
             }
         };
 
+        let mut not_found_slots = 0usize;
+        let mut backend_unavailable_slots = 0usize;
         for (index, request, observation) in observations {
             match observation {
                 Ok(FencedTransitionV2Status::Recorded(recorded)) => {
@@ -1314,8 +1316,8 @@ where
                     }
                     resolved[index] = Some(recorded);
                 }
-                Ok(FencedTransitionV2Status::NotFound) | Err(StoreError::BackendUnavailable(_)) => {
-                }
+                Ok(FencedTransitionV2Status::NotFound) => not_found_slots += 1,
+                Err(StoreError::BackendUnavailable(_)) => backend_unavailable_slots += 1,
                 Ok(FencedTransitionV2Status::RequestConflict) => {
                     resolved[index] = Some(Err(StoreError::FencedTransitionRequestConflict));
                 }
@@ -1349,6 +1351,12 @@ where
                 .collect());
         }
         if round == QUALIFICATION_TRANSIENT_RETRY_LIMIT {
+            eprintln!(
+                "sdk-741 exact status resolution failed: rounds={} request_slots={} recorded_slots={} final_not_found_slots={not_found_slots} final_backend_unavailable_slots={backend_unavailable_slots}",
+                round + 1,
+                requests.len(),
+                resolved.iter().filter(|result| result.is_some()).count(),
+            );
             return Err(ReleaseBatchFailure {
                 stage: ReleaseBatchFailureStage::StatusUnresolved,
             });

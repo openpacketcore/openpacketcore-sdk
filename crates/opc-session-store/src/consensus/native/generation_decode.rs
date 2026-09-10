@@ -664,8 +664,8 @@ pub(in crate::consensus::native) fn inspect_log(
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<facts::Row<facts::Log>> {
     check()?;
-    let bytes_to_reserve = json::log_scratch(bytes)?;
-    let _memory = VerificationMemory::reserve(bytes_to_reserve)?;
+    let bytes_to_reserve = json::log_scratch_checked(bytes, check)?;
+    let _memory = scratch::LogMemory::reserve(bytes_to_reserve, check)?;
     let row = crate::sqlite::consensus::decode_consensus_log_entry(bytes)?;
     if row.log_id.index != index {
         return Err(invalid("native generation log index differs"));
@@ -715,8 +715,8 @@ pub(in crate::consensus::native) fn owned_log(
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<OwnedLog> {
     check()?;
-    let scratch = json::log_scratch(bytes)?;
-    let mut memory = VerificationMemory::reserve(scratch)?;
+    let scratch = json::log_scratch_checked(bytes, check)?;
+    let mut memory = scratch::LogMemory::reserve(scratch, check)?;
     let decoded = crate::sqlite::consensus::decode_consensus_log_entry(bytes)?;
     if decoded.log_id.index != index {
         return Err(invalid("native owned log index differs"));
@@ -733,7 +733,7 @@ pub(in crate::consensus::native) fn owned_log(
     memory.shrink_to(retained)?;
     Ok(OwnedLog {
         entry,
-        _memory: memory,
+        _memory: memory.into_memory(),
     })
 }
 

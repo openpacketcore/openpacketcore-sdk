@@ -772,6 +772,14 @@ impl Wal {
             capture.storage.business.membership(),
         );
         let conn = self.native_detached_at(SessionStorageFailureStage::SnapshotExport, || {
+            #[cfg(feature = "test-control")]
+            let export_step = std::cell::Cell::new("before_capture_read");
+            macro_rules! export_step {
+                ($step:literal) => {
+                    #[cfg(feature = "test-control")]
+                    export_step.set($step);
+                };
+            }
             let check = || {
                 {
                     let state = lock_state(&self.shared)?;
@@ -786,12 +794,15 @@ impl Wal {
                 (self.control.hook)(Point::BeforeNativeSnapshotRead)?;
                 check()?;
                 let conn = if let Some(destination) = destination {
+                    export_step!("open_destination");
                     destination.verify_linked_identity()?;
                     let mut conn = super::super::open_pinned_snapshot_database(destination)?;
+                    export_step!("copy_cold_basis");
                     copy_cold_basis(&self.directory, self.binding, &mut conn)?;
                     // Backup can copy the template's journal/page settings.
                     // Restore the original bounded staging policy before the
                     // first receipt insertion into this exact owned inode.
+                    export_step!("restore_destination_policy");
                     conn.pragma_update(None, "query_only", false)
                         .map_err(db_error)?;
                     super::super::disable_snapshot_database_journal_sync(&conn)?;
@@ -799,8 +810,10 @@ impl Wal {
                     super::super::verify_pinned_snapshot_descriptor(destination, &conn)?;
                     conn
                 } else {
+                    export_step!("open_memory_basis");
                     cold_basis(&self.directory, self.binding)?
                 };
+                export_step!("export_captured_rows");
                 if install_base {
                     capture
                         .storage
@@ -811,10 +824,12 @@ impl Wal {
                         .export_cold_snapshot_checked(&conn, &check)?;
                 }
                 if let Some(destination) = destination {
+                    export_step!("verify_completed_destination");
                     super::super::snapshot_database_extent_sync(&conn)?;
                     super::super::verify_pinned_snapshot_descriptor(destination, &conn)?;
                     destination.verify_linked_identity()?;
                 }
+                export_step!("final_owner_check");
                 check()?;
                 Ok(conn)
             };
@@ -827,7 +842,27 @@ impl Wal {
                 {
                     Ok(None)
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    #[cfg(feature = "test-control")]
+                    {
+                        let cause = error.get_ref();
+                        let class = if cause.is_some_and(|cause| cause.is::<rusqlite::Error>()) {
+                            "sqlite"
+                        } else if cause.is_some_and(|cause| cause.is::<crate::StoreError>()) {
+                            "store"
+                        } else if cause.is_some_and(|cause| cause.is::<serde_json::Error>()) {
+                            "json"
+                        } else {
+                            "io_or_fixed_message"
+                        };
+                        eprintln!(
+                            "native_snapshot_export_failure step={} kind={:?} os_error={:?} cause_class={} applied={:?}",
+                            export_step.get(), error.kind(), error.raw_os_error(), class,
+                            captured_cut.0.map(|id| id.index),
+                        );
+                    }
+                    Err(error)
+                }
             }
         })?;
         let mut state = lock_state(&self.shared)?;

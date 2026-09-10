@@ -32,7 +32,13 @@ const PAGE_BLOCKS: usize = 256;
 const INDEX_PAGES: usize = MAX_BLOCKS / PAGE_BLOCKS;
 const ARC_HEADER: usize = 2 * size_of::<usize>();
 
+#[cfg_attr(feature = "test-control", track_caller)]
 fn invalid() -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "native_prefix_validation_failure source={}",
+        std::panic::Location::caller()
+    );
     io::Error::new(
         io::ErrorKind::InvalidData,
         "native prefix integrity check failed",

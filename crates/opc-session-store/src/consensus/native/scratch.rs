@@ -9,6 +9,10 @@ use crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS;
 use crate::consensus::verified_snapshot::VerificationMemory;
 use std::mem::size_of;
 
+#[path = "scratch_admission.rs"]
+mod admission;
+pub(super) use admission::LogMemory;
+
 // Per closed V2 request shape, 128 key slots cover all nested object fields.
 // Each 512-byte slot covers a decoded field name and even a separate B-tree
 // node; the traversal retains only keys of currently open maps. This also
@@ -301,10 +305,10 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
     add(size_of::<generation::decode::OwnedLog>(), owned)
 }
 
-fn run_reserved(
+fn run_reserved<M>(
     bytes: usize,
     check: &impl Fn() -> io::Result<()>,
-    reserve: impl FnOnce(usize) -> io::Result<VerificationMemory>,
+    reserve: impl FnOnce(usize) -> io::Result<M>,
     verify: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     check()?;
@@ -320,7 +324,12 @@ pub(super) fn log(
     check: &impl Fn() -> io::Result<()>,
     verify: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    run_reserved(log_bytes(row)?, check, VerificationMemory::reserve, verify)
+    run_reserved(
+        log_bytes(row)?,
+        check,
+        |bytes| LogMemory::reserve(bytes, check),
+        verify,
+    )
 }
 
 pub(super) fn key(

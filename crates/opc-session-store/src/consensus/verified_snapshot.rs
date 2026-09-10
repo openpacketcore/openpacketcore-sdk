@@ -19,7 +19,7 @@ const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const DIGEST_BYTES: usize = 32;
 const MAX_BLOCKS: usize = MAX_INDEX_BYTES / DIGEST_BYTES;
-const PROCESS_VERIFICATION_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const PROCESS_VERIFICATION_BYTES: usize = 128 * 1024 * 1024;
 static VERIFICATION_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Reservation shared across all retained images, their cache replacement
@@ -62,7 +62,14 @@ impl VerificationMemory {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= limit)
             })
-            .map_err(|_| io::Error::other("portable snapshot verification memory limit reached"))?;
+            .map_err(|_used| {
+                #[cfg(feature = "test-control")]
+                eprintln!(
+                    "verification_memory_admission_failure used={} requested={} limit={}",
+                    _used, bytes, limit,
+                );
+                io::Error::other("portable snapshot verification memory limit reached")
+            })?;
         Ok(Self { bytes, counter })
     }
 }
@@ -73,7 +80,13 @@ impl Drop for VerificationMemory {
     }
 }
 
+#[cfg_attr(feature = "test-control", track_caller)]
 fn invalid() -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "portable_snapshot_validation_failure source={}",
+        std::panic::Location::caller()
+    );
     io::Error::new(
         io::ErrorKind::InvalidData,
         "portable snapshot integrity check failed",
