@@ -64,7 +64,11 @@ impl ReceiptRange {
         Ok(Self { offset, length })
     }
 
-    fn end(self) -> u64 {
+    pub(super) fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub(super) fn end(self) -> u64 {
         self.offset + u64::from(self.length)
     }
 }

@@ -204,6 +204,12 @@ impl NativeReceipt {
             .map(|cold| (Arc::clone(&cold.source), cold.range))
     }
 
+    pub(super) fn cold_read_order(&self) -> Option<(usize, u64)> {
+        self.cold
+            .as_ref()
+            .map(|cold| (cold.source.source_order(), cold.range.offset()))
+    }
+
     /// Called only for a complete catalog row or an exact expected-readback
     /// relocation. The source pins the selected bytes; caller-owned keys and
     /// metadata contain no allocation borrowed from a decoder reservation.

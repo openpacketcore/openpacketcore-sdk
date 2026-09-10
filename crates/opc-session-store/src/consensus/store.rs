@@ -1902,6 +1902,7 @@ async fn shutdown_consensus_session_store(
             .shutdown()
             .await
             .map_err(|_| consensus_unavailable());
+        inner.storage_shutdown.stop_native_snapshot_exports();
         inner.storage_shutdown.wait().await;
         wal.shutdown().map_err(|_| consensus_unavailable())?;
         return raft_result;

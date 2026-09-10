@@ -2705,6 +2705,8 @@ impl SqliteConsensusLogStore {
 struct ConsensusStorageShutdownCompletion {
     active_owners: AtomicUsize,
     notify: tokio::sync::Notify,
+    #[cfg(target_os = "linux")]
+    snapshot_shutdown: AtomicBool,
     runtime_write_handoff: AtomicBool,
     runtime_write_handoff_pending: AtomicBool,
 }
@@ -2736,6 +2738,13 @@ impl RuntimeWriteHandoff {
 pub(crate) struct ConsensusStorageShutdownObserver(Arc<ConsensusStorageShutdownCompletion>);
 
 impl ConsensusStorageShutdownObserver {
+    /// Raft's core has exited, so an unfinished native export can retire its
+    /// private staging image. The observer still waits for every real owner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stop_native_snapshot_exports(&self) {
+        self.0.snapshot_shutdown.store(true, Ordering::Release);
+    }
+
     /// Enable scheduler handoff only after `Raft::new` has finished recovery
     /// and moved both write handles into its Tokio-spawned engine tasks.
     /// Startup itself may run on the caller's LocalSet, where block_in_place
@@ -2767,6 +2776,8 @@ impl ConsensusStorageShutdownGuard {
         Self(Some(Arc::new(ConsensusStorageShutdownCompletion {
             active_owners: AtomicUsize::new(1),
             notify: tokio::sync::Notify::new(),
+            #[cfg(target_os = "linux")]
+            snapshot_shutdown: AtomicBool::new(false),
             runtime_write_handoff: AtomicBool::new(false),
             runtime_write_handoff_pending: AtomicBool::new(false),
         })))
@@ -2774,6 +2785,13 @@ impl ConsensusStorageShutdownGuard {
 
     const fn detached() -> Self {
         Self(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_shutdown_requested(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|completion| completion.snapshot_shutdown.load(Ordering::Acquire))
     }
 
     fn try_admit_runtime_write_handoff(&self) -> Option<RuntimeWriteHandoff> {
@@ -5891,11 +5909,22 @@ async fn build_file_backed_snapshot_database(
         let expected_members = core.expected_members.clone();
         let expected_bindings = core.expected_bindings.clone();
         let fixed_placement_policy = core.fixed_placement_policy;
+        let snapshot_foreground_pacer = core.snapshot_foreground_pacer();
         let (result, snapshot_guard) = tokio::task::spawn_blocking(move || {
             let result = (|| {
-                let export = wal.native_export_snapshot()?;
-                consensus::build_snapshot_database_pinned_with_authority_into_sync(
+                let Some((export, captured_cut)) = wal
+                    .native_export_snapshot_into(&raw_snapshot, &|| {
+                        worker_shutdown_guard.snapshot_shutdown_requested()
+                    })?
+                else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native snapshot export stopped after Raft shutdown",
+                    ));
+                };
+                consensus::validate_native_snapshot_export_sync(
                     &export,
+                    &raw_snapshot,
                     consensus::SnapshotBuildAuthority {
                         identity,
                         profile,
@@ -5903,10 +5932,27 @@ async fn build_file_backed_snapshot_database(
                         expected_bindings: &expected_bindings,
                         fixed_placement_policy,
                     },
-                    vacuum_snapshot,
+                    &captured_cut,
+                )?;
+                drop(export);
+                if worker_shutdown_guard.snapshot_shutdown_requested() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native snapshot export stopped after Raft shutdown",
+                    ));
+                }
+                consensus::finalize_captured_snapshot_database_into_sync(
+                    identity,
+                    profile,
+                    &expected_members,
+                    &expected_bindings,
+                    fixed_placement_policy,
+                    &captured_cut,
                     raw_snapshot,
+                    vacuum_snapshot,
+                    &snapshot_foreground_pacer,
                 )
-                .map(|(cut, pin)| (cut, pin, 0))
+                .map(|pin| (captured_cut, pin, 0))
             })();
             drop(snapshot_directory_lease);
             drop(worker_shutdown_guard);
@@ -7667,6 +7713,32 @@ mod tests {
     use crate::record::{EncryptedSessionPayload, StoredSessionRecord};
 
     const PLAINTEXT_CANARY: &[u8] = b"never-persist-this-plaintext-canary";
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_snapshot_shutdown_request_does_not_retire_an_owned_worker() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let root = ConsensusStorageShutdownGuard::tracked();
+        let observer = root.observer().unwrap();
+        let worker = root.child();
+        drop(root);
+        let waiting = observer.wait();
+        tokio::pin!(waiting);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+        assert!(!worker.snapshot_shutdown_requested());
+        observer.stop_native_snapshot_exports();
+        assert!(worker.snapshot_shutdown_requested());
+        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        drop(worker);
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context),
+            Poll::Ready(())
+        ));
+    }
 
     #[derive(Debug)]
     struct MembershipObservationProbePeer {

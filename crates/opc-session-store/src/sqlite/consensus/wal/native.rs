@@ -44,6 +44,12 @@ impl Drop for OperationPermit {
 }
 
 pub(super) fn cold_basis(directory: &Path, binding: Binding) -> io::Result<Connection> {
+    let mut conn = Connection::open_in_memory().map_err(db_error)?;
+    copy_cold_basis(directory, binding, &mut conn)?;
+    Ok(conn)
+}
+
+fn copy_cold_basis(directory: &Path, binding: Binding, conn: &mut Connection) -> io::Result<()> {
     let path = directory.join("basis.sqlite");
     let portable =
         PortableSnapshot::capture(crate::sqlite::open_regular_read_nofollow(&path)?, MAX_BASIS)?;
@@ -60,16 +66,29 @@ pub(super) fn cold_basis(directory: &Path, binding: Binding) -> io::Result<Conne
     // A cold, read-only compatibility template only. The verified VFS binds
     // every page actually copied to the admitted descriptor/digest. Live
     // native state is exclusively NativeStorage's Rust maps, never this copy.
-    let mut conn = Connection::open_in_memory().map_err(db_error)?;
-    Backup::new(&source, &mut conn)
+    Backup::new(&source, conn)
         .map_err(db_error)?
         .run_to_completion(128, Duration::ZERO, None)
         .map_err(db_error)?;
     conn.pragma_update(None, "query_only", true)
         .map_err(db_error)?;
-    validate_basis(&conn, binding.identity)?;
-    Ok(conn)
+    validate_basis(conn, binding.identity)?;
+    Ok(())
 }
+
+// Only the cancellation check below can construct this private marker. An
+// Interrupted I/O error, corruption, owner failure or panic must still fence
+// the WAL; a concurrent shutdown flag must never mask an unrelated failure.
+#[derive(Debug)]
+struct SnapshotExportCancelled;
+
+impl std::fmt::Display for SnapshotExportCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("native snapshot export cancelled during shutdown")
+    }
+}
+
+impl std::error::Error for SnapshotExportCancelled {}
 
 pub(super) fn validate_roster_root(
     conn: &Connection,
@@ -623,18 +642,36 @@ impl Wal {
         Ok(state.native_install_pending || state.snapshot.is_some())
     }
 
+    #[cfg(test)]
     pub(crate) fn native_export_snapshot(&self) -> io::Result<Connection> {
-        self.native_export(false)
+        self.native_export(false, None, &|| false)?
+            .map(|(conn, _)| conn)
+            .ok_or_else(|| invalid_data("uncancelled native export returned no image"))
+    }
+
+    pub(crate) fn native_export_snapshot_into(
+        &self,
+        destination: &crate::consensus::snapshot::PinnedSqliteFile,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Option<(Connection, super::super::ConsensusAppliedMembership)>> {
+        self.native_export(false, Some(destination), cancelled)
     }
 
     #[cfg(test)]
     pub(in crate::sqlite::consensus) fn native_export_install_base_for_test(
         &self,
     ) -> io::Result<Connection> {
-        self.native_export(true)
+        self.native_export(true, None, &|| false)?
+            .map(|(conn, _)| conn)
+            .ok_or_else(|| invalid_data("uncancelled native export returned no image"))
     }
 
-    fn native_export(&self, install_base: bool) -> io::Result<Connection> {
+    fn native_export(
+        &self,
+        install_base: bool,
+        destination: Option<&crate::consensus::snapshot::PinnedSqliteFile>,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Option<(Connection, super::super::ConsensusAppliedMembership)>> {
         let _permit = self.native_operation()?;
         // Bounded immutable root capture. Every file read, row decode and SQL
         // output operation runs on this capture after releasing State.
@@ -655,23 +692,68 @@ impl Wal {
                 }
             }
         };
+        let captured_cut = (
+            capture.storage.business.applied(),
+            capture.storage.business.membership(),
+        );
         let conn = self.native_detached(|| {
-            (self.control.hook)(Point::BeforeNativeSnapshotRead)?;
-            let conn = cold_basis(&self.directory, self.binding)?;
             let check = || {
-                let state = lock_state(&self.shared)?;
-                ensure_readable(&state)
+                {
+                    let state = lock_state(&self.shared)?;
+                    ensure_readable(&state)?;
+                }
+                if cancelled() {
+                    return Err(io::Error::other(SnapshotExportCancelled));
+                }
+                Ok(())
             };
-            if install_base {
-                capture
-                    .storage
-                    .export_cold_install_base_checked(&conn, &check)?;
-            } else {
-                capture
-                    .storage
-                    .export_cold_snapshot_checked(&conn, &check)?;
+            let export = || -> io::Result<Connection> {
+                (self.control.hook)(Point::BeforeNativeSnapshotRead)?;
+                check()?;
+                let conn = if let Some(destination) = destination {
+                    destination.verify_linked_identity()?;
+                    let mut conn = super::super::open_pinned_snapshot_database(destination)?;
+                    copy_cold_basis(&self.directory, self.binding, &mut conn)?;
+                    // Backup can copy the template's journal/page settings.
+                    // Restore the original bounded staging policy before the
+                    // first receipt insertion into this exact owned inode.
+                    conn.pragma_update(None, "query_only", false)
+                        .map_err(db_error)?;
+                    super::super::disable_snapshot_database_journal_sync(&conn)?;
+                    super::super::install_snapshot_database_extent_guard_sync(&conn)?;
+                    super::super::verify_pinned_snapshot_descriptor(destination, &conn)?;
+                    conn
+                } else {
+                    cold_basis(&self.directory, self.binding)?
+                };
+                if install_base {
+                    capture
+                        .storage
+                        .export_cold_install_base_checked(&conn, &check)?;
+                } else {
+                    capture
+                        .storage
+                        .export_cold_snapshot_checked(&conn, &check)?;
+                }
+                if let Some(destination) = destination {
+                    super::super::snapshot_database_extent_sync(&conn)?;
+                    super::super::verify_pinned_snapshot_descriptor(destination, &conn)?;
+                    destination.verify_linked_identity()?;
+                }
+                check()?;
+                Ok(conn)
+            };
+            match export() {
+                Ok(conn) => Ok(Some(conn)),
+                Err(error)
+                    if error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<SnapshotExportCancelled>()) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
             }
-            Ok(conn)
         })?;
         let mut state = lock_state(&self.shared)?;
         ensure_readable(&state)?;
@@ -685,7 +767,7 @@ impl Wal {
             self.shared.ready.notify_all();
             return Err(error);
         }
-        Ok(conn)
+        Ok(conn.map(|conn| (conn, captured_cut)))
     }
 
     pub(crate) fn native_publish_snapshot(

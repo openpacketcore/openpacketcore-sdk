@@ -10,6 +10,7 @@ use std::time::Instant;
 
 mod application;
 mod cold_reads;
+mod export;
 mod public_reads;
 
 struct Gate {

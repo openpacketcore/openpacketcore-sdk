@@ -2347,10 +2347,27 @@ fn qualification_nofollow_metadata_flags() -> rustix::fs::OFlags {
     }
 }
 
+fn native_database_family_measure(path: &Path) -> (u64, u64) {
+    let mut candidate = path.as_os_str().to_os_string();
+    candidate.push(".native-wal");
+    let candidate = std::path::PathBuf::from(candidate);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => {
+            assert!(
+                metadata.file_type().is_dir(),
+                "native qualification artifacts require a real directory"
+            );
+            bounded_directory_measure(&candidate)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, 0),
+        Err(error) => panic!("read native qualification artifact directory: {error}"),
+    }
+}
+
 fn sqlite_database_family_bytes(path: &Path) -> u64 {
     use rustix::fs::{fstat, openat, FileType, Mode, CWD};
 
-    ["", "-wal", "-shm", "-journal"]
+    let sqlite_bytes = ["", "-wal", "-shm", "-journal"]
         .into_iter()
         .map(|suffix| {
             let mut candidate = path.as_os_str().to_os_string();
@@ -2387,13 +2404,19 @@ fn sqlite_database_family_bytes(path: &Path) -> u64 {
             total
                 .checked_add(bytes)
                 .expect("SQLite qualification artifact byte total overflow")
-        })
+        });
+    // Native storage is part of the same per-voter backend ceiling. Count
+    // every real file, including selected generations and pending cleanup,
+    // with the existing bounded descriptor-pinned directory walker.
+    sqlite_bytes
+        .checked_add(native_database_family_measure(path).0)
+        .expect("complete database qualification byte total overflow")
 }
 
 fn sqlite_database_family_artifacts(path: &Path) -> u64 {
     use rustix::fs::{fstat, openat, FileType, Mode, CWD};
 
-    ["", "-wal", "-shm", "-journal"]
+    let sqlite_artifacts = ["", "-wal", "-shm", "-journal"]
         .into_iter()
         .map(|suffix| {
             let mut candidate = path.as_os_str().to_os_string();
@@ -2429,7 +2452,10 @@ fn sqlite_database_family_artifacts(path: &Path) -> u64 {
             total
                 .checked_add(artifacts)
                 .expect("SQLite qualification artifact count overflow")
-        })
+        });
+    sqlite_artifacts
+        .checked_add(native_database_family_measure(path).1)
+        .expect("complete database qualification artifact count overflow")
 }
 
 fn directory_artifacts(path: &Path) -> u64 {

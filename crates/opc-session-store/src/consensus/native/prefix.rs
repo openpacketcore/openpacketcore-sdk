@@ -146,6 +146,8 @@ pub(crate) struct VerifiedAppendSource {
     admitted_length: AtomicU64,
     failed: AtomicBool,
     cache: Mutex<Option<CachedBlock>>,
+    #[cfg(test)]
+    blocks_read: AtomicU64,
     // Source, owner SHA state, page directory, and both old/new cache buffers.
     // Digest pages, views, capture/append scratch reserve separately from the
     // SAME process-wide VerificationMemory counter before allocation.
@@ -182,6 +184,8 @@ impl VerifiedAppendSource {
             admitted_length: AtomicU64::new(identity.length),
             failed: AtomicBool::new(false),
             cache: Mutex::new(None),
+            #[cfg(test)]
+            blocks_read: AtomicU64::new(0),
             _memory: memory,
         }))
     }
@@ -240,6 +244,8 @@ impl VerifiedAppendSource {
                 let mut bytes = buffer(self.block_bytes)?;
                 self.file
                     .read_exact_at(&mut bytes, index as u64 * self.block_bytes as u64)?;
+                #[cfg(test)]
+                self.blocks_read.fetch_add(1, Ordering::Relaxed);
                 let actual: [u8; 32] = Sha256::digest(&*bytes).into();
                 if actual != self.digest(index)? {
                     return Err(invalid());
@@ -311,6 +317,18 @@ impl VerifiedPrefix {
 
     pub(crate) fn identity(&self) -> PrefixIdentity {
         self.identity
+    }
+
+    // A process-local ordering hint only. All views of one append source
+    // share its cache even when they certify different immutable prefixes.
+    // A caller must still read through its own exact view and validate rows.
+    pub(super) fn source_order(&self) -> usize {
+        Arc::as_ptr(&self.source) as usize
+    }
+
+    #[cfg(test)]
+    pub(super) fn blocks_read(&self) -> u64 {
+        self.source.blocks_read.load(Ordering::Relaxed)
     }
 
     pub(crate) fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {

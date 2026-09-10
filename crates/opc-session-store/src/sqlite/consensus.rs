@@ -33979,6 +33979,42 @@ pub(crate) struct SnapshotBuildAuthority<'a> {
     pub(crate) fixed_placement_policy: Option<PlacementResiliencePolicy>,
 }
 
+/// Admit the completed native projection before the ordinary file-backed
+/// finalizer consumes it. Its source is one immutable native capture; neither
+/// the live owner nor a separately reopened pathname supplies this cut.
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_native_snapshot_export_sync(
+    conn: &Connection,
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    authority: SnapshotBuildAuthority<'_>,
+    expected_cut: &ConsensusAppliedMembership,
+) -> io::Result<()> {
+    pinned.verify_linked_identity()?;
+    verify_pinned_snapshot_descriptor(pinned, conn)?;
+    snapshot_database_extent_sync(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
+    validate_durable_authority_for_raw_access(
+        &tx,
+        authority.identity,
+        authority.profile,
+        authority.expected_members,
+        authority.expected_bindings,
+        authority.fixed_placement_policy,
+    )?;
+    validate_existing_schema(&tx, authority.identity)
+        .map_err(|_| invalid_data("native snapshot export schema is invalid"))?;
+    validate_sealed_state_sync(&tx)?;
+    validate_fenced_transition_receipts_sync(&tx, authority.identity)?;
+    if snapshot_applied_membership_sync(&tx, authority.identity)? != *expected_cut {
+        return Err(invalid_data(
+            "native snapshot export cut differs from captured authority",
+        ));
+    }
+    tx.commit().map_err(db_error)?;
+    pinned.verify_linked_identity()?;
+    verify_pinned_snapshot_descriptor(pinned, conn)
+}
+
 #[cfg(test)]
 pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     conn: &Connection,

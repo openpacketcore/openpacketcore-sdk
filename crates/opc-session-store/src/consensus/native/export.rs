@@ -22,6 +22,52 @@ enum Purpose {
     InstallBase,
 }
 
+struct OrderedReceipts<'a> {
+    rows: Vec<(
+        &'a FencedTransitionV2RequestId,
+        &'a SharedRow<NativeReceipt>,
+    )>,
+    _memory: crate::consensus::verified_snapshot::VerificationMemory,
+}
+
+impl<'a> OrderedReceipts<'a> {
+    fn new(state: &'a NativeState, check: &impl Fn() -> io::Result<()>) -> io::Result<Self> {
+        check()?;
+        if state.receipts.len() != lifecycle::receipt_count(state.frontiers.history)? {
+            return Err(invalid("native export receipt cardinality differs"));
+        }
+        // Only two borrowed pointers per receipt, charged before allocation.
+        // The immutable capture owns every row/source until this list drops;
+        // sorting does not hydrate or duplicate any historical response.
+        let bytes = state
+            .receipts
+            .len()
+            .checked_mul(std::mem::size_of::<(
+                &FencedTransitionV2RequestId,
+                &SharedRow<NativeReceipt>,
+            )>())
+            .ok_or_else(|| invalid("native export receipt order reservation overflow"))?;
+        let memory = crate::consensus::verified_snapshot::VerificationMemory::reserve(bytes)?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(state.receipts.len())
+            .map_err(|_| invalid("native export receipt order allocation failed"))?;
+        for row in &state.receipts {
+            check()?;
+            rows.push(row);
+        }
+        // Hash-map order otherwise repeatedly rehashes a whole verified block
+        // for each small receipt. Visit the same selected bytes by source and
+        // offset; the exact per-row view, decoder and revision checks below
+        // remain the authority. This in-place sort allocates no second list.
+        rows.sort_unstable_by_key(|(_, row)| row.cold_read_order());
+        check()?;
+        Ok(Self {
+            rows,
+            _memory: memory,
+        })
+    }
+}
+
 impl NativeStorage {
     pub(crate) fn export_cold_snapshot_checked(
         &self,
@@ -196,7 +242,9 @@ impl NativeStorage {
             });
             let remaining = reclaim.map(|_| history.reclaim_remaining() as u64);
             tx.execute("UPDATE consensus_fenced_transition_v2_history SET active_epoch=?1,retired_through_epoch=?2,generation=?3,current_bound_count=?4,reclaimed_entries=?5,reclaim_epoch=?6,reclaim_cursor_ordinal=?7,reclaim_remaining=?8 WHERE singleton=1",params![history.active_epoch().ok_or_else(|| invalid("native cold export active epoch missing"))?.get(),history.retired_through().map_or(0,|epoch| epoch.get()),history.generation(),history.bound_entries() as u64,history.reclaimed_entries(),reclaim,cursor,remaining]).map_err(db)?;
-            for (id, receipt) in &state.receipts {
+            let ordered = OrderedReceipts::new(state, check)?;
+            let mut insert = tx.prepare("INSERT INTO consensus_fenced_transition_v2_receipts (request_id,history_epoch,ordinal,configuration_epoch,payload_digest,retained_until,binding_digest,response_json,response_digest) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)").map_err(db)?;
+            for &(id, receipt) in &ordered.rows {
                 check()?;
                 // This exporter owns an immutable snapshot capture outside
                 // State. The manual SQL columns must use the complete cold
@@ -235,7 +283,19 @@ impl NativeStorage {
                         sql::fenced_transition_v2_receipt_response_digest(binding, encoded)
                     })
                     .transpose()?;
-                tx.execute("INSERT INTO consensus_fenced_transition_v2_receipts (request_id,history_epoch,ordinal,configuration_epoch,payload_digest,retained_until,binding_digest,response_json,response_digest) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id.to_bytes().as_slice(),id.epoch().get(),receipt.ordinal,epoch,receipt.payload_digest.as_slice(),retained_until,binding.as_slice(),encoded,response_digest.as_ref().map(|digest| digest.as_slice())]).map_err(db)?;
+                insert
+                    .execute(params![
+                        id.to_bytes().as_slice(),
+                        id.epoch().get(),
+                        receipt.ordinal,
+                        epoch,
+                        receipt.payload_digest.as_slice(),
+                        retained_until,
+                        binding.as_slice(),
+                        encoded,
+                        response_digest.as_ref().map(|digest| digest.as_slice())
+                    ])
+                    .map_err(db)?;
             }
         }
         for entry in &state.notifications {
@@ -296,5 +356,107 @@ impl NativeStorage {
         tx.commit().map_err(db)?;
         conn.pragma_update(None, "query_only", true).map_err(db)?;
         check()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::changes::tests::{apply, command, fixture, request, time};
+    use super::super::generation::{Catalog, PreparedBase};
+    use super::*;
+    use std::fs::OpenOptions;
+
+    #[test]
+    fn native_snapshot_receipt_export_reads_each_selected_block_once_with_exact_rows() {
+        const BLOCK: usize = 64 * 1024;
+        const MAXIMUM: u64 = 64 * 1024 * 1024;
+        let (mut original, _, _) = fixture();
+        for first in (2..1026).step_by(64) {
+            let entries = (first..first + 64)
+                .map(|index| command(index, &request(index, None), time(2), false))
+                .collect::<Vec<_>>();
+            apply(&mut original, &entries);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipts.native");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let prepared = PreparedBase::prepare(
+            &original,
+            [3; 32],
+            1,
+            1,
+            1,
+            [4; 32],
+            BLOCK,
+            MAXIMUM,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let identity = prepared.write_to(&mut file, &|| Ok(())).unwrap();
+        file.sync_all().unwrap();
+        let (owner, catalog) = Catalog::open(
+            &path,
+            identity,
+            MAXIMUM,
+            original.business.identity,
+            &original.business.members,
+            None,
+            [4; 32],
+            &|| Ok(()),
+        )
+        .unwrap();
+        let selected = owner.current();
+        let cold = catalog.into_storage(&|| Ok(())).unwrap();
+        assert_eq!(cold.cold_counts_for_test()[0], 1025);
+        let resolve_exact = |id: &FencedTransitionV2RequestId, row: &SharedRow<NativeReceipt>| {
+            let (source, range) = row.cold_range().unwrap();
+            let resolved = cold::ReceiptReadTicket::capture(&cold.business, *id, source, range)
+                .unwrap()
+                .resolve(&|| Ok(()))
+                .unwrap()
+                .copy_guarded(&cold.business)
+                .unwrap();
+            assert_eq!(
+                json(resolved.row()).unwrap(),
+                json(&**original.business.receipts.get(id).unwrap()).unwrap()
+            );
+        };
+        let before = selected.blocks_read();
+        for (id, row) in &cold.business.receipts {
+            resolve_exact(id, row);
+        }
+        let unordered_blocks = selected.blocks_read() - before;
+        let ordered = OrderedReceipts::new(&cold.business, &|| Ok(())).unwrap();
+        let mut required_blocks = BTreeSet::new();
+        for (_, row) in &ordered.rows {
+            let (_, range) = row.cold_range().unwrap();
+            required_blocks
+                .extend(range.offset() / BLOCK as u64..=(range.end() - 1) / BLOCK as u64);
+        }
+        let before = selected.blocks_read();
+        for &(id, row) in &ordered.rows {
+            resolve_exact(id, row);
+        }
+        let ordered_blocks = selected.blocks_read() - before;
+        assert!(
+            required_blocks.len() >= 4,
+            "exercise multiple independently verified blocks"
+        );
+        assert!(ordered_blocks <= required_blocks.len() as u64);
+        assert!(
+            unordered_blocks > ordered_blocks * 4,
+            "the original hash traversal must expose repeated reads"
+        );
+        eprintln!(
+            "native snapshot receipt block reads: receipts={} original={} ordered={} distinct={}",
+            ordered.rows.len(),
+            unordered_blocks,
+            ordered_blocks,
+            required_blocks.len()
+        );
     }
 }
