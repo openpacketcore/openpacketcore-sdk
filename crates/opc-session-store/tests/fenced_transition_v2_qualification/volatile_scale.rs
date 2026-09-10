@@ -1,10 +1,96 @@
-//! USER129 volatile measurement of the unchanged SDK-702 public workload.
+//! Async and USER129 volatile measurements of the original SDK-702 workload.
 //!
-//! The workload body is preserved from the durable release test. This entry
-//! requires explicit test-control activation and publishes no durable release
-//! attestation: all-voter crash/reopen evidence belongs to that unchanged test.
+//! Both entries retain the original workload, deadlines, tails and resources.
+//! Public Async uses ordinary construction and mode-aware readiness. The
+//! earlier volatile experiment retains its explicit test-control activation.
+//! Neither entry supplies the durable release test's all-cold attestation.
 
 use super::*;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalePersistence {
+    VolatileExperiment,
+    Async,
+}
+
+impl ScalePersistence {
+    fn label(self) -> &'static str {
+        match self {
+            Self::VolatileExperiment => "volatile",
+            Self::Async => "async",
+        }
+    }
+
+    fn evidence_mode(self) -> &'static str {
+        match self {
+            Self::VolatileExperiment => {
+                "explicit_volatile_original_scale_not_durable_qualification"
+            }
+            Self::Async => "public_async_original_scale_not_durable_qualification",
+        }
+    }
+
+    async fn ready_leader(self, stores: &[ConsensusSessionStore]) -> usize {
+        if self == Self::VolatileExperiment {
+            return ready_leader(stores).await;
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let readiness = futures_util::future::join_all(
+                    stores
+                        .iter()
+                        .map(ConsensusSessionStore::probe_fixed_quorum_readiness),
+                )
+                .await;
+                let statuses = stores
+                    .iter()
+                    .map(ConsensusSessionStore::status)
+                    .collect::<Vec<_>>();
+                if readiness
+                    .iter()
+                    .all(|report| report.traffic_authority().is_granted())
+                    && statuses.iter().all(|status| status.admitted)
+                    && statuses
+                        .first()
+                        .and_then(|status| status.leader_id)
+                        .is_some_and(|leader| {
+                            statuses
+                                .iter()
+                                .all(|status| status.leader_id == Some(leader))
+                        })
+                {
+                    let leader = statuses[0].leader_id.expect("known fixed-quorum leader");
+                    return statuses
+                        .iter()
+                        .position(|status| status.node_id == leader)
+                        .expect("leader is an exact fixed voter");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixed quorum reaches public Async readiness and elects a leader")
+    }
+}
+
+fn voter_persistence_observations(stores: &[ConsensusSessionStore]) -> Vec<serde_json::Value> {
+    stores
+        .iter()
+        .map(|store| {
+            let engine = consensus_local_durable_progress_for_test(store);
+            serde_json::json!({
+                "health": store.persistence_health(),
+                "engine_state": format!("{:?}", engine.engine_state),
+                "storage_error_subject": engine.storage_error_subject.map(|value| format!("{value:?}")),
+                "storage_error_verb": engine.storage_error_verb.map(|value| format!("{value:?}")),
+                "last_log_index": engine.last_log_index,
+                "applied_index": engine.applied_index,
+                "snapshot_index": engine.snapshot_index,
+                "purged_index": engine.purged_index,
+            })
+        })
+        .collect()
+}
 
 fn volatile_voter_costs(stores: &[ConsensusSessionStore]) -> Vec<serde_json::Value> {
     stores
@@ -19,13 +105,30 @@ fn volatile_voter_costs(stores: &[ConsensusSessionStore]) -> Vec<serde_json::Val
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "USER129 original 1,010,000-operation volatile performance measurement"]
-#[allow(clippy::assertions_on_constants)]
 async fn original_workload_preserves_rates_tails_and_limits() {
     assert_eq!(
         std::env::var_os("OPC_SESSION_VOLATILE_PERFORMANCE_EXPERIMENT").as_deref(),
         Some(std::ffi::OsStr::new("1")),
         "original volatile scale requires explicit experimental activation",
     );
+    run_original_scale(ScalePersistence::VolatileExperiment).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "public Async original 1,010,000-operation performance qualification"]
+async fn public_async_original_workload_preserves_rates_tails_and_limits() {
+    assert_eq!(
+        std::env::var_os("OPC_SESSION_ASYNC_PERFORMANCE_QUALIFICATION").as_deref(),
+        Some(std::ffi::OsStr::new("required")),
+        "public Async scale requires its explicit qualification controller",
+    );
+    assert!(std::env::var_os("OPC_SESSION_VOLATILE_PERFORMANCE_EXPERIMENT").is_none());
+    run_original_scale(ScalePersistence::Async).await;
+}
+
+#[allow(clippy::assertions_on_constants)]
+async fn run_original_scale(persistence: ScalePersistence) {
+    let mode_label = persistence.label();
     let build_profile = require_release_qualification_profile();
     let quiet_host_monitor =
         QualificationQuietHostMonitor::start().expect("quiet host before original volatile scale");
@@ -50,15 +153,34 @@ async fn original_workload_preserves_rates_tails_and_limits() {
             .expect("SDK-702 release qualification start"),
     );
     let clock = Arc::new(MutableClock::new(start));
-    let (stores, database_paths, snapshot_paths, peer_slots) =
-        fixed_cluster_with_snapshot_root(directory.path(), &snapshot_root, clock.clone()).await;
-    for store in &stores {
-        opc_session_store::test_support::enable_volatile_memory_performance_experiment_for_test(
-            store,
-        )
-        .expect("enable original volatile scale voter");
+    let (stores, database_paths, snapshot_paths, peer_slots) = match persistence {
+        ScalePersistence::VolatileExperiment => {
+            fixed_cluster_with_snapshot_root(directory.path(), &snapshot_root, clock.clone()).await
+        }
+        ScalePersistence::Async => {
+            fixed_cluster_with_snapshot_integrity_and_persistence(
+                directory.path(),
+                &snapshot_root,
+                clock.clone(),
+                opc_session_store::SnapshotIntegrityPolicy::FsVerity,
+                opc_session_store::SessionPersistenceMode::Async,
+            )
+            .await
+        }
+    };
+    if persistence == ScalePersistence::VolatileExperiment {
+        for store in &stores {
+            opc_session_store::test_support::enable_volatile_memory_performance_experiment_for_test(
+                store,
+            )
+            .expect("enable original volatile scale voter");
+        }
+    } else {
+        assert!(stores.iter().all(|store| {
+            store.persistence_mode() == opc_session_store::SessionPersistenceMode::Async
+        }));
     }
-    eprintln!("sdk-741 volatile original scale activation: durability=waived real_quorum=true real_apply=true background_coalesced_native_generations=true original_snapshot_policy=true cold_restart_qualification=false");
+    eprintln!("sdk-741 {mode_label} original scale activation: durability=waived real_quorum=true real_apply=true background_coalesced_native_generations=true original_snapshot_policy=true cold_restart_qualification=false");
     let provider = sealing_provider();
     let transient_retries = Arc::new(AtomicU64::new(0));
     // Keep every permitted retry in a causally distinct ledger: immutable
@@ -93,7 +215,7 @@ async fn original_workload_preserves_rates_tails_and_limits() {
     // Readiness and leader discovery are phase setup, not application traffic.
     // Keep one public ingress: its normal forwarding path follows any later
     // leader change without adding three fresh read barriers to every batch.
-    let leader = ready_leader(&stores).await;
+    let leader = persistence.ready_leader(&stores).await;
     let ingress_store = &stores[leader];
     let first_key = key(0);
     let first_observation = retry_exact_consensus_operation(&transient_retries, || {
@@ -378,8 +500,9 @@ async fn original_workload_preserves_rates_tails_and_limits() {
                         && !latency.item_scheduled_to_completion.is_empty())
                     .then(|| latency.p99_and_p999());
                     eprintln!(
-                        "sdk-741 volatile original scale failure: {}",
+                        "sdk-741 {mode_label} original scale failure: {}",
                         serde_json::json!({
+                            "mode": persistence.evidence_mode(),
                             "phase": phase_name, "stage": failure.stage.as_str(),
                             "offered_ops_per_second": target_rate, "submitted_operations": submitted,
                             "completed_operations": completed, "elapsed_ms": phase_started.elapsed().as_millis(),
@@ -387,6 +510,7 @@ async fn original_workload_preserves_rates_tails_and_limits() {
                             "item_p99_us": tails.map(|value| value.2.as_micros()), "item_p999_us": tails.map(|value| value.3.as_micros()),
                             "effect_counters": effect_snapshot,
                             "voter_wal_costs": volatile_voter_costs(&stores),
+                            "voter_persistence": voter_persistence_observations(&stores),
                         })
                     );
                     panic!(
@@ -415,8 +539,9 @@ async fn original_workload_preserves_rates_tails_and_limits() {
             .last()
             .expect("qualified phase has an item maximum after percentile sort");
         eprintln!(
-            "sdk-741 volatile original scale phase: {}",
+            "sdk-741 {mode_label} original scale phase: {}",
             serde_json::json!({
+                "mode": persistence.evidence_mode(),
                 "phase": phase_name, "stage": "completed", "offered_ops_per_second": target_rate,
                 "submitted_operations": submitted, "completed_operations": completed,
                 "elapsed_ms": elapsed.as_millis(), "batch_samples": batch_samples,
@@ -427,6 +552,7 @@ async fn original_workload_preserves_rates_tails_and_limits() {
                 "read_backend_unavailable_retries": transient_retries.load(Ordering::Relaxed),
                 "effect_counters": effect_counters.snapshot(),
                 "voter_wal_costs": volatile_voter_costs(&stores),
+                "voter_persistence": voter_persistence_observations(&stores),
             })
         );
         assert_qualification_phase_pacing(elapsed, operations as u64, target_rate as u64);
@@ -470,7 +596,7 @@ async fn original_workload_preserves_rates_tails_and_limits() {
         "every declared workload result must match its exact request and expected mutation"
     );
     assert_eq!(rotations, 7, "the 1.01m envelope crosses seven successors");
-    let leader = ready_leader(&stores).await;
+    let leader = persistence.ready_leader(&stores).await;
     let history = retry_exact_consensus_operation(&transient_retries, || {
         stores[leader].fenced_transition_v2_history_state()
     })
@@ -493,6 +619,27 @@ async fn original_workload_preserves_rates_tails_and_limits() {
         .map(ConsensusSessionStore::status)
         .collect::<Vec<_>>();
     let before_shutdown_costs = volatile_voter_costs(&stores);
+    let before_shutdown_persistence = voter_persistence_observations(&stores);
+    if persistence == ScalePersistence::Async {
+        for store in &stores {
+            let health = store.persistence_health();
+            assert!(health.engine_running);
+            assert_eq!(
+                health.storage_state,
+                opc_session_store::SessionStorageState::Running
+            );
+            assert!(health.storage_failure.is_none());
+            assert_eq!(
+                health.recovery,
+                Some(opc_session_store::SessionAsyncRecoveryState::Active)
+            );
+            let progress = health
+                .asynchronous
+                .expect("public Async persistence observation");
+            assert!(progress.background_failure.is_none() && !progress.saturated);
+            assert!(progress.completed_generation > 0);
+        }
+    }
     let effect_snapshot = effect_counters.snapshot();
     let read_only_retries = transient_retries.load(Ordering::Relaxed);
     let maintenance_retries = maintenance_reconciliation_retries.load(Ordering::Relaxed);
@@ -512,7 +659,7 @@ async fn original_workload_preserves_rates_tails_and_limits() {
         .finish()
         .expect("original volatile scale quiet-host interval");
     let observation = serde_json::json!({
-        "mode": "explicit_volatile_original_scale_not_durable_qualification",
+        "mode": persistence.evidence_mode(),
         "cargo_profile_family": build_profile.cargo_profile_family, "cargo_opt_level": build_profile.cargo_opt_level,
         "debug_assertions": build_profile.debug_assertions, "topology_voters": statuses.len(),
         "preload_operations": QUALIFICATION_SESSIONS, "total_exact_outcomes": matched_workload_outcomes.load(Ordering::Relaxed),
@@ -525,13 +672,14 @@ async fn original_workload_preserves_rates_tails_and_limits() {
         "completed_snapshot_count_by_voter": statuses.iter().map(|status| status.completed_snapshot_count).collect::<Vec<_>>(),
         "read_backend_unavailable_retries": read_only_retries, "maintenance_reconciliation_retries": maintenance_retries,
         "effect_counters": effect_snapshot, "voter_wal_costs_before_shutdown": before_shutdown_costs,
+        "voter_persistence_before_shutdown": before_shutdown_persistence,
         "database_bytes_by_voter": database_bytes_by_voter, "snapshot_bytes_by_voter": snapshot_bytes_by_voter,
         "database_ceiling_bytes_per_voter": QUALIFICATION_PER_VOTER_DATABASE_CEILING_BYTES,
         "snapshot_ceiling_bytes_per_voter": QUALIFICATION_PER_VOTER_SNAPSHOT_CEILING_BYTES,
         "peak_rss_kib": peak_rss_kib, "process_peak_rss_ceiling_kib": QUALIFICATION_PROCESS_PEAK_RSS_CEILING_KIB,
         "quiet_host": quiet_host, "cold_restart_qualification": false,
     });
-    eprintln!("sdk-741 volatile original scale summary: {observation}");
+    eprintln!("sdk-741 {mode_label} original scale summary: {observation}");
     assert_voter_resource_ceiling(
         "original volatile database family",
         &database_bytes_by_voter,

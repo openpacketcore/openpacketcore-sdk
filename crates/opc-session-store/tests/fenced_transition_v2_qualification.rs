@@ -1723,6 +1723,28 @@ async fn fixed_cluster_with_snapshot_integrity(
     Vec<std::path::PathBuf>,
     Vec<Arc<ScopedLoopbackPeer>>,
 ) {
+    fixed_cluster_with_snapshot_integrity_and_persistence(
+        directory,
+        snapshot_root,
+        clock,
+        snapshot_integrity,
+        opc_session_store::SessionPersistenceMode::Durable,
+    )
+    .await
+}
+
+async fn fixed_cluster_with_snapshot_integrity_and_persistence(
+    directory: &Path,
+    snapshot_root: &Path,
+    clock: Arc<dyn Clock>,
+    snapshot_integrity: opc_session_store::SnapshotIntegrityPolicy,
+    persistence: opc_session_store::SessionPersistenceMode,
+) -> (
+    Vec<ConsensusSessionStore>,
+    Vec<std::path::PathBuf>,
+    Vec<std::path::PathBuf>,
+    Vec<Arc<ScopedLoopbackPeer>>,
+) {
     let placement_policy = PlacementResiliencePolicy::default();
     let members = members();
     let identity = fixed_identity(&members, placement_policy);
@@ -1764,7 +1786,7 @@ async fn fixed_cluster_with_snapshot_integrity(
             })
             .collect::<BTreeMap<_, _>>();
         stores.push(
-            ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
+            ConsensusSessionStore::open_fixed_quorum_with_clock_and_persistence(
                 topologies[source].clone(),
                 SqliteSessionBackend::open(&database_paths[source]).expect("SQLite voter"),
                 &snapshot_paths[source],
@@ -1772,6 +1794,7 @@ async fn fixed_cluster_with_snapshot_integrity(
                 Arc::clone(&clock),
                 DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 snapshot_integrity,
+                persistence,
             )
             .await
             .expect("open fixed voter"),
