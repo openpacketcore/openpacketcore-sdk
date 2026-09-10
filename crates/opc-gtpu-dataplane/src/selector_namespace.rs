@@ -10133,6 +10133,78 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lab-memory")]
+    #[tokio::test]
+    async fn lab_memory_protected_namespace_provisions_and_reopens_without_sqlite() {
+        use opc_session_store::{EncryptingSessionBackend, FakeSessionBackend};
+
+        let tenant = TenantId::from_static("selector-lab");
+        let provider = Arc::new(opc_key::MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                opc_key::KeyId::new("selector-lab-key").unwrap(),
+                opc_key::KeyPurpose::Session,
+                tenant.clone(),
+                opc_key::Zeroizing::new([7; 32]),
+            )
+            .unwrap();
+        let store = SessionStore::new(EncryptingSessionBackend::new(
+            Arc::new(FakeSessionBackend::in_memory_lab()),
+            provider,
+            "selector-lab",
+        ));
+        let scope =
+            SelectorLedgerStorageScope::new(tenant, NetworkFunctionKind::from_static("epdg"));
+        let device = GtpuSessionDeviceId::new([1; 16]).unwrap();
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        let provisioned = GtpuSessionSelectorNamespaceAuthority::provision_protected(
+            store.clone(),
+            scope.clone(),
+            GtpuSelectorNamespaceBootstrap::from_qualified_backend(device, [2; 32]).unwrap(),
+            Arc::clone(&backend),
+            OwnerId::new("selector-lab-owner").unwrap(),
+            SELECTOR_NAMESPACE_MAX_LEASE_TTL,
+            32,
+        )
+        .await
+        .unwrap();
+        assert!(
+            provisioned
+                .read_state_for_provision()
+                .await
+                .unwrap()
+                .1
+                .lifecycle
+                == NamespaceLifecycle::Bound
+        );
+        let reopened = GtpuSessionSelectorNamespaceAuthority::open_protected(
+            store,
+            scope,
+            GtpuSelectorNamespaceBootstrap::from_qualified_backend(device, [2; 32]).unwrap(),
+            Arc::clone(&backend),
+            OwnerId::new("selector-lab-successor").unwrap(),
+            SELECTOR_NAMESPACE_MAX_LEASE_TTL,
+            32,
+        )
+        .await
+        .unwrap();
+        assert!(
+            reopened
+                .read_state_for_provision()
+                .await
+                .unwrap()
+                .1
+                .lifecycle
+                == NamespaceLifecycle::Bound
+        );
+        assert_eq!(
+            backend
+                .provision_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+    }
+
     async fn raw_production_authority(
         store: SessionStore<SqliteSessionBackend>,
         namespace_key: SessionKey,

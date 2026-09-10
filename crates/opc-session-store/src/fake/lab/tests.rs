@@ -322,3 +322,233 @@ async fn receipt_capacity_fails_without_record_mutation() {
         FenceToken::new(0)
     );
 }
+
+async fn insert_restore_record(backend: &FakeSessionBackend, id: &[u8]) -> StoredSessionRecord {
+    let mut value = record(1, 1);
+    value.key.stable_id = StableId::new(Bytes::copy_from_slice(id)).unwrap();
+    let lease = backend
+        .acquire(&value.key, value.owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    value.fence = lease.fence();
+    assert_eq!(
+        backend
+            .compare_and_set(CompareAndSet {
+                key: value.key.clone(),
+                expected_generation: None,
+                lease,
+                new_record: value.clone(),
+            })
+            .await
+            .unwrap(),
+        CompareAndSetResult::Success
+    );
+    value
+}
+
+#[tokio::test]
+async fn lab_restore_uses_authenticated_seek_pages_and_preserves_ordinary_fake_profile() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    let first_record = insert_restore_record(&backend, b"a").await;
+    let last_record = insert_restore_record(&backend, b"z").await;
+    let request = RestoreScanRequest::all(1);
+    let first = backend.scan_restore_records(request.clone()).await.unwrap();
+    assert_eq!(
+        backend.restore_scan_cursor_profile(),
+        Some(crate::RestoreScanCursorProfile::DurableOpaqueV1)
+    );
+    assert_eq!(
+        first.cursor_profile,
+        crate::RestoreScanCursorProfile::DurableOpaqueV1
+    );
+    first.validate_for_request(&request).unwrap();
+    assert_eq!(first.records, vec![first_record]);
+    let cursor = first.next_cursor.unwrap();
+    assert!(!cursor.is_legacy());
+    let next_request = RestoreScanRequest {
+        cursor: Some(cursor),
+        ..request
+    };
+    let last = backend
+        .scan_restore_records(next_request.clone())
+        .await
+        .unwrap();
+    last.validate_for_request(&next_request).unwrap();
+    assert_eq!(last.records, vec![last_record]);
+    assert!(last.complete);
+    assert_eq!(
+        FakeSessionBackend::new().restore_scan_cursor_profile(),
+        Some(crate::RestoreScanCursorProfile::LegacyCompatibility)
+    );
+}
+
+#[tokio::test]
+async fn lab_restore_rejects_legacy_foreign_scoped_and_changed_snapshot_cursors() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    insert_restore_record(&backend, b"a").await;
+    insert_restore_record(&backend, b"z").await;
+    let request = RestoreScanRequest::all(1);
+    let cursor = backend
+        .scan_restore_records(request.clone())
+        .await
+        .unwrap()
+        .next_cursor
+        .unwrap();
+    let next = RestoreScanRequest {
+        cursor: Some(cursor),
+        ..request.clone()
+    };
+    let legacy = RestoreScanRequest {
+        cursor: Some(RestoreScanCursor::from_offset(1)),
+        ..request
+    };
+    assert_eq!(
+        backend.scan_restore_records(legacy).await,
+        Err(StoreError::RestoreScanCursorStale)
+    );
+    assert_eq!(
+        FakeSessionBackend::in_memory_lab()
+            .scan_restore_records(next.clone())
+            .await,
+        Err(StoreError::RestoreScanCursorStale)
+    );
+    let mut scoped = next.clone();
+    scoped.scope.owner = Some(OwnerId::new("other-owner").unwrap());
+    assert!(backend.scan_restore_records(scoped).await.is_err());
+    insert_restore_record(&backend, b"b").await;
+    assert_eq!(
+        backend.scan_restore_records(next).await,
+        Err(StoreError::RestoreScanCursorStale)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn lab_restore_rejects_a_cursor_after_expiry_prunes_the_snapshot() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    insert_restore_record(&backend, b"a").await;
+    let expiring = insert_restore_record(&backend, b"z").await;
+    let lease = backend
+        .acquire(
+            &expiring.key,
+            expiring.owner.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    backend
+        .refresh_ttl(&lease, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let request = RestoreScanRequest::all(1);
+    let cursor = backend
+        .scan_restore_records(request.clone())
+        .await
+        .unwrap()
+        .next_cursor
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        backend
+            .scan_restore_records(RestoreScanRequest {
+                cursor: Some(cursor),
+                ..request
+            })
+            .await,
+        Err(StoreError::RestoreScanCursorStale)
+    );
+}
+
+#[tokio::test]
+async fn lab_restore_rejects_cursor_after_batch_or_rebuild_and_at_revision_exhaustion() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    let mut value = insert_restore_record(&backend, b"a").await;
+    insert_restore_record(&backend, b"z").await;
+    let lease = backend
+        .acquire(&value.key, value.owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    value.fence = lease.fence();
+    value.generation = Generation::new(2);
+    let request = RestoreScanRequest::all(1);
+    let cursor = backend
+        .scan_restore_records(request.clone())
+        .await
+        .unwrap()
+        .next_cursor
+        .unwrap();
+    let results = backend
+        .batch(vec![SessionOp::CompareAndSet(CompareAndSet {
+            key: value.key.clone(),
+            expected_generation: Some(Generation::new(1)),
+            lease,
+            new_record: value,
+        })])
+        .await
+        .unwrap();
+    assert!(matches!(
+        results.as_slice(),
+        [SessionOpResult::CompareAndSet(Ok(
+            CompareAndSetResult::Success
+        ))]
+    ));
+    assert_eq!(
+        backend
+            .scan_restore_records(RestoreScanRequest {
+                cursor: Some(cursor),
+                ..request.clone()
+            })
+            .await,
+        Err(StoreError::RestoreScanCursorStale)
+    );
+    let cursor = backend
+        .scan_restore_records(request.clone())
+        .await
+        .unwrap()
+        .next_cursor
+        .unwrap();
+    backend.rebuild_replication_state(Vec::new()).await.unwrap();
+    assert_eq!(
+        backend
+            .scan_restore_records(RestoreScanRequest {
+                cursor: Some(cursor),
+                ..request.clone()
+            })
+            .await,
+        Err(StoreError::RestoreScanCursorStale)
+    );
+    backend.inner.lock().await.lab_restore_revision = u64::MAX;
+    assert_eq!(
+        backend.scan_restore_records(request).await,
+        Err(StoreError::RestoreScanWorkBudgetExceeded)
+    );
+}
+
+#[tokio::test]
+async fn lab_restore_sparse_scope_pages_bound_work_and_advance_without_matches() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    let maximum = crate::restore::RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE;
+    {
+        let mut state = backend.inner.lock().await;
+        for index in 0..=maximum {
+            let mut value = record(1, 1);
+            value.key.stable_id =
+                StableId::new(Bytes::copy_from_slice(&(index as u64).to_be_bytes())).unwrap();
+            state
+                .records
+                .insert(FakeSessionBackend::map_key(&value.key), value);
+        }
+    }
+    let mut request = RestoreScanRequest::all(1);
+    request.scope.owner = Some(OwnerId::new("absent-owner").unwrap());
+    let first = backend.scan_restore_records(request.clone()).await.unwrap();
+    first.validate_for_request(&request).unwrap();
+    assert!(first.records.is_empty());
+    assert_eq!(first.excluded_count, maximum);
+    request.cursor = first.next_cursor;
+    assert!(request.cursor.is_some());
+    let last = backend.scan_restore_records(request.clone()).await.unwrap();
+    last.validate_for_request(&request).unwrap();
+    assert!(last.records.is_empty());
+    assert_eq!(last.excluded_count, 1);
+    assert!(last.complete);
+}

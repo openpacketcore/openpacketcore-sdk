@@ -12,8 +12,14 @@ use crate::{
     PreparedFencedTransition,
 };
 
+mod restore;
 #[cfg(test)]
 mod tests;
+
+pub(super) struct RestoreAuthority {
+    epoch: [u8; 16],
+    key: opc_key::Zeroizing<[u8; 32]>,
+}
 
 #[derive(Clone)]
 pub(super) struct Receipt {
@@ -40,12 +46,15 @@ impl FakeSessionBackend {
     /// Records, leases, preparation tokens and receipts never survive restart.
     /// The returned allocation must be shared by all consumers in this process.
     /// It cannot coordinate other workers or grant production HA authority.
+    /// Opaque restore cursors use the SDK's authenticated seek format, scoped
+    /// to this volatile allocation and invalidated by record mutation/expiry.
     pub fn in_memory_lab() -> Self {
         let mut backend = Self::with_limits(FakeBackendLimits {
             max_tracked_keys: 100_000,
             max_replication_entries: 65_536,
         });
         backend.lab_identity = Some(rand::random());
+        backend.lab_restore_authority = Some(Arc::new(RestoreAuthority::new()));
         backend
     }
 
@@ -121,6 +130,7 @@ impl FakeSessionBackend {
         let result = self.lab_apply(&mut staged, &request, now);
         if let Ok((outcome, replication)) = &result {
             let sequence = self.next_direct_replication_sequence(&state)?;
+            state.invalidate_lab_restore_snapshot();
             match staged.records.remove(&key) {
                 Some(record) => {
                     state.records.insert(key.clone(), record);
