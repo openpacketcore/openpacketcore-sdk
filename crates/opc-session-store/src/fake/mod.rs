@@ -56,6 +56,8 @@ pub struct FakeSessionBackend {
     clock: Arc<dyn Clock>,
     #[cfg(feature = "lab-memory")]
     lab_identity: Option<[u8; 32]>,
+    #[cfg(feature = "lab-memory")]
+    lab_restore_authority: Option<Arc<lab::RestoreAuthority>>,
 }
 
 struct FakeBackendState {
@@ -70,6 +72,8 @@ struct FakeBackendState {
     watchers: Vec<ReplicationWatcher>,
     #[cfg(feature = "lab-memory")]
     lab_transitions: HashMap<crate::FencedTransitionRequestId, lab::Receipt>,
+    #[cfg(feature = "lab-memory")]
+    lab_restore_revision: u64,
 }
 
 /// Canonical raw tuple used for fake-backend lookup and restore ordering.
@@ -98,6 +102,8 @@ impl FakeBackendState {
             watchers: Vec::new(),
             #[cfg(feature = "lab-memory")]
             lab_transitions: HashMap::new(),
+            #[cfg(feature = "lab-memory")]
+            lab_restore_revision: 0,
         }
     }
 
@@ -114,12 +120,25 @@ impl FakeBackendState {
             watchers: Vec::new(),
             #[cfg(feature = "lab-memory")]
             lab_transitions: self.lab_transitions.clone(),
+            #[cfg(feature = "lab-memory")]
+            lab_restore_revision: self.lab_restore_revision,
         }
     }
 
     fn commit_staged_data(&mut self, mut staged: Self) {
+        #[cfg(feature = "lab-memory")]
+        {
+            // Imports and replay must never restore an earlier cursor revision.
+            staged.lab_restore_revision = self.lab_restore_revision.saturating_add(1);
+        }
         staged.watchers = std::mem::take(&mut self.watchers);
         *self = staged;
+    }
+
+    #[cfg(feature = "lab-memory")]
+    fn invalidate_lab_restore_snapshot(&mut self) {
+        // Exhaustion permanently disables scans rather than reusing a revision.
+        self.lab_restore_revision = self.lab_restore_revision.saturating_add(1);
     }
 }
 
@@ -191,6 +210,8 @@ impl FakeSessionBackend {
             clock: Arc::new(TokioVirtualClock::new()),
             #[cfg(feature = "lab-memory")]
             lab_identity: None,
+            #[cfg(feature = "lab-memory")]
+            lab_restore_authority: None,
         }
     }
 
@@ -276,6 +297,8 @@ impl FakeSessionBackend {
     }
 
     fn prune_state(state: &mut FakeBackendState, now: Timestamp) {
+        #[cfg(feature = "lab-memory")]
+        let previous_records = state.records.len();
         state.records.retain(|_, record| {
             if let Some(expires_at) = record.expires_at {
                 expires_at > now
@@ -283,6 +306,10 @@ impl FakeSessionBackend {
                 true
             }
         });
+        #[cfg(feature = "lab-memory")]
+        if state.records.len() != previous_records {
+            state.invalidate_lab_restore_snapshot();
+        }
         state
             .leases
             .retain(|_, entry| entry.active && entry.expires_at > now);
@@ -339,6 +366,8 @@ impl FakeSessionBackend {
         op: CompareAndSet,
         now: Timestamp,
     ) -> Result<CompareAndSetResult, StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         validate_stored_record_expiry_at(&op.new_record, now)?;
         if !self.caps.atomic_compare_and_set {
             return Err(StoreError::CapabilityNotSupported(
@@ -421,6 +450,8 @@ impl FakeSessionBackend {
         lease: &LeaseGuard,
         now: Timestamp,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         if !self.caps.monotonic_fencing_token {
             return Err(StoreError::CapabilityNotSupported(
                 "monotonic_fencing_token".into(),
@@ -447,6 +478,8 @@ impl FakeSessionBackend {
         ttl: Duration,
         now: Timestamp,
     ) -> Result<Timestamp, StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         let expires_at = checked_session_deadline(now, ttl)?;
         if !self.caps.per_key_ttl {
             return Err(StoreError::CapabilityNotSupported("per_key_ttl".into()));
@@ -484,6 +517,8 @@ impl FakeSessionBackend {
         now: Timestamp,
         max_tracked_keys: usize,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         if Self::contains_protected_roster_established_create(&op) {
             return Err(StoreError::CapabilityNotSupported(
                 Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
@@ -851,6 +886,10 @@ impl Default for FakeSessionBackend {
 #[async_trait]
 impl SessionBackend for FakeSessionBackend {
     fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
+        #[cfg(feature = "lab-memory")]
+        if self.caps.restore_scan && self.lab_restore_authority.is_some() {
+            return Some(crate::RestoreScanCursorProfile::DurableOpaqueV1);
+        }
         self.caps
             .restore_scan
             .then_some(crate::RestoreScanCursorProfile::LegacyCompatibility)
@@ -1051,6 +1090,10 @@ impl SessionBackend for FakeSessionBackend {
     ) -> Result<RestoreScanPage, StoreError> {
         if !self.caps.restore_scan {
             return Err(StoreError::CapabilityNotSupported("restore_scan".into()));
+        }
+        #[cfg(feature = "lab-memory")]
+        if self.lab_restore_authority.is_some() {
+            return self.lab_scan_restore_records(request).await;
         }
         request.validate()?;
         if request

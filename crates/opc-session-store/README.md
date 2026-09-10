@@ -1672,6 +1672,12 @@ request receipts, CAS, expiry and fencing within that allocation. Prepared
 tokens bind the allocation that created them. Ordinary `FakeSessionBackend`
 construction still withholds atomic prepared-transition capability.
 
+Lab restore scans use the SDK's authenticated `DurableOpaqueV1` seek-cursor
+format with an allocation-local key and incarnation. Cursors reject another
+allocation, changed scope, record mutation, expiry pruning, or state rebuild;
+pages retain the existing row and byte bounds. The profile names the cursor
+format, not persistence: the lab loses its cursor authority on restart too.
+
 The process retains at most 100,000 tracked keys and 65,536 transition receipts
 and preparation tokens. History exhaustion rejects new requests rather than
 evicting request identities or fence floors. Restart loses all state and is

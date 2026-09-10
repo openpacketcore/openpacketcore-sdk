@@ -13,6 +13,10 @@ keywords = ["5g", "gtpu", "gtp", "linux", "packet-core"]
 categories = ["network-programming", "os::linux-apis"]
 publish = false
 
+[features]
+# Optional conformance coverage for the explicitly volatile session-store lab.
+lab-memory = ["opc-session-store/lab-memory"]
+
 [dependencies]
 bytes = { workspace = true }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
