@@ -42,6 +42,9 @@ use crate::{
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
 };
 
+#[cfg(feature = "lab-memory")]
+mod lab;
+
 /// In-memory session backend and lease manager for deterministic tests.
 ///
 /// `Clone` is cheap (Arc) so multiple tasks can share the same logical backend.
@@ -51,6 +54,8 @@ pub struct FakeSessionBackend {
     caps: BackendCapabilities,
     limits: FakeBackendLimits,
     clock: Arc<dyn Clock>,
+    #[cfg(feature = "lab-memory")]
+    lab_identity: Option<[u8; 32]>,
 }
 
 struct FakeBackendState {
@@ -63,6 +68,8 @@ struct FakeBackendState {
     last_replication_sequence: u64,
     replication_log: Vec<ReplicationEntry>,
     watchers: Vec<ReplicationWatcher>,
+    #[cfg(feature = "lab-memory")]
+    lab_transitions: HashMap<crate::FencedTransitionRequestId, lab::Receipt>,
 }
 
 /// Canonical raw tuple used for fake-backend lookup and restore ordering.
@@ -89,6 +96,8 @@ impl FakeBackendState {
             last_replication_sequence: 0,
             replication_log: Vec::new(),
             watchers: Vec::new(),
+            #[cfg(feature = "lab-memory")]
+            lab_transitions: HashMap::new(),
         }
     }
 
@@ -103,6 +112,8 @@ impl FakeBackendState {
             last_replication_sequence: self.last_replication_sequence,
             replication_log: self.replication_log.clone(),
             watchers: Vec::new(),
+            #[cfg(feature = "lab-memory")]
+            lab_transitions: self.lab_transitions.clone(),
         }
     }
 
@@ -178,6 +189,8 @@ impl FakeSessionBackend {
             caps,
             limits,
             clock: Arc::new(TokioVirtualClock::new()),
+            #[cfg(feature = "lab-memory")]
+            lab_identity: None,
         }
     }
 
@@ -860,6 +873,73 @@ impl SessionBackend for FakeSessionBackend {
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
         Ok(Self::get_with_state(&state, key, now))
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn observe_fenced_transition(
+        &self,
+        key: &SessionKey,
+    ) -> Result<crate::FencedTransitionObservation, StoreError> {
+        self.require_lab_identity()?;
+        let state = self.inner.lock().await;
+        crate::FencedTransitionObservation::new(
+            Self::get_with_state(&state, key, self.clock.now_utc()),
+            Self::current_fence(&state, &Self::map_key(key)),
+        )
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<crate::AtomicFencedTransitionCapability>, StoreError> {
+        Ok(self
+            .lab_identity
+            .map(|_| crate::AtomicFencedTransitionCapability::V1))
+    }
+
+    #[cfg(feature = "lab-memory")]
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        self.lab_identity.is_some()
+    }
+
+    #[cfg(feature = "lab-memory")]
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &crate::PreparedFencedTransition,
+    ) -> bool {
+        self.lab_request(prepared).is_ok()
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn prepare_fenced_transition(
+        &self,
+        request: crate::FencedTransitionRequest,
+    ) -> Result<crate::PreparedFencedTransition, StoreError> {
+        let identity = self.require_lab_identity()?;
+        request.validate_at(self.clock.now_utc())?;
+        crate::PreparedFencedTransition::from_unprotected_request(request)?.with_protection(
+            crate::fenced_transition::PreparedFencedTransitionProtection::LabMemoryPhysicalV1 {
+                instance_commitment: identity,
+            },
+        )
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn fenced_transition(
+        &self,
+        prepared: &crate::PreparedFencedTransition,
+    ) -> Result<crate::FencedTransitionOutcome, crate::FencedTransitionExecuteError> {
+        self.lab_execute(prepared)
+            .await
+            .map_err(crate::FencedTransitionExecuteError::Rejected)
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn fenced_transition_status(
+        &self,
+        prepared: &crate::PreparedFencedTransition,
+    ) -> Result<crate::FencedTransitionStatus, StoreError> {
+        self.lab_status(prepared).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
