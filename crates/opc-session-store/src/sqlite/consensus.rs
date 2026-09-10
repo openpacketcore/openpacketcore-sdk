@@ -24,7 +24,9 @@ use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
+use opc_consensus::engine::{
+    Entry, EntryPayload, LogId, Membership, StorageError, StoredMembership, Vote,
+};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::types::ValueRef;
@@ -5786,6 +5788,12 @@ pub(crate) struct SqliteConsensusCore {
     /// Only one unvalidated receiver may own disk space for this core.
     pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
+    /// The first failed state-machine snapshot install is fatal to this core.
+    /// Wake a concurrently dispatched purge with that original error; the
+    /// engine cannot consume its state-machine notification while awaiting
+    /// the purge's application frontier.
+    pub(crate) snapshot_install_failure:
+        tokio::sync::watch::Sender<Option<StorageError<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
@@ -6490,6 +6498,7 @@ impl SqliteConsensusCore {
         #[cfg(not(target_os = "linux"))]
         let _ = fresh_native_basis;
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
+        let (snapshot_install_failure, _) = tokio::sync::watch::channel(None);
 
         if let Some(diagnostics) = backend.consensus_diagnostics.as_ref() {
             match protected_roster_occupancy {
@@ -6531,6 +6540,7 @@ impl SqliteConsensusCore {
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             applied_progress,
+            snapshot_install_failure,
             watchers: Arc::clone(&backend.watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),

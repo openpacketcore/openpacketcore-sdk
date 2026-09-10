@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::persistence_protocol::{self, PersistenceProtocol};
 use super::raft_adapter::{
     FixedQuorumEngineAdmission, SessionRaftAdapterError, SessionRaftNetworkFactory,
     SessionRaftPeerDirectory, SessionRaftRpcHandler,
@@ -51,8 +52,9 @@ use super::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcFamily,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionMutationOutcome, SessionRaft, SessionRaftTypeConfig,
-    SessionTopologyMemberBinding, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SessionMutationIntent, SessionMutationOutcome, SessionPersistenceDrainError,
+    SessionPersistenceHealth, SessionPersistenceMode, SessionRaft, SessionRaftTypeConfig,
+    SessionStorageState, SessionTopologyMemberBinding, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::backend::{
@@ -127,6 +129,7 @@ use crate::readiness::{
     DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
     FixedQuorumReadinessReport, FixedQuorumTrafficAuthority, PlacementResiliencePolicy,
     PlacementResilienceReport, ReplicaReadinessObservation, ReplicaReadinessOutcome,
+    SessionQuorumReadinessReport,
 };
 use crate::record::StoredSessionRecord;
 use crate::restore::{RestoreScanPage, RestoreScanRequest};
@@ -156,7 +159,9 @@ pub fn validate_consensus_physical_fenced_transition_request(
     Ok(())
 }
 
+mod async_persistence;
 mod membership;
+mod quorum_readiness;
 
 /// Feature-gated signing fixtures for live consensus integration coverage.
 #[cfg(feature = "test-control")]
@@ -378,6 +383,10 @@ fn attestation_deadline_from_verification_start(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ConsensusSessionStoreOpenError {
+    /// An existing storage root selected another persistence mode. Changing
+    /// acknowledgement semantics never converts or resets retained state.
+    #[error("session consensus persistence mode does not match this storage root")]
+    PersistenceModeMismatch,
     /// The selected filesystem cannot satisfy the explicit integrity policy.
     #[error("required snapshot integrity is unavailable; qualify fs-verity storage or explicitly select portable verified snapshots")]
     SnapshotIntegrityUnavailable,
@@ -459,6 +468,7 @@ pub(crate) struct OperatorRecoveryCommitRequest {
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
+            SessionConsensusStorageError::PersistenceModeMismatch => Self::PersistenceModeMismatch,
             SessionConsensusStorageError::SnapshotIntegrityUnavailable => {
                 Self::SnapshotIntegrityUnavailable
             }
@@ -773,6 +783,10 @@ struct LocalProposalExecution {
     proposal_permit: tokio::sync::OwnedSemaphorePermit,
     operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
     cohort_freeze: Option<Arc<AtomicBool>>,
+    /// Private observation of this exact accepted client-write completion.
+    /// Never serialized in the ordinary mutation forwarding contract.
+    cold_completion:
+        Option<tokio::sync::oneshot::Sender<async_persistence::ColdProposalCompletion>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1794,6 +1808,8 @@ impl ConsensusStoreDiagnosticCounters {
 
 struct ConsensusSessionStoreInner {
     raft: SessionRaft,
+    persistence: SessionPersistenceMode,
+    persistence_protocol: PersistenceProtocol,
     storage_shutdown: storage::ConsensusStorageShutdownObserver,
     #[cfg(target_os = "linux")]
     private_wal: Option<Arc<crate::sqlite::consensus::wal::Wal>>,
@@ -3164,6 +3180,68 @@ impl ConsensusSessionStore {
         operation_timeout: Duration,
         snapshot_integrity: super::SnapshotIntegrityPolicy,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_fixed_quorum_with_clock_and_persistence(
+            topology,
+            backend,
+            snapshot_dir,
+            peers,
+            clock,
+            operation_timeout,
+            snapshot_integrity,
+            SessionPersistenceMode::Durable,
+        )
+        .await
+    }
+
+    /// Open an immutable fixed quorum with an explicit acknowledgement policy.
+    ///
+    /// Every voter must select the same persistence mode. Snapshot integrity
+    /// remains independent. Existing durable openers retain their exact
+    /// default. A root cannot be reopened under a different mode.
+    ///
+    /// In `Async`, a successful operation still requires actual quorum
+    /// replication and application. Disk persistence can lag success; losing
+    /// the volatile quorum can lose acknowledged results. A completed local
+    /// generation is local recovery input, never a current quorum proof.
+    pub async fn open_fixed_quorum_with_persistence(
+        topology: ValidatedQuorumTopology,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+        snapshot_integrity: super::SnapshotIntegrityPolicy,
+        persistence: SessionPersistenceMode,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_fixed_quorum_with_clock_and_persistence(
+            topology,
+            backend,
+            snapshot_dir,
+            peers,
+            Arc::new(SystemClock),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+            snapshot_integrity,
+            persistence,
+        )
+        .await
+    }
+
+    /// Open a fixed quorum with an explicit persistence mode, logical clock,
+    /// complete operation deadline and independent snapshot integrity policy.
+    ///
+    /// This has the same admission and acknowledgement semantics as
+    /// [`Self::open_fixed_quorum_with_persistence`]. The supplied deadline
+    /// covers each complete operation, including routing, quorum and apply;
+    /// it does not change the background persistence schedule.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_fixed_quorum_with_clock_and_persistence(
+        topology: ValidatedQuorumTopology,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+        snapshot_integrity: super::SnapshotIntegrityPolicy,
+        persistence: SessionPersistenceMode,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
         if !cfg!(target_os = "linux") {
             return Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform);
         }
@@ -3214,8 +3292,21 @@ impl ConsensusSessionStore {
         )?);
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
         let backend = backend.with_consensus_diagnostics(Arc::clone(&diagnostics));
+        #[cfg(target_os = "linux")]
+        let reopened_async = persistence == SessionPersistenceMode::Async
+            && backend
+                .native_owner
+                .as_ref()
+                .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?
+                .persistence_mode(identity)
+                .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?
+                .is_some();
+        #[cfg(not(target_os = "linux"))]
+        let reopened_async = false;
+        let persistence_protocol = PersistenceProtocol::new(persistence, reopened_async);
         let network =
-            SessionRaftNetworkFactory::try_new(identity, local_node_id, members.clone(), peers)?;
+            SessionRaftNetworkFactory::try_new(identity, local_node_id, members.clone(), peers)?
+                .with_persistence(persistence_protocol.clone());
         let peer_directory = network.peer_directory();
         let bindings = topology_node_bindings(&topology);
         let placement_policy = topology
@@ -3224,7 +3315,7 @@ impl ConsensusSessionStore {
             .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
         let roster_attestation_trust_root = topology.roster_attestation_trust_root().cloned();
         let (log_store, state_machine, storage_identity) =
-            storage::open_fixed_with_member_bindings_and_roster_attestation_root(
+            storage::open_fixed_with_persistence_and_roster_attestation_root(
                 &backend,
                 snapshot_dir,
                 identity,
@@ -3234,6 +3325,7 @@ impl ConsensusSessionStore {
                 placement_policy,
                 roster_attestation_trust_root.clone(),
                 snapshot_integrity,
+                persistence,
             )
             .await?;
         #[cfg(target_os = "linux")]
@@ -3252,7 +3344,9 @@ impl ConsensusSessionStore {
         topology_coordinator
             .load_retained_transitions(&membership_scope)
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
-        let config = Arc::new(session_raft_config()?);
+        let mut config = session_raft_config()?;
+        config.enable_elect = persistence_protocol.is_active();
+        let config = Arc::new(config);
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
@@ -3271,7 +3365,8 @@ impl ConsensusSessionStore {
                 Arc::clone(&admitted),
                 operation_timeout,
             ),
-        );
+        )
+        .with_persistence(persistence_protocol.clone());
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         let read_barrier = LinearizableReadBarrier::new(
             local_node_id,
@@ -3311,6 +3406,8 @@ impl ConsensusSessionStore {
 
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            persistence,
+            persistence_protocol,
             storage_shutdown,
             #[cfg(target_os = "linux")]
             private_wal,
@@ -3533,6 +3630,8 @@ impl ConsensusSessionStore {
 
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            persistence: SessionPersistenceMode::Durable,
+            persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
             #[cfg(target_os = "linux")]
             private_wal,
@@ -5584,6 +5683,9 @@ impl ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or(ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
+        if !self.inner.persistence_protocol.is_active() {
+            self.recover_async_before(deadline).await?;
+        }
         let initialized = tokio::time::timeout_at(deadline, self.inner.raft.is_initialized())
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?
@@ -5626,6 +5728,34 @@ impl ConsensusSessionStore {
         &self.inner.topology
     }
 
+    /// Storage acknowledgement policy chosen at construction.
+    pub fn persistence_mode(&self) -> SessionPersistenceMode {
+        self.inner.persistence
+    }
+
+    /// Observe local persistence and engine health without issuing work.
+    /// This observation grants no traffic, recovery or durability authority.
+    pub fn persistence_health(&self) -> SessionPersistenceHealth {
+        #[cfg(target_os = "linux")]
+        let storage = self
+            .inner
+            .private_wal
+            .as_ref()
+            .map(|wal| wal.storage_health());
+        #[cfg(not(target_os = "linux"))]
+        let storage = None;
+        let (storage_state, storage_failure, asynchronous) =
+            storage.unwrap_or((SessionStorageState::Unavailable, None, None));
+        SessionPersistenceHealth {
+            mode: self.persistence_mode(),
+            engine_running: self.inner.raft.metrics().borrow().running_state.is_ok(),
+            storage_state,
+            storage_failure,
+            asynchronous,
+            recovery: self.inner.persistence_protocol.recovery_state(),
+        }
+    }
+
     /// Snapshot redaction-safe status directly from the one Openraft engine.
     pub fn status(&self) -> SessionConsensusStatus {
         let current_members = self
@@ -5650,6 +5780,7 @@ impl ConsensusSessionStore {
         // exact durable applied scope is proven; engine failure and local
         // removal remain live vetoes.
         let admitted = self.inner.admitted.load(Ordering::Acquire)
+            && self.inner.persistence_protocol.is_active()
             && engine_running
             && current_members.contains(&self.inner.local_node_id)
             && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
@@ -5857,6 +5988,7 @@ impl ConsensusSessionStore {
 
     fn exact_membership_is_admitted(&self) -> bool {
         self.inner.admitted.load(Ordering::Acquire)
+            && self.inner.persistence_protocol.is_active()
             && self.engine_is_running_in_local_scope()
             && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
                 || self.fixed_durable_quorum_scope_is_exact())
@@ -6164,6 +6296,9 @@ impl ConsensusSessionStore {
             DurableReadinessState::TopologyInvalid => {
                 FixedQuorumTrafficAuthority::StructuralRecoveryRequired
             }
+            DurableReadinessState::PersistenceNotDurable => {
+                FixedQuorumTrafficAuthority::PersistenceNotDurable
+            }
         };
         FixedQuorumReadinessReport::new(traffic_authority, placement_resilience, durable_readiness)
     }
@@ -6172,6 +6307,19 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> DurableReadinessReport {
+        if self.persistence_mode() != SessionPersistenceMode::Durable {
+            return self.persistence_not_durable_readiness_report();
+        }
+        self.probe_fixed_quorum_readiness_before(deadline).await
+    }
+
+    async fn probe_fixed_quorum_readiness_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> DurableReadinessReport {
+        if !self.inner.persistence_protocol.is_active() {
+            return self.recovery_required_durable_readiness_report();
+        }
         if let Some(report) = self.local_authoritative_recovery_report() {
             return report;
         }
@@ -6186,7 +6334,7 @@ impl ConsensusSessionStore {
             Ok(Ok(false)) => return self.topology_invalid_readiness_report(),
             Ok(Err(_)) | Err(_) => return self.unavailable_durable_readiness_report(),
         }
-        let report = self.probe_durable_readiness_before(deadline).await;
+        let report = self.probe_quorum_readiness_before(deadline).await;
         if let Some(report) = self.local_authoritative_recovery_report() {
             return report;
         }
@@ -6309,6 +6457,29 @@ impl ConsensusSessionStore {
     }
 
     async fn probe_durable_readiness_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> DurableReadinessReport {
+        if self.persistence_mode() != SessionPersistenceMode::Durable {
+            return self.persistence_not_durable_readiness_report();
+        }
+        self.probe_quorum_readiness_before(deadline).await
+    }
+
+    fn persistence_not_durable_readiness_report(&self) -> DurableReadinessReport {
+        let configured = self.current_member_count().unwrap_or(0);
+        DurableReadinessReport::new(
+            DurableReadinessState::PersistenceNotDurable,
+            configured,
+            0,
+            0,
+            configured / 2 + 1,
+            None,
+            Vec::new(),
+        )
+    }
+
+    async fn probe_quorum_readiness_before(
         &self,
         deadline: tokio::time::Instant,
     ) -> DurableReadinessReport {
@@ -7348,11 +7519,33 @@ impl ConsensusSessionStore {
 
     async fn apply_on_local_leader_inner(
         &self,
+        request: ForwardMutationRequest,
+        origin: SessionConsensusNodeId,
+        deadline: tokio::time::Instant,
+        allow_operator_recovery: bool,
+        cohort_freeze: Option<Arc<AtomicBool>>,
+    ) -> ForwardMutationReply {
+        self.apply_on_local_leader_observed(
+            request,
+            origin,
+            deadline,
+            allow_operator_recovery,
+            cohort_freeze,
+            None,
+        )
+        .await
+    }
+
+    async fn apply_on_local_leader_observed(
+        &self,
         mut request: ForwardMutationRequest,
         origin: SessionConsensusNodeId,
         deadline: tokio::time::Instant,
         allow_operator_recovery: bool,
         cohort_freeze: Option<Arc<AtomicBool>>,
+        cold_completion: Option<
+            tokio::sync::oneshot::Sender<async_persistence::ColdProposalCompletion>,
+        >,
     ) -> ForwardMutationReply {
         if let Err(error) =
             validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
@@ -7973,6 +8166,7 @@ impl ConsensusSessionStore {
                     proposal_permit,
                     operation_guard,
                     cohort_freeze,
+                    cold_completion,
                 },
                 fenced_transition_admission,
                 deadline,
@@ -8023,6 +8217,7 @@ impl ConsensusSessionStore {
             proposal_permit,
             operation_guard,
             cohort_freeze,
+            cold_completion,
         } = execution;
         let Ok((identity, voters)) = self.current_scope() else {
             return ForwardMutationReply::Unavailable;
@@ -8162,6 +8357,7 @@ impl ConsensusSessionStore {
                 std::time::Instant::now(),
             )
         });
+        let committed_request_id = command.request_id;
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
@@ -8248,10 +8444,18 @@ impl ConsensusSessionStore {
             }
             let (reply, applied_observation) = match response.await {
                 Err(_) => (ForwardMutationReply::OutcomeUnknown, None),
-                Ok(Ok(response)) => (
-                    ForwardMutationReply::Applied(Box::new(response.data)),
-                    roster_response_observation,
-                ),
+                Ok(Ok(response)) => {
+                    if let Some(completion) = cold_completion {
+                        let _ = completion.send(async_persistence::ColdProposalCompletion {
+                            request_id: committed_request_id,
+                            log_id: response.log_id,
+                        });
+                    }
+                    (
+                        ForwardMutationReply::Applied(Box::new(response.data)),
+                        roster_response_observation,
+                    )
+                }
                 Ok(Err(error)) => (
                     client_write_receiver_error_reply(error, reroute_receiver_forward_to_leader),
                     None,
@@ -8419,6 +8623,7 @@ impl ConsensusSessionStore {
                     proposal_permit,
                     operation_guard,
                     cohort_freeze: None,
+                    cold_completion: None,
                 },
                 None,
                 deadline,
@@ -8635,6 +8840,12 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
         let payload =
             encode_bounded(request).map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
+        let payload = persistence_protocol::wrap_payload(
+            self.persistence_mode(),
+            payload,
+            family.max_request_payload_bytes(),
+        )
+        .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
         let wire = SessionConsensusWireRequest::try_new(
             identity,
             self.inner.local_node_id,
@@ -8652,7 +8863,9 @@ impl ConsensusSessionStore {
         let payload = response
             .result
             .map_err(ConsensusPeerCallFailure::AuthenticatedRejection)?;
-        decode_bounded(&payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
+        let payload = persistence_protocol::unwrap_payload(self.persistence_mode(), &payload)
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        decode_bounded(payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
     }
 
     /// Forward exactly one protected-roster mutation through the distinct,
@@ -8674,6 +8887,12 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
         let payload = encode_roster_bounded(&BorrowedForwardRequest::Mutation(request))
             .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
+        let payload = persistence_protocol::wrap_payload(
+            self.persistence_mode(),
+            payload,
+            SessionConsensusRpcFamily::ForwardRosterMutation.max_request_payload_bytes(),
+        )
+        .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
         let wire = SessionConsensusWireRequest::try_new(
             identity,
             self.inner.local_node_id,
@@ -8691,7 +8910,9 @@ impl ConsensusSessionStore {
         let payload = response
             .result
             .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
-        decode_roster_bounded(&payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
+        let payload = persistence_protocol::unwrap_payload(self.persistence_mode(), &payload)
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        decode_roster_bounded(payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
@@ -10976,7 +11197,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
     async fn handle(
         &self,
         authenticated_sender: SessionConsensusNodeId,
-        request: SessionConsensusWireRequest,
+        mut request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
         if request.validate().is_err()
             || request.schema_version != SESSION_CONSENSUS_SCHEMA_VERSION
@@ -10987,20 +11208,51 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
             };
         }
 
-        match request.family {
+        if matches!(
+            request.family,
             SessionConsensusRpcFamily::Vote
-            | SessionConsensusRpcFamily::AppendEntries
-            | SessionConsensusRpcFamily::AppendEntriesRoster
-            | SessionConsensusRpcFamily::InstallSnapshot => {
-                let deadline = tokio::time::Instant::now()
-                    .checked_add(self.store.inner.operation_timeout)
-                    .unwrap_or_else(tokio::time::Instant::now);
-                self.store
-                    .inner
-                    .raft_handler
-                    .handle_before(authenticated_sender, request, deadline)
-                    .await
-            }
+                | SessionConsensusRpcFamily::AppendEntries
+                | SessionConsensusRpcFamily::AppendEntriesRoster
+                | SessionConsensusRpcFamily::InstallSnapshot
+        ) {
+            let deadline = self
+                .store
+                .operation_deadline_from(tokio::time::Instant::now());
+            return self
+                .store
+                .inner
+                .raft_handler
+                .handle_before(authenticated_sender, request, deadline)
+                .await;
+        }
+        request.payload = match persistence_protocol::unwrap_owned_payload(
+            self.store.persistence_mode(),
+            request.payload,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => return SessionConsensusWireResponse { result: Err(error) },
+        };
+        persistence_protocol::wrap_response(
+            self.store.persistence_mode(),
+            self.handle_application(authenticated_sender, request).await,
+        )
+    }
+}
+
+impl SessionConsensusService {
+    async fn handle_application(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        // A cold replica can request a live witness from a different active
+        // member, but it cannot itself serve application or capability RPCs.
+        if !self.store.inner.persistence_protocol.is_active() {
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Rejected),
+            };
+        }
+        match request.family {
             SessionConsensusRpcFamily::ForwardMutation => {
                 if !self
                     .store
@@ -11089,6 +11341,15 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                     return SessionConsensusWireResponse {
                         result: Err(SessionConsensusPeerError::ScopeMismatch),
                     };
+                }
+                if request
+                    .payload
+                    .starts_with(persistence_protocol::COLD_BARRIER_WIRE)
+                {
+                    return self
+                        .store
+                        .handle_async_cold_barrier(authenticated_sender, &request.payload)
+                        .await;
                 }
                 if decode_bounded::<ReadBarrierRequest>(&request.payload).is_ok() {
                     let deadline = tokio::time::Instant::now()
@@ -19058,6 +19319,7 @@ mod membership_tests {
                     proposal_permit,
                     operation_guard,
                     cohort_freeze: None,
+                    cold_completion: None,
                 },
                 None,
                 deadline,
@@ -22974,6 +23236,7 @@ mod membership_tests {
                     proposal_permit,
                     operation_guard,
                     cohort_freeze: None,
+                    cold_completion: None,
                 },
                 None,
                 tokio::time::Instant::now() + Duration::from_secs(1),

@@ -382,6 +382,92 @@ async fn open() -> Result<(), opc_session_store::StoreError> {
 }
 ```
 
+### Fixed-quorum asynchronous persistence
+
+Fixed three- and five-voter stores support an explicit
+`SessionPersistenceMode::{Durable, Async}` storage choice. Existing constructors
+and `SessionPersistenceMode::default()` select `Durable`. Use the same fixed
+topology, authenticated peers, encryption wrappers, and operation APIs as in
+the recipe above; select the persistence mode when opening each voter:
+
+```rust
+let store = ConsensusSessionStore::open_fixed_quorum_with_clock_and_persistence(
+    topology,
+    SqliteSessionBackend::open("voter-0.sqlite")?,
+    "snapshots-voter-0",
+    consensus_peers,
+    std::sync::Arc::new(opc_session_store::clock::SystemClock),
+    std::time::Duration::from_millis(800),
+    SnapshotIntegrityPolicy::PortableVerified,
+    SessionPersistenceMode::Async,
+).await?;
+```
+
+`open_fixed_quorum_with_persistence(topology, backend, snapshot_dir, peers,
+snapshot_integrity, persistence)` supplies `SystemClock` and the existing
+ten-second SDK default instead. The explicit clock constructor above preserves
+an 800 ms complete-operation deadline for consumers requiring that bound.
+Background scheduling never extends the supplied foreground deadline.
+Both constructors are Linux-only and require file-backed storage.
+
+| Contract | `Durable` | `Async` |
+|:--|:--|:--|
+| Successful mutation | Durable log acknowledgement, real quorum replication, and committed application. | Validated resident storage, real quorum replication, and committed application. |
+| Disk progress | Required before the durable storage acknowledgement. | One coalescing writer persists and selects complete local generations after resident acknowledgement. |
+| Ordinary restart | Reopens the validated durable state under the existing admission checks. | Every existing root starts quarantined and requires catch-up from a surviving live quorum. |
+| Readiness API | Existing durable probes or `probe_fixed_quorum_readiness`. | `probe_fixed_quorum_readiness`; durable probes return `PersistenceNotDurable`. |
+
+An Async success can precede disk persistence. Loss of the live volatile quorum
+can lose acknowledged results. Even a completed local generation is only
+local recovery input; it does not grant current quorum or traffic authority.
+Every voter must select the same mode. The durable root binds that choice and
+rejects a different mode on reopen; engine and forwarded-control traffic also
+reject mixed modes. Changing snapshot integrity does not select persistence.
+No automatic conversion or cross-mode recovery is provided.
+
+Install `rpc_handler()` before calling `initialize_cluster()` on every startup.
+For an existing Async root, this call obtains a genuinely new committed entry
+from the other live voters, admits repair only from its certified leader, and
+waits for exact local application before allowing votes and traffic. A timeout
+or missing live majority returns `RecoveryRequired`. A later call may continue
+validated catch-up or obtain a fresh attempt. An all-cold quorum stays closed;
+local disk progress, cached responses, and recreating storage do not supply a
+supported recovery authority.
+
+Gate traffic on
+`store.probe_fixed_quorum_readiness().await.traffic_authority().is_granted()`.
+The returned `SessionQuorumReadinessReport` includes the selected mode,
+committed barrier, separate placement assessment, and passive persistence
+health. Each subsequent operation still performs its own authority checks.
+The `_at` and placement-attestation variants preserve the same quorum contract.
+
+`persistence_health()` reports engine/storage lifecycle, first typed failure,
+Async admission posture, resident/completed generation and sequence, local
+completed committed/applied indices, lag, extent limit, and saturation. It is
+a passive observation. The writer coalesces changes with a 250 ms capture
+schedule and at most one detached generation per voter; 250 ms is not a
+persistence-latency guarantee. The current generation extent ceiling is 8 GiB,
+separate from the bounded journal/verification working set and any process RSS
+qualification. There is no per-operation disk queue to fill before success.
+
+Ordinary background I/O failures are latched and stop persistence. Resident
+quorum operations may continue while the storage owner remains usable and its
+finite allocation permits progress. Corruption or ownership failures fence
+the owner. Monitor both `storage_failure` and `asynchronous.background_failure`;
+`saturated` identifies a recorded storage/memory capacity failure. A failed
+writer does not retry indefinitely or erase an already returned operation
+result.
+
+`drain_async_persistence().await` explicitly requests local persistence through
+the resident cut captured by that call, within the configured operation
+deadline. Later concurrent mutations need not be included. A timeout or caller
+cancellation leaves the writer responsible for its accepted work; typed drain
+errors distinguish deadline, failure, unavailable owner, and wrong mode.
+`shutdown()` joins owned work and reports failed drain. Neither operation
+establishes quorum persistence or permits an all-cold restart. See
+[ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md) for the
+storage and cold-admission contract.
+
 ### Identity invariants and legacy SQLite admission
 
 `StableId` contains exactly 1 through 64 opaque bytes. Its private storage and

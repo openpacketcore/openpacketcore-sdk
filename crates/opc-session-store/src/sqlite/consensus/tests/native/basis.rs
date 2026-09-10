@@ -9,6 +9,7 @@ use std::sync::{
 use std::time::Instant;
 
 mod application;
+mod asynchronous;
 mod cold_reads;
 mod export;
 mod public_reads;

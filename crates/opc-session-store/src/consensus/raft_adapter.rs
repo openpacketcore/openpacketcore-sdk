@@ -26,6 +26,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
 
+use super::persistence_protocol::{self, PersistenceProtocol};
+
 use super::{
     SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
@@ -844,6 +846,7 @@ fn validate_peer_transition_scope(
 pub(crate) struct SessionRaftNetworkFactory {
     local_node_id: SessionConsensusNodeId,
     peer_directory: SessionRaftPeerDirectory,
+    persistence: PersistenceProtocol,
 }
 
 impl SessionRaftNetworkFactory {
@@ -857,6 +860,7 @@ impl SessionRaftNetworkFactory {
     ) -> Result<Self, SessionRaftAdapterError> {
         Ok(Self {
             local_node_id,
+            persistence: PersistenceProtocol::default(),
             peer_directory: SessionRaftPeerDirectory::try_new(
                 identity,
                 local_node_id,
@@ -875,6 +879,7 @@ impl SessionRaftNetworkFactory {
     ) -> Result<Self, SessionRaftAdapterError> {
         Ok(Self {
             local_node_id,
+            persistence: PersistenceProtocol::default(),
             peer_directory: SessionRaftPeerDirectory::try_new_candidate(
                 current_identity,
                 local_node_id,
@@ -886,6 +891,11 @@ impl SessionRaftNetworkFactory {
     /// Shared dynamic directory used by the membership transition driver.
     pub(crate) fn peer_directory(&self) -> SessionRaftPeerDirectory {
         self.peer_directory.clone()
+    }
+
+    pub(crate) fn with_persistence(mut self, persistence: PersistenceProtocol) -> Self {
+        self.persistence = persistence;
+        self
     }
 }
 
@@ -910,6 +920,7 @@ impl RaftNetworkFactory<SessionRaftTypeConfig> for SessionRaftNetworkFactory {
             local_node_id: self.local_node_id,
             target,
             peer_directory: self.peer_directory.clone(),
+            persistence: self.persistence.clone(),
         }
     }
 }
@@ -919,6 +930,7 @@ pub(crate) struct SessionRaftNetwork {
     local_node_id: SessionConsensusNodeId,
     target: SessionConsensusNodeId,
     peer_directory: SessionRaftPeerDirectory,
+    persistence: PersistenceProtocol,
 }
 
 impl fmt::Debug for SessionRaftNetwork {
@@ -954,6 +966,11 @@ impl SessionRaftNetwork {
         Resp: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
     {
+        if !self.persistence.is_active() {
+            return Err(EngineRpcError::Unreachable(Unreachable::new(
+                &SessionConsensusPeerError::Rejected,
+            )));
+        }
         // Keep the route-generation permit for the complete peer call. A
         // uniform apply waits for all predecessor-scoped calls already in
         // flight before publishing successor routes.
@@ -970,6 +987,12 @@ impl SessionRaftNetwork {
             )));
         }
 
+        let payload = persistence_protocol::wrap_payload(
+            self.persistence.mode(),
+            payload,
+            family.max_request_payload_bytes(),
+        )
+        .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
         let wire = SessionConsensusWireRequest::try_new(
             route.identity,
             self.local_node_id,
@@ -990,10 +1013,12 @@ impl SessionRaftNetwork {
         let payload = response
             .result
             .map_err(|error| map_peer_error(error, action, self, hard_ttl))?;
-        let result: Result<Resp, RaftError<SessionConsensusNodeId, E>> = decode_bounded(&payload)
+        let payload = persistence_protocol::unwrap_payload(self.persistence.mode(), &payload)
+            .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
+        let result: Result<Resp, RaftError<SessionConsensusNodeId, E>> = decode_bounded(payload)
             .map_err(|error| {
-            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
-        })?;
+                EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+            })?;
         result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
     }
 
@@ -1006,12 +1031,37 @@ impl SessionRaftNetwork {
     ) -> Result<AppendEntriesResponse<SessionConsensusNodeId>, EngineRpcError> {
         let entry_count = request.entries.len();
         let roster_append = is_singleton_roster_append(request);
+        let family = if roster_append {
+            SessionConsensusRpcFamily::AppendEntriesRoster
+        } else {
+            SessionConsensusRpcFamily::AppendEntries
+        };
         let payload = match if roster_append {
             encode_roster_bounded(request)
         } else {
             encode_bounded(request)
         } {
-            Ok(payload) => payload,
+            Ok(payload)
+                if persistence_protocol::payload_fits(
+                    self.persistence.mode(),
+                    family,
+                    payload.len(),
+                ) =>
+            {
+                payload
+            }
+            Ok(_) => {
+                if !roster_append {
+                    if let Some(entries_hint) = append_entries_split_hint(entry_count) {
+                        return Err(EngineRpcError::PayloadTooLarge(
+                            PayloadTooLarge::new_entries_hint(entries_hint),
+                        ));
+                    }
+                }
+                return Err(EngineRpcError::Unreachable(Unreachable::new(
+                    &CodecTransportError(ConsensusCodecError::TooLarge),
+                )));
+            }
             Err(ConsensusCodecError::TooLarge) => {
                 if !roster_append {
                     if let Some(entries_hint) = append_entries_split_hint(entry_count) {
@@ -1031,11 +1081,7 @@ impl SessionRaftNetwork {
             }
         };
         self.call(
-            if roster_append {
-                SessionConsensusRpcFamily::AppendEntriesRoster
-            } else {
-                SessionConsensusRpcFamily::AppendEntries
-            },
+            family,
             opc_consensus::engine::RPCTypes::AppendEntries,
             payload,
             option,
@@ -1148,6 +1194,7 @@ pub(crate) struct SessionRaftRpcHandler {
     peer_directory: SessionRaftPeerDirectory,
     local_node_id: SessionConsensusNodeId,
     fixed_quorum_admission: Option<FixedQuorumEngineAdmission>,
+    persistence: PersistenceProtocol,
 }
 
 impl SessionRaftRpcHandler {
@@ -1161,6 +1208,7 @@ impl SessionRaftRpcHandler {
             peer_directory,
             local_node_id,
             fixed_quorum_admission: None,
+            persistence: PersistenceProtocol::default(),
         }
     }
 
@@ -1175,7 +1223,13 @@ impl SessionRaftRpcHandler {
             peer_directory,
             local_node_id,
             fixed_quorum_admission: Some(fixed_quorum_admission),
+            persistence: PersistenceProtocol::default(),
         }
+    }
+
+    pub(crate) fn with_persistence(mut self, persistence: PersistenceProtocol) -> Self {
+        self.persistence = persistence;
+        self
     }
 
     /// Handle a raw engine RPC using the complete inbound operation deadline.
@@ -1186,12 +1240,64 @@ impl SessionRaftRpcHandler {
     pub(crate) async fn handle_before(
         &self,
         authenticated_sender: SessionConsensusNodeId,
-        request: SessionConsensusWireRequest,
+        mut request: SessionConsensusWireRequest,
         deadline: tokio::time::Instant,
     ) -> SessionConsensusWireResponse {
         if let Err(error) = validate_envelope(authenticated_sender, &request) {
             return rejected_response(error);
         }
+        request.payload = match persistence_protocol::unwrap_owned_payload(
+            self.persistence.mode(),
+            request.payload,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => return rejected_response(error),
+        };
+        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async
+            && !self.persistence.is_active()
+        {
+            let permit = match tokio::time::timeout_at(
+                deadline,
+                Arc::clone(&self.persistence.cold_rpc_admission).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => return rejected_response(SessionConsensusPeerError::Timeout),
+            };
+            let handler = self.clone();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            // A cancelled transport must not drop the attempt's read guard
+            // while Raft still owns an accepted append or snapshot install.
+            // The finite permit is retained until its real engine completion.
+            tokio::spawn(async move {
+                let response = handler
+                    .handle_payload_before(authenticated_sender, request, deadline)
+                    .await;
+                let _ = send.send(response);
+                drop(permit);
+            });
+            match tokio::time::timeout_at(deadline, receive).await {
+                Ok(Ok(response)) => response,
+                _ => return rejected_response(SessionConsensusPeerError::Timeout),
+            }
+        } else {
+            self.handle_payload_before(authenticated_sender, request, deadline)
+                .await
+        };
+        persistence_protocol::wrap_response(self.persistence.mode(), response)
+    }
+
+    async fn handle_payload_before(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+        deadline: tokio::time::Instant,
+    ) -> SessionConsensusWireResponse {
+        let persistence = match self.persistence.engine_before(deadline).await {
+            Ok(admission) => admission,
+            Err(error) => return rejected_response(error),
+        };
         if let Some(authority) = &self.fixed_quorum_admission {
             // Initial formation permits only the pristine durable membership;
             // every other raw engine entry requires the exact durable fixed
@@ -1240,7 +1346,19 @@ impl SessionRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.append_entries(rpc).await)
+                if !persistence.permits_append(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                let matched = rpc
+                    .entries
+                    .last()
+                    .map(|entry| entry.log_id)
+                    .or(rpc.prev_log_id);
+                let result = self.raft.append_entries(rpc).await;
+                if matches!(result, Ok(AppendEntriesResponse::Success)) {
+                    persistence.confirm_append(matched);
+                }
+                encode_engine_result(&result)
             }
             SessionConsensusRpcFamily::AppendEntriesRoster => {
                 let rpc = match decode_roster_and_bind_sender::<
@@ -1251,9 +1369,24 @@ impl SessionRaftRpcHandler {
                     Ok(_) => return rejected_response(SessionConsensusPeerError::Protocol),
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.append_entries(rpc).await)
+                if !persistence.permits_append(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                let matched = rpc
+                    .entries
+                    .last()
+                    .map(|entry| entry.log_id)
+                    .or(rpc.prev_log_id);
+                let result = self.raft.append_entries(rpc).await;
+                if matches!(result, Ok(AppendEntriesResponse::Success)) {
+                    persistence.confirm_append(matched);
+                }
+                encode_engine_result(&result)
             }
             SessionConsensusRpcFamily::Vote => {
+                if !persistence.permits_vote() {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
                 let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
                     &request.payload,
                     request.sender,
@@ -1271,6 +1404,9 @@ impl SessionRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
+                if !persistence.permits_snapshot(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
                 if rpc.done
                     && self
                         .peer_directory
@@ -2593,6 +2729,7 @@ mod tests {
             local_node_id: node_id(1),
             target,
             peer_directory: directory.clone(),
+            persistence: PersistenceProtocol::default(),
         };
         let hard_ttl = Duration::from_secs(4);
         let option = RPCOption::new(hard_ttl);
@@ -2683,6 +2820,7 @@ mod tests {
             local_node_id: node_id(1),
             target,
             peer_directory: directory,
+            persistence: PersistenceProtocol::default(),
         };
         assert!(matches!(
             call_test_network(&retired).await,

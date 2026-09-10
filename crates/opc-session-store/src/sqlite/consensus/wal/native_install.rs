@@ -40,8 +40,17 @@ impl Wal {
                     || state.native_snapshot_pending.is_some()
                     || state.native_checkpoint_target.is_some()
                     || state.checkpoint_requested
+                    || state
+                        .asynchronous
+                        .as_ref()
+                        .is_some_and(|progress| !progress.caught_up())
                 {
-                    if state.status != Status::Running {
+                    if state.status != Status::Running
+                        || state
+                            .asynchronous
+                            .as_ref()
+                            .is_some_and(|progress| progress.failure.is_some())
+                    {
                         return Err(invalid_data("native install predecessor drain failed"));
                     }
                     state = self.shared.ready.wait(state).map_err(|_| {
@@ -91,7 +100,12 @@ fn require_live(
     if state.status != Status::Running
         || state.outstanding != 0
         || !state.queue.is_empty()
-        || state.sequence != disk.sequence
+        || state.sequence
+            != if state.asynchronous.is_some() {
+                old.native_sequence()
+            } else {
+                disk.sequence
+            }
         || state.native_operations != 0
         || state.native_install_pending
         || state.native_basis_active
@@ -102,7 +116,7 @@ fn require_live(
         || state.checkpoint_requested
         || state.application_marker.is_some()
         || state.checkpoint_epoch != old.epoch
-        || state.base_sequence != old.position.sequence
+        || state.base_sequence != old.native_sequence()
         || disk.anchor.as_ref() != Some(old)
         || handoff.transform != Transform::Install
         || !matches!(handoff.phase, Phase::Requested)
@@ -120,6 +134,18 @@ fn require_live(
         .native
         .as_ref()
         .ok_or_else(|| invalid_data("native install resident owner missing"))?;
+    if let Some(progress) = &state.asynchronous {
+        if !progress.caught_up()
+            || progress.failure.is_some()
+            || Some(progress.completed) != old.async_cut
+            || progress.completed.sequence != state.sequence
+            || progress.completed.committed != native.log.committed
+            || progress.completed.applied != native.business.applied()
+        {
+            return Err(invalid_data("asynchronous install predecessor cut differs"));
+        }
+        return version.require_current(native);
+    }
     let cut = state
         .durable_cuts
         .get(&disk.sequence)
@@ -144,8 +170,12 @@ pub(in crate::sqlite::consensus::wal) fn advance(
     control: &IoControl,
 ) -> io::Result<()> {
     let result = advance_inner(shared, disk, basis, binding, limits, control);
-    if result.is_err() {
+    if let Err(error) = &result {
         let mut state = lock_state(shared)?;
+        application::record_failure(
+            &mut state,
+            SessionStorageFailure::from_io(SessionStorageFailureStage::SnapshotInstall, error),
+        );
         application::fence(&mut state);
         shared.ready.notify_all();
     }
@@ -224,6 +254,21 @@ fn advance_inner(
         committed: candidate.0.last_log_id,
         installed: Some(InstalledCut::new(epoch, candidate)?),
     };
+    let async_cut = old
+        .async_cut
+        .map(|previous| {
+            Ok::<_, io::Error>(checkpoint::AsyncCut {
+                generation: previous
+                    .generation
+                    .checked_add(1)
+                    .filter(|generation| *generation != u64::MAX)
+                    .ok_or_else(|| invalid_data("asynchronous install generation exhausted"))?,
+                sequence: previous.sequence,
+                committed: candidate.0.last_log_id,
+                applied: candidate.0.last_log_id,
+            })
+        })
+        .transpose()?;
     let mut anchor = checkpoint::Anchor {
         root: binding.digest()?,
         epoch,
@@ -238,9 +283,17 @@ fn advance_inner(
                 .join(format!("segment-{:020}.wal", position.segment)),
             position.offset,
         )?,
-        applied: candidate.0.last_log_id,
+        applied: if async_cut.is_some() {
+            None
+        } else {
+            candidate.0.last_log_id
+        },
         marker: None,
-        cuts: BTreeMap::from([(position.sequence, cut)]),
+        cuts: if async_cut.is_some() {
+            old.cuts.clone()
+        } else {
+            BTreeMap::from([(position.sequence, cut)])
+        },
         native: true,
         native_generation: Some(checkpoint::NativeGeneration {
             file_epoch,
@@ -251,6 +304,7 @@ fn advance_inner(
             origin: candidate.clone(),
             current: candidate.clone(),
         }),
+        async_cut,
     };
     let cut_binding = anchor.native_cut_binding()?;
     let preparing = disk
@@ -279,7 +333,7 @@ fn advance_inner(
             binding.digest()?,
             file_epoch,
             epoch,
-            position.sequence,
+            anchor.native_sequence(),
             cut_binding,
             64 * 1024,
             MAX_BASIS,
@@ -346,12 +400,19 @@ fn advance_inner(
         require_live(&state, disk, &old, &installation, &version)?;
         let old_selected = basis.replace_for_install(&old, selected)?;
         let retired = state.native.replace(native);
-        state.base_sequence = position.sequence;
+        state.base_sequence = anchor.native_sequence();
         state.history_bytes = 0;
         state.checkpoint_epoch = epoch;
         state.durable_committed = candidate.0.last_log_id;
         state.durable_cuts = anchor.cuts.clone();
         state.authority.frozen_applied = candidate.0.last_log_id;
+        if let Some(progress) = &mut state.asynchronous {
+            let cut = anchor
+                .async_cut
+                .ok_or_else(|| invalid_data("asynchronous installed selection is absent"))?;
+            progress.generation = cut.generation;
+            progress.completed(cut, anchor.basis_bytes);
+        }
         disk.cuts = anchor.cuts.clone();
         disk.anchor = Some(anchor.clone());
         (retired, old_selected)

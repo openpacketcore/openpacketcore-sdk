@@ -68,6 +68,14 @@ impl Fixture {
     }
 
     fn with_control(limits: Limits, control: IoControl) -> Self {
+        Self::with_persistence(limits, control, crate::SessionPersistenceMode::Durable)
+    }
+
+    fn with_persistence(
+        limits: Limits,
+        control: IoControl,
+        persistence: crate::SessionPersistenceMode,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let oracle = SqliteSessionBackend::open(directory.path().join("oracle.sqlite")).unwrap();
         let conn = oracle.conn.blocking_lock();
@@ -78,14 +86,26 @@ impl Fixture {
             ConsensusAuthorityProfile::FixedImmutable,
         )
         .unwrap();
-        let wal = Wal::create_native(
-            &directory.path().join("wal"),
-            &conn,
-            identity(),
-            [0xE1; 32],
-            limits,
-            control,
-        )
+        let wal = match persistence {
+            crate::SessionPersistenceMode::Durable => Wal::create_native(
+                &directory.path().join("wal"),
+                &conn,
+                identity(),
+                [0xE1; 32],
+                limits,
+                control,
+            ),
+            crate::SessionPersistenceMode::Async => Wal::create_native_with_persistence(
+                &directory.path().join("wal"),
+                &conn,
+                identity(),
+                [0xE1; 32],
+                None,
+                limits,
+                control,
+                persistence,
+            ),
+        }
         .unwrap();
         drop(conn);
         Self {

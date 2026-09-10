@@ -43,8 +43,8 @@ use super::snapshot::{
     pending_snapshot_namespace_recovery_authority, PendingSnapshotNamespaceRecoveryAuthority,
 };
 use super::{
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
-    SessionTopologyMemberBinding, SnapshotIntegrityPolicy,
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionPersistenceMode,
+    SessionRaftTypeConfig, SessionTopologyMemberBinding, SnapshotIntegrityPolicy,
 };
 use crate::backend::ReplicationEntry;
 use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
@@ -322,14 +322,14 @@ fn snapshot_install_applied_progress_gates(
 }
 
 #[cfg(test)]
-struct SnapshotInstallAppliedProgressGateGuard {
+pub(crate) struct SnapshotInstallAppliedProgressGateGuard {
     directory: PathBuf,
     gate: Arc<SnapshotArtifactGate>,
 }
 
 #[cfg(test)]
 impl SnapshotInstallAppliedProgressGateGuard {
-    fn install(directory: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
+    pub(crate) fn install(directory: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
         snapshot_install_applied_progress_gates()
             .lock()
             .expect("install snapshot applied-progress gate")
@@ -1852,14 +1852,33 @@ fn fixed_install_source_copy_gates(
 }
 
 #[cfg(all(test, target_os = "linux"))]
-struct FixedInstallSourceCopyGateGuard {
+pub(crate) struct FixedInstallSourceCopyGateGuard {
     snapshot_directory: PathBuf,
     gate: std::sync::Arc<SnapshotArtifactGate>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
 impl FixedInstallSourceCopyGateGuard {
-    fn install(snapshot_directory: PathBuf, gate: std::sync::Arc<SnapshotArtifactGate>) -> Self {
+    pub(crate) fn for_live_directory(directory: &Path, gate: Arc<SnapshotArtifactGate>) -> Self {
+        let canonical =
+            std::fs::canonicalize(directory).expect("canonical live snapshot directory");
+        let lease = snapshot_directory_leases()
+            .lock()
+            .unwrap()
+            .get(&canonical)
+            .and_then(std::sync::Weak::upgrade)
+            .expect("live snapshot directory lease");
+        let path = lease
+            .namespace
+            .sqlite_child_path(std::ffi::OsStr::new("snapshot-test-hook"))
+            .expect("retained snapshot namespace hook");
+        Self::install(path.parent().unwrap().to_path_buf(), gate)
+    }
+
+    pub(crate) fn install(
+        snapshot_directory: PathBuf,
+        gate: std::sync::Arc<SnapshotArtifactGate>,
+    ) -> Self {
         fixed_install_source_copy_gates()
             .lock()
             .expect("set fixed install source-copy gate")
@@ -2109,6 +2128,9 @@ async fn wait_before_fixed_snapshot_return(final_path: &Path) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SessionConsensusStorageError {
+    /// An existing native root selected a different acknowledgement policy.
+    #[error("session consensus persistence mode does not match this storage root")]
+    PersistenceModeMismatch,
     /// The explicitly required snapshot integrity capability is unavailable.
     #[error("required session consensus snapshot integrity is unavailable")]
     SnapshotIntegrityUnavailable,
@@ -2384,11 +2406,13 @@ async fn attach_native_wal_before_snapshot_cleanup(
     core: &mut SqliteConsensusCore,
     owner: &consensus::wal::owner::NativeOwner,
     lease: Arc<SnapshotDirectoryLease>,
+    persistence: SessionPersistenceMode,
 ) -> io::Result<()> {
     let policy = core.snapshot_integrity;
     owner
         .attach_with_descriptors(
             core,
+            persistence,
             |snapshots, install| admit_wal_snapshots(snapshots, install, lease, policy),
             WalSnapshotAdmissions::verify,
             WalSnapshotAdmissions::install_source,
@@ -3034,6 +3058,7 @@ pub(crate) async fn open_with_member_bindings(
         None,
         None,
         SnapshotIntegrityPolicy::FsVerity,
+        SessionPersistenceMode::Durable,
     )
     .await
 }
@@ -3069,11 +3094,13 @@ pub(crate) async fn open_with_member_bindings_and_roster_attestation_root(
         None,
         roster_attestation_trust_root,
         SnapshotIntegrityPolicy::FsVerity,
+        SessionPersistenceMode::Durable,
     )
     .await
 }
 
 /// Fixed-quorum counterpart that persists the immutable roster root.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
     backend: &SqliteSessionBackend,
@@ -3093,6 +3120,41 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
     ),
     SessionConsensusStorageError,
 > {
+    open_fixed_with_persistence_and_roster_attestation_root(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        placement_policy,
+        roster_attestation_trust_root,
+        snapshot_integrity,
+        SessionPersistenceMode::Durable,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_fixed_with_persistence_and_roster_attestation_root(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    placement_policy: PlacementResiliencePolicy,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    snapshot_integrity: SnapshotIntegrityPolicy,
+    persistence: SessionPersistenceMode,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
     open_with_member_bindings_for_profile(
         backend,
         snapshot_dir,
@@ -3104,6 +3166,7 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
         Some(placement_policy),
         roster_attestation_trust_root,
         snapshot_integrity,
+        persistence,
     )
     .await
 }
@@ -3153,6 +3216,7 @@ async fn open_with_member_bindings_for_profile(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     snapshot_integrity: SnapshotIntegrityPolicy,
+    persistence: SessionPersistenceMode,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -3161,6 +3225,24 @@ async fn open_with_member_bindings_for_profile(
     ),
     SessionConsensusStorageError,
 > {
+    if persistence == SessionPersistenceMode::Async
+        && authority_profile != ConsensusAuthorityProfile::FixedImmutable
+    {
+        return Err(SessionConsensusStorageError::PersistenceModeMismatch);
+    }
+    // Reject an existing mode mismatch before initialization, filesystem
+    // probes, or cleanup can mutate either storage namespace.
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = &backend.native_owner {
+        if let Some(selected) = owner
+            .persistence_mode(identity)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?
+        {
+            if selected != persistence {
+                return Err(SessionConsensusStorageError::PersistenceModeMismatch);
+            }
+        }
+    }
     let snapshot_dir = snapshot_dir.into();
     let snapshot_directory_lease = acquire_snapshot_directory_lease(backend, &snapshot_dir)
         .await
@@ -3210,6 +3292,7 @@ async fn open_with_member_bindings_for_profile(
             &mut core,
             &owner,
             Arc::clone(&snapshot_directory_lease),
+            persistence,
         )
         .await
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -4657,9 +4740,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
-        wait_until_applied(&self.core, &log_id)
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
+        wait_until_applied(&self.core, &log_id).await?;
         #[cfg(target_os = "linux")]
         if let Some(mut wal) =
             self.core.private_wal_log_store().await.map_err(|error| {
@@ -4980,6 +5061,165 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     }
 
     async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+        snapshot: Box<SessionSnapshotFile>,
+    ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let result = self.install_snapshot_inner(meta, snapshot).await;
+        if let Err(error) = &result {
+            self.core
+                .snapshot_install_failure
+                .send_if_modified(|first| {
+                    if first.is_none() {
+                        *first = Some(error.clone());
+                        true
+                    } else {
+                        false
+                    }
+                });
+        }
+        result
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
+        let current = self
+            .core
+            .read_current_snapshot_for_serving()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+        let Some((meta, file_name, expected_checksum, expected_length)) = current else {
+            return Ok(None);
+        };
+        let path = self
+            ._snapshot_directory_lease
+            .namespace
+            .sqlite_child_path(std::ffi::OsStr::new(&file_name))
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
+        let (mut snapshot, checksum, length) =
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                // Validate and return the measured descriptor itself. A pathname
+                // reopen after measurement could substitute an unsealed inode.
+                let file = open_snapshot_child_in_namespace(
+                    Arc::clone(&self._snapshot_directory_lease.namespace),
+                    std::ffi::OsString::from(&file_name),
+                )
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+                let pinned = verify_admitted_snapshot(
+                    file,
+                    Arc::clone(&self._snapshot_directory_lease),
+                    std::ffi::OsString::from(&file_name),
+                    self.core.snapshot_integrity,
+                    expected_checksum,
+                    expected_length,
+                )
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+                let snapshot = SessionSnapshotFile::from_pinned(pinned, path.clone())
+                    .await
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                (snapshot, expected_checksum, expected_length)
+            } else {
+                let file = open_snapshot_child_in_namespace(
+                    Arc::clone(&self._snapshot_directory_lease.namespace),
+                    std::ffi::OsString::from(&file_name),
+                )
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+                let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
+                    .await
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
+                    .await
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                (snapshot, checksum, length)
+            };
+        if checksum != expected_checksum || length != expected_length {
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                consensus::invalid_data("session consensus snapshot metadata is inconsistent"),
+            ));
+        }
+        snapshot.rewind().await.map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
+        {
+            let conn = self.core.conn.lock().await;
+            consensus::with_durable_authority_raw_read_sync(
+                &conn,
+                self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
+                |_| Ok(()),
+            )
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
+        }
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: Box::new(snapshot),
+        }))
+    }
+}
+
+impl SqliteConsensusStateMachine {
+    async fn install_snapshot_inner(
         &mut self,
         meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
         snapshot: Box<SessionSnapshotFile>,
@@ -5682,175 +5922,56 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         }
         Ok(())
     }
-
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
-        let current = self
-            .core
-            .read_current_snapshot_for_serving()
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
-        let Some((meta, file_name, expected_checksum, expected_length)) = current else {
-            return Ok(None);
-        };
-        let path = self
-            ._snapshot_directory_lease
-            .namespace
-            .sqlite_child_path(std::ffi::OsStr::new(&file_name))
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
-        let (mut snapshot, checksum, length) =
-            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                // Validate and return the measured descriptor itself. A pathname
-                // reopen after measurement could substitute an unsealed inode.
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let pinned = verify_admitted_snapshot(
-                    file,
-                    Arc::clone(&self._snapshot_directory_lease),
-                    std::ffi::OsString::from(&file_name),
-                    self.core.snapshot_integrity,
-                    expected_checksum,
-                    expected_length,
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let snapshot = SessionSnapshotFile::from_pinned(pinned, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, expected_checksum, expected_length)
-            } else {
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, checksum, length)
-            };
-        if checksum != expected_checksum || length != expected_length {
-            return Err(storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                consensus::invalid_data("session consensus snapshot metadata is inconsistent"),
-            ));
-        }
-        snapshot.rewind().await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                error,
-            )
-        })?;
-        {
-            let conn = self.core.conn.lock().await;
-            consensus::with_durable_authority_raw_read_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                |_| Ok(()),
-            )
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
-        }
-        Ok(Some(Snapshot {
-            meta,
-            snapshot: Box::new(snapshot),
-        }))
-    }
 }
 
 async fn wait_until_applied(
     core: &SqliteConsensusCore,
     through: &LogId<SessionConsensusNodeId>,
-) -> io::Result<()> {
+) -> Result<(), StorageError<SessionConsensusNodeId>> {
+    let waiting_error =
+        |error| storage_error(ErrorSubject::Log(*through), ErrorVerb::Delete, error);
     let deadline = tokio::time::Instant::now()
         .checked_add(SNAPSHOT_APPLY_WAIT)
-        .ok_or_else(|| consensus::invalid_data("session consensus apply wait is invalid"))?;
+        .ok_or_else(|| {
+            waiting_error(consensus::invalid_data(
+                "session consensus apply wait is invalid",
+            ))
+        })?;
     let mut applied_progress = core.applied_progress.subscribe();
+    let mut install_failure = core.snapshot_install_failure.subscribe();
     loop {
+        if let Some(error) = install_failure.borrow_and_update().clone() {
+            return Err(error);
+        }
         let applied = *applied_progress.borrow_and_update();
         if let Some(applied) = applied {
             if applied.index > through.index || &applied == through {
                 return Ok(());
             }
             if applied.index == through.index {
-                return Err(consensus::invalid_data(
+                return Err(waiting_error(consensus::invalid_data(
                     "session consensus applied log conflicts with purge",
-                ));
+                )));
             }
         }
-        tokio::time::timeout_at(deadline, applied_progress.changed())
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "session consensus apply wait timed out",
-                )
-            })?
-            .map_err(|_| {
-                consensus::invalid_data("session consensus apply progress channel closed")
-            })?;
+        tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                changed = applied_progress.changed() => changed,
+                changed = install_failure.changed() => changed,
+            }
+        })
+        .await
+        .map_err(|_| {
+            waiting_error(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "session consensus apply wait timed out",
+            ))
+        })?
+        .map_err(|_| {
+            waiting_error(consensus::invalid_data(
+                "session consensus apply progress channel closed",
+            ))
+        })?;
     }
 }
 

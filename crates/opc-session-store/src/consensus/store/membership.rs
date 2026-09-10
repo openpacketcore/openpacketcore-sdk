@@ -1441,6 +1441,8 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            persistence: SessionPersistenceMode::Durable,
+            persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
             #[cfg(target_os = "linux")]
             private_wal: None,

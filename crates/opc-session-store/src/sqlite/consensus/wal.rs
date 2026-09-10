@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) mod adapter;
 pub(crate) mod application;
+mod async_persistence;
 mod checkpoint;
 pub(crate) mod integration;
 pub(crate) mod native;
@@ -36,6 +37,9 @@ pub(crate) mod snapshot;
 #[cfg(feature = "test-control")]
 mod volatile_experiment;
 
+use crate::consensus::{
+    SessionPersistenceMode, SessionStorageFailure, SessionStorageFailureStage, SessionStorageState,
+};
 use record::{Decoder, Record, MAX_FRAGMENT};
 
 use super::{
@@ -117,12 +121,18 @@ pub(super) struct Binding {
     pub(super) generation: [u8; 32],
     pub(super) basis: [u8; 32],
     pub(super) native: bool,
+    pub(super) persistence: SessionPersistenceMode,
 }
 
 impl Binding {
     pub(super) fn digest(self) -> io::Result<[u8; 32]> {
         let mut hash = Sha256::new();
-        if self.native {
+        if self.persistence == SessionPersistenceMode::Async {
+            if !self.native {
+                return Err(invalid_data("asynchronous storage requires a native root"));
+            }
+            hash.update(b"opc-session-native-async-v1");
+        } else if self.native {
             hash.update(b"opc-session-native-wal-v1");
         } else {
             hash.update(b"opc-session-wal-private-v3");
@@ -500,6 +510,7 @@ struct State {
     native_sql_fallbacks: u64,
     #[cfg(feature = "test-control")]
     volatile_experiment: Option<volatile_experiment::Observation>,
+    asynchronous: Option<async_persistence::Observation>,
     queue: VecDeque<Request>,
     outstanding: usize,
     outstanding_bytes: usize,
@@ -510,6 +521,7 @@ struct State {
     checkpoint_epoch: u64,
     snapshot: Option<snapshot::Handoff>,
     status: Status,
+    failure: Option<SessionStorageFailure>,
     observations: VecDeque<FlushObservation>,
     observation_requests: usize,
     observation_totals: integration::FlushCosts,
@@ -543,6 +555,9 @@ pub(crate) struct Wal {
 
 impl State {
     fn volatile_mode(&self) -> bool {
+        if self.asynchronous.is_some() {
+            return true;
+        }
         #[cfg(feature = "test-control")]
         if self.volatile_experiment.is_some() {
             return true;
@@ -551,8 +566,7 @@ impl State {
     }
 
     fn committed_for_application(&self) -> Option<LogId<SessionConsensusNodeId>> {
-        #[cfg(feature = "test-control")]
-        if self.volatile_experiment.is_some() {
+        if self.volatile_mode() {
             return self.native.as_ref().and_then(|native| native.log.committed);
         }
         self.durable_committed
@@ -589,16 +603,24 @@ impl State {
             native_sql_fallbacks: 0,
             #[cfg(feature = "test-control")]
             volatile_experiment: None,
+            asynchronous: if binding.persistence == SessionPersistenceMode::Async {
+                Some(async_persistence::Observation::recovered(anchor)?)
+            } else {
+                None
+            },
             queue: VecDeque::new(),
             outstanding: 0,
             outstanding_bytes: 0,
-            sequence: position.sequence,
-            base_sequence: anchor.map_or(0, |anchor| anchor.position.sequence),
+            sequence: anchor
+                .filter(|anchor| anchor.async_cut.is_some())
+                .map_or(position.sequence, checkpoint::Anchor::native_sequence),
+            base_sequence: anchor.map_or(0, checkpoint::Anchor::native_sequence),
             history_bytes,
             checkpoint_requested: false,
             checkpoint_epoch: anchor.map_or(0, |anchor| anchor.epoch),
             snapshot: None,
             status: Status::Running,
+            failure: None,
             observations: VecDeque::new(),
             observation_requests: 0,
             observation_totals: Default::default(),
@@ -625,7 +647,15 @@ impl Wal {
         control: IoControl,
     ) -> io::Result<Self> {
         Self::create_with_format(
-            directory, basis, identity, generation, limits, control, false, None,
+            directory,
+            basis,
+            identity,
+            generation,
+            limits,
+            control,
+            false,
+            None,
+            SessionPersistenceMode::Durable,
         )
     }
 
@@ -639,8 +669,12 @@ impl Wal {
         control: IoControl,
         native: bool,
         roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
+        persistence: SessionPersistenceMode,
     ) -> io::Result<Self> {
         let limits = limits.validate()?;
+        if persistence == SessionPersistenceMode::Async && !native {
+            return Err(invalid_data("asynchronous storage requires a native root"));
+        }
         validate_basis(basis, identity)?;
         if native {
             native::validate_roster_root(basis, roster_root.as_deref())?;
@@ -683,6 +717,7 @@ impl Wal {
             generation,
             basis: hash_file(&basis_path, MAX_BASIS)?,
             native,
+            persistence,
         };
         let digest = binding.digest()?;
         let segment = create_segment(directory, 0, digest, [0; 32])?;
@@ -783,10 +818,10 @@ impl Wal {
                 .anchor
                 .as_ref()
                 .ok_or_else(|| invalid_data("native creation selected anchor missing"))?;
-            state.base_sequence = anchor.position.sequence;
+            state.base_sequence = anchor.native_sequence();
             state.checkpoint_epoch = anchor.epoch;
             state.history_bytes = 0;
-            state.authority.frozen_applied = anchor.applied;
+            state.authority.frozen_applied = anchor.native_applied();
             state.durable_cuts = disk.cuts.clone();
             state.durable_committed = native.log.committed;
             state.native = Some(native);
@@ -855,6 +890,32 @@ impl Wal {
         self.binding
     }
 
+    pub(crate) fn storage_health(
+        &self,
+    ) -> (
+        SessionStorageState,
+        Option<SessionStorageFailure>,
+        Option<crate::consensus::SessionAsyncPersistenceProgress>,
+    ) {
+        let Ok(state) = self.shared.state.lock() else {
+            return (SessionStorageState::Unavailable, None, None);
+        };
+        let status = match state.status {
+            Status::Running => SessionStorageState::Running,
+            Status::Closing => SessionStorageState::Draining,
+            Status::Closed => SessionStorageState::Closed,
+            Status::Failed => SessionStorageState::Failed,
+        };
+        (
+            status,
+            state.failure,
+            state
+                .asynchronous
+                .as_ref()
+                .map(|progress| progress.observe(state.sequence)),
+        )
+    }
+
     pub(super) fn submit(&self, operation: Operation) -> io::Result<Ticket> {
         let (sender, receiver) = mpsc::sync_channel(1);
         self.admit(
@@ -862,6 +923,28 @@ impl Wal {
             Completion(Some(CompletionTarget::Blocking(sender))),
         )?;
         Ok(Ticket(receiver))
+    }
+
+    /// Capture an explicit local persistence cut and wake the existing writer.
+    /// No checkpoint work or disk wait executes on the calling thread.
+    pub(crate) fn request_async_persistence(
+        &self,
+    ) -> Result<(u64, u64), crate::consensus::SessionPersistenceDrainError> {
+        use crate::consensus::SessionPersistenceDrainError as Error;
+        let mut state = self.shared.state.lock().map_err(|_| Error::Unavailable)?;
+        let progress = state.asynchronous.as_ref().ok_or(Error::NotAsync)?;
+        if let Some(failure) = progress.failure.or(state.failure) {
+            return Err(Error::Failed(failure));
+        }
+        if state.status != Status::Running {
+            return Err(Error::Unavailable);
+        }
+        let cut = (progress.generation, state.sequence);
+        if !progress.caught_up() {
+            state.checkpoint_requested = true;
+            self.shared.ready.notify_all();
+        }
+        Ok(cut)
     }
 
     /// The actual Raft adapter cannot treat retained-history pressure as a
@@ -931,6 +1014,9 @@ impl Wal {
             }
             if state.status != Status::Running {
                 return Err(io::Error::other("private WAL writer is fenced"));
+            }
+            if state.asynchronous.is_some() {
+                return async_persistence::admit(self, &mut state, &operation, completion);
             }
             let retained_capacity_exhausted = state.sequence.saturating_sub(state.base_sequence)
                 >= self.limits.history_count as u64
@@ -1438,11 +1524,15 @@ fn write_loop(
         )
     }))
     .unwrap_or_else(|_| Err(io::Error::other("private WAL writer panicked")));
-    if result.is_err() {
+    if let Err(error) = &result {
         let mut state = match shared.state.lock() {
             Ok(state) => state,
             Err(poison) => poison.into_inner(),
         };
+        application::record_failure(
+            &mut state,
+            SessionStorageFailure::from_io(SessionStorageFailureStage::Persistence, error),
+        );
         application::fence(&mut state);
         shared.ready.notify_all();
     }
@@ -1485,6 +1575,10 @@ fn write_loop_body(
                 .map_err(|_| io::Error::other("private WAL wait poisoned"))?;
         }
         ensure_readable(&state)?;
+        if state.asynchronous.is_some() {
+            drop(state);
+            return async_persistence::write_loop(&shared, disk, basis, binding, limits, control);
+        }
         #[cfg(feature = "test-control")]
         if state.volatile_experiment.is_some()
             && state.queue.is_empty()

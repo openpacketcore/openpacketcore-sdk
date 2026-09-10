@@ -181,6 +181,52 @@ pub(in crate::sqlite::consensus) struct Opening {
     roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
 }
 
+fn audit_native_recovery(
+    directory: &Path,
+    binding: Binding,
+    limits: Limits,
+    anchor: Option<checkpoint::Anchor>,
+    native: &mut NativeStorage,
+) -> io::Result<RecoveryAudit> {
+    if binding.persistence == SessionPersistenceMode::Async {
+        let selected = anchor
+            .as_ref()
+            .ok_or_else(|| invalid_data("asynchronous recovery lacks its completed generation"))?;
+        if selected.async_cut.is_none() {
+            return Err(invalid_data("asynchronous recovery cut is absent"));
+        }
+        // Audit the immutable initial WAL header independently. No WAL entry,
+        // pending intent or tail can be replayed into an asynchronous cut.
+        let audit =
+            audit_recovery_projected(directory, binding, limits, anchor, false, None, |_| {
+                Err(invalid_data("asynchronous root contains a WAL operation"))
+            })?;
+        if audit.end != CutPosition::initial()
+            || audit.cut != 0
+            || audit.stage.is_some()
+            || audit.history_bytes != 0
+            || audit.segments.len() != 1
+            || audit
+                .segments
+                .get(&0)
+                .is_none_or(|(_, len)| *len != SEGMENT_HEADER as u64)
+        {
+            return Err(invalid_data("asynchronous root contains a WAL suffix"));
+        }
+        return Ok(audit);
+    }
+    let frozen = anchor.as_ref().and_then(checkpoint::Anchor::native_applied);
+    audit_recovery_projected(
+        directory,
+        binding,
+        limits,
+        anchor,
+        false,
+        native.log.committed,
+        |operation| native.log.project(operation, &native.business, frozen),
+    )
+}
+
 impl Opening {
     pub(in crate::sqlite::consensus) fn new(
         directory: &Path,
@@ -203,6 +249,9 @@ impl Opening {
         let mut native = from_pristine_basis(&conn, binding, &authority, roster_root.clone())?;
         let mut selected = None;
         let anchor = checkpoint::read(directory, binding, limits)?;
+        if binding.persistence == SessionPersistenceMode::Async && anchor.is_none() {
+            return Err(invalid_data("asynchronous selected generation is missing"));
+        }
         if anchor
             .as_ref()
             .is_some_and(|anchor| anchor.native_snapshots.is_some())
@@ -271,29 +320,15 @@ impl Opening {
                 )?;
             }
             if native.business.members() != &authority.members
-                || native.business.applied() != anchor.applied
-                || native.log.committed != anchor.cuts[&anchor.position.sequence].committed
+                || native.business.applied() != anchor.native_applied()
+                || native.log.committed != anchor.native_committed()
             {
                 return Err(invalid_data(
                     "native selected image pointers differ from selector",
                 ));
             }
         }
-        let frozen_applied = anchor.as_ref().and_then(|anchor| anchor.applied);
-        let committed = native.log.committed;
-        let audit = audit_recovery_projected(
-            directory,
-            binding,
-            limits,
-            anchor,
-            false,
-            committed,
-            |operation| {
-                native
-                    .log
-                    .project(operation, &native.business, frozen_applied)
-            },
-        )?;
+        let audit = audit_native_recovery(directory, binding, limits, anchor, &mut native)?;
         // The audit sees only complete published cuts. Replay the exact committed
         // prefix before file repair, selection stabilization or owner exposure.
         native.replay_committed()?;
@@ -392,8 +427,8 @@ impl Opening {
         (self.control.hook)(Point::AfterNativeBasisAdmission)?;
         self.native = catalog.into_storage(&|| Ok(()))?;
         if self.native.business.members() != &authority.members
-            || self.native.business.applied() != anchor.applied
-            || self.native.log.committed != anchor.cuts[&anchor.position.sequence].committed
+            || self.native.business.applied() != anchor.native_applied()
+            || self.native.log.committed != anchor.native_committed()
             || self.native.business.current_snapshot().as_ref() != Some(&snapshots.current)
         {
             return Err(invalid_data(
@@ -402,20 +437,12 @@ impl Opening {
         }
         self.selected = Some(native_basis::Selected::admitted(append, &self.native)?);
         self.native.begin_changes()?;
-        let frozen = anchor.applied;
-        let committed = self.native.log.committed;
-        self.audit = Some(audit_recovery_projected(
+        self.audit = Some(audit_native_recovery(
             &self.directory,
             self.binding,
             self.limits,
             Some(anchor),
-            false,
-            committed,
-            |operation| {
-                self.native
-                    .log
-                    .project(operation, &self.native.business, frozen)
-            },
+            &mut self.native,
         )?);
         self.native.replay_committed()?;
         self.native.validate_image()?;
@@ -477,7 +504,10 @@ impl Opening {
             disk.cuts.clone(),
             Some(native),
         )?;
-        state.authority.frozen_applied = disk.anchor.as_ref().and_then(|anchor| anchor.applied);
+        state.authority.frozen_applied = disk
+            .anchor
+            .as_ref()
+            .and_then(checkpoint::Anchor::native_applied);
         let mut wal = Wal::start_state(binding, limits, state, disk, control, Some(selected))?;
         wal.directory_pin = Some(directory_pin);
         Ok(wal)
@@ -565,6 +595,29 @@ impl Wal {
         limits: Limits,
         control: IoControl,
     ) -> io::Result<Self> {
+        Self::create_native_with_persistence(
+            directory,
+            basis,
+            identity,
+            generation,
+            roster_root,
+            limits,
+            control,
+            SessionPersistenceMode::Durable,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::sqlite::consensus) fn create_native_with_persistence(
+        directory: &Path,
+        basis: &Connection,
+        identity: SessionConsensusIdentity,
+        generation: [u8; 32],
+        roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
+        limits: Limits,
+        control: IoControl,
+        persistence: SessionPersistenceMode,
+    ) -> io::Result<Self> {
         Self::create_with_format(
             directory,
             basis,
@@ -574,6 +627,7 @@ impl Wal {
             control,
             true,
             roster_root,
+            persistence,
         )
     }
 
@@ -658,6 +712,11 @@ impl Wal {
     }
 
     #[cfg(test)]
+    pub(crate) fn native_snapshot_publication_pending_for_test(&self) -> io::Result<bool> {
+        Ok(lock_state(&self.shared)?.native_snapshot_pending.is_some())
+    }
+
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn native_export_install_base_for_test(
         &self,
     ) -> io::Result<Connection> {
@@ -686,6 +745,13 @@ impl Wal {
             {
                 Ok(capture) => capture,
                 Err(error) => {
+                    application::record_failure(
+                        &mut state,
+                        SessionStorageFailure::from_io(
+                            SessionStorageFailureStage::SnapshotExport,
+                            &error,
+                        ),
+                    );
                     application::fence(&mut state);
                     self.shared.ready.notify_all();
                     return Err(error);
@@ -696,7 +762,7 @@ impl Wal {
             capture.storage.business.applied(),
             capture.storage.business.membership(),
         );
-        let conn = self.native_detached(|| {
+        let conn = self.native_detached_at(SessionStorageFailureStage::SnapshotExport, || {
             let check = || {
                 {
                     let state = lock_state(&self.shared)?;
@@ -814,6 +880,7 @@ impl Wal {
         }
         state.native_snapshot_pending = Some(candidate.clone());
         state.checkpoint_requested = true;
+        async_persistence::dirty(&mut state);
         self.shared.ready.notify_all();
         while state
             .native
@@ -822,7 +889,12 @@ impl Wal {
             .as_ref()
             != Some(&candidate)
         {
-            if state.status != Status::Running {
+            if state.status != Status::Running
+                || state
+                    .asynchronous
+                    .as_ref()
+                    .is_some_and(|progress| progress.failure.is_some())
+            {
                 return Err(invalid_data("native snapshot publication failed"));
             }
             state = self
@@ -1008,15 +1080,29 @@ impl Wal {
     }
 
     fn native_detached<T>(&self, work: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        self.native_detached_at(SessionStorageFailureStage::Storage, work)
+    }
+
+    fn native_detached_at<T>(
+        &self,
+        stage: SessionStorageFailureStage,
+        work: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         // State has already been released. Keep all captures and decoder
         // guards inside this unwind boundary, then fence the existing owner
         // and wake queue retirement before propagating the original panic.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-        if !matches!(&result, Ok(Ok(_))) {
+        let failure = match &result {
+            Ok(Err(error)) => Some(SessionStorageFailure::from_io(stage, error)),
+            Err(_) => Some(SessionStorageFailure::panic(stage)),
+            Ok(Ok(_)) => None,
+        };
+        if let Some(failure) = failure {
             let mut state = match self.shared.state.lock() {
                 Ok(state) => state,
                 Err(poison) => poison.into_inner(),
             };
+            application::record_failure(&mut state, failure);
             application::fence(&mut state);
             self.shared.ready.notify_all();
         }
@@ -1345,6 +1431,10 @@ impl Wal {
             #[cfg(feature = "test-control")]
             if state.volatile_experiment.is_some() {
                 volatile_experiment::dirty(&mut state);
+                self.shared.ready.notify_all();
+            }
+            if state.asynchronous.is_some() {
+                async_persistence::dirty(&mut state);
                 self.shared.ready.notify_all();
             }
             state.application_costs.lock_wait += lock_wait;

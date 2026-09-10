@@ -178,6 +178,90 @@ impl Owner {
         self.relocations.is_some()
     }
 
+    /// Append and verify one asynchronous generation without a State guard.
+    /// CURRENT selection and resident publication are owned by the caller.
+    pub(super) fn append_async(
+        &mut self,
+        changes: crate::consensus::native::NativeChanges,
+        anchor: &mut checkpoint::Anchor,
+        binding: Binding,
+        limits: Limits,
+        control: &IoControl,
+    ) -> io::Result<crate::consensus::native::generation::Relocations> {
+        if binding.persistence != SessionPersistenceMode::Async
+            || anchor.async_cut.is_none()
+            || self.worker.is_some()
+            || self.relocations.is_some()
+        {
+            return Err(invalid_data("asynchronous append ownership differs"));
+        }
+        let selected = self
+            .selected
+            .as_mut()
+            .ok_or_else(|| invalid_data("asynchronous generation owner missing"))?;
+        let previous = selected.append.current();
+        let identity = previous.identity();
+        if anchor.epoch != identity.checkpoint_epoch.checked_add(1).unwrap_or(u64::MAX)
+            || anchor.native_sequence() < identity.operation_sequence
+            || anchor.root != identity.binding
+        {
+            return Err(invalid_data("asynchronous append predecessor differs"));
+        }
+        let delta = crate::consensus::native::generation::PreparedDelta::prepare(
+            previous,
+            &selected.version,
+            anchor.epoch,
+            anchor.native_sequence(),
+            anchor.native_cut_binding()?,
+            changes,
+            &|| Ok(()),
+        )?;
+        if identity
+            .length
+            .checked_add(delta.payload_bytes())
+            .and_then(|bytes| bytes.checked_add(identity.block_bytes as u64))
+            .is_none_or(|bytes| bytes > async_persistence::MAX_GENERATION_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "asynchronous generation extent limit reached",
+            ));
+        }
+        (control.hook)(Point::BeforeNativeGenerationAppend)?;
+        let (source, relocations) =
+            delta.append_with_relocations(&mut selected.append, &|| Ok(()))?;
+        (control.hook)(Point::AfterNativeGenerationAppend)?;
+        let prefix = source.identity();
+        anchor.basis = prefix.digest;
+        anchor.basis_bytes = prefix.length;
+        anchor.native_generation = Some(checkpoint::NativeGeneration {
+            file_epoch: prefix.file_epoch,
+            block_bytes: prefix.block_bytes,
+            frontiers: prefix.frontiers,
+        });
+        anchor.validate(binding, limits)?;
+        if anchor.native_prefix()? != Some(prefix) {
+            return Err(invalid_data(
+                "asynchronous appended prefix differs from selector",
+            ));
+        }
+        selected.version = delta.target_version();
+        Ok(relocations)
+    }
+
+    pub(super) fn begin_async_relocations(
+        &mut self,
+        relocations: crate::consensus::native::generation::Relocations,
+    ) -> io::Result<()> {
+        if self.worker.is_some() || self.relocations.is_some() {
+            return Err(invalid_data("asynchronous relocation owner is occupied"));
+        }
+        if !relocations.is_empty() {
+            self.relocations = Some(relocations);
+        }
+        Ok(())
+    }
+
     pub(super) fn require_install_owner(&self, anchor: &checkpoint::Anchor) -> io::Result<()> {
         if self.worker.is_some()
             || self.relocations.is_some()
@@ -483,6 +567,7 @@ fn prepare(
             frontiers: [0; 32],
         }),
         native_snapshots,
+        async_cut: None,
     };
     let cut_binding = anchor.native_cut_binding()?;
     let serialize_started = Instant::now();

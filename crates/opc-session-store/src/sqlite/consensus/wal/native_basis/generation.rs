@@ -91,6 +91,14 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
             frontiers: [0; 32],
         }),
         native_snapshots: None,
+        async_cut: (binding.persistence == SessionPersistenceMode::Async).then_some(
+            checkpoint::AsyncCut {
+                generation: 0,
+                sequence: position.sequence,
+                committed: native.log.committed,
+                applied: native.business.applied(),
+            },
+        ),
     };
     let cut_binding = anchor.native_cut_binding()?;
     let preparing = disk

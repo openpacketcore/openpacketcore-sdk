@@ -7,6 +7,8 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod native;
 pub mod network;
+mod persistence;
+mod persistence_protocol;
 pub(crate) mod raft_adapter;
 pub(crate) mod snapshot;
 mod snapshot_integrity;
@@ -16,6 +18,11 @@ pub mod types;
 #[cfg(target_os = "linux")]
 pub(crate) mod verified_snapshot;
 
+pub use persistence::{
+    SessionAsyncPersistenceProgress, SessionAsyncRecoveryState, SessionPersistenceDrainError,
+    SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,
+    SessionStorageFailureKind, SessionStorageFailureStage, SessionStorageState,
+};
 pub use snapshot_integrity::SnapshotIntegrityPolicy;
 
 #[cfg(feature = "test-control")]

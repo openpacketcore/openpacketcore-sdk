@@ -2,13 +2,21 @@
 
 ## Status
 
-Accepted direction; private implementation and recovery qualification in progress.
+Historical private design. [ADR 0022](0022-native-session-persistence-modes.md)
+supersedes its application composition, public activation, and migration scope.
+The ordered durable WAL implementation and its failure/recovery tests are
+preserved. The body below records the original SQLite-projection design and
+must not be read as the current public configuration or qualification status.
 
 ## Date
 
 2026-09-08
 
 ## Decision
+
+The following was the initial private implementation decision. The supported
+native application and selectable persistence contract are recorded in ADR
+0022; no legacy migration engineering is part of that decision.
 
 Replace the session Raft log's SQLite persistence with an SDK-owned sequential,
 segmented WAL and bounded group commit. SQLite is the initial durable session

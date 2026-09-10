@@ -6,6 +6,7 @@
 //! it cannot authorize Raft acknowledgement. Recovery reconstructs the pending
 //! view by replay and compares every non-log table, not only a high-water mark.
 
+use crate::consensus::{SessionStorageFailure, SessionStorageFailureStage};
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -457,9 +458,24 @@ pub(super) fn validate_live_cache(
 }
 
 pub(super) fn fence(state: &mut State) {
+    record_failure(
+        state,
+        SessionStorageFailure {
+            stage: SessionStorageFailureStage::Storage,
+            kind: crate::consensus::SessionStorageFailureKind::Other,
+            os_error: None,
+        },
+    );
     state.status = Status::Failed;
     state.applied_prefix = None;
     state.queue.clear();
+}
+
+pub(super) fn record_failure(state: &mut State, failure: SessionStorageFailure) {
+    // The secondary errors caused by a fence must never replace its cause.
+    if state.failure.is_none() {
+        state.failure = Some(failure);
+    }
 }
 
 fn next_index(applied: Option<LogId<SessionConsensusNodeId>>) -> io::Result<u64> {

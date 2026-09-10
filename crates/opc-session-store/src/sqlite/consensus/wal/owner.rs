@@ -14,10 +14,15 @@ use sha2::{Digest, Sha256};
 
 use super::super::{self as consensus, SqliteConsensusCore};
 use super::{invalid_data, Binding, IoControl, Limits, Wal};
+use crate::consensus::SessionPersistenceMode;
 
 pub(super) const ROOT_BYTES: u64 = 168;
 const ROOT_MAGIC: &[u8; 8] = b"OPCNR001";
+const ASYNC_ROOT_MAGIC: &[u8; 8] = b"OPCNA001";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
+
+#[cfg(test)]
+type GenerationHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 fn read_selection(database: &File) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
     let mut bytes = [0; ROOT_BYTES as usize];
@@ -72,6 +77,8 @@ pub(crate) struct NativeOwner {
     native_name: OsString,
     selected: AtomicBool,
     current: Mutex<Weak<Wal>>,
+    #[cfg(test)]
+    generation_hook: Mutex<Option<GenerationHookForTest>>,
 }
 
 impl NativeOwner {
@@ -110,7 +117,33 @@ impl NativeOwner {
             native_name,
             selected: AtomicBool::new(selected),
             current: Mutex::new(Weak::new()),
+            #[cfg(test)]
+            generation_hook: Mutex::new(None),
         })
+    }
+
+    /// Inject only an I/O boundary before ordinary owner construction. This
+    /// never selects a persistence mode or substitutes a test storage owner.
+    #[cfg(test)]
+    pub(crate) fn set_generation_hook_for_test(&self, hook: GenerationHookForTest) {
+        assert!(self.current.lock().unwrap().upgrade().is_none());
+        *self.generation_hook.lock().unwrap() = Some(hook);
+    }
+
+    fn io_control(&self) -> IoControl {
+        #[cfg(test)]
+        if let Some(hook) = self.generation_hook.lock().unwrap().clone() {
+            return IoControl {
+                hook: Arc::new(move |point| {
+                    if point == super::Point::BeforeNativeGenerationAppend {
+                        hook()?;
+                    }
+                    Ok(())
+                }),
+                ..IoControl::default()
+            };
+        }
+        IoControl::default()
     }
 
     pub(crate) fn selected(&self) -> bool {
@@ -134,6 +167,29 @@ impl NativeOwner {
 
     pub(crate) fn select(&self) {
         self.selected.store(true, Ordering::Release);
+    }
+
+    /// Read-only admission before initialization or snapshot cleanup. A mode
+    /// change is never an implicit migration, even when the selected cut is
+    /// empty. Recheck the full descriptor/inode binding again during attach.
+    pub(crate) fn persistence_mode(
+        &self,
+        identity_expected: consensus::SessionConsensusIdentity,
+    ) -> io::Result<Option<SessionPersistenceMode>> {
+        let path = directory_path(&self.parent).join(&self.native_name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let pin = pin_directory(&path)?;
+                Ok(Some(self.read_root(&pin, identity_expected)?.persistence))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if read_selection(&self.database)?.is_some() {
+                    return Err(invalid_data("selected native root is missing"));
+                }
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn current(&self) -> io::Result<Arc<Wal>> {
@@ -163,6 +219,7 @@ impl NativeOwner {
     pub(crate) async fn attach_with_descriptors<V, F>(
         &self,
         core: &mut SqliteConsensusCore,
+        persistence: SessionPersistenceMode,
         validate: impl FnOnce(Vec<consensus::CurrentSnapshot>, Option<consensus::CurrentSnapshot>) -> F,
         verify: impl FnOnce(&V) -> io::Result<()>,
         install_source: impl FnOnce(&V) -> Option<&super::snapshot::InstallSource>,
@@ -187,12 +244,15 @@ impl NativeOwner {
         let wal = if existing {
             let pin = pin_directory(&path)?;
             let binding = self.read_root(&pin, core.storage_identity)?;
+            if binding.persistence != persistence {
+                return Err(invalid_data("native persistence mode differs"));
+            }
             let opening = super::native::Opening::new(
                 &directory_path(&pin),
                 binding,
                 core.configured_roster_root.clone(),
                 Limits::default(),
-                IoControl::default(),
+                self.io_control(),
             )?;
             let descriptors = validate(opening.snapshots(), opening.install_candidate()).await?;
             opening
@@ -208,14 +268,15 @@ impl NativeOwner {
             let mut generation = [0; 32];
             generation[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             generation[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-            let wal = Wal::create_native_with_root(
+            let wal = Wal::create_native_with_persistence(
                 &path,
                 &conn,
                 core.storage_identity,
                 generation,
                 core.configured_roster_root.clone(),
                 Limits::default(),
-                IoControl::default(),
+                self.io_control(),
+                persistence,
             )?;
             self.write_root(&wal)?;
             wal
@@ -257,7 +318,10 @@ impl NativeOwner {
             .ok_or_else(|| invalid_data("native directory pin missing"))?;
         let directory_identity = identity(&directory.metadata()?);
         let mut bytes = [0; ROOT_BYTES as usize];
-        bytes[..8].copy_from_slice(ROOT_MAGIC);
+        bytes[..8].copy_from_slice(match wal.binding.persistence {
+            SessionPersistenceMode::Durable => ROOT_MAGIC,
+            SessionPersistenceMode::Async => ASYNC_ROOT_MAGIC,
+        });
         for (chunk, value) in bytes[8..40].chunks_exact_mut(8).zip([
             self.database_identity.0,
             self.database_identity.1,
@@ -312,9 +376,14 @@ impl NativeOwner {
                 "native root differs from durable database selection",
             ));
         }
-        if &bytes[..8] != ROOT_MAGIC || Sha256::digest(&bytes[..136])[..] != bytes[136..] {
+        if Sha256::digest(&bytes[..136])[..] != bytes[136..] {
             return Err(invalid_data("native root record proof differs"));
         }
+        let persistence = match &bytes[..8] {
+            magic if magic == ROOT_MAGIC => SessionPersistenceMode::Durable,
+            magic if magic == ASYNC_ROOT_MAGIC => SessionPersistenceMode::Async,
+            _ => return Err(invalid_data("native root persistence format differs")),
+        };
         let directory_identity = identity(&directory.metadata()?);
         for (chunk, expected) in bytes[8..40].chunks_exact(8).zip([
             self.database_identity.0,
@@ -335,6 +404,7 @@ impl NativeOwner {
             generation,
             basis,
             native: true,
+            persistence,
         };
         if binding.digest()? != bytes[104..136] {
             return Err(invalid_data("native root authority binding differs"));

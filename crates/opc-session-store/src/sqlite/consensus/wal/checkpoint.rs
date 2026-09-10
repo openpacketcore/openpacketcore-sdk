@@ -19,6 +19,18 @@ pub(super) struct NativeGeneration {
     pub(super) frontiers: [u8; 32],
 }
 
+/// A fully selected asynchronous after-image generation. Its logical storage
+/// sequence is deliberately separate from the immutable, empty WAL prefix:
+/// background selection cannot fabricate a foreground durable WAL callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AsyncCut {
+    pub(super) generation: u64,
+    pub(super) sequence: u64,
+    pub(super) committed: Option<LogId<SessionConsensusNodeId>>,
+    pub(super) applied: Option<LogId<SessionConsensusNodeId>>,
+}
+
 /// Retain the incoming origin after later locally produced snapshots replace
 /// the current export. These comparisons grant no authority until the opener
 /// re-runs the original installer on that independently admitted origin.
@@ -74,6 +86,8 @@ pub(super) struct Anchor {
     pub(super) native_generation: Option<NativeGeneration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) native_snapshots: Option<NativeSnapshots>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) async_cut: Option<AsyncCut>,
 }
 
 impl Anchor {
@@ -88,6 +102,34 @@ impl Anchor {
     }
 
     pub(super) fn validate(&self, binding: Binding, limits: Limits) -> io::Result<()> {
+        if self.async_cut.is_some() != (binding.persistence == SessionPersistenceMode::Async) {
+            return Err(invalid_data("native selector persistence mode differs"));
+        }
+        if let Some(cut) = self.async_cut {
+            if !self.native
+                || self.native_generation.is_none()
+                || self.position != CutPosition::initial()
+                || self.applied.is_some()
+                || self.marker.is_some()
+                || self.cuts.get(&0).is_none_or(|baseline| {
+                    baseline.committed.is_some() || baseline.installed.is_some()
+                })
+                || cut.generation == u64::MAX
+                || cut.sequence == u64::MAX
+            {
+                return Err(invalid_data("asynchronous selector lineage differs"));
+            }
+            if let Some(applied) = cut.applied {
+                let committed = cut.committed.ok_or_else(|| {
+                    invalid_data("asynchronous selected application is uncommitted")
+                })?;
+                super::super::ensure_log_id_not_after(
+                    &applied,
+                    &committed,
+                    "asynchronous selected application exceeds commit",
+                )?;
+            }
+        }
         if self.root != binding.digest()?
             || self.native != binding.native
             || self.epoch == 0
@@ -223,6 +265,22 @@ impl Anchor {
             .map_or(self.epoch, |generation| generation.file_epoch)
     }
 
+    pub(super) fn native_sequence(&self) -> u64 {
+        self.async_cut
+            .map_or(self.position.sequence, |cut| cut.sequence)
+    }
+
+    pub(super) fn native_applied(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        self.async_cut.map_or(self.applied, |cut| cut.applied)
+    }
+
+    pub(super) fn native_committed(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        self.async_cut.map_or_else(
+            || self.cuts[&self.position.sequence].committed,
+            |cut| cut.committed,
+        )
+    }
+
     pub(super) fn native_prefix(
         &self,
     ) -> io::Result<Option<crate::consensus::native::prefix::PrefixIdentity>> {
@@ -236,7 +294,7 @@ impl Anchor {
             binding: self.root,
             file_epoch: generation.file_epoch,
             checkpoint_epoch: self.epoch,
-            operation_sequence: self.position.sequence,
+            operation_sequence: self.native_sequence(),
             frontiers: generation.frontiers,
             length: self.basis_bytes,
             block_bytes: generation.block_bytes,
@@ -273,12 +331,17 @@ impl Anchor {
             return Err(invalid_data("native cut binding exceeds selector bound"));
         }
         let mut hash = Sha256::new();
-        hash.update(if self.native_snapshots.is_some() {
+        hash.update(if self.async_cut.is_some() {
+            b"OPC-native-async-cut-v1\0".as_slice()
+        } else if self.native_snapshots.is_some() {
             b"OPC-native-WAL-cut-v2\0"
         } else {
             b"OPC-native-WAL-cut-v1\0"
         });
         hash.update(&bytes);
+        if let Some(cut) = self.async_cut {
+            hash.update(encode_json(&cut)?);
+        }
         if let Some(snapshots) = &self.native_snapshots {
             let snapshots = encode_json(snapshots)?;
             if bytes
@@ -434,11 +497,17 @@ impl Wal {
             state.native_checkpoint_target = Some(target);
         }
         state.checkpoint_requested = true;
+        async_persistence::dirty(&mut state);
         self.shared.ready.notify_all();
         while native_target.map_or(state.checkpoint_epoch == epoch, |target| {
             !target.satisfied(&state)
         }) {
-            if state.status != Status::Running {
+            if state.status != Status::Running
+                || state
+                    .asynchronous
+                    .as_ref()
+                    .is_some_and(|progress| progress.failure.is_some())
+            {
                 return Err(io::Error::other("private WAL checkpoint failed"));
             }
             state = self
@@ -564,6 +633,7 @@ pub(super) fn prepare(
         native: false,
         native_generation: None,
         native_snapshots: None,
+        async_cut: None,
     };
     anchor.validate(binding, limits)?;
     // create_new above and an otherwise clean namespace prevent replacement
