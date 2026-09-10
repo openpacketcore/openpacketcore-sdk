@@ -158,6 +158,50 @@ const FIXED_V2_PROFILE_DIGEST: [u8; 32] = [
 struct ReleaseLatencySamples {
     batch: Vec<Duration>,
     item_scheduled_to_completion: Vec<Duration>,
+    paired_items: PairedItemLatency,
+    paired_items_over_25ms: PairedItemLatency,
+    paired_items_over_100ms: PairedItemLatency,
+}
+
+/// Constant-space paired observations. Queueing includes the original offered
+/// schedule, client-capacity wait and batch assembly. Batch execution begins at
+/// the existing pre-spawn timestamp and includes the public operation future.
+#[derive(Default)]
+struct PairedItemLatency {
+    count: usize,
+    queue: Duration,
+    batch: Duration,
+    maximum_queue: Duration,
+    slowest_total: Duration,
+    slowest_queue: Duration,
+    slowest_batch: Duration,
+}
+
+impl PairedItemLatency {
+    fn record(&mut self, total: Duration, queue: Duration, batch: Duration) {
+        self.count += 1;
+        self.queue += queue;
+        self.batch += batch;
+        self.maximum_queue = self.maximum_queue.max(queue);
+        if total > self.slowest_total {
+            self.slowest_total = total;
+            self.slowest_queue = queue;
+            self.slowest_batch = batch;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "count": self.count,
+            "queue_us": self.queue.as_micros(),
+            "batch_us": self.batch.as_micros(),
+            "maximum_queue_us": self.maximum_queue.as_micros(),
+            "slowest_total_us": self.slowest_total.as_micros(),
+            "slowest_queue_us": self.slowest_queue.as_micros(),
+            "slowest_batch_us": self.slowest_batch.as_micros(),
+        })
+    }
 }
 
 impl ReleaseLatencySamples {
@@ -168,12 +212,22 @@ impl ReleaseLatencySamples {
         item_scheduled_at: &[Instant],
     ) {
         self.batch.push(elapsed);
-        self.item_scheduled_to_completion
-            .extend(item_scheduled_at.iter().map(|scheduled_at| {
-                completed_at
-                    .checked_duration_since(*scheduled_at)
-                    .expect("a release batch cannot complete before an item is scheduled")
-            }));
+        for scheduled_at in item_scheduled_at {
+            let total = completed_at
+                .checked_duration_since(*scheduled_at)
+                .expect("a release batch cannot complete before an item is scheduled");
+            let queue = total
+                .checked_sub(elapsed)
+                .expect("a release batch cannot start before an item is scheduled");
+            self.item_scheduled_to_completion.push(total);
+            self.paired_items.record(total, queue, elapsed);
+            if total > Duration::from_millis(25) {
+                self.paired_items_over_25ms.record(total, queue, elapsed);
+            }
+            if total > Duration::from_millis(100) {
+                self.paired_items_over_100ms.record(total, queue, elapsed);
+            }
+        }
     }
 
     fn percentile(samples: &mut [Duration], numerator: usize, denominator: usize) -> Duration {
@@ -905,6 +959,24 @@ fn emit_bounded_scale_stall_observation(
         "sdk-704 bounded snapshot scale: phase={phase_name} stage={stage} offered_ops_per_second={target_rate} submitted_batches={submitted_batches} completed_batches={completed_batches} completed_operations={completed_operations} achieved_ops_per_second_milli={achieved_ops_per_second_milli} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={batch_p99_us:?} batch_p999_us={batch_p999_us:?} item_p99_us={item_p99_us:?} item_p999_us={item_p999_us:?} elapsed_ms={} read_backend_unavailable_retries={read_backend_unavailable_retries} effect_counters={effect_snapshot:?} completed_snapshot_count_by_voter={completed_snapshot_count_by_voter:?} voter_status={voter_status:?} voter_engine_progress={voter_engine_progress:?} voter_diagnostics={voter_diagnostics:?}",
         elapsed.as_millis(),
     );
+    #[cfg(target_os = "linux")]
+    {
+        let voter_wal_costs = diagnostics
+            .stores
+            .iter()
+            .map(|store| {
+                opc_session_store::test_support::consensus_local_wal_costs_for_test(store)
+                    .unwrap_or_else(|_| Some(serde_json::json!({ "observation": "unavailable" })))
+            })
+            .collect::<Vec<_>>();
+        let timing = serde_json::json!({
+            "paired_items": observation.latency.paired_items.json(),
+            "paired_items_over_25ms": observation.latency.paired_items_over_25ms.json(),
+            "paired_items_over_100ms": observation.latency.paired_items_over_100ms.json(),
+            "voter_wal_costs": voter_wal_costs,
+        });
+        eprintln!("sdk-741 bounded timing: phase={phase_name} stage={stage} timing={timing}");
+    }
 }
 
 /// Preserve the isolated voter artifacts after a controlled scale failure.

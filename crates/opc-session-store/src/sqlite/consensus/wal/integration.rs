@@ -36,6 +36,41 @@ pub(super) struct FlushCosts {
     intent_us: u128,
     data_sync_us: u128,
     publication_us: u128,
+    queue_wait_us: u128,
+    queue_wait_maximum_us: u128,
+    submit_to_callback_us: u128,
+    write_maximum_us: u128,
+    intent_maximum_us: u128,
+    data_sync_maximum_us: u128,
+    publication_maximum_us: u128,
+    slowest_request: SlowestFlushRequest,
+}
+
+#[derive(Default)]
+struct SlowestFlushRequest {
+    operation: &'static str,
+    queue_wait_us: u128,
+    submit_to_callback_us: u128,
+    rollover_us: u128,
+    write_us: u128,
+    intent_us: u128,
+    data_sync_us: u128,
+    publication_us: u128,
+}
+
+impl SlowestFlushRequest {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "operation": self.operation,
+            "queue_wait_us": self.queue_wait_us,
+            "submit_to_callback_us": self.submit_to_callback_us,
+            "rollover_us": self.rollover_us,
+            "write_us": self.write_us,
+            "intent_us": self.intent_us,
+            "data_sync_us": self.data_sync_us,
+            "publication_us": self.publication_us,
+        })
+    }
 }
 
 impl FlushCosts {
@@ -68,6 +103,36 @@ impl FlushCosts {
         self.intent_us += group.intent.as_micros();
         self.data_sync_us += group.data_sync.as_micros();
         self.publication_us += group.publication.as_micros();
+        self.write_maximum_us = self.write_maximum_us.max(group.write.as_micros());
+        self.intent_maximum_us = self.intent_maximum_us.max(group.intent.as_micros());
+        self.data_sync_maximum_us = self.data_sync_maximum_us.max(group.data_sync.as_micros());
+        self.publication_maximum_us = self
+            .publication_maximum_us
+            .max(group.publication.as_micros());
+        for ((admission, queue_wait), submit_to_callback) in group
+            .admission
+            .iter()
+            .zip(&group.queue_wait)
+            .zip(&group.submit_to_callback)
+        {
+            let queue_wait_us = queue_wait.as_micros();
+            let submit_to_callback_us = submit_to_callback.as_micros();
+            self.queue_wait_us += queue_wait_us;
+            self.queue_wait_maximum_us = self.queue_wait_maximum_us.max(queue_wait_us);
+            self.submit_to_callback_us += submit_to_callback_us;
+            if submit_to_callback_us > self.slowest_request.submit_to_callback_us {
+                self.slowest_request = SlowestFlushRequest {
+                    operation: admission.operation,
+                    queue_wait_us,
+                    submit_to_callback_us,
+                    rollover_us: group.rollover.as_micros(),
+                    write_us: group.write.as_micros(),
+                    intent_us: group.intent.as_micros(),
+                    data_sync_us: group.data_sync.as_micros(),
+                    publication_us: group.publication.as_micros(),
+                };
+            }
+        }
     }
 }
 
@@ -146,6 +211,10 @@ pub(super) struct CheckpointCosts {
     pub(super) native_capture: Duration,
     pub(super) native_owner_publish: Duration,
     pub(super) native_owner_maximum: Duration,
+    pub(super) native_select_io: Duration,
+    pub(super) native_select_io_maximum: Duration,
+    pub(super) native_reclaim_io: Duration,
+    pub(super) native_reclaim_io_maximum: Duration,
 }
 
 #[cfg(test)]
@@ -423,6 +492,14 @@ impl Wal {
             "intent_us": totals.intent_us,
             "data_sync_us": totals.data_sync_us,
             "publication_us": totals.publication_us,
+            "queue_wait_us": totals.queue_wait_us,
+            "queue_wait_maximum_us": totals.queue_wait_maximum_us,
+            "submit_to_callback_us": totals.submit_to_callback_us,
+            "write_maximum_us": totals.write_maximum_us,
+            "intent_maximum_us": totals.intent_maximum_us,
+            "data_sync_maximum_us": totals.data_sync_maximum_us,
+            "publication_maximum_us": totals.publication_maximum_us,
+            "slowest_request": totals.slowest_request.json(),
             "retained_groups": state.observations.len(),
             "retained_requests": state.observation_requests,
             "retained_request_limit": self.limits.history_count,
@@ -446,6 +523,10 @@ impl Wal {
                     "capture_us": state.checkpoint_costs.native_capture.as_micros(),
                     "owner_publish_us": state.checkpoint_costs.native_owner_publish.as_micros(),
                     "owner_maximum_us": state.checkpoint_costs.native_owner_maximum.as_micros(),
+                    "select_io_us": state.checkpoint_costs.native_select_io.as_micros(),
+                    "select_io_maximum_us": state.checkpoint_costs.native_select_io_maximum.as_micros(),
+                    "reclaim_io_us": state.checkpoint_costs.native_reclaim_io.as_micros(),
+                    "reclaim_io_maximum_us": state.checkpoint_costs.native_reclaim_io_maximum.as_micros(),
                 },
             },
             "discarded_groups": totals.groups - state.observations.len() as u64,

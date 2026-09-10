@@ -429,6 +429,21 @@ pub fn consensus_local_durable_progress_for_test(
     }
 }
 
+/// Return constant-space local WAL timing totals without issuing a read
+/// barrier or changing consensus state. The observation contains only fixed
+/// categories and numeric counters, with no payload, identity, or path.
+#[cfg(target_os = "linux")]
+pub fn consensus_local_wal_costs_for_test(
+    store: &ConsensusSessionStore,
+) -> std::io::Result<Option<serde_json::Value>> {
+    store
+        .inner
+        .private_wal
+        .as_ref()
+        .map(|wal| wal.integration_cost_snapshot())
+        .transpose()
+}
+
 /// Wait until the engine has purged beyond an isolated follower's previously
 /// applied index. This is test-only evidence that healing must use the real
 /// InstallSnapshot RPC rather than ordinary log replay.

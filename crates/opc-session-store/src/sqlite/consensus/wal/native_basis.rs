@@ -560,8 +560,12 @@ fn select(
     // The single writer retains Disk ownership. Admissions/applications may
     // advance State during this I/O; no newer WAL cut is published concurrently.
     // CURRENT is durable before any row eviction or covered-prefix removal.
+    let select_io_started = Instant::now();
     checkpoint::select(&disk.directory, &prepared.anchor, control)?;
+    let select_io = select_io_started.elapsed();
+    let reclaim_io_started = Instant::now();
     checkpoint::reclaim_covered(disk, &prepared.anchor, control)?;
+    let reclaim_io = reclaim_io_started.elapsed();
     let mut state = lock_state(shared)?;
     let held = Instant::now();
     ensure_readable(&state)?;
@@ -621,6 +625,10 @@ fn select(
     recorded.native_proof += costs.native_proof;
     recorded.native_decode_validate += costs.native_decode_validate;
     recorded.native_file_publish += costs.native_file_publish;
+    recorded.native_select_io += select_io;
+    recorded.native_select_io_maximum = recorded.native_select_io_maximum.max(select_io);
+    recorded.native_reclaim_io += reclaim_io;
+    recorded.native_reclaim_io_maximum = recorded.native_reclaim_io_maximum.max(reclaim_io);
     recorded.native_owner_publish += preflight_hold + publication_hold;
     recorded.native_owner_maximum = recorded
         .native_owner_maximum
