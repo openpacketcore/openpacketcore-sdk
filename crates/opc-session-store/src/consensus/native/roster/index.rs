@@ -95,12 +95,12 @@ pub(crate) struct Index {
     stable: ResidentMap<[u8; 32], RequestBindingKey>,
     requests: [ResidentMap<[u8; 16], RequestBindingKey>; 2],
     reservations: ResidentMap<[u8; 32], RequestBindingKey>,
-    partitions: im::OrdMap<ProductionFloorKey, im::OrdMap<RequestBindingKey, Facts>>,
-    epochs: im::OrdMap<(ProductionFloorKey, u64), usize>,
-    terminals: im::OrdMap<u64, RequestBindingKey>,
-    retained: im::OrdSet<(i128, RequestBindingKey)>,
-    non_tombstones: im::OrdSet<(ProductionFloorKey, RequestBindingKey)>,
-    original_v1: ResidentMap<OriginalLookup, im::OrdSet<RequestBindingKey>>,
+    partitions: imbl::OrdMap<ProductionFloorKey, imbl::OrdMap<RequestBindingKey, Facts>>,
+    epochs: imbl::OrdMap<(ProductionFloorKey, u64), usize>,
+    terminals: imbl::OrdMap<u64, RequestBindingKey>,
+    retained: imbl::OrdSet<(i128, RequestBindingKey)>,
+    non_tombstones: imbl::OrdSet<(ProductionFloorKey, RequestBindingKey)>,
+    original_v1: ResidentMap<OriginalLookup, imbl::OrdSet<RequestBindingKey>>,
 }
 
 impl Index {
@@ -232,7 +232,7 @@ impl Index {
     }
 
     pub(crate) fn partition_count(&self, key: ProductionFloorKey) -> usize {
-        self.partitions.get(&key).map_or(0, im::OrdMap::len)
+        self.partitions.get(&key).map_or(0, imbl::OrdMap::len)
     }
 
     pub(crate) fn epoch_count(&self, key: ProductionFloorKey, epoch: u64) -> usize {
@@ -249,6 +249,7 @@ impl Index {
 
     /// At most one original retirement page plus its lookahead. Epoch filtering
     /// follows the ordered seek; earlier epochs are checked through bounds.
+    #[cfg(test)]
     pub(crate) fn partition_prefix(
         &self,
         key: ProductionFloorKey,

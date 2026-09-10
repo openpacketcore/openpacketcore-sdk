@@ -86,6 +86,7 @@ pub(crate) struct SqlitePreparedBase<'a> {
 
 impl<'a> SqlitePreparedBase<'a> {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn prepare(
         conn: &'a mut Connection,
         identity: SessionConsensusIdentity,

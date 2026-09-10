@@ -2,7 +2,7 @@
 //! business read authority. Only the WAL owner's separately published durable
 //! committed watermark authorizes application.
 
-use im::OrdMap;
+use imbl::OrdMap;
 
 use bytes::Bytes;
 use opc_consensus::engine::Vote;
@@ -63,6 +63,7 @@ impl NativeLog {
             .or(self.purged)
     }
 
+    #[cfg(test)]
     pub(crate) fn read(
         &self,
         start: u64,

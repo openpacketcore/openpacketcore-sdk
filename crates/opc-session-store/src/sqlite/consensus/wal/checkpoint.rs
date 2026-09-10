@@ -465,6 +465,7 @@ impl Wal {
 
     /// Wait for a selected basis covering this operation and applied cut.
     /// Native admission continues while its immutable capture is prepared.
+    #[cfg(test)]
     pub(crate) fn checkpoint(&self) -> io::Result<u64> {
         let mut state = lock_state(&self.shared)?;
         while (state.snapshot.is_some() || state.native_install_pending)

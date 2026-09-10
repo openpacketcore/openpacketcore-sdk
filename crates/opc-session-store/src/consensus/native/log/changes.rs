@@ -268,6 +268,7 @@ impl LogChanges {
         }
     }
 
+    #[cfg(test)]
     fn validate(&self, log: &NativeLog, state: &NativeState) -> io::Result<()> {
         if !Arc::ptr_eq(&self.target, log.require_proof(state)?) {
             return Err(invalid("native log capture target differs"));
@@ -834,6 +835,7 @@ impl NativeLog {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn capture_changes(&mut self, state: &NativeState) -> io::Result<LogChanges> {
         self.changes
             .as_ref()

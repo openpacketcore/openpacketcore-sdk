@@ -16,6 +16,7 @@ pub(super) struct Target {
 }
 
 impl Target {
+    #[cfg(test)]
     pub(super) fn requested(state: &State) -> io::Result<Self> {
         let native = state
             .native

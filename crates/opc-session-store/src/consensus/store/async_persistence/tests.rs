@@ -26,6 +26,7 @@ use crate::topology::{
 use crate::{SessionAsyncRecoveryState, SnapshotIntegrityPolicy};
 
 mod admission;
+mod bootstrap;
 mod races;
 mod snapshots;
 mod writer;
@@ -245,6 +246,16 @@ impl Fleet {
         mode: SessionPersistenceMode,
         hook: Option<GenerationHook>,
     ) -> Result<(), ConsensusSessionStoreOpenError> {
+        self.open_with_hooks(index, mode, hook, None).await
+    }
+
+    async fn open_with_hooks(
+        &mut self,
+        index: usize,
+        mode: SessionPersistenceMode,
+        hook: Option<GenerationHook>,
+        root_hook: Option<crate::sqlite::consensus::wal::owner::RootHookForTest>,
+    ) -> Result<(), ConsensusSessionStoreOpenError> {
         assert!(self.stores[index].is_none());
         let backend =
             SqliteSessionBackend::open(self.directory.path().join(format!("node-{index}.sqlite")))
@@ -255,6 +266,13 @@ impl Fleet {
                 .as_ref()
                 .unwrap()
                 .set_generation_hook_for_test(hook);
+        }
+        if let Some(hook) = root_hook {
+            backend
+                .native_owner
+                .as_ref()
+                .unwrap()
+                .set_root_hook_for_test(hook);
         }
         let peers = self
             .peers

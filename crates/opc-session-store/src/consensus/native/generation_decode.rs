@@ -301,6 +301,7 @@ fn notification_scratch(bytes: &[u8]) -> io::Result<usize> {
     row.end(payload)
 }
 
+#[cfg(test)]
 fn generic_scratch(bytes: &[u8]) -> io::Result<usize> {
     generic_scratch_format(bytes, Format::V3)
 }
@@ -382,6 +383,7 @@ fn decode_generic(
 // callback to outlive scratch ownership. Cold reconstruction will retain only
 // separately charged compact metadata/ranges, and keys need their own resident
 // ownership when that reader is integrated. Input bytes are charged by Input.
+#[cfg(test)]
 pub(super) fn verify_key(
     bytes: &[u8],
     frontiers: &NativeFrontiers,
@@ -390,6 +392,7 @@ pub(super) fn verify_key(
     inspect_key(bytes, frontiers, check).map(|_| ())
 }
 
+#[cfg(test)]
 pub(super) fn inspect_key(
     bytes: &[u8],
     frontiers: &NativeFrontiers,
@@ -484,6 +487,7 @@ pub(super) fn owned_key(
     })
 }
 
+#[cfg(test)]
 pub(super) fn verify_notification(
     bytes: &[u8],
     sequence: u64,
@@ -548,6 +552,7 @@ pub(in crate::consensus::native) fn owned_notification(
     })
 }
 
+#[cfg(test)]
 pub(super) fn verify_generic(
     bytes: &[u8],
     frontiers: &NativeFrontiers,
@@ -574,6 +579,7 @@ pub(in crate::consensus::native) fn full_generic(
     Ok((id, row))
 }
 
+#[cfg(test)]
 pub(super) fn inspect_generic(
     bytes: &[u8],
     frontiers: &NativeFrontiers,
@@ -639,6 +645,7 @@ pub(super) fn owned_generic(
     Ok(row)
 }
 
+#[cfg(test)]
 pub(super) fn verify_log(
     bytes: &[u8],
     index: u64,

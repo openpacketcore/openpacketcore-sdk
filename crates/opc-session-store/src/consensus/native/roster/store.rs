@@ -36,6 +36,7 @@ pub(in crate::consensus::native) struct Store<'s, 'a> {
 }
 
 impl<'s, 'a> Store<'s, 'a> {
+    #[cfg(test)]
     pub(in crate::consensus::native) fn new(
         base: &'s NativeDelta<'a>,
         ledger: &Ledger,
@@ -56,6 +57,7 @@ impl<'s, 'a> Store<'s, 'a> {
 
     /// The caller has released State and retains its exact application
     /// capture. Every selected I/O and full verifier remains in that scope.
+    #[cfg(test)]
     pub(in crate::consensus::native) fn new_detached(
         base: &'s NativeDelta<'a>,
         ledger: &Ledger,

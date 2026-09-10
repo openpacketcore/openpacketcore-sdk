@@ -4,7 +4,9 @@
 
 use super::*;
 use opc_consensus::engine::Vote;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 
 pub(super) mod binary;
 mod legacy;
@@ -37,11 +39,13 @@ struct Header {
     logs: usize,
 }
 
+#[cfg(test)]
 fn write_item(writer: &mut impl Write, item: &impl Serialize, limit: usize) -> io::Result<()> {
     let bytes = serde_json::to_vec(item).map_err(|_| invalid("native image item cannot encode"))?;
     write_bytes(writer, &bytes, limit)
 }
 
+#[cfg(test)]
 fn write_bytes(writer: &mut impl Write, bytes: &[u8], limit: usize) -> io::Result<()> {
     if bytes.is_empty() || bytes.len() > limit {
         return Err(invalid("native image item exceeds bound"));
@@ -72,6 +76,7 @@ fn read_item<T: serde::de::DeserializeOwned>(
         .map_err(|_| invalid("native image item invalid"))
 }
 
+#[cfg(test)]
 fn write_row(writer: &mut impl Write, item: &impl Serialize, legacy: bool) -> io::Result<()> {
     if legacy {
         return write_item(writer, item, MAX_ITEM);
@@ -92,6 +97,7 @@ fn read_row<T: serde::de::DeserializeOwned + Serialize>(
 }
 
 impl NativeStorage {
+    #[cfg(test)]
     pub(crate) fn write_image(
         &self,
         writer: &mut impl Write,
@@ -101,6 +107,7 @@ impl NativeStorage {
         self.write_image_with_snapshot(writer, root, wal_sequence, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_image_with_snapshot(
         &self,
         writer: &mut impl Write,
@@ -141,6 +148,7 @@ impl NativeStorage {
         self.write_version(writer, root, wal_sequence, None, 3)
     }
 
+    #[cfg(test)]
     fn write_version(
         &self,
         writer: &mut impl Write,

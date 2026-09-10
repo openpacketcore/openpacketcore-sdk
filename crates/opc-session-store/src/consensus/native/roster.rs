@@ -120,7 +120,7 @@ pub(crate) fn fixed_scope(
 #[derive(Clone)]
 pub(crate) struct Ledger {
     pub(crate) rows: ResidentMap<RequestBindingKey, SharedRow<Row>>,
-    pub(crate) partitions: im::OrdMap<ProductionFloorKey, SharedRow<Partition>>,
+    pub(crate) partitions: imbl::OrdMap<ProductionFloorKey, SharedRow<Partition>>,
     pub(crate) index: Index,
     pub(crate) witness: Option<GlobalChargeWitness>,
     certificate: Arc<Certificate>,
@@ -130,7 +130,7 @@ impl Ledger {
     pub(crate) fn empty() -> Self {
         Self {
             rows: ResidentMap::new(),
-            partitions: im::OrdMap::new(),
+            partitions: imbl::OrdMap::new(),
             index: Index::default(),
             witness: None,
             certificate: Certificate::empty(),
@@ -141,6 +141,7 @@ impl Ledger {
     /// business predicates, shared floors/cursors, all uniqueness constraints,
     /// applied horizons and the original aggregate charge calculation.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn admit(
         root: &RosterAttestationTrustRootV1,
         scope: &MembershipValidationScope,
@@ -163,6 +164,7 @@ impl Ledger {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn admit_detached(
         root: &RosterAttestationTrustRootV1,
         scope: &MembershipValidationScope,

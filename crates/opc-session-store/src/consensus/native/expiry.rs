@@ -48,11 +48,11 @@ impl PartialOrd for OrderedKey {
 
 #[derive(Clone, Default)]
 pub(super) struct ExpiryIndex {
-    records: im::OrdSet<(Timestamp, OrderedKey)>,
-    ordered_records: im::OrdSet<OrderedKey>,
-    leases: im::OrdSet<(Timestamp, OrderedKey)>,
-    released: im::OrdSet<OrderedKey>,
-    v1_due: im::OrdSet<(Timestamp, [u8; 16])>,
+    records: imbl::OrdSet<(Timestamp, OrderedKey)>,
+    ordered_records: imbl::OrdSet<OrderedKey>,
+    leases: imbl::OrdSet<(Timestamp, OrderedKey)>,
+    released: imbl::OrdSet<OrderedKey>,
+    v1_due: imbl::OrdSet<(Timestamp, [u8; 16])>,
     v1_count: usize,
 }
 

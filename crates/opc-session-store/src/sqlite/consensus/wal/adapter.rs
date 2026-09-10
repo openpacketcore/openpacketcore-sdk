@@ -16,8 +16,8 @@ use opc_consensus::engine::{
 };
 use opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES;
 
-use super::super::{self as consensus, SessionConsensusNodeId, SessionRaftTypeConfig};
 use super::{encode_json, ensure_readable, invalid_data, lock_state, Operation, Wal, MAX_ENTRIES};
+use crate::sqlite::consensus::{self, SessionConsensusNodeId, SessionRaftTypeConfig};
 
 #[derive(Clone)]
 pub(crate) struct WalLogStore {

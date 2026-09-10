@@ -450,6 +450,7 @@ impl Opening {
         Ok(self)
     }
 
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn finish(
         self,
         verify: impl FnOnce() -> io::Result<()>,
@@ -514,6 +515,7 @@ impl Opening {
     }
 }
 
+#[cfg(test)]
 pub(super) fn open(
     directory: &Path,
     binding: Binding,
@@ -527,10 +529,12 @@ pub(super) fn open(
 /// Only the joined-owner audit below creates this view, while it holds the
 /// directory lock and all strict snapshot admissions. Receipt I/O therefore
 /// operates on one immutable, completely admitted state outside live State.
+#[cfg(test)]
 pub(crate) struct NativeAudit<'a> {
     state: &'a NativeState,
 }
 
+#[cfg(test)]
 impl std::ops::Deref for NativeAudit<'_> {
     type Target = NativeState;
     fn deref(&self) -> &Self::Target {
@@ -538,7 +542,9 @@ impl std::ops::Deref for NativeAudit<'_> {
     }
 }
 
+#[cfg(test)]
 impl NativeAudit<'_> {
+    #[cfg(test)]
     pub(crate) fn status(
         &self,
         request: &crate::FencedTransitionV2Request,
@@ -573,6 +579,7 @@ impl Wal {
         Ok(OperationPermit(Arc::clone(&self.shared)))
     }
 
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn create_native(
         directory: &Path,
         basis: &Connection,
@@ -586,6 +593,7 @@ impl Wal {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn create_native_with_root(
         directory: &Path,
         basis: &Connection,
@@ -638,6 +646,7 @@ impl Wal {
     /// Reconstruct only the published durable state after its writer joined.
     /// Keep the strict snapshot admissions alive during the evidence read.
     /// Unlike Opening::finish, this never repairs files or starts a writer.
+    #[cfg(test)]
     pub(crate) fn native_audit_closed<T, P>(
         &self,
         admit_snapshots: impl FnOnce(
@@ -922,6 +931,7 @@ impl Wal {
         Err(invalid_data("native owner rejects a live SQL fallback"))
     }
 
+    #[cfg(test)]
     pub(crate) fn native_sql_fallback_count(&self) -> io::Result<u64> {
         let state = lock_state(&self.shared)?;
         ensure_readable(&state)?;
@@ -1057,6 +1067,7 @@ impl Wal {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_native_receipt_read<T>(
         &self,
         requests: &[crate::FencedTransitionV2Request],

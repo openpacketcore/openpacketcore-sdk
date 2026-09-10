@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex, Weak};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use super::super::{self as consensus, SqliteConsensusCore};
 use super::{invalid_data, Binding, IoControl, Limits, Wal};
 use crate::consensus::SessionPersistenceMode;
+use crate::sqlite::consensus::{self, SqliteConsensusCore};
 
 pub(super) const ROOT_BYTES: u64 = 168;
 const ROOT_MAGIC: &[u8; 8] = b"OPCNR001";
@@ -23,6 +23,22 @@ const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
 #[cfg(test)]
 type GenerationHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootPointForTest {
+    BeforeCreate,
+    AfterCreate,
+    AfterWrite,
+    AfterFileSync,
+    AfterDirectorySync,
+    AfterParentSync,
+    AfterSelection,
+    AfterSelectionSync,
+}
+
+#[cfg(test)]
+pub(crate) type RootHookForTest = Arc<dyn Fn(RootPointForTest) -> io::Result<()> + Send + Sync>;
 
 fn read_selection(database: &File) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
     let mut bytes = [0; ROOT_BYTES as usize];
@@ -79,6 +95,8 @@ pub(crate) struct NativeOwner {
     current: Mutex<Weak<Wal>>,
     #[cfg(test)]
     generation_hook: Mutex<Option<GenerationHookForTest>>,
+    #[cfg(test)]
+    root_hook: Mutex<Option<RootHookForTest>>,
 }
 
 impl NativeOwner {
@@ -119,6 +137,8 @@ impl NativeOwner {
             current: Mutex::new(Weak::new()),
             #[cfg(test)]
             generation_hook: Mutex::new(None),
+            #[cfg(test)]
+            root_hook: Mutex::new(None),
         })
     }
 
@@ -128,6 +148,18 @@ impl NativeOwner {
     pub(crate) fn set_generation_hook_for_test(&self, hook: GenerationHookForTest) {
         assert!(self.current.lock().unwrap().upgrade().is_none());
         *self.generation_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_root_hook_for_test(&self, hook: RootHookForTest) {
+        assert!(self.current.lock().unwrap().upgrade().is_none());
+        *self.root_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn root_point_for_test(&self, point: RootPointForTest) -> io::Result<()> {
+        let hook = self.root_hook.lock().unwrap().clone();
+        hook.map_or(Ok(()), |hook| hook(point))
     }
 
     fn io_control(&self) -> IoControl {
@@ -335,11 +367,23 @@ impl NativeOwner {
         bytes[104..136].copy_from_slice(&wal.binding.digest()?);
         let checksum = Sha256::digest(&bytes[..136]);
         bytes[136..].copy_from_slice(&checksum);
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::BeforeCreate)?;
         let mut file = super::file_create(&directory_path(directory).join("ROOT"))?;
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::AfterCreate)?;
         file.write_all(&bytes)?;
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::AfterWrite)?;
         file.sync_all()?;
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::AfterFileSync)?;
         directory.sync_all()?;
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::AfterDirectorySync)?;
         self.parent.sync_all()?;
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::AfterParentSync)?;
         // Retain the complete ROOT proof on the actual database inode,
         // independently of the removable native namespace and its spelling.
         // CREATE prevents replacing a prior selection. The inode sync must
@@ -350,7 +394,12 @@ impl NativeOwner {
             &bytes,
             rustix::fs::XattrFlags::CREATE,
         )?;
-        self.database.sync_all()
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::AfterSelection)?;
+        self.database.sync_all()?;
+        #[cfg(test)]
+        self.root_point_for_test(RootPointForTest::AfterSelectionSync)?;
+        Ok(())
     }
 
     fn read_root(

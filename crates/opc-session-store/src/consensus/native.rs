@@ -42,7 +42,7 @@ use crate::sqlite::consensus::wal::snapshot::NativeSnapshotAuthority;
 pub(crate) use image::snapshot_prefix;
 use shared::SharedRow;
 
-use im::{HashMap as ResidentMap, Vector as ResidentVector};
+use imbl::{HashMap as ResidentMap, Vector as ResidentVector};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
@@ -453,6 +453,7 @@ fn unavailable() -> StoreError {
 }
 
 impl NativeState {
+    #[cfg(test)]
     pub(crate) fn empty(
         identity: SessionConsensusIdentity,
         members: BTreeSet<SessionConsensusNodeId>,
@@ -600,6 +601,7 @@ impl NativeState {
                 })
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_count(&self) -> usize {
         self.receipts.len()
     }
@@ -640,6 +642,7 @@ impl NativeState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self, key: &SessionKey) -> Option<StoredSessionRecord> {
         self.keys
             .get(key)?
@@ -741,6 +744,7 @@ impl NativeState {
         )
     }
 
+    #[cfg(test)]
     fn prepare(&self, entries: &[Entry<SessionRaftTypeConfig>]) -> io::Result<NativeDelta<'_>> {
         self.prepare_using(entries, None)
     }
@@ -791,6 +795,7 @@ impl NativeState {
     // Only the owning adapter can use this after validating exact durable
     // committed inputs. All allocation needed by publication is reserved
     // first; a poisoned enclosing owner can never return a partial image.
+    #[cfg(test)]
     pub(crate) fn apply(
         &mut self,
         entries: &[Entry<SessionRaftTypeConfig>],

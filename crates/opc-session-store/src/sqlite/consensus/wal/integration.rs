@@ -15,9 +15,9 @@ use std::time::Duration;
 #[cfg(test)]
 use super::super as consensus;
 use super::super::SqliteConsensusCore;
-use super::{invalid_data, Wal};
+use super::Wal;
 #[cfg(test)]
-use super::{Binding, IoControl, Limits};
+use super::{invalid_data, Binding, IoControl, Limits};
 
 /// Constant-space totals for this writer incarnation. Detailed samples below
 /// are recent groups bounded by retained request count; totals never reset at
@@ -541,6 +541,7 @@ impl Wal {
         observation
     }
 
+    #[cfg(test)]
     pub(crate) fn integration_observations(&self) -> io::Result<serde_json::Value> {
         let mut observation = {
             let state = super::lock_state(&self.shared)?;

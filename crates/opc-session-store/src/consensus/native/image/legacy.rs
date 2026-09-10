@@ -45,6 +45,7 @@ impl Key {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn from_current(key: &SessionKey, row: &NativeKeyState) -> io::Result<Self> {
         let lease = row
             .lease

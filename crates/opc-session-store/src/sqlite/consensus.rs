@@ -5,10 +5,13 @@
 //! redaction-safe failures into Openraft storage errors.
 
 pub(crate) mod consumer_receipts;
+#[cfg(target_os = "linux")]
 pub(crate) mod native_snapshot;
 pub(crate) mod roster_engine;
 pub(crate) mod roster_reads;
+#[cfg(target_os = "linux")]
 pub(crate) mod roster_rows;
+#[cfg(target_os = "linux")]
 pub(crate) mod roster_snapshot;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14054,10 +14057,6 @@ fn protected_roster_validate_binding_authority_before_lookup(
     }
     Ok((scope, roster_id))
 }
-
-/// Rehydrate one V2 carrier only after its dedicated canonical decoder and
-/// original-authority row agree.  This has no V1 fallback: a V1 row with
-/// matching fields is still an absence in Profile V2.
 
 /// Exact Profile-V2 admission status.  The stable slot and result carrier are
 /// V2-only, so V1 state can neither satisfy nor shadow this query.

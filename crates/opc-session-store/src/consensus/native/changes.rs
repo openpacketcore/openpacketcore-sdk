@@ -301,6 +301,7 @@ impl BusinessChanges {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate(&self, state: &NativeState) -> io::Result<()> {
         if !Arc::ptr_eq(state.require_business_proof()?, &self.target) {
             return Err(invalid(
@@ -1202,6 +1203,7 @@ impl NativeState {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn capture_changes(&mut self) -> io::Result<BusinessChanges> {
         self.changes
             .as_ref()

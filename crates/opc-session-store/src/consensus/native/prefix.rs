@@ -342,6 +342,7 @@ impl VerifiedPrefix {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_failed(&self) -> bool {
         self.source.failed.load(Ordering::Acquire)
     }

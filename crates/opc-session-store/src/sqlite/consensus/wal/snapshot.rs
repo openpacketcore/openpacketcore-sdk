@@ -2,11 +2,15 @@
 //! The primary SQLite connection stays with its owner; Disk and its flock stay
 //! with the sole WAL writer. A bounded pending proof bridges their commits.
 
-use super::super::{self as consensus, BackendCapabilities, CurrentSnapshot};
+#[cfg(test)]
+use super::super::BackendCapabilities;
 use super::*;
 use crate::consensus::snapshot::{PinnedSqliteFile, SNAPSHOT_ENVELOPE_FOOTER_BYTES};
+use crate::sqlite::consensus::{self, CurrentSnapshot};
 use crate::sqlite::ops::RestoreScanIncarnation;
-use rusqlite::{Transaction, TransactionBehavior};
+use rusqlite::Transaction;
+#[cfg(test)]
+use rusqlite::TransactionBehavior;
 
 #[path = "native_install.rs"]
 mod native_install;
@@ -552,6 +556,7 @@ impl Pending {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+#[cfg(test)]
 enum Proof {
     Absent,
     Preparing(Vec<u8>),
@@ -570,6 +575,7 @@ pub(super) fn is_proof_file(name: &str, len: u64) -> io::Result<bool> {
     Ok(true)
 }
 
+#[cfg(test)]
 fn read_proof(directory: &Path, binding: Binding, limits: Limits) -> io::Result<Proof> {
     let read = |name: &str| -> io::Result<Option<Vec<u8>>> {
         let mut file = match file_read(&directory.join(name)) {
@@ -677,6 +683,7 @@ impl Wal {
         Ok(lock_state(&self.shared)?.snapshot.is_some())
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_source_cut_for_test(&self) -> io::Result<()> {
         (self.control.hook)(Point::AfterSnapshotSourceCut)
     }
@@ -700,6 +707,7 @@ impl Wal {
     /// Called while the original snapshot gate and primary cache connection
     /// are held. The caller must retain its external candidate before entry:
     /// even a proof rename/sync error can leave recovery needing that file.
+    #[cfg(test)]
     pub(crate) fn publish_snapshot(
         &self,
         conn: &Connection,
@@ -1030,6 +1038,7 @@ fn retire_proof(directory: &Path, name: &str, control: &IoControl) -> io::Result
     (control.hook)(Point::AfterSnapshotProofRetireSync)
 }
 
+#[cfg(test)]
 struct Image {
     conn: Connection,
     audit: RecoveryAudit,
@@ -1037,6 +1046,7 @@ struct Image {
 
 /// An unusable opening owner. Its flock survives asynchronous immutable-file
 /// checks in storage.rs, before snapshot scavenging or legacy reseeding runs.
+#[cfg(test)]
 pub(crate) struct Opening {
     directory: PathBuf,
     binding: Binding,
@@ -1049,7 +1059,9 @@ pub(crate) struct Opening {
     install_candidate: Option<CurrentSnapshot>,
 }
 
+#[cfg(test)]
 impl Opening {
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn new(
         directory: &Path,
         binding: Binding,
@@ -1098,14 +1110,17 @@ impl Opening {
         Ok(opening)
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshots(&self) -> Vec<CurrentSnapshot> {
         self.snapshots.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn install_candidate(&self) -> Option<CurrentSnapshot> {
         self.install_candidate.clone()
     }
 
+    #[cfg(test)]
     fn audit_images(
         &self,
         install_source: Option<&InstallSource>,
@@ -1168,6 +1183,7 @@ impl Opening {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn finish(
         self,
         cache: &Connection,
@@ -1177,6 +1193,7 @@ impl Opening {
         self.finish_with_install_source(cache, caps, None, verify_descriptors)
     }
 
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn finish_with_install_source(
         self,
         cache: &Connection,

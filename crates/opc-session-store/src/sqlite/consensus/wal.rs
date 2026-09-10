@@ -1,19 +1,21 @@
-//! Private executable WAL candidate for ADR 0021. This module is test-only.
+//! Native persistence owner and the retained SQL WAL regression implementation.
 //!
-//! A selected SQLite image is the complete authority/application basis. A bounded
-//! anonymous, disposable projection uses the existing SQL admission/projection functions; it is
-//! only a pending read view, never a durability authority. Application binds
-//! a committed cut to the original SQLite business transaction. Legacy
-//! migration, snapshot publication/install, live recovery sidecars and production routing remain integration
-//! boundaries. Only pristine operator-recovery state is admitted. Fixed
-//! authority retains its complete original validators and frozen tuple.
+//! Durable native writes retire callbacks after their synced WAL cut. Async
+//! writes project resident authority and persist coalesced generations in the
+//! same owner. Real quorum commitment and application remain the public result
+//! boundary. Native snapshot publication, installation and cold reopening use
+//! the original strict descriptor and authority checks. The SQL projection
+//! implementation and its direct construction helpers remain for regression
+//! coverage of the durable WAL format.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -326,6 +328,7 @@ pub(crate) enum Point {
     AfterBasisReclaimFile,
     BeforeBasisReclaimSync,
     AfterBasisReclaimSync,
+    #[cfg(test)]
     AfterSnapshotSourceCut,
     BeforeSnapshotProof,
     AfterSnapshotProofCreate,
@@ -367,6 +370,7 @@ impl Default for IoControl {
 pub(super) struct AdmissionObservation {
     pub(super) operation: &'static str,
     pub(super) entries: usize,
+    #[cfg(test)]
     pub(super) encode: Duration,
     pub(super) lock_wait: Duration,
     pub(super) projection: Duration,
@@ -375,8 +379,11 @@ pub(super) struct AdmissionObservation {
 
 #[derive(Clone, Debug)]
 pub(super) struct FlushObservation {
+    #[cfg(test)]
     pub(super) first: u64,
+    #[cfg(test)]
     pub(super) last: u64,
+    #[cfg(test)]
     pub(super) bytes: usize,
     pub(super) queue_wait: Vec<Duration>,
     pub(super) admission: Vec<AdmissionObservation>,
@@ -386,6 +393,7 @@ pub(super) struct FlushObservation {
     pub(super) intent: Duration,
     pub(super) data_sync: Duration,
     pub(super) publication: Duration,
+    #[cfg(test)]
     pub(super) callback_delay: Duration,
     pub(super) sync_calls: usize,
 }
@@ -401,15 +409,19 @@ pub(super) struct ProjectionStorageObservation {
     pub(super) maximum_pages: u64,
 }
 
+#[cfg(test)]
 pub(super) struct Ticket(mpsc::Receiver<io::Result<u64>>);
 
+#[cfg(test)]
 impl Ticket {
+    #[cfg(test)]
     pub(super) fn wait(self) -> io::Result<u64> {
         self.0
             .recv()
             .map_err(|_| io::Error::other("private WAL writer lost completion"))?
     }
 
+    #[cfg(test)]
     pub(super) fn try_recv(&self) -> Result<io::Result<u64>, mpsc::TryRecvError> {
         self.0.try_recv()
     }
@@ -426,6 +438,7 @@ impl AsyncTicket {
 }
 
 enum CompletionTarget {
+    #[cfg(test)]
     Blocking(mpsc::SyncSender<io::Result<u64>>),
     Async(tokio::sync::oneshot::Sender<io::Result<u64>>),
     Append(LogFlushed<SessionRaftTypeConfig>),
@@ -436,6 +449,7 @@ struct Completion(Option<CompletionTarget>);
 impl Completion {
     fn finish(&mut self, result: io::Result<u64>) {
         match self.0.take() {
+            #[cfg(test)]
             Some(CompletionTarget::Blocking(sender)) => {
                 let _ = sender.send(result);
             }
@@ -548,6 +562,7 @@ pub(crate) struct Wal {
     shared: Arc<Shared>,
     writer: Mutex<Option<JoinHandle<io::Result<()>>>>,
     control: IoControl,
+    #[cfg(test)]
     configured_roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
     // Retain the namespace through writer/basis drain and every detached read.
     directory_pin: Option<Arc<File>>,
@@ -638,6 +653,7 @@ impl State {
 }
 
 impl Wal {
+    #[cfg(test)]
     pub(super) fn create(
         directory: &Path,
         basis: &Connection,
@@ -753,6 +769,7 @@ impl Wal {
         Ok(wal)
     }
 
+    #[cfg(test)]
     pub(super) fn open(
         directory: &Path,
         binding: Binding,
@@ -857,6 +874,7 @@ impl Wal {
         // Native creation/cold admission received this root from the caller
         // and compared the cold basis against it before any replay. Retain
         // that configured object for joined-owner audits of the same WAL.
+        #[cfg(test)]
         let configured_roster_root = state
             .native
             .as_ref()
@@ -881,11 +899,13 @@ impl Wal {
             shared,
             writer: Mutex::new(Some(writer)),
             control: caller_control,
+            #[cfg(test)]
             configured_roster_root,
             directory_pin: None,
         })
     }
 
+    #[cfg(test)]
     pub(super) fn binding(&self) -> Binding {
         self.binding
     }
@@ -916,6 +936,7 @@ impl Wal {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn submit(&self, operation: Operation) -> io::Result<Ticket> {
         let (sender, receiver) = mpsc::sync_channel(1);
         self.admit(
@@ -972,6 +993,7 @@ impl Wal {
         )
     }
 
+    #[cfg(test)]
     fn admit(&self, operation: Operation, completion: Completion) -> io::Result<()> {
         self.admit_inner(operation, completion, false)
     }
@@ -993,6 +1015,7 @@ impl Wal {
         };
         let record = operation.encode()?;
         let charge = record.charge(self.limits.fragment_bytes())?;
+        #[cfg(test)]
         let encode = submitted.elapsed();
         let lock_started = Instant::now();
         let mut state = lock_state(&self.shared)?;
@@ -1099,6 +1122,7 @@ impl Wal {
             admission: AdmissionObservation {
                 operation: operation_name,
                 entries,
+                #[cfg(test)]
                 encode,
                 lock_wait,
                 projection,
@@ -1118,6 +1142,7 @@ impl Wal {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn read(
         &self,
         start: u64,
@@ -1164,6 +1189,7 @@ impl Wal {
         read_committed_sync(&state.conn, self.binding.identity)
     }
 
+    #[cfg(test)]
     pub(super) fn observations(&self) -> io::Result<Vec<FlushObservation>> {
         Ok(lock_state(&self.shared)?
             .observations
@@ -1696,6 +1722,7 @@ fn write_loop_body(
             requests: group,
             completed: false,
         };
+        #[cfg(test)]
         let first = group
             .requests
             .first()
@@ -1880,6 +1907,7 @@ fn write_loop_body(
                 },
             );
         }
+        #[cfg(test)]
         let callback_started = Instant::now();
         let count = group.requests.len();
         let mut submit_to_callback = Vec::with_capacity(count);
@@ -1889,6 +1917,7 @@ fn write_loop_body(
             request.finish(Ok(sequence));
         }
         group.completed = true;
+        #[cfg(test)]
         let callback_delay = callback_started.elapsed();
         state.outstanding -= count;
         state.outstanding_bytes -= charge;
@@ -1897,8 +1926,11 @@ fn write_loop_body(
             shared.ready.notify_all();
         }
         let observation = FlushObservation {
+            #[cfg(test)]
             first,
+            #[cfg(test)]
             last,
+            #[cfg(test)]
             bytes: charge,
             queue_wait,
             admission,
@@ -1908,6 +1940,7 @@ fn write_loop_body(
             intent,
             data_sync,
             publication,
+            #[cfg(test)]
             callback_delay,
             sync_calls,
         };
@@ -2283,6 +2316,7 @@ fn validate_tail_geometry(
     Ok(())
 }
 
+#[cfg(test)]
 fn recover(
     directory: &Path,
     binding: Binding,
@@ -2312,6 +2346,7 @@ struct RecoveryAudit {
     retired: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 fn audit_recovery(
     directory: &Path,
     binding: Binding,

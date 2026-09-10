@@ -160,6 +160,7 @@ impl Row {
     pub(crate) fn reserved_key(&self) -> Option<&SessionKey> {
         self.reserved_key.as_ref()
     }
+    #[cfg(test)]
     pub(crate) fn is_cold(&self) -> bool {
         self.cold.is_some()
     }

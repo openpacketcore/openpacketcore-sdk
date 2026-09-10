@@ -67,6 +67,7 @@ pub(super) fn validate_row_profile(row: &Row, frontiers: &NativeFrontiers) -> io
 }
 
 impl NativeState {
+    #[cfg(test)]
     pub(crate) fn protected_roster_v2_activation_matches(
         &self,
         identity: SessionConsensusIdentity,

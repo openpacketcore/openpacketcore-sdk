@@ -38,7 +38,7 @@ serde_json = { workspace = true }
 postcard = { workspace = true }
 # Native snapshot captures retain immutable container roots. Ordinary writes
 # copy only the changed paths; they never clone the retained history index.
-im = { version = "=15.1.0", features = ["serde"] }
+imbl = { version = "=7.0.2", features = ["serde"] }
 thiserror = { workspace = true }
 # The bounded SQLite scheduler handoff relies on the validated blocking-pool
 # FIFO retirement order. Enforce it for SDK consumers, whose lockfile is their

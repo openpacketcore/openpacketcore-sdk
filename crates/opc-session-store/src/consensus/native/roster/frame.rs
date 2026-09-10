@@ -45,6 +45,7 @@ fn row_length(projection: usize, canonical: usize) -> io::Result<u32> {
 
 /// Encoding uses an already admitted in-process row. Exact expected readback
 /// and complete cold admission remain the enclosing generation's obligation.
+#[cfg(test)]
 pub(in crate::consensus::native) fn write_row(
     writer: &mut dyn Write,
     row: &Row,

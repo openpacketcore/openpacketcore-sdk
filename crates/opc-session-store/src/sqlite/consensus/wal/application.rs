@@ -11,15 +11,14 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use super::super::{
-    self as consensus, AppliedBatch, BackendCapabilities, SessionConsensusNodeId,
-    SessionRaftTypeConfig,
-};
 use super::{
     append_logs_in_tx, db_error, decode_json, encode_json, ensure_readable, invalid_data,
     lock_state, read_applied_sync, read_committed_sync, read_log_range_sync,
     read_storage_identity_sync, save_committed_in_tx, validate_exact_log_prefix_through_sync,
     Binding, Digest, Entry, LogId, Operation, Sha256, State, Status, Wal, MAX_ENTRIES,
+};
+use crate::sqlite::consensus::{
+    self, AppliedBatch, BackendCapabilities, SessionConsensusNodeId, SessionRaftTypeConfig,
 };
 use std::io;
 use std::time::{Duration, Instant};
@@ -258,6 +257,7 @@ impl Wal {
         result
     }
 
+    #[cfg(test)]
     pub(in crate::sqlite::consensus) fn restore_application(
         &self,
         conn: &Connection,

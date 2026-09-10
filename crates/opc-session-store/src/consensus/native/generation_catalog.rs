@@ -424,6 +424,7 @@ impl Catalog {
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_context_header(
     context: &Context,
     binding: [u8; 32],
