@@ -229,6 +229,39 @@ ownership and returns unsupported without mutating another backend's authority.
 The publish transaction is crate-private, so only SDK-owned trusted adapters
 can complete rebind.
 
+For an unchanged canonical authority, `renew_gtpu_traffic_proof` starts a new
+assessment while the predecessor remains valid through its original expiry.
+Pass the current opaque proof and a lease from the same registered store. The
+eBPF adapter retains at most two attempts for that group, inside its existing
+global capacity: one issued predecessor and one successor. The successor gets
+a fresh registration, publication identity, secret and sample stream; it must
+collect its own paired bidirectional observations. Its traffic cannot extend
+the predecessor's assessment. Ordinary `begin_gtpu_traffic_proof` still
+supersedes the group's existing attempts.
+
+Keep the predecessor session until the successor has yielded an opaque proof
+and the product has validated and published it under its current guards. Then
+close the predecessor before another renewal. This exact cleanup cannot delete
+the successor registration. During collection, validation of the predecessor
+checks the SDK-owned successor relation and its current registration, source,
+attachment, group and canonical authority. Old challenges cannot prove the
+successor. Source loss, malformed or stale observations, hook drift and
+authority replacement still fail closed; no positive readiness flag is cached.
+
+Cancellation before session delivery leaves one pending successor recoverable
+by repeating renewal with the same current predecessor. No third registration
+is allocated. Closing or dropping the predecessor retires an undelivered
+successor; after delivery the new session owns its own cleanup. Expiry during
+the async handoff refuses delivery, and the caller must close the predecessor
+before beginning a fresh assessment. Failed publication remains terminal and
+exactly recoverable; renewal does not promise continuity across an uncertain
+kernel effect. Unsupported backends inherit a fail-closed default.
+
+Scheduling early enough to gather the replacement observations, publishing
+under product guards, and qualifying uninterrupted readiness remain CNF
+responsibilities. The renewal tests exercise the adapter with a fake runtime;
+they are not live packet-forwarding or carrier qualification evidence.
+
 The product drives an authenticated ICMP Echo challenge through the live
 session by calling `GtpuTrafficProofSession::challenge` with a distinct nonzero
 sample ID. The sample's high and low 16-bit halves are the exact ICMP Echo

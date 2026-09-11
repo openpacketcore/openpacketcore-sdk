@@ -227,6 +227,32 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Collect a replacement assessment without extending or immediately
+    /// revoking the current predecessor proof.
+    ///
+    /// The predecessor must still validate under this exact canonical lease.
+    /// A trusted adapter retains at most one predecessor and one successor
+    /// for the group; callers keep the predecessor session alive until they
+    /// publish the new opaque proof, then close it before renewing again.
+    /// Fresh registration and sample authority belong to the SDK. The old
+    /// assessment keeps its original expiry, and source loss, drift and
+    /// authority replacement continue to invalidate protected use.
+    ///
+    /// Cancellation before delivery retains a bounded pending successor for
+    /// retry with the same predecessor. Closing that predecessor cleans up an
+    /// undelivered successor. A delivered successor owns its own lifecycle:
+    /// later predecessor cleanup cannot revoke it. Existing backends fail
+    /// closed; the ordinary begin operation retains its supersession contract.
+    async fn renew_gtpu_traffic_proof(
+        &self,
+        _predecessor: &GtpuTrafficProof,
+        _authority: GtpuTrafficProofAuthorityLease,
+    ) -> Result<GtpuTrafficProofSession, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof_renewal",
+        })
+    }
+
     /// Construct and hand off one exact challenge for this backend's live attempt.
     ///
     /// After SDK route resolution and packet construction, the backend
