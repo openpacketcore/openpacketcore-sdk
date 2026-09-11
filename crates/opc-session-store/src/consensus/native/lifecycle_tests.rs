@@ -56,7 +56,7 @@ pub(crate) fn seed(
                         ordinal,
                         payload_digest: digest,
                         retained_until: until,
-                        response: response.clone().map(Box::new),
+                        response: response.clone().map(Arc::new),
                         cold: None,
                     })
                     .unwrap(),

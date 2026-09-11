@@ -38,6 +38,21 @@ fn populated(count: u64) -> NativeStorage {
     storage
 }
 
+fn assert_receipt_capture_clones_are_bounded(storage: &NativeStorage) {
+    let captured = measure(|| {
+        for (_, row) in &storage.business.receipts {
+            let captured: SharedRow<NativeReceipt> = std::hint::black_box(row.clone());
+            assert!(captured.ptr_eq(row));
+            assert_eq!(captured.retained_until, row.retained_until);
+        }
+    });
+    assert_eq!(
+        captured.count_total, 0,
+        "receipt captures copy no heap bodies"
+    );
+    assert_eq!(captured.bytes_current, 0);
+}
+
 fn report_owners(label: &str, mut storage: NativeStorage) {
     // Each root is uniquely owned here. Releasing a root counts its actual
     // allocations, including child payloads; shared prefix storage is counted
@@ -64,6 +79,15 @@ fn report_owners(label: &str, mut storage: NativeStorage) {
         );
     });
     if label == "selected" {
+        // The immutable map entry can own the selected row metadata. Allow
+        // room for the trie nodes, but reject an additional row or body
+        // allocation for every retained receipt. Count actual released
+        // allocations, including their children, rather than type sizes.
+        assert!(
+            -receipts.count_current <= 4096 * 2,
+            "selected receipt owner retains {} allocations for 4096 rows",
+            -receipts.count_current,
+        );
         // The full retained profile allows 2 GiB for three voters. Receipt
         // rows need headroom for watch history, keys, logs, captures and the
         // runtime. Keep this one owner below 360 bytes per fixture receipt;
@@ -97,6 +121,7 @@ fn native_memory_ownership_profiles_resident_selected_and_captured_rows() {
         let mut hot = None;
         let resident = measure(|| hot = Some(populated(ROWS)));
         let hot = hot.unwrap();
+        assert_receipt_capture_clones_are_bounded(&hot);
         let mut capture = None;
         let captured = measure(|| capture = Some(hot.capture_snapshot().unwrap()));
         assert_eq!(
@@ -172,6 +197,7 @@ fn native_memory_ownership_profiles_resident_selected_and_captured_rows() {
             });
         });
         let cold = cold.unwrap();
+        assert_receipt_capture_clones_are_bounded(&cold);
         assert_eq!(cold.business.receipt_count(), ROWS as usize);
         assert_eq!(cold.business.notifications.len(), ROWS as usize);
         assert_eq!(cold.log.entries.len(), ROWS as usize + 1);

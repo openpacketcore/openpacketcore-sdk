@@ -3,6 +3,7 @@
 //! Serialization is transparent, preserving both native image wire versions.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Borrow;
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Deref;
@@ -35,29 +36,80 @@ impl RevisionIssuer {
     }
 }
 
-pub(crate) struct SharedRow<T> {
-    value: Arc<T>,
+/// Published values choose immutable ownership without changing revision
+/// semantics. Receipt metadata fits in its already shared map entry; other
+/// rows retain their original independent Arc. Every owner clone is bounded
+/// and shares variable-sized bodies rather than copying them under State.
+pub(crate) trait RowValue: Sized {
+    type Owner: Clone + Borrow<Self>;
+
+    fn new_owner(self) -> Self::Owner;
+    fn owner_allocation_bytes() -> usize;
+}
+
+macro_rules! arc_values {
+    ($($value:ty),+ $(,)?) => {
+        $(impl RowValue for $value {
+            type Owner = Arc<Self>;
+
+            fn new_owner(self) -> Self::Owner {
+                Arc::new(self)
+            }
+
+            fn owner_allocation_bytes() -> usize {
+                // Include both atomic reference counts and conservatively
+                // round header and value for either alignment.
+                std::mem::size_of::<Self>()
+                    + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+                    + 2 * (std::mem::align_of::<Self>()
+                        + std::mem::align_of::<std::sync::atomic::AtomicUsize>())
+            }
+        })+
+    };
+}
+
+arc_values!(
+    super::NativeKeyState,
+    super::NativeGenericReceipt,
+    super::log::NativeLogEntry,
+    super::roster::Row,
+    super::roster::Partition,
+);
+
+impl RowValue for super::NativeReceipt {
+    type Owner = Self;
+
+    fn new_owner(self) -> Self::Owner {
+        self
+    }
+
+    fn owner_allocation_bytes() -> usize {
+        0
+    }
+}
+
+#[cfg(test)]
+arc_values!(Vec<u64>, u64);
+
+pub(crate) struct SharedRow<T: RowValue> {
+    value: T::Owner,
     // Logical publication identity is independent of its representation. A
     // checked relocation can release a resident payload while old captures
     // retain it, without pretending to be a new business mutation.
     revision: NonZeroU64,
 }
 
-impl<T> SharedRow<T> {
-    /// A relocation allocates only a new value Arc and retains the issued
-    /// revision. Include its two atomic reference counts and conservatively round
-    /// both the header and value for either alignment, before allocating it.
+impl<T: RowValue> SharedRow<T> {
+    /// Charge the concrete owner before a relocation. Inline metadata is
+    /// already charged by its containing preparation vectors.
     pub(super) fn relocated_allocation_bytes() -> usize {
-        std::mem::size_of::<T>()
-            + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
-            + 2 * (std::mem::align_of::<T>()
-                + std::mem::align_of::<std::sync::atomic::AtomicUsize>())
+        T::owner_allocation_bytes()
     }
 
     pub(super) fn new(value: T) -> io::Result<Self> {
         let revision = issue_revision()?;
         Ok(Self {
-            value: Arc::new(value),
+            value: value.new_owner(),
             revision,
         })
     }
@@ -70,7 +122,7 @@ impl<T> SharedRow<T> {
     // exact captured revision and complete, readback-verified replacement.
     pub(super) fn relocated(&self, value: T) -> Self {
         Self {
-            value: Arc::new(value),
+            value: value.new_owner(),
             revision: self.revision,
         }
     }
@@ -82,29 +134,29 @@ impl<T> SharedRow<T> {
     }
 }
 
-impl<T> Clone for SharedRow<T> {
+impl<T: RowValue> Clone for SharedRow<T> {
     fn clone(&self) -> Self {
         Self {
-            value: Arc::clone(&self.value),
+            value: self.value.clone(),
             revision: self.revision,
         }
     }
 }
 
-impl<T> Deref for SharedRow<T> {
+impl<T: RowValue> Deref for SharedRow<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.value
+        self.value.borrow()
     }
 }
 
-impl<T: Serialize> Serialize for SharedRow<T> {
+impl<T: Serialize + RowValue> Serialize for SharedRow<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.value.as_ref().serialize(serializer)
+        Borrow::<T>::borrow(&self.value).serialize(serializer)
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for SharedRow<T> {
+impl<'de, T: Deserialize<'de> + RowValue> Deserialize<'de> for SharedRow<T> {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
         Self::new(T::deserialize(decoder)?).map_err(serde::de::Error::custom)
     }

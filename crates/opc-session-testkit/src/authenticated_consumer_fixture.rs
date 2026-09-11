@@ -1419,6 +1419,48 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         }
     }
 
+    /// Observe bounded, numeric local storage costs without issuing a request.
+    ///
+    /// This is available only with Linux `test-control`; other configurations
+    /// return `None`. The observation carries no authority, endpoints, payloads,
+    /// or storage paths. Take it outside a timed request and compare its totals
+    /// with a preceding observation from the same fixture incarnation.
+    pub fn local_storage_timing(&self) -> io::Result<Option<serde_json::Value>> {
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        {
+            let mut observations = Vec::with_capacity(FIXTURE_VOTER_COUNT);
+            for index in 0..FIXTURE_VOTER_COUNT {
+                let costs = opc_session_store::test_support::consensus_local_wal_costs_for_test(
+                    &self.cluster.store(index),
+                )?;
+                observations.push(costs.map(|costs| {
+                    // Select only fixed numeric categories. Do not propagate
+                    // experimental diagnostics or underlying error text.
+                    serde_json::json!({
+                        "voter_slot": index,
+                        "groups": costs["groups"],
+                        "requests": costs["requests"],
+                        "sync_calls": costs["sync_calls"],
+                        "admission_us": costs["admission_us"],
+                        "admission_lock_wait_us": costs["admission_lock_wait_us"],
+                        "projection_us": costs["projection_us"],
+                        "write_us": costs["write_us"],
+                        "intent_us": costs["intent_us"],
+                        "data_sync_us": costs["data_sync_us"],
+                        "publication_us": costs["publication_us"],
+                        "queue_wait_us": costs["queue_wait_us"],
+                        "submit_to_callback_us": costs["submit_to_callback_us"],
+                        "application": costs["application"],
+                        "checkpoint": costs["checkpoint"],
+                    })
+                }));
+            }
+            Ok(Some(serde_json::Value::from(observations)))
+        }
+        #[cfg(not(all(target_os = "linux", feature = "test-control")))]
+        Ok(None)
+    }
+
     /// Restart only the private authenticated listener frontends.
     ///
     /// Existing facades retain their old connections and should be dropped by

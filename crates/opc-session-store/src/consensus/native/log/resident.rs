@@ -76,6 +76,13 @@ impl NativeLogEntry {
         matches!(self.body, Body::Selected(_))
     }
 
+    pub(in crate::consensus::native) fn cold_read_order(&self) -> Option<(usize, u64)> {
+        match &self.body {
+            Body::Resident(_) => None,
+            Body::Selected(row) => Some(row.range.cold_read_order()),
+        }
+    }
+
     pub(in crate::consensus::native) fn content(&self, index: u64) -> io::Result<[u8; 32]> {
         if self.id().index != index {
             return Err(invalid("native log key differs from its exact ID"));

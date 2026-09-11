@@ -10,6 +10,7 @@ use std::io::Write;
 use std::mem::size_of;
 use std::sync::Arc;
 
+use super::shared::RowValue;
 use super::*;
 use crate::consensus::verified_snapshot::VerificationMemory;
 use sha2::{Digest as _, Sha256};
@@ -73,7 +74,7 @@ impl RowStamp {
     }
 }
 
-pub(super) fn stamp<T: resident::RowFingerprint>(
+pub(super) fn stamp<T: resident::RowFingerprint + RowValue>(
     table: u8,
     key: &impl Serialize,
     value: &SharedRow<T>,
@@ -183,20 +184,25 @@ impl BusinessProof {
     }
 }
 
-struct RowChange<T> {
-    before: Option<SharedRow<T>>,
-    after: Option<SharedRow<T>>,
+struct RowChange<T: RowValue> {
+    // A create-then-retire entry retains its conservation evidence even
+    // when neither endpoint row exists. Keep those empty entries compact
+    // regardless of the concrete live row representation. Present captured
+    // rows are charged separately before their boxes are allocated.
+    before: Option<Box<SharedRow<T>>>,
+    after: Option<Box<SharedRow<T>>>,
     before_hash: Option<RowStamp>,
     after_hash: Option<RowStamp>,
 }
 
-impl<T> RowChange<T> {
+impl<T: RowValue> RowChange<T> {
     fn follows(&self, prior: &Self) -> bool {
-        same_row(self.before.as_ref(), prior.after.as_ref()) && self.before_hash == prior.after_hash
+        same_row(self.before.as_deref(), prior.after.as_deref())
+            && self.before_hash == prior.after_hash
     }
 }
 
-fn same_row<T>(left: Option<&SharedRow<T>>, right: Option<&SharedRow<T>>) -> bool {
+fn same_row<T: RowValue>(left: Option<&SharedRow<T>>, right: Option<&SharedRow<T>>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => left.ptr_eq(right),
@@ -204,13 +210,13 @@ fn same_row<T>(left: Option<&SharedRow<T>>, right: Option<&SharedRow<T>>) -> boo
     }
 }
 
-struct StagedRow<K, T> {
+struct StagedRow<K, T: RowValue> {
     key: K,
     journal_key: Option<K>,
     change: RowChange<T>,
 }
 
-fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint>(
+fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint + RowValue>(
     table: u8,
     rows: HashMap<K, T>,
     base: &RowMap<K, SharedRow<T>>,
@@ -232,8 +238,8 @@ fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint>(
             key,
             journal_key,
             change: RowChange {
-                before,
-                after: Some(after),
+                before: before.map(Box::new),
+                after: Some(Box::new(after)),
                 before_hash,
                 after_hash,
             },
@@ -242,9 +248,13 @@ fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint>(
     Ok(staged)
 }
 
-fn scratch_size<K, T>(count: usize) -> io::Result<usize> {
+fn scratch_size<K, T: RowValue>(count: usize) -> io::Result<usize> {
     count
-        .checked_mul(size_of::<StagedRow<K, T>>() + 4 * (size_of::<(K, RowChange<T>)>() + 1))
+        .checked_mul(
+            size_of::<StagedRow<K, T>>()
+                + 4 * (size_of::<(K, RowChange<T>)>() + 1)
+                + 2 * (size_of::<SharedRow<T>>() + std::mem::align_of::<SharedRow<T>>()),
+        )
         .and_then(|bytes| bytes.checked_add(64))
         .ok_or_else(|| invalid("native change reservation overflow"))
 }
@@ -286,7 +296,7 @@ impl BusinessChanges {
         }
     }
 
-    fn check_rows<K: Eq + Hash + Serialize, T: resident::RowFingerprint>(
+    fn check_rows<K: Eq + Hash + Serialize, T: resident::RowFingerprint + RowValue>(
         table: u8,
         rows: &HashMap<K, RowChange<T>>,
         summary: &mut TableSummary,
@@ -296,13 +306,13 @@ impl BusinessChanges {
             scratch::small(check, || {
                 let before = change
                     .before
-                    .as_ref()
+                    .as_deref()
                     .map(|value| stamp(table, key, value))
                     .transpose()?;
                 check()?;
                 let after = change
                     .after
-                    .as_ref()
+                    .as_deref()
                     .map(|value| stamp(table, key, value))
                     .transpose()?;
                 if before != change.before_hash || after != change.after_hash {
@@ -322,13 +332,13 @@ impl BusinessChanges {
             ));
         }
         self.roster.require_current(&state.roster)?;
-        fn current<K: Eq + Hash, T>(
+        fn current<K: Eq + Hash, T: RowValue>(
             changes: &HashMap<K, RowChange<T>>,
             rows: &RowMap<K, SharedRow<T>>,
         ) -> io::Result<()> {
             if changes
                 .iter()
-                .any(|(key, change)| !same_row(change.after.as_ref(), rows.get(key)))
+                .any(|(key, change)| !same_row(change.after.as_deref(), rows.get(key)))
             {
                 return Err(invalid("native capture contains a stale row revision"));
             }
@@ -562,13 +572,13 @@ impl SnapshotSelection {
     }
 }
 
-fn validate_staged<K: Eq + Hash, T>(
+fn validate_staged<K: Eq + Hash, T: RowValue>(
     rows: &[StagedRow<K, T>],
     current: &RowMap<K, SharedRow<T>>,
     dirty: Option<&HashMap<K, RowChange<T>>>,
 ) -> io::Result<()> {
     for row in rows {
-        if !same_row(row.change.before.as_ref(), current.get(&row.key))
+        if !same_row(row.change.before.as_deref(), current.get(&row.key))
             || dirty.is_some() != row.journal_key.is_some()
         {
             return Err(invalid("native publication predecessor changed"));
@@ -585,7 +595,7 @@ fn validate_staged<K: Eq + Hash, T>(
     Ok(())
 }
 
-fn publish_rows<K: Clone + Eq + Hash, T>(
+fn publish_rows<K: Clone + Eq + Hash, T: RowValue>(
     rows: Vec<StagedRow<K, T>>,
     current: &mut RowMap<K, SharedRow<T>>,
     mut dirty: Option<&mut HashMap<K, RowChange<T>>>,
@@ -598,7 +608,7 @@ fn publish_rows<K: Clone + Eq + Hash, T>(
     {
         match &change.after {
             Some(value) => {
-                current.insert(key, value.clone());
+                current.insert(key, value.as_ref().clone());
             }
             None => {
                 current.remove(&key);
@@ -842,7 +852,7 @@ impl Publication {
                 key,
                 journal_key: tracking.then_some(key),
                 change: RowChange {
-                    before,
+                    before: before.map(Box::new),
                     after: None,
                     before_hash,
                     after_hash: None,

@@ -221,7 +221,7 @@ impl BusinessChanges {
         }
         for (id, change) in &self.generic {
             check()?;
-            generic_payload(change.after.as_deref())?;
+            generic_payload(change.after.as_deref().map(|row| &**row))?;
             writer.write_all(&[2])?;
             frame::write_before(writer, change.before_hash.map(|stamp| stamp.content))?;
             frame::write_binary(writer, &(id, change.after.as_deref()))?;
@@ -287,7 +287,7 @@ impl BusinessChanges {
         }
         for (id, change) in &self.generic {
             check()?;
-            let payload = generic_payload(change.after.as_deref())?;
+            let payload = generic_payload(change.after.as_deref().map(|row| &**row))?;
             frame::expect(reader, &[2])?;
             frame::expect_before(reader, change.before_hash.map(|stamp| stamp.content))?;
             frame::payload_scratch(payload, check, || {

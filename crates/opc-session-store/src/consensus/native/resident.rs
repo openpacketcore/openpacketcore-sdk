@@ -29,6 +29,11 @@ impl SelectedBytes {
 }
 
 impl SelectedRange {
+    // An ordering hint only; reads still use this exact admitted prefix view.
+    pub(super) fn cold_read_order(&self) -> (usize, u64) {
+        (self.source.source_order(), self.offset)
+    }
+
     pub(super) fn new(
         source: Arc<prefix::VerifiedPrefix>,
         offset: u64,
@@ -194,7 +199,7 @@ impl RowFingerprint for NativeReceipt {
 
 impl NativeReceipt {
     pub(super) fn relocation_allocation_bytes() -> usize {
-        SharedRow::<Self>::relocated_allocation_bytes() + std::mem::size_of::<ColdReceipt>()
+        SharedRow::<Self>::relocated_allocation_bytes()
     }
 
     pub(super) fn retained(&self) -> bool {
@@ -259,14 +264,14 @@ impl NativeReceipt {
             if receipt_response_time(row.retained_until)? != response.logical_time {
                 return Err(invalid("native admitted receipt retention differs"));
             }
-            row.cold = Some(Box::new(ColdReceipt {
+            row.cold = Some(ColdReceipt {
                 source,
                 range,
                 binding: receipt_binding(&id, &row)?,
                 content: facts.content,
                 response_sequence: response.sequence,
                 response_raft_index: response.raft_index,
-            }));
+            });
         } else if changes::fingerprint(1, &id, &row)? != facts.content {
             return Err(invalid("native admitted receipt tombstone differs"));
         }

@@ -160,7 +160,7 @@ fn decode(bytes: &[u8]) -> io::Result<(FencedTransitionV2RequestId, NativeReceip
         if crate::sqlite::consensus::encode_fenced_transition_v2_response(&response)? != remaining {
             return Err(invalid("native cold response is not canonical"));
         }
-        Some(Box::new(response))
+        Some(Arc::new(response))
     };
     Ok((
         id,
@@ -463,7 +463,7 @@ fn copy_receipt(row: &NativeReceipt) -> io::Result<NativeReceipt> {
             .as_deref()
             .map(copy_response)
             .transpose()?
-            .map(Box::new),
+            .map(Arc::new),
         cold: None,
     })
 }

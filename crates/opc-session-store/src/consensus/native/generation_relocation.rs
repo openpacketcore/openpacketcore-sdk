@@ -87,8 +87,8 @@ impl RetiredRows<'_> {
 impl RelocationBuilder {
     pub(super) fn new(maximum: usize) -> io::Result<Self> {
         // Both exact-capacity vectors coexist while ranges become compact
-        // rows. Notification metadata is inline in these vectors. Charge the
-        // largest remaining concrete value Arc plus selected-body Box; no
+        // rows. Receipt and notification metadata is inline in these vectors.
+        // Charge the largest remaining concrete value Arc and body; no
         // payload or prefix index is copied and logical revisions are retained.
         let allocation = NativeReceipt::relocation_allocation_bytes()
             .max(log::NativeLogEntry::relocation_allocation_bytes());

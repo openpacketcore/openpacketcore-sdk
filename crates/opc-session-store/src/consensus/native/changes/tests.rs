@@ -360,7 +360,7 @@ fn exact_storage(storage: &NativeStorage) -> Vec<u8> {
     .unwrap()
 }
 
-fn reconstruct_rows<K: Clone + Eq + Hash, T: serde::de::DeserializeOwned + Serialize>(
+fn reconstruct_rows<K: Clone + Eq + Hash, T: serde::de::DeserializeOwned + Serialize + RowValue>(
     target: &mut RowMap<K, SharedRow<T>>,
     changed: &HashMap<K, RowChange<T>>,
 ) {
@@ -492,7 +492,7 @@ fn native_changes_missing_or_stale_dirty_rows_reject_even_when_live_counts_match
                 dirty.notifications.clear();
             }
             3 => {
-                dirty.keys.get_mut(first.lease().key()).unwrap().after = Some(old);
+                dirty.keys.get_mut(first.lease().key()).unwrap().after = Some(Box::new(old));
             }
             _ => {
                 dirty
@@ -542,15 +542,17 @@ fn native_changes_complete_changed_row_predicates_run_before_any_publication() {
                 delta.receipts.values_mut().next().unwrap().ordinal = 1;
             }
             4 => {
-                delta
-                    .receipts
-                    .values_mut()
-                    .next()
-                    .unwrap()
-                    .response
-                    .as_mut()
-                    .unwrap()
-                    .raft_log_index = 99;
+                Arc::make_mut(
+                    delta
+                        .receipts
+                        .values_mut()
+                        .next()
+                        .unwrap()
+                        .response
+                        .as_mut()
+                        .unwrap(),
+                )
+                .raft_log_index = 99;
             }
             5 => {
                 delta.receipts.values_mut().next().unwrap().retained_until = time(1);
@@ -789,7 +791,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         key: 1,
         journal_key: Some(1),
         change: RowChange {
-            before: Some(original.clone()),
+            before: Some(Box::new(original.clone())),
             after: None,
             before_hash: Some(first_hash),
             after_hash: None,
@@ -803,7 +805,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         journal_key: Some(1),
         change: RowChange {
             before: None,
-            after: Some(replacement.clone()),
+            after: Some(Box::new(replacement.clone())),
             before_hash: None,
             after_hash: Some(stamp(0, &1u64, &replacement).unwrap()),
         },
@@ -1002,7 +1004,7 @@ fn native_capture_omitted_stale_or_modified_business_rows_fail_in_worker() {
             2 => dirty.generic.clear(),
             3 => dirty.notifications.clear(),
             4 => {
-                dirty.keys.get_mut(first.lease().key()).unwrap().after = Some(old);
+                dirty.keys.get_mut(first.lease().key()).unwrap().after = Some(Box::new(old));
             }
             5 => {
                 dirty
@@ -1016,9 +1018,9 @@ fn native_capture_omitted_stale_or_modified_business_rows_fail_in_worker() {
             }
             _ => {
                 let receipt = dirty.receipts.values_mut().next().unwrap();
-                let mut changed = (**receipt.after.as_ref().unwrap()).clone();
+                let mut changed = (***receipt.after.as_ref().unwrap()).clone();
                 changed.retained_until = time(0);
-                receipt.after = Some(SharedRow::new(changed).unwrap());
+                receipt.after = Some(Box::new(SharedRow::new(changed).unwrap()));
             }
         }
         // Transfer deliberately does no serialization or per-row validation.

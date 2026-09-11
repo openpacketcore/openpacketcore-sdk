@@ -119,7 +119,7 @@ fn native_cold_receipt_selected_metadata_preserves_exact_response_time_at_range_
             );
             let mut row = (**storage.business.receipts.get(&id).unwrap()).clone();
             row.retained_until = retention_deadline(now).unwrap();
-            let response = row.response.as_mut().unwrap();
+            let response = Arc::make_mut(row.response.as_mut().unwrap());
             response.result = Err(StoreError::CasConflict);
             response.logical_time = Some(now);
             let mut frontiers = storage.business.frontiers.clone();
@@ -242,13 +242,13 @@ fn native_cold_receipt_complete_capture_comparison_rejects_every_changed_field()
             1 => row.payload_digest[31] ^= 1,
             2 => row.retained_until = row.retained_until.add_seconds(1).unwrap(),
             3 => row.response = None,
-            4 => row.response.as_mut().unwrap().sequence += 1,
+            4 => Arc::make_mut(row.response.as_mut().unwrap()).sequence += 1,
             5 => {
-                row.response.as_mut().unwrap().digest =
+                Arc::make_mut(row.response.as_mut().unwrap()).digest =
                     Some(SessionConsensusEntryDigest::from_bytes([9; 32]))
             }
-            6 => row.response.as_mut().unwrap().raft_log_index += 1,
-            7 => row.response.as_mut().unwrap().result = Err(StoreError::LeaseHeld),
+            6 => Arc::make_mut(row.response.as_mut().unwrap()).raft_log_index += 1,
+            7 => Arc::make_mut(row.response.as_mut().unwrap()).result = Err(StoreError::LeaseHeld),
             8 => {
                 let mut commitment = *id.body_commitment();
                 commitment[31] ^= 1;
@@ -257,7 +257,7 @@ fn native_cold_receipt_complete_capture_comparison_rejects_every_changed_field()
                 assert_eq!(&encoded_id.to_bytes()[..24], &id.to_bytes()[..24]);
             }
             9 => {
-                row.response.as_mut().unwrap().logical_time = original
+                Arc::make_mut(row.response.as_mut().unwrap()).logical_time = original
                     .response
                     .as_ref()
                     .unwrap()

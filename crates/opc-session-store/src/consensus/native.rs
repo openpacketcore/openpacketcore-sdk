@@ -131,9 +131,12 @@ struct NativeReceipt {
     ordinal: u64,
     payload_digest: [u8; 32],
     retained_until: Timestamp,
-    response: Option<Box<SessionConsensusResponse>>,
+    // Published map entries already own immutable rows. Keep selected
+    // metadata inline and share a resident response across bounded captures.
+    // Both owner choices remain transparent to the original wire vocabulary.
+    response: Option<Arc<SessionConsensusResponse>>,
     #[serde(skip)]
-    cold: Option<Box<resident::ColdReceipt>>,
+    cold: Option<resident::ColdReceipt>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -790,7 +793,7 @@ impl NativeState {
                 ordinal: row.ordinal,
                 payload_digest: row.payload_digest,
                 retained_until: row.retained_until,
-                response: Some(Box::new(response)),
+                response: Some(Arc::new(response)),
                 cold: None,
             };
             if !row.matches_decoded(id, &decoded)? {
@@ -1657,7 +1660,7 @@ impl NativeDelta<'_> {
                 ordinal: ordinal as u64,
                 payload_digest,
                 retained_until: until,
-                response: Some(Box::new(response)),
+                response: Some(Arc::new(response)),
                 cold: None,
             },
         );

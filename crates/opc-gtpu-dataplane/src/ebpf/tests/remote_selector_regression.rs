@@ -361,6 +361,7 @@ async fn descriptor_commit<B: ProtectedSessionBackend>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn singleton_public_protected_flow_keeps_original_request_deadline() {
     let lab = start_lab(0x91).await;
+    let storage_before = lab.fixture.local_storage_timing();
     // Startup, required voter activation, stopped namespace provisioning, and
     // protected open precede this request. All ordinary request storage calls
     // share this one original deadline. 830ms is NOT an SDK API constant.
@@ -422,6 +423,14 @@ async fn singleton_public_protected_flow_keeps_original_request_deadline() {
             .as_ref()
             .map_or_else(|error| *error, |_| Classification::Complete),
     );
+    let storage_after = lab.fixture.local_storage_timing();
+    for (stage, observation) in [("before", storage_before), ("after", storage_after)] {
+        match observation {
+            Ok(Some(costs)) => eprintln!("sdk_selector_storage stage={stage} costs={costs}"),
+            Ok(None) => {}
+            Err(_) => eprintln!("sdk_selector_storage stage={stage} unavailable=true"),
+        }
+    }
     // A late worker is drained for ownership hygiene, never reclassified green.
     if let Some(commit) = pending_descriptor_commit {
         let _late_result = checked(

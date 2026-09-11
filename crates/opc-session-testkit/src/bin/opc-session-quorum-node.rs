@@ -1437,6 +1437,25 @@ impl QualificationNode {
                         &self.store
                     ),
                 );
+                #[cfg(all(target_os = "linux", feature = "test-control"))]
+                if let Ok(Some(costs)) =
+                    opc_session_store::test_support::consensus_local_wal_costs_for_test(&self.store)
+                {
+                    eprintln!(
+                        "qualification_local_wal_costs {}",
+                        serde_json::json!({
+                            "groups": costs["groups"],
+                            "sync_calls": costs["sync_calls"],
+                            "intent_us": costs["intent_us"],
+                            "data_sync_us": costs["data_sync_us"],
+                            "publication_us": costs["publication_us"],
+                            "queue_wait_us": costs["queue_wait_us"],
+                            "submit_to_callback_us": costs["submit_to_callback_us"],
+                            "application": costs["application"],
+                            "checkpoint": costs["checkpoint"],
+                        }),
+                    );
+                }
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
                 }
@@ -2894,6 +2913,19 @@ impl QualificationNode {
     async fn probe(&self) -> QualificationNodeReply {
         let report = self.store.probe_durable_readiness().await;
         let reason_code = qualification_readiness_code(report.state());
+        #[cfg(feature = "test-control")]
+        if !report.is_ready() && std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some()
+        {
+            // Read the existing local metrics after the original probe. This
+            // adds neither a network request nor a backend ownership wait.
+            eprintln!(
+                "qualification_local_durable_progress kind=readiness_probe node_index={} reason={reason_code:?} {:?}",
+                self.node_index,
+                opc_session_store::test_support::consensus_local_durable_progress_for_test(
+                    &self.store
+                ),
+            );
+        }
         let progress = report.recovery_progress();
         let status = self.store.status();
         QualificationNodeReply::Readiness {
@@ -3154,6 +3186,7 @@ async fn run_traffic_mutation_task(
     let mut lease = Some(lease);
     let mut consecutive_availability_interruptions = 0_u64;
     let mut shutdown_deadline = None;
+    let diagnostic_started_at = tokio::time::Instant::now();
     let terminal_failure = loop {
         match run_traffic_mutation_task_inner(
             &protected,
@@ -3179,6 +3212,23 @@ async fn run_traffic_mutation_task(
                 }
                 let recovery_started_at = tokio::time::Instant::now();
                 let deadline = traffic_recovery_deadline(recovery_started_at, shutdown_deadline);
+                if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
+                    // Fixed enums and atomic counters only, after the failed
+                    // public call and inside the original recovery budget.
+                    // No backend lock, payload, credential or error string.
+                    eprintln!(
+                        "qualification_local_durable_progress kind=traffic_interruption elapsed_millis={} node_index={node_index} failure={failure:?} diagnostics={:?}",
+                        diagnostic_started_at.elapsed().as_millis(),
+                        store.diagnostic_snapshot(),
+                    );
+                    #[cfg(feature = "test-control")]
+                    eprintln!(
+                        "qualification_local_durable_progress kind=traffic_engine node_index={node_index} {:?}",
+                        opc_session_store::test_support::consensus_local_durable_progress_for_test(
+                            &store
+                        ),
+                    );
+                }
                 match reconcile_traffic_mutation_checkpoint(
                     &protected,
                     &key,
@@ -4166,6 +4216,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
     deadline: tokio::time::Instant,
     cancellation: &mut oneshot::Receiver<()>,
 ) -> Result<Option<ReconciledTrafficWatch>, QualificationTrafficFailure> {
+    let diagnostic = std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some();
     if traffic_keys.len() != member_count
         || reconciled_generations.len() != member_count
         || reconciled_record_fences.len() != member_count
@@ -4183,6 +4234,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                 QualificationTrafficFailureStage::Watch,
                 recovery_started_at,
             ));
+        }
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=head_start sequence={reconciled_sequence} elapsed_us={}", recovery_started_at.elapsed().as_micros());
         }
         let head = tokio::select! {
             biased;
@@ -4225,6 +4279,10 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
             }
         };
 
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=head_complete sequence={reconciled_sequence} head={head} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+        }
+
         while reconciled_sequence < head {
             let Some((start, limit)) =
                 traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
@@ -4240,6 +4298,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                     QualificationTrafficFailureStage::Watch,
                 ));
             };
+            if diagnostic {
+                eprintln!("qualification_watch_reconciliation stage=page_start start={start} limit={limit} head={head} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+            }
             let entries = tokio::select! {
                 biased;
                 _ = &mut *cancellation => return Ok(None),
@@ -4280,6 +4341,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                     }
                 }
             };
+            if diagnostic {
+                eprintln!("qualification_watch_reconciliation stage=page_complete start={start} count={} head={head} elapsed_us={}", entries.len(), recovery_started_at.elapsed().as_micros());
+            }
             for entry in entries {
                 let Some(expected_sequence) = reconciled_sequence.checked_add(1) else {
                     return Err(QualificationTrafficFailure::fixed(
@@ -4319,6 +4383,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                 QualificationTrafficFailureStage::Watch,
             ));
         };
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=watch_start start={watch_start} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+        }
         let stream = tokio::select! {
             biased;
             _ = &mut *cancellation => return Ok(None),
@@ -4354,6 +4421,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                 }
             }
         };
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=watch_complete start={watch_start} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+        }
         return Ok(Some(ReconciledTrafficWatch {
             stream,
             watch_start,

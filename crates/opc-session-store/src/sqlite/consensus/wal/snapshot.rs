@@ -235,7 +235,17 @@ impl InstallSource {
         let incoming_memory = consensus::native_snapshot::reserve_input(&incoming_tx, check)?;
         conn.pragma_update(None, "query_only", false)
             .map_err(db_error)?;
-        self.apply_original(conn, binding, incarnation, |_| check(), |_| check())?;
+        self.apply_original(
+            conn,
+            binding,
+            incarnation,
+            |tx| {
+                check()?;
+                self.prepare_native_install_tail(tx, binding, &authority.members)?;
+                check()
+            },
+            |_| check(),
+        )?;
         drop(incoming_tx);
         drop(incoming);
         drop(incoming_memory);
@@ -280,6 +290,61 @@ impl InstallSource {
         });
         drop(installed_memory);
         Ok(proof)
+    }
+
+    /// Prepare only the disposable predecessor inside the original install
+    /// transaction. Raft leaves a received, uncommitted tail in place when it
+    /// ends before the incoming snapshot cut. The raw installer requires its
+    /// missing interval to start at the committed frontier, so use ordinary
+    /// exact-boundary truncation for this fully covered uncommitted tail.
+    /// The live native predecessor remains unchanged until durable selection;
+    /// every original source, authority and post-install check still runs.
+    fn prepare_native_install_tail(
+        &self,
+        tx: &Transaction<'_>,
+        binding: Binding,
+        members: &BTreeSet<SessionConsensusNodeId>,
+    ) -> io::Result<()> {
+        let (Some(target), Some(committed), Some(last)) = (
+            self.candidate.0.last_log_id.as_ref(),
+            read_committed_sync(tx, binding.identity)?,
+            consensus::last_log_sync(tx, binding.identity)?,
+        ) else {
+            return Ok(());
+        };
+        if last.index <= committed.index || last.index >= target.index {
+            return Ok(());
+        }
+        // Audit the complete original local history before removing anything.
+        // In particular, neither a hole nor a higher-term received entry can
+        // disappear behind a valid incoming snapshot.
+        consensus::validate_snapshot_install_replaced_pointers_sync(
+            tx,
+            binding.identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(target),
+        )?;
+        consensus::validate_snapshot_install_retained_rows_sync(
+            tx,
+            binding.identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            members,
+            Some(target),
+        )?;
+        consensus::validate_exact_log_prefix_through_sync(tx, binding.identity, &last, true)?;
+        consensus::ensure_log_id_not_after(
+            &last,
+            target,
+            "native install snapshot regresses received tail lineage",
+        )?;
+        let start = committed
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("native install tail index is exhausted"))?;
+        let since = consensus::retained_log_id_at_sync(tx, binding.identity, start)?
+            .ok_or_else(|| invalid_data("native install tail lacks exact truncate boundary"))?;
+        let (_, index) = consensus::validate_log_id(&since)?;
+        consensus::truncate_logs_in_tx(tx, binding.identity, &since, index)
     }
 }
 

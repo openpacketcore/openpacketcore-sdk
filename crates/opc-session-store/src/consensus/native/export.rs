@@ -2,6 +2,7 @@
 //! state under its owner and releases that owner before constructing this
 //! disposable SQLite image. No command is executed against this connection.
 
+use super::log::NativeLogEntry;
 use super::*;
 use crate::sqlite::{consensus as sql, ops};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
@@ -39,6 +40,54 @@ enum Purpose {
     Snapshot,
     PortableSnapshot,
     InstallBase,
+}
+
+struct OrderedLogs<'a> {
+    rows: Vec<&'a SharedRow<NativeLogEntry>>,
+    _memory: crate::consensus::verified_snapshot::VerificationMemory,
+}
+
+impl<'a> OrderedLogs<'a> {
+    fn new(
+        storage: &'a NativeStorage,
+        purpose: Purpose,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        check()?;
+        // One borrowed pointer per retained log, reserved before allocation.
+        // The detached immutable capture keeps every row and its source alive.
+        let bytes = storage
+            .log
+            .entries
+            .len()
+            .checked_mul(std::mem::size_of::<&SharedRow<NativeLogEntry>>())
+            .ok_or_else(|| invalid("native export log order reservation overflow"))?;
+        let memory = crate::consensus::verified_snapshot::VerificationMemory::reserve(bytes)?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(storage.log.entries.len())
+            .map_err(|_| invalid("native export log order allocation failed"))?;
+        for entry in storage.log.entries.values().filter(|entry| {
+            purpose == Purpose::InstallBase
+                || storage
+                    .business
+                    .frontiers
+                    .applied
+                    .is_some_and(|applied| entry.id().index <= applied.index)
+        }) {
+            check()?;
+            rows.push(entry);
+        }
+        // Delta frames use change-map order. Traversing them by Raft index
+        // otherwise rereads and rehashes whole blocks for individual rows.
+        // SQL insertion order has no authority: retain the exact row view,
+        // original full decoder and applied/suffix filter for every purpose.
+        rows.sort_unstable_by_key(|entry| entry.cold_read_order());
+        check()?;
+        Ok(Self {
+            rows,
+            _memory: memory,
+        })
+    }
 }
 
 struct OrderedReceipts<'a> {
@@ -202,12 +251,8 @@ impl NativeStorage {
                 tx.execute(&format!("INSERT OR REPLACE INTO {table} (singleton,configuration_epoch,term,log_index,log_id_json) VALUES (1,?1,?2,?3,?4)"),params![epoch,pointer.leader_id.term,pointer.index,json(&pointer)?]).map_err(|error| db!(error))?;
             }
         }
-        for entry in self.log.entries.values().filter(|entry| {
-            purpose == Purpose::InstallBase
-                || frontiers
-                    .applied
-                    .is_some_and(|applied| entry.id().index <= applied.index)
-        }) {
+        let ordered_logs = OrderedLogs::new(self, purpose, check)?;
+        for entry in &ordered_logs.rows {
             check()?;
             // Omission from the portable image is not permission to trust an
             // unread selected range. Preserve the raw export's full byte and
@@ -217,6 +262,7 @@ impl NativeStorage {
                 tx.execute("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)",params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(|error| db!(error))?;
             }
         }
+        drop(ordered_logs);
         if preserve_origin {
             if let Some((meta, name, checksum, length)) = &frontiers.current_snapshot {
                 tx.execute("INSERT INTO consensus_snapshot (singleton,configuration_epoch,meta_json,file_name,checksum,byte_length) VALUES (1,?1,?2,?3,?4,?5)",params![epoch,json(meta)?,name,checksum.as_slice(),length]).map_err(|error| db!(error))?;
@@ -404,10 +450,132 @@ impl NativeStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::super::changes::tests::{apply, command, fixture, request, time};
-    use super::super::generation::{Catalog, PreparedBase};
+    use super::super::changes::tests::{apply, clock, command, fixture, request, time};
+    use super::super::generation::{Catalog, PreparedBase, PreparedDelta, Version};
     use super::*;
     use std::fs::OpenOptions;
+
+    #[test]
+    fn native_snapshot_delta_log_export_bounds_block_reads_and_preserves_exact_rows() {
+        const BLOCK: usize = 64 * 1024;
+        const MAXIMUM: u64 = 64 * 1024 * 1024;
+        let (mut original, _, _) = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delta-logs.native");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let prepared = PreparedBase::prepare(
+            &original,
+            generation::BaseParameters {
+                binding: [3; 32],
+                file_epoch: 1,
+                checkpoint_epoch: 1,
+                operation_sequence: 1,
+                cut_binding: [4; 32],
+                block_bytes: BLOCK,
+                maximum: MAXIMUM,
+            },
+            &|| Ok(()),
+        )
+        .unwrap();
+        let identity = prepared.write_to(&mut file, &|| Ok(())).unwrap();
+        file.sync_all().unwrap();
+        fn scope(storage: &NativeStorage) -> generation::CatalogScope<'_> {
+            generation::CatalogScope {
+                identity: storage.business.identity,
+                members: &storage.business.members,
+                roster_root: None,
+            }
+        }
+        let (mut owner, _) =
+            Catalog::open(&path, identity, MAXIMUM, scope(&original), [4; 32], &|| {
+                Ok(())
+            })
+            .unwrap();
+        let version = Version::capture(&original).unwrap();
+        original.begin_changes().unwrap();
+        for first in (2..1026).step_by(64) {
+            let entries = (first..first + 64)
+                .map(|index| clock(index, time(2)))
+                .collect::<Vec<_>>();
+            apply(&mut original, &entries);
+        }
+        // The installation predecessor retains the uncommitted suffix; the
+        // portable and raw snapshots validate only their applied projection.
+        original
+            .log
+            .project(
+                &sql::wal::Operation::Append(vec![json(&clock(1026, time(2))).unwrap().into()]),
+                &original.business,
+                None,
+            )
+            .unwrap();
+        let delta = PreparedDelta::prepare(
+            owner.current(),
+            &version,
+            2,
+            2,
+            [5; 32],
+            original.take_changes().unwrap(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let selected = delta.append(&mut owner, &|| Ok(())).unwrap();
+        // Reconstruct arbitrary bytes through the cold catalog, independently
+        // of the process-local expected-readback admission used by append.
+        let (reopened, catalog) = Catalog::open(
+            &path,
+            selected.identity(),
+            MAXIMUM,
+            scope(&original),
+            [5; 32],
+            &|| Ok(()),
+        )
+        .unwrap();
+        let selected = reopened.current();
+        let cold = catalog.into_storage(&|| Ok(())).unwrap();
+        let blocks = selected.identity().length / BLOCK as u64;
+        assert!(
+            blocks >= 4,
+            "exercise several independently authenticated blocks"
+        );
+        for purpose in [
+            Purpose::InstallBase,
+            Purpose::Snapshot,
+            Purpose::PortableSnapshot,
+        ] {
+            let ordered = OrderedLogs::new(&cold, purpose, &|| Ok(())).unwrap();
+            let expected_len = if purpose == Purpose::InstallBase {
+                1027
+            } else {
+                1026
+            };
+            assert_eq!(ordered.rows.len(), expected_len);
+            let before = selected.blocks_read();
+            let mut indexes = BTreeSet::new();
+            for entry in ordered.rows {
+                assert!(indexes.insert(entry.id().index), "visit each full row once");
+                let actual = entry
+                    .read_bytes(cold.business.identity, &cold.business.members, &|| Ok(()))
+                    .unwrap();
+                let expected = original.log.entries.get(&entry.id().index).unwrap();
+                assert_eq!(actual.bytes(), expected.encoded_for_test().unwrap());
+                assert_eq!(
+                    sql::decode_consensus_log_entry(actual.bytes()).unwrap(),
+                    expected.resident().unwrap().entry,
+                    "the complete original decoder and every field remain authoritative",
+                );
+            }
+            let reads = selected.blocks_read() - before;
+            eprintln!(
+                "native_delta_log_export rows={expected_len} blocks={blocks} block_reads={reads}"
+            );
+            assert!(reads <= blocks, "export rereads authenticated delta blocks");
+        }
+    }
 
     #[test]
     fn native_snapshot_receipt_export_reads_each_selected_block_once_with_exact_rows() {

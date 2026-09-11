@@ -4,6 +4,7 @@
 
 use super::super::changes::{fingerprint, stamp, RowStamp, TableSummary};
 use super::super::resident::RowFingerprint;
+use super::super::shared::RowValue;
 use super::*;
 use std::mem::size_of;
 
@@ -89,7 +90,7 @@ impl Ledger {
     }
 }
 
-pub(in crate::consensus::native) struct Change<T> {
+pub(in crate::consensus::native) struct Change<T: RowValue> {
     pub(in crate::consensus::native) before: Option<SharedRow<T>>,
     pub(in crate::consensus::native) after: Option<SharedRow<T>>,
     // The last removed original row survives coalescing. A generation must
@@ -103,7 +104,7 @@ pub(in crate::consensus::native) struct Change<T> {
     removed: u64,
 }
 
-fn same<T>(left: Option<&SharedRow<T>>, right: Option<&SharedRow<T>>) -> bool {
+fn same<T: RowValue>(left: Option<&SharedRow<T>>, right: Option<&SharedRow<T>>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => left.ptr_eq(right),
@@ -111,7 +112,7 @@ fn same<T>(left: Option<&SharedRow<T>>, right: Option<&SharedRow<T>>) -> bool {
     }
 }
 
-impl<T> Change<T> {
+impl<T: RowValue> Change<T> {
     fn follows(&self, before: &Self) -> bool {
         self.key_stamp == before.key_stamp
             && same(self.before.as_ref(), before.after.as_ref())
@@ -462,7 +463,7 @@ impl Journal {
         if !Arc::ptr_eq(&self.target, &next.base) {
             return Err(invalid("native roster journal predecessor changed"));
         }
-        fn preflight<K: std::hash::Hash + Eq, T>(
+        fn preflight<K: std::hash::Hash + Eq, T: RowValue>(
             old: &HashMap<K, Change<T>>,
             new: &HashMap<K, Change<T>>,
         ) -> io::Result<()> {
@@ -594,7 +595,7 @@ pub(in crate::consensus::native) struct PreparedAppend<'a> {
 impl PreparedAppend<'_> {
     pub(in crate::consensus::native) fn commit(self) {
         let Self { journal, next } = self;
-        fn merge<K: std::hash::Hash + Eq, T>(
+        fn merge<K: std::hash::Hash + Eq, T: RowValue>(
             old: &mut HashMap<K, Change<T>>,
             new: HashMap<K, Change<T>>,
         ) {

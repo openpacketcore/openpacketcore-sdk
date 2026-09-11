@@ -505,7 +505,7 @@ impl<'a> SqlitePreparedBase<'a> {
                     response: encoded
                         .map(sql::decode_fenced_transition_v2_response)
                         .transpose()?
-                        .map(Box::new),
+                        .map(Arc::new),
                     cold: None,
                 };
                 validation::validate_receipt(

@@ -280,6 +280,236 @@ fn native_durable_install_empty_sequence_rotates_once_per_install_and_reopens_fi
 }
 
 #[test]
+fn native_durable_install_covers_a_valid_uncommitted_tail_without_relaxing_raw_install() {
+    let (_producer_dir, producer, signed, producer_wal) = fresh(Phase::Established);
+    let predecessor =
+        IncomingSnapshot::with_identity(&producer.conn.blocking_lock(), signed.identity);
+    let (directory, primary, wal) = destination(&signed, IoControl::default());
+    let primary_before = database(&primary.conn.blocking_lock());
+    wal.install_snapshot(&primary.conn.blocking_lock(), predecessor.source().unwrap())
+        .unwrap();
+    let committed = [admission(&signed), terminal(&signed, 4)];
+    parity(&producer_wal, &producer, &signed, &committed);
+    commit(&wal, &committed);
+    wal.native_apply_committed(&committed).unwrap();
+    let received = ordinary(&signed, 5, SessionMutationIntent::AdvanceLogicalTime);
+    wal.submit(append(std::slice::from_ref(&received)))
+        .unwrap()
+        .wait()
+        .unwrap();
+    wal.checkpoint().unwrap();
+    let before = wal.native_export_install_base_for_test().unwrap();
+    assert_eq!(
+        read_purged_sync(&before, signed.identity).unwrap(),
+        Some(log_id(2))
+    );
+    assert_eq!(
+        read_applied_sync(&before, signed.identity).unwrap(),
+        Some(log_id(4))
+    );
+    assert_eq!(
+        read_committed_sync(&before, signed.identity).unwrap(),
+        Some(log_id(4))
+    );
+    assert_eq!(
+        last_log_sync(&before, signed.identity).unwrap(),
+        Some(log_id(5))
+    );
+    validate_fixed_durable_state_sync(&before, signed.identity, &fixed_members()).unwrap();
+    let later = [
+        received,
+        ordinary(&signed, 6, SessionMutationIntent::AdvanceLogicalTime),
+        ordinary(&signed, 7, SessionMutationIntent::AdvanceLogicalTime),
+    ];
+    parity(&producer_wal, &producer, &signed, &later);
+    let incoming = IncomingSnapshot::with_identity(&producer.conn.blocking_lock(), signed.identity);
+    assert_eq!(incoming.candidate.0.last_log_id, Some(log_id(7)));
+
+    // The raw installer still rejects this shape. The native handoff must
+    // prepare its private predecessor without bypassing that validator or
+    // touching the live SQL cache / selected native predecessor on failure.
+    let raw = copy(&before);
+    raw.pragma_update(None, "query_only", false).unwrap();
+    let raw_before = database(&raw);
+    let error = install_snapshot_database_with_authority_sync(
+        &raw,
+        signed.identity,
+        ConsensusAuthorityProfile::FixedImmutable,
+        Some(&fixed_members()),
+        Some(&test_member_bindings(&fixed_members())),
+        FIXED_TEST_PLACEMENT_POLICY,
+        &incoming.raw,
+        &incoming.candidate.0,
+        &incoming.candidate.1,
+        incoming.candidate.2,
+        incoming.candidate.3,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("retained tail extends into absent suffix"));
+    assert_eq!(database(&raw), raw_before);
+
+    for damage in ["gap", "malformed", "future-term", "conflicting-cut"] {
+        let damaged = copy(&before);
+        damaged.pragma_update(None, "query_only", false).unwrap();
+        let extra = ordinary(&signed, 6, SessionMutationIntent::AdvanceLogicalTime);
+        append_logs_with_authority_sync(
+            &damaged,
+            signed.identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &fixed_members(),
+            &test_member_bindings(&fixed_members()),
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&extra),
+        )
+        .unwrap();
+        match damage {
+            "gap" => {
+                damaged
+                    .execute("DELETE FROM consensus_log WHERE log_index = 5", [])
+                    .unwrap();
+            }
+            "malformed" => {
+                damaged
+                    .execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 5",
+                        [b"{".as_slice()],
+                    )
+                    .unwrap();
+            }
+            "future-term" => {
+                let mut future = extra;
+                future.log_id.leader_id.term += 1;
+                damaged
+                    .execute(
+                        "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = 6",
+                        params![
+                            checked_i64(future.log_id.leader_id.term).unwrap(),
+                            encode_json(&future).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            }
+            "conflicting-cut" => {
+                let mut conflict = ordinary(&signed, 7, SessionMutationIntent::AdvanceLogicalTime);
+                conflict.log_id.leader_id.term += 1;
+                append_logs_with_authority_sync(
+                    &damaged,
+                    signed.identity,
+                    ConsensusAuthorityProfile::FixedImmutable,
+                    &fixed_members(),
+                    &test_member_bindings(&fixed_members()),
+                    FIXED_TEST_PLACEMENT_POLICY,
+                    &[conflict],
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let damaged_before = database(&damaged);
+        assert!(
+            incoming
+                .source()
+                .unwrap()
+                .apply_native_original(
+                    &damaged,
+                    wal.binding(),
+                    Some(&signed.root),
+                    &RestoreScanIncarnation::new().unwrap(),
+                    &|| Ok(()),
+                )
+                .is_err(),
+            "the original native install must reject {damage} before publication"
+        );
+        assert_eq!(
+            database(&damaged),
+            damaged_before,
+            "exact {damage} rollback"
+        );
+    }
+
+    // Reject an inconsistent incoming cut after the local preparation has
+    // actually run. Its transaction must restore every original local row.
+    let rejected = copy(&before);
+    let mut wrong_source =
+        IncomingSnapshot::with_identity(&producer.conn.blocking_lock(), signed.identity);
+    wrong_source.candidate.0.last_log_id = Some(log_id(8));
+    let rejected_before = database(&rejected);
+    let prepared = std::cell::Cell::new(false);
+    assert!(wrong_source
+        .source()
+        .unwrap()
+        .apply_native_original(
+            &rejected,
+            wal.binding(),
+            Some(&signed.root),
+            &RestoreScanIncarnation::new().unwrap(),
+            &|| {
+                if last_log_sync(&rejected, signed.identity)? == Some(log_id(4)) {
+                    prepared.set(true);
+                }
+                Ok(())
+            },
+        )
+        .is_err());
+    assert!(
+        prepared.get(),
+        "the rejection must follow actual transactional tail preparation"
+    );
+    assert_eq!(database(&rejected), rejected_before);
+
+    wal.install_snapshot(&primary.conn.blocking_lock(), incoming.source().unwrap())
+        .expect("the original native handoff must install a later snapshot over a valid uncommitted tail");
+    assert_eq!(database(&primary.conn.blocking_lock()), primary_before);
+    let actual = wal.native_export_install_base_for_test().unwrap();
+    let expected = copy(&before);
+    expected.pragma_update(None, "query_only", false).unwrap();
+    // Independent SQL oracle: ordinary exact-boundary truncation of only the
+    // uncommitted L5, followed by the complete original install transaction.
+    truncate_logs_with_authority_sync(
+        &expected,
+        signed.identity,
+        ConsensusAuthorityProfile::FixedImmutable,
+        &fixed_members(),
+        &test_member_bindings(&fixed_members()),
+        FIXED_TEST_PLACEMENT_POLICY,
+        &log_id(5),
+    )
+    .unwrap();
+    let incarnation = RestoreScanIncarnation::from_installed_sync(&actual).unwrap();
+    incoming
+        .source()
+        .unwrap()
+        .apply_native_original(
+            &expected,
+            wal.binding(),
+            Some(&signed.root),
+            &incarnation,
+            &|| Ok(()),
+        )
+        .unwrap();
+    exact(&wal, &expected, &signed);
+    for pointer in [
+        read_committed_sync(&actual, signed.identity).unwrap(),
+        read_applied_sync(&actual, signed.identity).unwrap(),
+        read_purged_sync(&actual, signed.identity).unwrap(),
+    ] {
+        assert_eq!(pointer, Some(log_id(7)));
+    }
+    assert_eq!(count(&actual, "consensus_log"), 0);
+    wal.checkpoint().unwrap();
+    wal.shutdown().unwrap();
+    let reopened = restored(&wal, directory.path(), &signed, &incoming);
+    exact(&reopened, &expected, &signed);
+    reopened.shutdown().unwrap();
+    let cold = restored(&reopened, directory.path(), &signed, &incoming);
+    exact(&cold, &expected, &signed);
+    cold.shutdown().unwrap();
+    producer_wal.shutdown().unwrap();
+}
+
+#[test]
 fn native_durable_install_retains_original_with_later_local_snapshot_and_rejects_substitution_before_repair(
 ) {
     let (_producer_dir, producer, signed, producer_wal) = fresh(Phase::Established);

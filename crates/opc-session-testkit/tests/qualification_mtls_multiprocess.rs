@@ -5839,6 +5839,24 @@ impl Fleet {
                 );
                 return;
             }
+            if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
+                // Observe the reports already returned by the original
+                // probes. No extra RPC or deadline adjustment is involved.
+                for report in &reports {
+                    eprintln!(
+                        "MTLS_RECOVERY_READINESS phase={phase} node_index={} ready={} reason={:?} configured={} reachable={} agreeing={} quorum={} committed={:?} applied={:?}",
+                        report.node_index,
+                        report.ready,
+                        report.reason_code,
+                        report.configured_voters,
+                        report.fresh_reachable_voters,
+                        report.agreeing_voters,
+                        report.required_quorum,
+                        report.committed_index,
+                        report.applied_index,
+                    );
+                }
+            }
             assert!(
                 deadline_allows_completion(Instant::now(), absolute_deadline),
                 "recovered-member readiness crossed its absolute deadline: phase={phase}, reports={reports:?}, stderr={:?}",
