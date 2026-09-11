@@ -575,3 +575,67 @@ fn native_ordinary_pruning_savepoint_and_same_apply_index_match_sql() {
     );
     fixture.wal.shutdown().unwrap();
 }
+
+#[test]
+fn native_snapshot_generic_projection_reuses_preparation_and_reads_current_rows() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let conn = backend.conn.blocking_lock();
+    initialize_schema(&conn, identity(), &expected_members()).unwrap();
+    let mut expected = Vec::new();
+    for index in 1_u8..=64 {
+        let id = SessionConsensusRequestId::from_bytes([index; 16]);
+        let digest = [index; 32];
+        let response = SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            sequence: u64::from(index),
+            digest: Some(SessionConsensusEntryDigest::from_bytes([index; 32])),
+            logical_time: Some(now(u64::from(index))),
+            raft_log_index: u64::from(index),
+        };
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+            params![id.as_bytes().as_slice(), epoch_i64(identity()).unwrap(), digest.as_slice(), encode_json(&response).unwrap()],
+        )
+        .unwrap();
+        expected.push((id, digest, response));
+    }
+    conn.flush_prepared_statement_cache();
+    let selects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&selects);
+    conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+        if matches!(context.action, rusqlite::hooks::AuthAction::Select) {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        rusqlite::hooks::Authorization::Allow
+    }));
+    for _ in 0..4 {
+        for (id, digest, response) in &expected {
+            assert_eq!(
+                crate::sqlite::consensus::native_snapshot::ordinary(&conn, identity(), *id)
+                    .unwrap(),
+                (*digest, response.clone())
+            );
+        }
+    }
+    let preparations = selects.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("native_snapshot_generic_query_preparations reads=256 prepares={preparations}");
+    // A reused statement must still observe and validate the caller's current
+    // transaction. No previous receipt result may survive a changed row.
+    let (id, digest, response) = &expected[0];
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    tx.execute(
+        "UPDATE consensus_request_outcomes SET response_json = ?1 WHERE request_id = ?2",
+        params![b"invalid-json".as_slice(), id.as_bytes().as_slice()],
+    )
+    .unwrap();
+    assert!(crate::sqlite::consensus::native_snapshot::ordinary(&tx, identity(), *id).is_err());
+    tx.rollback().unwrap();
+    assert_eq!(
+        crate::sqlite::consensus::native_snapshot::ordinary(&conn, identity(), *id).unwrap(),
+        (*digest, response.clone())
+    );
+    assert_eq!(
+        preparations, 1,
+        "one parameterized query serves the whole projection"
+    );
+}

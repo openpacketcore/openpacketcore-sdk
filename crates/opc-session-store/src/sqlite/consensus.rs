@@ -30350,8 +30350,11 @@ fn read_outcome_sync(
     request_id: SessionConsensusRequestId,
 ) -> io::Result<Option<([u8; 32], SessionConsensusResponse)>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT configuration_epoch, payload_digest, response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+        )
+        .map_err(db_error)?
+        .query_row(
             [request_id.as_bytes().as_slice()],
             |row| {
                 Ok((
