@@ -2123,6 +2123,62 @@ async fn wait_before_fixed_snapshot_return(final_path: &Path) {
     }
 }
 
+/// Hold a serving caller after it has opened its selected descriptor, before
+/// admission. A builder must not retire that inode during this interval.
+#[cfg(test)]
+fn current_snapshot_admission_gates(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct CurrentSnapshotAdmissionGateGuard {
+    path: PathBuf,
+    gate: Arc<SnapshotArtifactGate>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl CurrentSnapshotAdmissionGateGuard {
+    fn install(path: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
+        current_snapshot_admission_gates()
+            .lock()
+            .expect("install current snapshot admission gate")
+            .insert(path.clone(), Arc::clone(&gate));
+        Self { path, gate }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for CurrentSnapshotAdmissionGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut gates = current_snapshot_admission_gates()
+            .lock()
+            .expect("remove current snapshot admission gate");
+        if gates
+            .get(&self.path)
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.gate))
+        {
+            gates.remove(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_before_current_snapshot_admission(path: &Path) {
+    let gate = current_snapshot_admission_gates()
+        .lock()
+        .expect("find current snapshot admission gate")
+        .get(path)
+        .cloned();
+    if let Some(gate) = gate {
+        gate.block_if_armed().await;
+    }
+}
+
 /// Fail-closed errors emitted while binding an existing SQLite database to a
 /// durable consensus identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -2295,8 +2351,10 @@ async fn verify_admitted_snapshot(
     policy: SnapshotIntegrityPolicy,
     checksum: [u8; 32],
     length: u64,
+    retention: Option<SnapshotIntegrityWork>,
 ) -> io::Result<PinnedSqliteFile> {
     tokio::task::spawn_blocking(move || {
+        let _retention = retention;
         let path = lease.namespace.sqlite_child_path(&name)?;
         let mut pinned = PinnedSqliteFile::from_file_and_verify_in_namespace(
             file,
@@ -2358,9 +2416,16 @@ async fn admit_wal_snapshots(
         let path = lease.namespace.sqlite_child_path(&name)?;
         let file =
             open_snapshot_child_in_namespace(Arc::clone(&lease.namespace), name.clone()).await?;
-        let pin =
-            verify_admitted_snapshot(file, Arc::clone(&lease), name, policy, *checksum, *length)
-                .await?;
+        let pin = verify_admitted_snapshot(
+            file,
+            Arc::clone(&lease),
+            name,
+            policy,
+            *checksum,
+            *length,
+            None,
+        )
+        .await?;
         let length = *length;
         pins.push((candidate, pin, path, length));
     }
@@ -3734,6 +3799,7 @@ async fn validate_and_clean_snapshot_directory(
             core.snapshot_integrity,
             *checksum,
             *length,
+            None,
         )
         .await
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -3863,6 +3929,7 @@ async fn validate_and_clean_snapshot_directory(
                         core.snapshot_integrity,
                         *expected_checksum,
                         *expected_length,
+                        None,
                     )
                     .await
                     .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -5102,6 +5169,20 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
+        // Selection, descriptor admission and handoff share the builder's
+        // transaction gate. Otherwise a legitimate successor can retire the
+        // selected inode while its original integrity checks are running.
+        let consumer = LiveTerminalRecoveryHandoffConsumer::from_live_snapshot_owner(
+            &self.core,
+            &self._snapshot_directory_lease,
+        );
+        let snapshot_guard = consumer.acquire_gate().await.map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                io::Error::other(error),
+            )
+        })?;
         let current = self
             .core
             .read_current_snapshot_for_serving()
@@ -5137,6 +5218,8 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
+                #[cfg(test)]
+                wait_before_current_snapshot_admission(&path).await;
                 let pinned = verify_admitted_snapshot(
                     file,
                     Arc::clone(&self._snapshot_directory_lease),
@@ -5144,6 +5227,10 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     self.core.snapshot_integrity,
                     expected_checksum,
                     expected_length,
+                    Some(SnapshotIntegrityWork {
+                        _gate: snapshot_guard.clone(),
+                        _lease: Arc::clone(&self._snapshot_directory_lease),
+                    }),
                 )
                 .await
                 .map_err(|error| {
@@ -7581,6 +7668,7 @@ async fn track_previous_snapshot_artifact(
             snapshot_integrity,
             *expected_checksum,
             *expected_length,
+            None,
         )
         .await?;
         pinned.into_file()
@@ -14726,6 +14814,209 @@ mod tests {
         assert!(
             !old_bytes.is_empty(),
             "fixture started from a real sealed selected snapshot"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_current_snapshot_admission_survives_concurrent_publication() {
+        current_snapshot_admission_survives_concurrent_publication(true).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_current_snapshot_admission_survives_concurrent_publication() {
+        current_snapshot_admission_survives_concurrent_publication(false).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn current_snapshot_admission_survives_concurrent_publication(native: bool) {
+        use consensus::wal::integration::PrivateWalTest;
+
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log, mut machine, backend, token) = if native {
+            let token = Arc::new(PrivateWalTest::new_native(
+                directory.path().join("wal"),
+                [0xA7; 32],
+            ));
+            let (backend, log, machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .expect("open native snapshot serving owner");
+            (log, machine, Some(backend), Some(token))
+        } else {
+            let (log, machine, _) = open_fixed_raw_read_store(&directory).await;
+            (log, machine, None, None)
+        };
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry()],
+            "snapshot serving predecessor membership",
+        )
+        .await;
+        let mut initial = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish original snapshot");
+        let initial_meta = initial.meta.clone();
+        let initial_path = initial.snapshot.path().to_path_buf();
+        let mut initial_bytes = Vec::new();
+        initial
+            .snapshot
+            .read_to_end(&mut initial_bytes)
+            .await
+            .expect("read original sealed snapshot");
+        drop(initial);
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(1)],
+            "snapshot serving successor cut",
+        )
+        .await;
+
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard =
+            CurrentSnapshotAdmissionGateGuard::install(initial_path.clone(), Arc::clone(&gate));
+        let mut reader = machine.clone();
+        let serving = tokio::spawn(async move { reader.get_current_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("serving opens the selected predecessor before admission");
+        let mut builder = machine.get_snapshot_builder().await;
+        let mut building = tokio::spawn(async move { builder.build_snapshot().await });
+        let early_build = tokio::time::timeout(Duration::from_secs(1), &mut building)
+            .await
+            .ok();
+        let retired_during_admission = !initial_path.exists();
+        gate.release();
+        let served = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("serving completes after releasing its exact gate")
+            .expect("join serving caller");
+        let successor = match early_build {
+            Some(result) => result,
+            None => tokio::time::timeout(SNAPSHOT_APPLY_WAIT, building)
+                .await
+                .expect("builder completes after descriptor handoff"),
+        }
+        .expect("join concurrent snapshot builder")
+        .expect("publish successor through the original builder");
+        eprintln!(
+            "snapshot_serving_publication_race native={native} retired_during_admission={retired_during_admission} served={served:?}"
+        );
+        let mut served = served
+            .expect("legitimate successor publication must not invalidate snapshot admission")
+            .expect("selected snapshot exists");
+        assert!(!retired_during_admission);
+        assert_eq!(served.meta, initial_meta);
+        assert_eq!(successor.meta.last_log_id, Some(log_id(1)));
+        assert_ne!(successor.meta.snapshot_id, served.meta.snapshot_id);
+        assert!(
+            !initial_path.exists(),
+            "retire the predecessor after admission"
+        );
+        let mut served_bytes = Vec::new();
+        served
+            .snapshot
+            .read_to_end(&mut served_bytes)
+            .await
+            .expect("sealed descriptor remains readable after authorized retirement");
+        assert_eq!(served_bytes, initial_bytes);
+        assert_eq!(
+            machine
+                .get_current_snapshot()
+                .await
+                .expect("admit current successor")
+                .expect("published successor exists")
+                .meta,
+            successor.meta
+        );
+        if let Some(token) = token {
+            token
+                .current()
+                .expect("native owner")
+                .shutdown()
+                .expect("clean native stop");
+        }
+        drop(backend);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_fixed_current_snapshot_scan_retains_worker_ownership() {
+        cancelled_current_snapshot_scan_retains_worker_ownership(SnapshotIntegrityPolicy::FsVerity)
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_portable_current_snapshot_scan_retains_worker_ownership() {
+        cancelled_current_snapshot_scan_retains_worker_ownership(
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn cancelled_current_snapshot_scan_retains_worker_ownership(
+        policy: SnapshotIntegrityPolicy,
+    ) {
+        let directory = FixedRawReadStoreFixture::new();
+        let (_, mut machine, _) =
+            open_fixed_raw_read_store_with_integrity(&directory, None, policy).await;
+        machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply membership before current snapshot");
+        let original = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish current snapshot before cancellation");
+        let core = machine.core.clone();
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let hook_directory =
+            snapshot_namespace_test_hook_directory(&machine._snapshot_directory_lease);
+        let _gate_guard =
+            FixedPrepublicationScanGateGuard::install(hook_directory, Arc::clone(&gate));
+        let mut reader = machine.clone();
+        let serving = tokio::spawn(async move { reader.get_current_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("current snapshot reaches detached descriptor scan");
+        serving.abort();
+        assert!(serving
+            .await
+            .expect_err("cancel snapshot caller")
+            .is_cancelled());
+        let worker_owns_snapshot = Arc::clone(&core.snapshot_gate).try_lock_owned().is_err();
+        gate.release();
+        let released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&core.snapshot_gate).lock_owned(),
+        )
+        .await
+        .expect("detached scan releases snapshot transaction after completion");
+        drop(released);
+        assert!(
+            worker_owns_snapshot,
+            "cancelled admission must retain the snapshot transaction until its worker stops"
+        );
+        assert_eq!(
+            machine
+                .get_current_snapshot()
+                .await
+                .expect("read original snapshot after cancelled scan")
+                .expect("original snapshot remains selected")
+                .meta,
+            original.meta
         );
     }
 
