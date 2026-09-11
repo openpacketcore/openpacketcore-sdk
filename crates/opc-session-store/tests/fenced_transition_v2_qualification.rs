@@ -6,6 +6,9 @@
 
 #![recursion_limit = "256"]
 
+#[path = "fenced_transition_v2_qualification/native_capacity.rs"]
+mod native_capacity;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
