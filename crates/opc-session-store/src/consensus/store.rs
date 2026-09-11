@@ -16450,13 +16450,22 @@ mod membership_tests {
     }
 
     #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    fn legacy_sqlite_maintenance_backend(path: &std::path::Path) -> SqliteSessionBackend {
+        let mut backend = SqliteSessionBackend::open(path).expect("legacy SQL maintenance backend");
+        // These controls address SQL's checkpoint/prune workers and SQL lock.
+        // Native WAL maintenance has a separate owner and shutdown controls.
+        backend.native_owner = None;
+        backend
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
     #[tokio::test]
     async fn shutdown_stops_maintenance_lanes_before_a_held_raft_shutdown_and_reopens() {
         let directory = tempfile::tempdir().expect("shutdown-order directory");
         let database_path = directory.path().join("store.sqlite");
         let snapshot_path = directory.path().join("snapshots");
         let topology = fixed_shutdown_topology();
-        let backend = SqliteSessionBackend::open(&database_path).expect("file-backed backend");
+        let backend = legacy_sqlite_maintenance_backend(&database_path);
         let mut checkpoint_workers = backend.proactive_checkpoint_worker_observation_for_test();
         let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),
@@ -16526,7 +16535,7 @@ mod membership_tests {
         drop(store);
         let reopened = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),
-            SqliteSessionBackend::open(&database_path).expect("reopen file-backed backend"),
+            legacy_sqlite_maintenance_backend(&database_path),
             &snapshot_path,
             unavailable_fixed_shutdown_peers(&topology),
             crate::SnapshotIntegrityPolicy::PortableVerified,
@@ -16546,7 +16555,7 @@ mod membership_tests {
         let database_path = directory.path().join("store.sqlite");
         let snapshot_path = directory.path().join("snapshots");
         let topology = fixed_shutdown_topology();
-        let backend = SqliteSessionBackend::open(&database_path).expect("file-backed backend");
+        let backend = legacy_sqlite_maintenance_backend(&database_path);
         let mut checkpoint_workers = backend.proactive_checkpoint_worker_observation_for_test();
         let store =
             ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
@@ -23030,8 +23039,7 @@ mod membership_tests {
         let database_path = directory.path().join("store.sqlite");
         let snapshot_path = directory.path().join("snapshots");
         let topology = fixed_shutdown_topology();
-        let backend = SqliteSessionBackend::open(&database_path)
-            .expect("file-backed prune-readiness backend");
+        let backend = legacy_sqlite_maintenance_backend(&database_path);
         let inspection_backend = backend.clone();
         let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology.clone(),

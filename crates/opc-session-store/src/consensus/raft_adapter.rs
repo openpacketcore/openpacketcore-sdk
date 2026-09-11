@@ -2459,13 +2459,33 @@ mod tests {
         leader: SessionConsensusNodeId,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum FixedAuthorityBackend {
+        Sqlite,
+        #[cfg(target_os = "linux")]
+        Native,
+    }
+
     async fn fixed_follower_fixture(
         operation_timeout: Duration,
         admitted: bool,
+        selected: FixedAuthorityBackend,
     ) -> FixedFollowerFixture {
         let temp = tempfile::tempdir().expect("follower tempdir");
         let backend = SqliteSessionBackend::open(temp.path().join("sessions.sqlite"))
             .expect("follower backend");
+        #[cfg(target_os = "linux")]
+        let backend = {
+            let mut backend = backend;
+            if matches!(selected, FixedAuthorityBackend::Sqlite) {
+                // Retain the original SQL authority controls on an explicitly
+                // selected legacy fixture, alongside the native controls.
+                backend.native_owner = None;
+            }
+            backend
+        };
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(selected, FixedAuthorityBackend::Sqlite));
         let scope = identity(0x81);
         let leader = node_id(1);
         let local = node_id(2);
@@ -2495,6 +2515,15 @@ mod tests {
             )
             .await
             .expect("fixed follower storage");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            backend
+                .native_owner
+                .as_ref()
+                .is_some_and(|owner| owner.selected()),
+            matches!(selected, FixedAuthorityBackend::Native),
+            "the raw handler fixture must exercise its named authority owner"
+        );
         if admitted {
             let membership = membership_entry(leader, 0, vec![members.clone()], members.clone());
             log_store
@@ -2549,7 +2578,17 @@ mod tests {
 
     #[tokio::test]
     async fn raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family() {
-        let fixture = fixed_follower_fixture(Duration::from_secs(1), true).await;
+        for selected in [
+            FixedAuthorityBackend::Sqlite,
+            #[cfg(target_os = "linux")]
+            FixedAuthorityBackend::Native,
+        ] {
+            assert_one_raw_authority_check_per_family(selected).await;
+        }
+    }
+
+    async fn assert_one_raw_authority_check_per_family(selected: FixedAuthorityBackend) {
+        let fixture = fixed_follower_fixture(Duration::from_secs(1), true, selected).await;
         fixture
             .backend
             .fixed_quorum_durable_check_count
@@ -2582,7 +2621,7 @@ mod tests {
                     .fixed_quorum_durable_check_count
                     .load(Ordering::SeqCst),
                 before + 1,
-                "each admitted {family:?} has exactly one durable SQLite authority check"
+                "each admitted {family:?} has exactly one {selected:?} authority check"
             );
         }
         fixture
@@ -2595,7 +2634,9 @@ mod tests {
     #[tokio::test]
     async fn raw_fixed_handler_rejects_vote_before_admission_after_durable_placement_policy_drift()
     {
-        let fixture = fixed_follower_fixture(Duration::from_secs(1), false).await;
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), false, FixedAuthorityBackend::Sqlite)
+                .await;
         let conn = rusqlite::Connection::open(fixture._temp.path().join("sessions.sqlite"))
             .expect("open fixed voter database");
         conn.execute(
@@ -2636,7 +2677,8 @@ mod tests {
     #[tokio::test]
     async fn raw_fixed_handler_authority_check_honors_the_complete_operation_deadline() {
         let operation_timeout = Duration::from_millis(40);
-        let fixture = fixed_follower_fixture(operation_timeout, true).await;
+        let fixture =
+            fixed_follower_fixture(operation_timeout, true, FixedAuthorityBackend::Sqlite).await;
         let held_sqlite_lock = fixture.backend.lock_connection_for_test().await;
         let request = SessionConsensusWireRequest::try_new(
             fixture.scope,
@@ -2667,6 +2709,147 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown fixed test Raft");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_authority_check_honors_the_complete_operation_deadline() {
+        let fixture = fixed_follower_fixture(
+            Duration::from_millis(40),
+            true,
+            FixedAuthorityBackend::Native,
+        )
+        .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native owner selected")
+            .current()
+            .expect("live native owner");
+        let before = wal
+            .native_activation_facts_for_test()
+            .expect("raw owner before");
+        let held_wal = Arc::clone(&wal);
+        let (entered, holding) = tokio::sync::oneshot::channel();
+        let holder = std::thread::spawn(move || {
+            held_wal.with_native_owner_held_for_test(|| {
+                entered.send(()).expect("test awaits real lock acquisition");
+                // Release the fault independently of the Tokio executor, so
+                // even a blocking production regression can finish cleanup.
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        });
+        holding.await.expect("real native owner held");
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let started = Instant::now();
+        let response = fixture.handler.handle(fixture.leader, request).await;
+        let elapsed = started.elapsed();
+        holder
+            .join()
+            .expect("join finite fault")
+            .expect("held native owner");
+        let after = wal
+            .native_activation_facts_for_test()
+            .expect("raw owner after");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        eprintln!("native raw authority elapsed_us={}", elapsed.as_micros());
+        assert_eq!(
+            response.result,
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "a held native authority lock fails closed before engine admission"
+        );
+        assert!(elapsed >= Duration::from_millis(20));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "native authority consumes the unchanged 40 ms operation deadline"
+        );
+        assert_eq!(
+            after, before,
+            "timed-out authority cannot mutate vote/log/application"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_rejects_vote_before_admission_after_native_placement_policy_drift() {
+        use crate::readiness::PlacementResiliencePolicy::{
+            AllowReducedResilience, RequireIndependentFailureDomains,
+        };
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), false, FixedAuthorityBackend::Native)
+                .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native selection")
+            .current()
+            .expect("native owner");
+        let before = wal
+            .native_activation_facts_for_test()
+            .expect("raw pristine owner");
+        assert_eq!(before["placement"], 1);
+        wal.replace_native_placement_for_test(
+            RequireIndependentFailureDomains,
+            AllowReducedResilience,
+        )
+        .expect("inject only live placement fault");
+        let faulted = wal
+            .native_activation_facts_for_test()
+            .expect("independent fault readback");
+        let mut expected = before.clone();
+        expected["placement"] = serde_json::json!(2);
+        assert_eq!(
+            faulted, expected,
+            "only the selected live authority field changed"
+        );
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let response = fixture.handler.handle(fixture.leader, request).await;
+        let after = wal
+            .native_activation_facts_for_test()
+            .expect("raw rejected owner");
+        wal.replace_native_placement_for_test(
+            AllowReducedResilience,
+            RequireIndependentFailureDomains,
+        )
+        .expect("restore only this live placement field");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        assert_eq!(
+            response.result,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        assert_eq!(
+            after, faulted,
+            "rejected vote changes no native engine/application fact"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .fixed_quorum_durable_check_count
+                .load(Ordering::SeqCst),
+            1
+        );
     }
 
     fn rejecting_peer_map(

@@ -555,7 +555,11 @@ impl Gate {
                 |state| !state.0,
             )
             .unwrap();
-        assert!(state.0, "old owner reached declared boundary");
+        assert!(
+            state.0,
+            "old owner reached declared boundary {:?}",
+            self.point
+        );
     }
     fn release(&self) {
         self.state.lock().unwrap().1 = true;
@@ -581,6 +585,7 @@ fn native_durable_install_drains_captured_reads_apply_and_relocation_before_rele
         Point::BeforeNativeReceiptRead,
         Point::AfterNativeRelocationStep,
     ] {
+        eprintln!("native durable install draining boundary {point:?}");
         let gate = Gate::new(point);
         let fixture = Fixture::with_control(Limits::default(), gate.control());
         fixture.parity(&[formation(), activation(1, initial.clone(), timestamp(1))]);

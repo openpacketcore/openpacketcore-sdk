@@ -3233,14 +3233,9 @@ async fn open_with_member_bindings_for_profile(
     // Reject an existing mode mismatch before initialization, filesystem
     // probes, or cleanup can mutate either storage namespace.
     #[cfg(target_os = "linux")]
-    if let Some(owner) = &backend.native_owner {
-        if let Some(selected) = owner
-            .persistence_mode(identity)
-            .map_err(|_| SessionConsensusStorageError::CorruptState)?
-        {
-            if selected != persistence {
-                return Err(SessionConsensusStorageError::PersistenceModeMismatch);
-            }
+    if let Some(selected) = backend.native_persistence_preflight(identity).await? {
+        if selected != persistence {
+            return Err(SessionConsensusStorageError::PersistenceModeMismatch);
         }
     }
     let snapshot_dir = snapshot_dir.into();
@@ -3266,7 +3261,9 @@ async fn open_with_member_bindings_for_profile(
                 owner.select();
                 Some(Arc::clone(owner))
             } else if owner.selected() {
-                return Err(SessionConsensusStorageError::CorruptState);
+                // Preflight already verified this selected fixed native
+                // root. A dynamic opener requests another authority profile.
+                return Err(SessionConsensusStorageError::IdentityMismatch);
             } else {
                 None
             }
@@ -10973,6 +10970,10 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // The sequential SQL WAL initially selects basis.sqlite directly;
+            // CURRENT first exists after a checkpoint or snapshot handoff.
+            // Publish a real selector before requiring its exact sequence.
+            token.current().unwrap().checkpoint().unwrap();
             let sequence = private_install_selector(&directory)["position"]["sequence"].clone();
             // CURRENT may precede ordinary WAL acknowledgements. Remember the
             // physical sequence after the handoff, then require a repeat to

@@ -1330,6 +1330,42 @@ impl SqliteSessionBackend {
             })
     }
 
+    /// Validate the selected native root before comparing caller scope. Only
+    /// a root that also verifies against its original SQLite identity can
+    /// distinguish a different requested identity from corrupt recovery input.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn native_persistence_preflight(
+        &self,
+        expected: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<
+        Option<crate::consensus::SessionPersistenceMode>,
+        crate::consensus::storage::SessionConsensusStorageError,
+    > {
+        use crate::consensus::storage::SessionConsensusStorageError;
+
+        let Some(owner) = &self.native_owner else {
+            return Ok(None);
+        };
+        match owner.persistence_mode(expected) {
+            Ok(mode) => Ok(mode),
+            Err(_) => {
+                let conn = self.conn.lock().await;
+                let persisted = consensus::read_storage_identity_sync(&conn)
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+                if persisted != expected
+                    && owner
+                        .persistence_mode(persisted)
+                        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                        .is_some()
+                {
+                    Err(SessionConsensusStorageError::IdentityMismatch)
+                } else {
+                    Err(SessionConsensusStorageError::CorruptState)
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn lock_connection_for_test(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
@@ -1963,9 +1999,12 @@ impl SqliteSessionBackend {
         expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
         allow_pristine_membership: bool,
     ) -> bool {
+        #[cfg(test)]
+        self.fixed_quorum_durable_check_count
+            .fetch_add(1, Ordering::SeqCst);
         #[cfg(target_os = "linux")]
-        if let Some(result) = self.native_read(|wal| {
-            wal.native_fixed_read(
+        while let Some(result) = self.native_read(|wal| {
+            wal.native_fixed_try_read(
                 crate::sqlite::consensus::wal::native::FixedReadExpectation {
                     identity,
                     members: expected_members,
@@ -1977,11 +2016,12 @@ impl SqliteSessionBackend {
                 |_, exact| Ok(exact),
             )
         }) {
-            return result.unwrap_or(false);
+            match result {
+                Ok(Some(exact)) => return exact,
+                Err(_) => return false,
+                Ok(None) => tokio::time::sleep(Duration::from_millis(1)).await,
+            }
         }
-        #[cfg(test)]
-        self.fixed_quorum_durable_check_count
-            .fetch_add(1, Ordering::SeqCst);
         let conn = self.conn.lock().await;
         self.with_application_cache_read(&conn, || {
             consensus::fixed_quorum_authority_is_exact_sync(

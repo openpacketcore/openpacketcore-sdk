@@ -626,6 +626,7 @@ fn native_fixture_facts(
     serde_json::json!({
         "binding_identity": binding.identity,
         "durable_committed": committed,
+        "vote": native.log.vote,
         "last_log": native.log.last(),
         "authority_profile": match authority.profile {
             ConsensusAuthorityProfile::Dynamic => 1,
@@ -744,6 +745,44 @@ fn quorum_authority_observation_bounds_lock_and_refuses_async() {
 }
 
 impl Wal {
+    /// Change only the live test owner's placement field, leaving its persisted
+    /// import image and all engine/application facts intact.
+    #[cfg(test)]
+    pub(crate) fn replace_native_placement_for_test(
+        &self,
+        expected: PlacementResiliencePolicy,
+        replacement: PlacementResiliencePolicy,
+    ) -> io::Result<()> {
+        let mut state = self.fixture_state()?;
+        if state.status != Status::Running
+            || state.native.is_none()
+            || state.authority.profile != ConsensusAuthorityProfile::FixedImmutable
+            || state.authority.placement != Some(expected)
+            || state.outstanding != 0
+        {
+            return Err(invalid_data(
+                "native placement test owner is not idle and exact",
+            ));
+        }
+        state.authority.placement = Some(replacement);
+        Ok(())
+    }
+
+    /// Hold the actual native authority owner while a finite test fault runs.
+    #[cfg(test)]
+    pub(crate) fn with_native_owner_held_for_test<T>(
+        &self,
+        held: impl FnOnce() -> T,
+    ) -> io::Result<T> {
+        let state = self.fixture_state()?;
+        if state.native.is_none() {
+            return Err(invalid_data("test requires a native authority owner"));
+        }
+        let result = held();
+        drop(state);
+        Ok(result)
+    }
+
     /// Bound test observations/control acquisition independently of production
     /// locking. Contention is an observation error, never readiness.
     #[cfg(any(test, feature = "test-control"))]
@@ -1378,6 +1417,29 @@ impl Wal {
             .as_ref()
             .ok_or_else(|| invalid_data("native authority owner missing"))?;
         read(&native.business, exact)
+    }
+
+    /// A nonblocking attempt at the same live-owner authority check. An async
+    /// caller can yield on contention without blocking its original deadline.
+    pub(crate) fn native_fixed_try_read<T>(
+        &self,
+        expectation: FixedReadExpectation<'_>,
+        read: impl FnOnce(&NativeState, bool) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let state = match self.shared.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid_data("native authority owner poisoned"));
+            }
+        };
+        ensure_readable(&state)?;
+        let exact = self.native_fixed_exact(&state, &expectation)?;
+        let native = state
+            .native
+            .as_ref()
+            .ok_or_else(|| invalid_data("native authority owner missing"))?;
+        read(&native.business, exact).map(Some)
     }
 
     fn native_fixed_exact(
