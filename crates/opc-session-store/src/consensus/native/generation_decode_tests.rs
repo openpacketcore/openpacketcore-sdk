@@ -357,14 +357,15 @@ fn native_ordinary_single_notifications_and_logs_keep_full_owned_bodies() {
             &|| Ok(()),
         )
         .unwrap();
+        let admitted = inspect_notification(
+            &bytes,
+            row.sequence,
+            &storage.business.frontiers,
+            &|| Ok(()),
+        )
+        .unwrap();
         let owned =
-            owned_notification(
-                &bytes,
-                row.sequence,
-                &storage.business.frontiers,
-                &|| Ok(()),
-            )
-            .unwrap();
+            owned_notification(&bytes, admitted, &storage.business.frontiers, &|| Ok(())).unwrap();
         assert_eq!(postcard::to_allocvec(owned.entry()).unwrap(), bytes);
     }
     let intents = vec![
@@ -872,13 +873,15 @@ fn native_owned_key_notification_and_log_copies_release_decoder_backing_with_lar
     assert_eq!(postcard::to_allocvec(&copied).unwrap(), bytes);
     drop(copied);
     drop(_notification_memory);
-    let output = owned_notification(
+    let admitted = inspect_notification(
         &bytes,
         notification.sequence,
         &storage.business.frontiers,
         &|| Ok(()),
     )
     .unwrap();
+    let output =
+        owned_notification(&bytes, admitted, &storage.business.frontiers, &|| Ok(())).unwrap();
     assert_eq!(postcard::to_allocvec(output.entry()).unwrap(), bytes);
     drop(output);
 

@@ -498,26 +498,28 @@ fn native_roster_notification_codecs_charge_both_records_and_release_decoder_pay
         drop(copied_records);
         drop(copied);
         drop(memory);
-        let output =
-            owned_notification(&bytes, value.sequence, &storage.business.frontiers, &|| {
+        let admitted =
+            inspect_notification(&bytes, value.sequence, &storage.business.frontiers, &|| {
                 Ok(())
             })
             .unwrap();
+        let output =
+            owned_notification(&bytes, admitted, &storage.business.frontiers, &|| Ok(())).unwrap();
         assert_eq!(postcard::to_allocvec(output.entry()).unwrap(), bytes);
-        assert!(owned_notification(
-            &bytes,
-            value.sequence + 1,
-            &storage.business.frontiers,
-            &|| Ok(())
-        )
-        .is_err());
-        assert!(owned_notification(
-            &bytes,
-            value.sequence,
-            &storage.business.frontiers,
-            &|| Err(io::Error::other("cancelled"))
-        )
-        .is_err());
+        let mut wrong_sequence = admitted;
+        wrong_sequence.facts.sequence += 1;
+        assert!(
+            owned_notification(&bytes, wrong_sequence, &storage.business.frontiers, &|| Ok(
+                ()
+            ))
+            .is_err()
+        );
+        assert!(
+            owned_notification(&bytes, admitted, &storage.business.frontiers, &|| Err(
+                io::Error::other("cancelled")
+            ))
+            .is_err()
+        );
         for length in [0, 1, bytes.len() / 2, bytes.len() - 1] {
             assert!(notification_scratch(&bytes[..length]).is_err());
         }

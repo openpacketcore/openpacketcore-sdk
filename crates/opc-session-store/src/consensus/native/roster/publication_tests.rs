@@ -114,9 +114,16 @@ fn apply_logged(state: &mut NativeState, entry: &Entry<SessionRaftTypeConfig>) -
     let applied = state.apply(std::slice::from_ref(decoded.entry())).unwrap();
     for notification in &applied.notifications {
         let bytes = postcard::to_allocvec(notification).unwrap();
-        let copied = crate::consensus::native::generation::decode::owned_notification(
+        let admitted = crate::consensus::native::generation::decode::inspect_notification(
             &bytes,
             notification.sequence,
+            &state.frontiers,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let copied = crate::consensus::native::generation::decode::owned_notification(
+            &bytes,
+            admitted,
             &state.frontiers,
             &|| Ok(()),
         )

@@ -533,14 +533,25 @@ impl OwnedNotification {
 
 pub(in crate::consensus::native) fn owned_notification(
     bytes: &[u8],
-    sequence: u64,
+    expected: facts::Row<facts::Notification>,
     frontiers: &NativeFrontiers,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<OwnedNotification> {
     check()?;
     let memory = VerificationMemory::reserve(notification_scratch(bytes)?)?;
     let decoded: ReplicationEntry = binary::decode(bytes)?;
-    validation::validate_notification(&decoded, sequence, frontiers)?;
+    validation::validate_notification(&decoded, expected.facts.sequence, frontiers)?;
+    // Compare the complete admitted row while this one bounded decode is
+    // still owned. A separate inspection would decode the same immutable
+    // input again before producing the independent output below.
+    if changes::fingerprint(3, &decoded.sequence, &decoded)? != expected.content
+        || decoded.sequence != expected.facts.sequence
+        || decoded.timestamp != expected.facts.timestamp
+    {
+        return Err(invalid(
+            "native selected notification differs from admitted row",
+        ));
+    }
     // Independent copies of all carried payloads are below the six-times-sum
     // scratch bound. The copy performs no envelope parse or canonical encode.
     let entry = owned::notification(&decoded)?;
@@ -714,6 +725,36 @@ pub(in crate::consensus::native) fn owned_log(
     members: &BTreeSet<SessionConsensusNodeId>,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<OwnedLog> {
+    owned_log_inner(bytes, index, None, identity, members, check)
+}
+
+/// Bind the same complete closed decode to every fact of the selected row.
+/// No decoded model or unchecked selected bytes cross this boundary.
+pub(in crate::consensus::native) fn owned_selected_log(
+    bytes: &[u8],
+    expected: facts::Row<facts::Log>,
+    identity: SessionConsensusIdentity,
+    members: &BTreeSet<SessionConsensusNodeId>,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<OwnedLog> {
+    owned_log_inner(
+        bytes,
+        expected.facts.id.index,
+        Some(expected),
+        identity,
+        members,
+        check,
+    )
+}
+
+fn owned_log_inner(
+    bytes: &[u8],
+    index: u64,
+    expected: Option<facts::Row<facts::Log>>,
+    identity: SessionConsensusIdentity,
+    members: &BTreeSet<SessionConsensusNodeId>,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<OwnedLog> {
     check()?;
     let scratch = json::log_scratch_checked(bytes, check)?;
     let mut memory = scratch::LogMemory::reserve(scratch, check)?;
@@ -722,6 +763,18 @@ pub(in crate::consensus::native) fn owned_log(
         return Err(invalid("native owned log index differs"));
     }
     log::NativeLog::validate_entry_context(&decoded, identity, members)?;
+    if let Some(expected) = expected {
+        let membership = match &decoded.payload {
+            EntryPayload::Membership(value) => Some(facts::membership(value)?),
+            _ => None,
+        };
+        if log::fingerprint(index, bytes) != expected.content
+            || decoded.log_id != expected.facts.id
+            || membership != expected.facts.membership
+        {
+            return Err(invalid("native selected log differs from admitted row"));
+        }
+    }
     // The original peak includes two raw widths for retained models and a
     // separate maximum of canonical encoding/envelope validation. Those
     // codec temporaries are gone before this independent byte copy, which

@@ -17,6 +17,170 @@ const ROOT: [u8; 32] = [0xBD; 32];
 const CUT: [u8; 32] = [0xCE; 32];
 
 #[test]
+fn native_selected_notification_read_uses_one_bounded_decode() {
+    use crate::consensus::native::notification::NativeNotification;
+
+    let (original, _, _) = fixture();
+    let (_files, catalog) = Files::new(&original);
+    let indexed = &catalog.rows.notifications[0];
+    let bytes = row_bytes(&catalog, indexed);
+    let selected = |row| {
+        NativeNotification::from_admitted_range(
+            row,
+            Arc::clone(&catalog.source),
+            indexed.range.offset,
+            indexed.range.length,
+        )
+        .unwrap()
+    };
+    let row = selected(indexed.row);
+    let frontiers = &original.business.frontiers;
+    assert_eq!(
+        postcard::to_allocvec(row.read(frontiers, &|| Ok(())).unwrap().entry()).unwrap(),
+        bytes,
+        "selected reads preserve the complete independently encoded notification",
+    );
+    for field in 0..3 {
+        let mut changed = indexed.row;
+        match field {
+            0 => changed.content[0] ^= 1,
+            1 => changed.facts.sequence += 1,
+            _ => changed.facts.timestamp = time(0),
+        }
+        assert!(selected(changed).read(frontiers, &|| Ok(())).is_err());
+    }
+    let baseline = allocation_counter::measure(|| {
+        drop(decode::owned_notification(&bytes, indexed.row, frontiers, &|| Ok(())).unwrap());
+    });
+    let actual = allocation_counter::measure(|| {
+        drop(row.read(frontiers, &|| Ok(())).unwrap());
+    });
+    eprintln!(
+        "native_selected_notification_decode single_bytes={} selected_bytes={} input_bytes={} single_allocations={} selected_allocations={}",
+        baseline.bytes_total, actual.bytes_total, bytes.len(), baseline.count_total, actual.count_total,
+    );
+    assert_eq!(actual.bytes_current, 0);
+    assert!(
+        actual.bytes_total <= baseline.bytes_total + bytes.len() as u64,
+        "selected reads allocate one bounded input and one complete decode/copy, without decoding the same authenticated bytes again",
+    );
+}
+
+#[test]
+fn native_selected_log_read_uses_one_bounded_decode() {
+    let (original, _, _) = fixture();
+    let (_files, catalog) = Files::new(&original);
+    let cold = catalog.into_storage(&|| Ok(())).unwrap();
+    let hot_capture = original.capture_log_read().unwrap();
+    let selected_capture = cold.capture_log_read().unwrap();
+    for (index, hot) in &original.log.entries {
+        let selected = cold.log.entries.get(index).unwrap();
+        assert!(selected.is_cold());
+        let bytes = hot.encoded_for_test().unwrap();
+        let expected = hot_capture
+            .resolve(*index, Some(index + 1), Some(1), &|| Ok(()))
+            .unwrap();
+        let actual = selected_capture
+            .resolve(*index, Some(index + 1), Some(1), &|| Ok(()))
+            .unwrap();
+        assert!(
+            actual.entries() == expected.entries(),
+            "complete selected and resident results differ"
+        );
+        drop(actual);
+        drop(expected);
+        let authority = allocation_counter::measure(|| {
+            selected
+                .validate_context(
+                    *index,
+                    original.business.identity,
+                    &original.business.members,
+                )
+                .unwrap();
+        });
+        let baseline = allocation_counter::measure(|| {
+            drop(
+                hot_capture
+                    .resolve(*index, Some(index + 1), Some(1), &|| Ok(()))
+                    .unwrap(),
+            );
+        });
+        let actual = allocation_counter::measure(|| {
+            drop(
+                selected_capture
+                    .resolve(*index, Some(index + 1), Some(1), &|| Ok(()))
+                    .unwrap(),
+            );
+        });
+        eprintln!("native_selected_log_decode index={index} resident_bytes={} selected_bytes={} authority_bytes={} input_bytes={} resident_allocations={} selected_allocations={}", baseline.bytes_total, actual.bytes_total, authority.bytes_total, bytes.len(), baseline.count_total, actual.count_total);
+        assert_eq!(actual.bytes_current, 0);
+        assert!(actual.bytes_total <= baseline.bytes_total + authority.bytes_total + bytes.len() as u64,
+            "selected reads allocate the same complete bounded decode/copy plus their exact input and original scope check, without decoding the same log again");
+    }
+}
+
+#[test]
+fn native_selected_log_owned_read_rejects_changed_facts_scope_and_cancellation() {
+    let (original, _, _) = fixture();
+    let (_files, catalog) = Files::new(&original);
+    let identity = original.business.identity;
+    let members = &original.business.members;
+    for (index, indexed) in &catalog.rows.logs {
+        let selected = |row| {
+            log::NativeLogEntry::from_admitted_range(
+                row,
+                Arc::clone(&catalog.source),
+                indexed.range.offset,
+                indexed.range.length,
+                identity,
+                members,
+            )
+            .unwrap()
+        };
+        let row = selected(indexed.row);
+        let actual = row
+            .read_owned(*index, identity, members, &|| Ok(()))
+            .unwrap();
+        assert!(actual.entry() == &original.log.entries[index].resident().unwrap().entry);
+        drop(actual);
+        for field in 0..3 {
+            let mut changed = indexed.row;
+            match field {
+                0 => changed.content[0] ^= 1,
+                1 => {
+                    changed.facts.id =
+                        LogId::new(CommittedLeaderId::new(2, *members.first().unwrap()), *index);
+                }
+                _ => {
+                    changed.facts.membership = match changed.facts.membership {
+                        Some(_) => None,
+                        None => Some([0; 32]),
+                    };
+                }
+            }
+            assert!(selected(changed)
+                .read_owned(*index, identity, members, &|| Ok(()))
+                .is_err());
+        }
+        let mut wrong_members = members.clone();
+        wrong_members.pop_first();
+        assert!(row
+            .read_owned(*index, identity, &wrong_members, &|| Ok(()))
+            .is_err());
+        assert!(row
+            .read_owned(index + 1, identity, members, &|| Ok(()))
+            .is_err());
+        let error = row
+            .read_owned(*index, identity, members, &|| {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+}
+
+#[test]
 fn native_catalog_generic_conversion_bounds_verified_block_reads_and_preserves_every_row() {
     let (mut original, _, _) = fixture();
     for first in (2..1026).step_by(64) {

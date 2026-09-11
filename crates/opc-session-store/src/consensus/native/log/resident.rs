@@ -198,6 +198,33 @@ impl NativeLogEntry {
         }
     }
 
+    /// Outside State only. Decode selected bytes once, retaining all admitted
+    /// content, exact ID, membership and authority comparisons before copying.
+    pub(in crate::consensus::native) fn read_owned(
+        &self,
+        index: u64,
+        identity: SessionConsensusIdentity,
+        members: &BTreeSet<SessionConsensusNodeId>,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<generation::decode::OwnedLog> {
+        match &self.body {
+            Body::Resident(row) => {
+                generation::decode::owned_log(&row.encoded, index, identity, members, check)
+            }
+            Body::Selected(row) => {
+                self.validate_context(index, identity, members)?;
+                let input = row.range.read(check)?;
+                generation::decode::owned_selected_log(
+                    input.bytes(),
+                    row.row,
+                    identity,
+                    members,
+                    check,
+                )
+            }
+        }
+    }
+
     pub(in crate::consensus::native) fn validate_full(
         &self,
         index: u64,

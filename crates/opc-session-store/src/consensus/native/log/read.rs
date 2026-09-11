@@ -105,9 +105,7 @@ impl LogReadCapture {
         let (identity, members, _) = self.business.context();
         for (index, row) in self.log.entries.range(start..end).take(limit) {
             check()?;
-            let bytes = row.read_bytes(identity, members, check)?;
-            let owned =
-                generation::decode::owned_log(bytes.bytes(), *index, identity, members, check)?;
+            let owned = row.read_owned(*index, identity, members, check)?;
             if owned.entry().log_id != row.id() {
                 return Err(invalid("native log read ID differs from captured row"));
             }

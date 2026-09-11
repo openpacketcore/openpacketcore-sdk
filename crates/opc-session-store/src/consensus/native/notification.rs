@@ -190,14 +190,9 @@ impl NativeNotification {
         match &self.body {
             Body::Resident(row) => Ok(ReadNotification::Resident(row)),
             Body::Selected(row) => {
-                let bytes = Self::selected_bytes(row, frontiers, check)?;
-                generation::decode::owned_notification(
-                    bytes.bytes(),
-                    row.row.facts.sequence,
-                    frontiers,
-                    check,
-                )
-                .map(ReadNotification::Selected)
+                let bytes = row.range.read(check)?;
+                generation::decode::owned_notification(bytes.bytes(), row.row, frontiers, check)
+                    .map(ReadNotification::Selected)
             }
         }
     }
