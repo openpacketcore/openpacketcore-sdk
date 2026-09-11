@@ -608,6 +608,25 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
             .await
             .unwrap();
         let cold = fleet.store(forgotten).clone();
+        // The public opener restores storage before Raft::new spawns its
+        // core, but the metrics watch starts with an empty vote. First check
+        // the independently restored storage, then require the same exact
+        // vote from the engine within the existing fixture operation bound.
+        let mut restored_log = crate::sqlite::consensus::wal::adapter::WalLogStore::new(
+            Arc::clone(cold.inner.private_wal.as_ref().unwrap()),
+        );
+        assert_eq!(
+            opc_consensus::engine::storage::RaftLogStorage::read_vote(&mut restored_log)
+                .await
+                .unwrap(),
+            Some(retained_vote)
+        );
+        drop(restored_log);
+        until(
+            || cold.inner.raft.metrics().borrow().vote == retained_vote,
+            "startup publishes the independently restored committed vote",
+        )
+        .await;
         assert_eq!(cold.inner.raft.metrics().borrow().vote, retained_vote);
         assert!(!cold.inner.persistence_protocol.is_active());
         assert!(!cold.status().admitted);
