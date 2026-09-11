@@ -67,7 +67,6 @@ pub(super) fn validate_row_profile(row: &Row, frontiers: &NativeFrontiers) -> io
 }
 
 impl NativeState {
-    #[cfg(test)]
     pub(crate) fn protected_roster_v2_activation_matches(
         &self,
         identity: SessionConsensusIdentity,
@@ -221,6 +220,8 @@ impl NativeDelta<'_> {
         self.frontiers.digest = digest;
         self.frontiers.logical_time = Some(now);
         if let Some(op) = replication {
+            #[cfg(any(test, feature = "test-control"))]
+            let notification_started = std::time::Instant::now();
             let sequence = self
                 .frontiers
                 .watch_sequence
@@ -238,6 +239,21 @@ impl NativeDelta<'_> {
                 .map_err(|_| invalid("native roster replication notification invalid"))?;
             self.frontiers.watch_sequence = sequence;
             self.notifications.push(notification);
+            #[cfg(any(test, feature = "test-control"))]
+            crate::sqlite::consensus::record_native_roster_notification_timing(
+                notification_started,
+            );
+        }
+        #[cfg(any(test, feature = "test-control"))]
+        if matches!(
+            &outcome,
+            SessionMutationOutcome::RosterTerminal(
+                ConsensusRosterTerminalOutcome::Committed { .. }
+            ) | SessionMutationOutcome::RosterTerminalV2(
+                ConsensusRosterTerminalOutcome::Committed { .. }
+            )
+        ) {
+            self.terminal_remainder_started = Some(std::time::Instant::now());
         }
         check()?;
         Ok(self.response(index, Ok(outcome)))

@@ -318,14 +318,30 @@ impl NativeState {
         for (key, row) in &self.keys {
             validate_key(key, row, frontiers)?;
         }
-        let mut receipt_order = history_order::ReceiptOrder::preparing(frontiers.history)?;
+        // Cold admission clears the proof before entering this validator and
+        // must construct the complete independent ordinal index. An already
+        // published image can share its immutable paths, but still validates
+        // every row below and the complete index/row bijection afterward.
+        let admitted = self
+            .proof
+            .as_ref()
+            .and_then(|_| self.require_business_proof().ok());
+        let mut receipt_order = match admitted {
+            Some(proof) => proof.receipt_order.clone(),
+            None => history_order::ReceiptOrder::preparing(frontiers.history)?,
+        };
         if let Some(history) = frontiers.history {
             for (id, row) in &self.receipts {
                 validate_receipt(self.identity, id, row, frontiers, history)?;
-                receipt_order.insert_cold(*id, row.ordinal, row.retained_until)?;
+                if admitted.is_none() {
+                    receipt_order.insert_cold(*id, row.ordinal, row.retained_until)?;
+                }
             }
         }
         receipt_order.validate(frontiers.history)?;
+        if admitted.is_some() {
+            receipt_order.validate_rows(&self.receipts)?;
+        }
         let mut v1_count = 0usize;
         for (id, row) in &self.generic_receipts {
             validate_generic(id, row, frontiers)?;

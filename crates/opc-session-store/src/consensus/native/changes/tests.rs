@@ -242,7 +242,7 @@ fn native_scratch_worker_accepts_exact_original_log_limit_with_large_conflict_bo
         .len();
     let limit = crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES;
     let extra = limit - base;
-    let large = changed(16 + extra / 2, extra % 2 != 0);
+    let large = changed(16 + extra / 2, !extra.is_multiple_of(2));
     assert!(
         large.mutation().record().unwrap().payload.len()
             > crate::fenced_transition::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES
@@ -361,7 +361,7 @@ fn exact_storage(storage: &NativeStorage) -> Vec<u8> {
 }
 
 fn reconstruct_rows<K: Clone + Eq + Hash, T: serde::de::DeserializeOwned + Serialize>(
-    target: &mut ResidentMap<K, SharedRow<T>>,
+    target: &mut RowMap<K, SharedRow<T>>,
     changed: &HashMap<K, RowChange<T>>,
 ) {
     for (key, change) in changed {
@@ -722,7 +722,7 @@ fn native_changes_deserialization_cannot_supply_a_process_certificate() {
     let key = invalid.keys.keys().next().unwrap().clone();
     let mut value = (*invalid.keys[&key]).clone();
     value.fence = COUNTER_MAX;
-    invalid.keys.insert(key, SharedRow::new(value));
+    invalid.keys.insert(key, SharedRow::new(value).unwrap());
     assert!(invalid.admit_business().is_err());
     assert!(invalid.proof.is_none());
 }
@@ -779,9 +779,10 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
     let original = SharedRow::new(NativeKeyState {
         fence: 7,
         ..NativeKeyState::default()
-    });
+    })
+    .unwrap();
     let first_hash = stamp(0, &1u64, &original).unwrap();
-    let mut current = ResidentMap::new();
+    let mut current = RowMap::new();
     current.insert(1u64, original.clone());
     let mut dirty = HashMap::new();
     let removal = StagedRow {
@@ -796,7 +797,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
     };
     validate_staged(std::slice::from_ref(&removal), &current, Some(&dirty)).unwrap();
     publish_rows(vec![removal], &mut current, Some(&mut dirty));
-    let replacement = SharedRow::new((*original).clone());
+    let replacement = SharedRow::new((*original).clone()).unwrap();
     let reinsert = StagedRow {
         key: 1,
         journal_key: Some(1),
@@ -1017,7 +1018,7 @@ fn native_capture_omitted_stale_or_modified_business_rows_fail_in_worker() {
                 let receipt = dirty.receipts.values_mut().next().unwrap();
                 let mut changed = (**receipt.after.as_ref().unwrap()).clone();
                 changed.retained_until = time(0);
-                receipt.after = Some(SharedRow::new(changed));
+                receipt.after = Some(SharedRow::new(changed).unwrap());
             }
         }
         // Transfer deliberately does no serialization or per-row validation.

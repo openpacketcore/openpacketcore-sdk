@@ -58,7 +58,8 @@ pub(crate) fn seed(
                         retained_until: until,
                         response: response.clone().map(Box::new),
                         cold: None,
-                    }),
+                    })
+                    .unwrap(),
                 )
             };
             storage.business.receipts.insert(id, row);
@@ -176,7 +177,10 @@ fn native_history_full_validator_rejects_ordinal_holes_and_retention_regressions
             3 => row.payload_digest[0] ^= 1,
             _ => unreachable!(),
         }
-        storage.business.receipts.insert(id, SharedRow::new(row));
+        storage
+            .business
+            .receipts
+            .insert(id, SharedRow::new(row).unwrap());
         assert!(
             storage.business.validate_full_business().is_err(),
             "complete validator rejects case {case}"

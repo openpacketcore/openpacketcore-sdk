@@ -60,7 +60,8 @@ pub enum SessionStorageFailureKind {
     TimedOut,
     /// The operating system or a bounded allocator refused memory.
     OutOfMemory,
-    /// The filesystem refused additional storage.
+    /// Storage refused additional capacity, including a SQLite page limit.
+    /// This category alone does not identify an exhausted filesystem.
     StorageFull,
     /// An operation was interrupted.
     Interrupted,

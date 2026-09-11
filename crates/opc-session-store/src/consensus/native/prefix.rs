@@ -67,6 +67,18 @@ pub(crate) struct PrefixIdentity {
     pub(crate) digest: [u8; 32],
 }
 
+/// Exact new cut and payload extent for one append transaction.
+pub(crate) struct AppendTransaction {
+    /// Checkpoint immediately following the admitted predecessor.
+    pub(crate) checkpoint_epoch: u64,
+    /// Native operation sequence represented by the new checkpoint.
+    pub(crate) operation_sequence: u64,
+    /// Commitment to all resulting application and log frontiers.
+    pub(crate) frontiers: [u8; 32],
+    /// Complete encoded transaction length before canonical padding.
+    pub(crate) payload_bytes: u64,
+}
+
 impl PrefixIdentity {
     pub(crate) fn validate(self, maximum: u64) -> io::Result<()> {
         self.blocks(maximum).map(|_| ())
@@ -77,7 +89,7 @@ impl PrefixIdentity {
             || !self.block_bytes.is_power_of_two()
             || self.length == 0
             || self.length > maximum
-            || self.length % self.block_bytes as u64 != 0
+            || !self.length.is_multiple_of(self.block_bytes as u64)
             || self.file_epoch == u64::MAX
             || self.checkpoint_epoch == u64::MAX
         {
@@ -518,18 +530,22 @@ impl VerifiedAppendOwner {
     /// padding, sync, and decode its verified readback to exact EOF. The format
     /// validator must compare every decoded field to its captured expectation;
     /// the primitive deliberately cannot manufacture a semantic certificate.
-    /// `checkpoint_epoch` advances even when `operation_sequence` is unchanged.
+    /// The transaction's checkpoint advances even when its operation sequence
+    /// is unchanged.
     pub(crate) fn append(
         &mut self,
         predecessor: &Arc<VerifiedPrefix>,
-        checkpoint_epoch: u64,
-        operation_sequence: u64,
-        frontiers: [u8; 32],
-        payload_bytes: u64,
+        transaction: AppendTransaction,
         mut check: impl FnMut() -> io::Result<()>,
         encode: impl FnOnce(&mut dyn Write) -> io::Result<()>,
         validate: impl FnOnce(&mut dyn Read) -> io::Result<()>,
     ) -> io::Result<Arc<VerifiedPrefix>> {
+        let AppendTransaction {
+            checkpoint_epoch,
+            operation_sequence,
+            frontiers,
+            payload_bytes,
+        } = transaction;
         let source = Arc::clone(&self.current.source);
         let mut fence = FailureFence::new(&source.failed);
         let previous = self.current.identity;

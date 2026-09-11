@@ -41,7 +41,7 @@ impl Ordinals {
             Some(slot) => slot,
             None => {
                 if self.epochs.len()
-                    >= crate::fenced_transition::FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1
+                    > crate::fenced_transition::FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS
                 {
                     return Err(invalid(
                         "native catalog exceeds the original retained epoch bound",
@@ -53,14 +53,9 @@ impl Ordinals {
                         .checked_mul(size_of::<Option<Timestamp>>())
                         .ok_or_else(|| invalid("native ordinal reservation overflow"))?,
                 )?;
-                let mut times = Vec::new();
-                times
-                    .try_reserve_exact(count)
-                    .map_err(|_| invalid("native ordinal allocation failed"))?;
-                times.resize(count, None);
                 self.epochs.push(Epoch {
                     epoch,
-                    times,
+                    times: Vec::new(),
                     count: 0,
                     first: count,
                     last: 0,
@@ -74,6 +69,19 @@ impl Ordinals {
             }
         };
         let epoch = &mut self.epochs[slot];
+        if index >= epoch.times.len() {
+            // Keep the complete original reservation above, but allocate
+            // slots only through an actually decoded, checked ordinal. Round
+            // to bounded chunks so ascending input does not reallocate per
+            // receipt. Unallocated suffix slots have the same absent meaning.
+            let count = (index + 1).div_ceil(1024) * 1024;
+            let count = count.min(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES);
+            epoch
+                .times
+                .try_reserve_exact(count - epoch.times.len())
+                .map_err(|_| invalid("native ordinal allocation failed"))?;
+            epoch.times.resize(count, None);
+        }
         if epoch.times[index].is_some() {
             return Err(invalid("native catalog repeats a receipt ordinal"));
         }
@@ -99,7 +107,7 @@ impl Ordinals {
             .position(|row| row.epoch == epoch)
             .ok_or_else(|| invalid("native deleted ordinal epoch absent"))?;
         let epoch = &mut self.epochs[slot];
-        if epoch.times[index] != Some(until) {
+        if epoch.times.get(index).copied().flatten() != Some(until) {
             return Err(invalid(
                 "native deleted ordinal differs from its complete prior row",
             ));
@@ -168,5 +176,40 @@ impl Ordinals {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::native::changes::tests::time;
+
+    #[test]
+    fn native_catalog_ordinal_growth_preserves_absence_edges_and_original_limits() {
+        let mut rows = Ordinals::new().unwrap();
+        rows.insert(1, 1, time(2)).unwrap();
+        assert_eq!(rows.epochs[0].times.len(), 1024);
+        assert!(rows.remove(1, 4096, time(2)).is_err());
+        assert_eq!(rows.epochs[0].count, 1);
+        rows.insert(1, 4096, time(4)).unwrap();
+        assert_eq!(rows.epochs[0].times.len(), 4096);
+        assert!(rows.insert(1, 4096, time(4)).is_err());
+        assert!(rows.insert(1, 4095, time(5)).is_err());
+        assert!(rows.insert(1, 4097, time(3)).is_err());
+        rows.insert(1, 4095, time(3)).unwrap();
+        let last = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64;
+        rows.insert(1, last, time(5)).unwrap();
+        assert_eq!(rows.epochs[0].times.len(), last as usize);
+        assert!(rows.insert(1, 0, time(5)).is_err());
+        assert!(rows.insert(1, last + 1, time(5)).is_err());
+        assert!(rows.remove(1, last, time(4)).is_err());
+        assert_eq!(rows.epochs[0].count, 4);
+        rows.remove(1, last, time(5)).unwrap();
+        rows.remove(1, 1, time(2)).unwrap();
+        assert_eq!(rows.epochs[0].first, 4094);
+        assert_eq!(rows.epochs[0].last, 4095);
+        rows.remove(1, 4095, time(3)).unwrap();
+        rows.remove(1, 4096, time(4)).unwrap();
+        assert!(rows.epochs.is_empty());
     }
 }

@@ -202,7 +202,7 @@ impl Owner {
             .ok_or_else(|| invalid_data("asynchronous generation owner missing"))?;
         let previous = selected.append.current();
         let identity = previous.identity();
-        if anchor.epoch != identity.checkpoint_epoch.checked_add(1).unwrap_or(u64::MAX)
+        if anchor.epoch != identity.checkpoint_epoch.saturating_add(1)
             || anchor.native_sequence() < identity.operation_sequence
             || anchor.root != identity.binding
         {

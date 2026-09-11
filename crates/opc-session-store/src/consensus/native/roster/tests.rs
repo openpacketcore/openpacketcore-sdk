@@ -56,7 +56,8 @@ fn predecessor(
             lease: Some(NativeLease::from_guard(&guard).unwrap()),
             fence: authority.fence().get(),
             reserved: false,
-        }),
+        })
+        .unwrap(),
     );
     state.frontiers.next_fence = authority.fence().get() + 1;
     state.frontiers.next_credential = authority.credential_id() + 1;
@@ -378,7 +379,7 @@ fn native_roster_indexes_preserve_alias_rejection_and_bounded_mixed_history_pref
         bytes[..8].copy_from_slice(&epoch.to_be_bytes());
         bytes[112..].copy_from_slice(&number.to_be_bytes());
         let mut projection = template.projection.clone();
-        projection.profile = if number % 2 == 0 {
+        projection.profile = if number.is_multiple_of(2) {
             Profile::V1
         } else {
             Profile::V2
@@ -659,7 +660,7 @@ fn native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partit
     store
         .ledger
         .rows
-        .insert(second_binding, SharedRow::new(corrupt));
+        .insert(second_binding, SharedRow::new(corrupt).unwrap());
     let before_first = store.ledger.rows[&first_binding]
         .canonical()
         .unwrap()

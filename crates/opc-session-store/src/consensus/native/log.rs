@@ -188,8 +188,8 @@ impl NativeLog {
             "native application exceeds durable committed cut",
         )?;
         self.exact(durable)?;
-        let mut next = state.applied().map_or(0, |applied| applied.index + 1);
-        for entry in entries {
+        let first = state.applied().map_or(0, |applied| applied.index + 1);
+        for (next, entry) in (first..).zip(entries) {
             if entry.log_id.index != next {
                 return Err(invalid("native application is not contiguous"));
             }
@@ -202,7 +202,6 @@ impl NativeLog {
             if !persisted.matches_bytes(next, &encoded)? {
                 return Err(invalid("native application bytes differ from durable log"));
             }
-            next += 1;
         }
         Ok(())
     }

@@ -140,7 +140,7 @@ fn native_public_restore_filtered_progress_and_stale_revision_match_original_pag
                     sdk741_component_request(Sdk741Payload::Create, 102 + batch, slot, None)
                 })
                 .collect();
-            fenced_transition_v2_batch_entry(2 + batch as u64, requests, timestamp(2))
+            fenced_transition_v2_batch_entry(2 + batch, requests, timestamp(2))
         })
         .collect::<Vec<_>>();
     fixture.parity(&entries);

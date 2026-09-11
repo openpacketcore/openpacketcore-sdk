@@ -49,7 +49,7 @@ fn verify_partition(
             &mut io::Cursor::new(input.bytes()),
             input.bytes().len() as u32,
         )?;
-        if actual != key || &decoded != &**row {
+        if actual != key || decoded != **row {
             return Err(invalid(
                 "native roster generation partition readback differs",
             ));

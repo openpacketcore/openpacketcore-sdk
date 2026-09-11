@@ -83,7 +83,7 @@ fn native_v1_capture_rejects_binding_family_body_and_certificate_mutations() {
             4 => {
                 row = NativeGenericReceipt::Ordinary(NativeOrdinaryReceipt {
                     payload_digest: value.payload_digest,
-                    response: (**value.response.as_ref().unwrap()).clone(),
+                    response: value.response.as_ref().unwrap().clone(),
                 })
             }
             5 => delta.frontiers.v1_activation = None,
@@ -157,7 +157,7 @@ fn native_v1_original_lifetime_capacity_and_signed_sequence_horizon_are_exact() 
         };
         storage.business.generic_receipts.insert(
             SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
-            SharedRow::new(NativeGenericReceipt::FencedV1(row)),
+            SharedRow::new(NativeGenericReceipt::FencedV1(row)).unwrap(),
         );
     }
     storage.business.admit_business().unwrap();

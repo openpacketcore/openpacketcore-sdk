@@ -30,7 +30,7 @@ impl NativeDelta<'_> {
                 return Ok(self.response(index, Err(StoreError::CasIdempotencyConflict)));
             };
             return Ok(if receipt.payload_digest == payload_digest {
-                receipt.response.clone()
+                receipt.response.as_ref().clone()
             } else {
                 self.response(index, Err(StoreError::CasIdempotencyConflict))
             });
@@ -99,7 +99,7 @@ impl NativeDelta<'_> {
             command.request_id,
             NativeGenericReceipt::Ordinary(NativeOrdinaryReceipt {
                 payload_digest,
-                response: response.clone(),
+                response: Box::new(response.clone()),
             }),
         );
         self.compact_one_v1(now)?;

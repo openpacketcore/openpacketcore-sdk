@@ -76,7 +76,7 @@ fn stamp(index: u64, row: &SharedRow<NativeLogEntry>) -> io::Result<Stamp> {
     let mut revision = Sha256::new();
     revision.update(b"OPC-native-log-revision-v1\0");
     revision.update(content);
-    revision.update(row.address().to_le_bytes());
+    revision.update(row.revision().to_le_bytes());
     Ok(Stamp {
         content,
         revision: revision.finalize().into(),
@@ -345,7 +345,7 @@ impl LogChanges {
 struct Witness {
     index: u64,
     row: SharedRow<NativeLogEntry>,
-    revision: usize,
+    revision: u64,
 }
 
 /// At most five exact log lookups accompany a journal transfer. These row
@@ -373,14 +373,14 @@ impl CapturedLog {
         self.changes.validate_rows(identity, members, check)?;
         for witness in self.witnesses.iter().flatten() {
             check()?;
-            if witness.revision != witness.row.address() {
+            if witness.revision != witness.row.revision() {
                 return Err(invalid("native captured log witness revision differs"));
             }
             witness
                 .row
                 .validate_full(witness.index, identity, members, check)?;
         }
-        scratch::small(check, &|| {
+        scratch::small(check, || {
             validate_context(
                 &self.changes.target.frontiers,
                 members,
@@ -517,7 +517,7 @@ impl Publication {
                     }
                     let index = entry.log_id.index;
                     previous = Some(entry.log_id);
-                    let after = SharedRow::new(NativeLogEntry::new(encoded.clone(), entry));
+                    let after = SharedRow::new(NativeLogEntry::new(encoded.clone(), entry))?;
                     rows.insert(
                         index,
                         RowChange {
@@ -889,7 +889,7 @@ impl NativeLog {
             id.and_then(|id| {
                 self.entries.get(&id.index).cloned().map(|row| Witness {
                     index: id.index,
-                    revision: row.address(),
+                    revision: row.revision(),
                     row,
                 })
             })

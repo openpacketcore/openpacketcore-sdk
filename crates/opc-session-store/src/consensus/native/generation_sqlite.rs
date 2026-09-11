@@ -561,7 +561,7 @@ impl<'a> SqlitePreparedBase<'a> {
                         source::ordinary(&self.tx, context.business.identity, id)?;
                     NativeGenericReceipt::Ordinary(NativeOrdinaryReceipt {
                         payload_digest,
-                        response,
+                        response: Box::new(response),
                     })
                 };
                 validation::validate_generic(&id, &receipt, &context.business.frontiers)?;

@@ -278,7 +278,7 @@ impl Edit {
         value: Option<Partition>,
     ) -> io::Result<()> {
         let before = self.ledger.partitions.get(&key).cloned();
-        if before.as_ref().map(|row| &**row) == value.as_ref() {
+        if before.as_deref() == value.as_ref() {
             return Ok(());
         }
         if self.partition_changes.len() == self.partition_limit
@@ -291,7 +291,7 @@ impl Edit {
         if let Some(value) = &value {
             value.validate(key)?;
         }
-        let after = value.map(SharedRow::new);
+        let after = value.map(SharedRow::new).transpose()?;
         let before_stamp = before
             .as_ref()
             .map(|row| partition_stamp(key, row))

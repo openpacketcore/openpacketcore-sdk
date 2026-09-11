@@ -687,7 +687,7 @@ fn native_generation_cold_log_preflight_accepts_original_256_profile_and_exact_1
         .len();
     let limit = crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES;
     let extra = limit - small;
-    let large = conflict(16 + extra / 2, extra % 2 != 0);
+    let large = conflict(16 + extra / 2, !extra.is_multiple_of(2));
     assert!(matches!(
         large.validate(),
         Err(StoreError::FencedTransitionRequestConflict)

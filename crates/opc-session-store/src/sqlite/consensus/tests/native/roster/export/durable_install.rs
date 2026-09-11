@@ -212,15 +212,14 @@ fn native_durable_install_empty_sequence_rotates_once_per_install_and_reopens_fi
     let mut previous = RestoreScanIncarnation::from_installed_sync(&primary.conn.blocking_lock())
         .unwrap()
         .native_image();
-    let mut epoch = selected(directory.path())["epoch"].as_u64().unwrap();
-    for _ in 0..2 {
+    let epoch = selected(directory.path())["epoch"].as_u64().unwrap();
+    for offset in 1..=2 {
         wal.install_snapshot(&primary.conn.blocking_lock(), incoming.source().unwrap())
             .unwrap();
         let anchor = selected(directory.path());
         assert_eq!(anchor["position"]["sequence"], 0);
-        assert_eq!(anchor["epoch"].as_u64().unwrap(), epoch + 1);
+        assert_eq!(anchor["epoch"].as_u64().unwrap(), epoch + offset);
         assert_eq!(anchor["native_generation"]["file_epoch"], anchor["epoch"]);
-        epoch += 1;
         let actual = wal.native_export_install_base_for_test().unwrap();
         let installed = RestoreScanIncarnation::from_installed_sync(&actual)
             .unwrap()

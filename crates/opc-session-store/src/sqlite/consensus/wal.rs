@@ -1750,7 +1750,7 @@ fn write_loop_body(
         let mut dirty = false;
         let intent_started = Instant::now();
         (control.hook)(Point::BeforeIntent)?;
-        let planned = GroupIntent::plan(&disk, &group.requests, limits)?;
+        let planned = GroupIntent::plan(disk, &group.requests, limits)?;
         if planned.last != last || planned.bytes != charge {
             return Err(invalid_data(
                 "private WAL intent charge differs from admitted group",
@@ -1832,8 +1832,8 @@ fn write_loop_body(
                     disk.chain,
                     &body[..size],
                 );
-                write_controlled(&mut disk.file, &header, &control, &mut written)?;
-                write_controlled(&mut disk.file, &body[..size], &control, &mut written)?;
+                write_controlled(&mut disk.file, &header, control, &mut written)?;
+                write_controlled(&mut disk.file, &body[..size], control, &mut written)?;
                 disk.chain.copy_from_slice(&header[68..100]);
                 disk.offset += (FRAME_HEADER + size) as u64;
                 record_offset += size;
@@ -1856,7 +1856,7 @@ fn write_loop_body(
         sync_calls += 1;
         (control.hook)(Point::AfterDataSync)?;
         let publication_started = Instant::now();
-        let cut = encode_cut(&disk);
+        let cut = encode_cut(disk);
         // Append the final cut; a failed/partial write cannot erase the
         // previously durable proof that this group has no success callback.
         let cut_control = IoControl {

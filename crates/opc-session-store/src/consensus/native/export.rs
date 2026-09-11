@@ -18,7 +18,7 @@ macro_rules! db {
             std::mem::discriminant(&error),
             error.sqlite_error().map(|code| code.extended_code),
         );
-        io::Error::other(error)
+        sql::db_error(error)
     }};
 }
 fn store(error: StoreError) -> io::Error {
@@ -35,7 +35,9 @@ fn json(value: &impl Serialize) -> io::Result<Vec<u8>> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Purpose {
+    #[cfg(test)]
     Snapshot,
+    PortableSnapshot,
     InstallBase,
 }
 
@@ -86,6 +88,18 @@ impl<'a> OrderedReceipts<'a> {
 }
 
 impl NativeStorage {
+    /// Emit the portable business projection without first allocating pages
+    /// for local Raft state that snapshot finalization would discard. Source
+    /// validation, including reads of covered selected logs, remains mandatory.
+    pub(crate) fn export_cold_portable_snapshot_checked(
+        &self,
+        conn: &Connection,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.export_cold_checked(conn, Purpose::PortableSnapshot, check)
+    }
+
+    #[cfg(test)]
     pub(crate) fn export_cold_snapshot_checked(
         &self,
         conn: &Connection,
@@ -164,12 +178,16 @@ impl NativeStorage {
         .map_err(|error| db!(error))?;
         tx.execute("UPDATE consensus_machine SET application_sequence=?1,last_digest=?2,logical_time=?3,watch_sequence=?4 WHERE singleton=1 AND configuration_epoch=?5", params![frontiers.sequence,frontiers.digest.as_bytes().as_slice(),frontiers.logical_time.map(ops::format_rfc3339_normalized),frontiers.watch_sequence,epoch]).map_err(|error| db!(error))?;
         tx.execute("INSERT OR REPLACE INTO consensus_membership (singleton,configuration_epoch,membership_json) VALUES (1,?1,?2)", params![epoch,json(&frontiers.membership)?]).map_err(|error| db!(error))?;
-        let committed = if purpose == Purpose::InstallBase {
+        let portable = purpose == Purpose::PortableSnapshot;
+        let committed = if portable {
+            None
+        } else if purpose == Purpose::InstallBase {
             self.log.committed
         } else {
             frontiers.applied
         };
-        let preserve_origin = purpose == Purpose::InstallBase || state.snapshot_origin.is_some();
+        let preserve_origin =
+            !portable && (purpose == Purpose::InstallBase || state.snapshot_origin.is_some());
         let purged = if preserve_origin {
             self.log.purged
         } else {
@@ -191,15 +209,20 @@ impl NativeStorage {
                     .is_some_and(|applied| entry.id().index <= applied.index)
         }) {
             check()?;
+            // Omission from the portable image is not permission to trust an
+            // unread selected range. Preserve the raw export's full byte and
+            // authority checks even though these pages will not be written.
             let bytes = entry.read_bytes(state.identity, &state.members, check)?;
-            tx.execute("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)",params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(|error| db!(error))?;
+            if !portable {
+                tx.execute("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)",params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(|error| db!(error))?;
+            }
         }
         if preserve_origin {
             if let Some((meta, name, checksum, length)) = &frontiers.current_snapshot {
                 tx.execute("INSERT INTO consensus_snapshot (singleton,configuration_epoch,meta_json,file_name,checksum,byte_length) VALUES (1,?1,?2,?3,?4,?5)",params![epoch,json(meta)?,name,checksum.as_slice(),length]).map_err(|error| db!(error))?;
             }
         }
-        if let Some(vote) = self.log.vote {
+        if let Some(vote) = self.log.vote.filter(|_| !portable) {
             tx.execute("INSERT OR REPLACE INTO consensus_vote (singleton,configuration_epoch,term,node_id,vote_json) VALUES (1,?1,?2,?3,?4)",params![epoch,vote.leader_id.term,vote.leader_id.voted_for().map(|node| node.get()),json(&vote)?]).map_err(|error| db!(error))?;
         }
         if let Some(activation) = &frontiers.v1_activation {
@@ -406,13 +429,15 @@ mod tests {
             .unwrap();
         let prepared = PreparedBase::prepare(
             &original,
-            [3; 32],
-            1,
-            1,
-            1,
-            [4; 32],
-            BLOCK,
-            MAXIMUM,
+            crate::consensus::native::generation::BaseParameters {
+                binding: [3; 32],
+                file_epoch: 1,
+                checkpoint_epoch: 1,
+                operation_sequence: 1,
+                cut_binding: [4; 32],
+                block_bytes: BLOCK,
+                maximum: MAXIMUM,
+            },
             &|| Ok(()),
         )
         .unwrap();
@@ -422,9 +447,11 @@ mod tests {
             &path,
             identity,
             MAXIMUM,
-            original.business.identity,
-            &original.business.members,
-            None,
+            crate::consensus::native::generation::CatalogScope {
+                identity: original.business.identity,
+                members: &original.business.members,
+                roster_root: None,
+            },
             [4; 32],
             &|| Ok(()),
         )

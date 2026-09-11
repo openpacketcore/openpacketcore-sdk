@@ -87,9 +87,11 @@ fn admitted(
         path,
         prefix,
         MAXIMUM,
-        signed.identity,
-        &fixed_members(),
-        Some(Arc::new(signed.root.clone())),
+        crate::consensus::native::generation::CatalogScope {
+            identity: signed.identity,
+            members: &fixed_members(),
+            roster_root: Some(Arc::new(signed.root.clone())),
+        },
         Some(origin),
         CUT,
         &|| Ok(()),
@@ -193,11 +195,13 @@ fn native_snapshot_origin_original_install_preserves_local_vote_suffix_and_every
                     &path,
                     prefix,
                     MAXIMUM,
-                    signed.identity,
-                    &fixed_members(),
-                    Some(Arc::new(signed.root.clone())),
+                    crate::consensus::native::generation::CatalogScope {
+                        identity: signed.identity,
+                        members: &fixed_members(),
+                        roster_root: Some(Arc::new(signed.root.clone()))
+                    },
                     CUT,
-                    &|| Ok(())
+                    &|| Ok(()),
                 )
                 .is_err(),
                 "serialized metadata cannot admit a foreign snapshot or missing membership"
@@ -286,24 +290,28 @@ fn native_snapshot_origin_rejects_wrong_local_root_and_other_local_generation() 
         &path,
         prefix,
         MAXIMUM,
-        signed.identity,
-        &fixed_members(),
-        Some(Arc::new(signed.root.clone())),
+        crate::consensus::native::generation::CatalogScope {
+            identity: signed.identity,
+            members: &fixed_members(),
+            roster_root: Some(Arc::new(signed.root.clone()))
+        },
         Some(other_origin),
         CUT,
-        &|| Ok(())
+        &|| Ok(()),
     )
     .is_err());
     assert!(Catalog::open_with_origin(
         &path,
         prefix,
         MAXIMUM,
-        signed.identity,
-        &fixed_members(),
-        Some(wrong_root(&signed)),
+        crate::consensus::native::generation::CatalogScope {
+            identity: signed.identity,
+            members: &fixed_members(),
+            roster_root: Some(wrong_root(&signed))
+        },
         Some(origin),
         CUT,
-        &|| Ok(())
+        &|| Ok(()),
     )
     .is_err());
     assert_eq!(
@@ -364,12 +372,14 @@ fn native_snapshot_origin_requires_original_source_metadata_and_continuously_pin
         &path,
         prefix,
         MAXIMUM,
-        signed.identity,
-        &fixed_members(),
-        Some(Arc::new(signed.root.clone())),
+        crate::consensus::native::generation::CatalogScope {
+            identity: signed.identity,
+            members: &fixed_members(),
+            roster_root: Some(Arc::new(signed.root.clone()))
+        },
         Some(origin),
         CUT,
-        &|| Ok(())
+        &|| Ok(()),
     )
     .is_err());
     assert_eq!(files(directory.path()), before_files);
@@ -465,13 +475,15 @@ fn native_snapshot_origin_cold_rewrite_and_original_portable_reexport_preserve_a
         .unwrap();
     let prepared = PreparedBase::prepare(
         &storage,
-        wal.binding().digest().unwrap(),
-        2,
-        2,
-        0,
-        CUT,
-        BLOCK,
-        MAXIMUM,
+        crate::consensus::native::generation::BaseParameters {
+            binding: wal.binding().digest().unwrap(),
+            file_epoch: 2,
+            checkpoint_epoch: 2,
+            operation_sequence: 0,
+            cut_binding: CUT,
+            block_bytes: BLOCK,
+            maximum: MAXIMUM,
+        },
         &|| Ok(()),
     )
     .unwrap();
@@ -509,12 +521,14 @@ fn native_snapshot_origin_cold_rewrite_and_original_portable_reexport_preserve_a
             &path,
             prefix,
             MAXIMUM,
-            signed.identity,
-            &fixed_members(),
-            Some(Arc::new(signed.root.clone())),
+            crate::consensus::native::generation::CatalogScope {
+                identity: signed.identity,
+                members: &fixed_members(),
+                roster_root: Some(Arc::new(signed.root.clone()))
+            },
             Some(second),
             CUT,
-            &|| Ok(())
+            &|| Ok(()),
         )
         .is_err(),
         "a newer current snapshot cannot stand in for the original generation source"
@@ -599,11 +613,13 @@ fn native_snapshot_origin_empty_source_repeated_install_cold_reopen_and_first_me
             &path,
             prefix,
             MAXIMUM,
-            signed.identity,
-            &fixed_members(),
-            Some(Arc::new(signed.root.clone())),
+            crate::consensus::native::generation::CatalogScope {
+                identity: signed.identity,
+                members: &fixed_members(),
+                roster_root: Some(Arc::new(signed.root.clone()))
+            },
             CUT,
-            &|| Ok(())
+            &|| Ok(()),
         )
         .is_err());
         last = Some((path, prefix, origin));
@@ -613,9 +629,11 @@ fn native_snapshot_origin_empty_source_repeated_install_cold_reopen_and_first_me
         &path,
         prefix,
         MAXIMUM,
-        signed.identity,
-        &fixed_members(),
-        Some(Arc::new(signed.root.clone())),
+        crate::consensus::native::generation::CatalogScope {
+            identity: signed.identity,
+            members: &fixed_members(),
+            roster_root: Some(Arc::new(signed.root.clone())),
+        },
         Some(Arc::clone(&origin)),
         CUT,
         &|| Ok(()),
@@ -774,9 +792,11 @@ fn native_snapshot_origin_cold_catalog_rejects_present_wrong_log_id_and_membersh
             &path,
             expected,
             MAXIMUM,
-            signed.identity,
-            &fixed_members(),
-            Some(Arc::new(signed.root.clone())),
+            crate::consensus::native::generation::CatalogScope {
+                identity: signed.identity,
+                members: &fixed_members(),
+                roster_root: Some(Arc::new(signed.root.clone())),
+            },
             Some(Arc::clone(&origin)),
             CUT,
             &|| Ok(()),

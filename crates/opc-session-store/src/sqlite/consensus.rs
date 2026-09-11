@@ -221,21 +221,22 @@ pub struct ProtectedRosterTerminalApplyTimings {
     pub terminalization_preparation_count: u64,
     /// Aggregate nanoseconds spent constructing the deterministic terminal transaction.
     pub terminalization_preparation_nanos: u64,
-    /// Completed SQLite production compare-and-apply phase count.
+    /// Completed production compare-and-apply phase count on the active backend.
     pub production_apply_count: u64,
-    /// Aggregate nanoseconds spent in SQLite production compare-and-apply.
+    /// Aggregate nanoseconds spent in production compare-and-apply.
     pub production_apply_nanos: u64,
     /// Completed committed-outcome construction phase count.
     pub committed_outcome_count: u64,
     /// Aggregate nanoseconds spent constructing committed outcomes.
     pub committed_outcome_nanos: u64,
-    /// Completed replication notification JSON-and-insert phase count.
+    /// Completed replication notification construction-and-insert phase count.
     pub replication_notification_count: u64,
     /// Aggregate nanoseconds spent constructing and inserting notifications.
     pub replication_notification_nanos: u64,
-    /// Outer transaction remainder-and-commit phase count.
+    /// Outer transaction remainder-and-commit or native publication phase count.
     pub transaction_remainder_commit_count: u64,
-    /// Aggregate nanoseconds from post-notification remainder through commit.
+    /// Aggregate nanoseconds from post-notification remainder through commit
+    /// or checked native publication.
     pub transaction_remainder_commit_nanos: u64,
 }
 
@@ -286,6 +287,24 @@ fn record_protected_roster_terminal_apply_timing(
     nanos.fetch_add(
         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
+    );
+}
+
+#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+pub(crate) fn record_native_roster_notification_timing(start: Instant) {
+    record_protected_roster_terminal_apply_timing(
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_count,
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_nanos,
+        start,
+    );
+}
+
+#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+pub(crate) fn record_native_roster_publication_timing(start: Instant) {
+    record_protected_roster_terminal_apply_timing(
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_count,
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_nanos,
+        start,
     );
 }
 
@@ -5831,6 +5850,22 @@ impl Drop for SqliteConsensusCore {
 }
 
 impl SqliteConsensusCore {
+    pub(crate) async fn refresh_protected_roster_occupancy(&self) {
+        let Some(diagnostics) = &self.diagnostics else {
+            return;
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            wal.publish_native_roster_occupancy(diagnostics);
+            return;
+        }
+        let conn = self.conn.lock().await;
+        match protected_roster_diagnostic_occupancy_sync(&conn, self.storage_identity) {
+            Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
+            Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
+        }
+    }
+
     pub(crate) async fn read_current_snapshot_for_serving(
         &self,
     ) -> io::Result<Option<CurrentSnapshot>> {
@@ -16925,6 +16960,19 @@ impl SqliteSessionBackend {
         scope_identity: SessionConsensusIdentity,
         voters: BTreeSet<SessionConsensusNodeId>,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(io::Error::other(
+                        "native roster V2 activation identity differs",
+                    ));
+                }
+                Ok(state.protected_roster_v2_activation_matches(scope_identity, &voters))
+            })
+        }) {
+            return result.map_err(|_| super::native::unavailable());
+        }
         self.run_store_sqlite_task(super::SqliteStoreWorkKind::Read, move |conn| {
             protected_roster_profile_v2_activation_matches_scope_sync(
                 conn,
@@ -20805,14 +20853,96 @@ pub(crate) fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn db_error(_error: rusqlite::Error) -> io::Error {
+mod snapshot_resources;
+
+/// Retain only SQLite's fixed numeric vocabulary. Its original message can
+/// contain SQL text or session values and must not enter storage diagnostics.
+#[derive(Debug, thiserror::Error)]
+#[error("session consensus SQLite operation failed (extended code {extended_code})")]
+struct SqliteStorageFailure {
+    extended_code: i32,
+}
+
+fn sqlite_error_code(error: &io::Error) -> Option<i32> {
+    error
+        .get_ref()?
+        .downcast_ref::<SqliteStorageFailure>()
+        .map(|failure| failure.extended_code)
+}
+
+pub(crate) fn db_error(error: rusqlite::Error) -> io::Error {
     #[cfg(feature = "test-control")]
     eprintln!(
         "session_consensus_sqlite_failure variant={:?} extended_code={:?}",
-        std::mem::discriminant(&_error),
-        _error.sqlite_error().map(|code| code.extended_code),
+        std::mem::discriminant(&error),
+        error.sqlite_error().map(|code| code.extended_code),
     );
-    io::Error::other("session consensus SQLite operation failed")
+    let Some(code) = error.sqlite_error() else {
+        return io::Error::other("session consensus SQLite operation failed");
+    };
+    // FULL also covers SQLite's configured page limit. Preserve the capacity
+    // category without inventing an OS errno or attributing it to a mount.
+    let kind = if code.code == rusqlite::ErrorCode::DiskFull {
+        io::ErrorKind::StorageFull
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(
+        kind,
+        SqliteStorageFailure {
+            extended_code: code.extended_code,
+        },
+    )
+}
+
+#[cfg(test)]
+mod storage_failure_regression {
+    use super::*;
+
+    #[test]
+    fn sqlite_full_retains_storage_category_without_inventing_enospc() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("bounded.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096; PRAGMA max_page_count = 2; \
+             CREATE TABLE bounded(value BLOB);",
+        )
+        .unwrap();
+        let error = conn
+            .execute("INSERT INTO bounded VALUES (zeroblob(32768))", [])
+            .expect_err("the real SQLite page bound must refuse this write");
+        assert_eq!(error.sqlite_error().unwrap().extended_code, 13);
+        let converted = db_error(error);
+        let failure = crate::SessionStorageFailure::from_io(
+            crate::SessionStorageFailureStage::SnapshotExport,
+            &converted,
+        );
+        assert_eq!(failure.kind, crate::SessionStorageFailureKind::StorageFull);
+        assert_eq!(
+            failure.os_error, None,
+            "SQLITE_FULL does not prove OS ENOSPC"
+        );
+        assert!(format!("{converted:?}").contains("extended_code: 13"));
+    }
+
+    #[test]
+    fn sqlite_failure_keeps_numeric_cause_but_redacts_sqlite_messages() {
+        for code in [
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_IOERR_WRITE,
+        ] {
+            let converted = db_error(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("sensitive SQL value sentinel".into()),
+            ));
+            assert_eq!(sqlite_error_code(&converted), Some(code));
+            assert!(!format!("{converted:?} {converted}").contains("sentinel"));
+            assert_eq!(converted.raw_os_error(), None);
+        }
+        let non_sqlite = db_error(rusqlite::Error::InvalidParameterName("sentinel".into()));
+        assert_eq!(sqlite_error_code(&non_sqlite), None);
+        assert!(!format!("{non_sqlite:?} {non_sqlite}").contains("sentinel"));
+    }
 }
 
 fn encode_json<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
@@ -33992,6 +34122,7 @@ pub(crate) fn build_snapshot_database_with_capture_hook_sync(
     Ok(snapshot)
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SnapshotBuildAuthority<'a> {
     pub(crate) identity: SessionConsensusIdentity,
     pub(crate) profile: ConsensusAuthorityProfile,
@@ -34001,11 +34132,29 @@ pub(crate) struct SnapshotBuildAuthority<'a> {
     pub(crate) fixed_placement_policy: Option<PlacementResiliencePolicy>,
 }
 
-/// Admit the completed native projection before the ordinary file-backed
-/// finalizer consumes it. Its source is one immutable native capture; neither
+/// Admit the completed native projection before finalization consumes it.
+/// Its source is one immutable native capture; neither
 /// the live owner nor a separately reopened pathname supplies this cut.
 #[cfg(target_os = "linux")]
 pub(crate) fn validate_native_snapshot_export_sync(
+    conn: &Connection,
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    authority: SnapshotBuildAuthority<'_>,
+    expected_cut: &ConsensusAppliedMembership,
+) -> io::Result<()> {
+    validate_native_snapshot_export_inner_sync(conn, pinned, authority, expected_cut).inspect_err(
+        |error| {
+            snapshot_resources::record_failure(
+                "native_export_validation",
+                error,
+                &[("raw", pinned)],
+            )
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_native_snapshot_export_inner_sync(
     conn: &Connection,
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
     authority: SnapshotBuildAuthority<'_>,
@@ -34035,6 +34184,70 @@ pub(crate) fn validate_native_snapshot_export_sync(
     tx.commit().map_err(db_error)?;
     pinned.verify_linked_identity()?;
     verify_pinned_snapshot_descriptor(pinned, conn)
+}
+
+/// Finalize the direct native projection on the same owned inode. It contains
+/// no exported local log payload to reclaim, so no second full database is
+/// needed. Publication still receives a synced, independently validated pin.
+#[cfg(target_os = "linux")]
+pub(crate) fn finalize_native_snapshot_database_sync(
+    conn: Connection,
+    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    authority: SnapshotBuildAuthority<'_>,
+    expected_cut: &ConsensusAppliedMembership,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    let finalize = || -> io::Result<Connection> {
+        validate_native_snapshot_export_sync(&conn, &pinned, authority, expected_cut)?;
+        conn.pragma_update(None, "query_only", false)
+            .map_err(db_error)?;
+        prepare_portable_snapshot_metadata_sync(&conn)?;
+        verify_pinned_snapshot_descriptor(&pinned, &conn)?;
+        drop(conn);
+        pinned.capture_created_sidecars();
+        pinned.file().sync_all()?;
+        checked_snapshot_capture_workspace_bytes(&[
+            pinned.file().metadata()?.len(),
+            pinned_snapshot_database_sidecar_bytes_sync(&pinned)?,
+        ])?;
+        pinned.sync_parent_directory()?;
+        let conn = open_pinned_snapshot_database(&pinned)?;
+        validate_native_snapshot_export_sync(&conn, &pinned, authority, expected_cut)?;
+        Ok(conn)
+    };
+    let conn = finalize().inspect_err(|error| {
+        snapshot_resources::record_failure(
+            "native_portable_finalization",
+            error,
+            &[("portable", &pinned)],
+        );
+    })?;
+    pinned = refresh_pinned_snapshot_database(pinned)?;
+    verify_pinned_snapshot_descriptor(&pinned, &conn)?;
+    pinned.verify_linked_identity()?;
+    drop(conn);
+    pinned.capture_created_sidecars();
+    Ok(pinned)
+}
+
+fn prepare_portable_snapshot_metadata_sync(conn: &Connection) -> io::Result<()> {
+    conn.execute_batch(
+        r#"
+        DELETE FROM consensus_vote;
+        DELETE FROM consensus_committed;
+        DELETE FROM consensus_purged;
+        DELETE FROM consensus_log;
+        DELETE FROM consensus_snapshot;
+        "#,
+    )
+    .map_err(db_error)?;
+    // This local upgrade journal cannot authorize admission of an old
+    // unsealed source after rebuilding a portable successor.
+    strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(conn)?;
+    #[cfg(target_os = "linux")]
+    conn.execute_batch("DROP TABLE IF EXISTS consensus_wal_application;")
+        .map_err(db_error)?;
+    ops::rotate_restore_scan_epoch_sync(conn)
+        .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))
 }
 
 #[cfg(test)]
@@ -35190,6 +35403,22 @@ fn compact_pinned_snapshot_database_with_pacer_sync(
     compacted: &crate::consensus::snapshot::PinnedSqliteFile,
     foreground_pacer: &ConsensusSnapshotForegroundPacer,
 ) -> io::Result<()> {
+    compact_pinned_snapshot_database_inner_sync(source, compacted, foreground_pacer).inspect_err(
+        |error| {
+            snapshot_resources::record_failure(
+                "compaction",
+                error,
+                &[("raw", source), ("compacted", compacted)],
+            );
+        },
+    )
+}
+
+fn compact_pinned_snapshot_database_inner_sync(
+    source: &crate::consensus::snapshot::PinnedSqliteFile,
+    compacted: &crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
+) -> io::Result<()> {
     let settings = snapshot_compaction_source_settings_sync(source)?;
     let destination = open_empty_pinned_snapshot_compaction_database(
         compacted,
@@ -35450,74 +35679,75 @@ pub(crate) fn finalize_captured_snapshot_database_into_sync(
     // pathname cannot replace it between creation and the first SQLite page.
     // The logical copier installs its actual-page-size extent guard on this
     // empty descriptor before it creates any schema page.
-    pinned.verify_linked_identity()?;
-    compacted.verify_linked_identity()?;
-    let destination = open_pinned_snapshot_database(&pinned)?;
-    disable_snapshot_database_journal_sync(&destination)?;
-    destination
-        .execute_batch(
-            r#"
-        DELETE FROM consensus_vote;
-        DELETE FROM consensus_committed;
-        DELETE FROM consensus_purged;
-        DELETE FROM consensus_log;
-        DELETE FROM consensus_snapshot;
-        "#,
-        )
-        .map_err(db_error)?;
-    // This private, local upgrade journal is not consensus state.  A rebuilt
-    // successor must never carry permission to admit its old unsealed source.
-    strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(&destination)?;
-    #[cfg(target_os = "linux")]
-    destination
-        .execute_batch("DROP TABLE IF EXISTS consensus_wal_application;")
-        .map_err(db_error)?;
-    ops::rotate_restore_scan_epoch_sync(&destination)
-        .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
-    validate_existing_schema(&destination, identity)
-        .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
-    validate_sealed_state_sync(&destination)?;
-    let observed_cut = snapshot_applied_membership_sync(&destination, identity)?;
-    if &observed_cut != expected_cut {
-        return Err(invalid_data(
-            "session consensus snapshot metadata differs from its captured cut",
-        ));
-    }
-    verify_pinned_snapshot_descriptor(&pinned, &destination)?;
-    drop(destination);
+    let prepare_raw = || -> io::Result<()> {
+        pinned.verify_linked_identity()?;
+        compacted.verify_linked_identity()?;
+        let destination = open_pinned_snapshot_database(&pinned)?;
+        disable_snapshot_database_journal_sync(&destination)?;
+        prepare_portable_snapshot_metadata_sync(&destination)?;
+        validate_existing_schema(&destination, identity)
+            .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
+        validate_sealed_state_sync(&destination)?;
+        let observed_cut = snapshot_applied_membership_sync(&destination, identity)?;
+        if &observed_cut != expected_cut {
+            return Err(invalid_data(
+                "session consensus snapshot metadata differs from its captured cut",
+            ));
+        }
+        verify_pinned_snapshot_descriptor(&pinned, &destination)?;
+        drop(destination);
+        Ok(())
+    };
+    prepare_raw().inspect_err(|error| {
+        snapshot_resources::record_failure(
+            "raw_finalization",
+            error,
+            &[("raw", &pinned), ("compacted", &compacted)],
+        );
+    })?;
     pinned.capture_created_sidecars();
     compact_pinned_snapshot_database_with_pacer_sync(&pinned, &compacted, foreground_pacer)?;
 
-    compacted.verify_linked_identity()?;
-    compacted.file().sync_all()?;
-    compacted.capture_created_sidecars();
-    checked_snapshot_capture_workspace_bytes(&[
-        pinned.file().metadata()?.len(),
-        pinned_snapshot_database_sidecar_bytes_sync(&pinned)?,
-        compacted.file().metadata()?.len(),
-        pinned_snapshot_database_sidecar_bytes_sync(&compacted)?,
-    ])?;
-    compacted.sync_parent_directory()?;
-    let compacted_connection = open_pinned_snapshot_database(&compacted)?;
-    validate_durable_authority_for_raw_access(
-        &compacted_connection,
-        identity,
-        authority_profile,
-        expected_members,
-        expected_bindings,
-        fixed_placement_policy,
-    )?;
-    validate_existing_schema(&compacted_connection, identity).map_err(|_| {
-        invalid_data("built session consensus compacted snapshot failed validation")
+    let mut validate_compacted = || -> io::Result<Connection> {
+        compacted.verify_linked_identity()?;
+        compacted.file().sync_all()?;
+        compacted.capture_created_sidecars();
+        checked_snapshot_capture_workspace_bytes(&[
+            pinned.file().metadata()?.len(),
+            pinned_snapshot_database_sidecar_bytes_sync(&pinned)?,
+            compacted.file().metadata()?.len(),
+            pinned_snapshot_database_sidecar_bytes_sync(&compacted)?,
+        ])?;
+        compacted.sync_parent_directory()?;
+        let compacted_connection = open_pinned_snapshot_database(&compacted)?;
+        validate_durable_authority_for_raw_access(
+            &compacted_connection,
+            identity,
+            authority_profile,
+            expected_members,
+            expected_bindings,
+            fixed_placement_policy,
+        )?;
+        validate_existing_schema(&compacted_connection, identity).map_err(|_| {
+            invalid_data("built session consensus compacted snapshot failed validation")
+        })?;
+        validate_sealed_state_sync(&compacted_connection)?;
+        snapshot_database_extent_sync(&compacted_connection)?;
+        let observed_cut = snapshot_applied_membership_sync(&compacted_connection, identity)?;
+        if &observed_cut != expected_cut {
+            return Err(invalid_data(
+                "session consensus compacted snapshot metadata differs from its captured cut",
+            ));
+        }
+        Ok(compacted_connection)
+    };
+    let compacted_connection = validate_compacted().inspect_err(|error| {
+        snapshot_resources::record_failure(
+            "compacted_validation",
+            error,
+            &[("raw", &pinned), ("compacted", &compacted)],
+        );
     })?;
-    validate_sealed_state_sync(&compacted_connection)?;
-    snapshot_database_extent_sync(&compacted_connection)?;
-    let observed_cut = snapshot_applied_membership_sync(&compacted_connection, identity)?;
-    if &observed_cut != expected_cut {
-        return Err(invalid_data(
-            "session consensus compacted snapshot metadata differs from its captured cut",
-        ));
-    }
     compacted = refresh_pinned_snapshot_database(compacted)?;
     verify_pinned_snapshot_descriptor(&compacted, &compacted_connection)?;
     compacted.verify_linked_identity()?;

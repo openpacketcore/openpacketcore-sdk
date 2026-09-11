@@ -642,3 +642,538 @@ async fn fixed_three_voter_public_eight_item_v2_batches_with_full_activation() {
 
 mod native_flow;
 mod paced_viability;
+
+#[derive(Debug)]
+struct QuorumAuthorityClock(crate::Timestamp);
+
+impl crate::Clock for QuorumAuthorityClock {
+    fn now_utc(&self) -> crate::Timestamp {
+        self.0
+    }
+}
+
+fn quorum_authority_expected(topology: &ValidatedQuorumTopology) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let identity = topology.consensus_identity().expect("fixture identity");
+    let mut bindings = BTreeMap::new();
+    for member in topology.members() {
+        let node = topology
+            .consensus_node_id(member.replica_id())
+            .expect("fixture node");
+        let mut endpoint = Sha256::new();
+        endpoint.update(b"openpacketcore/session-store/topology-endpoint-binding/v1\0");
+        endpoint.update(Sha256::digest(member.endpoint().host().as_bytes()));
+        endpoint.update(member.endpoint().port().to_be_bytes());
+        let mut tls = Sha256::new();
+        tls.update(b"openpacketcore/session-store/topology-tls-binding/v1\0");
+        tls.update(Sha256::digest(member.tls_identity().as_str().as_bytes()));
+        let mut backing = Sha256::new();
+        backing.update(b"openpacketcore/session-store/topology-backing-binding/v1\0");
+        backing.update(member.backing_identity().fingerprint());
+        bindings.insert(
+            node,
+            serde_json::json!({
+                "descriptor": member.configuration_fingerprint(),
+                "endpoint": endpoint.finalize().to_vec(),
+                "tls_identity": tls.finalize().to_vec(),
+                "backing_identity": backing.finalize().to_vec(),
+            }),
+        );
+    }
+    let voters = bindings
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0");
+    digest.update(identity.cluster_id().as_bytes());
+    digest.update(identity.configuration_id().as_bytes());
+    digest.update(identity.configuration_epoch().get().to_be_bytes());
+    for voter in &voters {
+        digest.update(voter.get().to_be_bytes());
+    }
+    let profile = [
+        0x8a_u8, 0x0b, 0x70, 0xb5, 0x46, 0x54, 0xc7, 0x25, 0x0c, 0xf5, 0x46, 0x9d, 0xb6, 0xe1,
+        0xe5, 0x45, 0xf3, 0x5e, 0x38, 0xe9, 0x77, 0x8d, 0x5f, 0x50, 0x0f, 0xea, 0x67, 0x06, 0x96,
+        0xc4, 0xbd, 0xc3,
+    ];
+    assert_eq!(crate::fenced_transition_v2_profile_digest(), profile);
+    serde_json::json!({
+        "identity": identity, "voters": voters,
+        "bindings": bindings.into_iter().collect::<Vec<_>>(),
+        "activation": {"identity": identity, "voters": digest.finalize().to_vec(), "profile": profile},
+        "history": crate::FencedTransitionV2HistoryState::new(
+            Some(FencedTransitionV2HistoryEpoch::new(1).expect("fixture epoch")),
+            None, None, 0, 0, 2, 0,
+        ).expect("two exact successful fixture requests"),
+    })
+}
+
+fn quorum_authority_assert_native(facts: &serde_json::Value, expected: &serde_json::Value) {
+    for field in ["binding_identity", "scope_identity"] {
+        assert_eq!(facts[field], expected["identity"]);
+    }
+    for field in [
+        "authority_members",
+        "scope_members",
+        "application_authority_members",
+    ] {
+        assert_eq!(facts[field], expected["voters"]);
+    }
+    for field in ["authority_bindings", "scope_bindings"] {
+        assert_eq!(facts[field], expected["bindings"]);
+    }
+    assert_eq!(facts["authority_profile"], 2);
+    assert_eq!(facts["placement"], 2);
+    assert_eq!(facts["application_authority_epoch"], 1);
+    for field in ["predecessor_present", "pending_present", "terminal_present"] {
+        assert_eq!(facts[field], false);
+    }
+    for field in ["history_depth", "terminal_history_depth"] {
+        assert_eq!(facts[field], 0);
+    }
+    let business = &facts["business"];
+    assert_eq!(business["identity"], expected["identity"]);
+    assert_eq!(business["members"], expected["voters"]);
+    assert_eq!(business["activation"], expected["activation"]);
+    assert_eq!(business["history"], expected["history"]);
+    assert_eq!(business["receipt_count"], 2);
+    assert!(!business["membership_log_id"].is_null());
+    assert_eq!(
+        business["membership_configs"],
+        serde_json::json!([expected["voters"]])
+    );
+    assert_eq!(business["membership_nodes"], expected["voters"]);
+    assert!(!facts["durable_committed"].is_null());
+    assert_eq!(business["applied"], facts["durable_committed"]);
+}
+
+fn quorum_authority_sql_position(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Option<opc_consensus::engine::LogId<SessionConsensusNodeId>> {
+    use rusqlite::OptionalExtension;
+    assert!(matches!(table, "consensus_applied" | "consensus_committed"));
+    tx.query_row(&format!("SELECT configuration_epoch, term, log_index, log_id_json FROM {table} WHERE singleton = 1"), [], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?, row.get::<_, Vec<u8>>(3)?))
+    }).optional().expect("independent SQL full LogId row").map(|(epoch, term, index, bytes)| {
+        let id: opc_consensus::engine::LogId<SessionConsensusNodeId> = serde_json::from_slice(&bytes).expect("SQL LogId encoding");
+        assert_eq!(epoch, 1);
+        assert_eq!(term, id.leader_id.term);
+        assert_eq!(index, id.index);
+        id
+    })
+}
+
+fn quorum_authority_sql_connection(path: &std::path::Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("independent SQL connection");
+    conn.busy_timeout(Duration::ZERO)
+        .expect("bounded SQL witness lock");
+    conn
+}
+
+fn quorum_authority_timestamp(timestamp: crate::Timestamp) -> String {
+    let time = timestamp
+        .as_offset_datetime()
+        .to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        time.year(),
+        u8::from(time.month()),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+        time.nanosecond()
+    )
+}
+
+fn quorum_authority_sql_witness(
+    path: &std::path::Path,
+    expected: &serde_json::Value,
+    retained: &[(FencedTransitionV2Request, FencedTransitionOutcome)],
+) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let conn = quorum_authority_sql_connection(path);
+    let tx = conn
+        .unchecked_transaction()
+        .expect("one SQL witness transaction");
+    let identity: SessionConsensusIdentity =
+        serde_json::from_value(expected["identity"].clone()).expect("fixture identity");
+    let stored = tx.query_row("SELECT schema_version, cluster_id, configuration_id, configuration_epoch, authority_profile, fixed_placement_policy FROM consensus_identity WHERE singleton = 1", [], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?))
+    }).expect("raw SQL identity");
+    assert_eq!(
+        stored,
+        (
+            3,
+            identity.cluster_id().as_bytes().to_vec(),
+            identity.configuration_id().as_bytes().to_vec(),
+            1,
+            2,
+            2
+        )
+    );
+    let scope = tx.query_row("SELECT storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, current_bindings_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id IS NULL AND pending_transition_id IS NULL AND terminal_transition_id IS NULL FROM consensus_membership_scope WHERE singleton = 1", [], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, u64>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, u64>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, bool>(7)?))
+    }).expect("raw SQL application authority");
+    assert_eq!(
+        (scope.0, scope.1, scope.2, scope.5, scope.7),
+        (
+            1,
+            identity.configuration_id().as_bytes().to_vec(),
+            1,
+            1,
+            true
+        )
+    );
+    for members in [&scope.3, &scope.6] {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(members).expect("raw SQL voters"),
+            expected["voters"]
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&scope.4).expect("raw SQL bindings"),
+        expected["bindings"]
+    );
+    for (table, count) in [
+        ("consensus_membership_history", 0),
+        ("consensus_membership_terminal_history", 0),
+        ("consensus_fenced_transition_v2_activation", 1),
+        ("consensus_fenced_transition_v2_history", 1),
+        ("consensus_fenced_transition_v2_receipts", 2),
+        ("session_records", 2),
+        ("key_fences", 2),
+        ("leases", 2),
+    ] {
+        assert!(tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get::<_, bool>(0)
+            )
+            .expect("independent SQL table presence"));
+        assert_eq!(
+            tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                .get::<_, u64>(0))
+                .expect("independent SQL cardinality"),
+            count
+        );
+    }
+    let certificate = tx.query_row("SELECT storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest, profile_digest FROM consensus_fenced_transition_v2_activation WHERE singleton = 1", [], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, u64>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, Vec<u8>>(4)?))
+    }).expect("independent SQL certificate");
+    assert_eq!(
+        (certificate.0, certificate.1, certificate.2),
+        (1, identity.configuration_id().as_bytes().to_vec(), 1)
+    );
+    assert_eq!(
+        serde_json::json!(certificate.3),
+        expected["activation"]["voters"]
+    );
+    assert_eq!(
+        serde_json::json!(certificate.4),
+        expected["activation"]["profile"]
+    );
+    let history = tx.query_row("SELECT storage_configuration_epoch, profile_digest, active_epoch, retired_through_epoch, generation, current_bound_count, reclaim_epoch, reclaim_remaining, reclaimed_entries FROM consensus_fenced_transition_v2_history WHERE singleton = 1", [], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?, row.get::<_, Option<u64>>(6)?, row.get::<_, Option<u64>>(7)?, row.get::<_, u64>(8)?))
+    }).expect("independent SQL history");
+    assert_eq!(
+        serde_json::json!(history.1),
+        expected["activation"]["profile"]
+    );
+    assert_eq!(
+        (history.0, history.2, history.3, history.4, history.5, history.6, history.7, history.8),
+        (1, 1, 0, 0, 2, None, None, 0)
+    );
+    assert!(tx.query_row("SELECT pending_epoch IS NULL AND pending_plan_digest IS NULL FROM consensus_operator_recovery WHERE singleton = 1", [], |row| row.get::<_, bool>(0)).expect("SQL recovery clear"));
+    let applied = quorum_authority_sql_position(&tx, "consensus_applied").expect("SQL applied cut");
+    assert_eq!(
+        quorum_authority_sql_position(&tx, "consensus_committed"),
+        Some(applied)
+    );
+    let mut receipts = Vec::new();
+    let mut records = Vec::new();
+    let profile: [u8; 32] = serde_json::from_value(expected["activation"]["profile"].clone())
+        .expect("fixed receipt profile");
+    let receipt_prefix = |domain: &[u8], id: &[u8]| {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        digest.update(2_u16.to_be_bytes());
+        digest.update(profile);
+        digest.update(identity.cluster_id().as_bytes());
+        digest.update(identity.configuration_id().as_bytes());
+        digest.update(identity.configuration_epoch().get().to_be_bytes());
+        digest.update(id);
+        digest
+    };
+    for (index, (request, outcome)) in retained.iter().enumerate() {
+        let id = request.request_id().to_bytes();
+        let receipt = tx.query_row("SELECT history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_v2_receipts WHERE request_id = ?1", [id.as_slice()], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, String>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, Vec<u8>>(7)?))
+        }).expect("complete independent SQL receipt");
+        assert_eq!((receipt.0, receipt.1, receipt.2), (1, index as u64 + 1, 1));
+        assert!(
+            receipt.4 == quorum_authority_timestamp(outcome.retained_until()),
+            "exact receipt retention differs"
+        );
+        let payload: [u8; 32] = receipt_prefix(
+            b"openpacketcore/session-consensus/fenced-transition-v2/payload/v1\0",
+            &id,
+        )
+        .finalize()
+        .into();
+        assert_eq!(receipt.3.as_slice(), payload.as_slice());
+        let mut binding = receipt_prefix(
+            b"openpacketcore/session-consensus/fenced-transition-v2-receipt-binding/v1\0",
+            &id,
+        );
+        binding.update(receipt.0.to_be_bytes());
+        binding.update(receipt.1.to_be_bytes());
+        binding.update(&receipt.3);
+        binding.update((receipt.4.len() as u64).to_be_bytes());
+        binding.update(receipt.4.as_bytes());
+        let binding: [u8; 32] = binding.finalize().into();
+        assert_eq!(receipt.5.as_slice(), binding.as_slice());
+        let mut response_digest = Sha256::new();
+        response_digest
+            .update(b"openpacketcore/session-consensus/fenced-transition-v2-receipt-response/v1\0");
+        response_digest.update(&receipt.5);
+        response_digest.update((receipt.6.len() as u64).to_be_bytes());
+        response_digest.update(&receipt.6);
+        let response_digest: [u8; 32] = response_digest.finalize().into();
+        assert_eq!(receipt.7.as_slice(), response_digest.as_slice());
+        let response = crate::sqlite::consensus::decode_fenced_transition_v2_response(&receipt.6)
+            .expect("bounded SQL receipt decoding");
+        assert!(
+            matches!(&response.result, Ok(crate::consensus::types::SessionMutationOutcome::FencedTransition(found)) if found == outcome),
+            "exact SQL outcome differs"
+        );
+        assert!(response.raft_log_index > 0 && response.raft_log_index <= applied.index);
+        assert!(
+            crate::sqlite::consensus::encode_fenced_transition_v2_response(&response)
+                .expect("bounded canonical response")
+                == receipt.6,
+            "SQL receipt response is canonical"
+        );
+        receipts.push(
+            Sha256::digest(
+                serde_json::to_vec(&(id.as_slice(), &receipt))
+                    .expect("complete receipt commitment"),
+            )
+            .to_vec(),
+        );
+        let FencedTransitionMutation::Create { record } = request.mutation() else {
+            panic!("fixture create");
+        };
+        let key = &record.key;
+        let params = rusqlite::params![
+            key.tenant.as_str(),
+            key.nf_kind.as_str(),
+            key.key_type.as_str(),
+            key.stable_id.as_ref()
+        ];
+        let raw = tx.query_row("SELECT generation, owner, fence, state_class, state_type, expires_at, payload, encoding FROM session_records WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4", params, |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, u64>(7)?))
+        }).expect("raw SQL stored record");
+        assert!(
+            raw == (
+                record.generation.get(),
+                record.owner.as_str().to_owned(),
+                record.fence.get(),
+                record.state_class.to_string(),
+                record.state_type.as_str().to_owned(),
+                None,
+                record.payload.as_bytes().to_vec(),
+                2
+            ),
+            "complete encrypted SQL record differs"
+        );
+        assert_eq!(tx.query_row("SELECT fence FROM key_fences WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4", params, |row| row.get::<_, u64>(0)).expect("raw SQL fence"), record.fence.get());
+        let lease = outcome.lease();
+        let stored_lease = tx.query_row("SELECT active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at, acquired_at FROM leases WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4", params, |row| {
+            Ok((row.get::<_, bool>(0)?, row.get::<_, u64>(1)?, row.get::<_, String>(2)?, row.get::<_, u64>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?))
+        }).expect("complete independent SQL lease");
+        assert!(
+            stored_lease
+                == (
+                    true,
+                    lease.credential_id(),
+                    lease.owner().as_str().to_owned(),
+                    lease.fence().get(),
+                    (lease
+                        .expires_at()
+                        .as_offset_datetime()
+                        .unix_timestamp_nanos()
+                        / 1_000_000) as i64,
+                    quorum_authority_timestamp(lease.expires_at()),
+                    quorum_authority_timestamp(lease.acquired_at())
+                ),
+            "complete stored lease differs from the exact result"
+        );
+        records.push(Sha256::digest(serde_json::to_vec(&raw).expect("record commitment")).to_vec());
+    }
+    serde_json::json!({"applied": applied, "committed": applied, "receipt_digests": receipts, "record_digests": records})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quorum_authority_native_durable_cut_and_independent_sql_cold_reconstruction() {
+    let provider = provider();
+    let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial history");
+    let requests = vec![
+        v2_create_request(0, epoch, FenceToken::new(0), &provider).await,
+        v2_create_request(1, epoch, FenceToken::new(0), &provider).await,
+    ];
+    let now = crate::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("fixed witness time"),
+    );
+    let strict_root = std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT")
+        .expect("fresh strict snapshot root required");
+    let mut snapshots =
+        tempfile::tempdir_in(strict_root).expect("independent strict witness namespace");
+    snapshots.disable_cleanup(true);
+    let mut independent_outcomes = None;
+    for native in [false, true] {
+        let mut fleet = if native {
+            Fleet::new_native("quorum_authority_native")
+        } else {
+            Fleet::new("quorum_authority_sql")
+        };
+        fleet.directory.disable_cleanup(true);
+        fleet.clock = Some(Arc::new(QuorumAuthorityClock(now)));
+        if native {
+            fleet.snapshot_root = Some(snapshots.path().to_path_buf());
+        }
+        let expected = quorum_authority_expected(&fleet.topologies[0]);
+        fleet.open().await;
+        let result = AssertUnwindSafe(async {
+            for store in &fleet.stores {
+                assert_eq!(store.inner.private_wal.as_ref().expect("selected owner").is_native(), native);
+            }
+            let leader = fleet.stores.iter().position(|store| store.status().leader_id == Some(store.status().node_id)).expect("fixture leader");
+            let mut retained = Vec::new();
+            for request in &requests {
+                let effect = fleet.stores[leader].fenced_transition_v2_batch_effect(vec![request.clone()]).await;
+                let crate::fenced_transition::FencedTransitionV2Effect::Resolved(Ok(mut outcomes)) = effect else { panic!("healthy typed effect must resolve"); };
+                assert_eq!(outcomes.len(), 1);
+                let outcome = outcomes.remove(0).expect("healthy exact result");
+                assert_v2_create(request, &outcome);
+                retained.push((request.clone(), outcome));
+            }
+            let outcomes = retained.iter().map(|(_, outcome)| outcome.clone()).collect::<Vec<_>>();
+            if let Some(expected) = &independent_outcomes {
+                assert!(&outcomes == expected, "native outcomes differ from independent SQL execution");
+            } else { independent_outcomes = Some(outcomes); }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let live = loop {
+                let facts = fleet.stores.iter().enumerate().map(|(slot, store)| {
+                    if native {
+                        store.inner.private_wal.as_ref().expect("native ownership")
+                            .native_activation_facts_for_test().expect("bounded raw native facts")
+                    } else {
+                        let conn = quorum_authority_sql_connection(&fleet.directory.path().join(format!("node-{slot}.sqlite")));
+                        let tx = conn.unchecked_transaction().expect("SQL cut observation");
+                        serde_json::json!({
+                            "durable_committed": quorum_authority_sql_position(&tx, "consensus_committed"),
+                            "business": {"applied": quorum_authority_sql_position(&tx, "consensus_applied")},
+                        })
+                    }
+                }).collect::<Vec<_>>();
+                let cut = &facts[leader]["business"]["applied"];
+                if !cut.is_null() && facts.iter().all(|fact| fact["business"]["applied"] == *cut && fact["durable_committed"] == *cut) {
+                    break facts;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "all-voter exact durable cut deadline: {facts}", facts = serde_json::json!(facts));
+                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(10))).await.expect("unchanged cut setup budget");
+            };
+            let sql = if native {
+                for fact in &live {
+                    assert_eq!(fact["owner_running"], true);
+                    quorum_authority_assert_native(fact, &expected);
+                }
+                Vec::new()
+            } else {
+                (0..3).map(|slot| quorum_authority_sql_witness(&fleet.directory.path().join(format!("node-{slot}.sqlite")), &expected, &retained)).collect::<Vec<_>>()
+            };
+            eprintln!("QUORUM_AUTHORITY_WITNESS {}", serde_json::json!({
+                "phase": "all_voters_live_exact_cut", "native": native, "directory": fleet.directory.path(),
+                "live": live, "sql": sql,
+            }));
+            if native {
+                // Publish normal authenticated snapshots so the later clean
+                // reconstruction must actually read selected cold receipts.
+                for (slot, store) in fleet.stores.iter().enumerate() {
+                    let before = store.status().completed_snapshot_count;
+                    store.inner.raft.trigger().snapshot().await.expect("normal witness snapshot trigger");
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        while store.status().completed_snapshot_count == before {
+                            assert!(store.inner.raft.metrics().borrow().running_state.is_ok(), "snapshot must keep the voter running");
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }).await.expect("normal strict witness snapshot completed");
+                    let selected = store.inner.private_wal.as_ref().expect("native owner")
+                        .with_native_read(|state| Ok(state.current_snapshot())).expect("selected snapshot observation")
+                        .expect("strict witness selected snapshot");
+                    assert!(selected.0.snapshot_id.starts_with("native-"));
+                    let after = store.inner.private_wal.as_ref().expect("same native owner")
+                        .native_activation_facts_for_test().expect("post-snapshot raw witness");
+                    assert_eq!(after, live[slot], "snapshot publication preserves every captured authority/cut/business fact");
+                }
+            }
+            (retained, live, sql)
+        }).catch_unwind().await;
+        let closed = fleet.close().await;
+        let (retained, live, sql) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        assert_eq!(
+            closed.len(),
+            3,
+            "every voter and writer joined before cold evidence"
+        );
+        for (slot, wal) in closed.iter().enumerate() {
+            if native {
+                let mut expected_cold = live[slot].clone();
+                expected_cold["owner_running"] = serde_json::json!(false);
+                wal.native_audit_closed(
+                    |current, origin| native_flow::admit_native_snapshots(&snapshots.path().join(format!("snapshots-{slot}")), current, origin),
+                    native_flow::AdmittedNativeSnapshots::install_source,
+                    native_flow::AdmittedNativeSnapshots::verify,
+                    |state| {
+                        let cold = state.owner_facts_for_test()?;
+                        assert_eq!(cold, expected_cold);
+                        quorum_authority_assert_native(&cold, &expected);
+                        assert_eq!(state.durable_committed(), state.applied());
+                        assert_eq!(state.cold_receipt_count_for_test(), retained.len(), "every exact receipt came from selected cold bytes");
+                        for (request, outcome) in &retained {
+                            assert!(matches!(state.status(request)?, FencedTransitionV2Status::Recorded(found) if found.as_ref() == &Ok(outcome.clone())), "cold exact receipt differs");
+                            let FencedTransitionMutation::Create { record } = request.mutation() else { panic!("fixture create"); };
+                            assert!(state.get(&record.key).as_ref() == Some(record.as_ref()), "cold encrypted record differs");
+                            assert_eq!(state.key_fence_for_test(&record.key), record.fence.get());
+                        }
+                        Ok(())
+                    },
+                ).expect("independent joined cold reconstruction with authenticated snapshot admission");
+            } else {
+                assert_eq!(
+                    quorum_authority_sql_witness(
+                        &fleet.directory.path().join(format!("node-{slot}.sqlite")),
+                        &expected,
+                        &retained
+                    ),
+                    sql[slot]
+                );
+            }
+        }
+        eprintln!(
+            "QUORUM_AUTHORITY_WITNESS {}",
+            serde_json::json!({
+                "phase": "joined_cold_reconstruction_exact", "native": native, "voters": closed.len(),
+                "directory": fleet.directory.path(), "persistent_fault_injected": false,
+            })
+        );
+    }
+}

@@ -93,7 +93,7 @@ impl<'a> Cursor<'a> {
         // Postcard's versioned ReplicationOp enum order is locked by the
         // independent serializer oracle tests below. Reject all other variants
         // before any recursive/full ReplicationOp deserialization can occur.
-        if !matches!(tag, 3 | 4 | 5) {
+        if !matches!(tag, 3..=5) {
             return Err(invalid("native generation lease effect shape invalid"));
         }
         self.key()?;
@@ -291,7 +291,7 @@ fn notification_scratch(bytes: &[u8]) -> io::Result<usize> {
         row.mutation_effect(mutation)?
     } else if matches!(tag, 6 | 8) {
         row.roster_effect(tag)?
-    } else if matches!(tag, 3 | 4 | 5) {
+    } else if matches!(tag, 3..=5) {
         row.lease_effect(tag)?;
         0
     } else {
@@ -521,7 +521,7 @@ pub(in crate::consensus::native) fn inspect_notification(
 }
 
 pub(in crate::consensus::native) struct OwnedNotification {
-    entry: ReplicationEntry,
+    entry: Box<ReplicationEntry>,
     _memory: VerificationMemory,
 }
 
@@ -547,7 +547,7 @@ pub(in crate::consensus::native) fn owned_notification(
     drop(decoded);
     check()?;
     Ok(OwnedNotification {
-        entry,
+        entry: Box::new(entry),
         _memory: memory,
     })
 }

@@ -17,9 +17,15 @@ mod lifecycle;
 #[cfg(test)]
 pub(crate) mod lifecycle_tests;
 pub(crate) mod log;
+#[cfg(any(test, feature = "test-control"))]
+mod memory_observation;
+#[cfg(test)]
+mod memory_tests;
 mod ordinary;
 pub(crate) mod roster;
+mod row_map;
 mod shared;
+use row_map::RowMap;
 mod v1;
 mod validation;
 pub(crate) use application::ApplicationCapture;
@@ -134,7 +140,7 @@ struct NativeReceipt {
 #[serde(deny_unknown_fields)]
 struct NativeOrdinaryReceipt {
     payload_digest: [u8; 32],
-    response: SessionConsensusResponse,
+    response: Box<SessionConsensusResponse>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -288,9 +294,9 @@ pub(crate) struct NativeState {
     identity: SessionConsensusIdentity,
     members: BTreeSet<SessionConsensusNodeId>,
     frontiers: NativeFrontiers,
-    keys: ResidentMap<SessionKey, SharedRow<NativeKeyState>>,
-    receipts: ResidentMap<FencedTransitionV2RequestId, SharedRow<NativeReceipt>>,
-    generic_receipts: ResidentMap<SessionConsensusRequestId, SharedRow<NativeGenericReceipt>>,
+    keys: RowMap<SessionKey, SharedRow<NativeKeyState>>,
+    receipts: RowMap<FencedTransitionV2RequestId, SharedRow<NativeReceipt>>,
+    generic_receipts: RowMap<SessionConsensusRequestId, SharedRow<NativeGenericReceipt>>,
     notifications: ResidentVector<SharedRow<NativeNotification>>,
     #[serde(skip, default = "roster::Ledger::empty")]
     roster: roster::Ledger,
@@ -325,10 +331,10 @@ impl Serialize for NativeState {
             identity: SessionConsensusIdentity,
             members: &'a BTreeSet<SessionConsensusNodeId>,
             frontiers: &'a NativeFrontiers,
-            keys: &'a ResidentMap<SessionKey, SharedRow<NativeKeyState>>,
-            receipts: &'a ResidentMap<FencedTransitionV2RequestId, SharedRow<NativeReceipt>>,
+            keys: &'a RowMap<SessionKey, SharedRow<NativeKeyState>>,
+            receipts: &'a RowMap<FencedTransitionV2RequestId, SharedRow<NativeReceipt>>,
             generic_receipts:
-                &'a ResidentMap<SessionConsensusRequestId, SharedRow<NativeGenericReceipt>>,
+                &'a RowMap<SessionConsensusRequestId, SharedRow<NativeGenericReceipt>>,
             notifications: &'a ResidentVector<SharedRow<NativeNotification>>,
         }
         Legacy {
@@ -442,6 +448,8 @@ struct NativeDelta<'a> {
     generic_receipts: HashMap<SessionConsensusRequestId, NativeGenericReceipt>,
     responses: Vec<SessionConsensusResponse>,
     notifications: Vec<ReplicationEntry>,
+    #[cfg(any(test, feature = "test-control"))]
+    terminal_remainder_started: Option<std::time::Instant>,
 }
 
 #[cfg_attr(feature = "test-control", track_caller)]
@@ -496,9 +504,9 @@ impl NativeState {
                 roster_v2_activation: None,
                 current_snapshot: None,
             },
-            keys: ResidentMap::new(),
-            receipts: ResidentMap::new(),
-            generic_receipts: ResidentMap::new(),
+            keys: RowMap::new(),
+            receipts: RowMap::new(),
+            generic_receipts: RowMap::new(),
             notifications: ResidentVector::new(),
             roster: roster::Ledger::empty(),
             roster_root,
@@ -584,6 +592,235 @@ impl NativeState {
                 0,
             )
             .map_err(|_| invalid("native initial history invalid"))
+        })
+    }
+
+    /// Raw resident certificate facts; this does not run the acceptance validator.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn activation_facts_for_test(&self) -> serde_json::Value {
+        serde_json::json!({
+            "identity": self.identity,
+            "members": self.members,
+            "applied": self.frontiers.applied,
+            "membership": self.frontiers.membership,
+            "membership_log_id": self.frontiers.membership.log_id(),
+            "membership_configs": self.frontiers.membership.membership().get_joint_config(),
+            "membership_nodes": self.frontiers.membership.membership().nodes().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "activation": self.frontiers.activation,
+            "history": self.frontiers.history,
+            "receipt_count": self.receipts.len(),
+        })
+    }
+
+    /// Hash only business contents/frontiers, excluding the injected certificate
+    /// and background snapshot metadata. Call on a detached copy outside State.
+    /// This bounded V2 fixture witness rejects any protected-roster namespace.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn business_digest_for_test(&self) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        if self.roster_root.is_some()
+            || !self.roster.rows.is_empty()
+            || !self.roster.partitions.is_empty()
+            || self.roster.index.len() != 0
+            || self.roster.witness.is_some()
+            || self.frontiers.roster_v1_namespace
+            || self.frontiers.roster_v2_activation.is_some()
+        {
+            return Err(invalid(
+                "test V2 business witness does not admit a roster namespace",
+            ));
+        }
+        // JSON object keys cannot encode SessionKey or request-ID structs.
+        // Hash sorted complete rows instead; HAMT traversal order may change
+        // on a cold reconstruction even when every stored byte is identical.
+        fn row_digest(row: impl Serialize) -> io::Result<[u8; 32]> {
+            let bytes = serde_json::to_vec(&row)
+                .map_err(|_| invalid("test business row encoding failed"))?;
+            Ok(Sha256::digest(bytes).into())
+        }
+        fn rows(
+            digest: &mut Sha256,
+            count: usize,
+            rows: impl Iterator<Item = io::Result<[u8; 32]>>,
+        ) -> io::Result<()> {
+            let mut digests = Vec::new();
+            digests
+                .try_reserve_exact(count)
+                .map_err(|_| invalid("test business digest allocation failed"))?;
+            for row in rows {
+                digests.push(row?);
+            }
+            if digests.len() != count {
+                return Err(invalid("test business row count changed"));
+            }
+            digests.sort_unstable();
+            digest.update((count as u64).to_be_bytes());
+            for row in digests {
+                digest.update(row);
+            }
+            Ok(())
+        }
+        let maximum_rows = [
+            self.keys.len(),
+            self.receipts.len(),
+            self.generic_receipts.len(),
+            self.notifications.len(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let reserved = maximum_rows
+            .checked_mul(std::mem::size_of::<[u8; 32]>())
+            .and_then(|bytes| {
+                bytes.checked_add(4 * crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 64 * 1024)
+            })
+            .ok_or_else(|| invalid("test business evidence reservation overflow"))?;
+        let _memory = crate::consensus::verified_snapshot::VerificationMemory::reserve(reserved)?;
+        let mut digest = Sha256::new();
+        digest.update(b"OPC-native-test-business-v1\0");
+        rows(
+            &mut digest,
+            self.keys.len(),
+            self.keys.iter().map(row_digest),
+        )?;
+        rows(
+            &mut digest,
+            self.receipts.len(),
+            self.receipts
+                .iter()
+                .map(|(id, row)| Self::receipt_digest_for_test(*id, row)),
+        )?;
+        rows(
+            &mut digest,
+            self.generic_receipts.len(),
+            self.generic_receipts.iter().map(row_digest),
+        )?;
+        rows(
+            &mut digest,
+            self.notifications.len(),
+            self.notifications.iter().enumerate().map(|(index, row)| {
+                // Selected rows reject direct serialization. Read the complete
+                // bounded row through its pinned prefix on this detached capture
+                // so resident and reconstructed contents have the same digest.
+                let read = row.read(&self.frontiers, &|| Ok(()))?;
+                row_digest((index, read.entry()))
+            }),
+        )?;
+        digest.update(row_digest((
+            self.frontiers.applied,
+            self.frontiers.sequence,
+            self.frontiers.digest,
+            self.frontiers.logical_time,
+            self.frontiers.watch_sequence,
+            self.frontiers.next_fence,
+            self.frontiers.next_credential,
+            self.frontiers.restore_revision,
+            self.frontiers.history,
+        ))?);
+        digest.update(row_digest(&self.frontiers.v1_activation)?);
+        Ok(digest.finalize().into())
+    }
+
+    // Both representations hash the complete canonical persisted row. Cold
+    // reads use the already authenticated selected prefix, never a pathname,
+    // and happen only on the detached capture outside the owner lock. No
+    // acceptance or business-proof predicate is used as this fault oracle.
+    #[cfg(any(test, feature = "test-control"))]
+    fn receipt_digest_for_test(
+        id: FencedTransitionV2RequestId,
+        row: &NativeReceipt,
+    ) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        let _memory = crate::consensus::verified_snapshot::VerificationMemory::reserve(
+            5 * cold::MAX_BYTES + 64 * 1024,
+        )?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(cold::MAX_BYTES)
+            .map_err(|_| invalid("test receipt input allocation failed"))?;
+        if let Some((source, range)) = row.cold_range() {
+            let length = usize::try_from(range.end() - range.offset())
+                .map_err(|_| invalid("test receipt extent overflow"))?;
+            if length > cold::MAX_BYTES {
+                return Err(invalid("test receipt exceeds bounded input"));
+            }
+            bytes.resize(length, 0);
+            source.read_exact_at(range.offset(), &mut bytes)?;
+            // Compare independently framed identity/scalars before decoding
+            // the existing bounded response vocabulary. The resident binding
+            // then verifies the exact selected complete response commitment.
+            const HEADER: usize = 120;
+            let timestamp = row.retained_until.as_offset_datetime();
+            if bytes.len() < HEADER
+                || &bytes[..8] != b"OPCNRC01"
+                || bytes[8..64] != id.to_bytes()
+                || bytes[64..72] != row.ordinal.to_le_bytes()
+                || bytes[72..104] != row.payload_digest
+                || bytes[104..112] != timestamp.unix_timestamp().to_le_bytes()
+                || bytes[112..116] != timestamp.nanosecond().to_le_bytes()
+                || bytes[116..120] != ((bytes.len() - HEADER) as u32).to_le_bytes()
+                || bytes.len() == HEADER
+            {
+                return Err(invalid("test selected receipt raw facts differ"));
+            }
+            let response =
+                crate::sqlite::consensus::decode_fenced_transition_v2_response(&bytes[HEADER..])?;
+            if crate::sqlite::consensus::encode_fenced_transition_v2_response(&response)?
+                != bytes[HEADER..]
+            {
+                return Err(invalid("test selected receipt response is not canonical"));
+            }
+            let decoded = NativeReceipt {
+                ordinal: row.ordinal,
+                payload_digest: row.payload_digest,
+                retained_until: row.retained_until,
+                response: Some(Box::new(response)),
+                cold: None,
+            };
+            if !row.matches_decoded(id, &decoded)? {
+                return Err(invalid("test selected receipt commitment differs"));
+            }
+        } else {
+            cold::write_receipt(&mut bytes, id, row, &|| Ok(()))?;
+        }
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    /// Raw per-key fence, independent of read or acceptance validation.
+    #[cfg(test)]
+    pub(crate) fn key_fence_for_test(&self, key: &SessionKey) -> u64 {
+        self.keys.get(key).map_or(0, |state| state.fence)
+    }
+
+    /// Number of receipts whose response bytes reside in an admitted prefix.
+    /// A positive count proves a cold witness actually exercised that path.
+    #[cfg(test)]
+    pub(crate) fn cold_receipt_count_for_test(&self) -> usize {
+        self.receipts
+            .iter()
+            .filter(|(_, row)| row.cold_range().is_some())
+            .count()
+    }
+
+    /// Remove just the resident certificate and return its exact restoration.
+    /// This is a live-owner fault, never evidence of persisted corruption.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn remove_activation_for_test(
+        &mut self,
+    ) -> io::Result<impl FnOnce(&mut Self) -> io::Result<()> + use<>> {
+        let saved = self
+            .frontiers
+            .activation
+            .take()
+            .ok_or_else(|| invalid("test requires an existing activation"))?;
+        Ok(move |state: &mut Self| {
+            if state.frontiers.activation.is_some() {
+                return Err(invalid("test activation changed while fault was installed"));
+            }
+            state.frontiers.activation = Some(saved);
+            Ok(())
         })
     }
 
@@ -790,6 +1027,8 @@ impl NativeState {
             generic_receipts: HashMap::new(),
             responses: Vec::with_capacity(entries.len()),
             notifications: Vec::new(),
+            #[cfg(any(test, feature = "test-control"))]
+            terminal_remainder_started: None,
         };
         for entry in entries {
             check()?;

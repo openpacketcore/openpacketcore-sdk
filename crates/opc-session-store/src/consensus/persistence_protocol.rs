@@ -390,10 +390,10 @@ impl EngineAdmission {
     // snapshot catch-up the leader must still match a prefix through the cut.
     pub(super) fn confirm_append(&self, matched: Option<LogId<SessionConsensusNodeId>>) {
         if let Admission::CatchingUp { cut, confirmed } = &*self.guard {
-            if matched.is_some_and(|matched| covers(matched, cut.barrier)) {
-                if !confirmed.swap(true, Ordering::AcqRel) {
-                    self.progress.notify_one();
-                }
+            if matched.is_some_and(|matched| covers(matched, cut.barrier))
+                && !confirmed.swap(true, Ordering::AcqRel)
+            {
+                self.progress.notify_one();
             }
         }
     }

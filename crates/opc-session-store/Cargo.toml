@@ -69,6 +69,9 @@ rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks", "limits
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
+# Measure native owner allocations in focused, single-threaded unit tests.
+# This workspace dependency is never linked into the production store.
+allocation-counter = { workspace = true }
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["test-vfs"] }
 serde_json = { workspace = true }

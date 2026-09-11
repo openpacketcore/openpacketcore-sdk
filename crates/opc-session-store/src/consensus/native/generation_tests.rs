@@ -275,10 +275,12 @@ fn native_generation_readback_failure_fences_views_and_never_publishes_new_prefi
         .owner
         .append(
             &previous,
-            12,
-            21,
-            delta.header.after.digest().unwrap(),
-            bytes.len() as u64,
+            crate::consensus::native::prefix::AppendTransaction {
+                checkpoint_epoch: 12,
+                operation_sequence: 21,
+                frontiers: delta.header.after.digest().unwrap(),
+                payload_bytes: bytes.len() as u64,
+            },
             || Ok(()),
             |writer| writer.write_all(&bytes),
             |reader| delta.verify_payload(reader, &|| Ok(()), None)
@@ -404,13 +406,15 @@ fn native_history_captured_transient_omission_rejects_before_generation_selectio
             .unwrap();
         let base = PreparedBase::prepare(
             &storage,
-            ROOT,
-            4,
-            11,
-            18,
-            [0xE0; 32],
-            BLOCK,
-            maximum,
+            crate::consensus::native::generation::BaseParameters {
+                binding: ROOT,
+                file_epoch: 4,
+                checkpoint_epoch: 11,
+                operation_sequence: 18,
+                cut_binding: [0xE0; 32],
+                block_bytes: BLOCK,
+                maximum,
+            },
             &|| Ok(()),
         )
         .unwrap()
@@ -425,9 +429,11 @@ fn native_history_captured_transient_omission_rejects_before_generation_selectio
             &path,
             identity,
             maximum,
-            storage.business.identity,
-            &storage.business.members,
-            storage.business.roster_root.clone(),
+            crate::consensus::native::generation::CatalogScope {
+                identity: storage.business.identity,
+                members: &storage.business.members,
+                roster_root: storage.business.roster_root.clone(),
+            },
             [0xE0; 32],
             &|| Ok(()),
         )
@@ -471,9 +477,11 @@ fn native_history_captured_transient_omission_rejects_before_generation_selectio
                 &path,
                 final_identity,
                 maximum,
-                storage.business.identity,
-                &storage.business.members,
-                storage.business.roster_root.clone(),
+                crate::consensus::native::generation::CatalogScope {
+                    identity: storage.business.identity,
+                    members: &storage.business.members,
+                    roster_root: storage.business.roster_root.clone(),
+                },
                 [0xE1; 32],
                 &|| Ok(()),
             )
@@ -515,9 +523,11 @@ fn native_history_captured_transient_omission_rejects_before_generation_selectio
                 &bad_path,
                 bad_identity,
                 maximum,
-                storage.business.identity,
-                &storage.business.members,
-                storage.business.roster_root.clone(),
+                crate::consensus::native::generation::CatalogScope {
+                    identity: storage.business.identity,
+                    members: &storage.business.members,
+                    roster_root: storage.business.roster_root.clone(),
+                },
                 [0xE1; 32],
                 &|| Ok(()),
             )
@@ -549,13 +559,15 @@ fn native_v1_current_delta_over_original_generic_base_preserves_cold_commitments
         .unwrap();
     let base = PreparedBase::prepare(
         &storage,
-        ROOT,
-        4,
-        11,
-        18,
-        [0xE0; 32],
-        BLOCK,
-        maximum,
+        crate::consensus::native::generation::BaseParameters {
+            binding: ROOT,
+            file_epoch: 4,
+            checkpoint_epoch: 11,
+            operation_sequence: 18,
+            cut_binding: [0xE0; 32],
+            block_bytes: BLOCK,
+            maximum,
+        },
         &|| Ok(()),
     )
     .unwrap()
@@ -571,9 +583,11 @@ fn native_v1_current_delta_over_original_generic_base_preserves_cold_commitments
         &path,
         identity,
         maximum,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         [0xE0; 32],
         &|| Ok(()),
     )
@@ -621,9 +635,11 @@ fn native_v1_current_delta_over_original_generic_base_preserves_cold_commitments
         &path,
         selected,
         maximum,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         [0xE1; 32],
         &|| Ok(()),
     )
@@ -667,11 +683,13 @@ fn native_v1_current_delta_over_original_generic_base_preserves_cold_commitments
             &bad_path,
             bad_identity,
             maximum,
-            storage.business.identity,
-            &storage.business.members,
-            storage.business.roster_root.clone(),
+            crate::consensus::native::generation::CatalogScope {
+                identity: storage.business.identity,
+                members: &storage.business.members,
+                roster_root: storage.business.roster_root.clone()
+            },
             [0xE1; 32],
-            &|| Ok(())
+            &|| Ok(()),
         )
         .err()
         .unwrap()

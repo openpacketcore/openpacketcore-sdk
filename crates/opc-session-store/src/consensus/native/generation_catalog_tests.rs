@@ -34,18 +34,31 @@ impl Files {
             .create_new(true)
             .open(&path)
             .unwrap();
-        let prepared =
-            PreparedBase::prepare(storage, ROOT, 4, 11, 18, CUT, BLOCK, MAXIMUM, &|| Ok(()))
-                .unwrap();
+        let prepared = PreparedBase::prepare(
+            storage,
+            crate::consensus::native::generation::BaseParameters {
+                binding: ROOT,
+                file_epoch: 4,
+                checkpoint_epoch: 11,
+                operation_sequence: 18,
+                cut_binding: CUT,
+                block_bytes: BLOCK,
+                maximum: MAXIMUM,
+            },
+            &|| Ok(()),
+        )
+        .unwrap();
         let identity = prepared.write_to(&mut file, &|| Ok(())).unwrap();
         file.sync_all().unwrap();
         let (owner, catalog) = Catalog::open(
             &path,
             identity,
             MAXIMUM,
-            storage.business.identity,
-            &storage.business.members,
-            storage.business.roster_root.clone(),
+            crate::consensus::native::generation::CatalogScope {
+                identity: storage.business.identity,
+                members: &storage.business.members,
+                roster_root: storage.business.roster_root.clone(),
+            },
             CUT,
             &|| Ok(()),
         )
@@ -84,9 +97,11 @@ impl Files {
             &self.path,
             self.owner.current().identity(),
             MAXIMUM,
-            storage.business.identity,
-            &storage.business.members,
-            storage.business.roster_root.clone(),
+            crate::consensus::native::generation::CatalogScope {
+                identity: storage.business.identity,
+                members: &storage.business.members,
+                roster_root: storage.business.roster_root.clone(),
+            },
             self.cut,
             &|| Ok(()),
         )
@@ -264,9 +279,11 @@ fn reject(
         &path,
         identity,
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         cut,
         &|| Ok(()),
     ) {
@@ -420,9 +437,11 @@ fn native_catalog_same_sequence_snapshots_reject_clearing_and_regression_with_re
         &files.path,
         files.owner.current().identity(),
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         prepared.header.cut_binding,
         &|| Ok(()),
     )
@@ -501,9 +520,11 @@ fn native_catalog_truncated_and_net_absent_logs_require_unique_delta_indexes() {
         &files.path,
         files.owner.current().identity(),
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         prepared.header.cut_binding,
         &|| Ok(()),
     )
@@ -839,14 +860,16 @@ fn native_catalog_empty_base_keeps_explicit_format_bounds_and_cancellation() {
     ] {
         assert!(PreparedBase::prepare(
             &storage,
-            ROOT,
-            file_epoch,
-            checkpoint,
-            18,
-            CUT,
-            block,
-            maximum,
-            &|| Ok(())
+            crate::consensus::native::generation::BaseParameters {
+                binding: ROOT,
+                file_epoch,
+                checkpoint_epoch: checkpoint,
+                operation_sequence: 18,
+                cut_binding: CUT,
+                block_bytes: block,
+                maximum
+            },
+            &|| Ok(()),
         )
         .is_err());
     }
@@ -856,11 +879,34 @@ fn native_catalog_empty_base_keeps_explicit_format_bounds_and_cancellation() {
             "cancelled catalog",
         ))
     };
-    assert!(
-        PreparedBase::prepare(&storage, ROOT, 4, 11, 18, CUT, BLOCK, MAXIMUM, &cancelled).is_err()
-    );
-    let prepared =
-        PreparedBase::prepare(&storage, ROOT, 4, 11, 18, CUT, BLOCK, MAXIMUM, &|| Ok(())).unwrap();
+    assert!(PreparedBase::prepare(
+        &storage,
+        crate::consensus::native::generation::BaseParameters {
+            binding: ROOT,
+            file_epoch: 4,
+            checkpoint_epoch: 11,
+            operation_sequence: 18,
+            cut_binding: CUT,
+            block_bytes: BLOCK,
+            maximum: MAXIMUM
+        },
+        &cancelled,
+    )
+    .is_err());
+    let prepared = PreparedBase::prepare(
+        &storage,
+        crate::consensus::native::generation::BaseParameters {
+            binding: ROOT,
+            file_epoch: 4,
+            checkpoint_epoch: 11,
+            operation_sequence: 18,
+            cut_binding: CUT,
+            block_bytes: BLOCK,
+            maximum: MAXIMUM,
+        },
+        &|| Ok(()),
+    )
+    .unwrap();
     let mut output = Vec::new();
     assert!(prepared.write_to(&mut output, &cancelled).is_err());
     assert!(output.is_empty());
@@ -868,11 +914,13 @@ fn native_catalog_empty_base_keeps_explicit_format_bounds_and_cancellation() {
         &files.path,
         catalog.identity(),
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone()
+        },
         CUT,
-        &cancelled
+        &cancelled,
     )
     .is_err());
 }

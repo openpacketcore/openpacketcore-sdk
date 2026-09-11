@@ -206,7 +206,7 @@ fn native_selected_log_read_returns_eight_full_256_request_rows_with_shared_memo
             let requests = (0..count)
                 .map(|slot| sdk741_component_request(Sdk741Payload::Create, 10 + batch, slot, None))
                 .collect::<Vec<_>>();
-            fenced_transition_v2_batch_entry(2 + batch as u64, requests, timestamp(2 + batch as u8))
+            fenced_transition_v2_batch_entry(2 + batch, requests, timestamp(2 + batch as u8))
         })
         .collect::<Vec<_>>();
     fixture.parity(&entries);

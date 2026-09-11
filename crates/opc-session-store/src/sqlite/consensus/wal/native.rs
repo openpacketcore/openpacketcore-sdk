@@ -9,6 +9,27 @@ use crate::consensus::native::{
 };
 use crate::consensus::verified_snapshot::{PortableSnapshot, VerifiedFile};
 
+/// Exact caller expectations checked against the live fixed-quorum owner.
+pub(crate) struct FixedReadExpectation<'a> {
+    pub(crate) identity: SessionConsensusIdentity,
+    pub(crate) members: &'a BTreeSet<SessionConsensusNodeId>,
+    pub(crate) bindings: &'a BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    pub(crate) placement: PlacementResiliencePolicy,
+    pub(crate) pristine: bool,
+    pub(crate) database_path: Option<&'a Path>,
+}
+
+/// Scope and membership captured together from the native owner.
+pub(crate) type FixedScopeSnapshot = (
+    ConsensusAuthorityProfile,
+    Option<PlacementResiliencePolicy>,
+    super::super::MembershipValidationScope,
+    opc_consensus::engine::StoredMembership<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+);
+
 fn ensure_native_application_owner(state: &State) -> io::Result<()> {
     ensure_readable(state)?;
     if !matches!(state.status, Status::Running | Status::Closing) {
@@ -81,6 +102,14 @@ fn copy_cold_basis(directory: &Path, binding: Binding, conn: &mut Connection) ->
 // the WAL; a concurrent shutdown flag must never mask an unrelated failure.
 #[derive(Debug)]
 struct SnapshotExportCancelled;
+
+enum SnapshotExportPurpose {
+    Portable,
+    #[cfg(test)]
+    Raw,
+    #[cfg(test)]
+    InstallBase,
+}
 
 impl std::fmt::Display for SnapshotExportCancelled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -281,9 +310,11 @@ impl Opening {
                     &path,
                     prefix,
                     MAX_BASIS,
-                    binding.identity,
-                    &authority.members,
-                    roster_root.clone(),
+                    crate::consensus::native::generation::CatalogScope {
+                        identity: binding.identity,
+                        members: &authority.members,
+                        roster_root: roster_root.clone(),
+                    },
                     cut_binding,
                     &|| Ok(()),
                 )?;
@@ -414,9 +445,11 @@ impl Opening {
             &path,
             prefix,
             MAX_BASIS,
-            self.binding.identity,
-            &authority.members,
-            self.roster_root.clone(),
+            crate::consensus::native::generation::CatalogScope {
+                identity: self.binding.identity,
+                members: &authority.members,
+                roster_root: self.roster_root.clone(),
+            },
             Some(origin),
             cut_binding,
             &|| Ok(()),
@@ -532,6 +565,8 @@ pub(super) fn open(
 #[cfg(test)]
 pub(crate) struct NativeAudit<'a> {
     state: &'a NativeState,
+    committed: Option<LogId<SessionConsensusNodeId>>,
+    owner_facts: serde_json::Value,
 }
 
 #[cfg(test)]
@@ -544,6 +579,20 @@ impl std::ops::Deref for NativeAudit<'_> {
 
 #[cfg(test)]
 impl NativeAudit<'_> {
+    /// Raw authority and frontiers reconstructed from the selected durable
+    /// inputs after the original owner and writer have both stopped. Compute
+    /// the bounded fixture digest only when this V2 witness requests it.
+    pub(crate) fn owner_facts_for_test(&self) -> io::Result<serde_json::Value> {
+        let mut facts = self.owner_facts.clone();
+        facts["business_digest"] = serde_json::to_value(self.state.business_digest_for_test()?)?;
+        Ok(facts)
+    }
+
+    /// Full committed LogId recovered from the published durable WAL cut.
+    pub(crate) fn durable_committed(&self) -> Option<LogId<SessionConsensusNodeId>> {
+        self.committed
+    }
+
     #[cfg(test)]
     pub(crate) fn status(
         &self,
@@ -566,7 +615,261 @@ impl NativeAudit<'_> {
     }
 }
 
+#[cfg(any(test, feature = "test-control"))]
+fn native_fixture_facts(
+    binding: Binding,
+    authority: &Authority,
+    native: &NativeStorage,
+    committed: Option<LogId<SessionConsensusNodeId>>,
+) -> serde_json::Value {
+    let scope = &authority.scope;
+    serde_json::json!({
+        "binding_identity": binding.identity,
+        "durable_committed": committed,
+        "last_log": native.log.last(),
+        "authority_profile": match authority.profile {
+            ConsensusAuthorityProfile::Dynamic => 1,
+            ConsensusAuthorityProfile::FixedImmutable => 2,
+        },
+        "authority_members": authority.members,
+        "authority_bindings": authority.bindings.iter().collect::<Vec<_>>(),
+        "placement": authority.placement.map(|policy| match policy {
+            PlacementResiliencePolicy::RequireIndependentFailureDomains => 1,
+            PlacementResiliencePolicy::AllowReducedResilience => 2,
+        }),
+        "scope_identity": scope.current_identity,
+        "scope_members": scope.current_members,
+        "scope_bindings": scope.current_bindings.iter().collect::<Vec<_>>(),
+        "application_authority_epoch": scope.application_authority_epoch,
+        "application_authority_members": scope.application_authority_members,
+        "predecessor_present": scope.predecessor.is_some(),
+        "history_depth": scope.history.len(),
+        "terminal_history_depth": scope.terminal_history.len(),
+        "pending_present": scope.pending.is_some(),
+        "terminal_present": scope.terminal.is_some(),
+        "business": native.business.activation_facts_for_test(),
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn quorum_authority_observation_bounds_lock_and_refuses_async() {
+    let identity = SessionConsensusIdentity::new(
+        crate::consensus::SessionConsensusClusterId::new("quorum-authority-observation")
+            .expect("fixture cluster"),
+        crate::consensus::SessionConsensusConfigurationId::from_bytes([0x71; 32]),
+        crate::consensus::SessionConsensusConfigurationEpoch::new(1).expect("fixture epoch"),
+    );
+    let members = [7, 8, 9]
+        .into_iter()
+        .map(|id| SessionConsensusNodeId::new(id).expect("fixture voter"))
+        .collect();
+    for persistence in [
+        SessionPersistenceMode::Durable,
+        SessionPersistenceMode::Async,
+    ] {
+        let mut directory = tempfile::tempdir().expect("raw observation fixture directory");
+        directory.disable_cleanup(true);
+        let backend = crate::SqliteSessionBackend::open(directory.path().join("basis.sqlite"))
+            .expect("fixture basis");
+        let conn = backend.conn.blocking_lock();
+        super::super::initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("fixed raw observation scope");
+        let wal = Wal::create_native_with_persistence(
+            &directory.path().join("wal"),
+            &conn,
+            identity,
+            [0x71; 32],
+            None,
+            Limits::default(),
+            IoControl::default(),
+            persistence,
+        )
+        .expect("actual native owner");
+        drop(conn);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if persistence == SessionPersistenceMode::Async {
+                assert!(
+                    wal.native_activation_facts_for_test().is_err(),
+                    "Async cannot supply durable fixture evidence"
+                );
+            } else {
+                let facts = wal
+                    .native_activation_facts_for_test()
+                    .expect("empty durable owner raw facts");
+                assert!(facts["durable_committed"].is_null());
+                assert!(facts["business"]["applied"].is_null());
+                assert_eq!(facts["owner_running"], true);
+                let held = wal.shared.state.lock().expect("hold actual owner lock");
+                let began = Instant::now();
+                let error = wal
+                    .native_activation_facts_for_test()
+                    .expect_err("contended lock must never be ready");
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(
+                    began.elapsed() < Duration::from_secs(1),
+                    "bounded observation must return under the negative guard"
+                );
+                drop(held);
+                assert_eq!(
+                    wal.native_activation_facts_for_test()
+                        .expect("released lock"),
+                    facts
+                );
+            }
+        }));
+        let shutdown = wal.shutdown();
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        shutdown.expect("joined raw observation writer");
+        if persistence == SessionPersistenceMode::Durable {
+            assert_eq!(
+                wal.native_activation_facts_for_test()
+                    .expect("closed raw observation")["owner_running"],
+                false
+            );
+        }
+        eprintln!(
+            "QUORUM_AUTHORITY_OBSERVATION {}",
+            serde_json::json!({
+                "durable": persistence == SessionPersistenceMode::Durable,
+                "directory": directory.path(), "writer_joined": true,
+            })
+        );
+    }
+}
+
 impl Wal {
+    /// Bound test observations/control acquisition independently of production
+    /// locking. Contention is an observation error, never readiness.
+    #[cfg(any(test, feature = "test-control"))]
+    fn fixture_state(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(25);
+        loop {
+            match self.shared.state.try_lock() {
+                Ok(state) => return Ok(state),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(invalid_data("test native State poisoned"))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "test native State observation deadline",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    /// Actual durable publication and raw owner facts, without invoking fixed
+    /// acceptance or consulting the legacy SQLite import image.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn native_activation_facts_for_test(&self) -> io::Result<serde_json::Value> {
+        let state = self.fixture_state()?;
+        if state.volatile_mode() {
+            return Err(invalid_data(
+                "test durable oracle refuses asynchronous/volatile storage",
+            ));
+        }
+        let native = state
+            .native
+            .as_ref()
+            .ok_or_else(|| invalid_data("test native owner missing"))?;
+        let mut facts = native_fixture_facts(
+            self.binding,
+            &state.authority,
+            native,
+            state.durable_committed,
+        );
+        facts["owner_running"] = serde_json::json!(state.status == Status::Running);
+        let business = native.business.clone();
+        drop(state);
+        facts["business_digest"] = serde_json::to_value(business.business_digest_for_test()?)?;
+        Ok(facts)
+    }
+
+    /// Bind a filesystem fault to the database configured on this backend.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn native_fixture_database_matches_for_test(
+        &self,
+        backend: &crate::SqliteSessionBackend,
+        path: &Path,
+    ) -> bool {
+        self.binding.native
+            && backend
+                .database_path
+                .as_ref()
+                .is_some_and(|bound| bound.as_path() == path)
+    }
+
+    /// Scoped live-owner corruption. Neither branch writes a durable selected
+    /// input; the returned action restores only the field it changed.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn native_activation_fault_for_test(
+        &self,
+        remove_activation: bool,
+    ) -> io::Result<Box<dyn FnOnce() -> io::Result<()> + Send + '_>> {
+        let mut state = self.fixture_state()?;
+        if state.status != Status::Running
+            || state.volatile_mode()
+            || state.outstanding != 0
+            || state.native_basis_active
+            || state.native_install_pending
+            || state.snapshot.is_some()
+        {
+            return Err(invalid_data(
+                "test fault requires an idle durable native owner",
+            ));
+        }
+        let committed = state.durable_committed;
+        let native = state
+            .native
+            .as_mut()
+            .ok_or_else(|| invalid_data("test fault native owner missing"))?;
+        if committed.is_none() || native.business.applied() != committed {
+            return Err(invalid_data(
+                "test fault requires the exact durable applied cut",
+            ));
+        }
+        if remove_activation {
+            let restore = native.business.remove_activation_for_test()?;
+            Ok(Box::new(move || {
+                let mut state = self.fixture_state()?;
+                let native = state
+                    .native
+                    .as_mut()
+                    .ok_or_else(|| invalid_data("test restore native owner missing"))?;
+                restore(&mut native.business)
+            }))
+        } else {
+            let saved = state.authority.scope.application_authority_epoch;
+            let next = saved
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("test authority epoch exhausted"))?;
+            let injected = crate::consensus::SessionConsensusConfigurationEpoch::new(next)
+                .map_err(|_| invalid_data("test authority epoch invalid"))?;
+            state.authority.scope.application_authority_epoch = injected;
+            Ok(Box::new(move || {
+                let mut state = self.fixture_state()?;
+                if state.authority.scope.application_authority_epoch != injected {
+                    return Err(invalid_data(
+                        "test authority changed while fault was installed",
+                    ));
+                }
+                state.authority.scope.application_authority_epoch = saved;
+                Ok(())
+            }))
+        }
+    }
+
     fn native_operation(&self) -> io::Result<OperationPermit> {
         let mut state = self.wait_for_snapshot(lock_state(&self.shared)?)?;
         if state.snapshot.is_some() || state.native_install_pending {
@@ -643,6 +946,40 @@ impl Wal {
         self.binding.native
     }
 
+    /// Consume only the closed native owner after all durable witness reads.
+    /// Release outside the state mutex so accounting includes no lock holder.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn release_closed_native_memory_for_test(
+        &self,
+        observe: impl FnMut(&'static str, &mut dyn FnMut()),
+    ) -> io::Result<serde_json::Value> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| invalid_data("native memory audit join owner poisoned"))?;
+        let mut state = lock_state(&self.shared)?;
+        if writer.is_some()
+            || state.status != Status::Closed
+            || !state.queue.is_empty()
+            || state.outstanding != 0
+            || state.native_basis_active
+            || state.native_relocations_pending
+            || state.native_install_pending
+            || state.snapshot.is_some()
+        {
+            return Err(invalid_data(
+                "native memory audit requires a fully drained closed owner",
+            ));
+        }
+        let native = state
+            .native
+            .take()
+            .ok_or_else(|| invalid_data("native memory audit owner absent"))?;
+        drop(state);
+        drop(writer);
+        Ok(native.release_roots_for_test(observe))
+    }
+
     /// Reconstruct only the published durable state after its writer joined.
     /// Keep the strict snapshot admissions alive during the evidence read.
     /// Unlike Opening::finish, this never repairs files or starts a writer.
@@ -674,8 +1011,18 @@ impl Wal {
         let admitted = admit_snapshots(opening.snapshots(), opening.install_candidate())?;
         let opening = opening.admit_origin(install_source(&admitted))?;
         verify(&admitted)?;
+        let authority = Authority::load(&opening.conn, self.binding.identity)?;
+        let mut owner_facts = native_fixture_facts(
+            self.binding,
+            &authority,
+            &opening.native,
+            opening.native.log.committed,
+        );
+        owner_facts["owner_running"] = serde_json::json!(false);
         let result = read(&NativeAudit {
             state: &opening.native.business,
+            committed: opening.native.log.committed,
+            owner_facts,
         });
         verify(&admitted)?;
         drop(admitted);
@@ -707,17 +1054,30 @@ impl Wal {
 
     #[cfg(test)]
     pub(crate) fn native_export_snapshot(&self) -> io::Result<Connection> {
-        self.native_export(false, None, &|| false)?
+        self.native_export(SnapshotExportPurpose::Raw, None, &|| false)?
             .map(|(conn, _)| conn)
             .ok_or_else(|| invalid_data("uncancelled native export returned no image"))
     }
 
+    #[cfg(test)]
     pub(crate) fn native_export_snapshot_into(
         &self,
         destination: &crate::consensus::snapshot::PinnedSqliteFile,
         cancelled: &impl Fn() -> bool,
     ) -> io::Result<Option<(Connection, super::super::ConsensusAppliedMembership)>> {
-        self.native_export(false, Some(destination), cancelled)
+        self.native_export(SnapshotExportPurpose::Raw, Some(destination), cancelled)
+    }
+
+    pub(crate) fn native_export_portable_snapshot_into(
+        &self,
+        destination: &crate::consensus::snapshot::PinnedSqliteFile,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Option<(Connection, super::super::ConsensusAppliedMembership)>> {
+        self.native_export(
+            SnapshotExportPurpose::Portable,
+            Some(destination),
+            cancelled,
+        )
     }
 
     #[cfg(test)]
@@ -729,14 +1089,14 @@ impl Wal {
     pub(in crate::sqlite::consensus) fn native_export_install_base_for_test(
         &self,
     ) -> io::Result<Connection> {
-        self.native_export(true, None, &|| false)?
+        self.native_export(SnapshotExportPurpose::InstallBase, None, &|| false)?
             .map(|(conn, _)| conn)
             .ok_or_else(|| invalid_data("uncancelled native export returned no image"))
     }
 
     fn native_export(
         &self,
-        install_base: bool,
+        purpose: SnapshotExportPurpose,
         destination: Option<&crate::consensus::snapshot::PinnedSqliteFile>,
         cancelled: &impl Fn() -> bool,
     ) -> io::Result<Option<(Connection, super::super::ConsensusAppliedMembership)>> {
@@ -814,14 +1174,18 @@ impl Wal {
                     cold_basis(&self.directory, self.binding)?
                 };
                 export_step!("export_captured_rows");
-                if install_base {
-                    capture
+                match purpose {
+                    SnapshotExportPurpose::Portable => capture
                         .storage
-                        .export_cold_install_base_checked(&conn, &check)?;
-                } else {
-                    capture
+                        .export_cold_portable_snapshot_checked(&conn, &check)?,
+                    #[cfg(test)]
+                    SnapshotExportPurpose::InstallBase => capture
                         .storage
-                        .export_cold_snapshot_checked(&conn, &check)?;
+                        .export_cold_install_base_checked(&conn, &check)?,
+                    #[cfg(test)]
+                    SnapshotExportPurpose::Raw => capture
+                        .storage
+                        .export_cold_snapshot_checked(&conn, &check)?,
                 }
                 if let Some(destination) = destination {
                     export_step!("verify_completed_destination");
@@ -843,10 +1207,19 @@ impl Wal {
                     Ok(None)
                 }
                 Err(error) => {
+                    if let Some(destination) = destination {
+                        super::super::snapshot_resources::record_failure(
+                            "native_export",
+                            &error,
+                            &[("raw", destination)],
+                        );
+                    }
                     #[cfg(feature = "test-control")]
                     {
                         let cause = error.get_ref();
-                        let class = if cause.is_some_and(|cause| cause.is::<rusqlite::Error>()) {
+                        let class = if super::super::sqlite_error_code(&error).is_some()
+                            || cause.is_some_and(|cause| cause.is::<rusqlite::Error>())
+                        {
                             "sqlite"
                         } else if cause.is_some_and(|cause| cause.is::<crate::StoreError>()) {
                             "store"
@@ -976,15 +1349,7 @@ impl Wal {
     pub(crate) fn native_fixed_scope_snapshot(
         &self,
         identity: SessionConsensusIdentity,
-    ) -> io::Result<(
-        ConsensusAuthorityProfile,
-        Option<PlacementResiliencePolicy>,
-        super::super::MembershipValidationScope,
-        opc_consensus::engine::StoredMembership<
-            SessionConsensusNodeId,
-            opc_consensus::engine::EmptyNode,
-        >,
-    )> {
+    ) -> io::Result<FixedScopeSnapshot> {
         let state = lock_state(&self.shared)?;
         ensure_native_public_owner(&state)?;
         let native = state
@@ -1002,25 +1367,12 @@ impl Wal {
 
     pub(crate) fn native_fixed_read<T>(
         &self,
-        identity: SessionConsensusIdentity,
-        members: &BTreeSet<SessionConsensusNodeId>,
-        bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
-        placement: PlacementResiliencePolicy,
-        pristine: bool,
-        database_path: Option<&Path>,
+        expectation: FixedReadExpectation<'_>,
         read: impl FnOnce(&NativeState, bool) -> io::Result<T>,
     ) -> io::Result<T> {
         let state = lock_state(&self.shared)?;
         ensure_readable(&state)?;
-        let exact = self.native_fixed_exact(
-            &state,
-            identity,
-            members,
-            bindings,
-            placement,
-            pristine,
-            database_path,
-        )?;
+        let exact = self.native_fixed_exact(&state, &expectation)?;
         let native = state
             .native
             .as_ref()
@@ -1031,13 +1383,16 @@ impl Wal {
     fn native_fixed_exact(
         &self,
         state: &State,
-        identity: SessionConsensusIdentity,
-        members: &BTreeSet<SessionConsensusNodeId>,
-        bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
-        placement: PlacementResiliencePolicy,
-        pristine: bool,
-        database_path: Option<&Path>,
+        expectation: &FixedReadExpectation<'_>,
     ) -> io::Result<bool> {
+        let FixedReadExpectation {
+            identity,
+            members,
+            bindings,
+            placement,
+            pristine,
+            database_path,
+        } = *expectation;
         ensure_native_public_owner(state)?;
         let native = state
             .native
@@ -1076,28 +1431,13 @@ impl Wal {
 
     pub(crate) fn native_fixed_receipt_read<T>(
         &self,
-        identity: SessionConsensusIdentity,
-        members: &BTreeSet<SessionConsensusNodeId>,
-        bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
-        placement: PlacementResiliencePolicy,
-        pristine: bool,
-        database_path: Option<&Path>,
+        expectation: FixedReadExpectation<'_>,
         requests: &[crate::FencedTransitionV2Request],
         read: impl FnOnce(&NativeState, bool, Option<&ReceiptCopies>) -> io::Result<T>,
     ) -> io::Result<T> {
         self.native_receipt_read(
             requests,
-            |state| {
-                self.native_fixed_exact(
-                    state,
-                    identity,
-                    members,
-                    bindings,
-                    placement,
-                    pristine,
-                    database_path,
-                )
-            },
+            |state| self.native_fixed_exact(state, &expectation),
             read,
         )
     }
@@ -1495,6 +1835,16 @@ impl Wal {
                 responses: applied.responses,
                 notifications: applied.notifications,
             });
+        }
+    }
+
+    pub(crate) fn publish_native_roster_occupancy(
+        &self,
+        diagnostics: &crate::consensus::store::ConsensusStoreDiagnosticCounters,
+    ) {
+        match self.with_native_read(|state| state.protected_roster_diagnostic_occupancy()) {
+            Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
+            Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
         }
     }
 

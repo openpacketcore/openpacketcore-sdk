@@ -361,7 +361,9 @@ impl NativeSnapshotAuthority {
         // subsequent log/frontier admission after local snapshot publication.
         const HEX: &[u8; 16] = b"0123456789abcdef";
         suffix[..64]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .zip(self.binding)
             .all(|(pair, byte)| {
                 pair[0] == HEX[usize::from(byte >> 4)] && pair[1] == HEX[usize::from(byte & 15)]
@@ -560,7 +562,7 @@ impl Pending {
 enum Proof {
     Absent,
     Preparing(Vec<u8>),
-    Pending(Pending),
+    Pending(Box<Pending>),
 }
 
 pub(super) fn is_proof_file(name: &str, len: u64) -> io::Result<bool> {
@@ -607,7 +609,7 @@ fn read_proof(directory: &Path, binding: Binding, limits: Limits) -> io::Result<
                 return Err(invalid_data("private WAL snapshot proof is not canonical"));
             }
             proof.validate(binding, limits)?;
-            Ok(Proof::Pending(proof))
+            Ok(Proof::Pending(Box::new(proof)))
         }
     }
 }

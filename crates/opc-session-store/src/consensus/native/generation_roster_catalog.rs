@@ -4,6 +4,18 @@
 //! state; temporary changed-ID vectors use the shared verification budget.
 
 use super::*;
+
+/// Exact before/after roster context and its encoded section inventory.
+pub(super) struct Section<'a> {
+    /// Expected context before this section's row changes.
+    pub(super) before: &'a Context,
+    /// Complete context after this section's row changes.
+    pub(super) after: &'a Context,
+    /// Declared row and partition change counts.
+    pub(super) changed: [usize; 2],
+    /// Whether the section starts an empty base instead of a delta.
+    pub(super) base: bool,
+}
 use crate::consensus::native::resident::RowFingerprint;
 use crate::fenced_mutation_roster::{
     RequestBindingKey, RosterAttestationTrustRootV1, MAX_RESERVED_AND_RETAINED, TERMINAL_RETENTION,
@@ -277,14 +289,17 @@ impl Rosters {
     pub(super) fn read(
         &mut self,
         reader: &mut Cursor<'_>,
-        before: &Context,
-        after: &Context,
-        changed: [usize; 2],
-        base: bool,
+        section: Section<'_>,
         keys: &HashMap<facts::KeyId, Indexed<facts::Key>>,
         root: Option<&RosterAttestationTrustRootV1>,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        let Section {
+            before,
+            after,
+            changed,
+            base,
+        } = section;
         if changed
             .into_iter()
             .any(|count| count > validation::MAX_ITEMS)

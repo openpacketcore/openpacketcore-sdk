@@ -79,6 +79,14 @@ struct Rows {
     _memory: VerificationMemory,
 }
 
+/// Encoding and predecessor rules for one complete row section.
+struct RowSection {
+    checkpoint: u64,
+    counts: [usize; 5],
+    base: bool,
+    format: Format,
+}
+
 pub(crate) struct Catalog {
     source: Arc<VerifiedPrefix>,
     rows: Rows,
@@ -87,43 +95,44 @@ pub(crate) struct Catalog {
     snapshot_origin: Option<Arc<NativeSnapshotAuthority>>,
 }
 
+/// Independent authority expected when admitting a selected generation.
+pub(crate) struct CatalogScope<'a> {
+    /// Exact consensus configuration identity.
+    pub(crate) identity: SessionConsensusIdentity,
+    /// Complete configured voter set.
+    pub(crate) members: &'a BTreeSet<SessionConsensusNodeId>,
+    /// Configured roster trust root, if this owner carries roster state.
+    pub(crate) roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
+}
+
 impl Catalog {
     pub(crate) fn open(
         path: &Path,
         expected: PrefixIdentity,
         maximum: u64,
-        identity: SessionConsensusIdentity,
-        members: &BTreeSet<SessionConsensusNodeId>,
-        roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
+        scope: CatalogScope<'_>,
         cut_binding: [u8; 32],
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<(VerifiedAppendOwner, Self)> {
-        Self::open_with_origin(
-            path,
-            expected,
-            maximum,
-            identity,
-            members,
-            roster_root,
-            None,
-            cut_binding,
-            check,
-        )
+        Self::open_with_origin(path, expected, maximum, scope, None, cut_binding, check)
     }
 
     pub(crate) fn open_with_origin(
         path: &Path,
         expected: PrefixIdentity,
         maximum: u64,
-        identity: SessionConsensusIdentity,
-        members: &BTreeSet<SessionConsensusNodeId>,
-        roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
+        scope: CatalogScope<'_>,
         snapshot_origin: Option<Arc<NativeSnapshotAuthority>>,
         cut_binding: [u8; 32],
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<(VerifiedAppendOwner, Self)> {
         if let Some(origin) = &snapshot_origin {
-            origin.require_scope(expected.binding, identity, members, roster_root.as_deref())?;
+            origin.require_scope(
+                expected.binding,
+                scope.identity,
+                scope.members,
+                scope.roster_root.as_deref(),
+            )?;
             origin.verify()?;
         }
         let mut decoded = None;
@@ -131,9 +140,7 @@ impl Catalog {
             decoded = Some(Rows::read(
                 reader,
                 expected,
-                identity,
-                members,
-                roster_root.as_deref(),
+                &scope,
                 snapshot_origin.as_deref(),
                 cut_binding,
                 check,
@@ -150,7 +157,7 @@ impl Catalog {
             source: owner.current(),
             rows,
             cut_binding,
-            roster_root,
+            roster_root: scope.roster_root,
             snapshot_origin,
         };
         catalog.resident_index_allocation_bound()?;
@@ -208,9 +215,9 @@ impl Catalog {
                 identity: context.business.identity,
                 members: context.business.members.clone(),
                 frontiers: context.business.frontiers.clone(),
-                keys: ResidentMap::new(),
-                receipts: ResidentMap::new(),
-                generic_receipts: ResidentMap::new(),
+                keys: RowMap::new(),
+                receipts: RowMap::new(),
+                generic_receipts: RowMap::new(),
                 notifications: ResidentVector::new(),
                 roster: roster::Ledger::empty(),
                 roster_root: roster_root.clone(),
@@ -241,7 +248,7 @@ impl Catalog {
             if storage
                 .business
                 .keys
-                .insert(key, SharedRow::new(row))
+                .insert(key, SharedRow::new(row)?)
                 .is_some()
             {
                 return Err(invalid(
@@ -261,7 +268,7 @@ impl Catalog {
             if storage
                 .business
                 .receipts
-                .insert(id, SharedRow::new(row))
+                .insert(id, SharedRow::new(row)?)
                 .is_some()
             {
                 return Err(invalid(
@@ -288,7 +295,7 @@ impl Catalog {
             if storage
                 .business
                 .generic_receipts
-                .insert(id, SharedRow::new(row))
+                .insert(id, SharedRow::new(row)?)
                 .is_some()
             {
                 return Err(invalid(
@@ -307,7 +314,7 @@ impl Catalog {
             storage
                 .business
                 .notifications
-                .push_back(SharedRow::new(row));
+                .push_back(SharedRow::new(row)?);
         }
         for (index, indexed) in logs {
             check()?;
@@ -323,7 +330,7 @@ impl Catalog {
                 || storage
                     .log
                     .entries
-                    .insert(index, SharedRow::new(row))
+                    .insert(index, SharedRow::new(row)?)
                     .is_some()
             {
                 return Err(invalid("native resident log conversion differs"));
@@ -358,7 +365,7 @@ impl Catalog {
                     "native resident roster differs from its authenticated catalog",
                 ));
             }
-            Ok(SharedRow::new(row))
+            SharedRow::new(row)
         });
         storage.business.admit_selected_roster(
             roster_rows,
@@ -625,13 +632,14 @@ impl Rows {
     fn read(
         reader: &mut dyn Read,
         expected: PrefixIdentity,
-        identity: SessionConsensusIdentity,
-        members: &BTreeSet<SessionConsensusNodeId>,
-        root: Option<&RosterAttestationTrustRootV1>,
+        scope: &CatalogScope<'_>,
         origin: Option<&NativeSnapshotAuthority>,
         cut_binding: [u8; 32],
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Self> {
+        let identity = scope.identity;
+        let members = scope.members;
+        let root = scope.roster_root.as_deref();
         check()?;
         let memory =
             VerificationMemory::reserve(64 * 1024 + size_of::<Self>() + size_of::<Catalog>())?;
@@ -690,24 +698,29 @@ impl Rows {
         rows.read_rows(
             &mut reader,
             &base.context,
-            base.checkpoint_epoch,
-            counts,
-            true,
-            format,
+            RowSection {
+                checkpoint: base.checkpoint_epoch,
+                counts,
+                base: true,
+                format,
+            },
             &mut ordinals,
             check,
         )?;
         if format == Format::V4 {
             rows.rosters.read(
                 &mut reader,
-                &base.context,
-                &base.context,
-                base.context
-                    .business
-                    .roster
-                    .as_ref()
-                    .map_or([0; 2], |roster| roster.counts),
-                true,
+                roster_index::Section {
+                    before: &base.context,
+                    after: &base.context,
+                    changed: base
+                        .context
+                        .business
+                        .roster
+                        .as_ref()
+                        .map_or([0; 2], |roster| roster.counts),
+                    base: true,
+                },
                 &rows.keys,
                 root,
                 check,
@@ -776,20 +789,24 @@ impl Rows {
             rows.read_rows(
                 &mut reader,
                 &delta.after,
-                delta.checkpoint_epoch,
-                delta.changed,
-                false,
-                format,
+                RowSection {
+                    checkpoint: delta.checkpoint_epoch,
+                    counts: delta.changed,
+                    base: false,
+                    format,
+                },
                 &mut ordinals,
                 check,
             )?;
             if let Some(changed) = delta.roster_changed {
                 rows.rosters.read(
                     &mut reader,
-                    &delta.before,
-                    &delta.after,
-                    changed,
-                    false,
+                    roster_index::Section {
+                        before: &delta.before,
+                        after: &delta.after,
+                        changed,
+                        base: false,
+                    },
                     &rows.keys,
                     root,
                     check,
@@ -822,13 +839,16 @@ impl Rows {
         &mut self,
         reader: &mut Cursor<'_>,
         after: &Context,
-        checkpoint: u64,
-        counts: [usize; 5],
-        base: bool,
-        format: Format,
+        section: RowSection,
         ordinals: &mut Ordinals,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        let RowSection {
+            checkpoint,
+            counts,
+            base,
+            format,
+        } = section;
         if counts
             .into_iter()
             .any(|count| count > validation::MAX_ITEMS)

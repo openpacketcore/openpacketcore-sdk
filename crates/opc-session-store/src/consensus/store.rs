@@ -1220,6 +1220,11 @@ pub struct ProtectedRosterConsensusDiagnosticSnapshot {
     /// transaction contains a roster command or deterministic roster work.
     pub state_machine_sqlite_commit_latency_millis:
         [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Successful native state-machine application duration for batches
+    /// containing a protected-roster command, including detached validation
+    /// and checked publication. This does not measure a SQLite commit.
+    pub state_machine_native_apply_latency_millis:
+        [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
     /// Number of deterministic roster maintenance turns performed inside an
     /// ordinary response-path state-machine transaction.
     pub response_path_maintenance_turns: u64,
@@ -1309,6 +1314,8 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     protected_roster_log_append_sqlite_commit_latency_millis:
         [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
     protected_roster_state_machine_sqlite_commit_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_state_machine_native_apply_latency_millis:
         [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
     protected_roster_response_path_maintenance_turns: AtomicU64,
     protected_roster_response_path_maintenance_latency_millis:
@@ -1441,6 +1448,14 @@ impl ConsensusStoreDiagnosticCounters {
     pub(crate) fn observe_protected_roster_state_machine_sqlite_commit(&self, elapsed: Duration) {
         Self::record_latency(
             &self.protected_roster_state_machine_sqlite_commit_latency_millis,
+            elapsed,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn observe_protected_roster_state_machine_native_apply(&self, elapsed: Duration) {
+        Self::record_latency(
+            &self.protected_roster_state_machine_native_apply_latency_millis,
             elapsed,
         );
     }
@@ -1757,6 +1772,9 @@ impl ConsensusStoreDiagnosticCounters {
             ),
             state_machine_sqlite_commit_latency_millis: load_buckets(
                 &self.protected_roster_state_machine_sqlite_commit_latency_millis,
+            ),
+            state_machine_native_apply_latency_millis: load_buckets(
+                &self.protected_roster_state_machine_native_apply_latency_millis,
             ),
             response_path_maintenance_turns: self
                 .protected_roster_response_path_maintenance_turns
@@ -15451,6 +15469,7 @@ mod membership_tests {
         counters.observe_protected_roster_proposal_to_applied_response(true, false, Duration::MAX);
         counters.observe_protected_roster_log_append_sqlite_commit(Duration::from_millis(2));
         counters.observe_protected_roster_state_machine_sqlite_commit(Duration::from_millis(4));
+        counters.observe_protected_roster_state_machine_native_apply(Duration::from_millis(4));
         counters.observe_protected_roster_piggyback_maintenance(2, Duration::from_millis(16));
         counters.begin_proactive_checkpoint();
         counters.complete_proactive_checkpoint(false, Duration::from_millis(32));
@@ -15477,6 +15496,7 @@ mod membership_tests {
         );
         assert_eq!(snapshot.log_append_sqlite_commit_latency_millis[2], 1);
         assert_eq!(snapshot.state_machine_sqlite_commit_latency_millis[3], 1);
+        assert_eq!(snapshot.state_machine_native_apply_latency_millis[3], 1);
         assert_eq!(snapshot.response_path_maintenance_turns, 2);
         assert_eq!(snapshot.response_path_maintenance_latency_millis[5], 1);
         assert_eq!(snapshot.background_checkpoint_latency_millis[6], 1);
@@ -15499,6 +15519,7 @@ mod membership_tests {
             "terminal_applied_detached_latency_millis",
             "log_append_sqlite_commit_latency_millis",
             "state_machine_sqlite_commit_latency_millis",
+            "state_machine_native_apply_latency_millis",
             "response_path_maintenance_turns",
             "response_path_maintenance_latency_millis",
             "background_checkpoint_latency_millis",

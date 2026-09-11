@@ -40,6 +40,11 @@ impl ReadNotification<'_> {
 }
 
 impl NativeNotification {
+    #[cfg(any(test, feature = "test-control"))]
+    pub(super) fn is_selected_for_test(&self) -> bool {
+        matches!(self.body, Body::Selected(_))
+    }
+
     pub(super) fn relocation_allocation_bytes() -> usize {
         SharedRow::<Self>::relocated_allocation_bytes()
             + std::mem::size_of::<SelectedNotification>()

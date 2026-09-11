@@ -444,6 +444,23 @@ pub fn consensus_local_wal_costs_for_test(
         .transpose()
 }
 
+/// Release native Rust roots after this store has shut down and joined its
+/// writers. The observer must invoke each supplied release once, synchronously.
+/// This consumes the closed in-memory state and must follow every witness read.
+/// It changes no files, authorizes no recovery, and exposes no row payloads.
+#[cfg(target_os = "linux")]
+pub fn consensus_release_closed_native_owners_for_test(
+    store: &ConsensusSessionStore,
+    observe: impl FnMut(&'static str, &mut dyn FnMut()),
+) -> std::io::Result<serde_json::Value> {
+    store
+        .inner
+        .private_wal
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("native allocation diagnostic requires a WAL owner"))?
+        .release_closed_native_memory_for_test(observe)
+}
+
 /// Enable the explicit volatile-memory performance experiment on one native
 /// voter. Real quorum replication and state-machine application remain active;
 /// storage completion no longer promises cold-crash durability. The existing
@@ -2169,4 +2186,124 @@ fn consumer_record(key: &SessionKey, lease: &LeaseGuard) -> StoredSessionRecord 
         EncryptedSessionPayload::try_envelope(envelope.encode().expect("test envelope"))
             .expect("test encrypted payload");
     record
+}
+
+/// Read raw native durable publication, authority, activation and business
+/// facts with a 25ms bound on owner-lock acquisition. `None` means SQL owns
+/// the store. Business and receipt digests run on a detached capture after
+/// the lock is released, including any selected cold receipt reads.
+/// These facts do not invoke the production acceptance validator. Async and
+/// volatile persistence are errors, not durable evidence.
+#[cfg(target_os = "linux")]
+pub fn consensus_native_activation_facts_for_test(
+    store: &ConsensusSessionStore,
+) -> std::io::Result<Option<serde_json::Value>> {
+    store
+        .inner
+        .private_wal
+        .as_ref()
+        .filter(|wal| wal.is_native())
+        .map(|wal| wal.native_activation_facts_for_test())
+        .transpose()
+}
+
+/// A scoped fixture fault. Explicit restoration reports errors; drop also
+/// attempts restoration during an unwinding test. No fault is persistent
+/// corruption evidence except the separately read-back filesystem latch.
+#[cfg(target_os = "linux")]
+pub struct ConsensusActivationFaultForTest<'a> {
+    restore: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send + 'a>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ConsensusActivationFaultForTest<'_> {
+    /// Restore the one altered fixture field or remove the exact test latch.
+    pub fn restore(mut self) -> std::io::Result<()> {
+        match self.restore.take() {
+            Some(restore) => restore(),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ConsensusActivationFaultForTest<'_> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            if restore().is_err() {
+                eprintln!("activation fixture fault restoration failed");
+            }
+        }
+    }
+}
+
+/// Install one of the bounded fixture faults: 0 removes the resident native
+/// activation, 1 creates the actual recovery latch, 2 drifts the resident
+/// application-authority epoch. Native-only; SQL fixtures use independent SQL.
+#[cfg(target_os = "linux")]
+pub fn consensus_native_activation_fault_for_test<'a>(
+    store: &'a ConsensusSessionStore,
+    database: &std::path::Path,
+    fault: usize,
+) -> std::io::Result<ConsensusActivationFaultForTest<'a>> {
+    use crate::sqlite::consensus::{
+        ensure_operator_recovery_latch_sync, operator_recovery_latch_path,
+        read_operator_recovery_latch_sync, OperatorRecoveryLatch,
+    };
+    let wal = store
+        .inner
+        .private_wal
+        .as_ref()
+        .filter(|wal| wal.is_native())
+        .ok_or_else(|| std::io::Error::other("test fault requires native owner"))?;
+    let restore = match fault {
+        0 | 2 => wal.native_activation_fault_for_test(fault == 0)?,
+        1 => {
+            // Bind the caller's fixture path to the live backend before creating
+            // a latch. The identity is independently checked by the fixture.
+            if !wal.native_fixture_database_matches_for_test(&store.inner.backend, database) {
+                return Err(std::io::Error::other(
+                    "test latch database differs from owner",
+                ));
+            }
+            if read_operator_recovery_latch_sync(database)?.is_some() {
+                return Err(std::io::Error::other("test requires absent recovery latch"));
+            }
+            let latch = OperatorRecoveryLatch {
+                identity: store.inner.storage_identity,
+                recovery_epoch: 1,
+                plan_digest: [0x7b; 32],
+                audit_pending: false,
+            };
+            ensure_operator_recovery_latch_sync(database, latch)?;
+            if read_operator_recovery_latch_sync(database)? != Some(latch) {
+                return Err(std::io::Error::other(
+                    "test recovery latch readback differs",
+                ));
+            }
+            let database = database.to_path_buf();
+            Box::new(move || {
+                if read_operator_recovery_latch_sync(&database)? != Some(latch) {
+                    return Err(std::io::Error::other(
+                        "test recovery latch changed before restore",
+                    ));
+                }
+                let path = operator_recovery_latch_path(&database)?;
+                std::fs::remove_file(&path)?;
+                if let Some(parent) = path.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                if read_operator_recovery_latch_sync(&database)?.is_some() {
+                    return Err(std::io::Error::other(
+                        "test recovery latch restoration differs",
+                    ));
+                }
+                Ok(())
+            })
+        }
+        _ => return Err(std::io::Error::other("unknown test activation fault")),
+    };
+    Ok(ConsensusActivationFaultForTest {
+        restore: Some(restore),
+    })
 }

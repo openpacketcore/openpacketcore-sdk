@@ -318,12 +318,14 @@ impl NativeOwner {
             .fixed_placement_policy
             .ok_or_else(|| invalid_data("native fixed placement missing"))?;
         wal.native_fixed_read(
-            core.storage_identity,
-            &core.expected_members,
-            &core.expected_bindings,
-            placement,
-            true,
-            None,
+            crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                identity: core.storage_identity,
+                members: &core.expected_members,
+                bindings: &core.expected_bindings,
+                placement,
+                pristine: true,
+                database_path: None,
+            },
             |_, exact| {
                 if exact {
                     Ok(())
@@ -334,6 +336,9 @@ impl NativeOwner {
         )?;
         core.applied_progress
             .send_replace(wal.with_native_read(|state| Ok(state.applied()))?);
+        if let Some(diagnostics) = &core.diagnostics {
+            wal.publish_native_roster_occupancy(diagnostics);
+        }
         let wal = Arc::new(wal);
         *self
             .current
@@ -354,7 +359,7 @@ impl NativeOwner {
             SessionPersistenceMode::Durable => ROOT_MAGIC,
             SessionPersistenceMode::Async => ASYNC_ROOT_MAGIC,
         });
-        for (chunk, value) in bytes[8..40].chunks_exact_mut(8).zip([
+        for (chunk, value) in bytes[8..40].as_chunks_mut::<8>().0.iter_mut().zip([
             self.database_identity.0,
             self.database_identity.1,
             directory_identity.0,
@@ -434,13 +439,13 @@ impl NativeOwner {
             _ => return Err(invalid_data("native root persistence format differs")),
         };
         let directory_identity = identity(&directory.metadata()?);
-        for (chunk, expected) in bytes[8..40].chunks_exact(8).zip([
+        for (chunk, expected) in bytes[8..40].as_chunks::<8>().0.iter().zip([
             self.database_identity.0,
             self.database_identity.1,
             directory_identity.0,
             directory_identity.1,
         ]) {
-            if chunk != expected.to_be_bytes() {
+            if *chunk != expected.to_be_bytes() {
                 return Err(invalid_data("native root namespace identity differs"));
             }
         }

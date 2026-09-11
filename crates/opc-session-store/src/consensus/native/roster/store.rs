@@ -291,8 +291,9 @@ impl<'s, 'a> Store<'s, 'a> {
             .index
             .replaced(binding, current.map(|row| &**row), Some(&row))
             .map_err(|_| ReservationError::SnapshotMismatch)?;
+        let row = SharedRow::new(row).map_err(|_| ReservationError::SnapshotMismatch)?;
         ledger
-            .replace_row(binding, Some(SharedRow::new(row)))
+            .replace_row(binding, Some(row))
             .map_err(|_| ReservationError::SnapshotMismatch)?;
         ledger.index = index;
         ledger.witness = Some(next_witness);
@@ -597,9 +598,8 @@ impl RosterCommandStore for Store<'_, '_> {
             None => replacement.to_canonical_bytes()?,
         };
         let row = self.replacement(&ledger, binding, projection, canonical)?;
-        let effect;
         let mut restore_revision = self.restore_revision;
-        match (
+        let effect = match (
             transaction.admission_business_reservation(),
             transaction.business_cas(),
         ) {
@@ -617,7 +617,7 @@ impl RosterCommandStore for Store<'_, '_> {
                     return Err(ReservationError::BusinessCas);
                 }
                 key.reserved = true;
-                effect = (expected.key().clone(), key);
+                (expected.key().clone(), key)
             }
             (None, Some(business)) if admission.is_none() && row.facts.state == State::Retained => {
                 let action = business.action();
@@ -646,10 +646,10 @@ impl RosterCommandStore for Store<'_, '_> {
                     }
                 }
                 key.reserved = false;
-                effect = (expected.key().clone(), key);
+                (expected.key().clone(), key)
             }
             _ => return Err(ReservationError::SnapshotMismatch),
-        }
+        };
         Self::install(&mut ledger, binding, row, transaction.next_witness())?;
         self.accept(ledger)
             .map_err(|_| ReservationError::SnapshotMismatch)?;

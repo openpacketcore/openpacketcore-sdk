@@ -160,12 +160,14 @@ impl SqliteSessionBackend {
                 return Err(io::Error::other("native injected authority failure"));
             }
             wal.native_fixed_read(
-                acceptance.storage_identity,
-                &acceptance.expected_members,
-                &acceptance.expected_bindings,
-                acceptance.expected_placement_policy,
-                false,
-                self.database_path.as_deref().map(PathBuf::as_path),
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity: acceptance.storage_identity,
+                    members: &acceptance.expected_members,
+                    bindings: &acceptance.expected_bindings,
+                    placement: acceptance.expected_placement_policy,
+                    pristine: false,
+                    database_path: self.database_path.as_deref().map(PathBuf::as_path),
+                },
                 |state, exact| {
                     if !exact
                         || acceptance.storage_identity != acceptance.scope_identity
@@ -209,12 +211,14 @@ impl SqliteSessionBackend {
                 return Err(io::Error::other("native status cohort unavailable"));
             }
             wal.native_fixed_receipt_read(
-                acceptance.storage_identity,
-                &acceptance.expected_members,
-                &acceptance.expected_bindings,
-                acceptance.expected_placement_policy,
-                false,
-                self.database_path.as_deref().map(PathBuf::as_path),
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity: acceptance.storage_identity,
+                    members: &acceptance.expected_members,
+                    bindings: &acceptance.expected_bindings,
+                    placement: acceptance.expected_placement_policy,
+                    pristine: false,
+                    database_path: self.database_path.as_deref().map(PathBuf::as_path),
+                },
                 requests,
                 |state, exact, receipts| {
                     if !exact

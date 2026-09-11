@@ -35,6 +35,34 @@ impl ApplicationCapture {
         before_receipt_read: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<ApplicationPublication> {
         check()?;
+        #[cfg(feature = "test-control")]
+        let started = std::time::Instant::now();
+        // An ordinary lease/business update can revalidate a retained roster
+        // reservation too. Schedule detached evaluation before any hydration,
+        // retaining the shared allocation cap and every owner/cancellation
+        // check. Empty non-roster work bypasses it.
+        let roster_work = !self.state.roster.rows.is_empty()
+            || entries.iter().any(|entry| {
+                let EntryPayload::Normal(command) = &entry.payload else {
+                    return false;
+                };
+                let intent = match &command.intent {
+                    SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+                    intent => intent,
+                };
+                matches!(
+                    intent,
+                    SessionMutationIntent::RosterAdmission(_)
+                        | SessionMutationIntent::RosterAdmissionV2(_)
+                        | SessionMutationIntent::RosterTerminal(_)
+                        | SessionMutationIntent::RosterTerminalV2(_)
+                )
+            });
+        let roster_preparation = roster_work
+            .then(|| scratch::RosterPreparation::acquire(check))
+            .transpose()?;
+        #[cfg(feature = "test-control")]
+        let admitted = std::time::Instant::now();
         let reads = self.state.capture_apply_reads(entries)?;
         let copies = if reads.is_empty() {
             None
@@ -45,8 +73,24 @@ impl ApplicationCapture {
         let delta = self
             .state
             .prepare_using_checked(entries, copies.as_ref(), check)?;
+        #[cfg(feature = "test-control")]
+        let evaluated = std::time::Instant::now();
+        // Store::finish_with_changes has destroyed evaluator hydrations.
+        // No admission permit is held while waiting for the next phase.
+        drop(roster_preparation);
+        let _roster_publication = roster_work
+            .then(|| scratch::RosterPreparation::publication(check))
+            .transpose()?;
         let publication = changes::Publication::prepare_checked(delta, check)?;
         check()?;
+        #[cfg(feature = "test-control")]
+        if roster_work {
+            eprintln!(
+                "native_roster_preparation entries={} wait_ms={} evaluation_ms={} publication_ms={}",
+                entries.len(), admitted.duration_since(started).as_millis(),
+                evaluated.duration_since(admitted).as_millis(), evaluated.elapsed().as_millis(),
+            );
+        }
         Ok(ApplicationPublication(publication))
     }
 }

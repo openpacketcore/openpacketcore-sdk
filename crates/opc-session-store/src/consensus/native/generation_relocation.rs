@@ -88,7 +88,8 @@ impl RelocationBuilder {
     pub(super) fn new(maximum: usize) -> io::Result<Self> {
         // Both exact-capacity vectors coexist while ranges become compact
         // rows. Charge the largest concrete value Arc plus selected-body Box;
-        // no payload, revision Arc or prefix index is copied by relocation.
+        // no payload or prefix index is copied by relocation; its logical
+        // revision is retained without a separate allocation.
         let allocation = NativeReceipt::relocation_allocation_bytes()
             .max(NativeNotification::relocation_allocation_bytes())
             .max(log::NativeLogEntry::relocation_allocation_bytes());

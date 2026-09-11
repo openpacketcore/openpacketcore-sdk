@@ -118,13 +118,15 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
         let _io_memory = VerificationMemory::reserve(128 * 1024)?;
         let base = PreparedBase::prepare(
             &native,
-            binding.digest()?,
-            file_epoch,
-            epoch,
-            position.sequence,
-            cut_binding,
-            64 * 1024,
-            MAX_BASIS,
+            crate::consensus::native::generation::BaseParameters {
+                binding: binding.digest()?,
+                file_epoch,
+                checkpoint_epoch: epoch,
+                operation_sequence: position.sequence,
+                cut_binding,
+                block_bytes: 64 * 1024,
+                maximum: MAX_BASIS,
+            },
             &|| Ok(()),
         )?;
         let mut output = io::BufWriter::with_capacity(64 * 1024, &mut file);
@@ -165,9 +167,11 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
         &final_path,
         identity,
         MAX_BASIS,
-        binding.identity,
-        &members,
-        roster_root,
+        crate::consensus::native::generation::CatalogScope {
+            identity: binding.identity,
+            members: &members,
+            roster_root,
+        },
         cut_binding,
         &|| Ok(()),
     )?;

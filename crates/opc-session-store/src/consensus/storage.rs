@@ -4740,7 +4740,9 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
-        wait_until_applied(&self.core, &log_id).await?;
+        wait_until_applied(&self.core, &log_id)
+            .await
+            .map_err(|error| *error)?;
         #[cfg(target_os = "linux")]
         if let Some(mut wal) =
             self.core.private_wal_log_store().await.map_err(|error| {
@@ -4911,10 +4913,26 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             } else {
                 None
             };
+            let roster_started = entries
+                .iter()
+                .any(|entry| match &entry.payload {
+                    EntryPayload::Normal(command) => {
+                        consensus::contains_protected_roster_command(&command.intent)
+                    }
+                    _ => false,
+                })
+                .then(std::time::Instant::now);
             let applied = run_admitted_sqlite_write(&self.shutdown_guard, || {
                 wal.native_apply_committed(&entries)
             })
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
+            if let Some(diagnostics) = &self.core.diagnostics {
+                if let Some(started) = roster_started {
+                    diagnostics
+                        .observe_protected_roster_state_machine_native_apply(started.elapsed());
+                }
+                wal.publish_native_roster_occupancy(diagnostics);
+            }
             if applies_membership {
                 let membership = wal
                     .with_native_read(|state| Ok(state.membership()))
@@ -5065,7 +5083,10 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
         snapshot: Box<SessionSnapshotFile>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
-        let result = self.install_snapshot_inner(meta, snapshot).await;
+        let result = self
+            .install_snapshot_inner(meta, snapshot)
+            .await
+            .map_err(|error| *error);
         if let Err(error) = &result {
             self.core
                 .snapshot_install_failure
@@ -5223,7 +5244,7 @@ impl SqliteConsensusStateMachine {
         &mut self,
         meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
         snapshot: Box<SessionSnapshotFile>,
-    ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+    ) -> Result<(), Box<StorageError<SessionConsensusNodeId>>> {
         #[cfg(target_os = "linux")]
         self.core
             .validate_private_wal_snapshot_cache()
@@ -5457,13 +5478,13 @@ impl SqliteConsensusStateMachine {
                     )
                 })?
             {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     consensus::invalid_data(
                         "session consensus extracted snapshot path was replaced",
                     ),
-                ));
+                )));
             }
             raw_artifact
                 .record_identity_from_file(raw_snapshot.file())
@@ -5553,13 +5574,13 @@ impl SqliteConsensusStateMachine {
                     )
                 })?
             {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     consensus::invalid_data(
                         "session consensus extracted snapshot path was replaced",
                     ),
-                ));
+                )));
             }
             raw_artifact
                 .record_identity_from_file(raw_snapshot.file())
@@ -5627,11 +5648,11 @@ impl SqliteConsensusStateMachine {
                         )
                     })?;
             if promoted_checksum != checksum || promoted_length != total_length {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Read,
                     consensus::invalid_data("session consensus promoted snapshot is inconsistent"),
-                ));
+                )));
             }
             (
                 raw_snapshot,
@@ -5683,13 +5704,13 @@ impl SqliteConsensusStateMachine {
                                 )
                             })?,
                         (Some(_), None) => {
-                            return Err(storage_error(
+                            return Err(Box::new(storage_error(
                                 ErrorSubject::Snapshot(Some(meta.signature())),
                                 ErrorVerb::Read,
                                 consensus::invalid_data(
                                     "legacy fixed snapshot reseed has no current snapshot",
                                 ),
-                            ));
+                            )));
                         }
                         (None, _) => false,
                     }
@@ -5747,13 +5768,13 @@ impl SqliteConsensusStateMachine {
                 )
             })?;
             if observed_previous != previous {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     consensus::invalid_data(
                         "session consensus current snapshot changed under the publication owner",
                     ),
-                ));
+                )));
             }
             if let Some(promoted_pin) = &promoted_pin {
                 promoted_pin
@@ -5872,7 +5893,7 @@ impl SqliteConsensusStateMachine {
         drop(conn);
         let (previous, previous_artifact) = match install_result {
             Ok(previous) => previous,
-            Err(error) => return Err(error),
+            Err(error) => return Err(Box::new(error)),
         };
         // OpenRaft may enqueue PurgeLog immediately after dispatching this
         // install to its independent state-machine worker.  The replacement
@@ -5891,16 +5912,7 @@ impl SqliteConsensusStateMachine {
         drop(prune_preemption.take());
         #[cfg(test)]
         wait_after_snapshot_install_applied_progress(self.core.snapshot_dir.as_ref()).await;
-        if let Some(diagnostics) = &self.core.diagnostics {
-            let conn = self.core.conn.lock().await;
-            match consensus::protected_roster_diagnostic_occupancy_sync(
-                &conn,
-                self.core.storage_identity,
-            ) {
-                Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
-                Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
-            }
-        }
+        self.core.refresh_protected_roster_occupancy().await;
         self.core.signal_proactive_checkpoint();
         raw_artifact.remove().await.map_err(|error| {
             storage_error(
@@ -5927,7 +5939,7 @@ impl SqliteConsensusStateMachine {
 async fn wait_until_applied(
     core: &SqliteConsensusCore,
     through: &LogId<SessionConsensusNodeId>,
-) -> Result<(), StorageError<SessionConsensusNodeId>> {
+) -> Result<(), Box<StorageError<SessionConsensusNodeId>>> {
     let waiting_error =
         |error| storage_error(ErrorSubject::Log(*through), ErrorVerb::Delete, error);
     let deadline = tokio::time::Instant::now()
@@ -5941,7 +5953,7 @@ async fn wait_until_applied(
     let mut install_failure = core.snapshot_install_failure.subscribe();
     loop {
         if let Some(error) = install_failure.borrow_and_update().clone() {
-            return Err(error);
+            return Err(Box::new(error));
         }
         let applied = *applied_progress.borrow_and_update();
         if let Some(applied) = applied {
@@ -5949,9 +5961,9 @@ async fn wait_until_applied(
                 return Ok(());
             }
             if applied.index == through.index {
-                return Err(waiting_error(consensus::invalid_data(
+                return Err(Box::new(waiting_error(consensus::invalid_data(
                     "session consensus applied log conflicts with purge",
-                )));
+                ))));
             }
         }
         tokio::time::timeout_at(deadline, async {
@@ -6030,11 +6042,14 @@ async fn build_file_backed_snapshot_database(
         let expected_members = core.expected_members.clone();
         let expected_bindings = core.expected_bindings.clone();
         let fixed_placement_policy = core.fixed_placement_policy;
-        let snapshot_foreground_pacer = core.snapshot_foreground_pacer();
         let (result, snapshot_guard) = tokio::task::spawn_blocking(move || {
             let result = (|| {
+                // Native export writes the portable projection directly into
+                // the eventual sealed inode. Reclaim the empty raw reservation
+                // before allocating pages; there is no full-size compaction copy.
+                drop(raw_snapshot);
                 let Some((export, captured_cut)) = wal
-                    .native_export_snapshot_into(&raw_snapshot, &|| {
+                    .native_export_portable_snapshot_into(&vacuum_snapshot, &|| {
                         worker_shutdown_guard.snapshot_shutdown_requested()
                     })?
                 else {
@@ -6043,9 +6058,15 @@ async fn build_file_backed_snapshot_database(
                         "native snapshot export stopped after Raft shutdown",
                     ));
                 };
-                consensus::validate_native_snapshot_export_sync(
-                    &export,
-                    &raw_snapshot,
+                if worker_shutdown_guard.snapshot_shutdown_requested() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native snapshot export stopped after Raft shutdown",
+                    ));
+                }
+                consensus::finalize_native_snapshot_database_sync(
+                    export,
+                    vacuum_snapshot,
                     consensus::SnapshotBuildAuthority {
                         identity,
                         profile,
@@ -6054,24 +6075,6 @@ async fn build_file_backed_snapshot_database(
                         fixed_placement_policy,
                     },
                     &captured_cut,
-                )?;
-                drop(export);
-                if worker_shutdown_guard.snapshot_shutdown_requested() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "native snapshot export stopped after Raft shutdown",
-                    ));
-                }
-                consensus::finalize_captured_snapshot_database_into_sync(
-                    identity,
-                    profile,
-                    &expected_members,
-                    &expected_bindings,
-                    fixed_placement_policy,
-                    &captured_cut,
-                    raw_snapshot,
-                    vacuum_snapshot,
-                    &snapshot_foreground_pacer,
                 )
                 .map(|pin| (captured_cut, pin, 0))
             })();
@@ -7256,7 +7259,9 @@ where
     let mut destination = tokio::fs::File::from_std(raw_snapshot.file().try_clone()?);
     let mut copied = 0_u64;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    // This buffer lives across reads. Keeping it inline also embeds 64 KiB
+    // in every enclosing startup future, overflowing ordinary debug stacks.
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = source.read(&mut buffer).await?;
         if read == 0 {

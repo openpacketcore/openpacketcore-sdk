@@ -211,8 +211,8 @@ impl Index {
             .validate_new_binding(first)
             .map_err(|_| invalid("native roster row lies below its partition floor"))?;
         if let Some(cursor) = &partition.cursor {
-            if first.history_epoch() <= cursor.target_epoch() {
-                if first.history_epoch() != cursor.target_epoch()
+            if first.history_epoch() <= cursor.target_epoch()
+                && (first.history_epoch() != cursor.target_epoch()
                     || cursor.last_deleted().is_some_and(|last| first <= last)
                     || self
                         .non_tombstones
@@ -220,12 +220,11 @@ impl Index {
                         .next()
                         .is_some_and(|(other, binding)| {
                             *other == key && binding.history_epoch() <= cursor.target_epoch()
-                        })
-                {
-                    return Err(invalid(
-                        "native roster row lies outside its retirement cursor",
-                    ));
-                }
+                        }))
+            {
+                return Err(invalid(
+                    "native roster row lies outside its retirement cursor",
+                ));
             }
         }
         Ok(())

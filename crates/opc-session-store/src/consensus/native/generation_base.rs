@@ -9,6 +9,24 @@ pub(super) const MAGIC: &[u8; 8] = b"OPCNJ004";
 pub(super) const V3_MAGIC: &[u8; 8] = b"OPCNJ003";
 pub(super) const LEGACY_MAGIC: &[u8; 8] = b"OPCNJ002";
 
+/// Exact caller-supplied generation identity, durable cut and output bounds.
+pub(crate) struct BaseParameters {
+    /// Binding of this generation to its native owner.
+    pub(crate) binding: [u8; 32],
+    /// Identity of the newly created generation file.
+    pub(crate) file_epoch: u64,
+    /// Checkpoint selected by this complete base.
+    pub(crate) checkpoint_epoch: u64,
+    /// Native operation sequence represented by this base.
+    pub(crate) operation_sequence: u64,
+    /// Independently supplied binding of the exact committed cut.
+    pub(crate) cut_binding: [u8; 32],
+    /// Verification block width, validated before alignment arithmetic.
+    pub(crate) block_bytes: usize,
+    /// Existing maximum encoded generation length.
+    pub(crate) maximum: u64,
+}
+
 pub(crate) struct PreparedBase<'a> {
     storage: &'a NativeStorage,
     header: BaseHeader,
@@ -21,15 +39,18 @@ pub(crate) struct PreparedBase<'a> {
 impl<'a> PreparedBase<'a> {
     pub(crate) fn prepare(
         storage: &'a NativeStorage,
-        binding: [u8; 32],
-        file_epoch: u64,
-        checkpoint_epoch: u64,
-        operation_sequence: u64,
-        cut_binding: [u8; 32],
-        block_bytes: usize,
-        maximum: u64,
+        parameters: BaseParameters,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Self> {
+        let BaseParameters {
+            binding,
+            file_epoch,
+            checkpoint_epoch,
+            operation_sequence,
+            cut_binding,
+            block_bytes,
+            maximum,
+        } = parameters;
         check()?;
         let memory = VerificationMemory::reserve(HEADER_MEMORY)?;
         let version = Version::capture(storage)?;

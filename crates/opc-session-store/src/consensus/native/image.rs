@@ -285,7 +285,7 @@ impl NativeStorage {
         for _ in 0..header.keys {
             let (key, value) = if version < 3 {
                 let (key, value): (SessionKey, legacy::Key) = read_row(reader, legacy)?;
-                let value = SharedRow::new(value.into_current(&key)?);
+                let value = SharedRow::new(value.into_current(&key)?)?;
                 (key, value)
             } else {
                 read_row(reader, false)?
@@ -304,7 +304,7 @@ impl NativeStorage {
             let (id, value) = if legacy {
                 let (id, value): (SessionConsensusRequestId, NativeOrdinaryReceipt) =
                     read_row(reader, true)?;
-                (id, SharedRow::new(NativeGenericReceipt::Ordinary(value)))
+                (id, SharedRow::new(NativeGenericReceipt::Ordinary(value))?)
             } else {
                 let format = if version < 4 {
                     generation::Format::V2
@@ -316,7 +316,7 @@ impl NativeStorage {
                     format,
                     &image.business.frontiers,
                 )?;
-                (id, SharedRow::new(value))
+                (id, SharedRow::new(value)?)
             };
             if image.business.generic_receipts.insert(id, value).is_some() {
                 return Err(invalid("native image repeats a generic receipt"));
@@ -339,7 +339,7 @@ impl NativeStorage {
                 .entries
                 .insert(
                     entry.log_id.index,
-                    SharedRow::new(log::NativeLogEntry::new(encoded.into(), entry)),
+                    SharedRow::new(log::NativeLogEntry::new(encoded.into(), entry))?,
                 )
                 .is_some()
             {

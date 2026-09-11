@@ -19,6 +19,12 @@ enum ScaleWorkload {
     PreloadDiagnostic,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScaleHostPolicy {
+    QuietQualification,
+    ContendedDiagnostic,
+}
+
 impl ScalePersistence {
     fn label(self) -> &'static str {
         match self {
@@ -109,6 +115,46 @@ fn volatile_voter_costs(stores: &[ConsensusSessionStore]) -> Vec<serde_json::Val
         .collect()
 }
 
+fn observe_closed_native_memory(stores: &[ConsensusSessionStore]) {
+    if std::env::var_os("OPC_SESSION_NATIVE_ALLOCATION_DIAGNOSTIC").as_deref()
+        != Some(std::ffi::OsStr::new("required"))
+    {
+        return;
+    }
+    assert!(
+        std::env::var_os("LD_PRELOAD").is_none(),
+        "native release accounting uses the original system allocator"
+    );
+    for (voter, store) in stores.iter().enumerate() {
+        let status = || {
+            std::fs::read_to_string("/proc/self/status")
+                .expect("native diagnostic process status")
+                .lines()
+                .filter(|line| {
+                    line.starts_with("VmRSS:")
+                        || line.starts_with("RssAnon:")
+                        || line.starts_with("VmHWM:")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let before = status();
+        let mut roots = Vec::new();
+        let mut total_released_bytes = 0_i128;
+        let counts = opc_session_store::test_support::consensus_release_closed_native_owners_for_test(store, |root, release| {
+            let info = allocation_counter::measure(release);
+            let released_bytes = i128::from(info.bytes_total) - i128::from(info.bytes_current);
+            total_released_bytes += released_bytes;
+            roots.push(serde_json::json!({"root":root,"allocated_bytes_during_drop":info.bytes_total,"released_bytes":released_bytes,"released_allocations":i128::from(info.count_total)-i128::from(info.count_current)}));
+        }).expect("native allocation accounting requires joined fully drained owners");
+        let after = status();
+        eprintln!(
+            "native_original_workload_memory_owners={}",
+            serde_json::json!({"voter":voter,"counts_before_release":counts,"roots_in_release_order":roots,"total_released_bytes":total_released_bytes,"before":before,"after":after,"original_system_allocator":true,"scope":"Actual closed native Rust releases after the unchanged full workload; excludes SQLite C allocations, fixture owners and allocator retained pages"})
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "USER129 original 1,010,000-operation volatile performance measurement"]
 async fn original_workload_preserves_rates_tails_and_limits() {
@@ -148,12 +194,56 @@ async fn public_async_original_preload_diagnostic() {
     run_original_scale(ScalePersistence::Async, ScaleWorkload::PreloadDiagnostic).await;
 }
 
-#[allow(clippy::assertions_on_constants)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "instrumented original public Async workload; contention permitted, no qualification"]
+async fn public_async_original_instrumented_diagnostic() {
+    assert_eq!(
+        std::env::var_os("OPC_SESSION_ASYNC_INSTRUMENTED_DIAGNOSTIC").as_deref(),
+        Some(std::ffi::OsStr::new("required")),
+        "instrumented diagnosis requires its explicit controller",
+    );
+    for conflicting in [
+        "OPC_SESSION_ASYNC_PERFORMANCE_QUALIFICATION",
+        "OPC_SESSION_ASYNC_PRELOAD_DIAGNOSTIC",
+        "OPC_SESSION_VOLATILE_PERFORMANCE_EXPERIMENT",
+    ] {
+        assert!(std::env::var_os(conflicting).is_none());
+    }
+    run_original_scale_with_host_policy(
+        ScalePersistence::Async,
+        ScaleWorkload::Original,
+        ScaleHostPolicy::ContendedDiagnostic,
+    )
+    .await;
+}
+
 async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorkload) {
+    run_original_scale_with_host_policy(persistence, workload, ScaleHostPolicy::QuietQualification)
+        .await;
+}
+
+#[allow(clippy::assertions_on_constants)]
+async fn run_original_scale_with_host_policy(
+    persistence: ScalePersistence,
+    workload: ScaleWorkload,
+    host_policy: ScaleHostPolicy,
+) {
     let mode_label = persistence.label();
+    let evidence_mode = match host_policy {
+        ScaleHostPolicy::QuietQualification => persistence.evidence_mode(),
+        ScaleHostPolicy::ContendedDiagnostic => {
+            "public_async_original_instrumented_diagnostic_contention_permitted_not_qualification"
+        }
+    };
     let build_profile = require_release_qualification_profile();
-    let quiet_host_monitor =
-        QualificationQuietHostMonitor::start().expect("quiet host before original volatile scale");
+    let quiet_host_monitor = match host_policy {
+        ScaleHostPolicy::QuietQualification => Some(
+            QualificationQuietHostMonitor::start()
+                .expect("quiet host before original volatile scale"),
+        ),
+        ScaleHostPolicy::ContendedDiagnostic => None,
+    };
+    eprintln!("sdk-741 original scale host policy: {host_policy:?}; mode={evidence_mode}");
     let started = Instant::now();
     let directory = tempfile::tempdir().expect("original volatile scale directory");
     let snapshot_root = std::fs::canonicalize(
@@ -221,7 +311,7 @@ async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorklo
         eprintln!(
             "sdk-741 {mode_label} original scale preload failure: {}",
             serde_json::json!({
-                "mode": persistence.evidence_mode(),
+                "mode": evidence_mode,
                 "workload": format!("{workload:?}"),
                 "phase": "preload", "stage": stage,
                 "chunk_start": chunk_start, "chunk_end_exclusive": chunk_end,
@@ -366,7 +456,8 @@ async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorklo
         drop(stores);
         drop(peer_slots);
         let quiet_host = quiet_host_monitor
-            .finish()
+            .map(QualificationQuietHostMonitor::finish)
+            .transpose()
             .expect("original preload diagnostic quiet-host interval");
         eprintln!(
             "sdk-741 public async preload diagnostic summary: {}",
@@ -607,7 +698,7 @@ async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorklo
                     eprintln!(
                         "sdk-741 {mode_label} original scale failure: {}",
                         serde_json::json!({
-                            "mode": persistence.evidence_mode(),
+                            "mode": evidence_mode,
                             "phase": phase_name, "stage": failure.stage.as_str(),
                             "offered_ops_per_second": target_rate, "submitted_operations": submitted,
                             "completed_operations": completed, "elapsed_ms": phase_started.elapsed().as_millis(),
@@ -646,7 +737,7 @@ async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorklo
         eprintln!(
             "sdk-741 {mode_label} original scale phase: {}",
             serde_json::json!({
-                "mode": persistence.evidence_mode(),
+                "mode": evidence_mode,
                 "phase": phase_name, "stage": "completed", "offered_ops_per_second": target_rate,
                 "submitted_operations": submitted, "completed_operations": completed,
                 "elapsed_ms": elapsed.as_millis(), "batch_samples": batch_samples,
@@ -749,6 +840,7 @@ async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorklo
     let read_only_retries = transient_retries.load(Ordering::Relaxed);
     let maintenance_retries = maintenance_reconciliation_retries.load(Ordering::Relaxed);
     shutdown_fixed_cluster(&stores, &peer_slots).await;
+    observe_closed_native_memory(&stores);
     drop(stores);
     drop(peer_slots);
     let database_bytes_by_voter = database_paths
@@ -761,10 +853,12 @@ async fn run_original_scale(persistence: ScalePersistence, workload: ScaleWorklo
         .collect::<Vec<_>>();
     let peak_rss_kib = process_peak_rss_kib();
     let quiet_host = quiet_host_monitor
-        .finish()
+        .map(QualificationQuietHostMonitor::finish)
+        .transpose()
         .expect("original volatile scale quiet-host interval");
     let observation = serde_json::json!({
-        "mode": persistence.evidence_mode(),
+        "mode": evidence_mode,
+        "host_policy": format!("{host_policy:?}"), "durable_performance_qualified": false,
         "cargo_profile_family": build_profile.cargo_profile_family, "cargo_opt_level": build_profile.cargo_opt_level,
         "debug_assertions": build_profile.debug_assertions, "topology_voters": statuses.len(),
         "preload_operations": QUALIFICATION_SESSIONS, "total_exact_outcomes": matched_workload_outcomes.load(Ordering::Relaxed),

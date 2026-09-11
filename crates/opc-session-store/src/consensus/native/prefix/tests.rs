@@ -72,10 +72,12 @@ fn append(owner: &mut VerifiedAppendOwner, bytes: &[u8]) -> io::Result<Arc<Verif
     let previous = owner.current();
     owner.append(
         &previous,
-        previous.identity.checkpoint_epoch + 1,
-        previous.identity.operation_sequence,
-        [3; 32],
-        bytes.len() as u64,
+        crate::consensus::native::prefix::AppendTransaction {
+            checkpoint_epoch: previous.identity.checkpoint_epoch + 1,
+            operation_sequence: previous.identity.operation_sequence,
+            frontiers: [3; 32],
+            payload_bytes: bytes.len() as u64,
+        },
         || Ok(()),
         |writer| writer.write_all(bytes),
         |reader| {
@@ -325,16 +327,18 @@ fn native_prefix_wrong_identity_checkpoint_sequence_and_extent_reject_before_wri
         assert!(owner
             .append(
                 &supplied,
-                epoch,
-                sequence,
-                [3; 32],
-                payload,
+                crate::consensus::native::prefix::AppendTransaction {
+                    checkpoint_epoch: epoch,
+                    operation_sequence: sequence,
+                    frontiers: [3; 32],
+                    payload_bytes: payload
+                },
                 || Ok(()),
                 |_| {
                     encoded.set(true);
                     Ok(())
                 },
-                |_| Ok(())
+                |_| Ok(()),
             )
             .is_err());
         assert!(!encoded.get());
@@ -355,10 +359,12 @@ fn native_prefix_short_overlong_semantically_invalid_or_unread_encoding_is_unpub
         let bytes = [0x62; 17];
         let result = owner.append(
             &old,
-            20,
-            41,
-            [3; 32],
-            bytes.len() as u64,
+            crate::consensus::native::prefix::AppendTransaction {
+                checkpoint_epoch: 20,
+                operation_sequence: 41,
+                frontiers: [3; 32],
+                payload_bytes: bytes.len() as u64,
+            },
             || Ok(()),
             |writer| match bad {
                 0 => writer.write_all(&bytes[..16]),
@@ -388,10 +394,12 @@ fn native_prefix_readback_rejects_payload_and_padding_changed_on_same_inode() {
         assert!(owner
             .append(
                 &old,
-                20,
-                41,
-                [3; 32],
-                17,
+                crate::consensus::native::prefix::AppendTransaction {
+                    checkpoint_epoch: 20,
+                    operation_sequence: 41,
+                    frontiers: [3; 32],
+                    payload_bytes: 17
+                },
                 || Ok(()),
                 |writer| { writer.write_all(&[0x62; 17]) },
                 |reader| {
@@ -399,7 +407,7 @@ fn native_prefix_readback_rejects_payload_and_padding_changed_on_same_inode() {
                     fixture.file.write_all_at(&[0x99], offset)?;
                     fixture.file.sync_all()?;
                     check_bytes(reader, 17, 0x62)
-                }
+                },
             )
             .is_err());
         assert!(old.is_failed());
@@ -416,10 +424,12 @@ fn native_prefix_failed_or_panicking_extension_fences_without_tail_repair() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             owner.append(
                 &old,
-                20,
-                41,
-                [3; 32],
-                MIN_BLOCK as u64 + 1,
+                crate::consensus::native::prefix::AppendTransaction {
+                    checkpoint_epoch: 20,
+                    operation_sequence: 41,
+                    frontiers: [3; 32],
+                    payload_bytes: MIN_BLOCK as u64 + 1,
+                },
                 || Ok(()),
                 |writer| {
                     writer.write_all(&vec![0x62; MIN_BLOCK])?;

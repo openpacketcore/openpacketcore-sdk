@@ -153,6 +153,18 @@ pub(in crate::consensus::native) fn validate_candidate(
 }
 
 impl NativeState {
+    pub(crate) fn protected_roster_diagnostic_occupancy(
+        &self,
+    ) -> io::Result<crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy> {
+        self.require_business_proof()?;
+        self.roster
+            .certificate()?
+            .witness()
+            .unwrap_or_else(GlobalChargeWitness::empty)
+            .diagnostic_occupancy()
+            .map_err(|_| invalid("native roster diagnostic witness projection invalid"))
+    }
+
     pub(in crate::consensus::native) fn require_legacy_roster_absent(&self) -> io::Result<()> {
         if self.snapshot_origin.is_some() {
             return Err(invalid(

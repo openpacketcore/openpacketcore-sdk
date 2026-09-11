@@ -711,9 +711,15 @@ fn verify_retained(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "private release 60s SDK 1000 logical ops/s viability; not final qualification"]
 async fn paced_three_voter_sdk_1000_ops_per_second_for_60s() {
-    assert_eq!(env!("OPC_SESSION_STORE_CARGO_PROFILE_FAMILY"), "release");
-    assert_eq!(env!("OPC_SESSION_STORE_CARGO_OPT_LEVEL"), "3");
-    assert!(!cfg!(debug_assertions));
+    assert_eq!(
+        (
+            env!("OPC_SESSION_STORE_CARGO_PROFILE_FAMILY"),
+            env!("OPC_SESSION_STORE_CARGO_OPT_LEVEL"),
+            cfg!(debug_assertions),
+        ),
+        ("release", "3", false),
+        "paced viability requires the original optimized release configuration",
+    );
     let snapshot_parent =
         std::env::var_os("OPC_FS_VERITY_SNAPSHOT_ROOT").expect("strict root required");
     let mut snapshot_root =
@@ -826,6 +832,51 @@ async fn paced_three_voter_sdk_1000_ops_per_second_for_60s() {
         )
     }));
     drop(progress);
+    if std::env::var_os("OPC_SESSION_NATIVE_ALLOCATION_DIAGNOSTIC").as_deref()
+        == Some(std::ffi::OsStr::new("required"))
+    {
+        assert!(
+            receipts.is_ok(),
+            "memory teardown follows complete cold receipt validation"
+        );
+        for (voter, wal) in closed
+            .as_ref()
+            .expect("closed owners for allocation diagnostic")
+            .iter()
+            .enumerate()
+        {
+            let before =
+                std::fs::read_to_string("/proc/self/status").expect("RSS before native release");
+            let mut roots = Vec::new();
+            let mut total_released_bytes = 0_i128;
+            let counts = wal
+                .release_closed_native_memory_for_test(|root, release| {
+                    let info = allocation_counter::measure(release);
+                    let bytes = i128::from(info.bytes_total) - i128::from(info.bytes_current);
+                    total_released_bytes += bytes;
+                    roots.push(serde_json::json!({"root":root,"allocated_bytes_during_drop":info.bytes_total,"released_bytes":bytes,"released_allocations":i128::from(info.count_total)-i128::from(info.count_current)}));
+                })
+                .expect("fully drained native owner");
+            let released = serde_json::json!({"counts_before_release":counts,"roots_in_release_order":roots,"total_released_bytes":total_released_bytes,"scope":"Rust allocations released on this thread by the closed native owner; excludes SQLite C allocations and allocator retained pages"});
+            let after =
+                std::fs::read_to_string("/proc/self/status").expect("RSS after native release");
+            let rss = |status: &str| {
+                status
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("VmRSS:")
+                            || line.starts_with("RssAnon:")
+                            || line.starts_with("VmHWM:")
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            };
+            eprintln!(
+                "private_wal_paced_memory_owners={}",
+                serde_json::json!({"voter":voter,"before":rss(&before),"released":released,"after":rss(&after),"cold_receipt_validation_complete":true,"original_allocator":std::env::var_os("LD_PRELOAD").is_none()})
+            );
+        }
+    }
     let mutable_path = fleet.directory.keep();
     let snapshot_path = snapshot_root.keep();
     eprintln!(

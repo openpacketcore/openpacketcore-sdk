@@ -37,8 +37,8 @@ pub(crate) use relocation::Relocations;
 pub(in crate::consensus::native) use relocation::{PositionedReader, RelocationBuilder};
 #[path = "generation_facts.rs"]
 pub(super) mod facts;
-pub(crate) use base::PreparedBase;
-pub(crate) use catalog::Catalog;
+pub(crate) use base::{BaseParameters, PreparedBase};
+pub(crate) use catalog::{Catalog, CatalogScope};
 pub(crate) use sqlite::SqlitePreparedBase;
 
 const MAGIC: &[u8; 8] = b"OPCNJD04";
@@ -510,10 +510,12 @@ impl PreparedDelta {
     ) -> io::Result<Arc<VerifiedPrefix>> {
         owner.append(
             &self.previous,
-            self.header.checkpoint_epoch,
-            self.header.operation_sequence,
-            self.header.after.digest()?,
-            self.payload_bytes,
+            crate::consensus::native::prefix::AppendTransaction {
+                checkpoint_epoch: self.header.checkpoint_epoch,
+                operation_sequence: self.header.operation_sequence,
+                frontiers: self.header.after.digest()?,
+                payload_bytes: self.payload_bytes,
+            },
             check,
             |writer| self.write_payload(writer, check),
             |reader| self.verify_payload(reader, check, None),
@@ -535,10 +537,12 @@ impl PreparedDelta {
         let mut rows = RelocationBuilder::new(maximum)?;
         let source = owner.append(
             &self.previous,
-            self.header.checkpoint_epoch,
-            self.header.operation_sequence,
-            self.header.after.digest()?,
-            self.payload_bytes,
+            crate::consensus::native::prefix::AppendTransaction {
+                checkpoint_epoch: self.header.checkpoint_epoch,
+                operation_sequence: self.header.operation_sequence,
+                frontiers: self.header.after.digest()?,
+                payload_bytes: self.payload_bytes,
+            },
             check,
             |writer| self.write_payload(writer, check),
             |reader| self.verify_payload(reader, check, Some(&mut rows)),

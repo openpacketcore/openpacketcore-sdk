@@ -105,7 +105,7 @@ mod tests {
             storage
                 .business
                 .keys
-                .insert(key.clone(), SharedRow::new(row));
+                .insert(key.clone(), SharedRow::new(row).unwrap());
             storage.business.admit_business().unwrap();
             let mut bytes = Vec::new();
             storage

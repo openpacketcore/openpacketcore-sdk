@@ -236,7 +236,7 @@ impl Ledger {
                 .map_err(|_| invalid("native roster partition charge overflow"))?;
             if next
                 .partitions
-                .insert(key, SharedRow::new(partition))
+                .insert(key, SharedRow::new(partition)?)
                 .is_some()
             {
                 return Err(invalid("native roster repeats a partition"));

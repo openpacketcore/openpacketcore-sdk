@@ -80,9 +80,11 @@ fn admitted(
         &path,
         identity,
         MAXIMUM,
-        scope,
-        &fixed_members(),
-        root.cloned().map(Arc::new),
+        crate::consensus::native::generation::CatalogScope {
+            identity: scope,
+            members: &fixed_members(),
+            roster_root: root.cloned().map(Arc::new),
+        },
         CUT,
         &|| Ok(()),
     )

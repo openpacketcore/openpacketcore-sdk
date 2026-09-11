@@ -365,6 +365,9 @@ impl PrivateWalTest {
                 Some(wal.binding());
             core.applied_progress
                 .send_replace(wal.with_native_read(|state| Ok(state.applied()))?);
+            if let Some(diagnostics) = &core.diagnostics {
+                wal.publish_native_roster_occupancy(diagnostics);
+            }
             let wal = Arc::new(wal);
             *self
                 .current

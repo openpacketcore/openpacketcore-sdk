@@ -11,7 +11,7 @@ use std::mem::size_of;
 
 #[path = "scratch_admission.rs"]
 mod admission;
-pub(super) use admission::LogMemory;
+pub(super) use admission::{LogMemory, RosterPreparation};
 
 // Per closed V2 request shape, 128 key slots cover all nested object fields.
 // Each 512-byte slot covers a decoded field name and even a separate B-tree

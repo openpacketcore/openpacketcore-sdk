@@ -1,4 +1,5 @@
 use super::*;
+use crate::consensus::native::roster::v1_fixture;
 use crate::consensus::types::{
     protected_roster_profile_v2_voter_set_digest, protected_roster_profile_voter_set_digest,
     ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome,
@@ -11,9 +12,6 @@ use crate::sqlite::consensus::{
 };
 use opc_consensus::engine::Membership;
 use rusqlite::Connection;
-
-#[path = "roster/v1_fixture.rs"]
-mod v1_fixture;
 
 fn configured(signed: &RosterV2PersistenceFixture) -> NativeStorage {
     let members = [7, 8, 9]
@@ -44,7 +42,8 @@ fn configured(signed: &RosterV2PersistenceFixture) -> NativeStorage {
             lease: Some(NativeLease::from_guard(&guard).unwrap()),
             fence: authority.fence().get(),
             reserved: false,
-        }),
+        })
+        .unwrap(),
     );
     state.frontiers.next_fence = authority.fence().get() + 1;
     state.frontiers.next_credential = authority.credential_id() + 1;
@@ -163,7 +162,7 @@ fn exact_rosters(restored: &NativeStorage, expected: &NativeStorage) {
         expected.business.roster.partitions.len()
     );
     for (key, row) in &restored.business.roster.partitions {
-        assert!(&**row == &**expected.business.roster.partitions.get(key).unwrap());
+        assert!(**row == **expected.business.roster.partitions.get(key).unwrap());
     }
     for (key, row) in &expected.business.keys {
         assert_eq!(
@@ -458,11 +457,13 @@ fn native_roster_generation_requires_independent_root_and_rejects_rehashed_carri
             &files.path,
             catalog.identity(),
             MAXIMUM,
-            storage.business.identity,
-            &storage.business.members,
-            root,
+            crate::consensus::native::generation::CatalogScope {
+                identity: storage.business.identity,
+                members: &storage.business.members,
+                roster_root: root
+            },
             CUT,
-            &|| Ok(())
+            &|| Ok(()),
         )
         .is_err());
     }
@@ -476,9 +477,11 @@ fn native_roster_generation_requires_independent_root_and_rejects_rehashed_carri
         &path,
         identity,
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        Some(Arc::new(wrong_root)),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: Some(Arc::new(wrong_root)),
+        },
         CUT,
         &|| Ok(()),
     )
@@ -602,9 +605,11 @@ fn native_roster_generation_omitted_business_release_and_retired_transient_rejec
         &files.path,
         files.owner.current().identity(),
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         prepared.header.cut_binding,
         &|| Ok(()),
     )
@@ -641,9 +646,11 @@ fn native_roster_generation_omitted_business_release_and_retired_transient_rejec
         &files.path,
         files.owner.current().identity(),
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         prepared.header.cut_binding,
         &|| Ok(()),
     )
@@ -699,7 +706,7 @@ fn native_roster_generation_floor_advance_requires_the_original_retired_epoch() 
         .business
         .roster
         .partitions
-        .insert(key, SharedRow::new(forged.clone()));
+        .insert(key, SharedRow::new(forged.clone()).unwrap());
     isolated.business.admit_business().unwrap();
     isolated.log.admit(&isolated.business).unwrap();
     isolated.validate_image().unwrap();
@@ -730,9 +737,11 @@ fn native_roster_generation_floor_advance_requires_the_original_retired_epoch() 
         &files.path,
         files.owner.current().identity(),
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         prepared.header.cut_binding,
         &|| Ok(()),
     )
@@ -851,9 +860,11 @@ fn native_roster_generation_empty_activation_and_failed_conversion_expose_no_sta
         &files.path,
         source.identity(),
         MAXIMUM,
-        storage.business.identity,
-        &storage.business.members,
-        storage.business.roster_root.clone(),
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
         CUT,
         &|| Ok(()),
     )

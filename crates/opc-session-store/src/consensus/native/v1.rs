@@ -50,7 +50,7 @@ impl NativeGenericReceipt {
         Ok(match self {
             Self::Ordinary(row) => Self::Ordinary(NativeOrdinaryReceipt {
                 payload_digest: row.payload_digest,
-                response: owned::ordinary_response(&row.response)?,
+                response: Box::new(owned::ordinary_response(&row.response)?),
             }),
             Self::FencedV1(row) => Self::FencedV1(NativeV1Receipt {
                 payload_digest: row.payload_digest,

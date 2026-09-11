@@ -14,6 +14,8 @@ use std::time::Duration;
 
 const LARGE_LOG_BYTES: usize = PROCESS_VERIFICATION_BYTES / 8;
 static LARGE_LOG: LargeLogGate = LargeLogGate::new();
+static ROSTER_PREPARATION: LargeLogGate = LargeLogGate::new();
+static ROSTER_PUBLICATION: LargeLogGate = LargeLogGate::new();
 
 struct LargeLogGate {
     busy: Mutex<bool>,
@@ -70,6 +72,34 @@ impl Drop for LargeLogPermit {
             .unwrap_or_else(|poison| poison.into_inner());
         *busy = false;
         self.0.available.notify_one();
+    }
+}
+
+/// A roster evaluator owns predecessor hydration and replacement verification
+/// together. Publication starts after that evaluator and its hydrations drop;
+/// it has a separate gate so the next voter may evaluate concurrently. Both
+/// phases still reserve every allocation against the same process cap. These
+/// permits span detached pinned reads, never State, and cannot nest with each
+/// other. Large log decoding keeps its independent gate.
+pub(in crate::consensus::native) struct RosterPreparation {
+    _permit: Option<LargeLogPermit>,
+}
+
+impl RosterPreparation {
+    pub(in crate::consensus::native) fn acquire(
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let permit = ROSTER_PREPARATION.acquire(LARGE_LOG_BYTES, check)?;
+        check()?;
+        Ok(Self { _permit: permit })
+    }
+
+    pub(in crate::consensus::native) fn publication(
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let permit = ROSTER_PUBLICATION.acquire(LARGE_LOG_BYTES, check)?;
+        check()?;
+        Ok(Self { _permit: permit })
     }
 }
 

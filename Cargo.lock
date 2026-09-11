@@ -3733,6 +3733,7 @@ name = "opc-session-store"
 version = "0.2.0"
 dependencies = [
  "aes-gcm-siv",
+ "allocation-counter",
  "async-trait",
  "bytes",
  "futures-util",

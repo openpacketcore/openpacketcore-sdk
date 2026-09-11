@@ -240,6 +240,31 @@ fn native_roster_configured_root_signed_wal_replay_and_closed_audit_match_sql() 
                 },
             );
             let setup = parity(&wal, &backend, &signed, &[formation(), lease, activation]);
+            for members in [
+                fixed_members(),
+                BTreeSet::new(),
+                BTreeSet::from([node_id()]),
+            ] {
+                let expected = protected_roster_profile_v2_activation_matches_scope_sync(
+                    &backend.conn.blocking_lock(),
+                    signed.identity,
+                    signed.identity,
+                    &members,
+                )
+                .unwrap();
+                assert_eq!(
+                    wal.native_public_scalar_read(|state| Ok(
+                        state.protected_roster_v2_activation_matches(signed.identity, &members)
+                    ))
+                    .unwrap(),
+                    expected,
+                );
+            }
+            assert!(!wal
+                .native_public_scalar_read(|state| Ok(
+                    state.protected_roster_activation_matches(signed.identity, &fixed_members())
+                ))
+                .unwrap());
             assert!(
                 matches!(&setup.responses[1].result,Ok(SessionMutationOutcome::Lease(guard))
                 if guard.key() == signed.authority.key() && guard.owner() == signed.authority.owner()
@@ -414,12 +439,14 @@ async fn native_roster_core_configuration_reaches_fresh_and_reopened_owner() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("backend.sqlite");
     let snapshots = directory.path().join("snapshots");
-    let fixture = crate::sqlite::consensus::wal::integration::PrivateWalTest::new_native(
-        directory.path().join("wal"),
-        [0xC3; 32],
+    let fixture = Arc::new(
+        crate::sqlite::consensus::wal::integration::PrivateWalTest::new_native(
+            directory.path().join("wal"),
+            [0xC3; 32],
+        ),
     );
     for _ in 0..2 {
-        let backend = SqliteSessionBackend::open(&database).unwrap();
+        let mut backend = SqliteSessionBackend::open(&database).unwrap();
         let mut core = SqliteConsensusCore::initialize_with_roster_attestation_root(
             &backend,
             snapshots.clone(),
@@ -433,6 +460,7 @@ async fn native_roster_core_configuration_reaches_fresh_and_reopened_owner() {
         .await
         .unwrap();
         fixture.attach(&mut core).await.unwrap();
+        backend.private_wal_test = Some(Arc::clone(&fixture));
         let root = core.configured_roster_root.as_ref().unwrap();
         assert!(root.as_ref() == &signed.root);
         let wal = Arc::clone(core.private_wal.as_ref().unwrap());
@@ -443,9 +471,25 @@ async fn native_roster_core_configuration_reaches_fresh_and_reopened_owner() {
             .with_native_read(|state| Ok(state.applied()))
             .unwrap()
             .is_none());
+        assert!(!backend
+            .consensus_protected_roster_profile_v2_activation_matches_scope(
+                signed.identity,
+                signed.identity,
+                fixed_members(),
+            )
+            .await
+            .unwrap());
         tokio::task::spawn_blocking(move || wal.shutdown())
             .await
             .unwrap()
             .unwrap();
+        assert!(backend
+            .consensus_protected_roster_profile_v2_activation_matches_scope(
+                signed.identity,
+                signed.identity,
+                fixed_members(),
+            )
+            .await
+            .is_err());
     }
 }

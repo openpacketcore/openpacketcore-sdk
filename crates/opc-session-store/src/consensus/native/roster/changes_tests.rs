@@ -129,13 +129,14 @@ fn native_roster_journal_requires_exact_row_partition_and_ledger_revisions() {
     let (ledger, mut journal, _, _) = store.finish_with_changes().unwrap();
     let original = journal.rows[&binding].after.as_ref().unwrap().clone();
     let equal = Row::from_hydration(&original.hydrate(&signed.root, &scope).unwrap()).unwrap();
-    journal.rows.get_mut(&binding).unwrap().after = Some(SharedRow::new(equal));
+    journal.rows.get_mut(&binding).unwrap().after = Some(SharedRow::new(equal).unwrap());
     assert!(journal.require_current(&ledger).is_err());
     assert!(journal.validate(&|| Ok(())).is_err());
     journal.rows.get_mut(&binding).unwrap().after = Some(original);
     let key = ProductionFloorKey::from_binding(binding).unwrap();
     let original = journal.partitions[&key].after.as_ref().unwrap().clone();
-    journal.partitions.get_mut(&key).unwrap().after = Some(SharedRow::new((*original).clone()));
+    journal.partitions.get_mut(&key).unwrap().after =
+        Some(SharedRow::new((*original).clone()).unwrap());
     assert!(journal.require_current(&ledger).is_err());
     assert!(journal.validate(&|| Ok(())).is_err());
     journal.partitions.get_mut(&key).unwrap().after = Some(original);
@@ -173,7 +174,7 @@ fn native_roster_journal_preflight_failure_discards_business_witness_and_index_c
     let original = store.changes.rows[&binding].after.as_ref().unwrap().clone();
     let equal =
         Row::from_hydration(&original.hydrate(&signed.root, &store.scope).unwrap()).unwrap();
-    store.changes.rows.get_mut(&binding).unwrap().after = Some(SharedRow::new(equal));
+    store.changes.rows.get_mut(&binding).unwrap().after = Some(SharedRow::new(equal).unwrap());
     let ledger = store.ledger.clone();
     let key = store.key(signed.authority.key());
     let revision = store.restore_revision;

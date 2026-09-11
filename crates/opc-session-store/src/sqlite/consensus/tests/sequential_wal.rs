@@ -2422,7 +2422,7 @@ fn select_snapshot_proof_anchor(path: &Path, field: &str) {
         })
         .unwrap();
     let mut selected = b"OPCWBAS1".to_vec();
-    selected.extend_from_slice(body[start..end].as_bytes());
+    selected.extend_from_slice(&body.as_bytes()[start..end]);
     selected.extend_from_slice(&Sha256::digest(&selected));
     std::fs::write(path.join("CURRENT"), selected).unwrap();
 }

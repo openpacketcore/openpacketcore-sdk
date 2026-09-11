@@ -98,10 +98,10 @@ fn reconstruct(
             Some(row) => {
                 let encoded: Bytes = row.resident().unwrap().encoded.to_vec().into();
                 let entry = sql::decode_consensus_log_entry(&encoded).unwrap();
-                decoded
-                    .log
-                    .entries
-                    .insert(*index, SharedRow::new(NativeLogEntry::new(encoded, entry)));
+                decoded.log.entries.insert(
+                    *index,
+                    SharedRow::new(NativeLogEntry::new(encoded, entry)).unwrap(),
+                );
             }
             None => {
                 decoded.log.entries.remove(index);
@@ -378,16 +378,16 @@ fn native_log_changes_full_admission_checks_raw_schema_typed_binding_and_holes()
         match kind {
             0 => {
                 changed.resident_mut().unwrap().encoded = Bytes::from_static(b"{");
-                log.entries.insert(1, SharedRow::new(changed));
+                log.entries.insert(1, SharedRow::new(changed).unwrap());
             }
             1 => {
                 changed.resident_mut().unwrap().entry.log_id = id(2, 1);
-                log.entries.insert(1, SharedRow::new(changed));
+                log.entries.insert(1, SharedRow::new(changed).unwrap());
             }
             2 => {
                 changed.resident_mut().unwrap().encoded =
                     serde_json::to_vec(&blank(1, 2)).unwrap().into();
-                log.entries.insert(1, SharedRow::new(changed));
+                log.entries.insert(1, SharedRow::new(changed).unwrap());
             }
             3 => {
                 log.entries.remove(&1);
@@ -463,8 +463,10 @@ impl CapturedLog {
             if let Some(row) = &change.after {
                 let encoded: Bytes = row.resident().unwrap().encoded.to_vec().into();
                 let entry = sql::decode_consensus_log_entry(&encoded).unwrap();
-                log.entries
-                    .insert(*index, SharedRow::new(NativeLogEntry::new(encoded, entry)));
+                log.entries.insert(
+                    *index,
+                    SharedRow::new(NativeLogEntry::new(encoded, entry)).unwrap(),
+                );
             } else {
                 log.entries.remove(index);
             }
@@ -520,7 +522,7 @@ fn native_capture_log_worker_rejects_omission_stale_stamp_and_raw_schema_corrupt
                 } else {
                     row.resident_mut().unwrap().entry.log_id = id(2, 3);
                 }
-                change.after = Some(SharedRow::new(row));
+                change.after = Some(SharedRow::new(row).unwrap());
             }
             _ => unreachable!(),
         }
@@ -551,17 +553,18 @@ fn native_capture_log_witnesses_bind_schema_membership_and_exact_revision() {
                     witness.index += 1;
                 }
                 2 => {
-                    witness.row = SharedRow::new((*witness.row).clone());
+                    witness.row = SharedRow::new((*witness.row).clone()).unwrap();
                 }
                 _ => {
                     let entry = blank(1, 0);
                     witness.row = SharedRow::new(NativeLogEntry::new(
                         serde_json::to_vec(&entry).unwrap().into(),
                         entry,
-                    ));
+                    ))
+                    .unwrap();
                     // Even a forged process revision cannot make the wrong
                     // membership payload satisfy the captured full context.
-                    witness.revision = witness.row.address();
+                    witness.revision = witness.row.revision();
                     for other in captured.log.witnesses.iter_mut().skip(1) {
                         *other = None;
                     }

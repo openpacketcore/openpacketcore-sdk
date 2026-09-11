@@ -29,13 +29,15 @@ fn frozen(
     let identity = {
         let prepared = PreparedBase::prepare(
             &storage,
-            root,
-            1,
-            1,
-            7,
-            [0xD7; 32],
-            64 * 1024,
-            crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES,
+            crate::consensus::native::generation::BaseParameters {
+                binding: root,
+                file_epoch: 1,
+                checkpoint_epoch: 1,
+                operation_sequence: 7,
+                cut_binding: [0xD7; 32],
+                block_bytes: 64 * 1024,
+                maximum: crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES,
+            },
             &|| Ok(()),
         )
         .unwrap();
@@ -51,9 +53,11 @@ fn frozen(
         &path,
         identity,
         crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES,
-        signed.identity,
-        &fixed_members(),
-        Some(Arc::new(signed.root.clone())),
+        crate::consensus::native::generation::CatalogScope {
+            identity: signed.identity,
+            members: &fixed_members(),
+            roster_root: Some(Arc::new(signed.root.clone())),
+        },
         [0xD7; 32],
         &|| Ok(()),
     )

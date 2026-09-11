@@ -680,8 +680,7 @@ pub(super) fn restore_transaction(
         let mut next = next_index(current)?;
         while next <= applied.index {
             let end = next
-                .checked_add(MAX_ENTRIES as u64)
-                .unwrap_or(u64::MAX)
+                .saturating_add(MAX_ENTRIES as u64)
                 .min(next_index(Some(applied))?);
             let entries = read_log_range_sync(
                 &state.conn,

@@ -34,7 +34,7 @@ pub(super) fn assert_ledger_frames(store: &Store<'_, '_>, sequence: u64) {
         let mut exact = Vec::new();
         assert_eq!(frame::write_row(&mut exact, &rebuilt).unwrap(), length);
         assert_eq!(exact, encoded);
-        rows.push(SharedRow::new(rebuilt));
+        rows.push(SharedRow::new(rebuilt).unwrap());
     }
     let mut partitions = Vec::new();
     for (key, partition) in &store.ledger.partitions {

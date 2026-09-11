@@ -64,6 +64,34 @@ durable completion. Recovery validates the selected generation and all
 acknowledged retained history; it cannot silently fall back to older state or
 repair damage within acknowledged coverage.
 
+The business key, V2 receipt, and generic receipt indexes share immutable
+full-key/row entries through pointer-sized persistent hash-trie slots. Hashes
+only select buckets: collision resolution compares every original key byte.
+Replacing an entry preserves all earlier captures, and physical relocation
+continues to carry the existing independent `SharedRow` revision. Map codecs
+retain the original complete key and row fields; this changes resident
+allocation ownership, not persisted formats or history retention. Allocation
+regressions measure the actual live owners and capture releases. Those focused
+measurements do not replace the full three-voter process RSS qualification.
+
+Native snapshot export writes the portable SQLite business projection directly
+into the staging inode that will be sealed and published. It does not write
+local Raft log payloads and then allocate a second database to compact them
+away. The immutable native capture still validates local Raft frontiers and
+reads/authenticates the covered selected log bytes. Portable state retains all
+required records, leases, receipts, watch history, roster state, and the exact
+applied/membership cut. Finalization rotates restore metadata and validates the
+synced output before the existing seal, publication, and reclamation sequence.
+Install-base export separately retains the complete local predecessor required
+by the installer. The snapshot format and existing SQLite fallback are unchanged.
+
+This removes the native raw/compacted payload duplication; it does not reserve
+filesystem bytes against concurrent users. Capacity must still cover retained
+snapshots and origins, one growing portable staging database per active native
+builder, integrity metadata, and the separate native generations. The existing
+extent and namespace limits remain enforced. Retention limits and process RSS
+qualification are independent of this workspace reduction.
+
 Ordinary construction selects a fresh native root or reopens its exact selected
 state. The backing retains native-selection knowledge independently of the
 native directory, so missing selected state is an error. Existing populated

@@ -14076,8 +14076,15 @@ fn protected_roster_process_loss_voter_positions(
 }
 
 #[cfg(feature = "test-control")]
-fn protected_roster_process_loss_counter_total<const N: usize>(counters: &[u64; N]) -> u64 {
-    counters.iter().copied().sum()
+fn protected_roster_process_loss_apply_total(
+    snapshot: &ProtectedRosterConsensusDiagnosticSnapshot,
+) -> u64 {
+    snapshot
+        .state_machine_sqlite_commit_latency_millis
+        .iter()
+        .chain(&snapshot.state_machine_native_apply_latency_millis)
+        .copied()
+        .sum()
 }
 
 #[cfg(feature = "test-control")]
@@ -14104,13 +14111,9 @@ fn assert_protected_roster_process_loss_state_unchanged(
             "{context}: tombstone reservations remain unchanged on voter {voter}",
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &before[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            "{context}: no roster-bearing state-machine transaction commits on voter {voter}",
+            protected_roster_process_loss_apply_total(&after[voter]),
+            protected_roster_process_loss_apply_total(&before[voter]),
+            "{context}: no roster-bearing state-machine publications on voter {voter}",
         );
     }
 }
@@ -14941,12 +14944,8 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
             admission_diagnostics_before[voter].retained_reservations,
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &admission_diagnostics_after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &admission_diagnostics_before[voter].state_machine_sqlite_commit_latency_millis,
-            ) + 1,
+            protected_roster_process_loss_apply_total(&admission_diagnostics_after[voter]),
+            protected_roster_process_loss_apply_total(&admission_diagnostics_before[voter]) + 1,
             "exactly one roster-bearing state-machine transaction commits PollAdmit on every voter",
         );
     }
@@ -15188,12 +15187,8 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
             "the generic successor-fence acquisition is not a roster mutation",
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &current_fence_diagnostics_after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &current_fence_diagnostics_before[voter].state_machine_sqlite_commit_latency_millis,
-            ),
+            protected_roster_process_loss_apply_total(&current_fence_diagnostics_after[voter]),
+            protected_roster_process_loss_apply_total(&current_fence_diagnostics_before[voter]),
             "the generic successor-fence acquisition commits no roster state-machine transaction",
         );
     }
@@ -15396,12 +15391,8 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
             "terminalization converts the same reservation into one retained terminal on every voter",
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &terminal_diagnostics_after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &terminal_diagnostics_before[voter].state_machine_sqlite_commit_latency_millis,
-            ) + 1,
+            protected_roster_process_loss_apply_total(&terminal_diagnostics_after[voter]),
+            protected_roster_process_loss_apply_total(&terminal_diagnostics_before[voter]) + 1,
             "exactly one roster-bearing state-machine transaction commits Established on every voter",
         );
     }

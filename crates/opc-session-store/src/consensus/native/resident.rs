@@ -101,7 +101,24 @@ pub(super) struct ColdReceipt {
     // content. A cloned row with an altered scalar cannot reuse that digest.
     binding: [u8; 32],
     content: [u8; 32],
-    response: generation::facts::Response,
+    response_sequence: u64,
+    response_raft_index: u64,
+}
+
+// Complete admission already proves the exact fixed retention relation.
+// Keep its single timestamp resident and recover the original response time
+// without rounding, saturation or an inferred default. Constructors compare
+// this inverse to the independently decoded response before discarding its
+// duplicate field. Full response bytes and their content digest stay intact.
+fn receipt_response_time(retained_until: Timestamp) -> io::Result<Timestamp> {
+    let retention = time::Duration::try_from(FENCED_TRANSITION_OUTCOME_RETENTION)
+        .map_err(|_| invalid("native receipt retention duration invalid"))?;
+    retained_until
+        .as_offset_datetime()
+        .checked_sub(retention)
+        .map(Timestamp::from_offset_datetime)
+        .filter(|time| retention_deadline(*time) == Some(retained_until))
+        .ok_or_else(|| invalid("native receipt retained response time invalid"))
 }
 
 struct HashWriter(Sha256);
@@ -189,7 +206,11 @@ impl NativeReceipt {
             if self.response.is_some() {
                 return Err(invalid("native receipt has two representations"));
             }
-            Ok(Some(cold.response))
+            Ok(Some(generation::facts::Response {
+                sequence: cold.response_sequence,
+                logical_time: receipt_response_time(self.retained_until)?,
+                raft_index: cold.response_raft_index,
+            }))
         } else {
             self.response
                 .as_deref()
@@ -235,12 +256,16 @@ impl NativeReceipt {
             cold: None,
         };
         if let Some(response) = facts.facts.response {
+            if receipt_response_time(row.retained_until)? != response.logical_time {
+                return Err(invalid("native admitted receipt retention differs"));
+            }
             row.cold = Some(Box::new(ColdReceipt {
                 source,
                 range,
                 binding: receipt_binding(&id, &row)?,
                 content: facts.content,
-                response,
+                response_sequence: response.sequence,
+                response_raft_index: response.raft_index,
             }));
         } else if changes::fingerprint(1, &id, &row)? != facts.content {
             return Err(invalid("native admitted receipt tombstone differs"));

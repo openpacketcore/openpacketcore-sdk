@@ -247,7 +247,6 @@ impl<B: ProtectedSessionBackend + 'static> Lab<B> {
             timeout(CLEANUP_BOUND, self.fixture.shutdown()).await,
             "fixture shutdown bound",
         )
-        .ok()
         .expect("fixture shutdown");
     }
 }

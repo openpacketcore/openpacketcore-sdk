@@ -71,7 +71,7 @@ pub(super) fn stamp<T: resident::RowFingerprint>(
     let mut hash = Sha256::new();
     hash.update(b"OPC-native-process-revision-v1\0");
     hash.update(content);
-    hash.update(value.address().to_le_bytes());
+    hash.update(value.revision().to_le_bytes());
     Ok(RowStamp {
         content,
         revision: hash.finalize().into(),
@@ -200,7 +200,7 @@ struct StagedRow<K, T> {
 fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint>(
     table: u8,
     rows: HashMap<K, T>,
-    base: &ResidentMap<K, SharedRow<T>>,
+    base: &RowMap<K, SharedRow<T>>,
     tracking: bool,
     summary: &mut TableSummary,
 ) -> io::Result<Vec<StagedRow<K, T>>> {
@@ -211,7 +211,7 @@ fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint>(
             .as_ref()
             .map(|value| stamp(table, &key, value))
             .transpose()?;
-        let after = SharedRow::new(value);
+        let after = SharedRow::new(value)?;
         let after_hash = Some(stamp(table, &key, &after)?);
         summary.replace(before_hash, after_hash)?;
         let journal_key = tracking.then(|| key.clone());
@@ -311,7 +311,7 @@ impl BusinessChanges {
         self.roster.require_current(&state.roster)?;
         fn current<K: Eq + Hash, T>(
             changes: &HashMap<K, RowChange<T>>,
-            rows: &ResidentMap<K, SharedRow<T>>,
+            rows: &RowMap<K, SharedRow<T>>,
         ) -> io::Result<()> {
             if changes
                 .iter()
@@ -383,7 +383,7 @@ impl BusinessChanges {
                 self.roster.validate(check)?;
             }
         }
-        scratch::small(check, &|| {
+        scratch::small(check, || {
             validate_frontier_transition(&self.base.frontiers, &self.target.frontiers, true)
         })?;
         let mut tables = self.base.tables;
@@ -399,7 +399,7 @@ impl BusinessChanges {
         if tables != self.target.tables {
             return Err(invalid("native capture omitted or changed published rows"));
         }
-        scratch::small(check, &|| {
+        scratch::small(check, || {
             validation::validate_frontiers(
                 self.target.identity,
                 &self.target.members,
@@ -411,7 +411,7 @@ impl BusinessChanges {
         for (key, change) in &self.keys {
             check()?;
             if let Some(row) = &change.after {
-                scratch::key(row, check, &|| {
+                scratch::key(row, check, || {
                     validation::validate_key(key, row, &self.target.frontiers)
                 })?;
             }
@@ -434,7 +434,7 @@ impl BusinessChanges {
                 ));
             }
             if let Some(row) = &change.after {
-                scratch::receipt(check, &|| {
+                scratch::receipt(check, || {
                     validation::validate_receipt(
                         self.target.identity,
                         id,
@@ -487,7 +487,7 @@ impl BusinessChanges {
                 .checked_add(offset)
                 .and_then(|index| index.checked_add(1))
                 .ok_or_else(|| invalid("native captured notification sequence overflow"))?;
-            scratch::small(check, &|| {
+            scratch::small(check, || {
                 row.validate(sequence as u64, &self.target.frontiers)
             })?;
         }
@@ -551,7 +551,7 @@ impl SnapshotSelection {
 
 fn validate_staged<K: Eq + Hash, T>(
     rows: &[StagedRow<K, T>],
-    current: &ResidentMap<K, SharedRow<T>>,
+    current: &RowMap<K, SharedRow<T>>,
     dirty: Option<&HashMap<K, RowChange<T>>>,
 ) -> io::Result<()> {
     for row in rows {
@@ -574,7 +574,7 @@ fn validate_staged<K: Eq + Hash, T>(
 
 fn publish_rows<K: Clone + Eq + Hash, T>(
     rows: Vec<StagedRow<K, T>>,
-    current: &mut ResidentMap<K, SharedRow<T>>,
+    current: &mut RowMap<K, SharedRow<T>>,
     mut dirty: Option<&mut HashMap<K, RowChange<T>>>,
 ) {
     for StagedRow {
@@ -619,6 +619,8 @@ pub(super) struct Publication {
     delivery: NativeApplied,
     memory: Arc<VerificationMemory>,
     tracking: bool,
+    #[cfg(any(test, feature = "test-control"))]
+    terminal_remainder_started: Option<std::time::Instant>,
 }
 
 impl Publication {
@@ -656,6 +658,8 @@ impl Publication {
             generic_receipts,
             responses,
             notifications,
+            #[cfg(any(test, feature = "test-control"))]
+            terminal_remainder_started,
             ..
         } = delta;
         let predecessor = Arc::clone(base.require_business_proof()?);
@@ -846,7 +850,7 @@ impl Publication {
         let notifications = notifications
             .into_iter()
             .map(|row| SharedRow::new(NativeNotification::new(row)))
-            .collect::<Vec<_>>();
+            .collect::<io::Result<Vec<_>>>()?;
         for row in &notifications {
             tables[3].replace(None, Some(stamp(3, &row.sequence(), row)?))?;
         }
@@ -884,6 +888,8 @@ impl Publication {
             delivery,
             memory,
             tracking,
+            #[cfg(any(test, feature = "test-control"))]
+            terminal_remainder_started,
         })
     }
 
@@ -932,6 +938,8 @@ impl Publication {
             notifications,
             delivery,
             memory,
+            #[cfg(any(test, feature = "test-control"))]
+            terminal_remainder_started,
             ..
         } = self;
         let roster_append = state
@@ -968,6 +976,10 @@ impl Publication {
         state.roster = roster;
         state.frontiers = frontiers;
         state.proof = Some(proof);
+        #[cfg(any(test, feature = "test-control"))]
+        if let Some(started) = terminal_remainder_started {
+            crate::sqlite::consensus::record_native_roster_publication_timing(started);
+        }
         Ok(delivery)
     }
 }

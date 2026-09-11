@@ -343,7 +343,8 @@ fn native_roster_log_maximum_admission_body_keeps_original_bounds_and_detached_s
             lease: Some(NativeLease::from_guard(&guard).unwrap()),
             fence: guard.fence().get(),
             reserved: false,
-        }),
+        })
+        .unwrap(),
     );
     state.frontiers.next_fence = guard.fence().get() + 1;
     state.frontiers.next_credential = guard.credential_id() + 1;

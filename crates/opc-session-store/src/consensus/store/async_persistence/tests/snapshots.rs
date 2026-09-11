@@ -86,15 +86,19 @@ fn decode_snapshot(
     stage: &str,
 ) -> Result<
     InstallSnapshotResponse<SessionConsensusNodeId>,
-    RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+    Box<RaftError<SessionConsensusNodeId, InstallSnapshotError>>,
 > {
     let payload = response
         .result
         .unwrap_or_else(|error| panic!("{stage}: {error:?}"));
-    decode_bounded(
-        persistence_protocol::unwrap_payload(SessionPersistenceMode::Async, &payload).unwrap(),
-    )
+    decode_bounded::<
+        Result<
+            InstallSnapshotResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+        >,
+    >(persistence_protocol::unwrap_payload(SessionPersistenceMode::Async, &payload).unwrap())
     .unwrap()
+    .map_err(Box::new)
 }
 
 async fn prepare(fleet: &mut Fleet) -> Story {
@@ -476,7 +480,7 @@ async fn async_persistence_failed_final_snapshot_keeps_cold_admission_and_select
         )
         .expect_err("the real completed snapshot stream must reject its corrupted database");
         assert!(started.elapsed() < OPERATION_BOUND);
-        let RaftError::Fatal(fatal @ Fatal::StorageError(_)) = error else {
+        let RaftError::Fatal(fatal @ Fatal::StorageError(_)) = *error else {
             panic!("corrupted install must retain its actual storage error: {error:?}");
         };
         assert!(fatal.to_string().contains("checksum"), "{fatal}");

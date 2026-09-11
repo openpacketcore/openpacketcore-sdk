@@ -1883,12 +1883,14 @@ impl SqliteSessionBackend {
         #[cfg(target_os = "linux")]
         if let Some(result) = self.native_read(|wal| {
             wal.native_fixed_read(
-                identity,
-                expected_members,
-                expected_bindings,
-                expected_placement_policy,
-                false,
-                None,
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity,
+                    members: expected_members,
+                    bindings: expected_bindings,
+                    placement: expected_placement_policy,
+                    pristine: false,
+                    database_path: None,
+                },
                 |_, exact| Ok(exact),
             )
         }) {
@@ -1964,12 +1966,14 @@ impl SqliteSessionBackend {
         #[cfg(target_os = "linux")]
         if let Some(result) = self.native_read(|wal| {
             wal.native_fixed_read(
-                identity,
-                expected_members,
-                expected_bindings,
-                expected_placement_policy,
-                allow_pristine_membership,
-                None,
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity,
+                    members: expected_members,
+                    bindings: expected_bindings,
+                    placement: expected_placement_policy,
+                    pristine: allow_pristine_membership,
+                    database_path: None,
+                },
                 |_, exact| Ok(exact),
             )
         }) {
@@ -2020,12 +2024,14 @@ impl SqliteSessionBackend {
                 return Err(std::io::Error::other("native injected recovery failure"));
             }
             wal.native_fixed_read(
-                identity,
-                &expected_members,
-                &expected_bindings,
-                expected_placement_policy,
-                false,
-                self.database_path.as_deref().map(PathBuf::as_path),
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity,
+                    members: &expected_members,
+                    bindings: &expected_bindings,
+                    placement: expected_placement_policy,
+                    pristine: false,
+                    database_path: self.database_path.as_deref().map(PathBuf::as_path),
+                },
                 |_, exact| Ok(exact),
             )
         }) {
