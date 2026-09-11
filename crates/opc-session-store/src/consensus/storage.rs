@@ -7507,7 +7507,9 @@ async fn remove_old_snapshot(
     current_file_name: &str,
     previous_artifact: Option<RetainedCurrentSnapshotArtifact>,
 ) -> io::Result<()> {
-    #[cfg(all(test, target_os = "linux"))]
+    // Native recovery can still depend on an installed origin after a newer
+    // local snapshot is selected. This retention rule applies to live stores.
+    #[cfg(target_os = "linux")]
     if let Some(wal) = core.private_wal.as_ref().filter(|wal| wal.is_native()) {
         let retained = wal.native_retained_snapshots()?;
         if previous

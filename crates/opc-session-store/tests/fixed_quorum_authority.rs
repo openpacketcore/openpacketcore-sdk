@@ -1819,6 +1819,184 @@ async fn fixed_quorum_public_reopen_rejects_unsealed_current_schema_selected_sna
     );
 }
 
+/// Integration tests compile the SDK without `cfg(test)`. Keep this recovery
+/// sequence here as well as the private state-machine test: production cleanup
+/// must retain the authenticated install origin after a local snapshot replaces
+/// it as the snapshot offered to peers.
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+#[tokio::test]
+async fn fixed_quorum_public_snapshot_keeps_installed_origin_across_local_publication_and_reopen() {
+    use opc_session_store::test_support::{
+        append_consensus_padding_entry_for_test, consensus_local_durable_progress_for_test,
+        consensus_native_current_snapshot_for_test, consensus_padding_receipt_status_for_test,
+        trigger_consensus_log_purge_through_for_test, ConsensusPaddingReceiptStatusForTest,
+    };
+
+    if !fixed_verity_available_for_test() {
+        return;
+    }
+    let database_directory = tempfile::tempdir().expect("fixed quorum origin databases");
+    let snapshot_root = fs_verity_snapshot_tempdir("fixed-quorum-origin-snapshots-");
+    let (database_paths, stores, paths) = open_fixed_cluster_in_separate_paths(
+        database_directory.path(),
+        snapshot_root.path(),
+        3,
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .await;
+    let leader = (0..3)
+        .find(|index| {
+            let status = stores[*index].status();
+            status.leader_id == Some(status.node_id)
+        })
+        .expect("initialized majority has a leader");
+    let lagging = (leader + 1) % 3;
+    for ((source, target), peer) in &paths {
+        if *source == lagging || *target == lagging {
+            peer.set_enabled(false);
+        }
+    }
+    let origin_request = [0xD4; 16];
+    let origin_index = append_consensus_padding_entry_for_test(&stores[leader], origin_request)
+        .await
+        .expect("majority commits the exact origin receipt while follower is cut");
+    for (index, store) in stores.iter().enumerate() {
+        if index == lagging {
+            continue;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if consensus_local_durable_progress_for_test(store).applied_index
+                    >= Some(origin_index)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("surviving voter applies the origin before capture");
+        trigger_consensus_snapshot_for_test(store)
+            .await
+            .expect("capture the origin on every possible surviving leader");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if consensus_local_durable_progress_for_test(store).snapshot_index
+                    >= Some(origin_index)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("origin snapshot covers the committed receipt");
+        trigger_consensus_log_purge_through_for_test(store, origin_index)
+            .await
+            .expect("purge only through the exact authenticated snapshot");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if consensus_local_durable_progress_for_test(store).purged_index
+                    >= Some(origin_index)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both surviving voters purge the receipt log before healing");
+    }
+    for peer in paths.values() {
+        peer.set_enabled(true);
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let progress = consensus_local_durable_progress_for_test(&stores[lagging]);
+            if progress.applied_index >= Some(origin_index)
+                && progress.snapshot_index >= Some(origin_index)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("lagging voter must install the compacted snapshot through real Raft RPC");
+    let (native, origin_name) = consensus_native_current_snapshot_for_test(&stores[lagging])
+        .expect("read the actual native publication owner");
+    assert!(native, "production constructor must select native storage");
+    let snapshot_directory = snapshot_root.path().join(format!("snapshots-{lagging}"));
+    let origin = snapshot_directory.join(origin_name.expect("installed origin is selected"));
+    assert_sealed_snapshot(&origin);
+
+    let successor_request = [0xD5; 16];
+    let successor_index =
+        append_consensus_padding_entry_for_test(&stores[lagging], successor_request)
+            .await
+            .expect("recovered voter submits a new exact committed receipt");
+    trigger_consensus_snapshot_for_test(&stores[lagging])
+        .await
+        .expect("publish a newer local snapshot on the recovered voter");
+    let successor = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(path) = fixed_published_snapshot_path(
+                &stores[lagging],
+                &database_paths[lagging],
+                &snapshot_directory,
+            ) {
+                if path != origin {
+                    break path;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new local publication replaces the offered snapshot within bounded setup");
+    assert_sealed_snapshot(&successor);
+    assert!(
+        origin.is_file(),
+        "production publication must keep the installed snapshot still named by native lineage"
+    );
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
+    drop(stores);
+    drop(paths);
+
+    for _ in 0..2 {
+        let (_, reopened, reopened_paths) = open_fixed_cluster_in_separate_paths(
+            database_directory.path(),
+            snapshot_root.path(),
+            3,
+            PlacementResiliencePolicy::AllowReducedResilience,
+        )
+        .await;
+        assert!(
+            origin.is_file(),
+            "startup scavenging must preserve the origin"
+        );
+        assert!(
+            successor.is_file(),
+            "startup must preserve the selected successor"
+        );
+        for store in &reopened {
+            for (request, raft_log_index) in [
+                (origin_request, origin_index),
+                (successor_request, successor_index),
+            ] {
+                assert_eq!(
+                    consensus_padding_receipt_status_for_test(store, request)
+                        .await
+                        .expect("cold native receipt lookup"),
+                    ConsensusPaddingReceiptStatusForTest::Recorded { raft_log_index },
+                    "each cold voter must retain both exact original outcomes"
+                );
+            }
+        }
+        shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
+    }
+}
+
 #[tokio::test]
 async fn fixed_durable_quorum_reopen_rejects_placement_policy_mismatch() {
     for (initial, reopened) in [

@@ -30,6 +30,30 @@ pub(super) fn fingerprint(index: u64, encoded: &[u8]) -> [u8; 32] {
 
 pub(crate) const MAX_RETAINED_LOG_ENTRIES: usize = 1_048_576;
 
+/// A logical purge may advance while its physical rows remain necessary for
+/// replay from the installed origin. Only that authenticated full LogId or
+/// the exact purge boundary can witness a non-genesis physical prefix.
+pub(super) fn validate_retained_prefix(
+    first: LogId<SessionConsensusNodeId>,
+    purged: Option<LogId<SessionConsensusNodeId>>,
+    origin: Option<&NativeSnapshotAuthority>,
+) -> io::Result<()> {
+    if first.index == 0 {
+        return Ok(());
+    }
+    let adjacent =
+        |cut: &LogId<SessionConsensusNodeId>| cut.index.checked_add(1) == Some(first.index);
+    let predecessor = purged
+        .filter(adjacent)
+        .or_else(|| origin.and_then(|origin| origin.candidate().0.last_log_id.filter(adjacent)))
+        .ok_or_else(|| invalid("native retained log lacks its prefix"))?;
+    sql::ensure_log_id_not_after(
+        &predecessor,
+        &first,
+        "native retained log prefix lineage differs",
+    )
+}
+
 #[derive(Default)]
 pub(crate) struct NativeLog {
     pub(crate) entries: OrdMap<u64, SharedRow<NativeLogEntry>>,
@@ -219,8 +243,8 @@ impl NativeLog {
                     &row.id(),
                     "native retained log term regressed",
                 )?;
-            } else if *index != 0 && !self.purged.is_some_and(|floor| floor.index + 1 == *index) {
-                return Err(invalid("native retained log lacks its prefix"));
+            } else {
+                validate_retained_prefix(row.id(), self.purged, state.snapshot_origin.as_deref())?;
             }
             previous = Some(row.id());
         }

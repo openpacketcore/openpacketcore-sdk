@@ -1715,9 +1715,9 @@ impl SqliteSessionBackend {
         }
     }
 
-    /// Read one exact test-control padding receipt through a fresh WAL
-    /// acceptance-reader snapshot. This path never enters proposal admission
-    /// and cannot replay the command whose caller observed ambiguity.
+    /// Read one exact test-control padding receipt from the selected owner:
+    /// an immutable native capture or a fresh SQL acceptance-reader snapshot.
+    /// This never proposes or replays the command being observed.
     #[cfg(feature = "test-control")]
     pub(crate) async fn consensus_padding_receipt_status_for_test(
         &self,
@@ -1725,6 +1725,20 @@ impl SqliteSessionBackend {
         authority_identity: crate::consensus::SessionConsensusIdentity,
         request_id: crate::consensus::SessionConsensusRequestId,
     ) -> Result<consensus::ConsensusPaddingReceiptStatus, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, _check| {
+                    state
+                        .padding_receipt_for_test(storage_identity, authority_identity, request_id)
+                        .map_err(|_| {
+                            StoreError::Serialization(
+                                "session consensus padding receipt state is invalid".into(),
+                            )
+                        })
+                })
+                .await;
+        }
         self.run_consensus_acceptance_read_task(move |conn| {
             let tx = conn.unchecked_transaction().map_err(|_| {
                 StoreError::BackendUnavailable(

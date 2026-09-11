@@ -683,6 +683,147 @@ fn native_snapshot_origin_empty_source_repeated_install_cold_reopen_and_first_me
 }
 
 #[test]
+fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_export_and_cold_catalog(
+) {
+    let (directory, producer, signed, wal) = fresh(Phase::Established);
+    parity(
+        &wal,
+        &producer,
+        &signed,
+        &[admission(&signed), terminal(&signed, 4)],
+    );
+    let incoming = IncomingSnapshot::with_identity(&producer.conn.blocking_lock(), signed.identity);
+    let local = empty(&signed);
+    let mut installed = copy(&local.conn.blocking_lock());
+    let origin = install(&incoming, &installed, wal.binding(), &signed);
+    assert!(origin.matches_cut(log_id(4)));
+    let path = directory.path().join("installed-purge.native");
+    let prefix = written(
+        &mut installed,
+        &path,
+        wal.binding(),
+        Arc::clone(&origin),
+        &signed,
+    );
+    let (mut owner, catalog) = Catalog::open_with_origin(
+        &path,
+        prefix,
+        MAXIMUM,
+        crate::consensus::native::generation::CatalogScope {
+            identity: signed.identity,
+            members: &fixed_members(),
+            roster_root: Some(Arc::new(signed.root.clone())),
+        },
+        Some(Arc::clone(&origin)),
+        CUT,
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut storage = catalog.into_storage(&|| Ok(())).unwrap();
+    let version = Version::capture(&storage).unwrap();
+    storage.begin_changes().unwrap();
+    let suffix =
+        [5, 6, 7].map(|index| ordinary(&signed, index, SessionMutationIntent::AdvanceLogicalTime));
+    storage
+        .log
+        .project(&append(&suffix), &storage.business, Some(log_id(4)))
+        .unwrap();
+    storage
+        .log
+        .project(
+            &Operation::Committed(Some(log_id(7))),
+            &storage.business,
+            Some(log_id(4)),
+        )
+        .unwrap();
+    storage.replay_committed().unwrap();
+    // Purge admission must be backed by a genuinely selected applied basis,
+    // not merely by a later live applied value supplied to the projector.
+    let prepared = PreparedDelta::prepare(
+        owner.current(),
+        &version,
+        2,
+        2,
+        CUT,
+        storage.take_changes().unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    prepared.append(&mut owner, &|| Ok(())).unwrap();
+    let version = prepared.target_version();
+    let applied_basis = owner.current().identity();
+    drop(prepared);
+    assert_eq!(
+        admitted(&path, applied_basis, Arc::clone(&origin), &signed)
+            .business
+            .applied(),
+        Some(log_id(7)),
+        "independent cold admission proves the selected predecessor before purge"
+    );
+    storage
+        .log
+        .project(
+            &Operation::Purge(log_id(6)),
+            &storage.business,
+            Some(log_id(7)),
+        )
+        .unwrap();
+    assert_eq!(storage.log.purged, Some(log_id(6)));
+    assert_eq!(
+        storage.log.entries.keys().copied().collect::<Vec<_>>(),
+        [5, 6, 7]
+    );
+    storage.validate_image().expect(
+        "a logical purge preserves the physical suffix of the authenticated install origin",
+    );
+    let mut hole = storage.clone();
+    hole.log.entries.remove(&5);
+    assert!(
+        hole.validate_image().is_err(),
+        "an origin cannot authorize a missing first physical suffix row"
+    );
+    let target = empty(&signed);
+    storage
+        .export_cold_install_base_checked(&target.conn.blocking_lock(), &|| Ok(()))
+        .unwrap();
+    let exported = database(&target.conn.blocking_lock());
+    let portable = empty(&signed);
+    storage
+        .export_cold_portable_snapshot_checked(&portable.conn.blocking_lock(), &|| Ok(()))
+        .unwrap();
+    assert_eq!(count(&portable.conn.blocking_lock(), "consensus_log"), 0);
+    let prepared = PreparedDelta::prepare(
+        owner.current(),
+        &version,
+        3,
+        3,
+        CUT,
+        storage.take_changes().unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    prepared.append(&mut owner, &|| Ok(())).unwrap();
+    let selected = owner.current().identity();
+    drop(prepared);
+    drop(storage);
+    drop(owner);
+    let storage = admitted(&path, selected, Arc::clone(&origin), &signed);
+    assert_eq!(storage.log.purged, Some(log_id(6)));
+    assert_eq!(storage.business.applied(), Some(log_id(7)));
+    assert_eq!(
+        storage.log.entries.keys().copied().collect::<Vec<_>>(),
+        [5, 6, 7]
+    );
+    let cold = empty(&signed);
+    storage
+        .export_cold_install_base_checked(&cold.conn.blocking_lock(), &|| Ok(()))
+        .unwrap();
+    assert_eq!(database(&cold.conn.blocking_lock()), exported);
+    origin.verify().unwrap();
+    wal.shutdown().unwrap();
+}
+
+#[test]
 fn native_snapshot_origin_cold_catalog_rejects_present_wrong_log_id_and_membership_payload() {
     use sha2::{Digest as _, Sha256};
     #[derive(serde::Serialize)]

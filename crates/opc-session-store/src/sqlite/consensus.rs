@@ -26198,7 +26198,7 @@ pub(crate) fn exact_operator_recovery_v2_outcome_sync(
 /// envelope without reconstructing a leader-owned command.  Receipt status
 /// uses this for an already-authorized exact scope; it deliberately accepts
 /// neither a client-supplied internal request ID nor an unbound digest.
-fn authorized_mutation_payload_digest(
+pub(crate) fn authorized_mutation_payload_digest(
     storage_identity: SessionConsensusIdentity,
     authority_identity: SessionConsensusIdentity,
     mutation: &SessionMutationIntent,

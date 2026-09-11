@@ -1230,16 +1230,12 @@ impl Rows {
                 .checked_sub(first.index)
                 .and_then(|length| length.checked_add(1))
                 != Some(self.logs.len() as u64)
-                || (first.index != 0
-                    && context
-                        .log
-                        .purged
-                        .is_none_or(|floor| floor.index.checked_add(1) != Some(first.index)))
             {
                 return Err(invalid(
                     "native catalog retained log has a hole or missing prefix",
                 ));
             }
+            log::validate_retained_prefix(first, context.log.purged, origin)?;
         }
         let frontiers = &context.business.frontiers;
         let membership = facts::membership(frontiers.membership.membership())?;

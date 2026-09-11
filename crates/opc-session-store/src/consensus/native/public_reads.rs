@@ -66,6 +66,55 @@ impl ConsumerReceiptStore for ConsumerReceipts<'_> {
 }
 
 impl NativeState {
+    /// Passive test receipt witness from the selected native owner. No SQL
+    /// materialization or consensus proposal participates in this observation.
+    #[cfg(feature = "test-control")]
+    pub(crate) fn padding_receipt_for_test(
+        &self,
+        storage_identity: SessionConsensusIdentity,
+        authority_identity: SessionConsensusIdentity,
+        request_id: SessionConsensusRequestId,
+    ) -> io::Result<crate::sqlite::consensus::ConsensusPaddingReceiptStatus> {
+        use crate::sqlite::consensus::{
+            authorized_mutation_payload_digest, ConsensusPaddingReceiptStatus,
+        };
+
+        self.require_business_proof()?;
+        if self.identity != storage_identity {
+            return Err(invalid("native padding receipt storage identity differs"));
+        }
+        let expected = authorized_mutation_payload_digest(
+            storage_identity,
+            authority_identity,
+            &SessionMutationIntent::AdvanceLogicalTime,
+        )?;
+        let Some(receipt) = self.generic_receipts.get(&request_id) else {
+            return Ok(ConsensusPaddingReceiptStatus::NotFound);
+        };
+        validation::validate_generic(&request_id, receipt, &self.frontiers)?;
+        let NativeGenericReceipt::Ordinary(receipt) = &**receipt else {
+            return Ok(ConsensusPaddingReceiptStatus::Conflict);
+        };
+        if receipt.payload_digest != expected {
+            return Ok(ConsensusPaddingReceiptStatus::Conflict);
+        }
+        let response = &receipt.response;
+        // validate_generic checked the complete applied/sequence/time bounds.
+        // As for the independent SQL witness, require the exact padding shape
+        // and equality with the machine digest/time at its current sequence.
+        if !matches!(response.result, Ok(SessionMutationOutcome::Unit))
+            || response.raft_log_index == 0
+            || (response.sequence == self.frontiers.sequence
+                && (response.digest != Some(self.frontiers.digest)
+                    || response.logical_time != self.frontiers.logical_time))
+        {
+            return Err(invalid("native padding receipt response differs"));
+        }
+        Ok(ConsensusPaddingReceiptStatus::Recorded {
+            raft_log_index: response.raft_log_index,
+        })
+    }
+
     pub(crate) fn replication_log(
         &self,
         start: u64,
