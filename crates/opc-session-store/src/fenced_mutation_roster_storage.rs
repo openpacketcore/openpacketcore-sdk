@@ -4430,6 +4430,7 @@ impl HydratedProductionReservationRecord {
     }
 
     /// Return the exact canonical bytes retained by this complete hydration.
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn canonical(&self) -> &[u8] {
         &self.canonical
     }
@@ -7069,6 +7070,7 @@ pub(crate) struct ProductionSnapshotAccounting {
 }
 
 impl ProductionSnapshotAccounting {
+    #[cfg(target_os = "linux")]
     pub(crate) const fn empty() -> Self {
         Self {
             counters: zero_counters(),
@@ -7081,6 +7083,7 @@ impl ProductionSnapshotAccounting {
     /// Replace only previously derived contributions. Intermediate counts may
     /// cross a final cardinality bound while a checkpoint swaps disjoint rows;
     /// all arithmetic is checked and finish enforces the original limits.
+    #[cfg(target_os = "linux")]
     pub(crate) fn replace(
         &mut self,
         before: Option<Self>,

@@ -434,6 +434,12 @@ validated catch-up or obtain a fresh attempt. An all-cold quorum stays closed;
 local disk progress, cached responses, and recreating storage do not supply a
 supported recovery authority.
 
+If a restarted voter lost a previously acknowledged volatile tail, its
+certified live leader restores that prefix through ordinary snapshot
+installation and a real matching append. Recovery preserves the leader's vote
+and the configured initialization deadline. Snapshot installation alone does
+not admit the voter.
+
 Gate traffic on
 `store.probe_fixed_quorum_readiness().await.traffic_authority().is_granted()`.
 The returned `SessionQuorumReadinessReport` includes the selected mode,

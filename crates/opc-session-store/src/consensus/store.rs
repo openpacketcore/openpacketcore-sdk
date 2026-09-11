@@ -5755,15 +5755,15 @@ impl ConsensusSessionStore {
     /// This observation grants no traffic, recovery or durability authority.
     pub fn persistence_health(&self) -> SessionPersistenceHealth {
         #[cfg(target_os = "linux")]
-        let storage = self
+        let (storage_state, storage_failure, asynchronous) = self
             .inner
             .private_wal
             .as_ref()
-            .map(|wal| wal.storage_health());
+            .map(|wal| wal.storage_health())
+            .unwrap_or((SessionStorageState::Unavailable, None, None));
         #[cfg(not(target_os = "linux"))]
-        let storage = None;
         let (storage_state, storage_failure, asynchronous) =
-            storage.unwrap_or((SessionStorageState::Unavailable, None, None));
+            (SessionStorageState::Unavailable, None, None);
         SessionPersistenceHealth {
             mode: self.persistence_mode(),
             engine_running: self.inner.raft.metrics().borrow().running_state.is_ok(),
@@ -11359,6 +11359,15 @@ impl SessionConsensusService {
                     return SessionConsensusWireResponse {
                         result: Err(SessionConsensusPeerError::ScopeMismatch),
                     };
+                }
+                if request
+                    .payload
+                    .starts_with(persistence_protocol::COLD_REPAIR_WIRE)
+                {
+                    return self
+                        .store
+                        .handle_async_cold_repair(authenticated_sender, &request.payload)
+                        .await;
                 }
                 if request
                     .payload

@@ -28,6 +28,8 @@ use super::{
 const ASYNC_WIRE: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-ASYNC-1\0";
 pub(super) const COLD_BARRIER_WIRE: &[u8; 22] =
     b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-COLD-1\0";
+pub(super) const COLD_REPAIR_WIRE: &[u8; 24] =
+    b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-REPAIR-1\0";
 
 pub(super) fn wrap_payload(
     mode: SessionPersistenceMode,
@@ -139,6 +141,28 @@ pub(super) struct ColdQuorumCut {
     pub membership: Option<LogId<SessionConsensusNodeId>>,
     pub vote: Vote<SessionConsensusNodeId>,
     pub barrier: LogId<SessionConsensusNodeId>,
+    // Scheduling hint only: never substitutes for the fresh quorum cut,
+    // real matching append, or exact applied-state admission checks.
+    pub remembered_match: Option<LogId<SessionConsensusNodeId>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct ColdRepairRequest {
+    tag: [u8; 24],
+    pub cut: ColdQuorumCut,
+}
+
+impl ColdRepairRequest {
+    pub(super) fn new(cut: ColdQuorumCut) -> Self {
+        Self {
+            tag: *COLD_REPAIR_WIRE,
+            cut,
+        }
+    }
+
+    pub(super) fn is_valid(&self) -> bool {
+        self.tag == *COLD_REPAIR_WIRE && self.cut.request.is_valid()
+    }
 }
 
 enum Admission {
@@ -147,8 +171,9 @@ enum Admission {
         request: Option<ColdBarrierRequest>,
     },
     CatchingUp {
-        cut: ColdQuorumCut,
+        cut: Box<ColdQuorumCut>,
         confirmed: AtomicBool,
+        repair_needed: AtomicBool,
     },
 }
 
@@ -286,10 +311,26 @@ impl PersistenceProtocol {
             return Err(SessionConsensusPeerError::Rejected);
         }
         *state = Admission::CatchingUp {
-            cut,
+            cut: Box::new(cut),
             confirmed: AtomicBool::new(false),
+            repair_needed: AtomicBool::new(false),
         };
         Ok(())
+    }
+
+    pub(super) async fn take_repair_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ColdQuorumCut>, SessionConsensusPeerError> {
+        let state = tokio::time::timeout_at(deadline, self.admission.read())
+            .await
+            .map_err(|_| SessionConsensusPeerError::Timeout)?;
+        Ok(match &*state {
+            Admission::CatchingUp {
+                cut, repair_needed, ..
+            } if repair_needed.swap(false, Ordering::AcqRel) => Some(**cut),
+            _ => None,
+        })
     }
 
     pub(super) async fn activate_before<F, Fut>(
@@ -304,7 +345,7 @@ impl PersistenceProtocol {
         let mut state = tokio::time::timeout_at(deadline, self.admission.write())
             .await
             .map_err(|_| SessionConsensusPeerError::Timeout)?;
-        let Admission::CatchingUp { cut, confirmed } = &*state else {
+        let Admission::CatchingUp { cut, confirmed, .. } = &*state else {
             return Ok(matches!(*state, Admission::Active));
         };
         if !confirmed.load(Ordering::Acquire) {
@@ -313,7 +354,7 @@ impl PersistenceProtocol {
         // The exact attempt remains exclusively held through scope/local
         // application validation and publication. All earlier accepted cold
         // RPCs retain their read guard through definitive engine completion.
-        if !tokio::time::timeout_at(deadline, check(*cut))
+        if !tokio::time::timeout_at(deadline, check(**cut))
             .await
             .map_err(|_| SessionConsensusPeerError::Timeout)?
         {
@@ -351,6 +392,21 @@ pub(super) struct EngineAdmission {
 }
 
 impl EngineAdmission {
+    // A live leader can remember matches acknowledged by this voter's old
+    // volatile incarnation. Returning a regressed Conflict to Openraft would
+    // violate its durable-follower contract. Keep it unavailable while the
+    // exact cut's leader restores a real snapshot through the normal engine
+    // install path. Never manufacture a successful append or a higher vote.
+    pub(super) fn request_cold_repair(&self) -> bool {
+        if let Admission::CatchingUp { repair_needed, .. } = &*self.guard {
+            repair_needed.store(true, Ordering::Release);
+            self.progress.notify_one();
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn permits_vote(&self) -> bool {
         matches!(*self.guard, Admission::Active)
     }
@@ -389,7 +445,7 @@ impl EngineAdmission {
     // leader. Snapshot metadata alone is never the activation witness: after
     // snapshot catch-up the leader must still match a prefix through the cut.
     pub(super) fn confirm_append(&self, matched: Option<LogId<SessionConsensusNodeId>>) {
-        if let Admission::CatchingUp { cut, confirmed } = &*self.guard {
+        if let Admission::CatchingUp { cut, confirmed, .. } = &*self.guard {
             if matched.is_some_and(|matched| covers(matched, cut.barrier))
                 && !confirmed.swap(true, Ordering::AcqRel)
             {

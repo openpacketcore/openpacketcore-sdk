@@ -6,6 +6,7 @@
 
 #![recursion_limit = "256"]
 
+#[cfg(target_os = "linux")]
 #[path = "fenced_transition_v2_qualification/native_capacity.rs"]
 mod native_capacity;
 

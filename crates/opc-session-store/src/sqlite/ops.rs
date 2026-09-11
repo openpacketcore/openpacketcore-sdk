@@ -324,6 +324,7 @@ impl RestoreScanIncarnation {
     }
 
     /// Only the WAL's hash-verified proposed image may supply a replay choice.
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_installed_sync(conn: &Connection) -> Result<Self, StoreError> {
         let (epoch, _, cursor_key) = read_restore_scan_state_sync(conn)?;
         Ok(Self { epoch, cursor_key })
@@ -331,6 +332,7 @@ impl RestoreScanIncarnation {
 
     /// The native base image stores this fixed local choice outside its
     /// comparison context. Reading it grants no snapshot install authority.
+    #[cfg(target_os = "linux")]
     pub(crate) fn native_image(&self) -> Zeroizing<[u8; 48]> {
         let mut image = Zeroizing::new([0; 48]);
         image[..16].copy_from_slice(&self.epoch);
@@ -338,6 +340,7 @@ impl RestoreScanIncarnation {
         image
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_native_image(image: &[u8]) -> Result<Self, StoreError> {
         if image.len() != 48 || image[..16] == [0; 16] || image[16..] == [0; 32] {
             return Err(StoreError::Serialization(

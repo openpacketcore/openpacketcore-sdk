@@ -182,6 +182,16 @@ coverage is insufficient. Failed final installation retains its original
 storage error and wakes blocked purge/application waits without advancing the
 applied frontier.
 
+A live leader can remember a prefix acknowledged by the cold voter's former
+volatile incarnation. Its remembered match is only a catch-up scheduling hint:
+when that match exceeds the reopened local log, the certified leader sends an
+ordinary bounded snapshot through the fresh barrier and then a real matching
+AppendEntries. Cold append conflicts also request this repair while returning
+unavailability to the live engine. The SDK never reports regressed progress as
+durable, invents a successful acknowledgement, or changes the leader's vote to
+restart replication. Snapshot creation, transfer and confirmation consume the
+original initialization deadline; the scheduling hint grants no authority.
+
 The fresh-entry argument applies to the exact uniform fixed membership. A
 majority must commit the new barrier without the quarantined incarnation.
 Pre-crash cached acknowledgements cannot reach an entry appended after the new

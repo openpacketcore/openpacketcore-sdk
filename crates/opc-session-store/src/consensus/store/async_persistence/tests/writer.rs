@@ -304,6 +304,17 @@ async fn async_persistence_public_background_error_preserves_results_and_reports
             .await
             .traffic_authority()
             .is_granted());
+        let leader_vote = fleet.store(leader).inner.raft.metrics().borrow().vote;
+        let remembered = fleet
+            .store(leader)
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .replication
+            .as_ref()
+            .unwrap()[&fleet.peers[follower].node]
+            .unwrap();
         assert!(
             fleet.close_result(follower).await.is_err(),
             "shutdown reports the failed persistence drain after joining the owner"
@@ -318,7 +329,42 @@ async fn async_persistence_public_background_error_preserves_results_and_reports
             Some(SessionAsyncRecoveryState::AwaitingLiveQuorum)
         );
         assert!(!fleet.store(follower).status().admitted);
-        fleet.store(follower).initialize_cluster().await.unwrap();
+        assert!(
+            fleet
+                .store(follower)
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index
+                < Some(remembered.index),
+            "the restarted follower lost a previously acknowledged tail"
+        );
+        let started_repair = tokio::time::Instant::now();
+        let initialized = fleet.store(follower).initialize_cluster().await;
+        for (role, store) in [("leader", fleet.store(leader)), ("cold", fleet.store(follower))] {
+            let metrics = store.inner.raft.metrics();
+            let metrics = metrics.borrow();
+            eprintln!("async_failed_writer_rejoin role={role} elapsed_us={} result={initialized:?} health={:?} vote={:?} log={:?} applied={:?} snapshot={:?}", started_repair.elapsed().as_micros(), store.persistence_health(), metrics.vote, metrics.last_log_index, metrics.last_applied, metrics.snapshot);
+        }
+        initialized.unwrap();
+        assert_eq!(
+            fleet.store(leader).inner.raft.metrics().borrow().vote,
+            leader_vote
+        );
+        assert_eq!(
+            fleet.leader(),
+            leader,
+            "repair must not require another election"
+        );
+        assert!(fleet
+            .store(follower)
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .is_some_and(|last| last.index >= remembered.index));
         assert_recorded(fleet.store(follower), &first, &first_outcome).await;
         assert_recorded(fleet.store(follower), &second, &second_outcome).await;
         assert_recorded(fleet.store(follower), &third, &third_outcome).await;

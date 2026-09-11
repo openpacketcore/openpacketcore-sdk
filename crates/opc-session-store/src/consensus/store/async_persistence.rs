@@ -3,6 +3,8 @@
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
+mod cold_repair;
+
 use futures_util::stream::FuturesUnordered;
 use opc_consensus::engine::CommittedLeaderId;
 
@@ -139,11 +141,44 @@ impl ConsensusSessionStore {
             .accept_cut_before(cut, deadline)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
+        // The live leader may already know that this incarnation lost an
+        // acknowledged volatile tail. Start ordinary snapshot repair now,
+        // without spending this operation's deadline on its replication
+        // worker's unreachable-peer backoff. This hint grants no authority.
+        if cut.remembered_match.is_some_and(|remembered| {
+            self.inner.raft.metrics().borrow().last_log_index < Some(remembered.index)
+        }) {
+            protocol
+                .engine_before(deadline)
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?
+                .request_cold_repair();
+        }
         let mut metrics = self.inner.raft.metrics();
         loop {
             metrics.borrow_and_update();
             if self.activate_caught_up_async_before(deadline).await? {
                 return Ok(());
+            }
+            if let Some(cut) = protocol
+                .take_repair_before(deadline)
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?
+            {
+                let leader = cut
+                    .vote
+                    .leader_id
+                    .voted_for()
+                    .ok_or(ConsensusSessionStoreOpenError::RecoveryRequired)?;
+                self.call_peer::<_, ()>(
+                    leader,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &persistence_protocol::ColdRepairRequest::new(cut),
+                    deadline,
+                )
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
+                continue;
             }
             let changed = async {
                 tokio::select! {
@@ -277,7 +312,7 @@ impl ConsensusSessionStore {
         {
             return rejected();
         }
-        {
+        let remembered_match = {
             let metrics = self.inner.raft.metrics();
             let current = metrics.borrow();
             if current.running_state.is_err()
@@ -291,7 +326,11 @@ impl ConsensusSessionStore {
             {
                 return rejected();
             }
-        }
+            current
+                .replication
+                .as_ref()
+                .and_then(|replication| replication.get(&sender).copied().flatten())
+        };
         encode_service_reply(&ColdQuorumCut {
             identity: self.inner.storage_identity,
             request,
@@ -303,6 +342,7 @@ impl ConsensusSessionStore {
             membership,
             vote,
             barrier: completed.log_id,
+            remembered_match,
         })
     }
 }

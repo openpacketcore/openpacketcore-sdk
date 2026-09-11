@@ -20863,6 +20863,7 @@ struct SqliteStorageFailure {
     extended_code: i32,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn sqlite_error_code(error: &io::Error) -> Option<i32> {
     error
         .get_ref()?

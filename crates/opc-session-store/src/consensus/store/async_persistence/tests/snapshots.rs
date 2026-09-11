@@ -209,6 +209,192 @@ async fn prepare(fleet: &mut Fleet) -> Story {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_persistence_cold_repair_rejects_wrong_authority_and_requires_real_append() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let result = AssertUnwindSafe(async {
+        let story = prepare(&mut fleet).await;
+        let live = fleet.store(story.leader).clone();
+        let cold = fleet.store(story.follower).clone();
+        let leader = fleet.peers[story.leader].node;
+        let before = cold.inner.raft.metrics().borrow().clone();
+        let snapshots = live.status().completed_snapshot_count;
+        let cut = story.cut;
+        for (reason, bad) in [
+            (
+                "scope",
+                ColdQuorumCut {
+                    identity: SessionConsensusIdentity::new(
+                        cut.identity.cluster_id(),
+                        cut.identity.configuration_id(),
+                        ConsensusConfigurationEpoch::new(
+                            cut.identity.configuration_epoch().get() + 1,
+                        )
+                        .unwrap(),
+                    ),
+                    ..cut
+                },
+            ),
+            (
+                "requester",
+                ColdQuorumCut {
+                    requester: leader,
+                    ..cut
+                },
+            ),
+            (
+                "voters",
+                ColdQuorumCut {
+                    voters: [0; 32],
+                    ..cut
+                },
+            ),
+            (
+                "uncommitted vote",
+                ColdQuorumCut {
+                    vote: Vote::new(cut.vote.leader_id.term, leader),
+                    ..cut
+                },
+            ),
+            (
+                "other leader",
+                ColdQuorumCut {
+                    vote: Vote::new_committed(cut.vote.leader_id.term, cold.inner.local_node_id),
+                    ..cut
+                },
+            ),
+            (
+                "barrier lineage",
+                ColdQuorumCut {
+                    barrier: LogId::new(
+                        CommittedLeaderId::new(cut.vote.leader_id.term + 1, leader),
+                        cut.barrier.index,
+                    ),
+                    ..cut
+                },
+            ),
+            (
+                "membership",
+                ColdQuorumCut {
+                    membership: Some(cut.barrier),
+                    ..cut
+                },
+            ),
+            (
+                "unapplied barrier",
+                ColdQuorumCut {
+                    barrier: LogId::new(cut.barrier.leader_id, cut.barrier.index + 1_000),
+                    ..cut
+                },
+            ),
+        ] {
+            let response = cold
+                .call_peer::<_, ()>(
+                    leader,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &persistence_protocol::ColdRepairRequest::new(bad),
+                    tokio::time::Instant::now() + OPERATION_BOUND,
+                )
+                .await;
+            assert!(
+                matches!(
+                    response,
+                    Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                        SessionConsensusPeerError::Rejected
+                    ))
+                ),
+                "invalid repair {reason}: {response:?}"
+            );
+            assert_eq!(live.status().completed_snapshot_count, snapshots);
+            let metrics = cold.inner.raft.metrics();
+            let current = metrics.borrow();
+            assert_eq!(current.vote, before.vote);
+            assert_eq!(current.last_log_index, before.last_log_index);
+            assert_eq!(current.last_applied, before.last_applied);
+            assert_eq!(current.snapshot, before.snapshot);
+        }
+        let appends = fleet.peers[story.follower]
+            .successful_appends
+            .load(Ordering::Acquire);
+        *fleet.peers[story.follower]
+            .blocked_append_above
+            .lock()
+            .unwrap() = Some((leader, cut.barrier.index - 1));
+        fleet.set_link(story.leader, story.follower, true);
+        let repair = persistence_protocol::ColdRepairRequest::new(cut);
+        assert!(cold
+            .call_peer::<_, ()>(
+                leader,
+                SessionConsensusRpcFamily::ReadBarrier,
+                &repair,
+                tokio::time::Instant::now() + OPERATION_BOUND,
+            )
+            .await
+            .is_err());
+        assert!(cold
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .is_some_and(|last| { persistence_protocol::covers(last, cut.barrier) }));
+        assert!(cold
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .is_some_and(|last| { persistence_protocol::covers(last, cut.barrier) }));
+        assert_eq!(
+            fleet.peers[story.follower]
+                .successful_appends
+                .load(Ordering::Acquire),
+            appends
+        );
+        assert!(!cold
+            .activate_caught_up_async_before(tokio::time::Instant::now() + OPERATION_BOUND)
+            .await
+            .unwrap());
+        assert!(!cold.status().admitted);
+        assert_eq!(
+            cold.probe_fixed_quorum_readiness()
+                .await
+                .traffic_authority(),
+            FixedQuorumTrafficAuthority::RecoveryRequired
+        );
+        *fleet.peers[story.follower]
+            .blocked_append_above
+            .lock()
+            .unwrap() = None;
+        cold.call_peer::<_, ()>(
+            leader,
+            SessionConsensusRpcFamily::ReadBarrier,
+            &repair,
+            tokio::time::Instant::now() + OPERATION_BOUND,
+        )
+        .await
+        .unwrap();
+        assert!(
+            fleet.peers[story.follower]
+                .successful_appends
+                .load(Ordering::Acquire)
+                > appends
+        );
+        let initialized = tokio::time::Instant::now();
+        cold.initialize_cluster().await.unwrap();
+        assert!(initialized.elapsed() < OPERATION_BOUND);
+        assert_eq!(cold.inner.raft.metrics().borrow().vote, cut.vote);
+        assert_eq!(live.inner.raft.metrics().borrow().vote, cut.vote);
+        assert_recorded(&cold, &story.first, &story.first_outcome).await;
+        assert_recorded(&cold, &story.second, &story.second_outcome).await;
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 async fn install_base(cold: &ConsensusSessionStore, sender: SessionConsensusNodeId, story: &Story) {
     assert_eq!(
         decode_snapshot(

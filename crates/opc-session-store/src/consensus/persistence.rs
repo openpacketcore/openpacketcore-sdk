@@ -82,6 +82,7 @@ pub struct SessionStorageFailure {
     pub os_error: Option<i32>,
 }
 
+#[cfg(target_os = "linux")]
 impl SessionStorageFailure {
     pub(crate) fn from_io(stage: SessionStorageFailureStage, error: &std::io::Error) -> Self {
         let kind = match error.kind() {

@@ -900,10 +900,32 @@ async fn async_persistence_wire_bounds_full_lineage_and_attempt_replacement() {
         membership: None,
         vote: Vote::new_committed(8, leader),
         barrier: LogId::new(CommittedLeaderId::new(8, leader), 100),
+        remembered_match: Some(LogId::new(CommittedLeaderId::new(8, leader), 1_000)),
     };
+    let repair = persistence_protocol::ColdRepairRequest::new(cut);
+    let encoded_repair = encode_bounded(&repair).unwrap();
+    assert!(encoded_repair.starts_with(persistence_protocol::COLD_REPAIR_WIRE));
+    assert!(decode_bounded::<ReadBarrierRequest>(&encoded_repair).is_err());
+    assert!(decode_bounded::<ColdBarrierRequest>(&encoded_repair).is_err());
+    assert!(
+        decode_bounded::<persistence_protocol::ColdRepairRequest>(&encoded_repair)
+            .unwrap()
+            .is_valid()
+    );
+    assert!(!protocol
+        .engine_before(deadline)
+        .await
+        .unwrap()
+        .request_cold_repair());
+    assert!(protocol
+        .take_repair_before(deadline)
+        .await
+        .unwrap()
+        .is_none());
     protocol.accept_cut_before(cut, deadline).await.unwrap();
     let guard = protocol.engine_before(deadline).await.unwrap();
     assert!(!guard.permits_vote());
+    assert!(guard.request_cold_repair());
     for wrong in [
         LogId::new(CommittedLeaderId::new(9, leader), 7),
         LogId::new(CommittedLeaderId::new(9, leader), 100),
@@ -929,18 +951,30 @@ async fn async_persistence_wire_bounds_full_lineage_and_attempt_replacement() {
     }));
     guard.confirm_append(Some(short));
     drop(guard);
+    assert!(protocol.take_repair_before(deadline).await.unwrap() == Some(cut));
+    assert!(protocol
+        .take_repair_before(deadline)
+        .await
+        .unwrap()
+        .is_none());
     assert!(!protocol
         .activate_before(deadline, |_| async { true })
         .await
         .unwrap());
     let old = protocol.engine_before(deadline).await.unwrap();
     old.confirm_append(Some(cut.barrier));
+    assert!(old.request_cold_repair());
     // Replacement cannot pass accepted work's owned read fence.
     let replacement = protocol.quarantine_before(deadline);
     tokio::pin!(replacement);
     assert!(futures_util::poll!(replacement.as_mut()).is_pending());
     drop(old);
     let second = replacement.await.unwrap();
+    assert!(protocol
+        .take_repair_before(deadline)
+        .await
+        .unwrap()
+        .is_none());
     assert!(
         first.incarnation == second.incarnation
             && second.attempt == first.attempt + 1

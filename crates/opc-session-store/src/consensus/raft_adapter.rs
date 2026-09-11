@@ -1355,6 +1355,11 @@ impl SessionRaftRpcHandler {
                     .map(|entry| entry.log_id)
                     .or(rpc.prev_log_id);
                 let result = self.raft.append_entries(rpc).await;
+                if matches!(result, Ok(AppendEntriesResponse::Conflict))
+                    && persistence.request_cold_repair()
+                {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
                 if matches!(result, Ok(AppendEntriesResponse::Success)) {
                     persistence.confirm_append(matched);
                 }
@@ -1378,6 +1383,11 @@ impl SessionRaftRpcHandler {
                     .map(|entry| entry.log_id)
                     .or(rpc.prev_log_id);
                 let result = self.raft.append_entries(rpc).await;
+                if matches!(result, Ok(AppendEntriesResponse::Conflict))
+                    && persistence.request_cold_repair()
+                {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
                 if matches!(result, Ok(AppendEntriesResponse::Success)) {
                     persistence.confirm_append(matched);
                 }

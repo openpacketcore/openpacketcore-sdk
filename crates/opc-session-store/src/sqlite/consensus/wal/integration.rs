@@ -12,12 +12,12 @@ use std::sync::Arc;
 use std::sync::{Mutex, Weak};
 use std::time::Duration;
 
-#[cfg(test)]
-use super::super as consensus;
 use super::super::SqliteConsensusCore;
 use super::Wal;
 #[cfg(test)]
 use super::{invalid_data, Binding, IoControl, Limits};
+#[cfg(test)]
+use crate::sqlite::consensus;
 
 /// Constant-space totals for this writer incarnation. Detailed samples below
 /// are recent groups bounded by retained request count; totals never reset at
