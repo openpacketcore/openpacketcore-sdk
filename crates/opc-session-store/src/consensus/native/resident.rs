@@ -2,9 +2,9 @@
 //! to native admission/relocation. Deserialization can only produce resident
 //! values; a persisted digest cannot manufacture a cold row or its source.
 
+use super::changes::HashWriter;
 use super::*;
 use serde::ser::{SerializeStruct, Serializer};
-use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 
 /// A range can be constructed only after complete generation admission or
@@ -91,11 +91,10 @@ pub(super) fn authority_binding(
     identity: SessionConsensusIdentity,
     members: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<[u8; 32]> {
-    let mut writer = HashWriter(Sha256::new());
-    writer.0.update(b"OPC-native-resident-authority-v1\0");
+    let mut writer = HashWriter::new(b"OPC-native-resident-authority-v1\0");
     serde_json::to_writer(&mut writer, &(identity, members))
         .map_err(|_| invalid("native resident authority cannot encode"))?;
-    Ok(writer.0.finalize().into())
+    Ok(writer.finish())
 }
 
 #[derive(Clone)]
@@ -126,26 +125,44 @@ fn receipt_response_time(retained_until: Timestamp) -> io::Result<Timestamp> {
         .ok_or_else(|| invalid("native receipt retained response time invalid"))
 }
 
-struct HashWriter(Sha256);
-impl io::Write for HashWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn receipt_binding(key: &impl Serialize, row: &NativeReceipt) -> io::Result<[u8; 32]> {
-    let mut writer = HashWriter(Sha256::new());
-    writer.0.update(b"OPC-native-resident-receipt-binding-v1\0");
+    let mut writer = HashWriter::new(b"OPC-native-resident-receipt-binding-v1\0");
     serde_json::to_writer(
         &mut writer,
         &(key, row.ordinal, row.payload_digest, row.retained_until),
     )
     .map_err(|_| invalid("native resident receipt binding cannot encode"))?;
-    Ok(writer.0.finalize().into())
+    Ok(writer.finish())
+}
+
+#[test]
+fn native_resident_receipt_binding_matches_original_json_domain() {
+    use sha2::{Digest as _, Sha256};
+
+    let request = changes::tests::request(11, None);
+    let row = NativeReceipt {
+        ordinal: 7,
+        payload_digest: [0xAC; 32],
+        retained_until: retention_deadline(changes::tests::time(1)).unwrap(),
+        response: None,
+        cold: None,
+    };
+    let mut reference = Sha256::new();
+    reference.update(b"OPC-native-resident-receipt-binding-v1\0");
+    reference.update(
+        serde_json::to_vec(&(
+            request.request_id(),
+            row.ordinal,
+            row.payload_digest,
+            row.retained_until,
+        ))
+        .unwrap(),
+    );
+    let expected: [u8; 32] = reference.finalize().into();
+    assert_eq!(
+        receipt_binding(&request.request_id(), &row).unwrap(),
+        expected
+    );
 }
 
 impl Serialize for NativeReceipt {

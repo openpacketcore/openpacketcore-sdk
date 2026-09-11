@@ -92,13 +92,67 @@ fn notification_stamp(value: &NotificationRow) -> io::Result<RowStamp> {
     ))
 }
 
-struct HashWriter(Sha256);
-impl Write for HashWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
+// JSON emits punctuation and numeric array elements in many small writes.
+// Coalesce those writes without allocating or retaining an encoded row. The
+// buffer is synchronous scratch, and every byte still enters the same hash.
+pub(super) struct HashWriter {
+    hash: Sha256,
+    buffer: [u8; 256],
+    used: usize,
+}
+
+impl HashWriter {
+    pub(super) fn new(domain: &[u8]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(domain);
+        Self {
+            hash,
+            buffer: [0; 256],
+            used: 0,
+        }
     }
+
+    fn drain(&mut self) {
+        if self.used != 0 {
+            self.hash.update(&self.buffer[..self.used]);
+            self.used = 0;
+        }
+    }
+
+    pub(super) fn finish(mut self) -> [u8; 32] {
+        self.drain();
+        self.hash.finalize().into()
+    }
+}
+
+impl Write for HashWriter {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let length = bytes.len();
+        if self.used != 0 {
+            let count = bytes.len().min(self.buffer.len() - self.used);
+            self.buffer[self.used..self.used + count].copy_from_slice(&bytes[..count]);
+            self.used += count;
+            bytes = &bytes[count..];
+            if self.used != self.buffer.len() {
+                return Ok(length);
+            }
+            self.drain();
+        }
+        if bytes.len() >= self.buffer.len() {
+            self.hash.update(bytes);
+        } else {
+            self.buffer[..bytes.len()].copy_from_slice(bytes);
+            self.used = bytes.len();
+        }
+        Ok(length)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write(bytes).map(|_| ())
+    }
+
     fn flush(&mut self) -> io::Result<()> {
+        self.drain();
         Ok(())
     }
 }
@@ -108,14 +162,13 @@ pub(super) fn fingerprint(
     key: &impl Serialize,
     value: &impl Serialize,
 ) -> io::Result<[u8; 32]> {
-    let mut writer = HashWriter(Sha256::new());
-    writer.0.update(b"OPC-native-process-row-v1\0");
-    writer.0.update([table]);
+    let mut writer = HashWriter::new(b"OPC-native-process-row-v1\0");
+    writer.write_all(&[table])?;
     // Streaming serialization allocates no encoded row buffer. These hashes
     // remain private, and cannot be supplied as an admission certificate.
     serde_json::to_writer(&mut writer, &(key, value))
         .map_err(|_| invalid("native row fingerprint cannot encode"))?;
-    Ok(writer.0.finalize().into())
+    Ok(writer.finish())
 }
 
 pub(super) struct BusinessProof {

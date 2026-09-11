@@ -16,6 +16,119 @@ use opc_types::{NetworkFunctionKind, TenantId};
 use std::str::FromStr;
 use std::time::Duration;
 
+#[test]
+fn native_fingerprint_fragmented_stream_preserves_every_byte_without_allocation() {
+    let input: Vec<_> = (0..65_537).map(|index| (index % 256) as u8).collect();
+    let domain = b"OPC-native-fingerprint-stream-test\0";
+    let mut reference = Sha256::new();
+    reference.update(domain);
+    reference.update(&input);
+    let expected: [u8; 32] = reference.finalize().into();
+    for chunk_size in [1, 2, 3, 7, 63, 64, 65, 255, 256, 257, 4096, 65_537] {
+        for flush in [false, true] {
+            let memory = allocation_counter::measure(|| {
+                let mut writer = HashWriter::new(domain);
+                writer.flush().unwrap();
+                for (index, chunk) in input.chunks(chunk_size).enumerate() {
+                    assert_eq!(writer.write(&[]).unwrap(), 0);
+                    if index % 2 == 0 {
+                        assert_eq!(writer.write(chunk).unwrap(), chunk.len());
+                    } else {
+                        writer.write_all(chunk).unwrap();
+                    }
+                    if flush && index % 3 == 0 {
+                        writer.flush().unwrap();
+                    }
+                }
+                assert_eq!(writer.finish(), expected);
+            });
+            assert_eq!(memory.count_total, 0);
+            assert_eq!(memory.bytes_total, 0);
+        }
+    }
+}
+
+#[test]
+fn native_fingerprint_row_and_authority_match_original_json_domains() {
+    let request = request(7, None);
+    let entry = command(1, &request, time(1), true);
+    for table in 0..=4 {
+        let mut reference = Sha256::new();
+        reference.update(b"OPC-native-process-row-v1\0");
+        reference.update([table]);
+        reference.update(serde_json::to_vec(&(request.request_id(), &entry)).unwrap());
+        let expected: [u8; 32] = reference.finalize().into();
+        assert_eq!(
+            fingerprint(table, &request.request_id(), &entry).unwrap(),
+            expected
+        );
+    }
+    let mut reference = Sha256::new();
+    reference.update(b"OPC-native-resident-authority-v1\0");
+    reference.update(serde_json::to_vec(&(identity(), members())).unwrap());
+    let expected: [u8; 32] = reference.finalize().into();
+    assert_eq!(
+        resident::authority_binding(identity(), &members()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn native_fingerprint_rejects_partial_serialization() {
+    struct Rejected;
+    impl Serialize for Rejected {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let mut sequence = serializer.serialize_seq(None)?;
+            sequence.serialize_element(&[7_u8; 32])?;
+            Err(serde::ser::Error::custom("injected row encoding failure"))
+        }
+    }
+    assert_eq!(
+        fingerprint(1, &7_u64, &Rejected).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn native_fingerprint_streaming_cost_diagnostic() {
+    struct OriginalWriter(Sha256);
+    impl Write for OriginalWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let request = request(7, None);
+    let entry = command(1, &request, time(1), true);
+    let expected = fingerprint(1, &request.request_id(), &entry).unwrap();
+    for round in 0..4 {
+        for original in if round % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        } {
+            let start = std::time::Instant::now();
+            for _ in 0..128 {
+                let actual = if original {
+                    let mut writer = OriginalWriter(Sha256::new());
+                    writer.0.update(b"OPC-native-process-row-v1\0");
+                    writer.0.update([1]);
+                    serde_json::to_writer(&mut writer, &(request.request_id(), &entry)).unwrap();
+                    writer.0.finalize().into()
+                } else {
+                    fingerprint(1, &request.request_id(), &entry).unwrap()
+                };
+                assert_eq!(std::hint::black_box(actual), expected);
+            }
+            eprintln!("native_fingerprint_cost round={round} original={original} rows=128 elapsed_micros={}", start.elapsed().as_micros());
+        }
+    }
+}
+
 fn identity() -> SessionConsensusIdentity {
     SessionConsensusIdentity::new(
         SessionConsensusClusterId::new("native-changes").unwrap(),
