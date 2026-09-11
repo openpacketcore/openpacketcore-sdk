@@ -115,7 +115,7 @@ fn volatile_voter_costs(stores: &[ConsensusSessionStore]) -> Vec<serde_json::Val
         .collect()
 }
 
-fn observe_closed_native_memory(stores: &[ConsensusSessionStore]) {
+fn observe_closed_native_memory(stores: &[ConsensusSessionStore], workload: ScaleWorkload) {
     if std::env::var_os("OPC_SESSION_NATIVE_ALLOCATION_DIAGNOSTIC").as_deref()
         != Some(std::ffi::OsStr::new("required"))
     {
@@ -150,9 +150,48 @@ fn observe_closed_native_memory(stores: &[ConsensusSessionStore]) {
         let after = status();
         eprintln!(
             "native_original_workload_memory_owners={}",
-            serde_json::json!({"voter":voter,"counts_before_release":counts,"roots_in_release_order":roots,"total_released_bytes":total_released_bytes,"before":before,"after":after,"original_system_allocator":true,"scope":"Actual closed native Rust releases after the unchanged full workload; excludes SQLite C allocations, fixture owners and allocator retained pages"})
+            serde_json::json!({"voter":voter,"counts_before_release":counts,"roots_in_release_order":roots,"total_released_bytes":total_released_bytes,"before":before,"after":after,"original_system_allocator":true,"workload":format!("{workload:?}"),"scope":"Actual closed native Rust releases after joined workload shutdown; excludes SQLite C allocations, fixture owners and allocator retained pages"})
         );
     }
+}
+
+// This runs only after the original workload and joined shutdown. The
+// observer counts real Rust deallocations in the owner being consumed; it
+// does not assign SQLite C allocations or residual RSS to this owner.
+fn release_observed_fixture_owner<T>(owner: &'static str, value: T) {
+    if std::env::var_os("OPC_SESSION_NATIVE_ALLOCATION_DIAGNOSTIC").as_deref()
+        != Some(std::ffi::OsStr::new("required"))
+    {
+        drop(value);
+        return;
+    }
+    assert!(std::env::var_os("LD_PRELOAD").is_none());
+    let status = || {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("fixture diagnostic process status")
+            .lines()
+            .filter(|line| {
+                line.starts_with("VmRSS:")
+                    || line.starts_with("RssAnon:")
+                    || line.starts_with("VmHWM:")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let before = status();
+    let info = allocation_counter::measure(|| drop(value));
+    let after = status();
+    eprintln!(
+        "native_workload_fixture_memory_owner={}",
+        serde_json::json!({
+            "owner": owner,
+            "allocated_bytes_during_drop": info.bytes_total,
+            "released_bytes": i128::from(info.bytes_total) - i128::from(info.bytes_current),
+            "released_allocations": i128::from(info.count_total) - i128::from(info.count_current),
+            "before": before, "after": after, "original_system_allocator": true,
+            "scope": "Actual joined Rust owner release; excludes C allocations, other retained roots and allocator pages",
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -212,6 +251,34 @@ async fn public_async_original_instrumented_diagnostic() {
     run_original_scale_with_host_policy(
         ScalePersistence::Async,
         ScaleWorkload::Original,
+        ScaleHostPolicy::ContendedDiagnostic,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "bounded original 50,000-operation Async allocation diagnostic; contention permitted"]
+async fn public_async_original_preload_allocation_diagnostic() {
+    for required in [
+        "OPC_SESSION_ASYNC_INSTRUMENTED_DIAGNOSTIC",
+        "OPC_SESSION_NATIVE_ALLOCATION_DIAGNOSTIC",
+    ] {
+        assert_eq!(
+            std::env::var_os(required).as_deref(),
+            Some(std::ffi::OsStr::new("required")),
+            "bounded allocation diagnosis requires its explicit controller",
+        );
+    }
+    for conflicting in [
+        "OPC_SESSION_ASYNC_PERFORMANCE_QUALIFICATION",
+        "OPC_SESSION_ASYNC_PRELOAD_DIAGNOSTIC",
+        "OPC_SESSION_VOLATILE_PERFORMANCE_EXPERIMENT",
+    ] {
+        assert!(std::env::var_os(conflicting).is_none());
+    }
+    run_original_scale_with_host_policy(
+        ScalePersistence::Async,
+        ScaleWorkload::PreloadDiagnostic,
         ScaleHostPolicy::ContendedDiagnostic,
     )
     .await;
@@ -453,8 +520,9 @@ async fn run_original_scale_with_host_policy(
         let effect_snapshot = effect_counters.snapshot();
         let elapsed_ms = started.elapsed().as_millis();
         shutdown_fixed_cluster(&stores, &peer_slots).await;
-        drop(stores);
-        drop(peer_slots);
+        observe_closed_native_memory(&stores, workload);
+        release_observed_fixture_owner("joined_store_handles", stores);
+        release_observed_fixture_owner("cleared_peer_slots", peer_slots);
         let quiet_host = quiet_host_monitor
             .map(QualificationQuietHostMonitor::finish)
             .transpose()
@@ -475,6 +543,7 @@ async fn run_original_scale_with_host_policy(
                 "performance_qualified": false, "cold_restart_qualification": false,
             })
         );
+        release_observed_fixture_owner("preload_50000_request_outcome_pairs", sessions);
         assert_eq!(transient_retries.load(Ordering::Relaxed), 0);
         assert_eq!(effect_snapshot.not_transmitted_retries, 0);
         assert_eq!(effect_snapshot.outcome_unknown_batches, 0);
@@ -840,9 +909,9 @@ async fn run_original_scale_with_host_policy(
     let read_only_retries = transient_retries.load(Ordering::Relaxed);
     let maintenance_retries = maintenance_reconciliation_retries.load(Ordering::Relaxed);
     shutdown_fixed_cluster(&stores, &peer_slots).await;
-    observe_closed_native_memory(&stores);
-    drop(stores);
-    drop(peer_slots);
+    observe_closed_native_memory(&stores, workload);
+    release_observed_fixture_owner("joined_store_handles", stores);
+    release_observed_fixture_owner("cleared_peer_slots", peer_slots);
     let database_bytes_by_voter = database_paths
         .iter()
         .map(|path| sqlite_database_family_bytes(path))
@@ -879,6 +948,10 @@ async fn run_original_scale_with_host_policy(
         "quiet_host": quiet_host, "cold_restart_qualification": false,
     });
     eprintln!("sdk-741 {mode_label} original scale summary: {observation}");
+    // Preserve the original VmHWM observation above before releasing these
+    // fixture-only roots. The unchanged RSS assertion still uses that peak.
+    release_observed_fixture_owner("full_50000_request_outcome_pairs", sessions);
+    release_observed_fixture_owner("eight_epoch_representative_pairs", representatives);
     assert_voter_resource_ceiling(
         "original volatile database family",
         &database_bytes_by_voter,
