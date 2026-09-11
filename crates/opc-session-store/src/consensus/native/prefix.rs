@@ -259,7 +259,15 @@ impl VerifiedAppendSource {
                 .as_ref()
                 .is_none_or(|old| old.index != index || old.metadata != metadata)
             {
-                let mut bytes = buffer(self.block_bytes)?;
+                // A miss replaces every byte before authentication. Transfer
+                // the existing zeroizing allocation out of the old cache so
+                // ordinary reads do not allocate and wipe a whole block each
+                // time. Errors still drop/wipe this buffer and fence every
+                // view; no partially read or unverified bytes enter the cache.
+                let mut bytes = match cache.take() {
+                    Some(previous) => previous.bytes,
+                    None => buffer(self.block_bytes)?,
+                };
                 self.file
                     .read_exact_at(&mut bytes, index as u64 * self.block_bytes as u64)?;
                 #[cfg(test)]

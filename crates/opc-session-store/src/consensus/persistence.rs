@@ -82,7 +82,7 @@ pub struct SessionStorageFailure {
     pub os_error: Option<i32>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 impl SessionStorageFailure {
     pub(crate) fn from_io(stage: SessionStorageFailureStage, error: &std::io::Error) -> Self {
         let kind = match error.kind() {
@@ -102,6 +102,7 @@ impl SessionStorageFailure {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) const fn panic(stage: SessionStorageFailureStage) -> Self {
         Self {
             stage,

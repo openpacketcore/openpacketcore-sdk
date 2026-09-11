@@ -4430,7 +4430,7 @@ impl HydratedProductionReservationRecord {
     }
 
     /// Return the exact canonical bytes retained by this complete hydration.
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn canonical(&self) -> &[u8] {
         &self.canonical
     }

@@ -39734,7 +39734,7 @@ pub(crate) use tests::{
     ProtectedRosterV2RecoveryFixtureState,
 };
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn native_roster_apply_fixture(
     path: &Path,
     identity: SessionConsensusIdentity,
@@ -39750,7 +39750,7 @@ pub(crate) fn native_roster_apply_fixture(
     Ok(applied)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn native_roster_maintenance_fixture(
     path: &Path,
     identity: SessionConsensusIdentity,

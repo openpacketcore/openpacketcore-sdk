@@ -100,6 +100,41 @@ fn append(owner: &mut VerifiedAppendOwner, bytes: &[u8]) -> io::Result<Arc<Verif
 }
 
 #[test]
+fn native_prefix_cache_misses_bound_allocations_and_preserve_every_verified_byte() {
+    let fixture = Fixture::new(1);
+    let mut owner = fixture.open();
+    let view = append(&mut owner, &vec![0x62; MIN_BLOCK]).unwrap();
+    let mut actual = vec![0; MIN_BLOCK];
+    view.read_exact_at(MIN_BLOCK as u64, &mut actual).unwrap();
+    assert!(actual.iter().all(|byte| *byte == 0x62));
+    let before = view.blocks_read();
+    let started = std::time::Instant::now();
+    let allocations = allocation_counter::measure(|| {
+        for index in 0..64 {
+            let (offset, expected) = if index % 2 == 0 {
+                (0, 0x51)
+            } else {
+                (MIN_BLOCK as u64, 0x62)
+            };
+            view.read_exact_at(offset, &mut actual).unwrap();
+            assert!(actual.iter().all(|byte| *byte == expected));
+        }
+    });
+    assert_eq!(view.blocks_read() - before, 64);
+    assert!(!view.is_failed());
+    eprintln!(
+        "native_prefix_cache_misses reads=64 bytes_total={} count_total={} elapsed_us={}",
+        allocations.bytes_total,
+        allocations.count_total,
+        started.elapsed().as_micros(),
+    );
+    assert!(
+        allocations.bytes_total <= 2 * MIN_BLOCK as u64,
+        "authenticated cache misses allocate a fresh block for every read",
+    );
+}
+
+#[test]
 fn native_prefix_same_sequence_checkpoints_keep_fixed_views_and_cold_exact_bytes() {
     let fixture = Fixture::new(2);
     let mut owner = fixture.open();

@@ -4706,13 +4706,13 @@ impl Drop for ActivationFixtureFault<'_> {
 }
 
 fn inject_activation_fixture_fault<'a>(
-    store: &'a ConsensusSessionStore,
+    _store: &'a ConsensusSessionStore,
     database_path: &Path,
     fault: usize,
 ) -> ActivationFixtureFault<'a> {
     #[cfg(target_os = "linux")]
     if let Some(before) =
-        opc_session_store::test_support::consensus_native_activation_facts_for_test(store)
+        opc_session_store::test_support::consensus_native_activation_facts_for_test(_store)
             .expect("raw native pre-fault facts")
     {
         let database_path = database_path.to_path_buf();
@@ -4720,13 +4720,13 @@ fn inject_activation_fixture_fault<'a>(
             .expect("pre-fault latch read")
             .is_none());
         let guard = opc_session_store::test_support::consensus_native_activation_fault_for_test(
-            store,
+            _store,
             &database_path,
             fault,
         )
         .expect("install scoped native fixture fault");
         let after =
-            opc_session_store::test_support::consensus_native_activation_facts_for_test(store)
+            opc_session_store::test_support::consensus_native_activation_facts_for_test(_store)
                 .expect("raw native post-fault facts")
                 .expect("same native owner after fault");
         let mut expected = before.clone();
@@ -4781,7 +4781,7 @@ fn inject_activation_fixture_fault<'a>(
             restore: Some(Box::new(move || {
                 let observed =
                     opc_session_store::test_support::consensus_native_activation_facts_for_test(
-                        store,
+                        _store,
                     )
                     .map_err(|error| error.to_string());
                 let observed_latch = activation_fixture_latch_bytes(&database_path)
@@ -4793,7 +4793,7 @@ fn inject_activation_fixture_fault<'a>(
                 }
                 restored?;
                 if opc_session_store::test_support::consensus_native_activation_facts_for_test(
-                    store,
+                    _store,
                 )
                 .map_err(|error| error.to_string())?
                     != Some(before)
@@ -4902,9 +4902,9 @@ fn activation_fixture_mutation_facts(
     paths: &[PathBuf],
 ) -> Vec<serde_json::Value> {
     assert_eq!(stores.len(), paths.len());
-    stores.iter().zip(paths).map(|(store, path)| {
+    stores.iter().zip(paths).map(|(_store, path)| {
         #[cfg(target_os = "linux")]
-        if let Some(raw) = opc_session_store::test_support::consensus_native_activation_facts_for_test(store)
+        if let Some(raw) = opc_session_store::test_support::consensus_native_activation_facts_for_test(_store)
             .expect("bounded native mutation observation")
         {
             return serde_json::json!({

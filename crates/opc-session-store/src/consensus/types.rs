@@ -218,9 +218,12 @@ pub(crate) fn fenced_transition_voter_set_digest(
 // exact V2 ingress, provenance, proof, and evidence carriers above.
 #[cfg(test)]
 pub(crate) use tests::{
-    roster_v2_aborted_persistence_fixture, roster_v2_aborted_persistence_fixture_for_history,
-    roster_v2_fresh_wal_persistence_fixture, roster_v2_persistence_fixture,
+    roster_v2_aborted_persistence_fixture, roster_v2_persistence_fixture,
     RosterV2PersistenceFixture,
+};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::{
+    roster_v2_aborted_persistence_fixture_for_history, roster_v2_fresh_wal_persistence_fixture,
 };
 
 /// Bind the exact voter scope to the immutable protected-roster profile.
@@ -3440,6 +3443,7 @@ pub(crate) mod tests {
         roster_v2_persistence_fixture_for_binding(phase, [0x91; 16], 1)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn roster_v2_aborted_persistence_fixture_for_history(
         roster_id: [u8; 16],
         epoch: u64,
@@ -3455,6 +3459,7 @@ pub(crate) mod tests {
         roster_v2_persistence_fixture_for_authority(phase, roster_id, epoch, FenceToken::new(9), 10)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn roster_v2_fresh_wal_persistence_fixture(
         phase: Phase,
     ) -> RosterV2PersistenceFixture {

@@ -231,7 +231,7 @@ impl PersistenceProtocol {
         self.mode
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn hold_activation_for_test(&self) -> Arc<ActivationHoldForTest> {
         let hold = Arc::new(ActivationHoldForTest::default());
         assert!(self
