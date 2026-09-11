@@ -20966,12 +20966,20 @@ fn is_fenced_transition_v2_json_discriminant(key: &str) -> bool {
 }
 
 fn log_json_may_contain_fenced_transition_v2_discriminant(bytes: &[u8]) -> bool {
-    const FENCED_V2_DISCRIMINANT_STEM: &[u8] = b"FencedTransitionV2";
-    const RECOVERY_V2_DISCRIMINANT_STEM: &[u8] = b"FinalizeOperatorRecoveryV2";
+    const STEMS: [&str; 2] = ["FencedTransitionV2", "FinalizeOperatorRecoveryV2"];
+    // Valid UTF-8 can use the standard substring search instead of comparing
+    // every overlapping byte window. Serde may ignore non-UTF-8 bytes in a
+    // legacy extension value; retain the original byte gate for that input.
+    // Escaping still requires the complete independent JSON scan.
     bytes.contains(&b'\\')
-        || [FENCED_V2_DISCRIMINANT_STEM, RECOVERY_V2_DISCRIMINANT_STEM]
-            .into_iter()
-            .any(|stem| bytes.windows(stem.len()).any(|window| window == stem))
+        || match std::str::from_utf8(bytes) {
+            Ok(text) => STEMS.into_iter().any(|stem| text.contains(stem)),
+            Err(_) => STEMS.into_iter().any(|stem| {
+                bytes
+                    .windows(stem.len())
+                    .any(|window| window == stem.as_bytes())
+            }),
+        }
 }
 
 /// Allocation-light scan for a V2 discriminant anywhere in one syntactically
@@ -68029,6 +68037,71 @@ BEGIN IMMEDIATE;
         assert_eq!(
             decode_consensus_log_entry(escaped_hidden.as_bytes())
                 .expect_err("JSON escaping cannot hide a V2 discriminant")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn durable_log_decoder_finds_hidden_v2_after_unicode_and_partial_stems() {
+        let entry = acquire_entry(1, [0x97; 16], "legacy-v2-search-owner");
+        let canonical = encode_json(&entry).expect("canonical legacy JSON");
+        for padding in [0, 1, 15, 16, 17, 31, 32, 33, 127, 128, 129, 1024] {
+            // Exercise substring boundaries after multibyte UTF-8 and many
+            // partial matches. Ordinary ignored values remain compatible.
+            let noise = "é🦀FencedTransitionVFinalizeOperatorRecovery".repeat(padding);
+            for discriminant in [
+                "FencedTransitionV2",
+                "ActivateFencedTransitionV2",
+                "MaintainFencedTransitionV2History",
+                "FencedTransitionV2Batch",
+                "FinalizeOperatorRecoveryV2",
+            ] {
+                let compatible = format!(
+                    "{{\"noise\":\"{noise}{discriminant}\",{}",
+                    std::str::from_utf8(&canonical[1..]).expect("canonical object tail")
+                );
+                assert_eq!(
+                    decode_consensus_log_entry(compatible.as_bytes())
+                        .expect("V2 text in an ignored string is ordinary legacy data"),
+                    entry,
+                );
+                for key in [
+                    discriminant.to_owned(),
+                    format!(
+                        "\\u{:04x}{}",
+                        u32::from(discriminant.as_bytes()[0]),
+                        &discriminant[1..]
+                    ),
+                ] {
+                    let hidden = format!(
+                        "{{\"noise\":\"{noise}\",\"future\":[{{\"{key}\":null}}],{}",
+                        std::str::from_utf8(&canonical[1..]).expect("canonical object tail")
+                    );
+                    assert_eq!(
+                        decode_json::<Entry<SessionRaftTypeConfig>>(hidden.as_bytes())
+                            .expect("typed decoder alone ignores the hostile outer field"),
+                        entry,
+                    );
+                    assert_eq!(
+                        decode_consensus_log_entry(hidden.as_bytes())
+                            .expect_err("full durable decoder must reject hidden V2")
+                            .kind(),
+                        io::ErrorKind::InvalidData,
+                        "padding={padding} key={key}",
+                    );
+                }
+            }
+        }
+        let owner_offset = canonical
+            .windows(b"legacy-v2-search-owner".len())
+            .position(|window| window == b"legacy-v2-search-owner")
+            .expect("the typed owner string is present");
+        let mut invalid_utf8 = canonical.clone();
+        invalid_utf8[owner_offset] = 0xff;
+        assert_eq!(
+            decode_consensus_log_entry(&invalid_utf8)
+                .expect_err("the prescan cannot bypass typed UTF-8 validation")
                 .kind(),
             io::ErrorKind::InvalidData,
         );
