@@ -8,7 +8,8 @@
 //! version, tenant, or backend fails to decrypt instead of silently decoding.
 
 use opc_crypto::{
-    decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeV1,
+    decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeRef,
+    CryptoEnvelopeV1,
 };
 use opc_key::{
     decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, EnvelopeAad,
@@ -555,24 +556,22 @@ impl EncryptedSessionPayload {
         Ok(())
     }
 
-    fn decode_valid_session_envelope(&self) -> Result<(CryptoEnvelopeV1, EnvelopeAad), StoreError> {
+    fn decode_valid_session_envelope(
+        &self,
+    ) -> Result<(CryptoEnvelopeRef<'_>, EnvelopeAad), StoreError> {
         if self.encoding != SessionPayloadEncoding::EnvelopeV1 || self.bytes.is_empty() {
             return Err(invalid_session_envelope());
         }
-        let envelope = CryptoEnvelopeV1::decode(self.bytes.as_ref().as_slice())
+        let envelope = CryptoEnvelopeRef::decode(self.bytes.as_ref().as_slice())
             .map_err(|_| invalid_session_envelope())?;
         if envelope.nonce.len() != envelope.algorithm.nonce_len()
             || envelope.ciphertext_and_tag.len() < AEAD_TAG_LEN
-            || envelope
-                .encode()
-                .map_err(|_| invalid_session_envelope())?
-                .as_slice()
-                != self.bytes.as_ref().as_slice()
+            || !envelope.matches_encoding(self.bytes.as_ref().as_slice())
         {
             return Err(invalid_session_envelope());
         }
         let (aad, aad_key_id) =
-            decode_bound_aad(&envelope.aad).map_err(|_| invalid_session_envelope())?;
+            decode_bound_aad(envelope.aad).map_err(|_| invalid_session_envelope())?;
         if aad_key_id != envelope.key_id
             || aad.purpose() != KeyPurpose::Session
             || aad.version() != SESSION_ENVELOPE_VERSION
@@ -942,6 +941,55 @@ mod tests {
     };
     use serde::{de, Deserialize};
     use std::sync::Arc;
+
+    #[test]
+    fn envelope_validation_allocation_is_independent_of_ciphertext_size() {
+        use opc_key::{AeadAlgorithm, EnvelopeAad, KeyId, SessionAad};
+        let key_id = KeyId::new("allocation-key").unwrap();
+        let aad = EnvelopeAad::session(
+            opc_types::TenantId::new("allocation-tenant").unwrap(),
+            1,
+            SessionAad::new(
+                "amf",
+                "session-digest",
+                "amf-state",
+                2,
+                3,
+                "allocation-scope",
+            )
+            .unwrap(),
+        );
+        let bound_aad = opc_key::serialize_bound_aad(&aad, &key_id).unwrap();
+        let payload = |length| {
+            let encoded = opc_crypto::CryptoEnvelopeV1 {
+                algorithm: AeadAlgorithm::Aes256GcmSiv,
+                key_id: key_id.clone(),
+                nonce: vec![0; 12],
+                aad: bound_aad.clone(),
+                ciphertext_and_tag: vec![0xA5; length],
+            }
+            .encode()
+            .unwrap();
+            super::EncryptedSessionPayload::try_envelope(encoded).unwrap()
+        };
+        // Construction is outside the measured original validation boundary.
+        // This check proves format/AAD admission, not keyed decryption.
+        let small = payload(opc_key::AEAD_TAG_LEN);
+        let large = payload(256 * 1024);
+        small.validate_envelope().unwrap();
+        large.validate_envelope().unwrap();
+        let small_memory = allocation_counter::measure(|| small.validate_envelope().unwrap());
+        let large_memory = allocation_counter::measure(|| large.validate_envelope().unwrap());
+        eprintln!("envelope_validation_allocation small_bytes={} large_bytes={} small_peak={} large_peak={} small_count={} large_count={}",
+            small_memory.bytes_total, large_memory.bytes_total, small_memory.bytes_max,
+            large_memory.bytes_max, small_memory.count_total, large_memory.count_total);
+        assert_eq!(small_memory.bytes_current, 0);
+        assert_eq!(large_memory.bytes_current, 0);
+        assert_eq!(
+            large_memory.bytes_total, small_memory.bytes_total,
+            "validating immutable envelope bytes must not copy the ciphertext"
+        );
+    }
 
     #[test]
     fn log_row_reuse_preparation_payload_charge_includes_capacity_and_arc() {
