@@ -190,6 +190,19 @@ impl Timestamp {
             .checked_add(time::Duration::seconds(seconds))
             .map(Self)
     }
+
+    // RFC 3339 permits four year digits. This wrapper always holds UTC, so
+    // even all nine fractional digits fit in 30 bytes, including the final Z.
+    // Keep the library's complete formatting rules and use the actual sink
+    // position, including fractional digits, to select the written bytes.
+    fn format_rfc3339<'a>(&self, buffer: &'a mut [u8; 30]) -> Result<&'a str, fmt::Error> {
+        let mut sink = buffer.as_mut_slice();
+        self.0
+            .format_into(&mut sink, &Rfc3339)
+            .map_err(|_| fmt::Error)?;
+        let written = 30 - sink.len();
+        std::str::from_utf8(buffer.get(..written).ok_or(fmt::Error)?).map_err(|_| fmt::Error)
+    }
 }
 
 impl fmt::Debug for Timestamp {
@@ -200,8 +213,7 @@ impl fmt::Debug for Timestamp {
 
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = self.0.format(&Rfc3339).map_err(|_| fmt::Error)?;
-        f.write_str(&value)
+        f.write_str(self.format_rfc3339(&mut [0; 30])?)
     }
 }
 
@@ -232,7 +244,11 @@ impl Serialize for Timestamp {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        let mut buffer = [0; 30];
+        let value = self
+            .format_rfc3339(&mut buffer)
+            .map_err(|_| serde::ser::Error::custom("timestamp cannot encode as RFC 3339"))?;
+        serializer.serialize_str(value)
     }
 }
 
@@ -241,7 +257,29 @@ impl<'de> Deserialize<'de> for Timestamp {
     where
         D: Deserializer<'de>,
     {
-        let raw = String::deserialize(deserializer)?;
-        Self::from_str(&raw).map_err(serde::de::Error::custom)
+        struct TimestampVisitor;
+
+        impl serde::de::Visitor<'_> for TimestampVisitor {
+            type Value = Timestamp;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Timestamp::from_str(value).map_err(E::custom)
+            }
+
+            // String's visitor also accepts UTF-8 bytes. Preserve that input
+            // surface for serializers that deliver bytes instead of text.
+            fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                match std::str::from_utf8(value) {
+                    Ok(value) => self.visit_str(value),
+                    Err(_) => Err(E::invalid_value(serde::de::Unexpected::Bytes(value), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(TimestampVisitor)
     }
 }

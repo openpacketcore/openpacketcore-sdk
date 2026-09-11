@@ -17,6 +17,43 @@ use std::str::FromStr;
 use std::time::Duration;
 
 #[test]
+fn native_timestamp_fingerprint_and_decode_need_no_owned_text() {
+    let timestamp = Timestamp::from_str("2026-09-11T10:20:30.123456789Z").unwrap();
+    let canonical = timestamp
+        .as_offset_datetime()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let json = serde_json::to_vec(&canonical).unwrap();
+    let binary = postcard::to_stdvec(&canonical).unwrap();
+    let expected = fingerprint(2, &7_u64, &canonical).unwrap();
+    let encoding = allocation_counter::measure(|| {
+        assert_eq!(fingerprint(2, &7_u64, &timestamp).unwrap(), expected);
+        image::binary::compare(&timestamp, &binary).unwrap();
+    });
+    let decoding = allocation_counter::measure(|| {
+        assert_eq!(
+            serde_json::from_slice::<Timestamp>(&json).unwrap(),
+            timestamp
+        );
+        assert_eq!(
+            postcard::from_bytes::<Timestamp>(&binary).unwrap(),
+            timestamp
+        );
+    });
+    eprintln!(
+        "native_timestamp_text_allocation encoding_count={} encoding_bytes={} decoding_count={} decoding_bytes={}",
+        encoding.count_total, encoding.bytes_total, decoding.count_total, decoding.bytes_total
+    );
+    assert_eq!(encoding.bytes_current, 0);
+    assert_eq!(decoding.bytes_current, 0);
+    assert_eq!(encoding.count_total, 0, "timestamp text is bounded scratch");
+    assert_eq!(
+        decoding.count_total, 0,
+        "valid timestamp text can be borrowed"
+    );
+}
+
+#[test]
 fn native_fingerprint_fragmented_stream_preserves_every_byte_without_allocation() {
     let input: Vec<_> = (0..65_537).map(|index| (index % 256) as u8).collect();
     let domain = b"OPC-native-fingerprint-stream-test\0";
