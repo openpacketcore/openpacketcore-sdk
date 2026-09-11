@@ -509,6 +509,42 @@ fn wire<T: Serialize>(
         .unwrap()
 }
 
+async fn wait_for_restored_cold_metrics(cold: &ConsensusSessionStore) {
+    // The public opener restores storage before Raft publishes its first
+    // metrics update. Synchronize that setup before measuring an RPC's
+    // no-effect result; the initial empty watch is not a restored vote/cut.
+    let wal = cold.inner.private_wal.as_ref().unwrap();
+    let mut restored_log =
+        crate::sqlite::consensus::wal::adapter::WalLogStore::new(Arc::clone(wal));
+    let restored_vote =
+        opc_consensus::engine::storage::RaftLogStorage::read_vote(&mut restored_log)
+            .await
+            .unwrap()
+            .unwrap();
+    let restored_logs =
+        opc_consensus::engine::storage::RaftLogStorage::get_log_state(&mut restored_log)
+            .await
+            .unwrap();
+    drop(restored_log);
+    let restored_applied = wal.with_native_read(|state| Ok(state.applied())).unwrap();
+    assert!(restored_vote.committed);
+    assert!(restored_logs.last_log_id.is_some());
+    assert!(restored_applied.is_some());
+    races::until(
+        || {
+            let metrics = cold.inner.raft.metrics();
+            let current = metrics.borrow();
+            current.vote == restored_vote
+                && current.last_log_index == restored_logs.last_log_id.map(|id| id.index)
+                && current.last_applied == restored_applied
+        },
+        "cold baseline publishes the exact independently restored vote and application cut",
+    )
+    .await;
+    assert!(!cold.inner.persistence_protocol.is_active());
+    assert!(!cold.status().admitted);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_persistence_public_reopen_requires_live_cut_and_local_application() {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
@@ -574,6 +610,7 @@ async fn async_persistence_public_reopen_requires_live_cut_and_local_application
             FixedQuorumTrafficAuthority::RecoveryRequired
         );
         assert!(cold.fenced_transition_v2_status(&second).await.is_err());
+        wait_for_restored_cold_metrics(&cold).await;
         let previous_vote = cold.inner.raft.metrics().borrow().vote;
         let sender = fleet.peers[leader].node;
         let vote = VoteRequest {
@@ -692,6 +729,7 @@ async fn async_persistence_all_cold_roots_withhold_votes_and_restored_leader_tra
                 .unwrap();
         }
         let restored = fleet.store(leader);
+        wait_for_restored_cold_metrics(restored).await;
         assert_eq!(
             restored
                 .inner

@@ -84,38 +84,7 @@ async fn async_persistence_real_certificate_binds_request_scope_full_vote_and_me
             .await
             .unwrap();
         let cold = fleet.store(recovering).clone();
-        // Raft's metrics watch initially contains an empty vote and log cut.
-        // Before sending any altered certificate, bind the baseline to the
-        // independently reconstructed storage and wait for that exact startup
-        // observation within the fixture's existing operation bound.
-        let wal = cold.inner.private_wal.as_ref().unwrap();
-        let mut restored_log =
-            crate::sqlite::consensus::wal::adapter::WalLogStore::new(Arc::clone(wal));
-        let restored_vote =
-            opc_consensus::engine::storage::RaftLogStorage::read_vote(&mut restored_log)
-                .await
-                .unwrap()
-                .unwrap();
-        let restored_logs =
-            opc_consensus::engine::storage::RaftLogStorage::get_log_state(&mut restored_log)
-                .await
-                .unwrap();
-        drop(restored_log);
-        let restored_applied = wal.with_native_read(|state| Ok(state.applied())).unwrap();
-        assert!(restored_vote.committed);
-        assert!(restored_logs.last_log_id.is_some());
-        assert!(restored_applied.is_some());
-        until(
-            || {
-                let metrics = cold.inner.raft.metrics();
-                let current = metrics.borrow();
-                current.vote == restored_vote
-                    && current.last_log_index == restored_logs.last_log_id.map(|id| id.index)
-                    && current.last_applied == restored_applied
-            },
-            "certificate baseline publishes the exact independently restored cold cut",
-        )
-        .await;
+        wait_for_restored_cold_metrics(&cold).await;
         assert!(!cold.inner.persistence_protocol.is_active());
         assert!(!cold.status().admitted);
         let before = cold.inner.raft.metrics().borrow().clone();
