@@ -57,6 +57,17 @@ pub(super) struct RowStamp {
 }
 
 impl RowStamp {
+    fn new(content: [u8; 32], revision: u64) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"OPC-native-process-revision-v1\0");
+        hash.update(content);
+        hash.update(revision.to_le_bytes());
+        Self {
+            content,
+            revision: hash.finalize().into(),
+        }
+    }
+
     pub(super) fn content(self) -> [u8; 32] {
         self.content
     }
@@ -67,15 +78,17 @@ pub(super) fn stamp<T: resident::RowFingerprint>(
     key: &impl Serialize,
     value: &SharedRow<T>,
 ) -> io::Result<RowStamp> {
-    let content = value.row_fingerprint(table, key)?;
-    let mut hash = Sha256::new();
-    hash.update(b"OPC-native-process-revision-v1\0");
-    hash.update(content);
-    hash.update(value.revision().to_le_bytes());
-    Ok(RowStamp {
-        content,
-        revision: hash.finalize().into(),
-    })
+    Ok(RowStamp::new(
+        value.row_fingerprint(table, key)?,
+        value.revision(),
+    ))
+}
+
+fn notification_stamp(value: &NotificationRow) -> io::Result<RowStamp> {
+    Ok(RowStamp::new(
+        resident::RowFingerprint::row_fingerprint(&**value, 3, &value.sequence())?,
+        value.revision(),
+    ))
 }
 
 struct HashWriter(Sha256);
@@ -252,7 +265,7 @@ pub(super) struct BusinessChanges {
     keys: HashMap<SessionKey, RowChange<NativeKeyState>>,
     receipts: HashMap<FencedTransitionV2RequestId, RowChange<NativeReceipt>>,
     generic: HashMap<SessionConsensusRequestId, RowChange<NativeGenericReceipt>>,
-    notifications: Vec<SharedRow<NativeNotification>>,
+    notifications: Vec<NotificationRow>,
     roster: roster::changes::Journal,
     // Conservative container-growth reservations precede allocation. Captures
     // transfer these guards; cloned business images do not clone a journal.
@@ -393,7 +406,7 @@ impl BusinessChanges {
         let start = self.base.tables[3].count;
         for row in &self.notifications {
             scratch::small(check, || {
-                tables[3].replace(None, Some(stamp(3, &row.sequence(), row)?))
+                tables[3].replace(None, Some(notification_stamp(row)?))
             })?;
         }
         if tables != self.target.tables {
@@ -615,7 +628,7 @@ pub(super) struct Publication {
     keys: Vec<StagedRow<SessionKey, NativeKeyState>>,
     receipts: Vec<StagedRow<FencedTransitionV2RequestId, NativeReceipt>>,
     generic: Vec<StagedRow<SessionConsensusRequestId, NativeGenericReceipt>>,
-    notifications: Vec<SharedRow<NativeNotification>>,
+    notifications: Vec<NotificationRow>,
     delivery: NativeApplied,
     memory: Arc<VerificationMemory>,
     tracking: bool,
@@ -685,7 +698,7 @@ impl Publication {
             &mut bytes,
             notifications
                 .len()
-                .checked_mul(4 * size_of::<SharedRow<NativeNotification>>())
+                .checked_mul(4 * size_of::<NotificationRow>())
                 .ok_or_else(|| invalid("native change notification reservation overflow"))?,
         )?;
         for key in keys.keys() {
@@ -849,10 +862,10 @@ impl Publication {
         };
         let notifications = notifications
             .into_iter()
-            .map(|row| SharedRow::new(NativeNotification::new(row)))
+            .map(|row| NotificationRow::new(NativeNotification::new(row)))
             .collect::<io::Result<Vec<_>>>()?;
         for row in &notifications {
-            tables[3].replace(None, Some(stamp(3, &row.sequence(), row)?))?;
+            tables[3].replace(None, Some(notification_stamp(row)?))?;
         }
         validation::validate_frontiers(
             base.identity,
@@ -1159,7 +1172,7 @@ impl NativeState {
         }
         expiry.validate_requests(&self.frontiers)?;
         for row in &self.notifications {
-            tables[3].replace(None, Some(stamp(3, &row.sequence(), row)?))?;
+            tables[3].replace(None, Some(notification_stamp(row)?))?;
         }
         let proof = BusinessProof::new(
             self,

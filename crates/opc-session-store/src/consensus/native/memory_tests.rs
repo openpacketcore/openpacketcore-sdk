@@ -79,6 +79,14 @@ fn report_owners(label: &str, mut storage: NativeStorage) {
             "selected proof owner retains {} bytes for 4096 rows",
             -proof.bytes_current,
         );
+        // The persistent vector already shares immutable history chunks.
+        // Selected notification metadata needs no separate value and body
+        // allocations per row; keep the measured owner below 110 bytes/row.
+        assert!(
+            -notifications.bytes_current <= 4096 * 110,
+            "selected notification owner retains {} bytes for 4096 rows",
+            -notifications.bytes_current,
+        );
     }
 }
 

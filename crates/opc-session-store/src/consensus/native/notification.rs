@@ -6,7 +6,63 @@ use super::*;
 use resident::{RowFingerprint, SelectedBytes, SelectedRange};
 use serde::{Deserializer, Serializer};
 use std::io::Write;
+use std::num::NonZeroU64;
+use std::ops::Deref;
 use std::sync::Arc;
+
+/// The persistent vector shares immutable chunks. Keep selected metadata in
+/// those chunks without another Arc and Box per historical notification.
+/// Resident bodies remain shared when a captured chunk must be copied.
+#[derive(Clone)]
+pub(super) struct NotificationRow {
+    value: NativeNotification,
+    revision: NonZeroU64,
+}
+
+impl NotificationRow {
+    pub(super) fn new(value: NativeNotification) -> io::Result<Self> {
+        Ok(Self {
+            value,
+            revision: shared::issue_revision()?,
+        })
+    }
+
+    pub(super) fn ptr_eq(&self, other: &Self) -> bool {
+        self.revision == other.revision
+    }
+
+    // Only exact expected readback can produce a selected replacement. Its
+    // publication keeps the captured logical revision, like SharedRow.
+    pub(super) fn relocated(&self, value: NativeNotification) -> Self {
+        Self {
+            value,
+            revision: self.revision,
+        }
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.get()
+    }
+}
+
+impl Deref for NotificationRow {
+    type Target = NativeNotification;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl Serialize for NotificationRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NotificationRow {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        Self::new(NativeNotification::deserialize(decoder)?).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct NativeNotification {
@@ -15,8 +71,8 @@ pub(super) struct NativeNotification {
 
 #[derive(Clone)]
 enum Body {
-    Resident(Box<ReplicationEntry>),
-    Selected(Box<SelectedNotification>),
+    Resident(Arc<ReplicationEntry>),
+    Selected(SelectedNotification),
 }
 
 #[derive(Clone)]
@@ -45,14 +101,9 @@ impl NativeNotification {
         matches!(self.body, Body::Selected(_))
     }
 
-    pub(super) fn relocation_allocation_bytes() -> usize {
-        SharedRow::<Self>::relocated_allocation_bytes()
-            + std::mem::size_of::<SelectedNotification>()
-    }
-
     pub(super) fn new(row: ReplicationEntry) -> Self {
         Self {
-            body: Body::Resident(Box::new(row)),
+            body: Body::Resident(Arc::new(row)),
         }
     }
 
@@ -90,7 +141,7 @@ impl NativeNotification {
         }
         let range = SelectedRange::new(source, offset, length, generation::MAX_ITEM)?;
         Ok(Self {
-            body: Body::Selected(Box::new(SelectedNotification { range, row })),
+            body: Body::Selected(SelectedNotification { range, row }),
         })
     }
 

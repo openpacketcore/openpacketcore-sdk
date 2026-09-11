@@ -15,7 +15,7 @@ enum Expected {
         length: u32,
     },
     Notification {
-        row: SharedRow<NativeNotification>,
+        row: NotificationRow,
         offset: u64,
         length: u32,
     },
@@ -39,7 +39,7 @@ enum Replacement {
     },
     Notification {
         index: usize,
-        row: SharedRow<NativeNotification>,
+        row: NotificationRow,
     },
     Log {
         index: u64,
@@ -87,11 +87,10 @@ impl RetiredRows<'_> {
 impl RelocationBuilder {
     pub(super) fn new(maximum: usize) -> io::Result<Self> {
         // Both exact-capacity vectors coexist while ranges become compact
-        // rows. Charge the largest concrete value Arc plus selected-body Box;
-        // no payload or prefix index is copied by relocation; its logical
-        // revision is retained without a separate allocation.
+        // rows. Notification metadata is inline in these vectors. Charge the
+        // largest remaining concrete value Arc plus selected-body Box; no
+        // payload or prefix index is copied and logical revisions are retained.
         let allocation = NativeReceipt::relocation_allocation_bytes()
-            .max(NativeNotification::relocation_allocation_bytes())
             .max(log::NativeLogEntry::relocation_allocation_bytes());
         // Roster::Row::selected reserves its independent copy before it
         // transfers into resident metadata. That prospective replacement has
@@ -135,7 +134,7 @@ impl RelocationBuilder {
     }
     pub(in crate::consensus::native) fn notification(
         &mut self,
-        row: &SharedRow<NativeNotification>,
+        row: &NotificationRow,
         offset: u64,
         length: u32,
     ) -> io::Result<()> {

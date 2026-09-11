@@ -150,9 +150,36 @@ impl DigestPage {
 }
 
 struct CachedBlock {
-    metadata: MetadataIdentity,
+    metadata: Option<MetadataIdentity>,
     index: usize,
     bytes: Zeroizing<Vec<u8>>,
+}
+
+struct CachedBlocks {
+    recent: usize,
+    blocks: [CachedBlock; 2],
+    evicted: Option<(MetadataIdentity, usize)>,
+}
+
+impl CachedBlocks {
+    fn allocate(bytes: usize) -> io::Result<Self> {
+        Ok(Self {
+            recent: 0,
+            blocks: [
+                CachedBlock {
+                    metadata: None,
+                    index: 0,
+                    bytes: buffer(bytes)?,
+                },
+                CachedBlock {
+                    metadata: None,
+                    index: 0,
+                    bytes: Zeroizing::new(Vec::new()),
+                },
+            ],
+            evicted: None,
+        })
+    }
 }
 
 pub(crate) struct VerifiedAppendSource {
@@ -163,10 +190,10 @@ pub(crate) struct VerifiedAppendSource {
     pages: Vec<OnceLock<Box<DigestPage>>>,
     admitted_length: AtomicU64,
     failed: AtomicBool,
-    cache: Mutex<Option<CachedBlock>>,
+    cache: Mutex<Option<CachedBlocks>>,
     #[cfg(test)]
     blocks_read: AtomicU64,
-    // Source, owner SHA state, page directory, and both old/new cache buffers.
+    // Source, owner SHA state, page directory, and both verified cache buffers.
     // Digest pages, views, capture/append scratch reserve separately from the
     // SAME process-wide VerificationMemory counter before allocation.
     _memory: VerificationMemory,
@@ -255,36 +282,61 @@ impl VerifiedAppendSource {
             let metadata = self.metadata()?;
             let index =
                 usize::try_from(position / self.block_bytes as u64).map_err(|_| invalid())?;
-            if cache
-                .as_ref()
-                .is_none_or(|old| old.index != index || old.metadata != metadata)
-            {
+            let hit = cache.as_ref().and_then(|cache| {
+                cache
+                    .blocks
+                    .iter()
+                    .position(|block| block.index == index && block.metadata == Some(metadata))
+            });
+            let slot = if let Some(slot) = hit {
+                cache.as_mut().ok_or_else(invalid)?.recent = slot;
+                slot
+            } else {
                 // A miss replaces every byte before authentication. Transfer
-                // the existing zeroizing allocation out of the old cache so
-                // ordinary reads do not allocate and wipe a whole block each
-                // time. Errors still drop/wipe this buffer and fence every
-                // view; no partially read or unverified bytes enter the cache.
-                let mut bytes = match cache.take() {
-                    Some(previous) => previous.bytes,
-                    None => buffer(self.block_bytes)?,
+                // both zeroizing buffers out of the cache and reuse the less
+                // recent block. Alternating two blocks uses the same original
+                // two-buffer reservation without repeatedly reading/hashing
+                // either one. Errors drop/wipe both buffers and fence every
+                // view; partially read or unverified bytes cannot be cached.
+                let mut next = match cache.take() {
+                    Some(previous) => previous,
+                    None => CachedBlocks::allocate(self.block_bytes)?,
                 };
+                let older = 1 - next.recent;
+                // A sequential admission needs only one buffer. Allocate the
+                // reserved second buffer when a reader comes back to the last
+                // evicted block; this key is only an allocation hint. Every
+                // miss still reads and authenticates the complete block below.
+                let slot = if next.blocks[older].bytes.is_empty()
+                    && next.evicted != Some((metadata, index))
+                {
+                    next.recent
+                } else {
+                    older
+                };
+                let block = &mut next.blocks[slot];
+                next.evicted = block.metadata.map(|metadata| (metadata, block.index));
+                block.metadata = None;
+                if block.bytes.is_empty() {
+                    block.bytes = buffer(self.block_bytes)?;
+                }
                 self.file
-                    .read_exact_at(&mut bytes, index as u64 * self.block_bytes as u64)?;
+                    .read_exact_at(&mut block.bytes, index as u64 * self.block_bytes as u64)?;
                 #[cfg(test)]
                 self.blocks_read.fetch_add(1, Ordering::Relaxed);
-                let actual: [u8; 32] = Sha256::digest(&*bytes).into();
+                let actual: [u8; 32] = Sha256::digest(&*block.bytes).into();
                 if actual != self.digest(index)? {
                     return Err(invalid());
                 }
                 // Metadata is only a cache hint. The owned verified bytes
                 // stay exact even if the file changes immediately afterward.
-                *cache = Some(CachedBlock {
-                    metadata,
-                    index,
-                    bytes,
-                });
-            }
-            let cached = cache.as_ref().ok_or_else(invalid)?;
+                block.metadata = Some(metadata);
+                block.index = index;
+                next.recent = slot;
+                *cache = Some(next);
+                slot
+            };
+            let cached = &cache.as_ref().ok_or_else(invalid)?.blocks[slot];
             let inside = (position % self.block_bytes as u64) as usize;
             let count = (self.block_bytes - inside).min(output.len() - written);
             output[written..written + count].copy_from_slice(&cached.bytes[inside..inside + count]);

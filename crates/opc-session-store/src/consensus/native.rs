@@ -36,7 +36,7 @@ mod public_reads;
 mod public_restore;
 mod resident;
 mod scratch;
-use notification::NativeNotification;
+use notification::{NativeNotification, NotificationRow};
 pub(crate) mod owned;
 mod reads;
 pub(crate) use reads::{ReceiptCopies, ReceiptReads, ResolvedReceipts};
@@ -297,7 +297,7 @@ pub(crate) struct NativeState {
     keys: RowMap<SessionKey, SharedRow<NativeKeyState>>,
     receipts: RowMap<FencedTransitionV2RequestId, SharedRow<NativeReceipt>>,
     generic_receipts: RowMap<SessionConsensusRequestId, SharedRow<NativeGenericReceipt>>,
-    notifications: ResidentVector<SharedRow<NativeNotification>>,
+    notifications: ResidentVector<NotificationRow>,
     #[serde(skip, default = "roster::Ledger::empty")]
     roster: roster::Ledger,
     // Configuration comes from the independently validated opener. No
@@ -335,7 +335,7 @@ impl Serialize for NativeState {
             receipts: &'a RowMap<FencedTransitionV2RequestId, SharedRow<NativeReceipt>>,
             generic_receipts:
                 &'a RowMap<SessionConsensusRequestId, SharedRow<NativeGenericReceipt>>,
-            notifications: &'a ResidentVector<SharedRow<NativeNotification>>,
+            notifications: &'a ResidentVector<NotificationRow>,
         }
         Legacy {
             identity: self.identity,

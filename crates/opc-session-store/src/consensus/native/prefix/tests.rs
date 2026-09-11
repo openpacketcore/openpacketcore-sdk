@@ -100,21 +100,64 @@ fn append(owner: &mut VerifiedAppendOwner, bytes: &[u8]) -> io::Result<Arc<Verif
 }
 
 #[test]
-fn native_prefix_cache_misses_bound_allocations_and_preserve_every_verified_byte() {
+fn native_prefix_two_active_blocks_reuse_authenticated_bytes_without_allocations() {
     let fixture = Fixture::new(1);
     let mut owner = fixture.open();
     let view = append(&mut owner, &vec![0x62; MIN_BLOCK]).unwrap();
     let mut actual = vec![0; MIN_BLOCK];
-    view.read_exact_at(MIN_BLOCK as u64, &mut actual).unwrap();
-    assert!(actual.iter().all(|byte| *byte == 0x62));
+    // Visit the working set twice before measuring. A one-way cold scan
+    // need not allocate the second buffer reserved for alternating reads.
+    for (offset, expected) in [
+        (0, 0x51),
+        (MIN_BLOCK as u64, 0x62),
+        (0, 0x51),
+        (MIN_BLOCK as u64, 0x62),
+    ] {
+        view.read_exact_at(offset, &mut actual).unwrap();
+        assert!(actual.iter().all(|byte| *byte == expected));
+    }
     let before = view.blocks_read();
-    let started = std::time::Instant::now();
     let allocations = allocation_counter::measure(|| {
         for index in 0..64 {
             let (offset, expected) = if index % 2 == 0 {
                 (0, 0x51)
             } else {
                 (MIN_BLOCK as u64, 0x62)
+            };
+            view.read_exact_at(offset, &mut actual).unwrap();
+            assert!(actual.iter().all(|byte| *byte == expected));
+        }
+    });
+    assert_eq!(
+        view.blocks_read() - before,
+        0,
+        "alternating two admitted blocks must not verify the same file bytes repeatedly",
+    );
+    assert_eq!(allocations.bytes_total, 0);
+    assert!(!view.is_failed());
+}
+
+#[test]
+fn native_prefix_cache_misses_bound_allocations_and_preserve_every_verified_byte() {
+    let fixture = Fixture::new(1);
+    let mut owner = fixture.open();
+    append(&mut owner, &vec![0x62; MIN_BLOCK]).unwrap();
+    let view = append(&mut owner, &vec![0x73; MIN_BLOCK]).unwrap();
+    let mut actual = vec![0; MIN_BLOCK];
+    for (offset, expected) in [(MIN_BLOCK as u64, 0x62), (2 * MIN_BLOCK as u64, 0x73)] {
+        view.read_exact_at(offset, &mut actual).unwrap();
+        assert!(actual.iter().all(|byte| *byte == expected));
+    }
+    let before = view.blocks_read();
+    let started = std::time::Instant::now();
+    let allocations = allocation_counter::measure(|| {
+        for index in 0..64 {
+            // Three blocks still force a real eviction on every read with
+            // two cache slots. Keep the original 64-miss allocation bound.
+            let (offset, expected) = match index % 3 {
+                0 => (0, 0x51),
+                1 => (MIN_BLOCK as u64, 0x62),
+                _ => (2 * MIN_BLOCK as u64, 0x73),
             };
             view.read_exact_at(offset, &mut actual).unwrap();
             assert!(actual.iter().all(|byte| *byte == expected));

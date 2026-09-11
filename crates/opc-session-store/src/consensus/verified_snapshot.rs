@@ -138,16 +138,27 @@ struct CachedBlock {
     bytes: Zeroizing<Vec<u8>>,
 }
 
+#[derive(Default)]
+struct CachedBlocks {
+    recent: usize,
+    blocks: [Option<CachedBlock>; 2],
+    // Allocation hint only. A revisit needs the second already-reserved
+    // buffer; a sequential scan can keep reusing one buffer.
+    evicted: Option<(Generation, usize)>,
+}
+
 pub(crate) struct VerifiedFile {
     file: File,
     generation: Generation,
     block_bytes: usize,
     blocks: Box<[[u8; DIGEST_BYTES]]>,
     digest: [u8; DIGEST_BYTES],
-    // One verified owned block, shared by descriptor clones. Ctime is only a
-    // cache invalidation hint: every newly loaded block is hashed regardless.
-    cache: Mutex<Option<CachedBlock>>,
+    // At most the two originally reserved buffers, shared by descriptor
+    // clones. Ctime only invalidates cached bytes; each loaded block is hashed.
+    cache: Mutex<CachedBlocks>,
     _memory: VerificationMemory,
+    #[cfg(test)]
+    verified_reads: AtomicUsize,
 }
 
 impl VerifiedFile {
@@ -200,8 +211,10 @@ impl VerifiedFile {
             block_bytes,
             blocks: blocks.into_boxed_slice(),
             digest: hasher.finalize().into(),
-            cache: Mutex::new(None),
+            cache: Mutex::new(CachedBlocks::default()),
             _memory: memory,
+            #[cfg(test)]
+            verified_reads: AtomicUsize::new(0),
         }))
     }
 
@@ -243,26 +256,46 @@ impl VerifiedFile {
                 .checked_mul(self.block_bytes as u64)
                 .ok_or_else(invalid)?;
             let in_block = usize::try_from(position - block_start).map_err(|_| invalid())?;
-            if cache
-                .as_ref()
-                .is_none_or(|cached| cached.index != index || cached.generation != generation)
-            {
+            let slot = if let Some(slot) = cache.blocks.iter().position(|cached| {
+                cached
+                    .as_ref()
+                    .is_some_and(|cached| cached.index == index && cached.generation == generation)
+            }) {
+                slot
+            } else {
+                let other = cache.recent ^ 1;
+                let slot = if cache.blocks[other].is_none()
+                    && cache.evicted != Some((generation, index))
+                {
+                    cache.recent
+                } else {
+                    other
+                };
                 let bytes =
                     usize::try_from((self.length() - block_start).min(self.block_bytes as u64))
                         .map_err(|_| invalid())?;
-                let mut buffer = Zeroizing::new(vec![0; bytes]);
-                self.file.read_exact_at(&mut buffer, block_start)?;
-                let actual: [u8; 32] = Sha256::digest(&*buffer).into();
+                let mut buffer = if let Some(previous) = cache.blocks[slot].take() {
+                    cache.evicted = Some((previous.generation, previous.index));
+                    previous.bytes
+                } else {
+                    Zeroizing::new(vec![0; self.block_bytes])
+                };
+                self.file.read_exact_at(&mut buffer[..bytes], block_start)?;
+                #[cfg(test)]
+                self.verified_reads.fetch_add(1, Ordering::Relaxed);
+                let actual: [u8; 32] = Sha256::digest(&buffer[..bytes]).into();
                 if self.blocks.get(index) != Some(&actual) {
                     return Err(invalid());
                 }
-                *cache = Some(CachedBlock {
+                cache.blocks[slot] = Some(CachedBlock {
                     generation,
                     index,
                     bytes: buffer,
                 });
-            }
-            let cached = cache.as_ref().ok_or_else(invalid)?;
+                slot
+            };
+            cache.recent = slot;
+            let cached = cache.blocks[slot].as_ref().ok_or_else(invalid)?;
             let bytes = cached
                 .bytes
                 .len()
@@ -556,6 +589,115 @@ mod tests {
             block_size(1024 * 1024).expect("small snapshot block size")
         );
         assert!(block_size(MAX_BLOCK_BYTES as u64 * MAX_BLOCKS as u64 + 1).is_err());
+    }
+
+    #[test]
+    fn portable_snapshot_two_active_blocks_reuse_verified_bytes_without_allocations() {
+        let mut artifact = tempfile::NamedTempFile::new().expect("snapshot fixture");
+        for byte in [0x51, 0x62, 0x73] {
+            artifact.write_all(&vec![byte; MIN_BLOCK_BYTES]).unwrap();
+        }
+        artifact.flush().unwrap();
+        let source = VerifiedFile::capture(artifact.reopen().unwrap(), u64::MAX).unwrap();
+        let mut output = vec![0; MIN_BLOCK_BYTES];
+        for index in [0, 1, 0, 1] {
+            source
+                .read_exact_at((index * MIN_BLOCK_BYTES) as u64, &mut output)
+                .unwrap();
+        }
+        let before = source.verified_reads.load(Ordering::Relaxed);
+        let allocations = allocation_counter::measure(|| {
+            for ordinal in 0..64 {
+                let index = ordinal % 2;
+                source
+                    .read_exact_at((index * MIN_BLOCK_BYTES) as u64, &mut output)
+                    .unwrap();
+                assert!(output.iter().all(|byte| *byte == [0x51, 0x62][index]));
+            }
+        });
+        assert_eq!(
+            source.verified_reads.load(Ordering::Relaxed) - before,
+            0,
+            "two active blocks must not be read and hashed again"
+        );
+        assert_eq!(
+            allocations.bytes_total, 0,
+            "steady reads reuse the original reserved buffers"
+        );
+        assert_eq!(allocations.count_total, 0);
+    }
+
+    #[test]
+    fn portable_snapshot_both_cached_blocks_reject_changed_padding() {
+        for index in 0..2 {
+            let mut artifact = tempfile::NamedTempFile::new().unwrap();
+            artifact
+                .write_all(&vec![0x51; MIN_BLOCK_BYTES * 2])
+                .unwrap();
+            artifact.flush().unwrap();
+            let source = VerifiedFile::capture(artifact.reopen().unwrap(), u64::MAX).unwrap();
+            for warm in [0, 1, 0, 1] {
+                source
+                    .read_exact_at((warm * MIN_BLOCK_BYTES) as u64, &mut [0; 1])
+                    .unwrap();
+            }
+            artifact
+                .as_file()
+                .write_all_at(&[0x7e], ((index + 1) * MIN_BLOCK_BYTES - 1) as u64)
+                .unwrap();
+            artifact.as_file().sync_all().unwrap();
+            assert!(
+                source
+                    .read_exact_at((index * MIN_BLOCK_BYTES) as u64, &mut [0; 1])
+                    .is_err(),
+                "changed bytes elsewhere in either cached block must fail full-block verification"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_snapshot_sequential_and_three_block_misses_reuse_reserved_buffers() {
+        let mut artifact = tempfile::NamedTempFile::new().unwrap();
+        for byte in [0x51, 0x62, 0x73] {
+            artifact.write_all(&vec![byte; MIN_BLOCK_BYTES]).unwrap();
+        }
+        artifact.flush().unwrap();
+        let source = VerifiedFile::capture(artifact.reopen().unwrap(), u64::MAX).unwrap();
+        let mut output = vec![0; MIN_BLOCK_BYTES];
+        source.read_exact_at(0, &mut output).unwrap();
+        let sequential = allocation_counter::measure(|| {
+            for index in [1, 2, 0, 1, 2] {
+                source
+                    .read_exact_at((index * MIN_BLOCK_BYTES) as u64, &mut output)
+                    .unwrap();
+                assert!(output.iter().all(|byte| *byte == [0x51, 0x62, 0x73][index]));
+            }
+        });
+        assert_eq!(
+            sequential.bytes_total, 0,
+            "a sequential scan retains only one reusable buffer"
+        );
+        for index in [0, 1, 0, 1, 2] {
+            source
+                .read_exact_at((index * MIN_BLOCK_BYTES) as u64, &mut output)
+                .unwrap();
+        }
+        let before = source.verified_reads.load(Ordering::Relaxed);
+        let misses = allocation_counter::measure(|| {
+            for ordinal in 0..64 {
+                let index = ordinal % 3;
+                source
+                    .read_exact_at((index * MIN_BLOCK_BYTES) as u64, &mut output)
+                    .unwrap();
+                assert!(output.iter().all(|byte| *byte == [0x51, 0x62, 0x73][index]));
+            }
+        });
+        assert_eq!(source.verified_reads.load(Ordering::Relaxed) - before, 64);
+        assert_eq!(
+            misses.bytes_total, 0,
+            "each actual miss reuses a charged buffer"
+        );
+        assert_eq!(misses.count_total, 0);
     }
 
     #[test]

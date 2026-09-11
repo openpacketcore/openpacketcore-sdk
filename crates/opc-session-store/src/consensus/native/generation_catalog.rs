@@ -276,8 +276,8 @@ impl Catalog {
                 ));
             }
         }
-        // The source owns one authenticated block cache. Hash iteration
-        // repeatedly reloads and verifies that block for adjacent small rows.
+        // The source shares a bounded authenticated block cache. Hash iteration
+        // can repeatedly reload and verify blocks holding adjacent small rows.
         // Order only complete request IDs by their admitted source offsets;
         // each row still passes the same bound, decoder and semantic checks.
         // Charge the temporary IDs before allocating, and remove each old
@@ -344,7 +344,7 @@ impl Catalog {
             storage
                 .business
                 .notifications
-                .push_back(SharedRow::new(row)?);
+                .push_back(NotificationRow::new(row)?);
         }
         for (index, indexed) in logs {
             check()?;

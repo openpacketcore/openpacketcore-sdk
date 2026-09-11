@@ -17,6 +17,10 @@ struct RevisionIssuer(AtomicU64);
 
 static REVISIONS: RevisionIssuer = RevisionIssuer(AtomicU64::new(1));
 
+pub(super) fn issue_revision() -> io::Result<NonZeroU64> {
+    REVISIONS.issue()
+}
+
 impl RevisionIssuer {
     fn issue(&self) -> io::Result<NonZeroU64> {
         let value = self
@@ -51,7 +55,7 @@ impl<T> SharedRow<T> {
     }
 
     pub(super) fn new(value: T) -> io::Result<Self> {
-        let revision = REVISIONS.issue()?;
+        let revision = issue_revision()?;
         Ok(Self {
             value: Arc::new(value),
             revision,

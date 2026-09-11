@@ -546,12 +546,12 @@ impl Gate {
             ..IoControl::default()
         }
     }
-    fn entered(&self) {
+    fn entered(&self, deadline: Instant) {
         let (state, _) = self
             .changed
             .wait_timeout_while(
                 self.state.lock().unwrap(),
-                Duration::from_secs(10),
+                deadline.saturating_duration_since(Instant::now()),
                 |state| !state.0,
             )
             .unwrap();
@@ -594,6 +594,17 @@ fn native_durable_install_drains_captured_reads_apply_and_relocation_before_rele
         }
         if point == Point::BeforeNativeApplyPrepare {
             fixture.append_commit(std::slice::from_ref(&entry));
+        }
+        let capture_deadline = Instant::now() + Duration::from_secs(10);
+        if point == Point::BeforeNativeReceiptRead {
+            // Checkpoint selection precedes incremental row relocation. The
+            // declared detached read exists only after this receipt becomes
+            // file-backed; a resident read correctly needs no file boundary.
+            // Spend the same original setup deadline on both prerequisites.
+            while fixture.wal.native_cold_counts_for_test().unwrap()[0] != 1 {
+                assert!(Instant::now() < capture_deadline);
+                std::thread::yield_now();
+            }
         }
         let before_requests = fixture.wal.integration_cost_snapshot().unwrap()["requests"]
             .as_u64()
@@ -641,7 +652,7 @@ fn native_durable_install_drains_captured_reads_apply_and_relocation_before_rele
                 }
                 _ => unreachable!(),
             });
-            gate.entered();
+            gate.entered(capture_deadline);
             let source = incoming.source().unwrap();
             let wal = &fixture.wal;
             let primary = &fixture.oracle;
