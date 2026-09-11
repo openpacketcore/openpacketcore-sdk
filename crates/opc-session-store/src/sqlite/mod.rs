@@ -985,9 +985,10 @@ impl SqliteSessionBackend {
     /// Open a test database through an explicitly selected SQLite test VFS.
     ///
     /// This exists only for the `test-vfs` feature's real-file durability
-    /// qualification. Apart from selecting the VFS for `Connection::open`, it
-    /// takes the identical file-open path as [`Self::open`], including the
-    /// recovery latch check and the primary writer pragma profile.
+    /// qualification. It retains the SQLite backend and selects the VFS for
+    /// both primary and checkpoint connections. The recovery latch check and
+    /// primary writer pragma profile follow the same file-open path as
+    /// [`Self::open`].
     #[cfg(feature = "test-vfs")]
     #[doc(hidden)]
     pub fn open_with_vfs_for_test(
@@ -999,6 +1000,13 @@ impl SqliteSessionBackend {
             Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs_name)
                 .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
         let mut backend = Self::finish_file_open(path, conn)?;
+        // This fixture selects SQLite's actual primary/checkpoint writers.
+        // Native persistence bypasses the SQLite VFS and has no SQL checkpoint
+        // worker, so keeping that owner would miss the intended fault seam.
+        #[cfg(target_os = "linux")]
+        {
+            backend.native_owner = None;
+        }
         backend.checkpoint_vfs_name = Some(Arc::from(vfs_name));
         Ok(backend)
     }

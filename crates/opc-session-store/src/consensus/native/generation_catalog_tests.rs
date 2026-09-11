@@ -16,6 +16,52 @@ const MAXIMUM: u64 = 32 * BLOCK as u64;
 const ROOT: [u8; 32] = [0xBD; 32];
 const CUT: [u8; 32] = [0xCE; 32];
 
+#[test]
+fn native_catalog_generic_conversion_bounds_verified_block_reads_and_preserves_every_row() {
+    let (mut original, _, _) = fixture();
+    for first in (2..1026).step_by(64) {
+        let entries = (first..first + 64)
+            .map(|index| clock(index, time(2)))
+            .collect::<Vec<_>>();
+        apply(&mut original, &entries);
+    }
+    assert_eq!(original.business.generic_receipts.len(), 1024);
+    let (files, catalog) = Files::new(&original);
+    let selected = files.owner.current();
+    let blocks = selected.identity().length / BLOCK as u64;
+    assert!(blocks >= 4, "exercise several authenticated blocks");
+    let before = selected.blocks_read();
+    let started = std::time::Instant::now();
+    let cold = catalog.into_storage(&|| Ok(())).unwrap();
+    let reads = selected.blocks_read() - before;
+    eprintln!(
+        "native_generic_conversion rows=1024 blocks={blocks} block_reads={reads} elapsed_us={}",
+        started.elapsed().as_micros(),
+    );
+    cold.validate_image().unwrap();
+    assert_eq!(
+        Version::capture(&cold).unwrap().context_digest().unwrap(),
+        Version::capture(&original)
+            .unwrap()
+            .context_digest()
+            .unwrap(),
+    );
+    assert_eq!(cold.business.generic_receipts.len(), 1024);
+    for (id, expected) in &original.business.generic_receipts {
+        assert_eq!(
+            serde_json::to_vec(&**cold.business.generic_receipts.get(id).unwrap()).unwrap(),
+            serde_json::to_vec(&**expected).unwrap(),
+            "the complete independent typed response remains exact",
+        );
+    }
+    // Conversion and complete business/log admission may revisit blocks, but
+    // must remain within four complete scans rather than one block per row.
+    assert!(
+        reads <= 4 * blocks,
+        "selected generic conversion rereads blocks"
+    );
+}
+
 struct Files {
     _directory: tempfile::TempDir,
     path: PathBuf,

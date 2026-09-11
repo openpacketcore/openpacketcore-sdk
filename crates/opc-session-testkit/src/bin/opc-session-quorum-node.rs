@@ -1425,6 +1425,18 @@ impl QualificationNode {
                 }
             }
             QualificationNodeCommand::ConsensusDiagnostics => {
+                let health = self.store.persistence_health();
+                eprintln!(
+                    "qualification_persistence_health mode={:?} engine_running={} storage_state={:?} storage_failure={:?}",
+                    health.mode, health.engine_running, health.storage_state, health.storage_failure,
+                );
+                #[cfg(feature = "test-control")]
+                eprintln!(
+                    "qualification_local_durable_progress {:?}",
+                    opc_session_store::test_support::consensus_local_durable_progress_for_test(
+                        &self.store
+                    ),
+                );
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
                 }

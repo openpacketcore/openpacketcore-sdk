@@ -195,7 +195,7 @@ impl Catalog {
             context,
             keys,
             receipts,
-            generic,
+            mut generic,
             v1_count: _,
             notifications,
             logs,
@@ -276,7 +276,32 @@ impl Catalog {
                 ));
             }
         }
-        for (id, indexed) in generic {
+        // The source owns one authenticated block cache. Hash iteration
+        // repeatedly reloads and verifies that block for adjacent small rows.
+        // Order only complete request IDs by their admitted source offsets;
+        // each row still passes the same bound, decoder and semantic checks.
+        // Charge the temporary IDs before allocating, and remove each old
+        // catalog row before constructing its resident replacement.
+        let generic_order_memory = VerificationMemory::reserve(
+            generic
+                .len()
+                .checked_mul(size_of::<SessionConsensusRequestId>())
+                .ok_or_else(|| invalid("native generic conversion order overflows"))?,
+        )?;
+        let mut generic_order = Vec::new();
+        generic_order
+            .try_reserve_exact(generic.len())
+            .map_err(|_| invalid("native generic conversion order allocation failed"))?;
+        for id in generic.keys() {
+            check()?;
+            generic_order.push(*id);
+        }
+        generic_order.sort_unstable_by_key(|id| generic.get(id).map(|row| row.range.offset));
+        check()?;
+        for id in generic_order {
+            let indexed = generic
+                .remove(&id)
+                .ok_or_else(|| invalid("native generic conversion ordered row missing"))?;
             check()?;
             let range = resident::SelectedRange::new(
                 Arc::clone(&source),
@@ -303,6 +328,11 @@ impl Catalog {
                 ));
             }
         }
+        if !generic.is_empty() {
+            return Err(invalid("native generic conversion omitted a row"));
+        }
+        drop(generic);
+        drop(generic_order_memory);
         for indexed in notifications {
             check()?;
             let row = NativeNotification::from_admitted_range(
