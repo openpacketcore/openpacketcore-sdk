@@ -1862,6 +1862,13 @@ by issue #143.
   audit/readiness latching, terminal idempotency, and exact legacy
   confirmation.
 - Run with: `cargo test -p opc-session-store`.
+- Fixed-quorum fault, snapshot, and election qualification requires the existing
+  test controls: `cargo test --locked -p opc-session-store --all-features --test fixed_quorum_authority`.
+  On Linux, live authority faults execute against both the selected native WAL
+  and an explicitly selected legacy SQLite fixture, with independent readback.
+  Native resident drift is distinct from persisted snapshot corruption and the
+  actual inode-bound recovery latch. These controls keep the original watch and
+  complete-operation deadlines and restore each fault before clean shutdown.
 
 ## License
 

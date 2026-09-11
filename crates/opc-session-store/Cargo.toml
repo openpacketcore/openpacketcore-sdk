@@ -17,8 +17,8 @@ categories = ["network-programming", "data-structures"]
 
 [features]
 default = []
-# Enables non-production consensus election controls used only by integration
-# tests that must deterministically exercise a real authenticated campaign.
+# Enables non-production consensus election and live-owner fault controls for
+# integration tests, including independent native/SQL authority witnesses.
 test-control = []
 # Test-only VFS hooks used to qualify SQLite durability boundaries with the
 # bundled SQLite build. This feature is never enabled by production crates.

@@ -834,6 +834,24 @@ impl Wal {
         Ok(facts)
     }
 
+    /// Raw selected publication metadata; does not run an admission predicate.
+    #[cfg(feature = "test-control")]
+    pub(crate) fn native_current_snapshot_for_test(
+        &self,
+    ) -> io::Result<Option<super::super::CurrentSnapshot>> {
+        let state = self.fixture_state()?;
+        if state.volatile_mode() {
+            return Err(invalid_data(
+                "durable snapshot oracle refuses volatile storage",
+            ));
+        }
+        let native = state
+            .native
+            .as_ref()
+            .ok_or_else(|| invalid_data("test native snapshot owner missing"))?;
+        Ok(native.business.current_snapshot())
+    }
+
     /// Bind a filesystem fault to the database configured on this backend.
     #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn native_fixture_database_matches_for_test(
@@ -906,6 +924,127 @@ impl Wal {
                 state.authority.scope.application_authority_epoch = saved;
                 Ok(())
             }))
+        }
+    }
+
+    /// Change exactly one live authority field; never rewrite a persisted
+    /// selected input or restore a stale complete owner over concurrent work.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn native_fixed_authority_fault_for_test(
+        &self,
+        fault: usize,
+    ) -> io::Result<Box<dyn FnOnce() -> io::Result<()> + Send + '_>> {
+        let mut state = self.fixture_state()?;
+        if state.status != Status::Running
+            || state.volatile_mode()
+            || state.outstanding != 0
+            || state.native_basis_active
+            || state.native_install_pending
+            || state.snapshot.is_some()
+            || state.authority.profile != ConsensusAuthorityProfile::FixedImmutable
+        {
+            return Err(invalid_data(
+                "fixed test fault requires an idle durable native owner",
+            ));
+        }
+        if state.native.is_none() {
+            return Err(invalid_data("fixed test fault native owner missing"));
+        }
+        match fault {
+            3 => {
+                state.authority.profile = ConsensusAuthorityProfile::Dynamic;
+                Ok(Box::new(move || {
+                    let mut state = self.fixture_state()?;
+                    if state.authority.profile != ConsensusAuthorityProfile::Dynamic {
+                        return Err(invalid_data(
+                            "test authority profile changed before restore",
+                        ));
+                    }
+                    state.authority.profile = ConsensusAuthorityProfile::FixedImmutable;
+                    Ok(())
+                }))
+            }
+            4 => {
+                let saved = state
+                    .authority
+                    .placement
+                    .ok_or_else(|| invalid_data("test fixed placement missing"))?;
+                let injected = match saved {
+                    PlacementResiliencePolicy::RequireIndependentFailureDomains => {
+                        PlacementResiliencePolicy::AllowReducedResilience
+                    }
+                    PlacementResiliencePolicy::AllowReducedResilience => {
+                        PlacementResiliencePolicy::RequireIndependentFailureDomains
+                    }
+                };
+                state.authority.placement = Some(injected);
+                Ok(Box::new(move || {
+                    let mut state = self.fixture_state()?;
+                    if state.authority.placement != Some(injected) {
+                        return Err(invalid_data("test placement changed before restore"));
+                    }
+                    state.authority.placement = Some(saved);
+                    Ok(())
+                }))
+            }
+            5 => {
+                let (&member, &saved) = state
+                    .authority
+                    .scope
+                    .current_bindings
+                    .first_key_value()
+                    .ok_or_else(|| invalid_data("test fixed binding missing"))?;
+                let mut descriptor = saved.descriptor();
+                descriptor[0] ^= 1;
+                let injected = SessionTopologyMemberBinding::new(
+                    descriptor,
+                    saved.endpoint(),
+                    saved.tls_identity(),
+                    saved.backing_identity(),
+                );
+                state
+                    .authority
+                    .scope
+                    .current_bindings
+                    .insert(member, injected);
+                Ok(Box::new(move || {
+                    let mut state = self.fixture_state()?;
+                    if state.authority.scope.current_bindings.get(&member) != Some(&injected) {
+                        return Err(invalid_data("test binding changed before restore"));
+                    }
+                    state.authority.scope.current_bindings.insert(member, saved);
+                    Ok(())
+                }))
+            }
+            6 => {
+                let native = state
+                    .native
+                    .as_mut()
+                    .ok_or_else(|| invalid_data("test applied membership owner missing"))?;
+                let saved = native.business.membership();
+                let mut members = saved.membership().voter_ids().collect::<BTreeSet<_>>();
+                if saved.log_id().is_none() || members.pop_first().is_none() {
+                    return Err(invalid_data("test requires an applied fixed membership"));
+                }
+                let injected = opc_consensus::engine::StoredMembership::new(
+                    *saved.log_id(),
+                    opc_consensus::engine::Membership::new(vec![members], None),
+                );
+                native
+                    .business
+                    .replace_membership_for_test(&saved, injected.clone())?;
+                Ok(Box::new(move || {
+                    let mut state = self.fixture_state()?;
+                    let native = state
+                        .native
+                        .as_mut()
+                        .ok_or_else(|| invalid_data("test restore membership owner missing"))?;
+                    native
+                        .business
+                        .replace_membership_for_test(&injected, saved)
+                }))
+            }
+            _ => Err(invalid_data("unknown native fixed authority test fault")),
         }
     }
 
@@ -1487,7 +1626,12 @@ impl Wal {
                 && scope.terminal_history.is_empty()
                 && scope.pending.is_none()
                 && scope.terminal.is_none()
-                && (membership.log_id().is_some() || pristine),
+                && ((membership.log_id().is_some()
+                    && super::super::fixed_uniform_membership_matches(
+                        membership.membership(),
+                        members,
+                    ))
+                    || (pristine && membership.log_id().is_none())),
         )
     }
 

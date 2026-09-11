@@ -1918,7 +1918,7 @@ impl SqliteSessionBackend {
     ) -> bool {
         #[cfg(target_os = "linux")]
         if let Some(result) = self.native_read(|wal| {
-            wal.native_fixed_read(
+            wal.native_fixed_try_read(
                 crate::sqlite::consensus::wal::native::FixedReadExpectation {
                     identity,
                     members: expected_members,
@@ -1930,7 +1930,7 @@ impl SqliteSessionBackend {
                 |_, exact| Ok(exact),
             )
         }) {
-            return result.unwrap_or(false);
+            return matches!(result, Ok(Some(true)));
         }
         #[cfg(all(test, target_os = "linux"))]
         if self.private_wal_test.is_some() {

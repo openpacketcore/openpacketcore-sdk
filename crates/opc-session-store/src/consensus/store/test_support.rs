@@ -2207,6 +2207,40 @@ pub fn consensus_native_activation_facts_for_test(
         .transpose()
 }
 
+/// Explicit legacy SQL fixture for the retained SQL maintenance and schema
+/// compatibility contracts. Ordinary production constructors still select
+/// native storage or reject an unsupported legacy/cross-mode migration.
+#[cfg(target_os = "linux")]
+pub fn consensus_legacy_sqlite_backend_for_test(
+    database: &std::path::Path,
+) -> Result<SqliteSessionBackend, StoreError> {
+    let mut backend = SqliteSessionBackend::open(database)?;
+    backend.native_owner = None;
+    Ok(backend)
+}
+
+/// Observe the actual native publication owner without consulting SQL or an
+/// acceptance predicate. The first field identifies native ownership; a native
+/// owner with no published snapshot returns `(true, None)`, never SQL fallback.
+#[cfg(target_os = "linux")]
+pub fn consensus_native_current_snapshot_for_test(
+    store: &ConsensusSessionStore,
+) -> std::io::Result<(bool, Option<String>)> {
+    let Some(wal) = store
+        .inner
+        .private_wal
+        .as_ref()
+        .filter(|wal| wal.is_native())
+    else {
+        return Ok((false, None));
+    };
+    Ok((
+        true,
+        wal.native_current_snapshot_for_test()?
+            .map(|current| current.1),
+    ))
+}
+
 /// A scoped fixture fault. Explicit restoration reports errors; drop also
 /// attempts restoration during an unwinding test. No fault is persistent
 /// corruption evidence except the separately read-back filesystem latch.
@@ -2239,7 +2273,10 @@ impl Drop for ConsensusActivationFaultForTest<'_> {
 
 /// Install one of the bounded fixture faults: 0 removes the resident native
 /// activation, 1 creates the actual recovery latch, 2 drifts the resident
-/// application-authority epoch. Native-only; SQL fixtures use independent SQL.
+/// application-authority epoch. Controls 3/4/5/6 alter only the live profile,
+/// placement, scope binding, or applied membership respectively. Native-only;
+/// SQL fixtures use independent SQL. Controls other than 1 are resident faults,
+/// never evidence of corruption in a persisted selected input.
 #[cfg(target_os = "linux")]
 pub fn consensus_native_activation_fault_for_test<'a>(
     store: &'a ConsensusSessionStore,
@@ -2258,6 +2295,7 @@ pub fn consensus_native_activation_fault_for_test<'a>(
         .ok_or_else(|| std::io::Error::other("test fault requires native owner"))?;
     let restore = match fault {
         0 | 2 => wal.native_activation_fault_for_test(fault == 0)?,
+        3..=6 => wal.native_fixed_authority_fault_for_test(fault)?,
         1 => {
             // Bind the caller's fixture path to the live backend before creating
             // a latch. The identity is independently checked by the fixture.

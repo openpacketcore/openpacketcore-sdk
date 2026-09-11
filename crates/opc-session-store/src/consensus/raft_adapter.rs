@@ -2852,6 +2852,149 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_applied_membership_requires_the_exact_uniform_voters() {
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), true, FixedAuthorityBackend::Native)
+                .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native selection")
+            .current()
+            .expect("native owner");
+        let before = wal
+            .native_activation_facts_for_test()
+            .expect("raw admitted owner");
+        let restore = wal
+            .native_fixed_authority_fault_for_test(6)
+            .expect("alter only the live applied membership");
+        let faulted = wal
+            .native_activation_facts_for_test()
+            .expect("raw fault readback");
+        let members = BTreeSet::from([node_id(1), node_id(2), node_id(3)]);
+        let bindings = member_bindings(&members);
+        let policy = crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains;
+        let immediate = fixture.backend.fixed_quorum_authority_is_exact_now(
+            fixture.scope,
+            &members,
+            &bindings,
+            policy,
+        );
+        let raw = fixture
+            .backend
+            .fixed_quorum_authority_record_is_exact(
+                fixture.scope,
+                &members,
+                &bindings,
+                policy,
+                false,
+            )
+            .await;
+        let after = wal
+            .native_activation_facts_for_test()
+            .expect("raw post-check owner");
+        restore().expect("restore only applied membership");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        assert_eq!(
+            faulted["business"]["membership_log_id"],
+            before["business"]["membership_log_id"]
+        );
+        assert_eq!(
+            faulted["business"]["membership_configs"][0]
+                .as_array()
+                .expect("raw voters")
+                .len(),
+            2
+        );
+        assert_eq!(faulted["scope_members"], before["scope_members"]);
+        assert_eq!(faulted["authority_members"], before["authority_members"]);
+        assert_eq!(after, faulted, "authority probes mutate no owner facts");
+        assert!(
+            !immediate,
+            "a log ID alone cannot establish the exact applied voter set"
+        );
+        assert!(
+            !raw,
+            "raw engine admission requires the exact uniform applied membership"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_immediate_authority_never_waits_for_a_held_owner() {
+        let fixture = fixed_follower_fixture(
+            Duration::from_millis(40),
+            true,
+            FixedAuthorityBackend::Native,
+        )
+        .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native selection")
+            .current()
+            .expect("native owner");
+        let held_wal = Arc::clone(&wal);
+        let (entered, holding) = tokio::sync::oneshot::channel();
+        let holder = std::thread::spawn(move || {
+            held_wal.with_native_owner_held_for_test(|| {
+                entered.send(()).expect("test awaits real lock acquisition");
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        });
+        holding.await.expect("real owner held");
+        let members = BTreeSet::from([node_id(1), node_id(2), node_id(3)]);
+        let bindings = member_bindings(&members);
+        let policy = crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains;
+        let started = Instant::now();
+        let admitted = fixture.backend.fixed_quorum_authority_is_exact_now(
+            fixture.scope,
+            &members,
+            &bindings,
+            policy,
+        );
+        let elapsed = started.elapsed();
+        holder
+            .join()
+            .expect("join finite fault")
+            .expect("held real owner");
+        let restored = fixture.backend.fixed_quorum_authority_is_exact_now(
+            fixture.scope,
+            &members,
+            &bindings,
+            policy,
+        );
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        eprintln!(
+            "native immediate authority elapsed_us={}",
+            elapsed.as_micros()
+        );
+        assert!(
+            !admitted,
+            "immediate status fails closed while its authority owner is busy"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "immediate authority must not block the executor"
+        );
+        assert!(
+            restored,
+            "contention does not revoke or corrupt the restored authority"
+        );
+    }
+
     fn rejecting_peer_map(
         first_node_id: u64,
         count: usize,

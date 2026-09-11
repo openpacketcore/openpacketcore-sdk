@@ -537,6 +537,20 @@ impl NativeState {
         self.frontiers.membership.clone()
     }
 
+    /// Replace one exact membership field for a scoped live-owner control.
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn replace_membership_for_test(
+        &mut self,
+        expected: &StoredMembership<SessionConsensusNodeId, EmptyNode>,
+        replacement: StoredMembership<SessionConsensusNodeId, EmptyNode>,
+    ) -> io::Result<()> {
+        if &self.frontiers.membership != expected {
+            return Err(invalid("test membership changed before replacement"));
+        }
+        self.frontiers.membership = replacement;
+        Ok(())
+    }
+
     pub(crate) fn logical_time(&self) -> Option<Timestamp> {
         self.frontiers.logical_time
     }

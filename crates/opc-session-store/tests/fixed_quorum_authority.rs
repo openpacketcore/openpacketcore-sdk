@@ -120,6 +120,39 @@ fn fixed_current_snapshot_path(
 }
 
 #[cfg(all(target_os = "linux", feature = "test-control"))]
+fn fixed_published_snapshot_path(
+    store: &ConsensusSessionStore,
+    database: &std::path::Path,
+    snapshot_directory: &std::path::Path,
+) -> Option<PathBuf> {
+    use rusqlite::OptionalExtension as _;
+    let (native, file_name) =
+        opc_session_store::test_support::consensus_native_current_snapshot_for_test(store)
+            .expect("read actual native publication owner");
+    let file_name = if native {
+        file_name
+    } else {
+        let connection = rusqlite::Connection::open(database).expect("raw SQL publication owner");
+        connection
+            .query_row(
+                "SELECT file_name FROM consensus_snapshot WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("raw SQL selected snapshot")
+    };
+    file_name.map(|file_name| {
+        assert_eq!(
+            std::path::Path::new(&file_name).file_name(),
+            Some(std::ffi::OsStr::new(&file_name)),
+            "selected snapshot is a single namespace child"
+        );
+        snapshot_directory.join(file_name)
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
 fn assert_unsealed_snapshot(path: &std::path::Path) {
     use std::os::fd::AsFd as _;
 
@@ -851,6 +884,29 @@ async fn open_fixed_cluster_in_separate_paths_with_integrity(
     Vec<ConsensusSessionStore>,
     BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
 ) {
+    open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
+        database_directory,
+        snapshot_directory,
+        member_count,
+        placement_policy,
+        snapshot_integrity,
+        false,
+    )
+    .await
+}
+
+async fn open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
+    database_directory: &std::path::Path,
+    snapshot_directory: &std::path::Path,
+    member_count: usize,
+    placement_policy: PlacementResiliencePolicy,
+    snapshot_integrity: SnapshotIntegrityPolicy,
+    legacy_sqlite: bool,
+) -> (
+    Vec<PathBuf>,
+    Vec<ConsensusSessionStore>,
+    BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
     let members = fixed_members(member_count);
     let identity = fixed_consensus_identity(&members, placement_policy);
     let topologies = (0..member_count)
@@ -894,9 +950,23 @@ async fn open_fixed_cluster_in_separate_paths_with_integrity(
                 (node_ids[target], peer)
             })
             .collect::<BTreeMap<_, _>>();
+        let backend =
+            SqliteSessionBackend::open(&database_paths[source]).expect("file-backed voter store");
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        let backend = if legacy_sqlite {
+            drop(backend);
+            opc_session_store::test_support::consensus_legacy_sqlite_backend_for_test(
+                &database_paths[source],
+            )
+            .expect("explicit legacy SQL fixture")
+        } else {
+            backend
+        };
+        #[cfg(not(all(target_os = "linux", feature = "test-control")))]
+        assert!(!legacy_sqlite, "legacy owner controls require test-control");
         let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
             topology,
-            SqliteSessionBackend::open(&database_paths[source]).expect("file-backed voter store"),
+            backend,
             snapshot_directory.join(format!("snapshots-{source}")),
             peers,
             snapshot_integrity,
@@ -1472,18 +1542,14 @@ async fn portable_fixed_three_voter_quorum_snapshots_and_reopens_with_authority(
     // The engine trigger acknowledges scheduling, not durable publication.
     // Require every voter to finish publishing before inspecting its image.
     tokio::time::timeout(Duration::from_secs(5), async {
-        for database in &database_paths {
+        for (index, (store, database)) in stores.iter().zip(&database_paths).enumerate() {
             loop {
-                let connection = rusqlite::Connection::open(database)
-                    .expect("inspect portable snapshot publication");
-                let published: bool = connection
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM consensus_snapshot WHERE singleton = 1)",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .expect("read portable publication state");
-                drop(connection);
+                let published = fixed_published_snapshot_path(
+                    store,
+                    database,
+                    &directory.path().join(format!("snapshots-{index}")),
+                )
+                .is_some();
                 if published {
                     break;
                 }
@@ -1497,10 +1563,12 @@ async fn portable_fixed_three_voter_quorum_snapshots_and_reopens_with_authority(
         .iter()
         .enumerate()
         .map(|(index, database)| {
-            let path = fixed_current_snapshot_path(
+            let path = fixed_published_snapshot_path(
+                &stores[index],
                 database,
                 &directory.path().join(format!("snapshots-{index}")),
-            );
+            )
+            .expect("published snapshot remains selected");
             let bytes = std::fs::read(&path).expect("published portable image");
             (path, bytes)
         })
@@ -1550,13 +1618,16 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
 
     let database_directory = tempfile::tempdir().expect("fixed quorum database directory");
     let snapshot_root = fs_verity_snapshot_tempdir("fixed-quorum-reseed-snapshots-");
-    let (database_paths, stores, paths) = open_fixed_cluster_in_separate_paths(
-        database_directory.path(),
-        snapshot_root.path(),
-        3,
-        PlacementResiliencePolicy::AllowReducedResilience,
-    )
-    .await;
+    let (database_paths, stores, paths) =
+        open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
+            database_directory.path(),
+            snapshot_root.path(),
+            3,
+            PlacementResiliencePolicy::AllowReducedResilience,
+            SnapshotIntegrityPolicy::FsVerity,
+            true,
+        )
+        .await;
     for store in &stores {
         trigger_consensus_snapshot_for_test(store)
             .await
@@ -1608,13 +1679,16 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
         replace_operator_recovery_with_released_cursor_only_schema(database, schema);
     }
 
-    let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_separate_paths(
-        database_directory.path(),
-        snapshot_root.path(),
-        3,
-        PlacementResiliencePolicy::AllowReducedResilience,
-    )
-    .await;
+    let (_database_paths, reopened, reopened_paths) =
+        open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
+            database_directory.path(),
+            snapshot_root.path(),
+            3,
+            PlacementResiliencePolicy::AllowReducedResilience,
+            SnapshotIntegrityPolicy::FsVerity,
+            true,
+        )
+        .await;
     assert!(
         reopened.iter().all(|store| store.status().admitted),
         "reseeded fixed voters must retain exact durable admission"
@@ -1660,13 +1734,16 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
 
     // A second public reopen proves that neither the journal nor the old
     // namespace artifact remains necessary after the atomic metadata switch.
-    let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_separate_paths(
-        database_directory.path(),
-        snapshot_root.path(),
-        3,
-        PlacementResiliencePolicy::AllowReducedResilience,
-    )
-    .await;
+    let (_database_paths, reopened, reopened_paths) =
+        open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
+            database_directory.path(),
+            snapshot_root.path(),
+            3,
+            PlacementResiliencePolicy::AllowReducedResilience,
+            SnapshotIntegrityPolicy::FsVerity,
+            true,
+        )
+        .await;
     assert!(reopened.iter().all(|store| store.status().admitted));
     shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
 }
@@ -1694,12 +1771,23 @@ async fn fixed_quorum_public_reopen_rejects_unsealed_current_schema_selected_sna
     trigger_consensus_snapshot_for_test(&stores[0])
         .await
         .expect("capture sealed fixed selected snapshot");
+    let snapshot_directory = snapshot_root.path().join("snapshots-0");
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(path) =
+                fixed_published_snapshot_path(&stores[0], &database_paths[0], &snapshot_directory)
+            {
+                break path;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native selected snapshot publishes within bounded setup");
     shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
     drop(stores);
     drop(paths);
 
-    let snapshot_directory = snapshot_root.path().join("snapshots-0");
-    let selected = fixed_current_snapshot_path(&database_paths[0], &snapshot_directory);
     let bytes = std::fs::read(&selected).expect("read sealed selected snapshot");
     std::fs::remove_file(&selected).expect("remove sealed selected snapshot");
     std::fs::write(&selected, bytes).expect("replace with byte-identical unsealed snapshot");
@@ -1832,49 +1920,342 @@ async fn store_issued_consumer_manifest_retains_authoritative_node_to_tls_pairs(
     assert_eq!(actual_pairs, expected_pairs);
 }
 
+// These live-owner controls require the existing test-control feature. The
+// all-features gate executes every control on both native and retained SQL
+// ownership on Linux; production constructors and migration policy stay intact.
+#[cfg(feature = "test-control")]
+fn fixed_authority_fault_backends() -> &'static [bool] {
+    #[cfg(target_os = "linux")]
+    {
+        &[false, true]
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        &[false]
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn open_fixed_authority_fault_cluster(
+    placement: PlacementResiliencePolicy,
+    legacy_sqlite: bool,
+) -> (
+    tempfile::TempDir,
+    Vec<PathBuf>,
+    Vec<ConsensusSessionStore>,
+    BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
+    let directory = tempfile::tempdir().expect("fixed authority fixture directory");
+    let (databases, stores, paths) =
+        open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
+            directory.path(),
+            directory.path(),
+            3,
+            placement,
+            SnapshotIntegrityPolicy::PortableVerified,
+            legacy_sqlite,
+        )
+        .await;
+    #[cfg(target_os = "linux")]
+    for store in &stores {
+        assert_eq!(
+            opc_session_store::test_support::consensus_native_activation_facts_for_test(store)
+                .expect("raw backend selection")
+                .is_some(),
+            !legacy_sqlite,
+            "every control must execute against its explicitly selected owner",
+        );
+    }
+    eprintln!("fixed authority fault fixture legacy_sqlite={legacy_sqlite}");
+    (directory, databases, stores, paths)
+}
+
+#[cfg(feature = "test-control")]
+struct FixedAuthorityFault<'a> {
+    restore: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send + 'a>>,
+    native_before: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "test-control")]
+impl FixedAuthorityFault<'_> {
+    fn restore(mut self) {
+        self.restore.take().expect("one scoped restoration")()
+            .expect("restore only the injected authority field");
+    }
+
+    fn assert_no_business_effect(&self, store: &ConsensusSessionStore, database: &std::path::Path) {
+        #[cfg(target_os = "linux")]
+        if let Some(before) = &self.native_before {
+            let after =
+                opc_session_store::test_support::consensus_native_activation_facts_for_test(store)
+                    .expect("raw native post-mutation witness")
+                    .expect("native owner remains selected");
+            assert_eq!(
+                after["business_digest"], before["business_digest"],
+                "rejected mutation changes no native business rows"
+            );
+            assert_eq!(
+                after["business"]["applied"], before["business"]["applied"],
+                "rejected mutation publishes no native application"
+            );
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (store, &self.native_before);
+        let connection =
+            rusqlite::Connection::open(database).expect("raw SQL post-mutation witness");
+        let record_count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+            .expect("count durable session records after rejected mutation");
+        assert_eq!(
+            record_count, 0,
+            "rejected mutation must have no durable effect"
+        );
+    }
+}
+
+#[cfg(feature = "test-control")]
+impl Drop for FixedAuthorityFault<'_> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            if let Err(error) = restore() {
+                eprintln!("scoped authority fixture restore failed: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-control")]
+fn fixed_authority_fault<'a>(
+    store: &'a ConsensusSessionStore,
+    database: &std::path::Path,
+    fault: usize,
+) -> FixedAuthorityFault<'a> {
+    #[cfg(target_os = "linux")]
+    if let Some(before) =
+        opc_session_store::test_support::consensus_native_activation_facts_for_test(store)
+            .expect("raw authority owner before injection")
+    {
+        let guard = opc_session_store::test_support::consensus_native_activation_fault_for_test(
+            store, database, fault,
+        )
+        .expect("inject one actual native authority fault");
+        let after =
+            opc_session_store::test_support::consensus_native_activation_facts_for_test(store)
+                .expect("raw fault readback")
+                .expect("native fault cannot switch ownership");
+        let mut expected = before.clone();
+        match fault {
+            // The actual inode-bound latch is separately read back by the
+            // producer. It must not change any resident owner field.
+            1 => {}
+            2 => {
+                expected["application_authority_epoch"] = serde_json::json!(
+                    before["application_authority_epoch"]
+                        .as_u64()
+                        .expect("epoch")
+                        + 1
+                )
+            }
+            3 => expected["authority_profile"] = serde_json::json!(1),
+            4 => {
+                expected["placement"] =
+                    serde_json::json!(3 - before["placement"].as_u64().expect("placement"))
+            }
+            5 => {
+                let byte = before["scope_bindings"][0][1]["descriptor"][0]
+                    .as_u64()
+                    .expect("descriptor octet");
+                expected["scope_bindings"][0][1]["descriptor"][0] = serde_json::json!(byte ^ 1);
+            }
+            6 => {
+                assert_eq!(
+                    after["business"]["membership_log_id"],
+                    before["business"]["membership_log_id"]
+                );
+                let mut voters = before["business"]["membership_configs"][0]
+                    .as_array()
+                    .expect("uniform voters")
+                    .clone();
+                voters.remove(0);
+                assert_eq!(
+                    after["business"]["membership_configs"],
+                    serde_json::json!([voters])
+                );
+                assert_eq!(
+                    after["business"]["membership_nodes"],
+                    serde_json::json!(voters)
+                );
+                for field in ["membership", "membership_configs", "membership_nodes"] {
+                    expected["business"][field] = after["business"][field].clone();
+                }
+            }
+            _ => panic!("unknown live authority fault"),
+        }
+        assert_eq!(
+            after, expected,
+            "fault changes only its named field, never vote/log/application/business"
+        );
+        return FixedAuthorityFault {
+            restore: Some(Box::new(move || guard.restore())),
+            native_before: Some(before),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = store;
+
+    use rusqlite::types::Value;
+    let connection = rusqlite::Connection::open(database).expect("independent SQL authority owner");
+    let (table, columns): (&str, &[&str]) = match fault {
+        1 => (
+            "consensus_operator_recovery",
+            &["pending_epoch", "pending_plan_digest"],
+        ),
+        2 => (
+            "consensus_membership_scope",
+            &["application_authority_epoch"],
+        ),
+        3 => ("consensus_identity", &["authority_profile"]),
+        4 => ("consensus_identity", &["fixed_placement_policy"]),
+        5 => ("consensus_membership_scope", &["current_bindings_json"]),
+        6 => ("consensus_membership", &["membership_json"]),
+        _ => panic!("unknown SQL authority fault"),
+    };
+    let query = format!(
+        "SELECT {} FROM {table} WHERE singleton = 1",
+        columns.join(", ")
+    );
+    let count = columns.len();
+    let read = |connection: &rusqlite::Connection| {
+        connection.query_row(&query, [], |row| {
+            (0..count)
+                .map(|index| row.get::<_, Value>(index))
+                .collect::<Result<Vec<_>, _>>()
+        })
+    };
+    let saved = read(&connection).expect("raw SQL field before fault");
+    let injected = match fault {
+        1 => {
+            let epoch: i64 = connection
+                .query_row(
+                    "SELECT recovery_epoch FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("raw SQL recovery epoch");
+            vec![Value::Integer(epoch + 1), Value::Blob(vec![0; 32])]
+        }
+        2 | 4 => {
+            let Value::Integer(value) = saved[0] else {
+                panic!("integer authority field")
+            };
+            vec![Value::Integer(if fault == 2 {
+                value + 1
+            } else {
+                3 - value
+            })]
+        }
+        3 => vec![Value::Integer(1)],
+        5 => {
+            let Value::Blob(encoded) = &saved[0] else {
+                panic!("encoded SQL bindings")
+            };
+            let mut bindings: serde_json::Value =
+                serde_json::from_slice(encoded).expect("decode SQL bindings");
+            let byte = bindings[0][1]["descriptor"][0]
+                .as_u64()
+                .expect("descriptor octet");
+            bindings[0][1]["descriptor"][0] = serde_json::json!((byte + 1) % 256);
+            vec![Value::Blob(
+                serde_json::to_vec(&bindings).expect("encode drifted SQL binding"),
+            )]
+        }
+        6 => vec![Value::Blob(vec![0])],
+        _ => unreachable!("validated SQL fault"),
+    };
+    let update = format!(
+        "UPDATE {table} SET {} WHERE singleton = 1",
+        columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| format!("{name} = ?{}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert_eq!(
+        connection
+            .execute(&update, rusqlite::params_from_iter(&injected))
+            .expect("inject SQL authority fault"),
+        1
+    );
+    assert_eq!(
+        read(&connection).expect("independent SQL fault readback"),
+        injected
+    );
+    drop(connection);
+    let database = database.to_path_buf();
+    FixedAuthorityFault {
+        native_before: None,
+        restore: Some(Box::new(move || {
+            let mut connection =
+                rusqlite::Connection::open(database).map_err(std::io::Error::other)?;
+            let transaction = connection.transaction().map_err(std::io::Error::other)?;
+            let current = transaction
+                .query_row(&query, [], |row| {
+                    (0..count)
+                        .map(|index| row.get::<_, Value>(index))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(std::io::Error::other)?;
+            if current != injected {
+                return Err(std::io::Error::other(
+                    "SQL injected field changed before restoration",
+                ));
+            }
+            if transaction
+                .execute(&update, rusqlite::params_from_iter(saved))
+                .map_err(std::io::Error::other)?
+                != 1
+            {
+                return Err(std::io::Error::other(
+                    "SQL fixture row missing during restoration",
+                ));
+            }
+            transaction.commit().map_err(std::io::Error::other)
+        })),
+    }
+}
+
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() {
-    let (_directory, database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority_on_backend(cfg!(
+        target_os = "linux"
+    ))
+    .await;
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+#[tokio::test]
+async fn running_fixed_native_binding_drift_revokes_consumer_and_traffic_authority() {
+    persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority_on_backend(false).await;
+}
+
+#[cfg(feature = "test-control")]
+async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
     stores[0]
         .consumer_authorization_manifest([fixed_consumer_grant()])
         .await
         .expect("exact fixed store grants consumer authorization");
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    let encoded: Vec<u8> = connection
-        .query_row(
-            "SELECT current_bindings_json FROM consensus_membership_scope WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read fixed bindings");
-    let mut bindings: serde_json::Value =
-        serde_json::from_slice(&encoded).expect("decode fixed bindings");
-    let first_descriptor_octet = bindings
-        .as_array_mut()
-        .and_then(|entries| entries.first_mut())
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|entry| entry.get_mut(1))
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|binding| binding.get_mut("descriptor"))
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|digest| digest.first_mut())
-        .expect("descriptor binding octet");
-    let changed = first_descriptor_octet
-        .as_u64()
-        .expect("numeric descriptor octet")
-        .wrapping_add(1)
-        % 256;
-    *first_descriptor_octet = serde_json::Value::from(changed);
-    connection
-        .execute(
-            "UPDATE consensus_membership_scope SET current_bindings_json = ?1 WHERE singleton = 1",
-            [serde_json::to_vec(&bindings).expect("encode changed fixed bindings")],
-        )
-        .expect("persist fixed binding drift");
-    drop(connection);
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 5);
 
     assert!(stores[0]
         .consumer_authorization_manifest([fixed_consumer_grant()])
@@ -1887,44 +2268,67 @@ async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() 
         readiness.traffic_authority(),
         FixedQuorumTrafficAuthority::StructuralRecoveryRequired,
     );
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn running_fixed_scope_drift_revokes_linearizable_readiness_authority() {
-    let (_directory, database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
-    for database_path in database_paths {
-        let connection =
-            rusqlite::Connection::open(database_path).expect("open fixed voter database");
-        connection
-            .execute(
-                "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
-                [],
-            )
-            .expect("persist fixed structural scope drift");
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        running_fixed_scope_drift_revokes_linearizable_readiness_authority_on_backend(
+            legacy_sqlite,
+        )
+        .await;
     }
+}
+
+#[cfg(feature = "test-control")]
+async fn running_fixed_scope_drift_revokes_linearizable_readiness_authority_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
+    let faults = stores
+        .iter()
+        .zip(&database_paths)
+        .map(|(store, database)| fixed_authority_fault(store, database, 2))
+        .collect::<Vec<_>>();
 
     let readiness = stores[0].probe_durable_readiness().await;
     assert!(
         !readiness.is_ready(),
         "a linearizable read barrier must not report authority after durable fixed-scope drift"
     );
+    for fault in faults {
+        fault.restore();
+    }
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn running_fixed_profile_drift_revokes_traffic_authority() {
-    let (_directory, database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
-    for database_path in database_paths {
-        let connection =
-            rusqlite::Connection::open(database_path).expect("open fixed voter database");
-        connection
-            .execute(
-                "UPDATE consensus_identity SET authority_profile = 1 WHERE singleton = 1",
-                [],
-            )
-            .expect("persist fixed authority profile drift");
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        running_fixed_profile_drift_revokes_traffic_authority_on_backend(legacy_sqlite).await;
     }
+}
+
+#[cfg(feature = "test-control")]
+async fn running_fixed_profile_drift_revokes_traffic_authority_on_backend(legacy_sqlite: bool) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
+    let faults = stores
+        .iter()
+        .zip(&database_paths)
+        .map(|(store, database)| fixed_authority_fault(store, database, 3))
+        .collect::<Vec<_>>();
 
     assert!(
         stores[0]
@@ -1948,10 +2352,24 @@ async fn running_fixed_profile_drift_revokes_traffic_authority() {
         readiness.traffic_authority(),
         FixedQuorumTrafficAuthority::StructuralRecoveryRequired,
     );
+    for fault in faults {
+        fault.restore();
+    }
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn running_fixed_placement_policy_drift_revokes_live_authority() {
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        running_fixed_placement_policy_drift_revokes_live_authority_on_backend(legacy_sqlite).await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn running_fixed_placement_policy_drift_revokes_live_authority_on_backend(
+    legacy_sqlite: bool,
+) {
     for (configured_policy, drifted_policy) in [
         (
             PlacementResiliencePolicy::RequireIndependentFailureDomains,
@@ -1962,7 +2380,8 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority() {
             PlacementResiliencePolicy::RequireIndependentFailureDomains,
         ),
     ] {
-        let (_directory, database_paths, stores) = open_fixed_cluster(3, configured_policy).await;
+        let (_directory, database_paths, stores, paths) =
+            open_fixed_authority_fault_cluster(configured_policy, legacy_sqlite).await;
         stores[0]
             .consumer_authorization_manifest([fixed_consumer_grant()])
             .await
@@ -1979,20 +2398,8 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority() {
             .await
             .expect("open idle generic watch before policy drift");
 
-        let connection =
-            rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-        let stored_policy = match drifted_policy {
-            PlacementResiliencePolicy::RequireIndependentFailureDomains => 1_i64,
-            PlacementResiliencePolicy::AllowReducedResilience => 2_i64,
-            _ => unreachable!("test policy must have a durable encoding"),
-        };
-        connection
-            .execute(
-                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
-                [stored_policy],
-            )
-            .expect("persist fixed placement policy drift");
-        drop(connection);
+        let fault = fixed_authority_fault(&stores[0], &database_paths[0], 4);
+        assert_ne!(configured_policy, drifted_policy);
 
         assert!(
             !stores[0].status().admitted,
@@ -2029,22 +2436,32 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority() {
             watch.next().await.is_none(),
             "watch must terminate after fixed policy revocation"
         );
+        fault.restore();
+        shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
     }
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn running_fixed_applied_membership_drift_revokes_status_and_mutation_authority() {
-    let (_directory, database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_membership SET membership_json = x'00' WHERE singleton = 1",
-            [],
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        running_fixed_applied_membership_drift_revokes_status_and_mutation_authority_on_backend(
+            legacy_sqlite,
         )
-        .expect("persist malformed applied membership drift");
-    drop(connection);
+        .await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn running_fixed_applied_membership_drift_revokes_status_and_mutation_authority_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 6);
 
     assert!(
         !stores[0].status().admitted,
@@ -2054,12 +2471,30 @@ async fn running_fixed_applied_membership_drift_revokes_status_and_mutation_auth
         SessionBackend::batch(&stores[0], Vec::new()).await.is_err(),
         "mutation authority must fail closed when the persisted applied membership is not exact"
     );
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn running_fixed_scope_drift_terminates_an_already_open_generic_watch() {
-    let (_directory, database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        running_fixed_scope_drift_terminates_an_already_open_generic_watch_on_backend(
+            legacy_sqlite,
+        )
+        .await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn running_fixed_scope_drift_terminates_an_already_open_generic_watch_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
     let key = SessionKey {
         tenant: TenantId::new("fixed-watch-drift").expect("test tenant"),
         nf_kind: NetworkFunctionKind::smf(),
@@ -2081,14 +2516,7 @@ async fn running_fixed_scope_drift_terminates_an_already_open_generic_watch() {
         .await
         .expect("open generic watch before drift");
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
-            [],
-        )
-        .expect("persist fixed structural scope drift");
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 2);
 
     assert!(
         watch
@@ -2102,12 +2530,30 @@ async fn running_fixed_scope_drift_terminates_an_already_open_generic_watch() {
         watch.next().await.is_none(),
         "watch must terminate after revocation"
     );
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn running_fixed_scope_drift_terminates_an_idle_generic_watch_promptly() {
-    let (_directory, database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        running_fixed_scope_drift_terminates_an_idle_generic_watch_promptly_on_backend(
+            legacy_sqlite,
+        )
+        .await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn running_fixed_scope_drift_terminates_an_idle_generic_watch_promptly_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
     let start_sequence = stores[0]
         .status()
         .last_log_index
@@ -2116,15 +2562,7 @@ async fn running_fixed_scope_drift_terminates_an_idle_generic_watch_promptly() {
         .await
         .expect("open idle generic watch before drift");
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
-            [],
-        )
-        .expect("persist fixed structural scope drift");
-    drop(connection);
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 2);
 
     let item = tokio::time::timeout(Duration::from_secs(1), watch.next())
         .await
@@ -2138,6 +2576,8 @@ async fn running_fixed_scope_drift_terminates_an_idle_generic_watch_promptly() {
         watch.next().await.is_none(),
         "watch must terminate after revocation"
     );
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
 #[tokio::test]
@@ -2286,10 +2726,26 @@ async fn fixed_majority_loss_revokes_readiness_reads_and_stale_lease_owner_mutat
     );
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event() {
-    let (_directory, database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event_on_backend(
+            legacy_sqlite,
+        )
+        .await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
     let start_sequence = stores[0]
         .status()
         .last_log_index
@@ -2298,17 +2754,7 @@ async fn fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event(
         .await
         .expect("open idle generic watch before recovery latch activation");
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
-        .expect("activate durable fixed recovery latch");
-    drop(connection);
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 1);
 
     let item = tokio::time::timeout(Duration::from_secs(1), watch.next())
         .await
@@ -2322,12 +2768,30 @@ async fn fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event(
         watch.next().await.is_none(),
         "watch must terminate after recovery authority is revoked"
     );
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn fixed_recovery_latch_during_readiness_barrier_never_grants_traffic() {
-    let (_directory, database_paths, stores, paths) =
-        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        fixed_recovery_latch_during_readiness_barrier_never_grants_traffic_on_backend(
+            legacy_sqlite,
+        )
+        .await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn fixed_recovery_latch_during_readiness_barrier_never_grants_traffic_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
     let admitted_at = TopologyAttestationTime::from_unix_seconds(1);
     assert!(
         stores[0]
@@ -2356,17 +2820,7 @@ async fn fixed_recovery_latch_during_readiness_barrier_never_grants_traffic() {
         "the detector must hold readiness inside its quorum barrier"
     );
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
-        .expect("activate durable fixed recovery latch during readiness barrier");
-    drop(connection);
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 1);
     for target in 1..3 {
         paths
             .get(&(0, target))
@@ -2383,12 +2837,30 @@ async fn fixed_recovery_latch_during_readiness_barrier_never_grants_traffic() {
         FixedQuorumTrafficAuthority::RecoveryRequired,
         "Recovery activated during a quorum barrier must revoke traffic before readiness returns"
     );
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn fixed_recovery_latch_during_ordinary_read_barrier_never_returns_data() {
-    let (_directory, database_paths, stores, paths) =
-        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        fixed_recovery_latch_during_ordinary_read_barrier_never_returns_data_on_backend(
+            legacy_sqlite,
+        )
+        .await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn fixed_recovery_latch_during_ordinary_read_barrier_never_returns_data_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
     let key = SessionKey {
         tenant: TenantId::new("fixed-recovery-read-race").expect("test tenant"),
         nf_kind: NetworkFunctionKind::smf(),
@@ -2414,17 +2886,7 @@ async fn fixed_recovery_latch_during_ordinary_read_barrier_never_returns_data() 
         "the detector must hold the ordinary read inside its quorum barrier"
     );
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
-        .expect("activate durable fixed recovery latch during ordinary read barrier");
-    drop(connection);
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 1);
     for target in 1..3 {
         paths
             .get(&(0, target))
@@ -2440,12 +2902,30 @@ async fn fixed_recovery_latch_during_ordinary_read_barrier_never_returns_data() 
             .is_err(),
         "Recovery activated during a quorum barrier must revoke an ordinary read before return"
     );
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn fixed_recovery_latch_during_mutation_barrier_never_admits_new_lease() {
-    let (_directory, database_paths, stores, paths) =
-        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for &legacy_sqlite in fixed_authority_fault_backends() {
+        fixed_recovery_latch_during_mutation_barrier_never_admits_new_lease_on_backend(
+            legacy_sqlite,
+        )
+        .await;
+    }
+}
+
+#[cfg(feature = "test-control")]
+async fn fixed_recovery_latch_during_mutation_barrier_never_admits_new_lease_on_backend(
+    legacy_sqlite: bool,
+) {
+    let (_directory, database_paths, stores, paths) = open_fixed_authority_fault_cluster(
+        PlacementResiliencePolicy::AllowReducedResilience,
+        legacy_sqlite,
+    )
+    .await;
     let key = SessionKey {
         tenant: TenantId::new("fixed-recovery-mutation-race").expect("test tenant"),
         nf_kind: NetworkFunctionKind::smf(),
@@ -2478,17 +2958,7 @@ async fn fixed_recovery_latch_during_mutation_barrier_never_admits_new_lease() {
         "the detector must hold the mutation inside its quorum barrier"
     );
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
-        .expect("activate durable fixed recovery latch during mutation barrier");
-    drop(connection);
+    let fault = fixed_authority_fault(&stores[0], &database_paths[0], 1);
     for target in 1..3 {
         paths
             .get(&(0, target))
@@ -2504,15 +2974,9 @@ async fn fixed_recovery_latch_during_mutation_barrier_never_admits_new_lease() {
             .is_err(),
         "Recovery activated during a quorum barrier must revoke mutation before proposal"
     );
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("reopen fixed voter database");
-    let record_count: u64 = connection
-        .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
-        .expect("count durable session records after rejected mutation");
-    assert_eq!(
-        record_count, 0,
-        "rejected mutation must have no durable effect"
-    );
+    fault.assert_no_business_effect(&stores[0], &database_paths[0]);
+    fault.restore();
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
 }
 
 #[tokio::test]
