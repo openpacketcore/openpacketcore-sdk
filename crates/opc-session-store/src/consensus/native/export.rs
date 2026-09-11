@@ -259,7 +259,7 @@ impl NativeStorage {
             // authority checks even though these pages will not be written.
             let bytes = entry.read_bytes(state.identity, &state.members, check)?;
             if !portable {
-                tx.execute("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)",params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(|error| db!(error))?;
+                tx.prepare_cached("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)").map_err(|error| db!(error))?.execute(params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(|error| db!(error))?;
             }
         }
         drop(ordered_logs);
@@ -290,7 +290,7 @@ impl NativeStorage {
                 crate::consensus::verified_snapshot::VerificationMemory::reserve(encoding_bytes)?;
             match &**receipt {
                 NativeGenericReceipt::Ordinary(receipt) => {
-                    tx.execute("INSERT INTO consensus_request_outcomes (request_id,configuration_epoch,payload_digest,response_json) VALUES (?1,?2,?3,?4)",params![id.as_bytes().as_slice(),epoch,receipt.payload_digest.as_slice(),json(&receipt.response)?]).map_err(|error| db!(error))?;
+                    tx.prepare_cached("INSERT INTO consensus_request_outcomes (request_id,configuration_epoch,payload_digest,response_json) VALUES (?1,?2,?3,?4)").map_err(|error| db!(error))?.execute(params![id.as_bytes().as_slice(),epoch,receipt.payload_digest.as_slice(),json(&receipt.response)?]).map_err(|error| db!(error))?;
                 }
                 NativeGenericReceipt::FencedV1(receipt) => {
                     let until = ops::format_rfc3339_normalized(receipt.retained_until);
@@ -400,7 +400,7 @@ impl NativeStorage {
                 })?;
             let _encoding_memory =
                 crate::consensus::verified_snapshot::VerificationMemory::reserve(encoding_bytes)?;
-            tx.execute("INSERT INTO session_replication_log (sequence,tx_id,entry_json,timestamp) VALUES (?1,?2,?3,?4)",params![entry.sequence,entry.tx_id.as_str(),serde_json::to_string(entry).map_err(io::Error::other)?,ops::format_rfc3339_normalized(entry.timestamp)]).map_err(|error| db!(error))?;
+            tx.prepare_cached("INSERT INTO session_replication_log (sequence,tx_id,entry_json,timestamp) VALUES (?1,?2,?3,?4)").map_err(|error| db!(error))?.execute(params![entry.sequence,entry.tx_id.as_str(),serde_json::to_string(entry).map_err(io::Error::other)?,ops::format_rfc3339_normalized(entry.timestamp)]).map_err(|error| db!(error))?;
         }
         if frontiers.roster_v1_namespace {
             sql::roster_snapshot::activate_v1(&tx)?;

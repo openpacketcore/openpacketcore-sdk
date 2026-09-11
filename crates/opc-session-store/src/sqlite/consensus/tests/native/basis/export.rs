@@ -1,6 +1,131 @@
 use super::*;
 use crate::sqlite::consensus::tests::native::ordinary::rows;
 
+#[test]
+fn native_snapshot_export_reuses_insert_preparations_and_preserves_exact_rows() {
+    let fixture = Fixture::new();
+    let first = fenced_transition_v2_request(0xC1, 1, "native-export-preparation");
+    fixture.parity(&[formation(), activation(1, first, timestamp(1))]);
+    let requests = (0..128)
+        .map(|slot| sdk741_component_request(Sdk741Payload::Create, 2, slot, None))
+        .collect::<Vec<_>>();
+    fixture.parity(&[fenced_transition_v2_batch_entry(2, requests, timestamp(2))]);
+    let clocks = (3..=130)
+        .map(|index| Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes(
+                    (0xEA00_0000_0000_0000u128 + u128::from(index)).to_be_bytes(),
+                ),
+                logical_time: timestamp(3),
+                intent: SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(),
+                    mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
+                },
+            }),
+        })
+        .collect::<Vec<_>>();
+    fixture.parity(&clocks);
+    let entries = fixture.wal.native_log_read(0, None, Some(131)).unwrap();
+    assert_eq!(entries.len(), 131);
+    let mut storage = NativeStorage::empty(identity(), fixed_members()).unwrap();
+    for chunk in entries.chunks(64) {
+        storage
+            .log
+            .project(&append(chunk), &storage.business, None)
+            .unwrap();
+    }
+    storage
+        .log
+        .project(
+            &Operation::Committed(Some(log_id(130))),
+            &storage.business,
+            None,
+        )
+        .unwrap();
+    storage.replay_committed().unwrap();
+    let basis = SqliteSessionBackend::in_memory().unwrap();
+    let conn = basis.conn.blocking_lock();
+    initialize_schema_with_profile(
+        &conn,
+        identity(),
+        &fixed_members(),
+        ConsensusAuthorityProfile::FixedImmutable,
+    )
+    .unwrap();
+    let preparations = Arc::new([const { AtomicUsize::new(0) }; 3]);
+    let observed = Arc::clone(&preparations);
+    conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+        let slot = match context.action {
+            rusqlite::hooks::AuthAction::Insert {
+                table_name: "consensus_log",
+            } => Some(0),
+            rusqlite::hooks::AuthAction::Insert {
+                table_name: "consensus_request_outcomes",
+            } => Some(1),
+            rusqlite::hooks::AuthAction::Insert {
+                table_name: "session_replication_log",
+            } => Some(2),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            observed[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        rusqlite::hooks::Authorization::Allow
+    }));
+    let started = Instant::now();
+    storage
+        .export_cold_install_base_checked(&conn, &|| Ok(()))
+        .unwrap();
+    let elapsed = started.elapsed();
+    let counts = preparations
+        .each_ref()
+        .map(|value| value.load(Ordering::Relaxed));
+    let oracle = fixture.oracle.conn.blocking_lock();
+    for table in [
+        "session_records",
+        "leases",
+        "key_fences",
+        "lease_globals",
+        "consensus_machine",
+        "consensus_applied",
+        "consensus_committed",
+        "consensus_membership",
+        "consensus_request_outcomes",
+        "consensus_fenced_transition_v2_receipts",
+        "session_replication_log",
+        "consensus_log",
+    ] {
+        assert_eq!(
+            rows(&conn, table),
+            rows(&oracle, table),
+            "exact table {table}"
+        );
+    }
+    let row_counts: [usize; 3] = [
+        "consensus_log",
+        "consensus_request_outcomes",
+        "session_replication_log",
+    ]
+    .map(|table| rows(&conn, table).len());
+    assert!(row_counts.iter().all(|count| *count >= 128));
+    drop(oracle);
+    fixture.wal.shutdown().unwrap();
+    eprintln!(
+        "native_export_insert_preparations rows={row_counts:?} preparations={counts:?} elapsed_us={}",
+        elapsed.as_micros(),
+    );
+    // Authorizers run when SQLite prepares the program. Every row above is
+    // still executed and compared to an independently applied SQL oracle.
+    assert_eq!(
+        counts, [1; 3],
+        "repeated export inserts must reuse their programs"
+    );
+}
+
 fn populated() -> Fixture {
     let fixture = Fixture::new();
     let first = fenced_transition_v2_request(0xC1, 1, "native-file-export");
