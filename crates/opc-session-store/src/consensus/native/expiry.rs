@@ -5,9 +5,14 @@
 
 use super::*;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
+// The same immutable complete key belongs to several derived indexes and
+// their branch separators. Share its owner instead of duplicating strings
+// and reserving the full key width in every tree slot. Ordering and equality
+// still compare the original values, never the allocation address.
 #[derive(Clone, PartialEq, Eq)]
-struct OrderedKey(SessionKey);
+struct OrderedKey(Arc<SessionKey>);
 
 impl Ord for OrderedKey {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -110,7 +115,7 @@ impl ExpiryIndex {
         before: Option<&NativeKeyState>,
         after: Option<&NativeKeyState>,
     ) {
-        let key = OrderedKey(key.clone());
+        let key = OrderedKey(Arc::new(key.clone()));
         if let Some(before) = before {
             if before.record.is_some() {
                 self.ordered_records.remove(&key);
@@ -149,29 +154,147 @@ impl ExpiryIndex {
     ) -> impl Iterator<Item = &SessionKey> {
         use std::ops::Bound::{Excluded, Unbounded};
         let start = after
-            .map(|key| Excluded(OrderedKey(key.clone())))
+            .map(|key| Excluded(OrderedKey(Arc::new(key.clone()))))
             .unwrap_or(Unbounded);
         self.ordered_records
             .range((start, Unbounded))
-            .map(|key| &key.0)
+            .map(|key| key.0.as_ref())
     }
 
     pub(super) fn due_record(&self, now: Timestamp) -> Option<SessionKey> {
         self.records
             .get_min()
             .filter(|(until, _)| *until <= now)
-            .map(|(_, key)| key.0.clone())
+            .map(|(_, key)| (*key.0).clone())
     }
 
     pub(super) fn due_lease(&self, now: Timestamp) -> Option<SessionKey> {
         self.released
             .get_min()
-            .map(|key| key.0.clone())
+            .map(|key| (*key.0).clone())
             .or_else(|| {
                 self.leases
                     .get_min()
                     .filter(|(until, _)| *until <= now)
-                    .map(|(_, key)| key.0.clone())
+                    .map(|(_, key)| (*key.0).clone())
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use allocation_counter::measure;
+    use changes::tests::{fixture, time};
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    fn key(number: u64) -> SessionKey {
+        SessionKey {
+            tenant: TenantId::from_static("native-expiry-owner"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: crate::SessionKeyType::PduSession,
+            stable_id: bytes::Bytes::copy_from_slice(&number.to_be_bytes())
+                .try_into()
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn native_expiry_index_owns_bounded_full_keys_and_preserves_captured_order() {
+        const ROWS: u64 = 4096;
+        let (storage, _, _) = fixture();
+        let mut row = (**storage.business.keys.values().next().unwrap()).clone();
+        row.record.as_mut().unwrap().expires_at = Some(time(20));
+        row.lease.as_mut().unwrap().guard_expires_at = time(30);
+        // These are the production derived indexes, with a distinct complete
+        // key in all three trees. The input row's payload is never indexed.
+        // No fixture key retains the newly allocated identifier backing.
+        let mut index = ExpiryIndex::default();
+        let owned = measure(|| {
+            for number in (0..ROWS).rev() {
+                index.replace(&key(number), None, Some(&row));
+            }
+        });
+        eprintln!(
+            "native_expiry_index_owner rows={ROWS} live={} allocations={} peak={}",
+            owned.bytes_current, owned.count_current, owned.bytes_max,
+        );
+        assert_eq!(index.ordered_records(None).count(), ROWS as usize);
+        for (number, actual) in index.ordered_records(None).enumerate() {
+            assert_eq!(*actual, key(number as u64));
+        }
+        assert_eq!(index.due_record(time(19)), None);
+        assert_eq!(index.due_record(time(20)), Some(key(0)));
+        assert_eq!(index.due_lease(time(29)), None);
+        assert_eq!(index.due_lease(time(30)), Some(key(0)));
+        let mut captured = None;
+        let capture = measure(|| captured = Some(index.clone()));
+        assert_eq!(capture.count_total, 0, "capture shares immutable roots");
+        let captured = captured.unwrap();
+        let mut released = row.clone();
+        released.record = None;
+        released.lease.as_mut().unwrap().active = false;
+        for number in 0..ROWS {
+            let key = key(number);
+            assert_eq!(index.due_record(time(20)), Some(key.clone()));
+            // An independently reconstructed key must find the old value;
+            // pointer identity cannot replace complete key comparison.
+            index.replace(&key, Some(&row), Some(&released));
+            assert_eq!(index.due_lease(time(1)), Some(key.clone()));
+            index.replace(&key, Some(&released), None);
+            assert_eq!(captured.due_record(time(20)), Some(self::key(0)));
+            assert_eq!(captured.due_lease(time(30)), Some(self::key(0)));
+            assert_eq!(
+                captured.ordered_records(Some(&key)).next(),
+                (number + 1 < ROWS).then(|| self::key(number + 1)).as_ref(),
+            );
+        }
+        assert_eq!(index.ordered_records(None).next(), None);
+        assert_eq!(index.due_record(time(59)), None);
+        assert_eq!(index.due_lease(time(59)), None);
+        drop(index);
+        let released = measure(|| drop(captured));
+        assert_eq!(owned.bytes_current, -released.bytes_current);
+        assert_eq!(owned.count_current, -released.count_current);
+        // This owner is additional to the authoritative key map, receipts,
+        // logs and runtime. Bound actual retained allocations, not type sizes.
+        // The original three-voter 2 GiB RSS qualification remains separate.
+        assert!(
+            owned.bytes_current <= ROWS as i64 * 384,
+            "expiry indexes retain {} bytes for {ROWS} complete keys",
+            owned.bytes_current,
+        );
+    }
+
+    #[test]
+    fn native_expiry_order_distinguishes_complete_namespace_and_key_bytes() {
+        let (storage, _, _) = fixture();
+        let row = &**storage.business.keys.values().next().unwrap();
+        let base = key(7);
+        let mut tenant = base.clone();
+        tenant.tenant = TenantId::from_static("native-expiry-other-tenant");
+        let mut nf = base.clone();
+        nf.nf_kind = NetworkFunctionKind::from_static("upf");
+        let mut kind = base.clone();
+        kind.key_type = crate::SessionKeyType::TeidMapping;
+        let keys = [base, tenant, nf, kind, key(8)];
+        let mut index = ExpiryIndex::default();
+        for key in &keys {
+            index.replace(key, None, Some(row));
+        }
+        assert_eq!(index.ordered_records(None).count(), keys.len());
+        for key in &keys {
+            assert!(index.ordered_records(None).any(|actual| actual == key));
+        }
+        for (removed, key) in keys.iter().enumerate() {
+            index.replace(&key.clone(), Some(row), None);
+            assert_eq!(
+                index.ordered_records(None).count(),
+                keys.len() - removed - 1
+            );
+            for retained in &keys[removed + 1..] {
+                assert!(index.ordered_records(None).any(|actual| actual == retained));
+            }
+        }
     }
 }
