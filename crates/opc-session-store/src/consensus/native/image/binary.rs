@@ -20,6 +20,39 @@ struct CanonicalSink<'a, 'error> {
     position: usize,
     maximum: usize,
     error: &'error mut Option<io::Error>,
+    buffer: [u8; 256],
+    used: usize,
+}
+
+// Postcard emits scalar fields and byte-sequence elements separately. Pass
+// bounded chunks to the generation's counting/hash writer without retaining
+// another encoded row. The final partial chunk must succeed before this
+// serializer can report success; the enclosing row and generation admission
+// still precede publication.
+fn write_fragment(
+    writer: &mut dyn Write,
+    buffer: &mut [u8; 256],
+    used: &mut usize,
+    mut bytes: &[u8],
+) -> io::Result<()> {
+    if *used != 0 {
+        let count = bytes.len().min(buffer.len() - *used);
+        buffer[*used..*used + count].copy_from_slice(&bytes[..count]);
+        *used += count;
+        bytes = &bytes[count..];
+        if *used != buffer.len() {
+            return Ok(());
+        }
+        writer.write_all(buffer)?;
+        *used = 0;
+    }
+    if bytes.len() >= buffer.len() {
+        writer.write_all(bytes)?;
+    } else {
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        *used = bytes.len();
+    }
+    Ok(())
 }
 
 impl postcard::ser_flavors::Flavor for CanonicalSink<'_, '_> {
@@ -38,7 +71,8 @@ impl postcard::ser_flavors::Flavor for CanonicalSink<'_, '_> {
         match &mut self.destination {
             Destination::Count => {}
             Destination::Writer(writer) => {
-                if let Err(error) = writer.write_all(bytes) {
+                if let Err(error) = write_fragment(*writer, &mut self.buffer, &mut self.used, bytes)
+                {
                     *self.error = Some(error);
                     return Err(postcard::Error::SerializeBufferFull);
                 }
@@ -53,7 +87,17 @@ impl postcard::ser_flavors::Flavor for CanonicalSink<'_, '_> {
         Ok(())
     }
 
-    fn finalize(self) -> postcard::Result<usize> {
+    fn finalize(mut self) -> postcard::Result<usize> {
+        let written = match &mut self.destination {
+            Destination::Writer(writer) if self.used != 0 => {
+                writer.write_all(&self.buffer[..self.used])
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = written {
+            *self.error = Some(error);
+            return Err(postcard::Error::SerializeBufferFull);
+        }
         if matches!(self.destination,Destination::Compare(bytes) if bytes.len() != self.position) {
             return Err(postcard::Error::SerializeBufferFull);
         }
@@ -74,6 +118,8 @@ fn serialize(
             position: 0,
             maximum,
             error: &mut error,
+            buffer: [0; 256],
+            used: 0,
         },
     );
     if let Some(error) = error {
@@ -515,6 +561,53 @@ mod tests {
     }
 
     #[test]
+    fn native_binary_key_row_coalesces_output_without_an_encoded_allocation() {
+        let (storage, request, _) = crate::consensus::native::changes::tests::fixture();
+        let key = &request.mutation().record().unwrap().key;
+        let row = storage.business.keys.get(key).unwrap();
+        let value = (key, Some(row));
+        let expected = postcard::to_allocvec(&value).unwrap();
+        struct ObservedOutput<'a> {
+            remaining: &'a [u8],
+            calls: usize,
+        }
+        impl Write for ObservedOutput<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(!bytes.is_empty());
+                assert!(self.remaining.starts_with(bytes));
+                self.remaining = &self.remaining[bytes.len()..];
+                self.calls += 1;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = ObservedOutput {
+            remaining: &expected,
+            calls: 0,
+        };
+        let allocation = allocation_counter::measure(|| {
+            assert_eq!(
+                write_to(&value, &mut output, expected.len()).unwrap(),
+                expected.len()
+            );
+        });
+        assert!(output.remaining.is_empty());
+        eprintln!(
+            "native_binary_key_row_output encoded_bytes={} writer_calls={} allocations={} allocated_bytes={}",
+            expected.len(), output.calls, allocation.count_total, allocation.bytes_total
+        );
+        assert_eq!(allocation.count_total, 0);
+        assert_eq!(allocation.bytes_current, 0);
+        assert!(
+            output.calls <= expected.len().div_ceil(64) + 1,
+            "one native row must amortize tiny field writes before generation hashing"
+        );
+    }
+
+    #[test]
     fn native_binary_streaming_encoding_matches_postcard_and_preserves_writer_errors() {
         let value = (
             vec![0u8, 1, 127, 128, 255],
@@ -555,6 +648,71 @@ mod tests {
         let error = write_to(&value, &mut FailedWriter, expected.len()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), "writer fixture");
+    }
+
+    #[test]
+    fn native_binary_output_preserves_short_writes_interruptions_and_tail_errors() {
+        let value = (
+            (0..1_025)
+                .map(|index| (index % 256) as u8)
+                .collect::<Vec<_>>(),
+            "complete final field",
+        );
+        let expected = postcard::to_allocvec(&value).unwrap();
+        struct Output<'a> {
+            expected: &'a [u8],
+            position: usize,
+            step: usize,
+            fail_at: usize,
+            interrupted: bool,
+        }
+        impl Write for Output<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.interrupted = !self.interrupted;
+                if self.interrupted {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                if self.position == self.fail_at {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "exact output fault",
+                    ));
+                }
+                let count = bytes.len().min(self.step).min(self.fail_at - self.position);
+                assert_eq!(
+                    self.expected
+                        .get(self.position..self.position + count)
+                        .unwrap(),
+                    &bytes[..count]
+                );
+                self.position += count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("row encoding must not flush its caller's output")
+            }
+        }
+        for step in [1, 7, 255, 256, 257, expected.len()] {
+            for fail_at in [0, 1, 63, 255, 256, 257, expected.len() - 1, expected.len()] {
+                let mut output = Output {
+                    expected: &expected,
+                    position: 0,
+                    step,
+                    fail_at,
+                    interrupted: false,
+                };
+                let result = write_to(&value, &mut output, expected.len());
+                assert_eq!(output.position, fail_at);
+                if fail_at == expected.len() {
+                    assert_eq!(result.unwrap(), expected.len());
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                    assert_eq!(error.to_string(), "exact output fault");
+                }
+            }
+        }
     }
 
     #[test]
