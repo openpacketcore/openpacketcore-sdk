@@ -35,6 +35,33 @@ fn fixture_rows(count: usize) -> (Connection, Context, NativeOrdinaryReceipt) {
     (conn, context, original.clone())
 }
 
+fn bounded_rows(count: usize, shape: usize) -> (Connection, Context) {
+    let (conn, context, mut original) = fixture_rows(count);
+    if shape == 0 {
+        return (conn, context);
+    }
+    let (_, _, previous) = fixture();
+    for index in 0..count {
+        let kind = if shape == 3 { index % 3 } else { shape };
+        original.response.result = Ok(match kind {
+            0 => SessionMutationOutcome::Unit,
+            1 => SessionMutationOutcome::Lease(previous.lease().clone()),
+            _ => {
+                SessionMutationOutcome::CompareAndSet(crate::backend::CompareAndSetResult::Success)
+            }
+        });
+        conn.execute(
+            "UPDATE consensus_request_outcomes SET response_json=?1 WHERE request_id=?2",
+            params![
+                serde_json::to_vec(&original.response).unwrap(),
+                request(index).as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+    }
+    (conn, context)
+}
+
 // The complete pre-change ordinary loop is the oracle, including its separate
 // per-ID SQL reader and streaming writer. It does not call candidate helpers.
 fn original_serial(
@@ -160,6 +187,143 @@ fn native_sql_ordinary_hash_matches_original_complete_bytes_and_context() {
             assert_eq!(value.started > 0, available > 1);
             eprintln!("native_sql_ordinary available={available} rows=257 max_batch={} charged={} started={} joined={} peak={}", value.max_rows, value.max_bytes, value.started, value.joined, budget.peak.get());
         });
+    }
+}
+
+#[test]
+fn native_sql_ordinary_hash_borrows_lease_and_cas_without_allocating_row_owners() {
+    for shape in [1, 2] {
+        let (mut conn, context) = bounded_rows(1, shape);
+        let tx = conn.transaction().unwrap();
+        let id = request(0);
+        let (payload_digest, response) =
+            source::ordinary(&tx, context.business.identity, id).unwrap();
+        let receipt = NativeGenericReceipt::Ordinary(NativeOrdinaryReceipt {
+            payload_digest,
+            response: Box::new(response),
+        });
+        validation::validate_generic(&id, &receipt, &context.business.frontiers).unwrap();
+        let expected = receipt.row_fingerprint(2, &id).unwrap();
+        let memory = allocation_counter::measure(|| {
+            assert_eq!(receipt.row_fingerprint(2, &id).unwrap(), expected);
+        });
+        assert_eq!(memory.count_total, 0, "shape {shape}");
+        assert_eq!(memory.bytes_total, 0, "shape {shape}");
+    }
+}
+
+#[test]
+fn native_sql_ordinary_hash_lease_and_cas_match_original_under_memory_pressure() {
+    static USED: AtomicUsize = AtomicUsize::new(0);
+    for shape in 1..=3 {
+        let (mut conn, context) = bounded_rows(257, shape);
+        let tx = conn.transaction().unwrap();
+        let largest: usize = tx
+            .query_row(
+                "SELECT MAX(length(response_json)) FROM consensus_request_outcomes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let maximum = row_memory_bytes(largest).unwrap();
+        let mut expected = Vec::new();
+        let mut expected_context = context.clone();
+        original_serial(&tx, &mut expected, &mut expected_context).unwrap();
+        for available in [1, 2, 8] {
+            for limit in [
+                PROCESS_VERIFICATION_BYTES,
+                maximum,
+                maximum * 4,
+                BYTES + 128 * 1024,
+            ] {
+                let budget = Budget::new(&USED, limit);
+                let mut actual = Vec::new();
+                let mut actual_context = context.clone();
+                candidate(
+                    &tx,
+                    &mut actual,
+                    &mut actual_context,
+                    &|| Ok(()),
+                    &budget,
+                    available,
+                )
+                .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "shape {shape}, available {available}, limit {limit}"
+                );
+                assert!(actual_context == expected_context);
+                OBSERVED.with(|value| {
+                    let value = value.borrow();
+                    if limit == PROCESS_VERIFICATION_BYTES {
+                        assert_eq!(value.started > 0, available > 1);
+                    } else if limit <= maximum * 4 {
+                        assert_eq!(value.started, 0);
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn native_sql_ordinary_hash_rejects_malformed_leases_with_original_prefix_and_context() {
+    static USED: AtomicUsize = AtomicUsize::new(0);
+    for index in [1, 70] {
+        for field in ["fence", "credential_id", "expires_at"] {
+            let (mut conn, context) = bounded_rows(80, 1);
+            let tx = conn.transaction().unwrap();
+            let id = request(index);
+            let (_, mut response) = source::ordinary(&tx, context.business.identity, id).unwrap();
+            let mut guard = match &response.result {
+                Ok(SessionMutationOutcome::Lease(guard)) => serde_json::to_value(guard).unwrap(),
+                _ => unreachable!(),
+            };
+            guard[field] = if field == "expires_at" {
+                serde_json::to_value(time(0)).unwrap()
+            } else {
+                serde_json::json!(0)
+            };
+            response.result = Ok(SessionMutationOutcome::Lease(
+                serde_json::from_value(guard).unwrap(),
+            ));
+            tx.execute(
+                "UPDATE consensus_request_outcomes SET response_json=?1 WHERE request_id=?2",
+                params![
+                    serde_json::to_vec(&response).unwrap(),
+                    id.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+            let mut expected = Vec::new();
+            let mut expected_context = context.clone();
+            let expected_error =
+                original_serial(&tx, &mut expected, &mut expected_context).unwrap_err();
+            assert_eq!(expected_error.to_string(), "native generic lease invalid");
+            for available in [1, 8] {
+                let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
+                let mut actual = Vec::new();
+                let mut actual_context = context.clone();
+                let error = candidate(
+                    &tx,
+                    &mut actual,
+                    &mut actual_context,
+                    &|| Ok(()),
+                    &budget,
+                    available,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    (error.kind(), error.to_string()),
+                    (expected_error.kind(), expected_error.to_string())
+                );
+                assert_eq!(
+                    actual, expected,
+                    "index {index}, field {field}, available {available}"
+                );
+                assert!(actual_context == expected_context);
+            }
+        }
     }
 }
 
@@ -337,57 +501,59 @@ impl Drop for ResetFaults {
 #[test]
 fn native_sql_ordinary_hash_worker_faults_preserve_order_and_join_before_refunding() {
     static USED: AtomicUsize = AtomicUsize::new(0);
-    for faults in [
-        Faults {
-            spawn: Some(3),
-            panic: None,
-        },
-        Faults {
-            spawn: None,
-            panic: Some(3),
-        },
-    ] {
-        let _reset = ResetFaults(FAULTS.with(|value| value.replace(faults)));
-        let (mut conn, context, _) = fixture_rows(80);
-        let tx = conn.transaction().unwrap();
-        // A later SQL failure cannot replace the failure of an earlier batch.
-        tx.execute(
-            "UPDATE consensus_request_outcomes SET response_json=x'7b' WHERE request_id=?1",
-            [request(70).as_bytes().as_slice()],
-        )
-        .unwrap();
-        let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
-        let error = candidate(
-            &tx,
-            &mut io::sink(),
-            &mut context.clone(),
-            &|| Ok(()),
-            &budget,
-            8,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("worker"));
-        OBSERVED.with(|value| assert!(value.borrow().started >= 3));
-        // Conversely an early original decoder failure occurs before any
-        // parallel-sized batch. Its exact original error must still win.
-        tx.execute(
-            "UPDATE consensus_request_outcomes SET response_json=x'7b' WHERE request_id=?1",
-            [request(1).as_bytes().as_slice()],
-        )
-        .unwrap();
-        let expected = original_serial(&tx, &mut io::sink(), &mut context.clone()).unwrap_err();
-        let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
-        let error = candidate(
-            &tx,
-            &mut io::sink(),
-            &mut context.clone(),
-            &|| Ok(()),
-            &budget,
-            8,
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), expected.to_string());
-        OBSERVED.with(|value| assert_eq!(value.borrow().started, 0));
+    for shape in 0..=3 {
+        for faults in [
+            Faults {
+                spawn: Some(3),
+                panic: None,
+            },
+            Faults {
+                spawn: None,
+                panic: Some(3),
+            },
+        ] {
+            let _reset = ResetFaults(FAULTS.with(|value| value.replace(faults)));
+            let (mut conn, context) = bounded_rows(80, shape);
+            let tx = conn.transaction().unwrap();
+            // A later SQL failure cannot replace the failure of an earlier batch.
+            tx.execute(
+                "UPDATE consensus_request_outcomes SET response_json=x'7b' WHERE request_id=?1",
+                [request(70).as_bytes().as_slice()],
+            )
+            .unwrap();
+            let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
+            let error = candidate(
+                &tx,
+                &mut io::sink(),
+                &mut context.clone(),
+                &|| Ok(()),
+                &budget,
+                8,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("worker"));
+            OBSERVED.with(|value| assert!(value.borrow().started >= 3));
+            // Conversely an early original decoder failure occurs before any
+            // parallel-sized batch. Its exact original error must still win.
+            tx.execute(
+                "UPDATE consensus_request_outcomes SET response_json=x'7b' WHERE request_id=?1",
+                [request(1).as_bytes().as_slice()],
+            )
+            .unwrap();
+            let expected = original_serial(&tx, &mut io::sink(), &mut context.clone()).unwrap_err();
+            let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
+            let error = candidate(
+                &tx,
+                &mut io::sink(),
+                &mut context.clone(),
+                &|| Ok(()),
+                &budget,
+                8,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected.to_string());
+            OBSERVED.with(|value| assert_eq!(value.borrow().started, 0));
+        }
     }
 }
 
@@ -407,69 +573,71 @@ impl Write for RejectWriter {
 #[test]
 fn native_sql_ordinary_hash_cancellation_and_earlier_output_failure_release_all_owners() {
     static USED: AtomicUsize = AtomicUsize::new(0);
-    let (mut conn, context, _) = fixture_rows(128);
-    let tx = conn.transaction().unwrap();
-    let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
-    let calls = Cell::new(0);
-    candidate(
-        &tx,
-        &mut io::sink(),
-        &mut context.clone(),
-        &|| {
-            calls.set(calls.get() + 1);
-            Ok(())
-        },
-        &budget,
-        8,
-    )
-    .unwrap();
-    let total = calls.get();
-    let caller = std::thread::current().id();
-    for cancel_at in [1, 20, total / 2, total - 1] {
+    for shape in 0..=3 {
+        let (mut conn, context) = bounded_rows(128, shape);
+        let tx = conn.transaction().unwrap();
         let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
-        calls.set(0);
-        let error = candidate(
+        let calls = Cell::new(0);
+        candidate(
             &tx,
             &mut io::sink(),
             &mut context.clone(),
             &|| {
-                assert_eq!(std::thread::current().id(), caller);
                 calls.set(calls.get() + 1);
-                if calls.get() == cancel_at {
-                    Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
-                } else {
-                    Ok(())
-                }
+                Ok(())
             },
             &budget,
             8,
         )
+        .unwrap();
+        let total = calls.get();
+        let caller = std::thread::current().id();
+        for cancel_at in [1, 20, total / 2, total - 1] {
+            let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
+            calls.set(0);
+            let error = candidate(
+                &tx,
+                &mut io::sink(),
+                &mut context.clone(),
+                &|| {
+                    assert_eq!(std::thread::current().id(), caller);
+                    calls.set(calls.get() + 1);
+                    if calls.get() == cancel_at {
+                        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                &budget,
+                8,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(calls.get(), cancel_at);
+        }
+        // Flushing the first completed rows still precedes a later SQL error.
+        tx.execute(
+            "UPDATE consensus_request_outcomes SET response_json=x'7b' WHERE request_id=?1",
+            [request(20).as_bytes().as_slice()],
+        )
+        .unwrap();
+        let expected = original_serial(&tx, &mut RejectWriter, &mut context.clone()).unwrap_err();
+        let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
+        let actual = candidate(
+            &tx,
+            &mut RejectWriter,
+            &mut context.clone(),
+            &|| Ok(()),
+            &budget,
+            8,
+        )
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(calls.get(), cancel_at);
+        assert_eq!(
+            (actual.kind(), actual.to_string()),
+            (expected.kind(), expected.to_string())
+        );
+        assert_eq!(actual.kind(), io::ErrorKind::PermissionDenied);
     }
-    // Flushing the first completed rows still precedes a later SQL error.
-    tx.execute(
-        "UPDATE consensus_request_outcomes SET response_json=x'7b' WHERE request_id=?1",
-        [request(20).as_bytes().as_slice()],
-    )
-    .unwrap();
-    let expected = original_serial(&tx, &mut RejectWriter, &mut context.clone()).unwrap_err();
-    let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
-    let actual = candidate(
-        &tx,
-        &mut RejectWriter,
-        &mut context.clone(),
-        &|| Ok(()),
-        &budget,
-        8,
-    )
-    .unwrap_err();
-    assert_eq!(
-        (actual.kind(), actual.to_string()),
-        (expected.kind(), expected.to_string())
-    );
-    assert_eq!(actual.kind(), io::ErrorKind::PermissionDenied);
 }
 
 #[test]
@@ -533,7 +701,7 @@ fn native_sql_ordinary_hash_pressure_preserves_original_row_admission_and_count_
 }
 
 #[test]
-fn native_sql_ordinary_hash_keeps_small_large_and_non_unit_rows_serial() {
+fn native_sql_ordinary_hash_keeps_small_large_and_interrupted_batches_serial() {
     static USED: AtomicUsize = AtomicUsize::new(0);
     for case in 0..3 {
         let count = if case == 0 { PARALLEL_MIN - 1 } else { 80 };

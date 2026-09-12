@@ -1,7 +1,8 @@
 //! Two-pass conversion of a detached original SQL image to a complete V4
 //! native generation. The exclusive connection borrow and read transaction
 //! span validation, counting and encoding. Notification decoding uses only a
-//! charged, bounded temporary batch, as does hashing of decoded Unit receipts.
+//! charged, bounded temporary batch, as does hashing of decoded Unit, Lease
+//! and successful CAS receipts.
 //! No payload cache survives either pass.
 //! The caller must sync and cold-admit the result before selecting any file.
 

@@ -1,7 +1,7 @@
-//! Bounded full hashing of already decoded and validated ordinary Unit
-//! receipts. SQL queries, their original response decoder, cancellation and
-//! ordered output stay on the caller. Workers borrow its fixed-size receipts;
-//! neither inputs nor decoded owners are allocated or freed on those workers.
+//! Bounded full hashing of already decoded and validated ordinary Unit,
+//! Lease and successful CAS receipts. SQL queries, their original response
+//! decoder, cancellation and ordered output stay on the caller. Workers only
+//! borrow its receipts; decoded owners are allocated and freed on the caller.
 
 use super::*;
 
@@ -21,7 +21,8 @@ struct Staged {
     receipt: NativeGenericReceipt,
     content: Option<io::Result<[u8; 32]>>,
     // The caller drops the complete receipt before refunding its original
-    // row charge. Only Unit results, with no variable body, can be staged.
+    // row charge, including a Lease guard's key and owner. Only the closed
+    // result family below, with borrowing serializers, can be staged.
     _memory: VerificationMemory,
 }
 
@@ -286,7 +287,11 @@ fn write_with_resources(
         };
         if let Some(batch) = &mut batch {
             if matches!(&receipt, NativeGenericReceipt::Ordinary(row)
-                if matches!(row.response.result, Ok(SessionMutationOutcome::Unit)))
+                if matches!(row.response.result,
+                    Ok(SessionMutationOutcome::Unit
+                        | SessionMutationOutcome::Lease(_)
+                        | SessionMutationOutcome::CompareAndSet(
+                            crate::backend::CompareAndSetResult::Success))))
             {
                 batch.rows.push(Staged {
                     id,
