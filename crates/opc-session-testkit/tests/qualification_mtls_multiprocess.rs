@@ -2746,15 +2746,29 @@ enum ChildStderrDiagnostic {
     Redacted,
 }
 
-/// Receive one child reply using the supplied absolute deadline.  Keeping the
-/// deadline conversion at this one boundary makes the directed-handshake and
-/// status/lifecycle callers testable without a wall-clock race: a withheld
-/// reply with an expired deadline has a zero receive budget.
+/// Receive one child reply within the supplied absolute deadline. A zero-timeout
+/// channel receive can return an already queued reply, so both admission and
+/// successful completion must be observed before the deadline expires.
 fn receive_qualification_reply_until<T>(
     replies: &Receiver<T>,
     deadline: Instant,
 ) -> Result<T, RecvTimeoutError> {
-    replies.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    receive_qualification_reply_until_with_clock(replies, deadline, Instant::now)
+}
+
+fn receive_qualification_reply_until_with_clock<T>(
+    replies: &Receiver<T>,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<T, RecvTimeoutError> {
+    let remaining = deadline
+        .checked_duration_since(now())
+        .ok_or(RecvTimeoutError::Timeout)?;
+    let reply = replies.recv_timeout(remaining)?;
+    if !deadline_allows_completion(now(), deadline) {
+        return Err(RecvTimeoutError::Timeout);
+    }
+    Ok(reply)
 }
 
 struct ChildNode {
@@ -20766,6 +20780,71 @@ fn transition_deadline_never_accepts_a_late_success() {
         started,
         started + operation_timeout - Duration::from_nanos(1)
     ));
+}
+
+#[test]
+fn child_reply_receive_rejects_an_already_queued_reply_after_deadline() {
+    let (sender, replies) = mpsc::sync_channel(1);
+    sender.send(17).expect("queue scripted child reply");
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_nanos(1))
+        .expect("monotonic instant supports an expired deadline");
+
+    assert!(
+        matches!(
+            receive_qualification_reply_until(&replies, deadline),
+            Err(RecvTimeoutError::Timeout)
+        ),
+        "an already queued reply cannot satisfy an expired receive deadline"
+    );
+    assert_eq!(
+        replies.try_recv(),
+        Ok(17),
+        "an expired admission must leave the queued reply available for evidence"
+    );
+}
+
+#[test]
+fn child_reply_receive_checks_completion_against_original_deadline() {
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(10);
+    for (admitted, completed, expected) in [
+        (started, started, Ok(17)),
+        (started, deadline, Ok(17)),
+        (deadline, deadline, Ok(17)),
+        (
+            started,
+            deadline + Duration::from_nanos(1),
+            Err(RecvTimeoutError::Timeout),
+        ),
+    ] {
+        let (sender, replies) = mpsc::sync_channel(1);
+        sender.send(17).expect("queue scripted child reply");
+        // Keep the real channel receive while controlling only its clock
+        // observations. This also models a descheduled receiver that resumes
+        // after the deadline with a reply already available.
+        let mut observations = [admitted, completed].into_iter();
+        let result = receive_qualification_reply_until_with_clock(&replies, deadline, || {
+            observations.next().expect("bounded clock observations")
+        });
+        assert_eq!(result, expected);
+        assert!(observations.next().is_none());
+    }
+}
+
+#[test]
+fn child_reply_receive_preserves_disconnection_before_deadline() {
+    let (sender, replies) = mpsc::sync_channel::<()>(1);
+    drop(sender);
+    let started = Instant::now();
+    assert_eq!(
+        receive_qualification_reply_until_with_clock(
+            &replies,
+            started + Duration::from_millis(10),
+            || started,
+        ),
+        Err(RecvTimeoutError::Disconnected)
+    );
 }
 
 #[test]
