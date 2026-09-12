@@ -42,6 +42,9 @@ use crate::{
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
 };
 
+#[cfg(feature = "lab-memory")]
+mod lab;
+
 /// In-memory session backend and lease manager for deterministic tests.
 ///
 /// `Clone` is cheap (Arc) so multiple tasks can share the same logical backend.
@@ -51,6 +54,10 @@ pub struct FakeSessionBackend {
     caps: BackendCapabilities,
     limits: FakeBackendLimits,
     clock: Arc<dyn Clock>,
+    #[cfg(feature = "lab-memory")]
+    lab_identity: Option<[u8; 32]>,
+    #[cfg(feature = "lab-memory")]
+    lab_restore_authority: Option<Arc<lab::RestoreAuthority>>,
 }
 
 struct FakeBackendState {
@@ -63,6 +70,10 @@ struct FakeBackendState {
     last_replication_sequence: u64,
     replication_log: Vec<ReplicationEntry>,
     watchers: Vec<ReplicationWatcher>,
+    #[cfg(feature = "lab-memory")]
+    lab_transitions: HashMap<crate::FencedTransitionRequestId, lab::Receipt>,
+    #[cfg(feature = "lab-memory")]
+    lab_restore_revision: u64,
 }
 
 /// Canonical raw tuple used for fake-backend lookup and restore ordering.
@@ -89,6 +100,10 @@ impl FakeBackendState {
             last_replication_sequence: 0,
             replication_log: Vec::new(),
             watchers: Vec::new(),
+            #[cfg(feature = "lab-memory")]
+            lab_transitions: HashMap::new(),
+            #[cfg(feature = "lab-memory")]
+            lab_restore_revision: 0,
         }
     }
 
@@ -103,12 +118,27 @@ impl FakeBackendState {
             last_replication_sequence: self.last_replication_sequence,
             replication_log: self.replication_log.clone(),
             watchers: Vec::new(),
+            #[cfg(feature = "lab-memory")]
+            lab_transitions: self.lab_transitions.clone(),
+            #[cfg(feature = "lab-memory")]
+            lab_restore_revision: self.lab_restore_revision,
         }
     }
 
     fn commit_staged_data(&mut self, mut staged: Self) {
+        #[cfg(feature = "lab-memory")]
+        {
+            // Imports and replay must never restore an earlier cursor revision.
+            staged.lab_restore_revision = self.lab_restore_revision.saturating_add(1);
+        }
         staged.watchers = std::mem::take(&mut self.watchers);
         *self = staged;
+    }
+
+    #[cfg(feature = "lab-memory")]
+    fn invalidate_lab_restore_snapshot(&mut self) {
+        // Exhaustion permanently disables scans rather than reusing a revision.
+        self.lab_restore_revision = self.lab_restore_revision.saturating_add(1);
     }
 }
 
@@ -178,6 +208,10 @@ impl FakeSessionBackend {
             caps,
             limits,
             clock: Arc::new(TokioVirtualClock::new()),
+            #[cfg(feature = "lab-memory")]
+            lab_identity: None,
+            #[cfg(feature = "lab-memory")]
+            lab_restore_authority: None,
         }
     }
 
@@ -263,6 +297,8 @@ impl FakeSessionBackend {
     }
 
     fn prune_state(state: &mut FakeBackendState, now: Timestamp) {
+        #[cfg(feature = "lab-memory")]
+        let previous_records = state.records.len();
         state.records.retain(|_, record| {
             if let Some(expires_at) = record.expires_at {
                 expires_at > now
@@ -270,6 +306,10 @@ impl FakeSessionBackend {
                 true
             }
         });
+        #[cfg(feature = "lab-memory")]
+        if state.records.len() != previous_records {
+            state.invalidate_lab_restore_snapshot();
+        }
         state
             .leases
             .retain(|_, entry| entry.active && entry.expires_at > now);
@@ -326,6 +366,8 @@ impl FakeSessionBackend {
         op: CompareAndSet,
         now: Timestamp,
     ) -> Result<CompareAndSetResult, StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         validate_stored_record_expiry_at(&op.new_record, now)?;
         if !self.caps.atomic_compare_and_set {
             return Err(StoreError::CapabilityNotSupported(
@@ -408,6 +450,8 @@ impl FakeSessionBackend {
         lease: &LeaseGuard,
         now: Timestamp,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         if !self.caps.monotonic_fencing_token {
             return Err(StoreError::CapabilityNotSupported(
                 "monotonic_fencing_token".into(),
@@ -434,6 +478,8 @@ impl FakeSessionBackend {
         ttl: Duration,
         now: Timestamp,
     ) -> Result<Timestamp, StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         let expires_at = checked_session_deadline(now, ttl)?;
         if !self.caps.per_key_ttl {
             return Err(StoreError::CapabilityNotSupported("per_key_ttl".into()));
@@ -471,6 +517,8 @@ impl FakeSessionBackend {
         now: Timestamp,
         max_tracked_keys: usize,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "lab-memory")]
+        state.invalidate_lab_restore_snapshot();
         if Self::contains_protected_roster_established_create(&op) {
             return Err(StoreError::CapabilityNotSupported(
                 Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
@@ -838,6 +886,10 @@ impl Default for FakeSessionBackend {
 #[async_trait]
 impl SessionBackend for FakeSessionBackend {
     fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
+        #[cfg(feature = "lab-memory")]
+        if self.caps.restore_scan && self.lab_restore_authority.is_some() {
+            return Some(crate::RestoreScanCursorProfile::DurableOpaqueV1);
+        }
         self.caps
             .restore_scan
             .then_some(crate::RestoreScanCursorProfile::LegacyCompatibility)
@@ -860,6 +912,73 @@ impl SessionBackend for FakeSessionBackend {
         let now = self.clock.now_utc();
         Self::prune_state(&mut state, now);
         Ok(Self::get_with_state(&state, key, now))
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn observe_fenced_transition(
+        &self,
+        key: &SessionKey,
+    ) -> Result<crate::FencedTransitionObservation, StoreError> {
+        self.require_lab_identity()?;
+        let state = self.inner.lock().await;
+        crate::FencedTransitionObservation::new(
+            Self::get_with_state(&state, key, self.clock.now_utc()),
+            Self::current_fence(&state, &Self::map_key(key)),
+        )
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<crate::AtomicFencedTransitionCapability>, StoreError> {
+        Ok(self
+            .lab_identity
+            .map(|_| crate::AtomicFencedTransitionCapability::V1))
+    }
+
+    #[cfg(feature = "lab-memory")]
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        self.lab_identity.is_some()
+    }
+
+    #[cfg(feature = "lab-memory")]
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &crate::PreparedFencedTransition,
+    ) -> bool {
+        self.lab_request(prepared).is_ok()
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn prepare_fenced_transition(
+        &self,
+        request: crate::FencedTransitionRequest,
+    ) -> Result<crate::PreparedFencedTransition, StoreError> {
+        let identity = self.require_lab_identity()?;
+        request.validate_at(self.clock.now_utc())?;
+        crate::PreparedFencedTransition::from_unprotected_request(request)?.with_protection(
+            crate::fenced_transition::PreparedFencedTransitionProtection::LabMemoryPhysicalV1 {
+                instance_commitment: identity,
+            },
+        )
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn fenced_transition(
+        &self,
+        prepared: &crate::PreparedFencedTransition,
+    ) -> Result<crate::FencedTransitionOutcome, crate::FencedTransitionExecuteError> {
+        self.lab_execute(prepared)
+            .await
+            .map_err(crate::FencedTransitionExecuteError::Rejected)
+    }
+
+    #[cfg(feature = "lab-memory")]
+    async fn fenced_transition_status(
+        &self,
+        prepared: &crate::PreparedFencedTransition,
+    ) -> Result<crate::FencedTransitionStatus, StoreError> {
+        self.lab_status(prepared).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -971,6 +1090,10 @@ impl SessionBackend for FakeSessionBackend {
     ) -> Result<RestoreScanPage, StoreError> {
         if !self.caps.restore_scan {
             return Err(StoreError::CapabilityNotSupported("restore_scan".into()));
+        }
+        #[cfg(feature = "lab-memory")]
+        if self.lab_restore_authority.is_some() {
+            return self.lab_scan_restore_records(request).await;
         }
         request.validate()?;
         if request

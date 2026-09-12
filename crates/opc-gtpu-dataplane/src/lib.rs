@@ -185,7 +185,7 @@ pub use selector_namespace::{
     GtpuSessionSelectorReadbackRequest, GtpuSessionSelectorRemovalRequest,
     GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorRetiringNoEffectRequest,
     GtpuSessionSelectorReuseAuthorization, GtpuSessionSelectorReuseReceipt,
-    GtpuSessionSelectorReuseRequest,
+    GtpuSessionSelectorReuseRequest, GtpuSessionSelectorUnadmittedClaim,
 };
 #[cfg(test)]
 pub(crate) use selector_namespace::{

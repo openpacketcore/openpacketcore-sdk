@@ -17,6 +17,8 @@ categories = ["network-programming", "data-structures"]
 
 [features]
 default = []
+# Process-local lab state only; never supplies persistence or cross-process HA.
+lab-memory = []
 # Enables non-production consensus election controls used only by integration
 # tests that must deterministically exercise a real authenticated campaign.
 test-control = []
