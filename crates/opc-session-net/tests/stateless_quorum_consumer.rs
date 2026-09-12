@@ -4053,9 +4053,43 @@ async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack()
         SessionConsumerV2Operation::FencedTransitionV2Capability,
     );
 
+    // Reach the intended HelloAck stall before crossing the setup deadline.
+    // Keep this controller runnable so paused time cannot auto-advance while
+    // the real TCP/TLS tasks reach that phase. The original wall-clock bound
+    // still bounds fixture preparation; this is a deadline-state test.
+    let wall_started = Instant::now();
+    tokio::time::pause();
     let started_at = tokio::time::Instant::now();
+    let mut execution = Box::pin(client.execute_v2(&request));
+    for _ in 0..10_000 {
+        tokio::select! {
+            biased;
+            outcome = &mut execution => {
+                panic!("V2 setup ended before the controlled HelloAck stall: {outcome:?}");
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+        if hello_seen.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        assert!(
+            wall_started.elapsed() < Duration::from_millis(500),
+            "the real TLS fixture must reach Hello within the original outer bound"
+        );
+    }
+    assert_eq!(hello_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(started_at.elapsed(), Duration::ZERO);
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::select! {
+        biased;
+        outcome = &mut execution => {
+            panic!("V2 setup expired before its original 100ms deadline: {outcome:?}");
+        }
+        _ = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(Duration::from_millis(1)).await;
     assert_eq!(
-        client.execute_v2(&request).await,
+        execution.await,
         Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
             cause: SessionConsumerClientError::Unavailable,
         }),
@@ -4066,6 +4100,11 @@ async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack()
         started_at.elapsed() < Duration::from_millis(500),
         "the V2 setup deadline does not consume the operation response budget"
     );
+    assert!(
+        wall_started.elapsed() < Duration::from_millis(500),
+        "the controlled setup test retains its original real wall-clock bound"
+    );
+    tokio::time::resume();
     stalled_hello_ack.abort();
 }
 

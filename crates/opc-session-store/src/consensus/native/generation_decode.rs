@@ -14,6 +14,13 @@ use crate::record::SessionPayloadEncoding;
 #[path = "generation_json.rs"]
 pub(super) mod json;
 
+#[path = "generation_decode_notification.rs"]
+mod notification_export;
+pub(in crate::consensus::native) use notification_export::{
+    notification_encoding_bytes, ExportNotification, NotificationInput, NotificationPreparation,
+    PreparedNotification,
+};
+
 // The metadata in this closed shape includes the roster event's two records
 // and separate current authority. Identifier constructors have their original
 // 128-byte ceilings; canonical RFC3339 timestamps fit well within 64 bytes.
@@ -548,6 +555,19 @@ pub(in crate::consensus::native) fn owned_notification(
 ) -> io::Result<OwnedNotification> {
     check()?;
     let memory = VerificationMemory::reserve(notification_scratch(bytes)?)?;
+    let entry = decode_owned_notification(bytes, expected, frontiers)?;
+    check()?;
+    Ok(OwnedNotification {
+        entry,
+        _memory: memory,
+    })
+}
+
+fn decode_owned_notification(
+    bytes: &[u8],
+    expected: facts::Row<facts::Notification>,
+    frontiers: &NativeFrontiers,
+) -> io::Result<Box<ReplicationEntry>> {
     let decoded: ReplicationEntry = binary::decode(bytes)?;
     validation::validate_notification(&decoded, expected.facts.sequence, frontiers)?;
     // Compare the complete admitted row while this one bounded decode is
@@ -565,11 +585,7 @@ pub(in crate::consensus::native) fn owned_notification(
     // scratch bound. The copy performs no envelope parse or canonical encode.
     let entry = owned::notification(&decoded)?;
     drop(decoded);
-    check()?;
-    Ok(OwnedNotification {
-        entry: Box::new(entry),
-        _memory: memory,
-    })
+    Ok(Box::new(entry))
 }
 
 #[cfg(test)]

@@ -10,6 +10,9 @@ use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::sync::Arc;
 
+#[path = "notification_export.rs"]
+mod export;
+
 /// The persistent vector shares immutable chunks. Keep selected metadata in
 /// those chunks without another Arc and Box per historical notification.
 /// Resident bodies remain shared when a captured chunk must be copied.

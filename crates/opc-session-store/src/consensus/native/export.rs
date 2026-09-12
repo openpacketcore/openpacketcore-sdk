@@ -391,22 +391,15 @@ impl NativeStorage {
                     .map_err(|error| db!(error))?;
             }
         }
-        for entry in &state.notifications {
-            check()?;
-            let resolved = entry.read(&state.frontiers, check)?;
-            let entry = resolved.entry();
-            // JSON numeric bytes use at most four bytes per payload byte;
-            // charge old/new String growth before creating that output.
-            let encoding_bytes = changes::notification_payload(entry)?
-                .checked_mul(12)
-                .and_then(|bytes| bytes.checked_add(64 * 1024))
-                .ok_or_else(|| {
-                    invalid("native snapshot notification encoding reservation overflow")
-                })?;
-            let _encoding_memory =
-                crate::consensus::verified_snapshot::VerificationMemory::reserve(encoding_bytes)?;
-            tx.prepare_cached("INSERT INTO session_replication_log (sequence,tx_id,entry_json,timestamp) VALUES (?1,?2,?3,?4)").map_err(|error| db!(error))?.execute(params![entry.sequence,entry.tx_id.as_str(),serde_json::to_string(entry).map_err(io::Error::other)?,ops::format_rfc3339_normalized(entry.timestamp)]).map_err(|error| db!(error))?;
-        }
+        NativeNotification::visit_export(
+            &state.notifications,
+            &state.frontiers,
+            check,
+            &mut |entry| {
+                tx.prepare_cached("INSERT INTO session_replication_log (sequence,tx_id,entry_json,timestamp) VALUES (?1,?2,?3,?4)").map_err(|error| db!(error))?.execute(params![entry.sequence,entry.tx_id.as_str(),serde_json::to_string(entry).map_err(io::Error::other)?,ops::format_rfc3339_normalized(entry.timestamp)]).map_err(|error| db!(error))?;
+                Ok(())
+            },
+        )?;
         if frontiers.roster_v1_namespace {
             sql::roster_snapshot::activate_v1(&tx)?;
         }
