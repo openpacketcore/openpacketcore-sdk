@@ -286,6 +286,38 @@ async fn cancelled_predecessor_does_not_cool_down_new_epoch() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn correlated_discarded_responses_share_reconnect_cooldown() {
+    let _metrics = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+        .lock()
+        .await;
+    for error in [
+        SessionConsensusPeerError::Timeout,
+        SessionConsensusPeerError::Protocol,
+        SessionConsensusPeerError::Authentication,
+        SessionConsensusPeerError::ScopeMismatch,
+        SessionConsensusPeerError::Rejected,
+    ] {
+        for staged in [false, true] {
+            let mut fixture = Fixture::new(staged).await;
+            let call = fixture.call(Duration::from_millis(20));
+            let call_id = fixture.receive_call_id().await;
+            let response = SessionConsensusWireResponse { result: Err(error) };
+            write_frame(
+                fixture.remote.as_mut().expect("live remote"),
+                &SessionConsensusTransportResponse::Call {
+                    call_id,
+                    response: response.clone(),
+                },
+            )
+            .await
+            .expect("write complete rejected response");
+            assert_eq!(call.await.expect("join rejected call"), Ok(response));
+            fixture.assert_shared_cooldown().await;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn correlated_unavailable_response_preserves_reuse_without_cooldown() {
     let _metrics = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
         .lock()

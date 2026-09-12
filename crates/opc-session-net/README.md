@@ -118,6 +118,10 @@ position but grants no success or authority. Cancellation, timeout, EOF,
 framing, `Protocol`, `Authentication`, `ScopeMismatch`, `Rejected`, evidence
 mismatch, lifecycle retirement, or any uncertain stream position drops it, so
 a late or partial response cannot be consumed by another Openraft RPC. The
+discarded socket shares the existing per-peer reconnect cooldown, including
+when a complete correlated response carries a typed error that forbids reuse.
+This preserves the original returned error and uses the connection's admitted
+epoch, so a late predecessor cannot delay newly published credentials. The
 client applies one absolute logical deadline to lane acquisition, waiting for a
 usable connection, bounded encoding, request write, and response read. Cold
 DNS/TCP/TLS/identity/bootstrap work admitted while that caller is waiting may

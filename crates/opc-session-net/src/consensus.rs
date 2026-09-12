@@ -367,18 +367,19 @@ struct ConsensusConnection {
 }
 
 // A negotiated call owns its socket until a complete correlated response is
-// validated. Failed reads/writes and caller cancellation all discard that
-// socket, so they must share the same reconnect cooldown as other lane losses.
-// Keep the admitted epoch: a late predecessor cannot delay a fresh epoch.
+// validated. Failed reads/writes, caller cancellation and typed responses
+// that forbid reuse all discard that socket, so they share the same reconnect
+// cooldown as other lane losses. Keep the admitted epoch: a late predecessor
+// cannot delay a fresh epoch.
 struct ConsensusNegotiatedLoss<'a> {
     reconnect_gate: &'a ReconnectGate,
     epoch: ConsensusColdConnectionEpoch,
-    response_validated: bool,
+    response_allows_reuse: bool,
 }
 
 impl Drop for ConsensusNegotiatedLoss<'_> {
     fn drop(&mut self) {
-        if !self.response_validated {
+        if !self.response_allows_reuse {
             self.reconnect_gate.publish_failure_cooldown(
                 self.epoch.reauthentication_generation,
                 self.epoch.material_epoch,
@@ -2792,7 +2793,7 @@ impl RemoteSessionConsensusPeer {
         let mut loss = ConsensusNegotiatedLoss {
             reconnect_gate: &self.connection_pool.reconnect_gate,
             epoch: self.connection_epoch(connection),
-            response_validated: false,
+            response_allows_reuse: false,
         };
         let call = async {
             write_frame_bounded_until(
@@ -2858,7 +2859,9 @@ impl RemoteSessionConsensusPeer {
             }
         };
         connection.lifecycle = lifecycle;
-        loss.response_validated = response.is_ok();
+        loss.response_allows_reuse = response
+            .as_ref()
+            .is_ok_and(consensus_response_allows_connection_reuse);
         response
     }
 }
