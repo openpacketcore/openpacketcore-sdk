@@ -156,6 +156,12 @@ jobs:
     name: Linux 6.8 committed classifier load
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # Debug symbols dominate these host test executables and are not inputs
+    # to the kernel classifier or datapath proofs transferred into the guest.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -189,6 +195,8 @@ jobs:
           test -n "${datapath_binary}"
           test -x "${datapath_binary}"
           cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
+          wc -c "${RUNNER_TEMP}/opc-gtpu-linux68-test" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
+          sha256sum "${RUNNER_TEMP}/opc-gtpu-linux68-test" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
 
       - name: Load both classifiers on pinned Linux 6.8
         run: |

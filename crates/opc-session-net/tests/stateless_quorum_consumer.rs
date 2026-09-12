@@ -4053,9 +4053,43 @@ async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack()
         SessionConsumerV2Operation::FencedTransitionV2Capability,
     );
 
+    // Reach the intended HelloAck stall before crossing the setup deadline.
+    // Keep this controller runnable so paused time cannot auto-advance while
+    // the real TCP/TLS tasks reach that phase. The original wall-clock bound
+    // still bounds fixture preparation; this is a deadline-state test.
+    let wall_started = Instant::now();
+    tokio::time::pause();
     let started_at = tokio::time::Instant::now();
+    let mut execution = Box::pin(client.execute_v2(&request));
+    for _ in 0..10_000 {
+        tokio::select! {
+            biased;
+            outcome = &mut execution => {
+                panic!("V2 setup ended before the controlled HelloAck stall: {outcome:?}");
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+        if hello_seen.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        assert!(
+            wall_started.elapsed() < Duration::from_millis(500),
+            "the real TLS fixture must reach Hello within the original outer bound"
+        );
+    }
+    assert_eq!(hello_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(started_at.elapsed(), Duration::ZERO);
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::select! {
+        biased;
+        outcome = &mut execution => {
+            panic!("V2 setup expired before its original 100ms deadline: {outcome:?}");
+        }
+        _ = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(Duration::from_millis(1)).await;
     assert_eq!(
-        client.execute_v2(&request).await,
+        execution.await,
         Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
             cause: SessionConsumerClientError::Unavailable,
         }),
@@ -4066,6 +4100,11 @@ async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack()
         started_at.elapsed() < Duration::from_millis(500),
         "the V2 setup deadline does not consume the operation response budget"
     );
+    assert!(
+        wall_started.elapsed() < Duration::from_millis(500),
+        "the controlled setup test retains its original real wall-clock bound"
+    );
+    tokio::time::resume();
     stalled_hello_ack.abort();
 }
 
@@ -14076,8 +14115,15 @@ fn protected_roster_process_loss_voter_positions(
 }
 
 #[cfg(feature = "test-control")]
-fn protected_roster_process_loss_counter_total<const N: usize>(counters: &[u64; N]) -> u64 {
-    counters.iter().copied().sum()
+fn protected_roster_process_loss_apply_total(
+    snapshot: &ProtectedRosterConsensusDiagnosticSnapshot,
+) -> u64 {
+    snapshot
+        .state_machine_sqlite_commit_latency_millis
+        .iter()
+        .chain(&snapshot.state_machine_native_apply_latency_millis)
+        .copied()
+        .sum()
 }
 
 #[cfg(feature = "test-control")]
@@ -14104,13 +14150,9 @@ fn assert_protected_roster_process_loss_state_unchanged(
             "{context}: tombstone reservations remain unchanged on voter {voter}",
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &before[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            "{context}: no roster-bearing state-machine transaction commits on voter {voter}",
+            protected_roster_process_loss_apply_total(&after[voter]),
+            protected_roster_process_loss_apply_total(&before[voter]),
+            "{context}: no roster-bearing state-machine publications on voter {voter}",
         );
     }
 }
@@ -14941,12 +14983,8 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
             admission_diagnostics_before[voter].retained_reservations,
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &admission_diagnostics_after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &admission_diagnostics_before[voter].state_machine_sqlite_commit_latency_millis,
-            ) + 1,
+            protected_roster_process_loss_apply_total(&admission_diagnostics_after[voter]),
+            protected_roster_process_loss_apply_total(&admission_diagnostics_before[voter]) + 1,
             "exactly one roster-bearing state-machine transaction commits PollAdmit on every voter",
         );
     }
@@ -15188,12 +15226,8 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
             "the generic successor-fence acquisition is not a roster mutation",
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &current_fence_diagnostics_after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &current_fence_diagnostics_before[voter].state_machine_sqlite_commit_latency_millis,
-            ),
+            protected_roster_process_loss_apply_total(&current_fence_diagnostics_after[voter]),
+            protected_roster_process_loss_apply_total(&current_fence_diagnostics_before[voter]),
             "the generic successor-fence acquisition commits no roster state-machine transaction",
         );
     }
@@ -15396,12 +15430,8 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
             "terminalization converts the same reservation into one retained terminal on every voter",
         );
         assert_eq!(
-            protected_roster_process_loss_counter_total(
-                &terminal_diagnostics_after[voter].state_machine_sqlite_commit_latency_millis,
-            ),
-            protected_roster_process_loss_counter_total(
-                &terminal_diagnostics_before[voter].state_machine_sqlite_commit_latency_millis,
-            ) + 1,
+            protected_roster_process_loss_apply_total(&terminal_diagnostics_after[voter]),
+            protected_roster_process_loss_apply_total(&terminal_diagnostics_before[voter]) + 1,
             "exactly one roster-bearing state-machine transaction commits Established on every voter",
         );
     }

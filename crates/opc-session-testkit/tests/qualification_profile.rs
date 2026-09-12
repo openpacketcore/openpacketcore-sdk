@@ -1791,7 +1791,8 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         serde_json::json!({
             "consumer-fixture": ["dep:rcgen", "dep:rustls-pki-types"],
             "default": [],
-            "foundation-insecure": ["opc-session-net/insecure-test"]
+            "foundation-insecure": ["opc-session-net/insecure-test"],
+            "test-control": ["opc-session-store/test-control"]
         })
     );
     let foundation_network = testkit["dependencies"]

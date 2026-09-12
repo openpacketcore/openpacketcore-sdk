@@ -4413,8 +4413,12 @@ impl Fleet {
                     self.nodes[node_index].invoke(&QualificationNodeCommand::TrafficStatus);
                 let source_at_failure = self.projected_status(node_index);
                 let material_at_failure = self.material_status(node_index);
+                // Observe only after the unchanged readiness deadline failed.
+                // The node emits fixed storage-health categories on this
+                // existing diagnostic command, without raw storage errors.
+                let consensus_at_failure = self.all_consensus_diagnostics();
                 panic!(
-                    "exact-address restart did not regain readiness: restarted_node={node_index}, readiness_before={readiness_before:?}, progress_before={progress_before:?}, readiness_after={reports:?}, progress_after={progress_after:?}, traffic_before={traffic_before:?}, traffic_after={traffic_after:?}, restarted_traffic={restarted_traffic:?}, source_before={source_before:?}, source_after={source_after:?}, source_at_failure={source_at_failure:?}, material_before={material_before:?}, material_after={material_after:?}, material_at_failure={material_at_failure:?}, stderr={:?}",
+                    "exact-address restart did not regain readiness: restarted_node={node_index}, readiness_before={readiness_before:?}, progress_before={progress_before:?}, readiness_after={reports:?}, progress_after={progress_after:?}, traffic_before={traffic_before:?}, traffic_after={traffic_after:?}, restarted_traffic={restarted_traffic:?}, source_before={source_before:?}, source_after={source_after:?}, source_at_failure={source_at_failure:?}, material_before={material_before:?}, material_after={material_after:?}, material_at_failure={material_at_failure:?}, consensus_at_failure={consensus_at_failure:?}, stderr={:?}",
                     self.stderr_diagnostics()
                 );
             }
@@ -5834,6 +5838,24 @@ impl Fleet {
                     self.stderr_diagnostics()
                 );
                 return;
+            }
+            if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
+                // Observe the reports already returned by the original
+                // probes. No extra RPC or deadline adjustment is involved.
+                for report in &reports {
+                    eprintln!(
+                        "MTLS_RECOVERY_READINESS phase={phase} node_index={} ready={} reason={:?} configured={} reachable={} agreeing={} quorum={} committed={:?} applied={:?}",
+                        report.node_index,
+                        report.ready,
+                        report.reason_code,
+                        report.configured_voters,
+                        report.fresh_reachable_voters,
+                        report.agreeing_voters,
+                        report.required_quorum,
+                        report.committed_index,
+                        report.applied_index,
+                    );
+                }
             }
             assert!(
                 deadline_allows_completion(Instant::now(), absolute_deadline),

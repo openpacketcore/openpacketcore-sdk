@@ -118,6 +118,10 @@ position but grants no success or authority. Cancellation, timeout, EOF,
 framing, `Protocol`, `Authentication`, `ScopeMismatch`, `Rejected`, evidence
 mismatch, lifecycle retirement, or any uncertain stream position drops it, so
 a late or partial response cannot be consumed by another Openraft RPC. The
+discarded socket shares the existing per-peer reconnect cooldown, including
+when a complete correlated response carries a typed error that forbids reuse.
+This preserves the original returned error and uses the connection's admitted
+epoch, so a late predecessor cannot delay newly published credentials. The
 client applies one absolute logical deadline to lane acquisition, waiting for a
 usable connection, bounded encoding, request write, and response read. Cold
 DNS/TCP/TLS/identity/bootstrap work admitted while that caller is waiting may
@@ -149,6 +153,10 @@ first negotiated RPC, so an AppendEntries soft TTL cannot be exhausted by a
 successful handshake before the connection sends useful work. A cached lane
 resets shared reconnect backoff only after a complete validated reusable
 response proves the connection usable.
+Failure or cancellation during a negotiated call publishes one shared
+reconnect cooldown using the existing lifecycle policy. The loss retains the
+connection's admitted epoch, so a late predecessor cannot delay a newer epoch.
+A complete correlated semantic response does not count as transport loss.
 At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
 outbound lanes. During one bounded retirement step, at most one retiring
 generation per lane may overlap its replacement, for up to 120 server-side

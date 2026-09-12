@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Selectable fixed-quorum persistence — `opc-session-store`:** supported
+  `SessionPersistenceMode::Async` acknowledges validated resident storage,
+  real quorum replication, and committed application while one coalescing
+  writer persists local generations. Existing constructors retain `Durable`.
+  Additive openers accept persistence independently of snapshot integrity,
+  including the existing explicit clock and complete-operation deadline shape.
+  Mode-aware readiness, typed passive health, and an explicit local drain
+  report the selected contract. Every existing Async root rejoins through a
+  fresh surviving-quorum commit and exact local catch-up; an all-cold set stays
+  `RecoveryRequired`. Mode mismatches fail closed on disk and consensus/control
+  traffic. Losing the volatile quorum can lose acknowledged results; local
+  persistence does not authorize recovery. No automatic mode migration is
+  provided. See ADR 0022 for semantics and qualification boundaries.
 - **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
   workload scopes select separate bpffs roots and local writer locks. An
   explicit stopped-generation reset reclaims only the unbound current IPv4

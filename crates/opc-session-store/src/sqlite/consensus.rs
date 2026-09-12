@@ -4,6 +4,16 @@
 //! adapter in `consensus::storage` owns async locking and maps these coarse,
 //! redaction-safe failures into Openraft storage errors.
 
+pub(crate) mod consumer_receipts;
+#[cfg(target_os = "linux")]
+pub(crate) mod native_snapshot;
+pub(crate) mod roster_engine;
+pub(crate) mod roster_reads;
+#[cfg(target_os = "linux")]
+pub(crate) mod roster_rows;
+#[cfg(target_os = "linux")]
+pub(crate) mod roster_snapshot;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -17,7 +27,9 @@ use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
+use opc_consensus::engine::{
+    Entry, EntryPayload, LogId, Membership, StorageError, StoredMembership, Vote,
+};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::types::ValueRef;
@@ -209,21 +221,22 @@ pub struct ProtectedRosterTerminalApplyTimings {
     pub terminalization_preparation_count: u64,
     /// Aggregate nanoseconds spent constructing the deterministic terminal transaction.
     pub terminalization_preparation_nanos: u64,
-    /// Completed SQLite production compare-and-apply phase count.
+    /// Completed production compare-and-apply phase count on the active backend.
     pub production_apply_count: u64,
-    /// Aggregate nanoseconds spent in SQLite production compare-and-apply.
+    /// Aggregate nanoseconds spent in production compare-and-apply.
     pub production_apply_nanos: u64,
     /// Completed committed-outcome construction phase count.
     pub committed_outcome_count: u64,
     /// Aggregate nanoseconds spent constructing committed outcomes.
     pub committed_outcome_nanos: u64,
-    /// Completed replication notification JSON-and-insert phase count.
+    /// Completed replication notification construction-and-insert phase count.
     pub replication_notification_count: u64,
     /// Aggregate nanoseconds spent constructing and inserting notifications.
     pub replication_notification_nanos: u64,
-    /// Outer transaction remainder-and-commit phase count.
+    /// Outer transaction remainder-and-commit or native publication phase count.
     pub transaction_remainder_commit_count: u64,
-    /// Aggregate nanoseconds from post-notification remainder through commit.
+    /// Aggregate nanoseconds from post-notification remainder through commit
+    /// or checked native publication.
     pub transaction_remainder_commit_nanos: u64,
 }
 
@@ -274,6 +287,24 @@ fn record_protected_roster_terminal_apply_timing(
     nanos.fetch_add(
         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
+    );
+}
+
+#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+pub(crate) fn record_native_roster_notification_timing(start: Instant) {
+    record_protected_roster_terminal_apply_timing(
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_count,
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_nanos,
+        start,
+    );
+}
+
+#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+pub(crate) fn record_native_roster_publication_timing(start: Instant) {
+    record_protected_roster_terminal_apply_timing(
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_count,
+        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_nanos,
+        start,
     );
 }
 
@@ -543,6 +574,10 @@ static ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = O
 // add-on and ALTER-based operator-recovery products remain supported, but
 // only their exact emitted DDL is admitted once that object is populated.
 static OPERATOR_RECOVERY_CERTIFICATE_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
+// Only the expected SDK-defined manifest is shared. Every validation still
+// reads all matching objects from the actual main or attached database.
+static PROTECTED_ROSTER_SCHEMA_MANIFEST: OnceLock<BTreeMap<(String, String), String>> =
+    OnceLock::new();
 // Recovery sidecars are self-bound to their persistent Linux file handle.
 // Earlier unbound OPCRL001/OPCRL002 records are intentionally not accepted:
 // a same-byte copy at the public pathname must remain invalid after a retry
@@ -1050,7 +1085,7 @@ fn open_nofollow_read(path: &Path) -> io::Result<File> {
     super::open_regular_read_nofollow(path)
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 fn read_operator_recovery_latch_record(
     database: &Path,
 ) -> io::Result<Option<OperatorRecoveryLatchRecord>> {
@@ -1932,7 +1967,7 @@ pub(crate) fn operator_recovery_latch_phase_sync(
     Ok(phase)
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn read_operator_recovery_latch_sync(
     database: &Path,
 ) -> io::Result<Option<OperatorRecoveryLatch>> {
@@ -4259,6 +4294,7 @@ pub(crate) struct ConsensusSnapshotForegroundPacer {
     primary_writers: Option<Arc<AtomicUsize>>,
     writer_generation: Option<Arc<AtomicU64>>,
     observed_writer_generation: Arc<AtomicU64>,
+    last_pause_finished: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ConsensusSnapshotForegroundPacer {
@@ -4268,10 +4304,25 @@ impl ConsensusSnapshotForegroundPacer {
             primary_writers: Some(primary_writers),
             writer_generation: Some(writer_generation),
             observed_writer_generation: Arc::new(AtomicU64::new(observed_writer_generation)),
+            last_pause_finished: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn pace_with(&self, pause: impl FnOnce(Duration)) -> bool {
+    fn pace_with(&self, now: impl Fn() -> Instant, pause: impl FnOnce(Duration)) -> bool {
+        // One foreground pause earns one equally bounded snapshot work turn.
+        // Charging a fresh pause after each tiny SQLite progress callback can
+        // otherwise starve compaction while writers remain continuously busy,
+        // retaining the source WAL and delaying physical reclamation. This
+        // mutex belongs only to snapshot pacing, never to a primary writer.
+        let mut last_pause_finished = self
+            .last_pause_finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_pause_finished.is_some_and(|finished| {
+            now().saturating_duration_since(finished) < SNAPSHOT_FOREGROUND_PACING_PAUSE
+        }) {
+            return false;
+        }
         let writer_generation_advanced =
             self.writer_generation.as_ref().is_some_and(|generation| {
                 let current = generation.load(Ordering::Acquire);
@@ -4286,6 +4337,16 @@ impl ConsensusSnapshotForegroundPacer {
                 .is_some_and(|writers| writers.load(Ordering::Acquire) != 0)
         {
             pause(SNAPSHOT_FOREGROUND_PACING_PAUSE);
+            *last_pause_finished = Some(now());
+            // Writers that ran during this pause have already received their
+            // foreground turn. Acknowledge them when snapshot work resumes,
+            // otherwise steady traffic can recharge the same pause at every
+            // backup page group or compaction progress callback. A writer
+            // still pending is checked independently at the next callback.
+            if let Some(generation) = &self.writer_generation {
+                self.observed_writer_generation
+                    .store(generation.load(Ordering::Acquire), Ordering::Release);
+            }
             true
         } else {
             false
@@ -4293,7 +4354,7 @@ impl ConsensusSnapshotForegroundPacer {
     }
 
     fn pace(&self) {
-        let _ = self.pace_with(std::thread::sleep);
+        let _ = self.pace_with(Instant::now, std::thread::sleep);
     }
 }
 
@@ -4309,7 +4370,9 @@ struct ConsensusLogPruneActiveInterrupt {
 pub(crate) struct ConsensusLogPruneLane {
     sender: tokio::sync::mpsc::Sender<()>,
     stop: tokio::sync::watch::Sender<bool>,
-    stopping: AtomicBool,
+    // The active SQLite turn must retain shutdown cancellation between VM
+    // statements, where a one-shot sqlite3_interrupt can have no effect.
+    stopping: Arc<AtomicBool>,
     degraded: AtomicBool,
     /// One writer turn owns this from its pre-publication recheck through its
     /// SQLite transaction rollback or commit. Primary writers hold an owned
@@ -4360,7 +4423,7 @@ impl ConsensusLogPruneLane {
         let lane = Arc::new(Self {
             sender,
             stop,
-            stopping: AtomicBool::new(false),
+            stopping: Arc::new(AtomicBool::new(false)),
             degraded: AtomicBool::new(false),
             turn_ownership: Arc::new(tokio::sync::Mutex::new(())),
             interrupt_delivery: Arc::new(Mutex::new(())),
@@ -4616,6 +4679,7 @@ async fn run_consensus_log_prune_lane(
         let source_for_turn = Arc::clone(&source);
         let expected_members_for_turn = expected_members.clone();
         let expected_bindings_for_turn = expected_bindings.clone();
+        let stopping = Arc::clone(&lane.stopping);
         let primary_writers = Arc::clone(&lane.primary_writers);
         let interrupt_delivery = Arc::clone(&lane.interrupt_delivery);
         #[cfg(all(test, target_os = "linux"))]
@@ -4636,6 +4700,7 @@ async fn run_consensus_log_prune_lane(
                 &expected_bindings_for_turn,
                 fixed_placement_policy,
                 ConsensusLogPruneTurnControl {
+                    stopping,
                     primary_writers: Arc::clone(&primary_writers),
                     interrupt_delivery: Arc::clone(&interrupt_delivery),
                     preemption_requested: Arc::clone(&preemption_requested),
@@ -4828,6 +4893,7 @@ async fn wait_consensus_log_prune_pacing(
 }
 
 struct ConsensusLogPruneTurnControl {
+    stopping: Arc<AtomicBool>,
     primary_writers: Arc<AtomicUsize>,
     interrupt_delivery: Arc<Mutex<()>>,
     preemption_requested: Arc<AtomicBool>,
@@ -4835,10 +4901,12 @@ struct ConsensusLogPruneTurnControl {
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
 
-/// Interrupt every SQLite VM step in a prune turn once a primary writer has
-/// announced itself. The lane publishes the connection interrupt handle
-/// before entering this scope; this callback closes the interval where that
+/// Interrupt every SQLite VM step in a prune turn after shutdown or primary
+/// preemption. The lane publishes the connection interrupt handle before
+/// entering this scope; these persistent flags close the interval where that
 /// cross-thread interrupt arrives with no VDBE active and SQLite clears it.
+/// Cleanup removes this callback before rollback, so a retained stop cannot
+/// prevent the transaction from returning its writer ownership.
 struct ConsensusLogPruneProgressGuard<'a> {
     conn: &'a Connection,
 }
@@ -4846,6 +4914,7 @@ struct ConsensusLogPruneProgressGuard<'a> {
 impl<'a> ConsensusLogPruneProgressGuard<'a> {
     fn install(
         conn: &'a Connection,
+        stopping: Arc<AtomicBool>,
         primary_writers: Arc<AtomicUsize>,
         observed_preemption: Arc<AtomicBool>,
         #[cfg(all(test, target_os = "linux"))] turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
@@ -4853,6 +4922,9 @@ impl<'a> ConsensusLogPruneProgressGuard<'a> {
         conn.progress_handler(
             1,
             Some(move || {
+                if stopping.load(Ordering::Acquire) {
+                    return true;
+                }
                 let preempt = primary_writers.load(Ordering::Acquire) != 0;
                 if preempt {
                     #[cfg(all(test, target_os = "linux"))]
@@ -4891,6 +4963,7 @@ fn prune_consensus_log_turn_sync(
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
     let progress = ConsensusLogPruneProgressGuard::install(
         conn,
+        Arc::clone(&control.stopping),
         Arc::clone(&control.primary_writers),
         Arc::clone(&control.preemption_requested),
         #[cfg(all(test, target_os = "linux"))]
@@ -5687,6 +5760,12 @@ enum SnapshotDirectoryInitialization {
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) private_wal: Option<Arc<wal::Wal>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) configured_roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) fresh_native_basis: bool,
     /// A pending recovery terminal remains descriptor-bound until the
     /// snapshot-directory opener has validated the current selected image
     /// through a duplicate of this exact file descriptor.  Keeping it on the
@@ -5735,6 +5814,12 @@ pub(crate) struct SqliteConsensusCore {
     /// Only one unvalidated receiver may own disk space for this core.
     pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
+    /// The first failed state-machine snapshot install is fatal to this core.
+    /// Wake a concurrently dispatched purge with that original error; the
+    /// engine cannot consume its state-machine notification while awaiting
+    /// the purge's application frontier.
+    pub(crate) snapshot_install_failure:
+        tokio::sync::watch::Sender<Option<StorageError<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
@@ -5769,6 +5854,119 @@ impl Drop for SqliteConsensusCore {
 }
 
 impl SqliteConsensusCore {
+    pub(crate) async fn refresh_protected_roster_occupancy(&self) {
+        let Some(diagnostics) = &self.diagnostics else {
+            return;
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            wal.publish_native_roster_occupancy(diagnostics);
+            return;
+        }
+        let conn = self.conn.lock().await;
+        match protected_roster_diagnostic_occupancy_sync(&conn, self.storage_identity) {
+            Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
+            Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
+        }
+    }
+
+    pub(crate) async fn read_current_snapshot_for_serving(
+        &self,
+    ) -> io::Result<Option<CurrentSnapshot>> {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            return wal.with_native_read(|state| Ok(state.current_snapshot()));
+        }
+        let conn = self.conn.lock().await;
+        self.with_application_cache_read(&conn, || {
+            with_durable_authority_raw_read_sync(
+                &conn,
+                self.storage_identity,
+                self.authority_profile,
+                &self.expected_members,
+                &self.expected_bindings,
+                self.fixed_placement_policy,
+                |conn| read_current_snapshot_sync(conn, self.storage_identity),
+            )
+        })
+    }
+
+    pub(crate) fn read_selected_snapshot(
+        &self,
+        conn: &Connection,
+    ) -> io::Result<Option<CurrentSnapshot>> {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            return wal.with_native_read(|state| Ok(state.current_snapshot()));
+        }
+        read_current_snapshot_sync(conn, self.storage_identity)
+    }
+
+    pub(crate) fn read_selected_legacy_reseed(
+        &self,
+        conn: &Connection,
+    ) -> io::Result<Option<LegacyFixedSnapshotReseed>> {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            return wal.with_native_read(|_| Ok(None));
+        }
+        read_legacy_fixed_snapshot_reseed_sync(conn, self.storage_identity)
+    }
+
+    pub(crate) fn reserve_selected_legacy_reseed(
+        &self,
+        conn: &Connection,
+        candidate: &str,
+    ) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            return wal.with_native_read(|_| Ok(false));
+        }
+        reserve_legacy_fixed_snapshot_reseed_candidate_sync(conn, self.storage_identity, candidate)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_recovery_probe(
+        &self,
+    ) -> Option<io::Result<LiveTerminalRecoveryHandoffProbe>> {
+        self.private_wal
+            .as_ref()
+            .filter(|wal| wal.is_native())
+            .map(|wal| {
+                wal.with_native_read(|_| {
+                    if self
+                        .terminal_recovery_handoff_pending()
+                        .map_err(io::Error::other)?
+                    {
+                        return Err(invalid_data("native terminal handoff requires recovery"));
+                    }
+                    let database = self
+                        .database_file
+                        .as_ref()
+                        .ok_or_else(|| invalid_data("native database provenance missing"))?;
+                    database.verify_linked_identity()?;
+                    let active = read_operator_recovery_latch_sync(database.path())?.is_some();
+                    Ok(if active {
+                        LiveTerminalRecoveryHandoffProbe::Active
+                    } else {
+                        LiveTerminalRecoveryHandoffProbe::Clear
+                    })
+                })
+            })
+    }
+
+    pub(crate) fn with_application_cache_read<T>(
+        &self,
+        _conn: &Connection,
+        read: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.private_wal.as_ref() {
+            return wal.with_application_read(_conn, read)?;
+        }
+        read()
+    }
+
     /// Test-only observer for storage's failure-path assertions.  It exposes
     /// no descriptor or terminal contents: callers can prove only that a
     /// failed validation has not consumed the pending handoff.
@@ -5828,6 +6026,20 @@ impl SqliteConsensusCore {
         selected_name: Option<&str>,
         admitted_snapshot_file: Option<&File>,
     ) -> Result<LiveTerminalRecoveryHandoffInstallOutcome, SessionConsensusStorageError> {
+        #[cfg(target_os = "linux")]
+        if let Some(probe) = self.native_recovery_probe() {
+            return match probe.map_err(|_| SessionConsensusStorageError::CorruptState)? {
+                LiveTerminalRecoveryHandoffProbe::Clear => {
+                    Ok(LiveTerminalRecoveryHandoffInstallOutcome::Clear)
+                }
+                LiveTerminalRecoveryHandoffProbe::Active => {
+                    Ok(LiveTerminalRecoveryHandoffInstallOutcome::Active)
+                }
+                LiveTerminalRecoveryHandoffProbe::TerminalNeedsSnapshot => {
+                    Err(SessionConsensusStorageError::RecoveryRequired)
+                }
+            };
+        }
         let database = self
             .database_file
             .as_ref()
@@ -5922,6 +6134,13 @@ impl SqliteConsensusCore {
         selected_name: Option<&str>,
         admitted_snapshot_file: Option<&File>,
     ) -> Result<(), SessionConsensusStorageError> {
+        #[cfg(target_os = "linux")]
+        if let Some(probe) = self.native_recovery_probe() {
+            return match probe.map_err(|_| SessionConsensusStorageError::CorruptState)? {
+                LiveTerminalRecoveryHandoffProbe::Clear => Ok(()),
+                _ => Err(SessionConsensusStorageError::RecoveryRequired),
+            };
+        }
         let conn = self.conn.lock().await;
         let mut handoffs = self
             .terminal_recovery_handoff
@@ -6172,6 +6391,16 @@ impl SqliteConsensusCore {
         if !cfg!(target_os = "linux") {
             return Err(SessionConsensusStorageError::UnsupportedPlatform);
         }
+        #[cfg(target_os = "linux")]
+        let native_selected = backend
+            .native_owner
+            .as_ref()
+            .is_some_and(|owner| owner.selected());
+        #[cfg(not(target_os = "linux"))]
+        let native_selected = false;
+        if native_selected && authority_profile != ConsensusAuthorityProfile::FixedImmutable {
+            return Err(SessionConsensusStorageError::CorruptState);
+        }
         validate_member_set(&expected_members, false)
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
         validate_member_bindings(&expected_members, &expected_bindings)
@@ -6217,8 +6446,14 @@ impl SqliteConsensusCore {
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             protected_roster_occupancy,
+            fresh_native_basis,
         ) = {
             let conn = backend.conn.lock().await;
+            // Existing fixed storage without its native directory must never
+            // be mistaken for a fresh, empty root. The original identity
+            // schema is the durable witness, including interrupted startup.
+            let fresh_native_basis = !super::consensus_identity_exists(&conn)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
             let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
                 &conn,
                 required_storage_identity,
@@ -6256,6 +6491,7 @@ impl SqliteConsensusCore {
             // live writer and this lane's exact backing file.
             let proactive_checkpoint_lane = database_file
                 .as_ref()
+                .filter(|_| !native_selected)
                 .map(|source| {
                     ProactiveCheckpointLane::start(
                         Arc::clone(source),
@@ -6270,25 +6506,27 @@ impl SqliteConsensusCore {
                     )
                 })
                 .transpose()?;
-            let consensus_log_prune_lane =
-                if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                    database_file
-                        .as_ref()
-                        .map(|source| {
-                            ConsensusLogPruneLane::start(
-                                Arc::clone(source),
-                                backend.checkpoint_vfs_name.clone(),
-                                storage_identity,
-                                expected_members.clone(),
-                                expected_bindings.clone(),
-                                fixed_placement_policy,
-                                backend.consensus_diagnostics.clone(),
-                            )
-                        })
-                        .transpose()?
-                } else {
-                    None
-                };
+            let consensus_log_prune_lane = if authority_profile
+                == ConsensusAuthorityProfile::FixedImmutable
+                && !native_selected
+            {
+                database_file
+                    .as_ref()
+                    .map(|source| {
+                        ConsensusLogPruneLane::start(
+                            Arc::clone(source),
+                            backend.checkpoint_vfs_name.clone(),
+                            storage_identity,
+                            expected_members.clone(),
+                            expected_bindings.clone(),
+                            fixed_placement_policy,
+                            backend.consensus_diagnostics.clone(),
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             (
                 storage_identity,
                 applied,
@@ -6296,9 +6534,13 @@ impl SqliteConsensusCore {
                 proactive_checkpoint_lane,
                 consensus_log_prune_lane,
                 protected_roster_occupancy,
+                fresh_native_basis,
             )
         };
+        #[cfg(not(target_os = "linux"))]
+        let _ = fresh_native_basis;
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
+        let (snapshot_install_failure, _) = tokio::sync::watch::channel(None);
 
         if let Some(diagnostics) = backend.consensus_diagnostics.as_ref() {
             match protected_roster_occupancy {
@@ -6311,6 +6553,12 @@ impl SqliteConsensusCore {
             backend.terminal_recovery_handoff_restore_slot();
         let core = Self {
             conn: Arc::clone(&backend.conn),
+            #[cfg(target_os = "linux")]
+            private_wal: None,
+            #[cfg(target_os = "linux")]
+            configured_roster_root: roster_attestation_trust_root.map(Arc::new),
+            #[cfg(target_os = "linux")]
+            fresh_native_basis,
             terminal_recovery_handoff: Arc::new(Mutex::new(terminal_recovery_handoff.disarm())),
             terminal_recovery_handoff_restore_slot,
             diagnostics: backend.consensus_diagnostics.clone(),
@@ -6334,6 +6582,7 @@ impl SqliteConsensusCore {
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             applied_progress,
+            snapshot_install_failure,
             watchers: Arc::clone(&backend.watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
@@ -7055,11 +7304,10 @@ fn initialize_schema_with_storage_anchor_and_pending(
 }
 
 fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [name],
-        |row| row.get(0),
-    )
+    )?
+    .query_row([name], |row| row.get(0))
 }
 
 pub(crate) fn read_storage_identity_sync(
@@ -7553,7 +7801,7 @@ fn read_membership_history_sync(
         return Ok(Vec::new());
     }
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT storage_configuration_epoch, configuration_id, configuration_epoch, members_json, transition_id, transition_digest, transition_start_index, cutover_index FROM consensus_membership_history ORDER BY configuration_epoch ASC",
         )
         .map_err(db_error)?;
@@ -7616,7 +7864,7 @@ fn read_membership_terminal_history_sync(
         return Ok(Vec::new());
     }
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT storage_configuration_epoch, transition_id, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index FROM consensus_membership_terminal_history ORDER BY transition_start_index ASC, transition_id ASC",
         )
         .map_err(db_error)?;
@@ -7810,8 +8058,11 @@ pub(crate) fn read_membership_scope_sync(
         });
     }
     let row: MembershipScopeRow = conn
-        .query_row(
+        .prepare_cached(
             "SELECT storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, pending_transition_start_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, pending_learners_ready_index, terminal_learners_ready_index, current_bindings_json, desired_bindings_json, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index FROM consensus_membership_scope WHERE singleton = 1",
+        )
+        .map_err(db_error)?
+        .query_row(
             [],
             |row| {
                 Ok((
@@ -8643,14 +8894,17 @@ impl SqliteSessionBackend {
         transition_digest: [u8; 32],
     ) -> Result<bool, MembershipScopeMutationError> {
         let conn = self.conn.lock().await;
-        let marker = read_candidate_bootstrap_marker_sync(&conn, storage_identity)
-            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-        Ok(marker.is_some_and(|marker| {
-            marker.local_candidate_node_id == local_candidate_node_id
-                && marker.transition_id == transition_id
-                && marker.transition_digest == transition_digest
-                && marker.state == CandidateBootstrapState::Cancelled
-        }))
+        self.with_application_cache_read(&conn, || {
+            let marker = read_candidate_bootstrap_marker_sync(&conn, storage_identity)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+            Ok(marker.is_some_and(|marker| {
+                marker.local_candidate_node_id == local_candidate_node_id
+                    && marker.transition_id == transition_id
+                    && marker.transition_digest == transition_digest
+                    && marker.state == CandidateBootstrapState::Cancelled
+            }))
+        })
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
     }
 
     pub(crate) async fn cancel_provisional_consensus_candidate(
@@ -8680,11 +8934,21 @@ impl SqliteSessionBackend {
         ),
         MembershipScopeMutationError,
     > {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_fixed_scope_snapshot(storage_identity)
+                .map(|(_, _, scope, membership)| (scope, membership))
+        }) {
+            return result.map_err(|_| MembershipScopeMutationError::CorruptState);
+        }
         let conn = self.conn.lock().await;
-        let scope = read_scope_for_mutation(&conn, storage_identity)?;
-        let membership = read_membership_sync(&conn, storage_identity)
-            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-        Ok((scope, membership))
+        self.with_application_cache_read(&conn, || {
+            let scope = read_scope_for_mutation(&conn, storage_identity)?;
+            let membership = read_membership_sync(&conn, storage_identity)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+            Ok((scope, membership))
+        })
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
     }
 
     /// Atomically read fixed-quorum structural authority and applied Openraft
@@ -8701,18 +8965,27 @@ impl SqliteSessionBackend {
         ),
         MembershipScopeMutationError,
     > {
+        #[cfg(target_os = "linux")]
+        if let Some(result) =
+            self.native_read(|wal| wal.native_fixed_scope_snapshot(storage_identity))
+        {
+            return result.map_err(|_| MembershipScopeMutationError::CorruptState);
+        }
         #[cfg(test)]
         self.fixed_quorum_durable_check_count
             .fetch_add(1, Ordering::SeqCst);
         let conn = self.conn.lock().await;
-        let authority_profile = read_consensus_authority_profile_sync(&conn)
-            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-        let placement_policy = read_fixed_placement_policy_sync(&conn)
-            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-        let scope = read_scope_for_mutation(&conn, storage_identity)?;
-        let membership = read_membership_sync(&conn, storage_identity)
-            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-        Ok((authority_profile, placement_policy, scope, membership))
+        self.with_application_cache_read(&conn, || {
+            let authority_profile = read_consensus_authority_profile_sync(&conn)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+            let placement_policy = read_fixed_placement_policy_sync(&conn)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+            let scope = read_scope_for_mutation(&conn, storage_identity)?;
+            let membership = read_membership_sync(&conn, storage_identity)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+            Ok((authority_profile, placement_policy, scope, membership))
+        })
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
     }
 
     /// Atomically read the durable transition scope, exact evidence, and
@@ -8731,16 +9004,19 @@ impl SqliteSessionBackend {
         MembershipScopeMutationError,
     > {
         let conn = self.conn.lock().await;
-        let scope = read_scope_for_mutation(&conn, storage_identity)?;
-        let evidence = read_membership_transition_evidence_sync(
-            &conn,
-            storage_identity,
-            transition_id,
-            transition_digest,
-        )?;
-        let membership = read_membership_sync(&conn, storage_identity)
-            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-        Ok((scope, evidence, membership))
+        self.with_application_cache_read(&conn, || {
+            let scope = read_scope_for_mutation(&conn, storage_identity)?;
+            let evidence = read_membership_transition_evidence_sync(
+                &conn,
+                storage_identity,
+                transition_id,
+                transition_digest,
+            )?;
+            let membership = read_membership_sync(&conn, storage_identity)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+            Ok((scope, evidence, membership))
+        })
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
     }
 }
 
@@ -10448,6 +10724,16 @@ fn protected_roster_schema_objects_are_exact_in_sync(
     conn: &Connection,
     attached: bool,
 ) -> io::Result<bool> {
+    let expected = expected_protected_roster_schema_manifest()?;
+    let observed = protected_roster_schema_manifest(conn, attached)?;
+    Ok(&observed == expected)
+}
+
+fn expected_protected_roster_schema_manifest(
+) -> io::Result<&'static BTreeMap<(String, String), String>> {
+    if let Some(expected) = PROTECTED_ROSTER_SCHEMA_MANIFEST.get() {
+        return Ok(expected);
+    }
     let canonical = SqliteSessionBackend::canonical_schema_connection()
         .map_err(|_| invalid_data("protected roster canonical schema is unavailable"))?;
     canonical
@@ -10460,8 +10746,12 @@ fn protected_roster_schema_objects_are_exact_in_sync(
         .execute_batch(PROTECTED_ROSTER_SCHEMA)
         .map_err(db_error)?;
     let expected = protected_roster_schema_manifest(&canonical, false)?;
-    let observed = protected_roster_schema_manifest(conn, attached)?;
-    Ok(observed == expected)
+    // Concurrent first users may construct the same immutable manifest. A
+    // failed construction publishes nothing and remains fallible on retry.
+    let _ = PROTECTED_ROSTER_SCHEMA_MANIFEST.set(expected);
+    PROTECTED_ROSTER_SCHEMA_MANIFEST
+        .get()
+        .ok_or_else(|| invalid_data("protected roster canonical schema is unavailable"))
 }
 
 /// A predecessor has no roster object of any kind.  Do not reuse the manifest
@@ -10613,7 +10903,7 @@ fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
 /// rejection so the ordered log can still advance without committing a
 /// partial reservation.
 #[derive(Clone, Copy, Debug)]
-enum ProtectedRosterApplyError {
+pub(crate) enum ProtectedRosterApplyError {
     Rejected,
     Corrupt,
 }
@@ -10631,7 +10921,7 @@ impl ProtectedRosterApplyError {
 /// storage/corruption fault. Only the former may be recorded while advancing
 /// the replicated state machine; a fatal fault must roll back the outer apply
 /// transaction so a repaired follower can replay the same log position.
-enum ProtectedRosterCommandApplyError {
+pub(crate) enum ProtectedRosterCommandApplyError {
     Rejected(ConsensusRosterRejection),
     Fatal,
 }
@@ -11303,6 +11593,7 @@ fn protected_roster_due_reclaim_records_sync(
     let cutoff = maintenance
         .as_nanos()
         .checked_sub(PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS)
+        .filter(|cutoff| *cutoff >= 0)
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
@@ -11388,6 +11679,7 @@ fn protected_roster_due_reclaim_order_sync(
     let cutoff = maintenance
         .as_nanos()
         .checked_sub(PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS)
+        .filter(|cutoff| *cutoff >= 0)
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
@@ -13047,7 +13339,7 @@ fn protected_roster_v2_live_reservation_by_business_key_sync(
 /// Immutable V2 Q1 authority fields retained beside the compact carrier.
 /// Unlike a live carrier this deliberately has no raw session key: compact
 /// history proves the key only through the binding commitment.
-struct ProtectedRosterV2OriginalAuthorityProjection {
+pub(crate) struct ProtectedRosterV2OriginalAuthorityProjection {
     owner: OwnerId,
     fence: u64,
     credential_id: u64,
@@ -13594,38 +13886,6 @@ fn protected_roster_validate_live_authority_sync(
     Ok(())
 }
 
-fn protected_roster_validate_current_authority_sync(
-    conn: &Connection,
-    admission: &Admission,
-    original: &AuthorityBinding,
-    current: &AuthorityBinding,
-    logical_time: Timestamp,
-    require_original: bool,
-) -> Result<(), ProtectedRosterApplyError> {
-    if current.scope() != admission.scope()
-        || current.key() != admission.key()
-        || current.generation() != admission.expected_generation()
-        || current.fence() < admission.admission_fence()
-        || (require_original && current != original)
-        // Logical ownership is immutable provenance for the original
-        // admission guard, not a permanent execution-owner restriction. An
-        // authenticated lease successor may have a different owner, but only
-        // at a strictly higher fence; the exact live-lease comparison below
-        // still rejects invented, stale, or expired successor authorities.
-        || (!require_original
-            && current.fence() == admission.admission_fence()
-            && current != original)
-    {
-        return Err(ProtectedRosterApplyError::Rejected);
-    }
-    protected_roster_validate_live_authority_sync(
-        conn,
-        current,
-        Some(admission.expected_generation()),
-        logical_time,
-    )
-}
-
 /// Exact result of a single protected-roster lookup.  This type is deliberately
 /// crate-private: the opaque registration and retained composite are intended
 /// only for the production ingress/transport adapters, never SQL callers.
@@ -13851,271 +14111,6 @@ fn protected_roster_validate_binding_authority_before_lookup(
     Ok((scope, roster_id))
 }
 
-fn protected_roster_read_result_sync(
-    conn: &Connection,
-    hydrated: HydratedProductionReservationRecord,
-    original_authority: AuthorityBinding,
-    current_authority: &AuthorityBinding,
-    logical_time: Timestamp,
-    mode: ProtectedRosterReadAuthorityMode,
-) -> Result<ProtectedRosterReadResult, ProtectedRosterApplyError> {
-    let (record, _canonical, payload) = hydrated.into_parts();
-    match (record.state(), payload) {
-        (
-            ReservationState::Live,
-            HydratedProductionReservationPayload::Live {
-                admission,
-                admission_provenance,
-                ..
-            },
-        ) => {
-            protected_roster_validate_current_authority_sync(
-                conn,
-                &admission,
-                &original_authority,
-                current_authority,
-                logical_time,
-                false,
-            )?;
-            if matches!(mode, ProtectedRosterReadAuthorityMode::StrictSuccessor)
-                && current_authority.fence() <= original_authority.fence()
-            {
-                return Err(ProtectedRosterApplyError::Rejected);
-            }
-            Ok(ProtectedRosterReadResult::Admitted(Box::new(
-                ProtectedRosterLiveRead {
-                    registration: protected_roster_registration(record.binding(), &admission)?,
-                    admission: admission.clone(),
-                    admission_provenance,
-                },
-            )))
-        }
-        (
-            ReservationState::Retained,
-            HydratedProductionReservationPayload::Retained {
-                admission,
-                admission_provenance,
-                committed_terminal,
-                committed_canonical,
-                ..
-            },
-        ) => {
-            protected_roster_validate_current_authority_sync(
-                conn,
-                &admission,
-                &original_authority,
-                current_authority,
-                logical_time,
-                false,
-            )?;
-            if matches!(mode, ProtectedRosterReadAuthorityMode::StrictSuccessor)
-                && current_authority.fence() <= original_authority.fence()
-            {
-                return Err(ProtectedRosterApplyError::Rejected);
-            }
-            Ok(ProtectedRosterReadResult::Terminalized(Box::new(
-                ProtectedRosterTerminalRead {
-                    registration: protected_roster_registration(record.binding(), &admission)?,
-                    admission: admission.clone(),
-                    admission_provenance,
-                    committed: *committed_terminal,
-                    committed_canonical,
-                },
-            )))
-        }
-        (
-            ReservationState::Tombstone,
-            HydratedProductionReservationPayload::Tombstone { tombstone, .. },
-        ) => {
-            protected_roster_validate_live_authority_sync(
-                conn,
-                current_authority,
-                Some(original_authority.generation()),
-                logical_time,
-            )?;
-            let allowed = match mode {
-                ProtectedRosterReadAuthorityMode::StrictSuccessor => {
-                    current_authority.fence() > original_authority.fence()
-                }
-                ProtectedRosterReadAuthorityMode::OriginalOrSuccessor => {
-                    current_authority == &original_authority
-                        || current_authority.fence() > original_authority.fence()
-                }
-            };
-            if !allowed {
-                return Err(ProtectedRosterApplyError::Rejected);
-            }
-            Ok(ProtectedRosterReadResult::Compacted {
-                history_epoch: record.binding().history_epoch(),
-                tombstone: Box::new(tombstone),
-            })
-        }
-        _ => Err(ProtectedRosterApplyError::Corrupt),
-    }
-}
-
-/// Rehydrate one V2 carrier only after its dedicated canonical decoder and
-/// original-authority row agree.  This has no V1 fallback: a V1 row with
-/// matching fields is still an absence in Profile V2.
-fn protected_roster_v2_read_result_sync(
-    conn: &Connection,
-    identity: SessionConsensusIdentity,
-    hydrated: HydratedProductionReservationRecordV2,
-    current_authority: &AuthorityBinding,
-    logical_time: Timestamp,
-    mode: ProtectedRosterReadAuthorityMode,
-) -> Result<ProtectedRosterV2ReadResult, ProtectedRosterApplyError> {
-    let record = hydrated.record();
-    if record.state() == ProductionReservationStateV2::Tombstone {
-        protected_roster_validate_live_authority_sync(
-            conn,
-            current_authority,
-            Some(Generation::new(1)),
-            logical_time,
-        )?;
-        let original = protected_roster_v2_original_authority_projection_sync(
-            conn,
-            identity,
-            record.binding(),
-        )?;
-        let same_original = current_authority.fence().get() == original.fence
-            && current_authority.owner() == &original.owner
-            && current_authority.credential_id() == original.credential_id
-            && current_authority.generation() == Generation::new(1)
-            && current_authority.acquired_at() == original.acquired_at
-            && current_authority.expires_at() == original.expires_at;
-        let allowed = match mode {
-            ProtectedRosterReadAuthorityMode::StrictSuccessor => {
-                current_authority.fence().get() > original.fence
-            }
-            ProtectedRosterReadAuthorityMode::OriginalOrSuccessor => {
-                same_original || current_authority.fence().get() > original.fence
-            }
-        };
-        if !allowed {
-            return Err(ProtectedRosterApplyError::Rejected);
-        }
-        let root = read_roster_attestation_trust_root_sync(conn)
-            .map_err(|_| ProtectedRosterApplyError::Corrupt)?
-            .ok_or(ProtectedRosterApplyError::Corrupt)?;
-        let membership_scope = read_membership_scope_sync(conn, identity)
-            .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-        validate_hydrated_protected_roster_v2_compacted_sync(
-            &root,
-            &membership_scope,
-            record.binding(),
-            &hydrated,
-            &original,
-        )?;
-        return Ok(ProtectedRosterV2ReadResult::Compacted {
-            history_epoch: record.binding().history_epoch(),
-            tombstone: Box::new(
-                hydrated
-                    .tombstone()
-                    .ok_or(ProtectedRosterApplyError::Corrupt)?
-                    .clone(),
-            ),
-        });
-    }
-    let admission = hydrated
-        .admission()
-        .ok_or(ProtectedRosterApplyError::Corrupt)?;
-    if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
-        return Err(ProtectedRosterApplyError::Corrupt);
-    }
-    let original =
-        protected_roster_v2_original_authority_sync(conn, identity, record.binding(), admission)?;
-    protected_roster_validate_live_authority_sync(
-        conn,
-        current_authority,
-        Some(admission.expected_generation()),
-        logical_time,
-    )?;
-    let allowed = match mode {
-        ProtectedRosterReadAuthorityMode::StrictSuccessor => {
-            current_authority.fence() > original.fence()
-        }
-        ProtectedRosterReadAuthorityMode::OriginalOrSuccessor => {
-            current_authority == &original || current_authority.fence() > original.fence()
-        }
-    };
-    if !allowed {
-        return Err(ProtectedRosterApplyError::Rejected);
-    }
-    protected_roster_validate_current_authority_sync(
-        conn,
-        admission,
-        &original,
-        current_authority,
-        logical_time,
-        false,
-    )?;
-    #[cfg(any(test, feature = "test-control"))]
-    record_protected_roster_v2_terminal_status_validation_stage(
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.authority_verified,
-    );
-    let registration = BackendRegistration::from_consensus_parts(
-        roster_registration_handle(record.binding()),
-        RosterRequestId::bind(record.binding().history_epoch(), admission)
-            .map_err(|_| ProtectedRosterApplyError::Corrupt)?,
-        admission,
-    )
-    .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-    let root = read_roster_attestation_trust_root_sync(conn)
-        .map_err(|_| ProtectedRosterApplyError::Corrupt)?
-        .ok_or(ProtectedRosterApplyError::Corrupt)?;
-    let membership_scope = read_membership_scope_sync(conn, identity)
-        .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-    validate_hydrated_protected_roster_v2_attestations_sync(
-        &root,
-        &membership_scope,
-        record.binding(),
-        &hydrated,
-        &original,
-    )?;
-    match record.state() {
-        ProductionReservationStateV2::Live => {
-            if record.absence_reservation().is_none() {
-                return Err(ProtectedRosterApplyError::Corrupt);
-            }
-            Ok(ProtectedRosterV2ReadResult::Admitted(Box::new(
-                ProtectedRosterV2LiveRead {
-                    admission: admission.clone(),
-                    admission_provenance: hydrated.admission_provenance().clone(),
-                    registration,
-                },
-            )))
-        }
-        ProductionReservationStateV2::Retained => {
-            if record.absence_reservation().is_some() {
-                return Err(ProtectedRosterApplyError::Corrupt);
-            }
-            let committed_canonical = hydrated
-                .committed_canonical()
-                .ok_or(ProtectedRosterApplyError::Corrupt)?
-                .to_vec();
-            let committed = hydrated
-                .committed_terminal()
-                .ok_or(ProtectedRosterApplyError::Corrupt)?
-                .clone();
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_v2_terminal_status_validation_stage(
-                &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.retained_shape_verified,
-            );
-            Ok(ProtectedRosterV2ReadResult::Terminalized(Box::new(
-                ProtectedRosterV2TerminalRead {
-                    admission: admission.clone(),
-                    admission_provenance: hydrated.admission_provenance().clone(),
-                    registration,
-                    committed,
-                    committed_canonical,
-                },
-            )))
-        }
-        ProductionReservationStateV2::Tombstone => Err(ProtectedRosterApplyError::Corrupt),
-    }
-}
-
 /// Exact Profile-V2 admission status.  The stable slot and result carrier are
 /// V2-only, so V1 state can neither satisfy nor shadow this query.
 pub(crate) fn read_protected_roster_v2_admission_status_sync(
@@ -14125,55 +14120,13 @@ pub(crate) fn read_protected_roster_v2_admission_status_sync(
     current_authority: &AuthorityBinding,
     logical_time: Timestamp,
 ) -> Result<ProtectedRosterV2ReadResult, StoreError> {
-    if admission.profile() != crate::fenced_mutation_roster::Profile::v2()
-        || current_authority.scope() != admission.scope()
-        || current_authority.key() != admission.key()
-        || current_authority.generation() != admission.expected_generation()
-        || current_authority.fence() < admission.admission_fence()
-    {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_validate_live_authority_sync(
-        conn,
-        current_authority,
-        Some(Generation::new(1)),
-        logical_time,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)?;
-    let slot =
-        protected_roster_v2_stable_slot(admission.scope(), admission.key(), admission.roster_id());
-    let Some(binding) = protected_roster_v2_binding_by_stable_slot_sync(conn, slot)
-        .map_err(ProtectedRosterApplyError::store_error)?
-    else {
-        return Ok(ProtectedRosterV2ReadResult::Missing);
-    };
-    let record = protected_roster_v2_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    protected_roster_v2_authenticate_hydration_sync(conn, identity, binding, &record)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    if record.record().state() == ProductionReservationStateV2::Tombstone {
-        record
-            .tombstone()
-            .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?
-            .validate_admission_for_profile(
-                crate::fenced_mutation_roster::Profile::v2(),
-                binding.history_epoch(),
-                admission,
-            )
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-    } else if record.admission() != Some(admission) {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_v2_read_result_sync(
-        conn,
+    roster_reads::read_protected_roster_v2_admission_status_sync(
+        &conn,
         identity,
-        record,
+        admission,
         current_authority,
         logical_time,
-        ProtectedRosterReadAuthorityMode::OriginalOrSuccessor,
     )
-    .map_err(ProtectedRosterApplyError::store_error)
 }
 
 /// Exact Profile-V2 successor recovery.  This reconstructs only the V2
@@ -14184,75 +14137,7 @@ pub(crate) fn read_protected_roster_v2_recovery_sync(
     recovery: &RecoveryRequest,
     logical_time: Timestamp,
 ) -> Result<ProtectedRosterV2ReadResult, StoreError> {
-    let current = recovery.authority();
-    if current.ingress_scope() != recovery.lookup().scope()
-        || current.fence() <= recovery.original_admission_fence()
-    {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_validate_live_authority_sync(
-        conn,
-        current,
-        Some(Generation::new(1)),
-        logical_time,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)?;
-    let slot = protected_roster_v2_stable_slot(
-        recovery.lookup().scope(),
-        current.key(),
-        recovery.lookup().roster_id(),
-    );
-    let Some(binding) = protected_roster_v2_binding_by_stable_slot_sync(conn, slot)
-        .map_err(ProtectedRosterApplyError::store_error)?
-    else {
-        return Ok(ProtectedRosterV2ReadResult::Missing);
-    };
-    let record = protected_roster_v2_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    protected_roster_v2_authenticate_hydration_sync(conn, identity, binding, &record)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    if record.record().state() == ProductionReservationStateV2::Tombstone {
-        record
-            .tombstone()
-            .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?
-            .validate_lookup_for_profile(
-                crate::fenced_mutation_roster::Profile::v2(),
-                recovery.compacted_terminal_lookup(binding.history_epoch()),
-            )
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        return protected_roster_v2_read_result_sync(
-            conn,
-            identity,
-            record,
-            current,
-            logical_time,
-            ProtectedRosterReadAuthorityMode::StrictSuccessor,
-        )
-        .map_err(ProtectedRosterApplyError::store_error);
-    }
-    let admission = record
-        .admission()
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    let original = protected_roster_v2_original_authority_sync(conn, identity, binding, admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    if admission.scope() != recovery.lookup().scope()
-        || admission.key() != current.key()
-        || admission.roster_id() != recovery.lookup().roster_id()
-        || original.owner() != recovery.original_owner()
-        || original.fence() != recovery.original_admission_fence()
-    {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_v2_read_result_sync(
-        conn,
-        identity,
-        record,
-        current,
-        logical_time,
-        ProtectedRosterReadAuthorityMode::StrictSuccessor,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)
+    roster_reads::read_protected_roster_v2_recovery_sync(&conn, identity, recovery, logical_time)
 }
 
 /// Exact Profile-V2 terminal status.  The V2 compact terminal evidence is a
@@ -14263,154 +14148,7 @@ pub(crate) fn read_protected_roster_v2_terminal_status_sync(
     binding: RequestBindingKey,
     request: ProtectedRosterV2TerminalStatusRequest<'_>,
 ) -> Result<ProtectedRosterV2ReadResult, StoreError> {
-    let ProtectedRosterV2TerminalStatusRequest {
-        registration_parts,
-        current_authority,
-        terminal_body_commitment,
-        terminal_evidence,
-        logical_time,
-    } = request;
-    protected_roster_validate_binding_authority_before_lookup(binding, current_authority)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    let (registration_handle, registration_request_id, registration_terminal_slot) =
-        registration_parts;
-    if registration_handle != roster_registration_handle(binding)
-        || registration_terminal_slot == [0; 32]
-        || registration_request_id.history_epoch() != binding.history_epoch()
-    {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_validate_live_authority_sync(
-        conn,
-        current_authority,
-        Some(Generation::new(1)),
-        logical_time,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)?;
-    let record = protected_roster_v2_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    let Some(record) = record else {
-        return Ok(ProtectedRosterV2ReadResult::Missing);
-    };
-    protected_roster_v2_authenticate_hydration_sync(conn, identity, binding, &record)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    #[cfg(any(test, feature = "test-control"))]
-    record_protected_roster_v2_terminal_status_validation_stage(
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.record_decoded,
-    );
-    if record.record().state() == ProductionReservationStateV2::Tombstone {
-        let tombstone = record
-            .tombstone()
-            .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-        let stored_evidence = record
-            .terminal_evidence()
-            .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-        // The compact carrier retains Q2's operation-four ingress, whereas
-        // this status request is authenticated with a fresh operation-five
-        // ingress.  Compare only the immutable provenance and generic compact
-        // terminal evidence, exactly as retained status does; the caller's
-        // fresh status capsule is authenticated independently.
-        let stored_provenance = stored_evidence
-            .provenance()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
-        let incoming_provenance = terminal_evidence
-            .provenance()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        let stored_compact = stored_evidence
-            .evidence()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
-        let incoming_compact = terminal_evidence
-            .evidence()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        if stored_provenance != incoming_provenance || stored_compact != incoming_compact {
-            return Err(ProtectedRosterApplyError::Rejected.store_error());
-        }
-        tombstone
-            .validate_compacted_terminal_for_profile(CompactedTerminalValidation {
-                profile: crate::fenced_mutation_roster::Profile::v2(),
-                binding,
-                request_id: registration_request_id,
-                terminal_slot: registration_terminal_slot,
-                current_fence: current_authority.fence(),
-                current_generation: current_authority.generation(),
-                terminal_body_commitment,
-            })
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        return protected_roster_v2_read_result_sync(
-            conn,
-            identity,
-            record,
-            current_authority,
-            logical_time,
-            ProtectedRosterReadAuthorityMode::OriginalOrSuccessor,
-        )
-        .map_err(ProtectedRosterApplyError::store_error);
-    }
-    let admission = record
-        .admission()
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    let registration = BackendRegistration::from_consensus_parts(
-        registration_handle,
-        registration_request_id,
-        admission,
-    )
-    .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-    if registration.consensus_parts().2.as_bytes() != &registration_terminal_slot {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    if record.record().state() == ProductionReservationStateV2::Retained {
-        let committed = record
-            .committed_terminal()
-            .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-        let retained = record
-            .terminal_evidence()
-            .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-        // Status ingress is freshly issued for operation five; it must not be
-        // byte-equal to the terminalize ingress retained in Q2.  The caller
-        // authenticates that fresh V2 ingress against this exact status
-        // capsule before this read. Here we compare only the immutable
-        // admission provenance and generic compact terminal evidence that
-        // identify the retained terminal body without leaking an oracle.
-        let retained_provenance = retained
-            .provenance()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
-        let incoming_provenance = terminal_evidence
-            .provenance()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        let retained_compact = retained
-            .evidence()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
-        let incoming_compact = terminal_evidence
-            .evidence()
-            .canonical_bytes()
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        if committed.record().body_commitment() != terminal_body_commitment
-            || retained_provenance != incoming_provenance
-            || retained_compact != incoming_compact
-        {
-            return Err(ProtectedRosterApplyError::Rejected.store_error());
-        }
-        #[cfg(any(test, feature = "test-control"))]
-        record_protected_roster_v2_terminal_status_validation_stage(
-            &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.retained_evidence_invariant,
-        );
-    }
-    protected_roster_v2_read_result_sync(
-        conn,
-        identity,
-        record,
-        current_authority,
-        logical_time,
-        ProtectedRosterReadAuthorityMode::OriginalOrSuccessor,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)
+    roster_reads::read_protected_roster_v2_terminal_status_sync(&conn, identity, binding, request)
 }
 
 /// V2 terminal-status request with the separately framed V2 evidence.
@@ -14431,74 +14169,13 @@ pub(crate) fn read_protected_roster_admission_status_sync(
     current_authority: &AuthorityBinding,
     logical_time: Timestamp,
 ) -> Result<ProtectedRosterReadResult, StoreError> {
-    // Preserve the pre-lookup scope/key defense: a valid lease for a
-    // different session must not turn Missing into an existence oracle.
-    if current_authority.scope() != admission.scope()
-        || current_authority.key() != admission.key()
-        || current_authority.generation() != admission.expected_generation()
-        || current_authority.fence() < admission.admission_fence()
-    {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_validate_live_authority_sync(
-        conn,
+    roster_reads::read_protected_roster_admission_status_sync(
+        &conn,
+        identity,
+        admission,
         current_authority,
-        Some(admission.expected_generation()),
         logical_time,
     )
-    .map_err(ProtectedRosterApplyError::store_error)?;
-    let slot =
-        protected_roster_stable_slot(admission.scope(), admission.key(), admission.roster_id());
-    let Some(binding) = protected_roster_binding_by_stable_slot_sync(conn, slot)
-        .map_err(ProtectedRosterApplyError::store_error)?
-    else {
-        return Ok(ProtectedRosterReadResult::Missing);
-    };
-    let hydrated = protected_roster_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    let original = protected_roster_original_authority_sync(conn, identity, binding, admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    match hydrated.payload() {
-        HydratedProductionReservationPayload::Tombstone { tombstone, .. } => {
-            protected_roster_validate_current_authority_sync(
-                conn,
-                admission,
-                &original,
-                current_authority,
-                logical_time,
-                false,
-            )
-            .map_err(ProtectedRosterApplyError::store_error)?;
-            tombstone
-                .validate_admission(binding.history_epoch(), admission)
-                .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-            Ok(ProtectedRosterReadResult::Compacted {
-                history_epoch: binding.history_epoch(),
-                tombstone: Box::new(tombstone.clone()),
-            })
-        }
-        HydratedProductionReservationPayload::Live {
-            admission: stored_admission,
-            ..
-        }
-        | HydratedProductionReservationPayload::Retained {
-            admission: stored_admission,
-            ..
-        } if stored_admission == admission => protected_roster_read_result_sync(
-            conn,
-            hydrated,
-            original,
-            current_authority,
-            logical_time,
-            // The admission and stored provenance remain exact and immutable,
-            // while the execution lease may be the original live authority or
-            // an authenticated strictly higher-fence successor.
-            ProtectedRosterReadAuthorityMode::OriginalOrSuccessor,
-        )
-        .map_err(ProtectedRosterApplyError::store_error),
-        _ => Err(ProtectedRosterApplyError::Rejected.store_error()),
-    }
 }
 
 /// One stable-slot recovery lookup for a valid strictly higher current fence.
@@ -14508,62 +14185,7 @@ pub(crate) fn read_protected_roster_recovery_sync(
     recovery: &RecoveryRequest,
     logical_time: Timestamp,
 ) -> Result<ProtectedRosterReadResult, StoreError> {
-    let current = recovery.authority();
-    if current.ingress_scope() != recovery.lookup().scope() {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_validate_live_authority_sync(conn, current, None, logical_time)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    if current.fence() <= recovery.original_admission_fence() {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    let Some(binding) = protected_roster_binding_by_current_key_roster_and_original_sync(
-        conn,
-        current.key(),
-        recovery.lookup().roster_id(),
-        recovery.original_owner(),
-        recovery.original_admission_fence(),
-        current.generation(),
-    )
-    .map_err(ProtectedRosterApplyError::store_error)?
-    else {
-        return Ok(ProtectedRosterReadResult::Missing);
-    };
-    let hydrated = protected_roster_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    if let HydratedProductionReservationPayload::Tombstone { tombstone, .. } = hydrated.payload() {
-        tombstone
-            .validate_lookup(recovery.compacted_terminal_lookup(binding.history_epoch()))
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        return Ok(ProtectedRosterReadResult::Compacted {
-            history_epoch: binding.history_epoch(),
-            tombstone: Box::new(tombstone.clone()),
-        });
-    }
-    let admission = hydrated
-        .record()
-        .admission()
-        .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
-    let current = AuthorityBinding::for_validated_admission(&admission, current, true)
-        .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-    let original = protected_roster_original_authority_sync(conn, identity, binding, &admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    if original.owner() != recovery.original_owner()
-        || original.fence() != recovery.original_admission_fence()
-        || original.generation() != current.generation()
-    {
-        return Err(ProtectedRosterApplyError::Corrupt.store_error());
-    }
-    protected_roster_read_result_sync(
-        conn,
-        hydrated,
-        original,
-        &current,
-        logical_time,
-        ProtectedRosterReadAuthorityMode::StrictSuccessor,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)
+    roster_reads::read_protected_roster_recovery_sync(&conn, identity, recovery, logical_time)
 }
 
 /// Exact terminal-status lookup. The registration and terminal commitment are
@@ -14582,95 +14204,7 @@ pub(crate) fn read_protected_roster_terminal_status_sync(
     binding: RequestBindingKey,
     request: ProtectedRosterTerminalStatusRequest<'_>,
 ) -> Result<ProtectedRosterReadResult, StoreError> {
-    let ProtectedRosterTerminalStatusRequest {
-        registration_parts,
-        current_authority,
-        terminal_body_commitment,
-        terminal_evidence,
-        logical_time,
-    } = request;
-    let (_scope, _roster_id) =
-        protected_roster_validate_binding_authority_before_lookup(binding, current_authority)
-            .map_err(ProtectedRosterApplyError::store_error)?;
-    let (registration_handle, registration_request_id, registration_terminal_slot) =
-        registration_parts;
-    if registration_handle != roster_registration_handle(binding)
-        || registration_terminal_slot == [0; 32]
-        || registration_request_id.history_epoch() != binding.history_epoch()
-    {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    protected_roster_validate_live_authority_sync(conn, current_authority, None, logical_time)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    let Some(hydrated) = protected_roster_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?
-    else {
-        return Ok(ProtectedRosterReadResult::Missing);
-    };
-    if let HydratedProductionReservationPayload::Tombstone {
-        tombstone,
-        terminal_evidence: stored_evidence,
-        ..
-    } = hydrated.payload()
-    {
-        if stored_evidence != terminal_evidence {
-            return Err(ProtectedRosterApplyError::Rejected.store_error());
-        }
-        tombstone
-            .validate_compacted_terminal(
-                binding,
-                registration_request_id,
-                registration_terminal_slot,
-                current_authority.fence(),
-                current_authority.generation(),
-                terminal_body_commitment,
-            )
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-        return Ok(ProtectedRosterReadResult::Compacted {
-            history_epoch: binding.history_epoch(),
-            tombstone: Box::new(tombstone.clone()),
-        });
-    }
-    let admission = hydrated
-        .record()
-        .admission()
-        .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
-    let resolved_authority =
-        AuthorityBinding::for_validated_admission(&admission, current_authority, false)
-            .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
-    let expected_registration = protected_roster_registration(binding, &admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    let (expected_handle, expected_request_id, expected_terminal_slot) =
-        expected_registration.consensus_parts();
-    if expected_handle != registration_handle
-        || expected_request_id != registration_request_id
-        || expected_terminal_slot.as_bytes() != &registration_terminal_slot
-    {
-        return Err(ProtectedRosterApplyError::Rejected.store_error());
-    }
-    if let HydratedProductionReservationPayload::Retained {
-        committed_terminal,
-        terminal_evidence: stored_evidence,
-        ..
-    } = hydrated.payload()
-    {
-        if committed_terminal.record().body_commitment() != terminal_body_commitment
-            || stored_evidence != terminal_evidence
-        {
-            return Err(ProtectedRosterApplyError::Rejected.store_error());
-        }
-    }
-    let original = protected_roster_original_authority_sync(conn, identity, binding, &admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    protected_roster_read_result_sync(
-        conn,
-        hydrated,
-        original,
-        &resolved_authority,
-        logical_time,
-        ProtectedRosterReadAuthorityMode::OriginalOrSuccessor,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)
+    roster_reads::read_protected_roster_terminal_status_sync(&conn, identity, binding, request)
 }
 
 /// Exact, read-only backend-current authority validation for an already
@@ -14687,112 +14221,12 @@ pub(crate) fn read_protected_roster_current_publication_authority_sync(
     request: &crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
     logical_time: Timestamp,
 ) -> Result<(), StoreError> {
-    let reject = || ProtectedRosterApplyError::Rejected.store_error();
-    let roster_id = RosterId::from_bytes(request.roster_id()).map_err(|_| reject())?;
-    let raw_current = AuthorityBinding::from_consensus_parts(
-        request.scope(),
-        request.key().clone(),
-        request.current_owner().clone(),
-        request.current_fence(),
-        AuthorityLeaseMetadata::new(
-            request.current_credential_id(),
-            request.current_generation(),
-            request.current_lease_acquired_at(),
-            request.current_lease_expires_at(),
-        ),
-    )
-    .map_err(|_| reject())?;
-
-    // Reject a stale or expired same-key guard before resolving any durable
-    // roster lineage. Besides fencing publication, this keeps the
-    // redacted rejection from becoming a retained-roster existence oracle.
-    protected_roster_validate_live_authority_sync(
-        conn,
-        &raw_current,
-        Some(request.current_generation()),
+    roster_reads::read_protected_roster_current_publication_authority_sync(
+        &conn,
+        identity,
+        request,
         logical_time,
     )
-    .map_err(ProtectedRosterApplyError::store_error)?;
-
-    // Resolve immutable admission scope only from durable lineage. The
-    // authenticated current ingress scope can differ after a configuration
-    // successor takes over, and must never be accepted as historical scope.
-    let binding = protected_roster_binding_by_current_key_roster_and_original_sync(
-        conn,
-        request.key(),
-        roster_id,
-        request.logical_owner(),
-        request.admission_fence(),
-        request.current_generation(),
-    )
-    .map_err(ProtectedRosterApplyError::store_error)?
-    .ok_or_else(reject)?;
-    let (admission_scope, bound_roster_id) =
-        protected_roster_validate_binding_authority_before_lookup(binding, &raw_current)
-            .map_err(ProtectedRosterApplyError::store_error)?;
-    if bound_roster_id != roster_id {
-        return Err(reject());
-    }
-
-    let hydrated = protected_roster_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    let hydrated = hydrated.ok_or_else(reject)?;
-    let (admission, committed) = match hydrated.payload() {
-        HydratedProductionReservationPayload::Retained {
-            admission,
-            committed_terminal,
-            ..
-        } => (admission, committed_terminal),
-        // Live, Aborted, and compacted state can never mint or preserve
-        // publication eligibility.
-        _ => return Err(reject()),
-    };
-    if admission.scope() != admission_scope
-        || admission.key() != request.key()
-        || admission.roster_id() != roster_id
-        || admission.body_commitment() != request.admission_commitment()
-        || admission.logical_owner() != request.logical_owner()
-        || admission.admission_fence() != request.admission_fence()
-        || admission.expected_generation() != request.current_generation()
-    {
-        return Err(reject());
-    }
-    let current = AuthorityBinding::for_validated_admission(admission, &raw_current, false)
-        .map_err(|_| reject())?;
-
-    let expected_registration = protected_roster_registration(binding, admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    let (registration_handle, registration_request_id, registration_terminal_slot) =
-        expected_registration.consensus_parts();
-    if registration_handle != request.registration_handle()
-        || registration_request_id.to_bytes() != request.registration_request_id()
-        || registration_terminal_slot.as_bytes() != &request.registration_terminal_slot()
-    {
-        return Err(reject());
-    }
-
-    // The hydrated retained terminal has already passed its canonical receipt
-    // validation. Require its Established phase and both immutable
-    // commitments so a body/receipt from any other terminal cannot publish.
-    if committed.record().phase().map_err(|_| reject())?
-        != crate::fenced_mutation_roster::Phase::Established
-        || committed.record().body_commitment() != request.terminal_body_commitment()
-        || committed.receipt_commitment() != request.receipt_commitment()
-    {
-        return Err(reject());
-    }
-
-    let original = protected_roster_original_authority_sync(conn, identity, binding, admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    protected_roster_validate_current_authority_sync(
-        conn,
-        admission,
-        &original,
-        &current,
-        logical_time,
-        false,
-    )
-    .map_err(ProtectedRosterApplyError::store_error)
 }
 
 /// Validate an Established Profile-V2 publication against the isolated V2
@@ -14806,82 +14240,12 @@ pub(crate) fn read_protected_roster_v2_current_publication_authority_sync(
     request: &crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
     logical_time: Timestamp,
 ) -> Result<(), StoreError> {
-    let reject = || ProtectedRosterApplyError::Rejected.store_error();
-    let roster_id = RosterId::from_bytes(request.roster_id()).map_err(|_| reject())?;
-    let current = AuthorityBinding::from_consensus_parts(
-        request.scope(),
-        request.key().clone(),
-        request.current_owner().clone(),
-        request.current_fence(),
-        AuthorityLeaseMetadata::new(
-            request.current_credential_id(),
-            request.current_generation(),
-            request.current_lease_acquired_at(),
-            request.current_lease_expires_at(),
-        ),
-    )
-    .map_err(|_| reject())?;
-    let slot = protected_roster_v2_stable_slot(
-        Scope::from_digest(request.scope()),
-        request.key(),
-        roster_id,
-    );
-    let binding = protected_roster_v2_binding_by_stable_slot_sync(conn, slot)
-        .map_err(ProtectedRosterApplyError::store_error)?
-        .ok_or_else(reject)?;
-    let record = protected_roster_v2_read_record_sync(conn, identity, binding)
-        .map_err(ProtectedRosterApplyError::store_error)?
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    protected_roster_v2_authenticate_hydration_sync(conn, identity, binding, &record)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    if record.record().state() != ProductionReservationStateV2::Retained {
-        return Err(reject());
-    }
-    let admission = record
-        .admission()
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    let committed = record
-        .committed_terminal()
-        .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-    if admission.profile() != crate::fenced_mutation_roster::Profile::v2()
-        || admission.scope().digest() != request.scope()
-        || admission.key() != request.key()
-        || admission.roster_id() != roster_id
-        || admission.body_commitment() != request.admission_commitment()
-        || admission.logical_owner() != request.logical_owner()
-        || admission.admission_fence() != request.admission_fence()
-        || admission.expected_generation() != request.current_generation()
-        || committed.record().phase().map_err(|_| reject())?
-            != crate::fenced_mutation_roster::Phase::Established
-        || committed.record().body_commitment() != request.terminal_body_commitment()
-        || committed.receipt_commitment() != request.receipt_commitment()
-    {
-        return Err(reject());
-    }
-    let registration = BackendRegistration::from_consensus_parts(
-        roster_registration_handle(binding),
-        RosterRequestId::bind(binding.history_epoch(), admission).map_err(|_| reject())?,
-        admission,
-    )
-    .map_err(|_| reject())?;
-    let (handle, request_id, terminal_slot) = registration.consensus_parts();
-    if handle != request.registration_handle()
-        || request_id.to_bytes() != request.registration_request_id()
-        || terminal_slot.as_bytes() != &request.registration_terminal_slot()
-    {
-        return Err(reject());
-    }
-    let original = protected_roster_v2_original_authority_sync(conn, identity, binding, admission)
-        .map_err(ProtectedRosterApplyError::store_error)?;
-    protected_roster_validate_current_authority_sync(
-        conn,
-        admission,
-        &original,
-        &current,
+    roster_reads::read_protected_roster_v2_current_publication_authority_sync(
+        &conn,
+        identity,
+        request,
         logical_time,
-        false,
     )
-    .map_err(ProtectedRosterApplyError::store_error)
 }
 
 /// The sole SQLite implementation of the domain transaction adapter.  It
@@ -14972,6 +14336,274 @@ fn advance_terminal_key_fence_sync(
     Ok(())
 }
 
+// The shared evaluator retains the original SQLite transaction implementation.
+// It receives the caller's connection and never creates its own transaction.
+impl roster_engine::RosterCommandStore for &Connection {
+    fn trust_root(
+        &self,
+    ) -> Result<Option<RosterAttestationTrustRootV1>, SessionConsensusStorageError> {
+        read_roster_attestation_trust_root_sync(self)
+    }
+    fn validate_live_authority(
+        &self,
+        authority: &AuthorityBinding,
+        expected_generation: Option<Generation>,
+        logical_time: Timestamp,
+    ) -> Result<(), ProtectedRosterApplyError> {
+        protected_roster_validate_live_authority_sync(
+            self,
+            authority,
+            expected_generation,
+            logical_time,
+        )
+    }
+    fn record_v1(
+        &self,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+    ) -> Result<Option<HydratedProductionReservationRecord>, ProtectedRosterApplyError> {
+        protected_roster_read_record_sync(self, identity, binding)
+    }
+    fn original_authority_v1(
+        &self,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+        admission: &Admission,
+    ) -> Result<AuthorityBinding, ProtectedRosterApplyError> {
+        protected_roster_original_authority_sync(self, identity, binding, admission)
+    }
+    fn raw_record(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        ops::get_raw_sync(self, key)
+    }
+    fn original_binding_v1(
+        &self,
+        key: &SessionKey,
+        roster_id: RosterId,
+        owner: &OwnerId,
+        fence: FenceToken,
+        generation: Generation,
+    ) -> Result<Option<RequestBindingKey>, ProtectedRosterApplyError> {
+        protected_roster_binding_by_current_key_roster_and_original_sync(
+            self, key, roster_id, owner, fence, generation,
+        )
+    }
+    fn stable_slot_v1(
+        &self,
+        slot: [u8; 32],
+    ) -> Result<Option<RequestBindingKey>, ProtectedRosterApplyError> {
+        protected_roster_binding_by_stable_slot_sync(self, slot)
+    }
+    fn floor(
+        &self,
+        identity: SessionConsensusIdentity,
+        key: ProductionFloorKey,
+    ) -> Result<Option<IrreversibleHistoryFloor>, ProtectedRosterApplyError> {
+        protected_roster_read_floor_sync(self, identity, key)
+    }
+    fn retirement_cursor(
+        &self,
+        identity: SessionConsensusIdentity,
+        key: ProductionFloorKey,
+    ) -> Result<Option<ProductionRetirementCursor>, ReservationError> {
+        protected_roster_read_retirement_cursor_sync(self, identity, key)
+    }
+    fn witness(
+        &self,
+        identity: SessionConsensusIdentity,
+    ) -> Result<Option<GlobalChargeWitness>, ProtectedRosterApplyError> {
+        protected_roster_read_witness_sync(self, identity)
+    }
+    fn vacancy(
+        &self,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+    ) -> Result<ProductionBindingVacancyGuard, ProtectedRosterApplyError> {
+        protected_roster_binding_vacancy_guard_sync(self, identity, binding)
+    }
+    fn apply_v1(
+        &mut self,
+        identity: SessionConsensusIdentity,
+        transaction: PreparedProductionTransaction,
+        admission: Option<&ConsensusRosterAdmissionCommand>,
+        authority: Option<&AuthorityBinding>,
+    ) -> Result<(), ReservationError> {
+        SqliteProductionReservationTransactionAdapter {
+            conn: self,
+            identity,
+            admission_command: admission,
+            terminal_authority: authority,
+        }
+        .compare_and_apply_production(transaction)
+    }
+    fn membership_scope(
+        &self,
+        identity: SessionConsensusIdentity,
+    ) -> io::Result<MembershipValidationScope> {
+        read_membership_scope_sync(self, identity)
+    }
+    fn stable_slot_v2(
+        &self,
+        slot: [u8; 32],
+    ) -> Result<Option<RequestBindingKey>, ProtectedRosterApplyError> {
+        protected_roster_v2_binding_by_stable_slot_sync(self, slot)
+    }
+    fn record_v2(
+        &self,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+    ) -> Result<Option<HydratedProductionReservationRecordV2>, ProtectedRosterApplyError> {
+        protected_roster_v2_read_record_sync(self, identity, binding)
+    }
+    fn authenticate_record_v2(
+        &self,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+        hydrated: &HydratedProductionReservationRecordV2,
+    ) -> Result<(), ProtectedRosterApplyError> {
+        protected_roster_v2_authenticate_hydration_sync(self, identity, binding, hydrated)
+    }
+    fn original_authority_v2(
+        &self,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+        admission: &Admission,
+    ) -> Result<AuthorityBinding, ProtectedRosterApplyError> {
+        protected_roster_v2_original_authority_sync(self, identity, binding, admission)
+    }
+    fn original_projection_v2(
+        &self,
+        identity: SessionConsensusIdentity,
+        binding: RequestBindingKey,
+    ) -> Result<ProtectedRosterV2OriginalAuthorityProjection, ProtectedRosterApplyError> {
+        protected_roster_v2_original_authority_projection_sync(self, identity, binding)
+    }
+    fn live_reservation_v2(
+        &self,
+        identity: SessionConsensusIdentity,
+        key: &SessionKey,
+    ) -> Result<Option<RequestBindingKey>, ProtectedRosterApplyError> {
+        protected_roster_v2_live_reservation_by_business_key_sync(self, identity, key)
+    }
+    fn apply_admission_v2(
+        &mut self,
+        identity: SessionConsensusIdentity,
+        record: &ProductionReservationRecordV2,
+        command: &ConsensusRosterAdmissionCommand,
+        preparation: &PreparedProductionV2Admission,
+    ) -> Result<(), ProtectedRosterCommandApplyError> {
+        protected_roster_v2_write_live_admission_sync(self, identity, record, command, preparation)
+    }
+    fn apply_terminal_v2(
+        &mut self,
+        storage_identity: SessionConsensusIdentity,
+        authority: &AuthorityBinding,
+        write: roster_engine::V2TerminalWrite<'_>,
+        next_witness: GlobalChargeWitness,
+    ) -> Result<Option<ReplicationOp>, ProtectedRosterCommandApplyError> {
+        let conn = *self;
+        let roster_engine::V2TerminalWrite {
+            binding,
+            replacement,
+            old_canonical,
+            new_canonical,
+            replacement_terminalized_at,
+            replacement_terminal_sequence,
+            action,
+        } = write;
+        if ops::get_raw_sync(conn, action.predicate().key())
+            .map_err(ProtectedRosterCommandApplyError::fatal)?
+            .is_some()
+        {
+            // Q1's authenticated absent-row predicate is still live at
+            // this point.  A physical row here cannot be a fresh domain
+            // conflict: it is local divergence or a violated CAS, and
+            // must roll back the complete outer consensus apply.
+            return Err(ProtectedRosterCommandApplyError::Fatal);
+        }
+        let reservation_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_v2_absence_reservations WHERE business_key=?1 AND binding=?2 AND configuration_epoch=?3)",
+                params![
+                    session_key_commitment(action.predicate().key()).as_slice(),
+                    binding.to_bytes().as_slice(),
+                    epoch_i64(storage_identity)
+                        .map_err(ProtectedRosterCommandApplyError::fatal)?,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(ProtectedRosterCommandApplyError::fatal)?;
+        if !reservation_present {
+            return Err(ProtectedRosterCommandApplyError::Fatal);
+        }
+        let changed = conn
+            .execute(
+                "UPDATE consensus_protected_roster_v2_admissions \
+                 SET partition=?1, history_epoch=?2, state=2, terminalized_at=?3, \
+                     terminal_sequence=?4, canonical_record=?5 \
+                 WHERE binding=?6 AND configuration_epoch=?7 AND partition=?8 \
+                   AND history_epoch=?9 AND state=1 AND terminalized_at IS NULL \
+                   AND terminal_sequence IS NULL AND canonical_record=?10",
+                params![
+                    replacement.binding().partition_bytes().as_slice(),
+                    checked_positive_i64(replacement.binding().history_epoch())
+                        .map_err(ProtectedRosterCommandApplyError::fatal)?,
+                    replacement_terminalized_at.as_slice(),
+                    replacement_terminal_sequence,
+                    new_canonical,
+                    binding.to_bytes().as_slice(),
+                    epoch_i64(storage_identity).map_err(ProtectedRosterCommandApplyError::fatal)?,
+                    binding.partition_bytes().as_slice(),
+                    checked_positive_i64(binding.history_epoch())
+                        .map_err(ProtectedRosterCommandApplyError::fatal)?,
+                    old_canonical,
+                ],
+            )
+            .map_err(ProtectedRosterCommandApplyError::fatal)?;
+        if changed != 1 {
+            return Err(ProtectedRosterCommandApplyError::Fatal);
+        }
+        let replication = match action {
+            ProductionTerminalAbsentBusinessActionV2::AbortedCompareAbsentRelease { .. } => None,
+            ProductionTerminalAbsentBusinessActionV2::EstablishedCreate { successor, .. } => {
+                let successor = successor
+                    .authoritative_record()
+                    .map_err(protected_roster_terminalization_reservation_error)?;
+                if successor.key != *authority.key() || successor.generation != Generation::new(1) {
+                    return Err(ProtectedRosterCommandApplyError::Fatal);
+                }
+                ops::insert_record_if_absent_sync(conn, &successor)
+                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
+                Some(ReplicationOp::ProtectedRosterEstablishedCreate {
+                    key: successor.key.clone(),
+                    record: successor,
+                    owner: authority.owner().clone(),
+                    fence: authority.fence(),
+                    credential_id: authority.credential_id(),
+                    guard_acquired_at: authority.acquired_at(),
+                    guard_expires_at: authority.expires_at(),
+                })
+            }
+        };
+        let removed = conn
+            .execute(
+                "DELETE FROM consensus_protected_roster_v2_absence_reservations WHERE business_key=?1 AND binding=?2 AND configuration_epoch=?3",
+                params![
+                    session_key_commitment(action.predicate().key()).as_slice(),
+                    binding.to_bytes().as_slice(),
+                    epoch_i64(storage_identity)
+                        .map_err(ProtectedRosterCommandApplyError::fatal)?,
+                ],
+            )
+            .map_err(ProtectedRosterCommandApplyError::fatal)?;
+        if removed != 1 {
+            return Err(ProtectedRosterCommandApplyError::Fatal);
+        }
+        protected_roster_write_witness_sync(conn, storage_identity, next_witness)
+            .map_err(protected_roster_terminalization_reservation_error)?;
+        Ok(replication)
+    }
+}
+
 impl ProductionReservationTransactionAdapter for SqliteProductionReservationTransactionAdapter<'_> {
     fn compare_and_apply_production(
         &mut self,
@@ -14988,6 +14620,7 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                 .maintenance_time()
                 .as_nanos()
                 .checked_sub(PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS)
+                .filter(|cutoff| *cutoff >= 0)
                 .ok_or(ReservationError::InvalidMaintenanceTime)?;
             let mut statement = self
                 .conn
@@ -16213,10 +15846,12 @@ fn maintain_due_protected_roster_reclaim_sync(
     let Some(cutoff) = maintenance
         .as_nanos()
         .checked_sub(PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS)
+        .filter(|cutoff| *cutoff >= 0)
     else {
         // No nonnegative terminal timestamp can yet have aged for the fixed
-        // retention period.  This remains a true no-op rather than asking the
-        // planner to create an empty maintenance transaction.
+        // retention period. Signed subtraction can produce a negative value
+        // without overflowing; its big-endian bytes must never enter the SQL
+        // predicate over nonnegative timestamps. This remains a true no-op.
         return Ok(false);
     };
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn).map_err(|_| {
@@ -16385,78 +16020,6 @@ fn protected_roster_original_authority_sync(
     Ok(authority)
 }
 
-fn protected_roster_admission_business(
-    conn: &Connection,
-    admission: &Admission,
-    authority: &AuthorityBinding,
-) -> Result<ProductionBusinessState, ProtectedRosterCommandApplyError> {
-    if authority.key() != admission.key()
-        || authority.owner() != admission.logical_owner()
-        || authority.fence() != admission.admission_fence()
-        || authority.generation() != admission.expected_generation()
-    {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::Authority,
-        ));
-    }
-    let current = ops::get_raw_sync(conn, admission.key())
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    if admission
-        .established_mutation()
-        .requires_absent_predecessor()
-    {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::InvalidProtectedCheckpoint,
-        ));
-    }
-    let current = current.ok_or_else(|| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::RecordMissing)
-    })?;
-    if current.generation != admission.expected_generation() {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::GenerationConflict,
-        ));
-    }
-    if current.owner != *admission.logical_owner() || current.fence != admission.admission_fence() {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::Authority,
-        ));
-    }
-    if let Some(state_type) = admission.established_mutation().state_type() {
-        let generation = admission.expected_generation().next().ok_or_else(|| {
-            ProtectedRosterCommandApplyError::rejected(
-                ConsensusRosterRejection::GenerationExhausted,
-            )
-        })?;
-        let payload = EncryptedSessionPayload::try_envelope(admission.terminal_checkpoint())
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::InvalidProtectedCheckpoint,
-                )
-            })?;
-        let successor = StoredSessionRecord {
-            key: admission.key().clone(),
-            generation,
-            owner: admission.logical_owner().clone(),
-            fence: admission.admission_fence(),
-            state_class: StateClass::AuthoritativeSession,
-            state_type: state_type.clone(),
-            expires_at: None,
-            payload,
-        };
-        successor
-            .payload
-            .validate_envelope_for_record(&successor)
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::InvalidProtectedCheckpoint,
-                )
-            })?;
-    }
-    ProductionBusinessState::from_authoritative_record(&current)
-        .map_err(|_| ProtectedRosterCommandApplyError::Fatal)
-}
-
 fn apply_protected_roster_admission_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
@@ -16465,234 +16028,15 @@ fn apply_protected_roster_admission_sync(
     logical_time: Timestamp,
     command: &ConsensusRosterAdmissionCommand,
 ) -> Result<ConsensusRosterAdmissionOutcome, ProtectedRosterCommandApplyError> {
-    if raft_log_index == 0 {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::HistoryFull,
-        ));
-    }
-    let root = read_roster_attestation_trust_root_sync(conn)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .ok_or_else(|| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    let admission = command.admission();
-    let authority = command.authority();
-    protected_roster_validate_current_authority_sync(
-        conn,
-        admission,
-        authority,
-        authority,
-        logical_time,
-        false,
-    )
-    .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-    let ingress = command.ingress_attestation().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let capsule =
-        roster_poll_admit_ingress_capsule_commitment(admission, authority).map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    ingress
-        .verify_roster_command(
-            &root,
-            &RosterIngressAttestationRosterCommandInputV1 {
-                configuration_identity: &authority_identity,
-                expected_scope: authority.scope().digest(),
-                expected_request_id: command.ingress_request_id(),
-                expected_operation_tag: 1,
-                expected_capsule_digest: capsule,
-                logical_time,
-            },
-        )
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    let admission_provenance = command.admission_provenance().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let provenance_binding = admission.binding_key(raft_log_index).map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
-    })?;
-    verify_compact_admission_provenance_v2(CompactAdmissionProvenanceVerificationV2 {
-        root: &root,
-        configuration_identity: authority_identity,
-        binding: provenance_binding,
-        admission,
-        original_authority: authority,
-        ingress: ingress.signing_input(),
-        provenance: &admission_provenance,
-    })
-    .map_err(|_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority))?;
-    // The roster-ID slot is permanent for this body namespace.  Replaying
-    // the exact admission returns its original registration; another body
-    // with the same stable ID is a closed conflict and never reaches the
-    // reservation/budget path a second time.
-    let slot = command.admission_slot().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::RecoveryRequired)
-    })?;
-    if let Some(binding) = protected_roster_binding_by_stable_slot_sync(conn, slot)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-    {
-        let hydrated = protected_roster_read_record_sync(conn, storage_identity, binding)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?
-            .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-        match hydrated.payload() {
-            HydratedProductionReservationPayload::Live {
-                admission: stored_admission,
-                admission_provenance: stored_provenance,
-                ..
-            }
-            | HydratedProductionReservationPayload::Retained {
-                admission: stored_admission,
-                admission_provenance: stored_provenance,
-                ..
-            } if stored_admission == admission => {
-                let original = protected_roster_original_authority_sync(
-                    conn,
-                    storage_identity,
-                    binding,
-                    stored_admission,
-                )
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-                verify_historical_compact_admission_provenance_v2(
-                    HistoricalCompactAdmissionProvenanceVerificationV2 {
-                        root: &root,
-                        configuration_identity: authority_identity,
-                        binding,
-                        admission: stored_admission,
-                        original_authority: &original,
-                        provenance: stored_provenance,
-                    },
-                )
-                .map_err(|_| {
-                    ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-                })?;
-                // A retry may arrive through a valid strictly newer execution
-                // fence.  It replays the immutable admission registration;
-                // it never rewrites the original authority provenance.
-                protected_roster_validate_current_authority_sync(
-                    conn,
-                    stored_admission,
-                    &original,
-                    authority,
-                    logical_time,
-                    false,
-                )
-                .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-                return ConsensusRosterAdmissionOutcome::replayed(command)
-                    .map_err(ProtectedRosterCommandApplyError::fatal);
-            }
-            HydratedProductionReservationPayload::Tombstone {
-                tombstone,
-                admission_provenance: stored_provenance,
-                ..
-            } => {
-                tombstone
-                    .validate_admission(binding.history_epoch(), admission)
-                    .map_err(|_| {
-                        ProtectedRosterCommandApplyError::rejected(
-                            ConsensusRosterRejection::TerminalConflict,
-                        )
-                    })?;
-                let original = protected_roster_original_authority_sync(
-                    conn,
-                    storage_identity,
-                    binding,
-                    admission,
-                )
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-                verify_historical_compact_admission_provenance_v2(
-                    HistoricalCompactAdmissionProvenanceVerificationV2 {
-                        root: &root,
-                        configuration_identity: authority_identity,
-                        binding,
-                        admission,
-                        original_authority: &original,
-                        provenance: stored_provenance,
-                    },
-                )
-                .map_err(|_| {
-                    ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-                })?;
-                protected_roster_validate_current_authority_sync(
-                    conn,
-                    admission,
-                    &original,
-                    authority,
-                    logical_time,
-                    false,
-                )
-                .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-                return ConsensusRosterAdmissionOutcome::replayed(command)
-                    .map_err(ProtectedRosterCommandApplyError::fatal);
-            }
-            _ => {
-                return Err(ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::TerminalConflict,
-                ));
-            }
-        }
-    }
-    let business = protected_roster_admission_business(conn, admission, authority)?;
-    let reservation = ProductionAdmissionBusinessReservation::new(admission, business)
-        .map_err(protected_roster_reservation_error)?;
-    let record = ProductionReservationRecord::live_with_provenance_and_ingress(
-        admission,
-        &ingress,
-        &admission_provenance,
+    let mut store = conn;
+    roster_engine::admit_v1(
+        &mut store,
+        storage_identity,
+        authority_identity,
         raft_log_index,
-        reservation,
-        ChargeProfile::v1(),
+        logical_time,
+        command,
     )
-    .map_err(protected_roster_reservation_error)?;
-    let floor_key = ProductionFloorKey::from_floor(
-        IrreversibleHistoryFloor::initial(record.binding()).map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
-        })?,
-    )
-    .map_err(protected_roster_reservation_error)?;
-    let floor = protected_roster_read_floor_sync(conn, storage_identity, floor_key)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let retirement_cursor =
-        protected_roster_read_retirement_cursor_sync(conn, storage_identity, floor_key)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let witness = protected_roster_read_witness_sync(conn, storage_identity)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .unwrap_or_else(GlobalChargeWitness::empty);
-    let vacancy =
-        protected_roster_binding_vacancy_guard_sync(conn, storage_identity, record.binding())
-            .map_err(ProtectedRosterCommandApplyError::from_vacancy)?;
-    let prepared = prepare_production_admission(ProductionAdmissionPreparation {
-        vacancy: &vacancy,
-        existing: None,
-        record: record.clone(),
-        existing_floor: floor,
-        existing_retirement_cursor: retirement_cursor.as_ref(),
-        witness,
-        budget: GlobalChargeBudget::production(),
-        profile: ChargeProfile::v1(),
-    })
-    .map_err(protected_roster_reservation_error)?;
-    let registration = BackendRegistration::from_consensus_parts(
-        roster_registration_handle(record.binding()),
-        RosterRequestId::bind(raft_log_index, admission).map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
-        })?,
-        admission,
-    )
-    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let mut adapter = SqliteProductionReservationTransactionAdapter {
-        conn,
-        identity: storage_identity,
-        admission_command: Some(command),
-        terminal_authority: None,
-    };
-    adapter
-        .compare_and_apply_production(prepared)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    ConsensusRosterAdmissionOutcome::admitted(command, registration)
-        .map_err(ProtectedRosterCommandApplyError::fatal)
 }
 
 /// Profile V2's Q1 admission applies only to the independent absent-row
@@ -16708,293 +16052,15 @@ fn apply_protected_roster_admission_v2_sync(
     logical_time: Timestamp,
     command: &ConsensusRosterAdmissionCommand,
 ) -> Result<ConsensusRosterAdmissionOutcome, ProtectedRosterCommandApplyError> {
-    if raft_log_index == 0 {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::HistoryFull,
-        ));
-    }
-    let admission = command.admission();
-    let authority = command.authority();
-    if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::Authority,
-        ));
-    }
-
-    // Authenticate the `/4` transport and its V2-only compact provenance
-    // before a lease, roster, or business-row lookup.  The typed outer intent
-    // and typed decoders make a structurally valid V1 capsule unusable here.
-    let root = read_roster_attestation_trust_root_sync(conn)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .ok_or_else(|| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    let ingress = command.ingress_attestation_v2().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let capsule =
-        roster_poll_admit_ingress_capsule_commitment_v2(admission, authority).map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    ingress
-        .verify_roster_command(
-            &root,
-            &RosterIngressAttestationRosterCommandInputV2 {
-                configuration_identity: &authority_identity,
-                expected_scope: authority.scope().digest(),
-                expected_request_id: command.ingress_request_id(),
-                expected_operation_tag: 1,
-                expected_capsule_digest: capsule,
-                logical_time,
-            },
-        )
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    let admission_provenance = command.admission_provenance_v2().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    admission_provenance
-        .verify_for(&root, authority_identity, admission, authority, &ingress)
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-
-    protected_roster_validate_current_authority_sync(
-        conn,
-        admission,
-        authority,
-        authority,
-        logical_time,
-        true,
-    )
-    .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-
-    let slot = command.admission_slot().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::RecoveryRequired)
-    })?;
-    if let Some(binding) = protected_roster_v2_binding_by_stable_slot_sync(conn, slot)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-    {
-        let stored = protected_roster_v2_read_record_sync(conn, storage_identity, binding)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?
-            .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-        protected_roster_v2_authenticate_hydration_sync(conn, storage_identity, binding, &stored)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-        if stored.record().state() == ProductionReservationStateV2::Tombstone {
-            let tombstone = stored
-                .tombstone()
-                .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-            tombstone
-                .validate_admission_for_profile(
-                    crate::fenced_mutation_roster::Profile::v2(),
-                    binding.history_epoch(),
-                    admission,
-                )
-                .map_err(|_| {
-                    ProtectedRosterCommandApplyError::rejected(
-                        ConsensusRosterRejection::TerminalConflict,
-                    )
-                })?;
-            let original = protected_roster_v2_original_authority_sync(
-                conn,
-                storage_identity,
-                binding,
-                admission,
-            )
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            let membership_scope = read_membership_scope_sync(conn, storage_identity)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            let original_projection = protected_roster_v2_original_authority_projection_sync(
-                conn,
-                storage_identity,
-                binding,
-            )
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            validate_hydrated_protected_roster_v2_compacted_sync(
-                &root,
-                &membership_scope,
-                binding,
-                &stored,
-                &original_projection,
-            )
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            protected_roster_validate_current_authority_sync(
-                conn,
-                admission,
-                &original,
-                authority,
-                logical_time,
-                false,
-            )
-            .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-            return ConsensusRosterAdmissionOutcome::replayed(command)
-                .map_err(ProtectedRosterCommandApplyError::fatal);
-        }
-        let stored_admission = stored
-            .admission()
-            .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-        if stored_admission != admission {
-            return Err(ProtectedRosterCommandApplyError::rejected(
-                ConsensusRosterRejection::TerminalConflict,
-            ));
-        }
-        let original = protected_roster_v2_original_authority_sync(
-            conn,
-            storage_identity,
-            binding,
-            stored_admission,
-        )
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-        let stored_ingress = stored
-            .admission_ingress()
-            .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-        let stored_provenance = stored.admission_provenance();
-        // The retained Q1 envelope is immutable evidence from its original
-        // membership epoch.  A retry after a membership cutover still has to
-        // authenticate its fresh ingress under the current identity (above),
-        // but it must not reinterpret the stored ingress/provenance as a
-        // statement by that newer configuration.  First prove the stored
-        // identity owned this binding's exact historical interval, then
-        // verify both retained V2 carriers in that sealed identity.
-        let historical_identity = stored_provenance.configuration_identity();
-        let membership_scope = read_membership_scope_sync(conn, storage_identity)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-        validate_roster_admission_attestation_identity_interval(
-            &membership_scope,
-            binding,
-            historical_identity,
-        )
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-        let stored_capsule =
-            roster_poll_admit_ingress_capsule_commitment_v2(stored_admission, &original)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-        let stored_time = stored_ingress.signing_input().authenticated_at;
-        stored_ingress
-            .verify_roster_command(
-                &root,
-                &RosterIngressAttestationRosterCommandInputV2 {
-                    configuration_identity: &historical_identity,
-                    expected_scope: stored_admission.scope().digest(),
-                    expected_request_id: stored_ingress.request_id(),
-                    expected_operation_tag: 1,
-                    expected_capsule_digest: stored_capsule,
-                    logical_time: stored_time,
-                },
-            )
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-            })?;
-        stored_provenance
-            .verify_for(
-                &root,
-                historical_identity,
-                stored_admission,
-                &original,
-                stored_ingress,
-            )
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-            })?;
-        protected_roster_validate_current_authority_sync(
-            conn,
-            stored_admission,
-            &original,
-            authority,
-            logical_time,
-            false,
-        )
-        .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-        return ConsensusRosterAdmissionOutcome::replayed(command)
-            .map_err(ProtectedRosterCommandApplyError::fatal);
-    }
-
-    // Replay is resolved before absence. A distinct admission that hashes to
-    // another V2 stable slot still cannot reserve an existing authoritative
-    // session row; V1 roster tables are never queried or written here.
-    if ops::get_raw_sync(conn, admission.key())
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .is_some()
-    {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::RecordAlreadyExists,
-        ));
-    }
-    let binding = admission.binding_key(raft_log_index).map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
-    })?;
-    let reservation = ProductionAdmissionAbsentBusinessReservationV2::new(admission, binding)
-        .map_err(protected_roster_v2_admission_reservation_error)?;
-    let record = ProductionReservationRecord::live_v2_absent_with_provenance_and_ingress(
-        admission,
-        &ingress,
-        &admission_provenance,
+    let mut store = conn;
+    roster_engine::admit_v2(
+        &mut store,
+        storage_identity,
+        authority_identity,
         raft_log_index,
-        reservation,
-        ChargeProfile::v1(),
-    )
-    .map_err(protected_roster_v2_admission_reservation_error)?;
-    if protected_roster_v2_live_reservation_by_business_key_sync(
-        conn,
-        storage_identity,
-        admission.key(),
-    )
-    .map_err(ProtectedRosterCommandApplyError::fatal)?
-    .is_some()
-    {
-        // This is the one deterministic Q1 reservation conflict: the exact
-        // committed session-key reservation was read and revalidated as a
-        // live V2 carrier.  All malformed or unreadable side-table states
-        // reached the fatal branch above.
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::BusinessKeyReserved,
-        ));
-    }
-    // Q1 reserves both its live occupancy and the exact maximum retained
-    // terminal carrier in the same global V1+V2 witness.  Q2 only exchanges
-    // that pre-reserved peak for its smaller retained body, so it cannot
-    // discover a late capacity failure after terminal authority is accepted.
-    let witness = protected_roster_read_witness_sync(conn, storage_identity)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .unwrap_or_else(GlobalChargeWitness::empty);
-    let floor_key = ProductionFloorKey::from_binding(record.binding())
-        .map_err(protected_roster_v2_admission_reservation_error)?;
-    let floor = protected_roster_read_floor_sync(conn, storage_identity, floor_key)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let cursor = protected_roster_read_retirement_cursor_sync(conn, storage_identity, floor_key)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let vacancy =
-        protected_roster_binding_vacancy_guard_sync(conn, storage_identity, record.binding())
-            .map_err(ProtectedRosterCommandApplyError::from_vacancy)?;
-    let admission_preparation = prepare_production_v2_admission_with_floor(
-        &vacancy,
-        &record,
-        floor,
-        cursor.as_ref(),
-        witness,
-        GlobalChargeBudget::production(),
-        ChargeProfile::v1(),
-    )
-    .map_err(protected_roster_v2_admission_reservation_error)?;
-    protected_roster_v2_write_live_admission_sync(
-        conn,
-        storage_identity,
-        &record,
+        logical_time,
         command,
-        &admission_preparation,
-    )?;
-    let registration = BackendRegistration::from_consensus_parts(
-        roster_registration_handle(record.binding()),
-        RosterRequestId::bind(raft_log_index, admission).map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
-        })?,
-        admission,
     )
-    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    ConsensusRosterAdmissionOutcome::admitted(command, registration)
-        .map_err(ProtectedRosterCommandApplyError::fatal)
 }
 
 fn apply_protected_roster_terminal_sync(
@@ -17007,292 +16073,16 @@ fn apply_protected_roster_terminal_sync(
     command: &ConsensusRosterTerminalCommand,
 ) -> Result<(ConsensusRosterTerminalOutcome, Option<ReplicationOp>), ProtectedRosterCommandApplyError>
 {
-    protected_roster_terminalization_sequences_are_valid(application_sequence, raft_log_index)?;
-    let binding = command.binding();
-    // Authenticate the exact least-authority binding and the current live
-    // execution guard before probing the stable roster slot. Existing and
-    // absent foreign rows must therefore be observationally indistinguishable.
-    protected_roster_validate_binding_authority_before_lookup(binding, command.authority())
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    protected_roster_validate_live_authority_sync(conn, command.authority(), None, logical_time)
-        .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-    let hydrated = protected_roster_read_record_sync(conn, storage_identity, binding)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .ok_or_else(|| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::TerminalLocked)
-        })?;
-    let state = hydrated.record().state();
-    if state == ReservationState::Tombstone {
-        // A compacted row deliberately retains only the authenticated history
-        // required for reads.  It no longer has the raw admission, provider
-        // proof bundle, or terminal ingress capsule required to authenticate a
-        // terminal *mutation* under the current membership authority.  Do not
-        // turn a syntactically matching retry into a definitive mutation
-        // response before those inputs are verified.  Authenticated callers
-        // can obtain compacted status through the read-only terminal-status
-        // path, which compares the retained evidence after the restart scanner
-        // has reauthenticated the tombstone against the persisted current
-        // membership lineage and its trust root.
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::TerminalConflict,
-        ));
-    }
-    // The row hydration already decoded, authenticated, and recanonicalized
-    // this potentially multi-megabyte body. Retain one owned copy for receipt
-    // construction while the sealed hydration itself moves into the live-row
-    // terminal CAS preparation below.
-    let admission = match hydrated.payload() {
-        HydratedProductionReservationPayload::Live { admission, .. }
-        | HydratedProductionReservationPayload::Retained { admission, .. } => admission.clone(),
-        HydratedProductionReservationPayload::Tombstone { .. } => {
-            return Err(ProtectedRosterCommandApplyError::Fatal);
-        }
-        #[cfg(test)]
-        HydratedProductionReservationPayload::Legacy => hydrated
-            .record()
-            .admission()
-            .map_err(ProtectedRosterCommandApplyError::fatal)?,
-    };
-    let original =
-        protected_roster_original_authority_sync(conn, storage_identity, binding, &admission)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let authority =
-        AuthorityBinding::for_validated_admission(&admission, command.authority(), false).map_err(
-            |_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority),
-        )?;
-    protected_roster_validate_current_authority_sync(
-        conn,
-        &admission,
-        &original,
-        &authority,
+    let mut store = conn;
+    roster_engine::terminal_v1(
+        &mut store,
+        storage_identity,
+        authority_identity,
+        application_sequence,
+        raft_log_index,
         logical_time,
-        false,
+        command,
     )
-    .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-    let (handle, request_id, terminal_slot) = command.registration_parts();
-    let expected_request = RosterRequestId::bind(binding.history_epoch(), &admission)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let registration = BackendRegistration::from_consensus_parts(handle, request_id, &admission)
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::TerminalConflict)
-        })?;
-    if request_id != expected_request
-        || handle != roster_registration_handle(binding)
-        || registration.consensus_parts().2.as_bytes() != &terminal_slot
-    {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::TerminalConflict,
-        ));
-    }
-    #[cfg(any(test, feature = "test-control"))]
-    let decode_and_proof_started = Instant::now();
-    let terminal = TerminalRecord::from_canonical_bytes(command.record_bytes(), &admission)
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::TerminalConflict)
-        })?;
-    if terminal.request_id() != request_id {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::TerminalConflict,
-        ));
-    }
-    let root = read_roster_attestation_trust_root_sync(conn)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .ok_or_else(|| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    let proof_bundle = command.proof_bundle().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    verify_executor_terminal_proof_bundle(ExecutorTerminalProofVerification {
-        root: Some(&root),
-        configuration_identity: authority_identity,
-        logical_time,
-        binding,
-        registration,
-        admission: &admission,
-        authority: &authority,
-        terminal: &terminal,
-        bundle: &proof_bundle,
-    })
-    .map_err(|_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority))?;
-    let ingress = command.ingress_attestation().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let terminal_evidence = command.terminal_evidence().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let capsule = roster_terminal_ingress_capsule_commitment(
-        binding,
-        registration,
-        &authority,
-        &terminal,
-        &admission,
-        &proof_bundle,
-        &terminal_evidence,
-    )
-    .map_err(|_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority))?;
-    ingress
-        .verify_roster_command(
-            &root,
-            &RosterIngressAttestationRosterCommandInputV1 {
-                configuration_identity: &authority_identity,
-                expected_scope: authority.ingress_scope().digest(),
-                expected_request_id: command.ingress_request_id(),
-                expected_operation_tag: 4,
-                expected_capsule_digest: capsule,
-                logical_time,
-            },
-        )
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    let admission_provenance = match hydrated.payload() {
-        HydratedProductionReservationPayload::Live {
-            admission_provenance,
-            ..
-        }
-        | HydratedProductionReservationPayload::Retained {
-            admission_provenance,
-            ..
-        }
-        | HydratedProductionReservationPayload::Tombstone {
-            admission_provenance,
-            ..
-        } => admission_provenance.clone(),
-        #[cfg(test)]
-        HydratedProductionReservationPayload::Legacy => {
-            return Err(ProtectedRosterCommandApplyError::fatal(
-                ReservationError::StateShape,
-            ));
-        }
-    };
-    verify_compact_terminal_evidence_v2(CompactTerminalEvidenceVerificationV2 {
-        root: &root,
-        configuration_identity: authority_identity,
-        logical_time,
-        binding,
-        registration,
-        admission_provenance: &admission_provenance,
-        committing_authority: &authority,
-        evidence: &terminal_evidence,
-    })
-    .map_err(|_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority))?;
-    #[cfg(any(test, feature = "test-control"))]
-    record_protected_roster_terminal_apply_timing(
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_nanos,
-        decode_and_proof_started,
-    );
-    match state {
-        ReservationState::Tombstone => Err(ProtectedRosterCommandApplyError::Fatal),
-        ReservationState::Retained => {
-            let (committed, retained_evidence) = match hydrated.payload() {
-                HydratedProductionReservationPayload::Retained {
-                    committed_terminal,
-                    terminal_evidence,
-                    ..
-                } => (committed_terminal.as_ref(), terminal_evidence),
-                #[cfg(test)]
-                HydratedProductionReservationPayload::Legacy => {
-                    return Err(ProtectedRosterCommandApplyError::Fatal);
-                }
-                _ => return Err(ProtectedRosterCommandApplyError::Fatal),
-            };
-            if committed.record() != &terminal || retained_evidence != &terminal_evidence {
-                return Err(ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::TerminalConflict,
-                ));
-            }
-            #[cfg(any(test, feature = "test-control"))]
-            let committed_outcome_started = Instant::now();
-            let outcome =
-                ConsensusRosterTerminalOutcome::committed(command, true, committed, &admission)
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
-                committed_outcome_started,
-            );
-            Ok((outcome, None))
-        }
-        ReservationState::Live => {
-            // This closes the deliberately separate deterministic planner
-            // phase: metadata issuance, witness read, protected transaction
-            // construction, and the derived replication projection.  It is
-            // neither terminal decoding/proof verification nor SQLite apply.
-            #[cfg(any(test, feature = "test-control"))]
-            let terminalization_preparation_started = Instant::now();
-            let metadata =
-                ConsensusCommitMetadata::issue(application_sequence, raft_log_index, logical_time)
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            let committed = CommittedTerminal::issue_from_record(
-                registration,
-                &admission,
-                &authority,
-                terminal,
-                metadata,
-            )
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::TerminalConflict,
-                )
-            })?;
-            let witness = protected_roster_read_witness_sync(conn, storage_identity)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?
-                .unwrap_or_else(GlobalChargeWitness::empty);
-            let prepared = prepare_production_terminalization_hydrated_with_evidence_and_ingress(
-                hydrated,
-                binding,
-                &committed,
-                &proof_bundle,
-                &ingress,
-                &terminal_evidence,
-                witness,
-                GlobalChargeBudget::production(),
-                ChargeProfile::v1(),
-            )
-            .map_err(protected_roster_terminalization_reservation_error)?;
-            let replication = protected_roster_established_replication(&prepared, &authority)?;
-            let mut adapter = SqliteProductionReservationTransactionAdapter {
-                conn,
-                identity: storage_identity,
-                admission_command: None,
-                terminal_authority: Some(&authority),
-            };
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_nanos,
-                terminalization_preparation_started,
-            );
-            #[cfg(any(test, feature = "test-control"))]
-            let production_apply_started = Instant::now();
-            adapter
-                .compare_and_apply_production(prepared)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_nanos,
-                production_apply_started,
-            );
-            #[cfg(any(test, feature = "test-control"))]
-            let committed_outcome_started = Instant::now();
-            let outcome =
-                ConsensusRosterTerminalOutcome::committed(command, false, &committed, &admission)
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
-                committed_outcome_started,
-            );
-            Ok((outcome, replication))
-        }
-    }
 }
 
 fn apply_protected_roster_terminal_v2_sync(
@@ -17305,500 +16095,16 @@ fn apply_protected_roster_terminal_v2_sync(
     command: &ConsensusRosterTerminalCommandV2,
 ) -> Result<(ConsensusRosterTerminalOutcome, Option<ReplicationOp>), ProtectedRosterCommandApplyError>
 {
-    protected_roster_terminalization_sequences_are_valid(application_sequence, raft_log_index)?;
-    let binding = command.binding();
-    // Validate the untrusted current authority before we resolve a V2
-    // binding.  In particular, this intentionally does not probe V1 rows as
-    // a fallback: an absent V2 reservation and a V1 row are distinct states.
-    protected_roster_validate_binding_authority_before_lookup(binding, command.authority())
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    protected_roster_validate_live_authority_sync(conn, command.authority(), None, logical_time)
-        .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-
-    let hydrated = protected_roster_v2_read_record_sync(conn, storage_identity, binding)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .ok_or_else(|| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::TerminalLocked)
-        })?;
-    protected_roster_v2_authenticate_hydration_sync(conn, storage_identity, binding, &hydrated)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let record = hydrated.record();
-    if record.state() == ProductionReservationStateV2::Tombstone {
-        protected_roster_validate_live_authority_sync(
-            conn,
-            command.authority(),
-            Some(Generation::new(1)),
-            logical_time,
-        )
-        .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-        let (handle, request_id, terminal_slot) = command.registration_parts();
-        if handle != roster_registration_handle(binding) || terminal_slot == [0; 32] {
-            return Err(ProtectedRosterCommandApplyError::rejected(
-                ConsensusRosterRejection::TerminalConflict,
-            ));
-        }
-        let tombstone = hydrated
-            .tombstone()
-            .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-        let terminal_body = TerminalRecord::canonical_body_commitment(command.record_bytes())
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::TerminalConflict,
-                )
-            })?;
-        tombstone
-            .validate_compacted_terminal_for_profile(CompactedTerminalValidation {
-                profile: crate::fenced_mutation_roster::Profile::v2(),
-                binding,
-                request_id,
-                terminal_slot,
-                current_fence: command.authority().fence(),
-                current_generation: command.authority().generation(),
-                terminal_body_commitment: terminal_body,
-            })
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::TerminalConflict,
-                )
-            })?;
-        let original =
-            protected_roster_v2_original_authority_projection_sync(conn, storage_identity, binding)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-        let root = read_roster_attestation_trust_root_sync(conn)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?
-            .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-        let membership_scope = read_membership_scope_sync(conn, storage_identity)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-        validate_hydrated_protected_roster_v2_compacted_sync(
-            &root,
-            &membership_scope,
-            binding,
-            &hydrated,
-            &original,
-        )
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-        return ConsensusRosterTerminalOutcome::compacted_v2(command, tombstone.clone())
-            .map(|outcome| (outcome, None))
-            .map_err(ProtectedRosterCommandApplyError::fatal);
-    }
-    let admission = hydrated
-        .admission()
-        .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-    if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
-        return Err(ProtectedRosterCommandApplyError::Fatal);
-    }
-    let original =
-        protected_roster_v2_original_authority_sync(conn, storage_identity, binding, admission)
-            .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let authority =
-        AuthorityBinding::for_validated_admission(admission, command.authority(), false).map_err(
-            |_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority),
-        )?;
-    protected_roster_validate_current_authority_sync(
-        conn,
-        admission,
-        &original,
-        &authority,
+    let mut store = conn;
+    roster_engine::terminal_v2(
+        &mut store,
+        storage_identity,
+        authority_identity,
+        application_sequence,
+        raft_log_index,
         logical_time,
-        false,
+        command,
     )
-    .map_err(ProtectedRosterCommandApplyError::from_authority)?;
-
-    let (handle, request_id, terminal_slot) = command.registration_parts();
-    let expected_request = RosterRequestId::bind(binding.history_epoch(), admission)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-    let registration = BackendRegistration::from_consensus_parts(handle, request_id, admission)
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::TerminalConflict)
-        })?;
-    if request_id != expected_request
-        || handle != roster_registration_handle(binding)
-        || registration.consensus_parts().2.as_bytes() != &terminal_slot
-    {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::TerminalConflict,
-        ));
-    }
-    // Keep the Profile-V2 timing boundaries identical to the frozen V1 path.
-    // These aggregate-only counters exist solely behind test/test-control and
-    // intentionally do not influence admission, proof, or transaction flow.
-    #[cfg(any(test, feature = "test-control"))]
-    let decode_and_proof_started = Instant::now();
-    let terminal = TerminalRecord::from_canonical_bytes(command.record_bytes(), admission)
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::TerminalConflict)
-        })?;
-    if terminal.request_id() != request_id {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::TerminalConflict,
-        ));
-    }
-
-    let root = read_roster_attestation_trust_root_sync(conn)
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        .ok_or_else(|| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    let admission_ingress = hydrated
-        .admission_ingress()
-        .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-    let stored_provenance = hydrated.admission_provenance();
-    let proof_bundle = command.proof_bundle().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let terminal_evidence = command.terminal_evidence().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let ingress = command.ingress_attestation().map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    // A V2 outer command must retain exactly the immutable Q1 provenance and
-    // must authenticate its own fresh terminal ingress.  Equality here is
-    // over canonical bytes; no structurally similar V1 carrier is probed.
-    if terminal_evidence
-        .provenance()
-        .canonical_bytes()
-        .map_err(ProtectedRosterCommandApplyError::fatal)?
-        != stored_provenance
-            .canonical_bytes()
-            .map_err(ProtectedRosterCommandApplyError::fatal)?
-        || terminal_evidence
-            .ingress()
-            .canonical_bytes()
-            .map_err(ProtectedRosterCommandApplyError::fatal)?
-            != ingress
-                .canonical_bytes()
-                .map_err(ProtectedRosterCommandApplyError::fatal)?
-        || proof_bundle.admission_provenance_commitment()
-            != stored_provenance
-                .commitment()
-                .map_err(ProtectedRosterCommandApplyError::fatal)?
-        || proof_bundle
-            .ingress()
-            .canonical_bytes()
-            .map_err(ProtectedRosterCommandApplyError::fatal)?
-            != ingress
-                .canonical_bytes()
-                .map_err(ProtectedRosterCommandApplyError::fatal)?
-    {
-        return Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::Authority,
-        ));
-    }
-    let capsule = roster_terminal_ingress_capsule_commitment_v2(
-        binding,
-        registration,
-        &authority,
-        &terminal,
-        admission,
-        stored_provenance,
-        terminal_evidence.evidence(),
-    )
-    .map_err(|_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority))?;
-    let admission_capsule = roster_poll_admit_ingress_capsule_commitment_v2(admission, &original)
-        .map_err(|_| {
-        ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-    })?;
-    let historical_identity = stored_provenance.configuration_identity();
-    verify_profile_v2_compact_terminal_evidence(ProfileV2CompactTerminalEvidenceVerificationV1 {
-        root: &root,
-        terminal_configuration_identity: authority_identity,
-        terminal_logical_time: logical_time,
-        binding,
-        registration,
-        admission,
-        original_authority: &original,
-        admission_provenance: stored_provenance,
-        admission_ingress,
-        admission_ingress_command: RosterIngressAttestationRosterCommandInputV2 {
-            configuration_identity: &historical_identity,
-            expected_scope: original.ingress_scope().digest(),
-            expected_request_id: admission_ingress.request_id(),
-            expected_operation_tag: 1,
-            expected_capsule_digest: admission_capsule,
-            logical_time: admission_ingress.signing_input().authenticated_at,
-        },
-        committing_authority: &authority,
-        terminal: &terminal,
-        proof_bundle: &proof_bundle,
-        evidence: &terminal_evidence,
-    })
-    .map_err(|_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority))?;
-    ingress
-        .verify_roster_command(
-            &root,
-            &RosterIngressAttestationRosterCommandInputV2 {
-                configuration_identity: &authority_identity,
-                expected_scope: authority.ingress_scope().digest(),
-                expected_request_id: command.ingress_request_id(),
-                expected_operation_tag: 4,
-                expected_capsule_digest: capsule,
-                logical_time,
-            },
-        )
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    // The sealed verifier authenticates signatures and membership. The raw
-    // terminal bytes additionally must be the exact checkpoint/result whose
-    // commitments the compact evidence carries.
-    terminal_evidence
-        .evidence()
-        .verify_raw_terminal(admission, &terminal)
-        .map_err(|_| {
-            ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority)
-        })?;
-    #[cfg(any(test, feature = "test-control"))]
-    record_protected_roster_terminal_apply_timing(
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_nanos,
-        decode_and_proof_started,
-    );
-
-    match record.state() {
-        ProductionReservationStateV2::Retained => {
-            let committed = hydrated
-                .committed_terminal()
-                .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-            let retained_proof = hydrated
-                .terminal_proof_bundle()
-                .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-            let retained_evidence = hydrated
-                .terminal_evidence()
-                .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-            let proof_bytes = proof_bundle
-                .canonical_bytes()
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            let evidence_bytes = terminal_evidence
-                .canonical_bytes()
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            if committed.record() != &terminal
-                || retained_proof
-                    .canonical_bytes()
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?
-                    != proof_bytes
-                || retained_evidence
-                    .canonical_bytes()
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?
-                    != evidence_bytes
-            {
-                return Err(ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::TerminalConflict,
-                ));
-            }
-            #[cfg(any(test, feature = "test-control"))]
-            let committed_outcome_started = Instant::now();
-            let outcome =
-                ConsensusRosterTerminalOutcome::committed_v2(command, true, committed, admission)
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
-                committed_outcome_started,
-            );
-            Ok((outcome, None))
-        }
-        ProductionReservationStateV2::Live => {
-            if record.absence_reservation().is_none() {
-                return Err(ProtectedRosterCommandApplyError::Fatal);
-            }
-            #[cfg(any(test, feature = "test-control"))]
-            let terminalization_preparation_started = Instant::now();
-            let metadata =
-                ConsensusCommitMetadata::issue(application_sequence, raft_log_index, logical_time)
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            let committed = CommittedTerminal::issue_from_record(
-                registration,
-                admission,
-                &authority,
-                terminal,
-                metadata,
-            )
-            .map_err(|_| {
-                ProtectedRosterCommandApplyError::rejected(
-                    ConsensusRosterRejection::TerminalConflict,
-                )
-            })?;
-            let prepared = record
-                .prepare_terminalization(
-                    &committed,
-                    &proof_bundle,
-                    &terminal_evidence,
-                    ChargeProfile::v1(),
-                )
-                .map_err(protected_roster_terminalization_reservation_error)?;
-            let witness = protected_roster_read_witness_sync(conn, storage_identity)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?
-                .unwrap_or_else(GlobalChargeWitness::empty);
-            let capacity = prepare_production_v2_terminal_capacity(
-                record,
-                &prepared,
-                witness,
-                GlobalChargeBudget::production(),
-                ChargeProfile::v1(),
-            )
-            .map_err(protected_roster_terminalization_reservation_error)?;
-            let old_canonical = hydrated.canonical().to_vec();
-            let replacement = prepared.replacement();
-            let new_canonical = replacement
-                .to_canonical_bytes()
-                .map_err(protected_roster_terminalization_reservation_error)?;
-            if replacement.binding() != binding
-                || replacement.state() != ProductionReservationStateV2::Retained
-            {
-                return Err(ProtectedRosterCommandApplyError::Fatal);
-            }
-            let replacement_terminalized_at = replacement
-                .terminalized_at()
-                .map(|value| value.as_nanos().to_be_bytes())
-                .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-            let replacement_terminal_sequence = replacement
-                .terminal_sequence()
-                .map(checked_positive_i64)
-                .transpose()
-                .map_err(ProtectedRosterCommandApplyError::fatal)?
-                .ok_or(ProtectedRosterCommandApplyError::Fatal)?;
-            let action = prepared.business_cas().action();
-            let reservation = action.reservation();
-            reservation
-                .validate_for(admission, binding)
-                .map_err(protected_roster_terminalization_reservation_error)?;
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_nanos,
-                terminalization_preparation_started,
-            );
-            // The predicate read, V2-row compare-and-swap, optional
-            // generation-one create, reservation release, and witness update
-            // are one indivisible production-apply phase.  In particular an
-            // Aborted terminal reaches this phase even though it emits no
-            // replication notification.
-            #[cfg(any(test, feature = "test-control"))]
-            let production_apply_started = Instant::now();
-            if ops::get_raw_sync(conn, action.predicate().key())
-                .map_err(ProtectedRosterCommandApplyError::fatal)?
-                .is_some()
-            {
-                // Q1's authenticated absent-row predicate is still live at
-                // this point.  A physical row here cannot be a fresh domain
-                // conflict: it is local divergence or a violated CAS, and
-                // must roll back the complete outer consensus apply.
-                return Err(ProtectedRosterCommandApplyError::Fatal);
-            }
-            let reservation_present: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_v2_absence_reservations WHERE business_key=?1 AND binding=?2 AND configuration_epoch=?3)",
-                    params![
-                        session_key_commitment(action.predicate().key()).as_slice(),
-                        binding.to_bytes().as_slice(),
-                        epoch_i64(storage_identity)
-                            .map_err(ProtectedRosterCommandApplyError::fatal)?,
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            if !reservation_present {
-                return Err(ProtectedRosterCommandApplyError::Fatal);
-            }
-            let changed = conn
-                .execute(
-                    "UPDATE consensus_protected_roster_v2_admissions \
-                     SET partition=?1, history_epoch=?2, state=2, terminalized_at=?3, \
-                         terminal_sequence=?4, canonical_record=?5 \
-                     WHERE binding=?6 AND configuration_epoch=?7 AND partition=?8 \
-                       AND history_epoch=?9 AND state=1 AND terminalized_at IS NULL \
-                       AND terminal_sequence IS NULL AND canonical_record=?10",
-                    params![
-                        replacement.binding().partition_bytes().as_slice(),
-                        checked_positive_i64(replacement.binding().history_epoch())
-                            .map_err(ProtectedRosterCommandApplyError::fatal)?,
-                        replacement_terminalized_at.as_slice(),
-                        replacement_terminal_sequence,
-                        new_canonical,
-                        binding.to_bytes().as_slice(),
-                        epoch_i64(storage_identity)
-                            .map_err(ProtectedRosterCommandApplyError::fatal)?,
-                        binding.partition_bytes().as_slice(),
-                        checked_positive_i64(binding.history_epoch())
-                            .map_err(ProtectedRosterCommandApplyError::fatal)?,
-                        old_canonical,
-                    ],
-                )
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            if changed != 1 {
-                return Err(ProtectedRosterCommandApplyError::Fatal);
-            }
-            let replication = match action {
-                ProductionTerminalAbsentBusinessActionV2::AbortedCompareAbsentRelease {
-                    ..
-                } => None,
-                ProductionTerminalAbsentBusinessActionV2::EstablishedCreate {
-                    successor, ..
-                } => {
-                    let successor = successor
-                        .authoritative_record()
-                        .map_err(protected_roster_terminalization_reservation_error)?;
-                    if successor.key != *authority.key()
-                        || successor.generation != Generation::new(1)
-                    {
-                        return Err(ProtectedRosterCommandApplyError::Fatal);
-                    }
-                    ops::insert_record_if_absent_sync(conn, &successor)
-                        .map_err(ProtectedRosterCommandApplyError::fatal)?;
-                    Some(ReplicationOp::ProtectedRosterEstablishedCreate {
-                        key: successor.key.clone(),
-                        record: successor,
-                        owner: authority.owner().clone(),
-                        fence: authority.fence(),
-                        credential_id: authority.credential_id(),
-                        guard_acquired_at: authority.acquired_at(),
-                        guard_expires_at: authority.expires_at(),
-                    })
-                }
-            };
-            let removed = conn
-                .execute(
-                    "DELETE FROM consensus_protected_roster_v2_absence_reservations WHERE business_key=?1 AND binding=?2 AND configuration_epoch=?3",
-                    params![
-                        session_key_commitment(action.predicate().key()).as_slice(),
-                        binding.to_bytes().as_slice(),
-                        epoch_i64(storage_identity)
-                            .map_err(ProtectedRosterCommandApplyError::fatal)?,
-                    ],
-                )
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            if removed != 1 {
-                return Err(ProtectedRosterCommandApplyError::Fatal);
-            }
-            protected_roster_write_witness_sync(conn, storage_identity, capacity.next_witness())
-                .map_err(protected_roster_terminalization_reservation_error)?;
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_nanos,
-                production_apply_started,
-            );
-            #[cfg(any(test, feature = "test-control"))]
-            let committed_outcome_started = Instant::now();
-            let outcome =
-                ConsensusRosterTerminalOutcome::committed_v2(command, false, &committed, admission)
-                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
-            #[cfg(any(test, feature = "test-control"))]
-            record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
-                committed_outcome_started,
-            );
-            Ok((outcome, replication))
-        }
-        ProductionReservationStateV2::Tombstone => Err(ProtectedRosterCommandApplyError::rejected(
-            ConsensusRosterRejection::TerminalLocked,
-        )),
-    }
 }
 
 /// Build the journal projection for the *first* successful Established
@@ -18237,13 +16543,11 @@ fn fenced_transition_v2_schema_is_exact_in_sync(
         "main.sqlite_master"
     };
     let unexpected: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM {master} WHERE sql IS NOT NULL AND ((tbl_name IN ('consensus_fenced_transition_v2_receipts', 'consensus_fenced_transition_v2_activation', 'consensus_fenced_transition_v2_history') AND type IN ('index', 'trigger')) OR name IN ('consensus_fenced_transition_v2_receipts_reclaim', 'consensus_fenced_transition_v2_receipts_due'))"
-            ),
-            [],
-            |row| row.get(0),
-        )
+        .prepare_cached(&format!(
+            "SELECT COUNT(*) FROM {master} WHERE sql IS NOT NULL AND ((tbl_name IN ('consensus_fenced_transition_v2_receipts', 'consensus_fenced_transition_v2_activation', 'consensus_fenced_transition_v2_history') AND type IN ('index', 'trigger')) OR name IN ('consensus_fenced_transition_v2_receipts_reclaim', 'consensus_fenced_transition_v2_receipts_due'))"
+        ))
+        .map_err(db_error)?
+        .query_row([], |row| row.get(0))
         .map_err(db_error)?;
     Ok(unexpected == 2)
 }
@@ -18260,11 +16564,15 @@ fn schema_object_is_exact_in_sync(
     } else {
         "main.sqlite_master"
     };
+    // Cache only the bounded statement program. Every invocation still reads
+    // and compares the current complete schema text, including on a reused
+    // connection after schema or identity changes.
     let observed = conn
+        .prepare_cached(&format!(
+            "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM {master} WHERE type = ?2 AND name = ?3"
+        ))
+        .map_err(db_error)?
         .query_row(
-            &format!(
-                "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM {master} WHERE type = ?2 AND name = ?3"
-            ),
             params![CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES, kind, name],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
         )
@@ -18272,7 +16580,8 @@ fn schema_object_is_exact_in_sync(
         .map_err(db_error)?;
     Ok(observed.is_some_and(|(sql, len)| {
         len <= CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES
-            && sql.is_some_and(|sql| normalize_schema_sql(&sql) == normalize_schema_sql(expected))
+            && sql
+                .is_some_and(|sql| normalized_schema_sql(&sql).eq(normalized_schema_sql(expected)))
     }))
 }
 
@@ -18348,25 +16657,15 @@ pub(crate) fn fenced_transition_activation_matches_scope_sync(
     scope_identity: SessionConsensusIdentity,
     voters: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<bool> {
-    if fenced_transition_receipt_ledger_layout_sync(conn)?
-        != FencedTransitionReceiptLedgerLayout::Activated
-    {
-        return Ok(false);
-    }
-    if scope_identity.cluster_id() != storage_identity.cluster_id() || voters.is_empty() {
-        return Ok(false);
-    }
-    let Some((certificate_scope, certificate_voters)) =
-        read_fenced_transition_activation_certificate_sync(conn, storage_identity, false)?
-    else {
-        return Ok(false);
-    };
-    Ok(certificate_scope == scope_identity
-        && fenced_transition_activation_voter_set_digest_matches_scope(
-            certificate_voters,
-            scope_identity,
-            voters,
-        ))
+    let layout = fenced_transition_receipt_ledger_layout_sync(conn)?;
+    fenced_transition_v1_scope_activations_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+        layout,
+    )
+    .map(|(fenced_transition, _)| fenced_transition)
 }
 
 /// Return whether the existing immutable certificate is specifically the
@@ -18378,20 +16677,49 @@ pub(crate) fn protected_roster_profile_activation_matches_scope_sync(
     scope_identity: SessionConsensusIdentity,
     voters: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<bool> {
-    if fenced_transition_receipt_ledger_layout_sync(conn)?
-        != FencedTransitionReceiptLedgerLayout::Activated
+    let layout = fenced_transition_receipt_ledger_layout_sync(conn)?;
+    fenced_transition_v1_scope_activations_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+        layout,
+    )
+    .map(|(_, protected_roster)| protected_roster)
+}
+
+/// Derive both V1 proofs from the same fully decoded certificate. Projection
+/// loading supplies a full layout check from its current SQLite transaction;
+/// standalone probes above each obtain their own fresh layout check.
+fn fenced_transition_v1_scope_activations_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+    layout: FencedTransitionReceiptLedgerLayout,
+) -> io::Result<(bool, bool)> {
+    if layout != FencedTransitionReceiptLedgerLayout::Activated
         || scope_identity.cluster_id() != storage_identity.cluster_id()
         || voters.is_empty()
     {
-        return Ok(false);
+        return Ok((false, false));
     }
     let Some((certificate_scope, certificate_voters)) =
         read_fenced_transition_activation_certificate_sync(conn, storage_identity, false)?
     else {
-        return Ok(false);
+        return Ok((false, false));
     };
-    Ok(certificate_scope == scope_identity
-        && certificate_voters == protected_roster_profile_voter_set_digest(scope_identity, voters))
+    Ok((
+        certificate_scope == scope_identity
+            && fenced_transition_activation_voter_set_digest_matches_scope(
+                certificate_voters,
+                scope_identity,
+                voters,
+            ),
+        certificate_scope == scope_identity
+            && certificate_voters
+                == protected_roster_profile_voter_set_digest(scope_identity, voters),
+    ))
 }
 
 type ProtectedRosterV2ActivationCertificate = (SessionConsensusIdentity, [u8; 32], [u8; 32]);
@@ -18650,6 +16978,19 @@ impl SqliteSessionBackend {
         scope_identity: SessionConsensusIdentity,
         voters: BTreeSet<SessionConsensusNodeId>,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(io::Error::other(
+                        "native roster V2 activation identity differs",
+                    ));
+                }
+                Ok(state.protected_roster_v2_activation_matches(scope_identity, &voters))
+            })
+        }) {
+            return result.map_err(|_| super::native::unavailable());
+        }
         self.run_store_sqlite_task(super::SqliteStoreWorkKind::Read, move |conn| {
             protected_roster_profile_v2_activation_matches_scope_sync(
                 conn,
@@ -18797,7 +17138,7 @@ fn activate_fenced_transition_scope_sync(
 /// The digest is validated against the current scope before any format or
 /// certificate state is changed, so callers cannot use this shared storage
 /// primitive to synthesize arbitrary capability evidence.
-fn activate_fenced_transition_scope_with_voter_digest_sync(
+pub(crate) fn activate_fenced_transition_scope_with_voter_digest_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
     scope_identity: SessionConsensusIdentity,
@@ -19212,6 +17553,33 @@ pub(crate) fn fenced_transition_v2_activation_matches_scope_sync(
         return Ok(false);
     }
     let history = read_fenced_transition_v2_history_row_in_sync(conn, storage_identity, false)?;
+    fenced_transition_v2_activation_matches_history_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+        profile_digest,
+        &history,
+    )
+}
+
+/// The caller fully validates the V2 layout and history row before entering
+/// here. Projection reuses that row only within its current read transaction.
+fn fenced_transition_v2_activation_matches_history_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+    profile_digest: [u8; 32],
+    history: &FencedTransitionV2HistoryRow,
+) -> io::Result<bool> {
+    if scope_identity.cluster_id() != storage_identity.cluster_id()
+        || voters.is_empty()
+        || !fenced_transition_v2_payload_cap_matches_local_storage()
+        || profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest()
+    {
+        return Ok(false);
+    }
     let Some((certificate_scope, certificate_voters, certificate_profile)) =
         read_fenced_transition_v2_activation_certificate_in_sync(conn, storage_identity, false)?
     else {
@@ -19315,7 +17683,7 @@ fn validate_fenced_transition_v2_activation_certificate_in_sync(
 /// transaction-only: callers must share the SQLite transaction with the first
 /// V2 receipt and its session effect, so no observable format-two hybrid can
 /// exist.
-fn activate_fenced_transition_v2_scope_sync(
+pub(crate) fn activate_fenced_transition_v2_scope_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
     scope_identity: SessionConsensusIdentity,
@@ -19858,11 +18226,14 @@ fn schema_manifest_in_sync(
     Ok(manifest)
 }
 
-fn normalize_schema_sql(sql: &str) -> String {
+fn normalized_schema_sql(sql: &str) -> impl Iterator<Item = char> + '_ {
     sql.chars()
         .filter(|character| !character.is_ascii_whitespace())
         .map(|character| character.to_ascii_lowercase())
-        .collect()
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    normalized_schema_sql(sql).collect()
 }
 
 /// Require the complete activated V1 receipt layout, not merely a pair of
@@ -20070,11 +18441,11 @@ fn persisted_schema_version_in_sync(conn: &Connection, attached: bool) -> io::Re
     } else {
         "main.consensus_identity"
     };
-    conn.query_row(
-        &format!("SELECT schema_version FROM {source} WHERE singleton = 1"),
-        [],
-        |row| row.get(0),
-    )
+    conn.prepare_cached(&format!(
+        "SELECT schema_version FROM {source} WHERE singleton = 1"
+    ))
+    .map_err(db_error)?
+    .query_row([], |row| row.get(0))
     .map_err(db_error)
 }
 
@@ -22489,12 +20860,108 @@ pub(crate) fn checked_positive_u64(value: i64) -> io::Result<u64> {
     Ok(value)
 }
 
+#[cfg_attr(feature = "test-control", track_caller)]
 pub(crate) fn invalid_data(message: &'static str) -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "consensus_validation_failure source={} reason={}",
+        std::panic::Location::caller(),
+        message,
+    );
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn db_error(_: rusqlite::Error) -> io::Error {
-    io::Error::other("session consensus SQLite operation failed")
+mod snapshot_resources;
+
+/// Retain only SQLite's fixed numeric vocabulary. Its original message can
+/// contain SQL text or session values and must not enter storage diagnostics.
+#[derive(Debug, thiserror::Error)]
+#[error("session consensus SQLite operation failed (extended code {extended_code})")]
+struct SqliteStorageFailure {
+    extended_code: i32,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sqlite_error_code(error: &io::Error) -> Option<i32> {
+    error
+        .get_ref()?
+        .downcast_ref::<SqliteStorageFailure>()
+        .map(|failure| failure.extended_code)
+}
+
+pub(crate) fn db_error(error: rusqlite::Error) -> io::Error {
+    #[cfg(feature = "test-control")]
+    eprintln!(
+        "session_consensus_sqlite_failure variant={:?} extended_code={:?}",
+        std::mem::discriminant(&error),
+        error.sqlite_error().map(|code| code.extended_code),
+    );
+    let Some(code) = error.sqlite_error() else {
+        return io::Error::other("session consensus SQLite operation failed");
+    };
+    // FULL also covers SQLite's configured page limit. Preserve the capacity
+    // category without inventing an OS errno or attributing it to a mount.
+    let kind = if code.code == rusqlite::ErrorCode::DiskFull {
+        io::ErrorKind::StorageFull
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(
+        kind,
+        SqliteStorageFailure {
+            extended_code: code.extended_code,
+        },
+    )
+}
+
+#[cfg(test)]
+mod storage_failure_regression {
+    use super::*;
+
+    #[test]
+    fn sqlite_full_retains_storage_category_without_inventing_enospc() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("bounded.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 4096; PRAGMA max_page_count = 2; \
+             CREATE TABLE bounded(value BLOB);",
+        )
+        .unwrap();
+        let error = conn
+            .execute("INSERT INTO bounded VALUES (zeroblob(32768))", [])
+            .expect_err("the real SQLite page bound must refuse this write");
+        assert_eq!(error.sqlite_error().unwrap().extended_code, 13);
+        let converted = db_error(error);
+        let failure = crate::SessionStorageFailure::from_io(
+            crate::SessionStorageFailureStage::SnapshotExport,
+            &converted,
+        );
+        assert_eq!(failure.kind, crate::SessionStorageFailureKind::StorageFull);
+        assert_eq!(
+            failure.os_error, None,
+            "SQLITE_FULL does not prove OS ENOSPC"
+        );
+        assert!(format!("{converted:?}").contains("extended_code: 13"));
+    }
+
+    #[test]
+    fn sqlite_failure_keeps_numeric_cause_but_redacts_sqlite_messages() {
+        for code in [
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_IOERR_WRITE,
+        ] {
+            let converted = db_error(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("sensitive SQL value sentinel".into()),
+            ));
+            assert_eq!(sqlite_error_code(&converted), Some(code));
+            assert!(!format!("{converted:?} {converted}").contains("sentinel"));
+            assert_eq!(converted.raw_os_error(), None);
+        }
+        let non_sqlite = db_error(rusqlite::Error::InvalidParameterName("sentinel".into()));
+        assert_eq!(sqlite_error_code(&non_sqlite), None);
+        assert!(!format!("{non_sqlite:?} {non_sqlite}").contains("sentinel"));
+    }
 }
 
 fn encode_json<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
@@ -22517,12 +20984,20 @@ fn is_fenced_transition_v2_json_discriminant(key: &str) -> bool {
 }
 
 fn log_json_may_contain_fenced_transition_v2_discriminant(bytes: &[u8]) -> bool {
-    const FENCED_V2_DISCRIMINANT_STEM: &[u8] = b"FencedTransitionV2";
-    const RECOVERY_V2_DISCRIMINANT_STEM: &[u8] = b"FinalizeOperatorRecoveryV2";
+    const STEMS: [&str; 2] = ["FencedTransitionV2", "FinalizeOperatorRecoveryV2"];
+    // Valid UTF-8 can use the standard substring search instead of comparing
+    // every overlapping byte window. Serde may ignore non-UTF-8 bytes in a
+    // legacy extension value; retain the original byte gate for that input.
+    // Escaping still requires the complete independent JSON scan.
     bytes.contains(&b'\\')
-        || [FENCED_V2_DISCRIMINANT_STEM, RECOVERY_V2_DISCRIMINANT_STEM]
-            .into_iter()
-            .any(|stem| bytes.windows(stem.len()).any(|window| window == stem))
+        || match std::str::from_utf8(bytes) {
+            Ok(text) => STEMS.into_iter().any(|stem| text.contains(stem)),
+            Err(_) => STEMS.into_iter().any(|stem| {
+                bytes
+                    .windows(stem.len())
+                    .any(|window| window == stem.as_bytes())
+            }),
+        }
 }
 
 /// Allocation-light scan for a V2 discriminant anywhere in one syntactically
@@ -22606,13 +21081,12 @@ impl<'de> serde::de::Visitor<'de> for FencedTransitionV2JsonScanVisitor {
     }
 }
 
-/// Duplicate-aware parsed JSON used only to audit V2's exact durable schema.
+/// Duplicate-aware traversal used only to audit V2's exact durable schema.
 /// Structural validation rejects unknown or duplicate keys and a second JSON
 /// value. Durable acceptance additionally requires the original bytes to equal
 /// canonical encoding, so object order, escaping, and whitespace are part of
 /// the persisted byte contract.
 struct ExactFencedTransitionV2Json {
-    value: serde_json::Value,
     has_duplicate_key: bool,
     contains_v2_discriminant: bool,
 }
@@ -22635,25 +21109,22 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
         formatter.write_str("one exact session consensus V2 log JSON value")
     }
 
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Bool(value),
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
     }
 
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Number(value.into()),
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Number(value.into()),
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
@@ -22663,26 +21134,23 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
     where
         E: serde::de::Error,
     {
-        let value = serde_json::Number::from_f64(value)
+        serde_json::Number::from_f64(value)
             .ok_or_else(|| E::custom("invalid session consensus JSON number"))?;
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Number(value),
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
     }
 
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::String(value.to_owned()),
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
     }
 
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+    fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::String(value),
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
@@ -22690,7 +21158,6 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
 
     fn visit_none<E>(self) -> Result<Self::Value, E> {
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Null,
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
@@ -22698,7 +21165,6 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
 
     fn visit_unit<E>(self) -> Result<Self::Value, E> {
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Null,
             has_duplicate_key: false,
             contains_v2_discriminant: false,
         })
@@ -22708,16 +21174,13 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
     where
         A: serde::de::SeqAccess<'de>,
     {
-        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
         let mut has_duplicate_key = false;
         let mut contains_v2_discriminant = false;
         while let Some(value) = sequence.next_element::<ExactFencedTransitionV2Json>()? {
             has_duplicate_key |= value.has_duplicate_key;
             contains_v2_discriminant |= value.contains_v2_discriminant;
-            values.push(value.value);
         }
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Array(values),
             has_duplicate_key,
             contains_v2_discriminant,
         })
@@ -22727,7 +21190,10 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
     where
         A: serde::de::MapAccess<'de>,
     {
-        let mut values = serde_json::Map::with_capacity(map.size_hint().unwrap_or(0));
+        // Only the decoded keys of currently open objects need retention.
+        // Child values (especially numeric payload-byte arrays) never do.
+        // Decoded String equality preserves escaped-key duplicate detection.
+        let mut keys = BTreeSet::new();
         let mut has_duplicate_key = false;
         let mut contains_v2_discriminant = false;
         while let Some(key) = map.next_key::<String>()? {
@@ -22735,10 +21201,9 @@ impl<'de> serde::de::Visitor<'de> for ExactFencedTransitionV2JsonVisitor {
             let value = map.next_value::<ExactFencedTransitionV2Json>()?;
             has_duplicate_key |= value.has_duplicate_key;
             contains_v2_discriminant |= value.contains_v2_discriminant;
-            has_duplicate_key |= values.insert(key, value.value).is_some();
+            has_duplicate_key |= !keys.insert(key);
         }
         Ok(ExactFencedTransitionV2Json {
-            value: serde_json::Value::Object(values),
             has_duplicate_key,
             contains_v2_discriminant,
         })
@@ -22772,10 +21237,45 @@ fn scan_log_json_for_fenced_transition_v2(bytes: &[u8]) -> io::Result<bool> {
     Ok(scan.0)
 }
 
+fn log_entry_has_exact_fenced_transition_v2_batch_shape(
+    entry: &Entry<SessionRaftTypeConfig>,
+) -> bool {
+    let EntryPayload::Normal(command) = &entry.payload else {
+        return false;
+    };
+    matches!(
+        command.intent,
+        SessionMutationIntent::FencedTransitionV2Batch(_)
+    ) || matches!(&command.intent, SessionMutationIntent::Authorized { mutation, .. }
+            if matches!(mutation.as_ref(), SessionMutationIntent::FencedTransitionV2Batch(_)))
+}
+
 fn validate_exact_fenced_transition_v2_log_json(
     bytes: &[u8],
     entry: &Entry<SessionRaftTypeConfig>,
 ) -> io::Result<()> {
+    let canonical = encode_json(entry)
+        .map_err(|_| invalid_data("session consensus V2 log entry encoding failed"))?;
+    if bytes != canonical.as_slice() {
+        return Err(invalid_data(
+            "session consensus V2 log entry schema is invalid",
+        ));
+    }
+    // The comparison is complete. Do not retain a second encoded row while
+    // the independent structural traversal owns its decoded object keys.
+    drop(canonical);
+    // A batch, optionally under its one authority envelope, serializes only
+    // fixed-field structs/enums, strings, integers and byte arrays. Its typed
+    // decoder has already traversed every request structurally. Exact
+    // equality with that complete serialization also proves every original
+    // key, value, order and delimiter: ignored or duplicate fields, escaped
+    // alternatives and trailing JSON cannot survive this comparison. Parsing
+    // those same numeric byte arrays a second time adds no schema evidence.
+    // Keep the generic structural audit for other intent shapes, including
+    // recursive authority envelopes and V2 hidden in ignored legacy fields.
+    if log_entry_has_exact_fenced_transition_v2_batch_shape(entry) {
+        return Ok(());
+    }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let audited =
         <ExactFencedTransitionV2Json as serde::Deserialize>::deserialize(&mut deserializer)
@@ -22783,16 +21283,7 @@ fn validate_exact_fenced_transition_v2_log_json(
     deserializer
         .end()
         .map_err(|_| invalid_data("session consensus V2 log entry schema is invalid"))?;
-    let canonical = encode_json(entry)
-        .map_err(|_| invalid_data("session consensus V2 log entry encoding failed"))?;
-    // The duplicate-aware visitor deliberately materializes the whole JSON
-    // value while it rejects nested duplicate keys; canonical *bytes*, not
-    // that normalized value, are the durable V2 equality relation.
-    let _ = &audited.value;
-    if audited.has_duplicate_key
-        || !audited.contains_v2_discriminant
-        || bytes != canonical.as_slice()
-    {
+    if audited.has_duplicate_key || !audited.contains_v2_discriminant {
         return Err(invalid_data(
             "session consensus V2 log entry schema is invalid",
         ));
@@ -22806,10 +21297,14 @@ fn validate_exact_fenced_transition_v2_log_json(
 /// V2 singleton, activation, maintenance, batch, and authorized forms use an
 /// exact structural schema, including when a V2 discriminant appears only in
 /// data an ordinary derived decoder would ignore.
-fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeConfig>> {
+pub(crate) fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeConfig>> {
+    #[cfg(test)]
+    log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::FullDecode);
     if bytes.is_empty() || bytes.len() > SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES {
         return Err(invalid_data("session consensus log entry size is invalid"));
     }
+    #[cfg(test)]
+    log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::TypedDecode);
     let entry: Entry<SessionRaftTypeConfig> = decode_json(bytes)?;
     let typed_v2 = log_entry_contains_fenced_transition_v2(&entry);
     let raw_v2 = !typed_v2
@@ -22819,6 +21314,325 @@ fn decode_consensus_log_entry(bytes: &[u8]) -> io::Result<Entry<SessionRaftTypeC
         validate_exact_fenced_transition_v2_log_json(bytes, &entry)?;
     }
     Ok(entry)
+}
+
+// These are optional retention limits, not durable-row acceptance limits.
+// A narrow typed proof also owns one completely audited Entry. Every nested
+// capacity and the normalized identifier backing are charged before retention;
+// other eligible batches retain only the original encoded allocation.
+const LOG_ROW_REUSE_MAX_RAW_CAPACITY: usize = 32 * 1024;
+const LOG_ROW_REUSE_MAX_RETAINED_BYTES: usize = 64 * 1024;
+const LOG_ROW_REUSE_MAX_TYPED_BYTES: usize = 256 * 1024;
+const LOG_ROW_REUSE_AGGREGATE_BYTES: usize = 4 * 1024 * 1024;
+
+struct LogRowRetentionBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl LogRowRetentionBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Option<LogRowRetentionPermit<'_>> {
+        let used = self.used.load(Ordering::Acquire);
+        let next = used.checked_add(bytes).filter(|next| *next <= self.limit)?;
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::BeforeReservationCas);
+        // One attempt only. Even ordinary reservation contention uses the
+        // original decoder; this optional optimization never waits or retries.
+        self.used
+            .compare_exchange(used, next, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(LogRowRetentionPermit {
+            budget: self,
+            bytes,
+        })
+    }
+}
+
+struct LogRowRetentionPermit<'budget> {
+    budget: &'budget LogRowRetentionBudget,
+    bytes: usize,
+}
+
+impl Drop for LogRowRetentionPermit<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::Release);
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Refund);
+    }
+}
+
+static LOG_ROW_RETENTION_BUDGET: LogRowRetentionBudget =
+    LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+
+struct LogRowCanonicalProof<'budget> {
+    // Field destruction order is part of the resource contract. On mismatch or
+    // abandonment, both allocations die before refund. A hit instead MOVES the
+    // Entry into the original decoder result position, deallocates its empty
+    // Box, then frees these extra bytes before refund. That Entry thereafter
+    // has the original consumer/output lifetime; no detached clone survives.
+    encoded: Vec<u8>,
+    #[cfg(test)]
+    _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+    entry: Option<Box<Entry<SessionRaftTypeConfig>>>,
+    #[cfg(test)]
+    _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
+    epoch: i64,
+    term: i64,
+    index: i64,
+    _permit: LogRowRetentionPermit<'budget>,
+}
+
+// Construction owns the original decoder result and encoded buffer before any
+// new allocation. Declaration order keeps both ahead of the permit on unwind.
+// The final proof will box the normalized Entry to keep empty owners small.
+struct LogRowPendingProof<'budget> {
+    encoded: Vec<u8>,
+    #[cfg(test)]
+    _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+    entry: Option<Entry<SessionRaftTypeConfig>>,
+    #[cfg(test)]
+    _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
+    permit: LogRowRetentionPermit<'budget>,
+}
+
+struct LogRowReadReuse<'budget> {
+    budget: &'budget LogRowRetentionBudget,
+    proof: Option<LogRowCanonicalProof<'budget>>,
+    capture_attempted: bool,
+}
+
+impl<'budget> LogRowReadReuse<'budget> {
+    fn new(budget: &'budget LogRowRetentionBudget) -> Self {
+        Self {
+            budget,
+            proof: None,
+            capture_attempted: false,
+        }
+    }
+
+    fn retained_bytes(encoded_capacity: usize) -> Option<usize> {
+        if encoded_capacity > LOG_ROW_REUSE_MAX_RAW_CAPACITY {
+            return None;
+        }
+        // Account for the containing owner and a moved proof's fixed storage
+        // conservatively in addition to the actual Vec capacity. Raw mode has
+        // no copied bytes or retained decoded allocations.
+        encoded_capacity
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<LogRowCanonicalProof<'budget>>())
+            .filter(|bytes| *bytes <= LOG_ROW_REUSE_MAX_RETAINED_BYTES)
+    }
+
+    fn typed_retained_bytes(
+        encoded_capacity: usize,
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> Option<usize> {
+        let EntryPayload::Normal(command) = &entry.payload else {
+            return None;
+        };
+        let (intent, authorization_bytes) = match &command.intent {
+            SessionMutationIntent::Authorized { mutation, .. } => (
+                mutation.as_ref(),
+                std::mem::size_of::<SessionMutationIntent>(),
+            ),
+            intent => (intent, 0),
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+            return None;
+        };
+        if !(1..=8).contains(&requests.len()) {
+            return None;
+        }
+        // Include the final owner, a moved proof, the pending construction
+        // guard, Box<Entry>, a full Entry move at transfer, the temporary Box
+        // handle and one sequential identifier conversion. These are concrete
+        // capacity/layout terms, not compiler frames or allocator/RSS bounds.
+        let mut bytes = Self::retained_bytes(encoded_capacity)?
+            .checked_add(std::mem::size_of::<LogRowPendingProof<'budget>>())?
+            .checked_add(std::mem::size_of::<Entry<SessionRaftTypeConfig>>().checked_mul(2)?)?
+            .checked_add(std::mem::size_of::<Option<Box<Entry<SessionRaftTypeConfig>>>>())?
+            .checked_add(crate::SessionKey::log_row_reuse_normalization_bytes()?)?
+            .checked_add(authorization_bytes)?
+            .checked_add(Self::request_allocation_bytes(requests.capacity())?)?;
+        for request in requests {
+            bytes = bytes.checked_add(request.log_row_reuse_allocation_bytes()?)?;
+        }
+        (bytes <= LOG_ROW_REUSE_MAX_TYPED_BYTES).then_some(bytes)
+    }
+
+    fn request_allocation_bytes(capacity: usize) -> Option<usize> {
+        capacity.checked_mul(std::mem::size_of::<crate::FencedTransitionV2Request>())
+    }
+
+    fn capture_after_full_audit(
+        &mut self,
+        epoch: i64,
+        term: i64,
+        index: i64,
+        encoded: Vec<u8>,
+        entry: Entry<SessionRaftTypeConfig>,
+    ) {
+        let first_attempt = !std::mem::replace(&mut self.capture_attempted, true);
+        if !first_attempt || !log_entry_has_exact_fenced_transition_v2_batch_shape(&entry) {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Ineligible);
+            return;
+        }
+        // Select typed/raw/fallback before the single CAS. In particular a
+        // failed typed reservation cannot attempt another, smaller raw charge.
+        let typed_bytes = Self::typed_retained_bytes(encoded.capacity(), &entry);
+        let retained_bytes = typed_bytes.or_else(|| Self::retained_bytes(encoded.capacity()));
+        let Some(retained_bytes) = retained_bytes else {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Ineligible);
+            return;
+        };
+        // Drop an ineligible decoded value before reservation, including any
+        // externally supplied backing's destructor. The raw path retains none.
+        let entry = if typed_bytes.is_some() {
+            Some(entry)
+        } else {
+            drop(entry);
+            None
+        };
+        let Some(permit) = self.budget.try_reserve(retained_bytes) else {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::BudgetFallback);
+            return;
+        };
+        if let Some(entry) = entry {
+            // Construct this guard without any fallible operation after the
+            // reservation. It owns raw and decoded allocations before the
+            // first normalization, Box allocation or test-only unwind hook.
+            let mut pending = LogRowPendingProof {
+                encoded,
+                #[cfg(test)]
+                _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+                entry: Some(entry),
+                #[cfg(test)]
+                _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
+                permit,
+            };
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Reserved);
+            let Some(Entry {
+                payload: EntryPayload::Normal(command),
+                ..
+            }) = pending.entry.as_mut()
+            else {
+                return;
+            };
+            let intent = match &mut command.intent {
+                SessionMutationIntent::Authorized { mutation, .. } => mutation.as_mut(),
+                intent => intent,
+            };
+            let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+                return;
+            };
+            for request in requests {
+                request.normalize_log_row_reuse_backing();
+                #[cfg(test)]
+                log_row_reuse_test_observer::note(
+                    log_row_reuse_test_observer::Event::NormalizedRequest,
+                );
+            }
+            // This local is declared after the guard, so an unwind after
+            // boxing drops it before the guard refunds its permit. The final
+            // field moves below are infallible and retain the same order.
+            let entry = pending.entry.take().map(Box::new);
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::BoxedEntry);
+            self.proof = Some(LogRowCanonicalProof {
+                encoded: pending.encoded,
+                #[cfg(test)]
+                _after_bytes: pending._after_bytes,
+                entry,
+                #[cfg(test)]
+                _after_entry: pending._after_entry,
+                epoch,
+                term,
+                index,
+                _permit: pending.permit,
+            });
+        } else {
+            self.proof = Some(LogRowCanonicalProof {
+                encoded,
+                #[cfg(test)]
+                _after_bytes: log_row_reuse_test_observer::AfterBytesDrop,
+                entry: None,
+                #[cfg(test)]
+                _after_entry: log_row_reuse_test_observer::AfterEntrySlotDrop,
+                epoch,
+                term,
+                index,
+                _permit: permit,
+            });
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Reserved);
+        }
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Captured);
+    }
+
+    // Call only at the original decoder position, after field conversions and
+    // epoch validation. Exact fresh bytes prove the prior full audit. Typed
+    // mode moves its Entry here; raw mode repeats typed decoding. Every original
+    // consumer-specific validation still runs at the call site in both modes.
+    fn decode(
+        &mut self,
+        epoch: i64,
+        term: i64,
+        index: i64,
+        encoded: &[u8],
+    ) -> io::Result<Entry<SessionRaftTypeConfig>> {
+        if self
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.index == index)
+        {
+            let Some(mut proof) = self.proof.take() else {
+                return decode_consensus_log_entry(encoded);
+            };
+            let matches = proof.epoch == epoch
+                && proof.term == term
+                && proof.index == index
+                && proof.encoded == encoded;
+            if matches {
+                if let Some(entry) = proof.entry.take().map(|entry| *entry) {
+                    #[cfg(test)]
+                    log_row_reuse_test_observer::note(
+                        log_row_reuse_test_observer::Event::TypedTransfer,
+                    );
+                    // The Box is already deallocated. This destroys only the
+                    // extra raw/proof ownership, then refunds. `entry` is now
+                    // the ordinary consumer result, never a surviving clone.
+                    drop(proof);
+                    #[cfg(test)]
+                    log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Hit);
+                    return Ok(entry);
+                }
+                drop(proof);
+                #[cfg(test)]
+                log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::Hit);
+                #[cfg(test)]
+                log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::TypedDecode);
+                return decode_json(encoded);
+            }
+            // Mismatch consumes both raw and decoded allocations before the
+            // permit refund and before entering the unchanged full decoder.
+            drop(proof);
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::TupleFallback);
+        }
+        decode_consensus_log_entry(encoded)
+    }
 }
 
 fn epoch_i64(identity: SessionConsensusIdentity) -> io::Result<i64> {
@@ -22834,7 +21648,7 @@ fn validate_epoch(stored: i64, identity: SessionConsensusIdentity) -> io::Result
     Ok(())
 }
 
-fn validate_log_id(log_id: &LogId<SessionConsensusNodeId>) -> io::Result<(i64, i64)> {
+pub(crate) fn validate_log_id(log_id: &LogId<SessionConsensusNodeId>) -> io::Result<(i64, i64)> {
     let term = checked_i64(log_id.leader_id.term)?;
     let index = checked_i64(log_id.index)?;
     Ok((term, index))
@@ -23424,10 +22238,35 @@ impl MembershipLogProjection {
         storage_identity: SessionConsensusIdentity,
         allow_published_684_recovery_layout: bool,
     ) -> io::Result<Self> {
+        // A projection may reuse fully validated rows only while they belong
+        // to one SQLite snapshot. Append and fixed-authority raw reads already
+        // hold a transaction; dynamic/recovery readers acquire one just for
+        // this load. No validation result survives into a later load.
+        if conn.is_autocommit() {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)
+                .map_err(db_error)?;
+            let projection = Self::load_in_transaction(
+                &tx,
+                storage_identity,
+                allow_published_684_recovery_layout,
+            )?;
+            tx.commit().map_err(db_error)?;
+            return Ok(projection);
+        }
+        Self::load_in_transaction(conn, storage_identity, allow_published_684_recovery_layout)
+    }
+
+    fn load_in_transaction(
+        conn: &Connection,
+        storage_identity: SessionConsensusIdentity,
+        allow_published_684_recovery_layout: bool,
+    ) -> io::Result<Self> {
+        debug_assert!(!conn.is_autocommit());
         let (application_sequence, _, logical_time, _) = read_machine_sync(conn, storage_identity)?;
         let scope = read_membership_scope_sync(conn, storage_identity)?;
+        let fenced_receipt_layout = fenced_transition_receipt_ledger_layout_sync(conn)?;
         let (fenced_receipt_ledger_has_commitments, projected_fenced_receipt_count) =
-            match fenced_transition_receipt_ledger_layout_sync(conn)? {
+            match fenced_receipt_layout {
                 FencedTransitionReceiptLedgerLayout::Activated => {
                     (true, fenced_transition_receipt_count_sync(conn)?)
                 }
@@ -23443,18 +22282,13 @@ impl MembershipLogProjection {
                     ));
                 }
             };
-        let fenced_transition_scope_activated = fenced_transition_activation_matches_scope_sync(
-            conn,
-            storage_identity,
-            scope.current_identity,
-            &scope.current_members,
-        )?;
-        let protected_roster_profile_scope_activated =
-            protected_roster_profile_activation_matches_scope_sync(
+        let (fenced_transition_scope_activated, protected_roster_profile_scope_activated) =
+            fenced_transition_v1_scope_activations_sync(
                 conn,
                 storage_identity,
                 scope.current_identity,
                 &scope.current_members,
+                fenced_receipt_layout,
             )?;
         let protected_roster_profile_v2_scope_activated =
             protected_roster_profile_v2_activation_matches_scope_sync(
@@ -23466,24 +22300,38 @@ impl MembershipLogProjection {
         let (projected_v2_history, projected_v2_scope_activated) =
             match fenced_transition_v2_ledger_layout_sync(conn)? {
                 FencedTransitionV2LedgerLayout::Absent => (None, false),
-                FencedTransitionV2LedgerLayout::Activated => (
-                    Some(read_fenced_transition_v2_history_row_in_sync(
+                FencedTransitionV2LedgerLayout::Activated => {
+                    let history = read_fenced_transition_v2_history_row_in_sync(
                         conn,
                         storage_identity,
                         false,
-                    )?),
-                    fenced_transition_v2_activation_matches_scope_sync(
+                    )?;
+                    let activated = fenced_transition_v2_activation_matches_history_sync(
                         conn,
                         storage_identity,
                         scope.current_identity,
                         &scope.current_members,
                         crate::fenced_transition::fenced_transition_v2_profile_digest(),
-                    )?,
-                ),
+                        &history,
+                    )?;
+                    (Some(history), activated)
+                }
             };
+        let membership = read_membership_unchecked_sync(conn, storage_identity)?;
+        if !is_pristine_membership(&membership)
+            || read_applied_sync(conn, storage_identity)?.is_some()
+        {
+            let log_index = membership
+                .log_id()
+                .ok_or_else(|| {
+                    invalid_data("session consensus membership log identity is missing")
+                })?
+                .index;
+            validate_membership_for_log(&membership, &scope, log_index)?;
+        }
         Ok(Self {
             scope,
-            membership: read_membership_sync(conn, storage_identity)?,
+            membership,
             projected_bound_requests: BTreeSet::new(),
             projected_fenced_receipt_count,
             fenced_receipt_ledger_has_commitments,
@@ -24678,6 +23526,18 @@ fn replay_unapplied_log_prefix_sync(
     before: u64,
     projection: &mut MembershipLogProjection,
 ) -> io::Result<Option<u64>> {
+    // Append keeps both of its original full highest-row audits and every
+    // prefix decode. Only a range-read owner may capture a canonical proof.
+    replay_unapplied_log_prefix_with_reuse_sync(conn, storage_identity, before, projection, None)
+}
+
+fn replay_unapplied_log_prefix_with_reuse_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    before: u64,
+    projection: &mut MembershipLogProjection,
+    mut reuse: Option<&mut LogRowReadReuse<'_>>,
+) -> io::Result<Option<u64>> {
     let applied_log_id = read_applied_sync(conn, storage_identity)?;
     let applied = applied_log_id.as_ref().map(|log_id| log_id.index);
     let first = applied
@@ -24689,7 +23549,7 @@ fn replay_unapplied_log_prefix_sync(
         .transpose()?
         .unwrap_or(0)
         .max(logical_log_start(conn, storage_identity, 0)?);
-    let target = last_log_sync(conn, storage_identity)?
+    let target = last_log_with_optional_capture_sync(conn, storage_identity, reuse.as_deref_mut())?
         .map(|log_id| {
             log_id
                 .index
@@ -24718,7 +23578,14 @@ fn replay_unapplied_log_prefix_sync(
         let index: i64 = row.get(2).map_err(db_error)?;
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, storage_identity)?;
-        let entry = decode_consensus_log_entry(&encoded)?;
+        let entry = match reuse.as_deref_mut() {
+            Some(reuse) => reuse.decode(epoch, term, index, &encoded)?,
+            None => decode_consensus_log_entry(&encoded)?,
+        };
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(
+            log_row_reuse_test_observer::Event::PrefixContiguityCheck,
+        );
         if entry.log_id.index != expected
             || checked_u64(index)? != expected
             || checked_u64(term)? != entry.log_id.leader_id.term
@@ -24728,12 +23595,18 @@ fn replay_unapplied_log_prefix_sync(
             ));
         }
         if let Some(previous) = previous_log.as_ref() {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(
+                log_row_reuse_test_observer::Event::PrefixLeaderCheck,
+            );
             ensure_log_id_not_after(
                 previous,
                 &entry.log_id,
                 "persisted session consensus unapplied log leader ordering regressed",
             )?;
         }
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::PrefixProjection);
         projection.project(conn, &entry, storage_identity)?;
         expected = expected
             .checked_add(1)
@@ -24851,7 +23724,9 @@ fn read_log_pointer(
         "SELECT configuration_epoch, term, log_index, log_id_json FROM {table} WHERE singleton = 1"
     );
     let row = conn
-        .query_row(&sql, [], |row| {
+        .prepare_cached(&sql)
+        .map_err(db_error)?
+        .query_row([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -24901,8 +23776,11 @@ fn retained_log_id_at_sync(
     index: u64,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index = ?1",
+        )
+        .map_err(db_error)?
+        .query_row(
             [checked_i64(index)?],
             |row| {
                 Ok((
@@ -25264,6 +24142,11 @@ fn decode_durable_log_audit_batch(
     rows: &[EncodedDurableLogAuditRow],
     identity: SessionConsensusIdentity,
 ) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    if rows.len() < DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS {
+        // Even discovering CPU/cgroup capacity involves OS work. Ordinary
+        // frontier advances have no parallel work to size and stay inline.
+        return decode_durable_log_audit_rows(rows, identity);
+    }
     decode_durable_log_audit_batch_with_available_parallelism(
         rows,
         identity,
@@ -25697,11 +24580,16 @@ fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
         let retained_through_target =
             read_log_range_sync(conn, identity, start, Some(target_end), None)?;
         if retained_through_target.last().map(|entry| entry.log_id) == Some(*target) {
-            return validate_exact_log_prefix_through_sync(
+            // The complete original payload audit above already includes this
+            // exact target. No source row or marker changed during the range
+            // projection in this transaction; retain every ordinary prefix
+            // predicate without decoding the same witness set again.
+            return validate_exact_log_prefix_from_witnesses_sync(
                 conn,
                 identity,
                 target,
                 require_retained_target,
+                &witnesses,
             );
         }
         // The exact P+1..C retained prefix followed by an entirely absent
@@ -25735,7 +24623,13 @@ fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
             .index
             .checked_add(1)
             .ok_or_else(|| invalid_data("session consensus retained tail index is exhausted"))?;
-        let retained = read_log_range_sync(conn, identity, start, Some(retained_end), None)?;
+        checked_i64(retained_end)?;
+        // The original P+1..S read strictly decoded and projected this entire
+        // P+1..C subset from the same membership state and purge floor. Reuse
+        // its rows only within this unchanged transaction. Exact full LogId
+        // boundaries and the absent-suffix query below remain mandatory.
+        let retained = &retained_through_target
+            [..retained_through_target.partition_point(|entry| entry.log_id.index < retained_end)];
         if retained.first().map(|entry| entry.log_id.index) != Some(start)
             || retained.last().map(|entry| entry.log_id) != Some(committed)
         {
@@ -25939,6 +24833,14 @@ pub(crate) fn last_log_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    last_log_with_optional_capture_sync(conn, identity, None)
+}
+
+fn last_log_with_optional_capture_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    reuse: Option<&mut LogRowReadReuse<'_>>,
+) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     let floor = read_purged_sync(conn, identity)?;
     let row = conn
         .query_row(
@@ -25962,7 +24864,13 @@ pub(crate) fn last_log_sync(
     if let EntryPayload::Normal(command) = &entry.payload {
         validate_command_for_log(command, identity)?;
     }
-    Ok(Some(entry.log_id))
+    let log_id = entry.log_id;
+    if let Some(reuse) = reuse {
+        reuse.capture_after_full_audit(epoch, term, index, encoded, entry);
+    }
+    #[cfg(test)]
+    log_row_reuse_test_observer::after_highest_audit(conn);
+    Ok(Some(log_id))
 }
 
 pub(crate) fn read_log_range_sync(
@@ -26119,6 +25027,72 @@ fn read_log_range_with_batch_sync(
     append_entries_batch: bool,
     recovery_profile: LogRangeRecoveryProfile,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    let mut reuse = LogRowReadReuse::new(&LOG_ROW_RETENTION_BUDGET);
+    read_log_range_with_batch_and_reuse_sync(
+        conn,
+        identity,
+        start,
+        end,
+        limit,
+        append_entries_batch,
+        recovery_profile,
+        &mut reuse,
+    )
+}
+
+struct LogRangeReadOptions {
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    append_entries_batch: bool,
+    recovery_profile: LogRangeRecoveryProfile,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_log_range_with_batch_and_reuse_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    append_entries_batch: bool,
+    recovery_profile: LogRangeRecoveryProfile,
+    reuse: &mut LogRowReadReuse<'_>,
+) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    let mut entries = Vec::new();
+    visit_log_range_with_reuse_sync(
+        conn,
+        identity,
+        LogRangeReadOptions {
+            start,
+            end,
+            limit,
+            append_entries_batch,
+            recovery_profile,
+        },
+        reuse,
+        |entry| entries.push(entry),
+    )?;
+    Ok(entries)
+}
+
+/// Run the complete range decoder, membership projection and original batch
+/// decisions before handing each included row to its consumer. A consumer
+/// cannot stop this audit early or hide a later malformed retained row.
+fn visit_log_range_with_reuse_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    options: LogRangeReadOptions,
+    reuse: &mut LogRowReadReuse<'_>,
+    mut visit: impl FnMut(Entry<SessionRaftTypeConfig>),
+) -> io::Result<()> {
+    let LogRangeReadOptions {
+        start,
+        end,
+        limit,
+        append_entries_batch,
+        recovery_profile,
+    } = options;
     let start_u64 = start;
     let start = checked_i64(start)?;
     let end = end.map(checked_i64).transpose()?;
@@ -26153,9 +25127,14 @@ fn read_log_range_with_batch_sync(
         .transpose()?
         .unwrap_or(0)
         .max(start_u64);
-    let applied_index =
-        replay_unapplied_log_prefix_sync(conn, identity, start_u64, &mut projection)?;
-    let mut entries = Vec::new();
+    let applied_index = replay_unapplied_log_prefix_with_reuse_sync(
+        conn,
+        identity,
+        start_u64,
+        &mut projection,
+        Some(reuse),
+    )?;
+    let mut first_entry = true;
     let sql = match (end, limit) {
         (Some(_), Some(_)) => {
             "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC LIMIT ?3"
@@ -26185,7 +25164,9 @@ fn read_log_range_with_batch_sync(
         let index: i64 = row.get(2).map_err(db_error)?;
         let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
         validate_epoch(epoch, identity)?;
-        let entry = decode_consensus_log_entry(&encoded)?;
+        let entry = reuse.decode(epoch, term, index, &encoded)?;
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeLogIdCheck);
         validate_log_id(&entry.log_id)?;
         if checked_u64(term)? != entry.log_id.leader_id.term
             || checked_u64(index)? != entry.log_id.index
@@ -26194,16 +25175,20 @@ fn read_log_range_with_batch_sync(
         }
         if recovery_profile.scans_physical_retained_suffix()
             && previous_log.is_none()
-            && entries.is_empty()
+            && first_entry
         {
             expected_log_index = entry.log_id.index;
         }
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeContiguityCheck);
         if entry.log_id.index != expected_log_index {
             return Err(invalid_data(
                 "persisted session consensus log range contains a hole",
             ));
         }
         if let Some(previous) = previous_log.as_ref() {
+            #[cfg(test)]
+            log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeLeaderCheck);
             if entry.log_id.leader_id.term < previous.leader_id.term
                 || (entry.log_id.leader_id.term == previous.leader_id.term
                     && entry.log_id.leader_id != previous.leader_id)
@@ -26214,6 +25199,8 @@ fn read_log_range_with_batch_sync(
             }
         }
         let log_id = entry.log_id;
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeProjection);
         match applied_index {
             Some(applied_through) if entry.log_id.index <= applied_through => {
                 validate_applied_entry_for_membership_scope(
@@ -26225,6 +25212,8 @@ fn read_log_range_with_batch_sync(
             }
             _ => projection.project(conn, &entry, identity)?,
         }
+        #[cfg(test)]
+        log_row_reuse_test_observer::note(log_row_reuse_test_observer::Event::RangeBatchDecision);
         let decision = batch
             .as_mut()
             .map(|batch| {
@@ -26234,9 +25223,12 @@ fn read_log_range_with_batch_sync(
             })
             .transpose()?;
         match decision {
-            Some(AppendEntriesBatchDecision::Include) | None => entries.push(entry),
+            Some(AppendEntriesBatchDecision::Include) | None => {
+                visit(entry);
+                first_entry = false;
+            }
             Some(AppendEntriesBatchDecision::IncludeAndStop) => {
-                entries.push(entry);
+                visit(entry);
                 break;
             }
             Some(AppendEntriesBatchDecision::StopBefore) => break,
@@ -26247,7 +25239,7 @@ fn read_log_range_with_batch_sync(
             .checked_add(1)
             .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
     }
-    Ok(entries)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -26524,8 +25516,10 @@ fn logical_purge_logs_in_tx(
     through: &LogId<SessionConsensusNodeId>,
     _index: i64,
 ) -> io::Result<()> {
+    let mut current_witnesses = None;
     if let Some(current) = read_purged_sync(tx, identity)? {
-        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        let witnesses = validated_log_witnesses_through_sync(tx, identity, &current)?;
+        validate_exact_log_prefix_from_witnesses_sync(tx, identity, &current, false, &witnesses)?;
         if through.index < current.index {
             // A delayed engine notification may describe a prefix which the
             // snapshot replacement transaction already made durable. It is
@@ -26549,10 +25543,43 @@ fn logical_purge_logs_in_tx(
             through,
             "session consensus purged index regressed",
         )?;
+        current_witnesses = Some(witnesses);
     }
     let applied = read_applied_sync(tx, identity)?
         .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
-    let witnesses = validated_log_witnesses_through_sync(tx, identity, &applied)?;
+    let witnesses = if let Some(mut witnesses) = current_witnesses {
+        // The current-floor audit already decoded every retained row through
+        // the highest compaction marker. No row or marker has changed in this
+        // transaction. Preserve that audit's error and idempotence ordering,
+        // then decode only the applied tail beyond its complete scan bound.
+        // These witnesses never escape this transaction or authorize a later
+        // call without a fresh full-row audit.
+        validate_log_id(&applied)?;
+        let previous_scan_end = witnesses
+            .last_key_value()
+            .map(|(index, _)| *index)
+            .ok_or_else(|| invalid_data("session consensus purge audit lacks an exact witness"))?;
+        let start = previous_scan_end
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+        insert_validated_log_rows_in_range_sync(
+            tx,
+            identity,
+            start,
+            applied.index,
+            &mut witnesses,
+        )?;
+        for pair in witnesses.values().collect::<Vec<_>>().windows(2) {
+            ensure_log_id_not_after(
+                pair[0],
+                pair[1],
+                "session consensus durable log leader ordering regressed",
+            )?;
+        }
+        witnesses
+    } else {
+        validated_log_witnesses_through_sync(tx, identity, &applied)?
+    };
     validate_exact_log_prefix_from_witnesses_sync(tx, identity, &applied, false, &witnesses)?;
     ensure_log_id_not_after(
         through,
@@ -26618,15 +25645,19 @@ fn logical_purge_logs_after_portable_snapshot_install_in_tx(
         &applied,
         "session consensus cannot purge unapplied logs",
     )?;
-    validate_exact_log_prefix_after_portable_snapshot_install_sync(
-        tx,
-        identity,
-        authority_profile,
-        preinstall_committed,
-        preinstall_applied,
-        through,
-        false,
-    )?;
+    if through != &applied {
+        // Equal full LogIds have just received this exact proof, with no
+        // intervening write. Distinct applied and purge cuts keep both audits.
+        validate_exact_log_prefix_after_portable_snapshot_install_sync(
+            tx,
+            identity,
+            authority_profile,
+            preinstall_committed,
+            preinstall_applied,
+            through,
+            false,
+        )?;
+    }
     save_log_pointer(tx, "consensus_purged", identity, through)
 }
 
@@ -27120,7 +26151,7 @@ pub(crate) fn read_membership_sync(
     Ok(membership)
 }
 
-fn payload_digest(
+pub(crate) fn payload_digest(
     storage_identity: SessionConsensusIdentity,
     command: &SessionConsensusCommand,
 ) -> io::Result<[u8; 32]> {
@@ -27253,7 +26284,7 @@ pub(crate) fn exact_operator_recovery_v2_outcome_sync(
 /// envelope without reconstructing a leader-owned command.  Receipt status
 /// uses this for an already-authorized exact scope; it deliberately accepts
 /// neither a client-supplied internal request ID nor an unbound digest.
-fn authorized_mutation_payload_digest(
+pub(crate) fn authorized_mutation_payload_digest(
     storage_identity: SessionConsensusIdentity,
     authority_identity: SessionConsensusIdentity,
     mutation: &SessionMutationIntent,
@@ -27306,32 +26337,13 @@ pub(crate) fn read_consumer_request_binding_sync(
     binding_request_id: SessionConsensusRequestId,
     request_commitment: [u8; 32],
 ) -> Result<ConsumerRequestBindingLookup, StoreError> {
-    let binding_digest = authorized_mutation_payload_digest(
+    consumer_receipts::read_consumer_request_binding_sync(
+        &conn,
         storage_identity,
         authority_identity,
-        &SessionMutationIntent::BindConsumerRequest { request_commitment },
+        binding_request_id,
+        request_commitment,
     )
-    .map_err(|_| StoreError::BackendUnavailable("consumer binding lookup is unavailable".into()))?;
-    match read_outcome_sync(conn, storage_identity, binding_request_id).map_err(|_| {
-        StoreError::BackendUnavailable("consumer binding lookup is unavailable".into())
-    })? {
-        Some((digest, response))
-            if digest == binding_digest
-                && matches!(&response.result, Ok(SessionMutationOutcome::Unit)) =>
-        {
-            Ok(ConsumerRequestBindingLookup::Matched(Box::new(response)))
-        }
-        Some(_) => Ok(ConsumerRequestBindingLookup::Conflict),
-        None if request_id_has_fenced_transition_receipt_sync(
-            conn,
-            storage_identity,
-            binding_request_id,
-        )? =>
-        {
-            Ok(ConsumerRequestBindingLookup::Conflict)
-        }
-        None => Ok(ConsumerRequestBindingLookup::Missing),
-    }
 }
 
 #[derive(serde::Serialize)]
@@ -27384,12 +26396,12 @@ fn fenced_transition_request(intent: &SessionMutationIntent) -> Option<&FencedTr
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum ProtectedRosterProfileVersion {
+pub(crate) enum ProtectedRosterProfileVersion {
     V1,
     V2,
 }
 
-enum RosterCommandRef<'a> {
+pub(crate) enum RosterCommandRef<'a> {
     Admission(
         &'a ConsensusRosterAdmissionCommand,
         ProtectedRosterProfileVersion,
@@ -27399,7 +26411,7 @@ enum RosterCommandRef<'a> {
 }
 
 impl RosterCommandRef<'_> {
-    const fn profile(&self) -> ProtectedRosterProfileVersion {
+    pub(crate) const fn profile(&self) -> ProtectedRosterProfileVersion {
         match self {
             Self::Admission(_, profile) => *profile,
             Self::TerminalV1(_) => ProtectedRosterProfileVersion::V1,
@@ -27408,18 +26420,18 @@ impl RosterCommandRef<'_> {
     }
 }
 
-struct ProtectedRosterCommandRef<'a> {
-    roster: RosterCommandRef<'a>,
-    authority_identity: SessionConsensusIdentity,
+pub(crate) struct ProtectedRosterCommandRef<'a> {
+    pub(crate) roster: RosterCommandRef<'a>,
+    pub(crate) authority_identity: SessionConsensusIdentity,
 }
 
 #[derive(Clone, Copy)]
-enum ProtectedRosterCommandAuthorityValidation {
+pub(crate) enum ProtectedRosterCommandAuthorityValidation {
     CurrentOnly,
     AppliedHistory,
 }
 
-fn contains_protected_roster_command(intent: &SessionMutationIntent) -> bool {
+pub(crate) fn contains_protected_roster_command(intent: &SessionMutationIntent) -> bool {
     let mut intent = intent;
     loop {
         match intent {
@@ -27470,7 +26482,7 @@ fn roster_command(intent: &SessionMutationIntent) -> Option<RosterCommandRef<'_>
 /// one outer envelope here so follower append, deterministic apply, and replay
 /// cannot unwrap an untrusted raw or nested roster command around that
 /// boundary.
-fn protected_roster_command_for_scope<'a>(
+pub(crate) fn protected_roster_command_for_scope<'a>(
     intent: &'a SessionMutationIntent,
     scope: &MembershipValidationScope,
     storage_identity: SessionConsensusIdentity,
@@ -27688,7 +26700,7 @@ fn fenced_transition_v2_maintenance(
 /// It binds the complete canonical request to the stable storage/consensus
 /// identity, but intentionally excludes changing authority, leader timestamp,
 /// and log metadata.
-fn fenced_transition_payload_digest(
+pub(crate) fn fenced_transition_payload_digest(
     storage_identity: SessionConsensusIdentity,
     request: &FencedTransitionRequest,
 ) -> io::Result<[u8; 32]> {
@@ -27758,7 +26770,7 @@ fn update_fenced_transition_v2_length_prefixed(
     Ok(())
 }
 
-fn fenced_transition_receipt_binding_digest(
+pub(crate) fn fenced_transition_receipt_binding_digest(
     identity: SessionConsensusIdentity,
     request_id: SessionConsensusRequestId,
     payload_digest: [u8; 32],
@@ -27777,7 +26789,7 @@ fn fenced_transition_receipt_binding_digest(
     Ok(hasher.finalize().into())
 }
 
-fn fenced_transition_receipt_response_digest(
+pub(crate) fn fenced_transition_receipt_response_digest(
     binding_digest: [u8; 32],
     response: &SessionConsensusResponse,
 ) -> io::Result<[u8; 32]> {
@@ -28851,7 +27863,7 @@ fn maintain_fenced_transition_v2_history_sync(
     Ok(FencedTransitionV2MaintenanceResult::Applied)
 }
 
-fn validate_fenced_transition_receipt(
+pub(crate) fn validate_fenced_transition_receipt(
     retained_until: Timestamp,
     response: &SessionConsensusResponse,
 ) -> io::Result<()> {
@@ -28902,7 +27914,7 @@ fn validate_fenced_transition_receipt(
 /// Only fixed deterministic results the fenced executor can durably record.
 /// In particular, no caller-authored diagnostic string or node-local failure
 /// may enter a receipt that status/reopen later deserializes.
-fn is_persistable_fenced_transition_error(error: &StoreError) -> bool {
+pub(crate) fn is_persistable_fenced_transition_error(error: &StoreError) -> bool {
     matches!(
         error,
         StoreError::TopologyAuthorityRevoked
@@ -28918,7 +27930,7 @@ fn is_persistable_fenced_transition_error(error: &StoreError) -> bool {
     )
 }
 
-fn validate_fenced_transition_response_for_request(
+pub(crate) fn validate_fenced_transition_response_for_request(
     request: &FencedTransitionRequest,
     response: &SessionConsensusResponse,
 ) -> io::Result<()> {
@@ -29835,119 +28847,14 @@ pub(crate) fn read_consumer_lease_mutation_status_sync(
     operation_request_id: SessionConsensusRequestId,
     request: &crate::consumer::SessionConsumerRequest,
 ) -> Result<crate::consumer::SessionConsumerLeaseMutationStatus, StoreError> {
-    use crate::consumer::{
-        SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationStatus,
-        SessionConsumerOperation,
-    };
-
-    request.validate().map_err(|_| {
-        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
-    })?;
-    if request.scope().consensus_identity() != authority_identity {
-        return Err(StoreError::BackendUnavailable(
-            "consumer lease receipt status is unavailable".into(),
-        ));
-    }
-    let lease_operation = match request.operation() {
-        SessionConsumerOperation::AcquireLease { key, owner, ttl } => {
-            SessionConsumerLeaseMutationOperation::Acquire {
-                key: key.clone(),
-                owner: owner.clone(),
-                ttl: *ttl,
-            }
-        }
-        SessionConsumerOperation::RenewLease { lease, ttl } => {
-            SessionConsumerLeaseMutationOperation::Renew {
-                lease: lease.clone(),
-                ttl: *ttl,
-            }
-        }
-        SessionConsumerOperation::ReleaseLease { lease } => {
-            SessionConsumerLeaseMutationOperation::Release {
-                lease: lease.clone(),
-            }
-        }
-        _ => {
-            return Err(StoreError::BackendUnavailable(
-                "consumer lease receipt status is unavailable".into(),
-            ));
-        }
-    };
-    let commitment = crate::consumer::consumer_request_commitment(request).map_err(|_| {
-        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
-    })?;
-    let binding_digest = authorized_mutation_payload_digest(
+    consumer_receipts::read_consumer_lease_mutation_status_sync(
+        &conn,
         storage_identity,
         authority_identity,
-        &SessionMutationIntent::BindConsumerRequest {
-            request_commitment: commitment,
-        },
+        binding_request_id,
+        operation_request_id,
+        request,
     )
-    .map_err(|_| {
-        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
-    })?;
-    let operation_intent = match &lease_operation {
-        SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl } => {
-            SessionMutationIntent::AcquireLease {
-                key: key.clone(),
-                owner: owner.clone(),
-                ttl: *ttl,
-            }
-        }
-        SessionConsumerLeaseMutationOperation::Renew { lease, ttl } => {
-            SessionMutationIntent::RenewLease {
-                lease: lease.clone(),
-                ttl: *ttl,
-            }
-        }
-        SessionConsumerLeaseMutationOperation::Release { lease } => {
-            SessionMutationIntent::ReleaseLease(lease.clone())
-        }
-    };
-    let operation_digest =
-        authorized_mutation_payload_digest(storage_identity, authority_identity, &operation_intent)
-            .map_err(|_| {
-                StoreError::BackendUnavailable(
-                    "consumer lease receipt status is unavailable".into(),
-                )
-            })?;
-
-    let binding = read_outcome_sync(conn, storage_identity, binding_request_id).map_err(|_| {
-        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
-    })?;
-    let binding_matches = match binding {
-        Some((digest, response)) if digest == binding_digest => {
-            matches!(response.result, Ok(SessionMutationOutcome::Unit))
-        }
-        Some(_) => return Ok(SessionConsumerLeaseMutationStatus::RequestConflict),
-        None => false,
-    };
-    if !binding_matches {
-        if request_id_is_occupied_sync(conn, storage_identity, binding_request_id)?
-            || request_id_is_occupied_sync(conn, storage_identity, operation_request_id)?
-        {
-            return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
-        }
-        return Ok(SessionConsumerLeaseMutationStatus::NotFound);
-    }
-
-    let Some((digest, response)) = read_outcome_sync(conn, storage_identity, operation_request_id)
-        .map_err(|_| {
-            StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
-        })?
-    else {
-        if request_id_is_occupied_sync(conn, storage_identity, operation_request_id)? {
-            return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
-        }
-        return Ok(SessionConsumerLeaseMutationStatus::NotFound);
-    };
-    if digest != operation_digest {
-        return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
-    }
-    let recorded = consumer_lease_mutation_result_from_response(&lease_operation, &response)?;
-    Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(
-        recorded,
-    )))
 }
 
 /// Read the exact binding and compare-and-set outcomes for one prepared
@@ -29958,68 +28865,7 @@ pub(crate) fn read_consumer_compare_and_set_status_sync(
     storage_identity: SessionConsensusIdentity,
     lookup: ConsumerCompareAndSetReceiptLookup,
 ) -> Result<crate::consumer::SessionConsumerCompareAndSetStatus, StoreError> {
-    use crate::consumer::{
-        SessionConsumerCompareAndSetReceiptOutcome, SessionConsumerCompareAndSetStatus,
-        SessionConsumerStoreError,
-    };
-
-    let binding =
-        read_outcome_sync(conn, storage_identity, lookup.binding_request_id).map_err(|_| {
-            StoreError::BackendUnavailable("consumer compare-and-set status is unavailable".into())
-        })?;
-    let binding_matches = match binding {
-        Some((digest, response)) if digest == lookup.binding_digest => {
-            matches!(response.result, Ok(SessionMutationOutcome::Unit))
-        }
-        Some(_) => return Ok(SessionConsumerCompareAndSetStatus::RequestConflict),
-        None => false,
-    };
-    if !binding_matches {
-        if request_id_has_fenced_transition_receipt_sync(
-            conn,
-            storage_identity,
-            lookup.binding_request_id,
-        )? || request_id_is_occupied_sync(conn, storage_identity, lookup.operation_request_id)?
-        {
-            return Ok(SessionConsumerCompareAndSetStatus::RequestConflict);
-        }
-        return Ok(SessionConsumerCompareAndSetStatus::NotFound);
-    }
-
-    let Some((digest, response)) =
-        read_outcome_sync(conn, storage_identity, lookup.operation_request_id).map_err(|_| {
-            StoreError::BackendUnavailable("consumer compare-and-set status is unavailable".into())
-        })?
-    else {
-        if request_id_has_fenced_transition_receipt_sync(
-            conn,
-            storage_identity,
-            lookup.operation_request_id,
-        )? {
-            return Ok(SessionConsumerCompareAndSetStatus::RequestConflict);
-        }
-        return Ok(SessionConsumerCompareAndSetStatus::NotFound);
-    };
-    if digest != lookup.operation_digest {
-        return Ok(SessionConsumerCompareAndSetStatus::RequestConflict);
-    }
-    let recorded = match response.result {
-        Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success)) => {
-            SessionConsumerCompareAndSetReceiptOutcome::Applied
-        }
-        Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict { .. })) => {
-            SessionConsumerCompareAndSetReceiptOutcome::Conflict
-        }
-        Err(error) => SessionConsumerCompareAndSetReceiptOutcome::Rejected(
-            SessionConsumerStoreError::from(error),
-        ),
-        Ok(_) => {
-            return Err(StoreError::BackendUnavailable(
-                "consumer compare-and-set status is unavailable".into(),
-            ));
-        }
-    };
-    Ok(SessionConsumerCompareAndSetStatus::Recorded(recorded))
+    consumer_receipts::read_consumer_compare_and_set_status_sync(&conn, storage_identity, lookup)
 }
 
 fn request_id_has_fenced_transition_receipt_sync(
@@ -31590,8 +30436,11 @@ fn read_outcome_sync(
     request_id: SessionConsensusRequestId,
 ) -> io::Result<Option<([u8; 32], SessionConsensusResponse)>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT configuration_epoch, payload_digest, response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+        )
+        .map_err(db_error)?
+        .query_row(
             [request_id.as_bytes().as_slice()],
             |row| {
                 Ok((
@@ -32521,7 +31370,7 @@ pub(crate) fn apply_entries_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn apply_entries_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -32557,6 +31406,40 @@ pub(crate) fn apply_entries_with_authority_and_diagnostics_sync(
     entries: Vec<Entry<SessionRaftTypeConfig>>,
     diagnostics: Option<&ConsensusStoreDiagnosticCounters>,
 ) -> io::Result<AppliedBatch> {
+    apply_entries_with_authority_and_diagnostics_and_hooks_sync(
+        conn,
+        identity,
+        caps,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        entries,
+        diagnostics,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+// The ordinary path supplies no-op hooks. A private WAL state-machine adapter
+// uses this transaction boundary to materialize an already-durable committed
+// log prefix and bind its application marker atomically with business state.
+// This hook does not admit a pre-quorum append or weaken the existing apply
+// implementation, authority checks, deterministic errors, or diagnostics.
+#[allow(clippy::too_many_arguments)]
+fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    caps: &BackendCapabilities,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    entries: Vec<Entry<SessionRaftTypeConfig>>,
+    diagnostics: Option<&ConsensusStoreDiagnosticCounters>,
+    prepare: impl FnOnce(&Transaction<'_>) -> io::Result<()>,
+    before_commit: impl FnOnce(&Transaction<'_>) -> io::Result<()>,
+) -> io::Result<AppliedBatch> {
     if entries.is_empty() && authority_profile == ConsensusAuthorityProfile::Dynamic {
         return Ok(AppliedBatch {
             responses: Vec::new(),
@@ -32565,6 +31448,7 @@ pub(crate) fn apply_entries_with_authority_and_diagnostics_sync(
     }
     let mut tx =
         Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    prepare(&tx)?;
     let mut last_applied = read_applied_sync(&tx, identity)?;
     let allows_initial_formation = last_applied.is_none()
         && entries.first().is_some_and(|entry| {
@@ -33421,6 +32305,7 @@ pub(crate) fn apply_entries_with_authority_and_diagnostics_sync(
         None
     };
     let roster_commit_started = protected_roster_changed.then(Instant::now);
+    before_commit(&tx)?;
     tx.commit().map_err(db_error)?;
     if let Some(diagnostics) = diagnostics {
         if let Some(started) = roster_commit_started {
@@ -33525,7 +32410,7 @@ fn validate_fixed_log_id(log_id: &LogId<SessionConsensusNodeId>) -> io::Result<(
     validate_log_id(log_id).map(|_| ())
 }
 
-fn ensure_log_id_not_after(
+pub(crate) fn ensure_log_id_not_after(
     earlier: &LogId<SessionConsensusNodeId>,
     later: &LogId<SessionConsensusNodeId>,
     message: &'static str,
@@ -34290,16 +33175,23 @@ fn validate_snapshot_install_replaced_pointers_sync(
             }
         }
     }
-    for pointer in [
+    let pointers = [
         purged.as_ref(),
         applied.as_ref(),
         committed.as_ref(),
         snapshot,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        validate_exact_log_prefix_through_sync(conn, identity, pointer, false)?;
+    ];
+    if let Some(highest) = pointers.into_iter().flatten().max_by_key(|id| id.index) {
+        // The same read-only audit runs inside one unchanged transaction.
+        // Decode the complete union once, then retain every original exact
+        // identity and no-hole proof for each individual pointer. No witness
+        // escapes this invocation or survives a source mutation.
+        let witnesses = validated_log_witnesses_through_sync(conn, identity, highest)?;
+        for pointer in pointers.into_iter().flatten() {
+            validate_exact_log_prefix_from_witnesses_sync(
+                conn, identity, pointer, false, &witnesses,
+            )?;
+        }
     }
     if purged.is_none() && snapshot.is_none() {
         for pointer in [applied.as_ref(), committed.as_ref()].into_iter().flatten() {
@@ -34345,44 +33237,70 @@ fn validate_snapshot_install_retained_rows_sync(
                 .ok_or_else(|| invalid_data("session consensus snapshot index is exhausted"))
         })
         .transpose()?;
-    let start = if purged.is_none()
-        && snapshot_successor.is_some_and(|successor| first_index == Some(successor))
-    {
-        snapshot_successor.expect("selected snapshot successor was matched")
-    } else {
-        0
-    };
-    let entries = read_log_range_sync(conn, identity, start, None, None)?;
+    let start = snapshot_successor
+        .filter(|successor| purged.is_none() && first_index == Some(*successor))
+        .unwrap_or(0);
+    let mut first_log_id = None;
+    let mut entry_validation = Ok(());
+    let mut entry_error_message = None;
+    let mut reuse = LogRowReadReuse::new(&LOG_ROW_RETENTION_BUDGET);
+    visit_log_range_with_reuse_sync(
+        conn,
+        identity,
+        LogRangeReadOptions {
+            start: logical_log_start(conn, identity, start)?,
+            end: None,
+            limit: None,
+            append_entries_batch: false,
+            recovery_profile: LogRangeRecoveryProfile::Strict,
+        },
+        &mut reuse,
+        |entry| {
+            first_log_id.get_or_insert(entry.log_id);
+            // The original collecting reader finishes all row/projection
+            // checks before reporting snapshot-policy errors. Keep only the
+            // first policy error and continue that same complete audit.
+            if entry_validation.is_err() || entry_error_message.is_some() {
+                return;
+            }
+            if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                entry_validation = validate_fixed_log_id(&entry.log_id);
+                if entry_validation.is_err() {
+                    return;
+                }
+                if fixed_profile_entry_changes_topology(&entry, fixed_expected_members) {
+                    entry_error_message = Some("session consensus fixed log entry is invalid");
+                    return;
+                }
+            }
+            if incoming.is_some_and(|incoming| {
+                entry.log_id.index == incoming.index && entry.log_id != *incoming
+            }) {
+                entry_error_message =
+                    Some("session consensus incoming snapshot conflicts with retained log");
+            }
+        },
+    )?;
+    drop(reuse);
     if start != 0 {
-        if let (Some(snapshot), Some(first)) = (snapshot, entries.first()) {
+        if let (Some(snapshot), Some(first)) = (snapshot, first_log_id.as_ref()) {
             ensure_log_id_not_after(
                 snapshot,
-                &first.log_id,
+                first,
                 "session consensus retained log regresses selected snapshot",
             )?;
         }
     }
-    if incoming.is_none() && !entries.is_empty() {
+    if incoming.is_none() && first_log_id.is_some() {
         return Err(invalid_data(
             "session consensus pristine snapshot cannot replace retained logs",
         ));
     }
-    for entry in &entries {
-        if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-            validate_fixed_log_id(&entry.log_id)?;
-            if fixed_profile_entry_changes_topology(entry, fixed_expected_members) {
-                return Err(invalid_data("session consensus fixed log entry is invalid"));
-            }
-        }
-        if incoming.is_some_and(|incoming| {
-            entry.log_id.index == incoming.index && entry.log_id != *incoming
-        }) {
-            return Err(invalid_data(
-                "session consensus incoming snapshot conflicts with retained log",
-            ));
-        }
+    entry_validation?;
+    match entry_error_message {
+        Some(message) => Err(invalid_data(message)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Audit every local pointer and retained row after a portable snapshot
@@ -34542,7 +33460,7 @@ fn validate_retained_durable_log_sync(
     Ok(())
 }
 
-fn fixed_profile_entry_changes_topology(
+pub(crate) fn fixed_profile_entry_changes_topology(
     entry: &Entry<SessionRaftTypeConfig>,
     expected_members: &BTreeSet<SessionConsensusNodeId>,
 ) -> bool {
@@ -34742,63 +33660,330 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
 
     validate_lease_state_sync(conn)?;
 
+    validate_sealed_replication_log_sync(conn)
+}
+
+struct EncodedSealedReplicationAuditRow {
+    sequence: i64,
+    tx_id: Option<String>,
+    encoded: String,
+}
+
+fn validate_sealed_replication_audit_row(
+    stored_sequence: i64,
+    stored_tx_id: Option<&str>,
+    encoded: &str,
+    expected: u64,
+) -> io::Result<u64> {
+    let stored_sequence = checked_u64(stored_sequence)?;
+    let stored_tx_id: ReplicationTxId = stored_tx_id
+        .ok_or_else(|| invalid_data("persisted session replication transaction ID is invalid"))?
+        .try_into()
+        .map_err(|_| invalid_data("persisted session replication transaction ID is invalid"))?;
+    let entry: ReplicationEntry = serde_json::from_str(encoded)
+        .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+    if stored_sequence != expected || entry.sequence != stored_sequence {
+        return Err(invalid_data(
+            "persisted session replication log is not contiguous",
+        ));
+    }
+    if entry.tx_id != stored_tx_id {
+        return Err(invalid_data(
+            "persisted session replication transaction ID is inconsistent",
+        ));
+    }
+    entry
+        .validate()
+        .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+    validate_sealed_replication_op(&entry.op)?;
+    expected
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session replication sequence exhausted"))
+}
+
+fn validate_sealed_replication_audit_rows(
+    rows: &[EncodedSealedReplicationAuditRow],
+    mut expected: u64,
+) -> io::Result<u64> {
+    for row in rows {
+        expected = validate_sealed_replication_audit_row(
+            row.sequence,
+            row.tx_id.as_deref(),
+            &row.encoded,
+            expected,
+        )?;
+    }
+    Ok(expected)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct SealedReplicationAuditStatsForTest {
+    maximum_rows: usize,
+    maximum_encoded_bytes: usize,
+    maximum_workers: usize,
+    oversized_inline_rows: usize,
+    spawned_workers: usize,
+    joined_workers: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEALED_REPLICATION_AUDIT_STATS: std::cell::Cell<SealedReplicationAuditStatsForTest> =
+        const { std::cell::Cell::new(SealedReplicationAuditStatsForTest {
+            maximum_rows: 0, maximum_encoded_bytes: 0, maximum_workers: 0,
+            oversized_inline_rows: 0, spawned_workers: 0, joined_workers: 0,
+        }) };
+    static SEALED_REPLICATION_AUDIT_FAULTS: std::cell::Cell<DurableLogAuditFaultsForTest> =
+        const { std::cell::Cell::new(DurableLogAuditFaultsForTest::NONE) };
+}
+
+#[cfg(test)]
+fn record_sealed_replication_audit_stats(
+    update: impl FnOnce(&mut SealedReplicationAuditStatsForTest),
+) {
+    SEALED_REPLICATION_AUDIT_STATS.with(|stats| {
+        let mut observed = stats.get();
+        update(&mut observed);
+        stats.set(observed);
+    });
+}
+
+fn validate_sealed_replication_audit_batch_with_parallelism(
+    rows: &[EncodedSealedReplicationAuditRow],
+    expected: u64,
+    available_parallelism: usize,
+) -> io::Result<u64> {
+    let workers = durable_log_audit_worker_count(rows.len(), available_parallelism);
+    #[cfg(test)]
+    record_sealed_replication_audit_stats(|stats| {
+        stats.maximum_workers = stats.maximum_workers.max(workers);
+    });
+    if workers == 1 {
+        return validate_sealed_replication_audit_rows(rows, expected);
+    }
+    let rows_per_worker = rows.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(workers)
+            .map_err(|_| io::Error::other("session replication audit allocation failed"))?;
+        let mut spawn_error = None;
+        for (worker_index, chunk) in rows.chunks(rows_per_worker).enumerate() {
+            #[cfg(test)]
+            if SEALED_REPLICATION_AUDIT_FAULTS
+                .with(|faults| faults.get().spawn_failure_worker == Some(worker_index))
+            {
+                spawn_error = Some(invalid_data(
+                    "session replication audit worker spawn failed",
+                ));
+                break;
+            }
+            #[cfg(test)]
+            let panic_worker = SEALED_REPLICATION_AUDIT_FAULTS
+                .with(|faults| faults.get().panic_worker == Some(worker_index));
+            let offset = worker_index * rows_per_worker;
+            let handle = std::thread::Builder::new()
+                .spawn_scoped(scope, move || {
+                    #[cfg(test)]
+                    if panic_worker {
+                        panic!("injected sealed replication audit worker failure");
+                    }
+                    // A later chunk's arithmetic failure is returned in source
+                    // order, after all earlier chunks have been checked.
+                    let expected = u64::try_from(offset)
+                        .ok()
+                        .and_then(|offset| expected.checked_add(offset))
+                        .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+                    validate_sealed_replication_audit_rows(chunk, expected)
+                })
+                .map_err(|_| invalid_data("session replication audit worker spawn failed"));
+            match handle {
+                Ok(handle) => {
+                    handles.push(handle);
+                    #[cfg(test)]
+                    record_sealed_replication_audit_stats(|stats| stats.spawned_workers += 1);
+                }
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut next = expected;
+        let mut first_error = None;
+        // Join every owned worker even after rejection or failed later spawn.
+        // Full row checks and failures retain the original source ordering.
+        for handle in handles {
+            let result = handle
+                .join()
+                .map_err(|_| invalid_data("session replication audit worker failed"));
+            #[cfg(test)]
+            record_sealed_replication_audit_stats(|stats| stats.joined_workers += 1);
+            match result {
+                Ok(Ok(chunk_next)) if first_error.is_none() => next = chunk_next,
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) | Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else if let Some(error) = spawn_error {
+            Err(error)
+        } else {
+            Ok(next)
+        }
+    })
+}
+
+fn finish_sealed_replication_audit_batch(
+    rows: &mut Vec<EncodedSealedReplicationAuditRow>,
+    encoded_bytes: &mut usize,
+    expected: &mut u64,
+) -> io::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    record_sealed_replication_audit_stats(|stats| {
+        stats.maximum_rows = stats.maximum_rows.max(rows.len());
+        stats.maximum_encoded_bytes = stats.maximum_encoded_bytes.max(*encoded_bytes);
+    });
+    *expected = if rows.len() < DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS {
+        // Small snapshots stay inline without even querying OS CPU capacity.
+        validate_sealed_replication_audit_rows(rows, *expected)?
+    } else {
+        validate_sealed_replication_audit_batch_with_parallelism(
+            rows,
+            *expected,
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        )?
+    };
+    rows.clear();
+    *encoded_bytes = 0;
+    Ok(())
+}
+
+fn validate_sealed_replication_log_sync(conn: &Connection) -> io::Result<()> {
     let mut stmt = conn
         .prepare(
-            r#"
-            SELECT sequence,
-                   CASE
-                       WHEN typeof(tx_id) = 'text'
-                        AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2
-                       THEN tx_id
-                   END,
-                   entry_json
-            FROM session_replication_log
-            ORDER BY sequence ASC
-            "#,
+            "SELECT sequence, CASE WHEN typeof(tx_id) = 'text' \
+             AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2 THEN tx_id END, \
+             entry_json FROM session_replication_log ORDER BY sequence ASC",
         )
         .map_err(db_error)?;
-    let rows = stmt
-        .query_map(
-            params![REPLICATION_TX_ID_MIN_BYTES, REPLICATION_TX_ID_MAX_BYTES],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
+    let mut rows = stmt
+        .query(params![
+            REPLICATION_TX_ID_MIN_BYTES,
+            REPLICATION_TX_ID_MAX_BYTES
+        ])
         .map_err(db_error)?;
     let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
         .checked_add(1)
         .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
-    for row in rows {
-        let (stored_sequence, stored_tx_id, encoded) = row.map_err(db_error)?;
-        let stored_sequence = checked_u64(stored_sequence)?;
-        let stored_tx_id: ReplicationTxId = stored_tx_id
-            .ok_or_else(|| invalid_data("persisted session replication transaction ID is invalid"))?
-            .try_into()
-            .map_err(|_| invalid_data("persisted session replication transaction ID is invalid"))?;
-        let entry: ReplicationEntry = serde_json::from_str(&encoded)
-            .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
-        if stored_sequence != expected || entry.sequence != stored_sequence {
-            return Err(invalid_data(
-                "persisted session replication log is not contiguous",
-            ));
+    let mut buffered = Vec::new();
+    let mut encoded_bytes = 0;
+    loop {
+        let row = match rows.next().map_err(db_error) {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(error) => {
+                finish_sealed_replication_audit_batch(
+                    &mut buffered,
+                    &mut encoded_bytes,
+                    &mut expected,
+                )?;
+                return Err(error);
+            }
+        };
+        let next = (|| {
+            let sequence = row.get::<_, i64>(0).map_err(db_error)?;
+            let tx_id = row.get::<_, Option<String>>(1).map_err(db_error)?;
+            // Borrow SQLite's current text before allocating a copy. This keeps
+            // an arbitrarily wide legacy row out of every parallel buffer.
+            // as_str retains String's TEXT/valid-UTF-8 column contract.
+            let encoded = row
+                .get_ref(2)
+                .map_err(db_error)?
+                .as_str()
+                .map_err(|_| db_error(rusqlite::Error::InvalidQuery))?;
+            Ok::<_, io::Error>((sequence, tx_id, encoded))
+        })();
+        let (sequence, tx_id, encoded) = match next {
+            Ok(row) => row,
+            Err(error) => {
+                finish_sealed_replication_audit_batch(
+                    &mut buffered,
+                    &mut encoded_bytes,
+                    &mut expected,
+                )?;
+                return Err(error);
+            }
+        };
+        if buffered.len() == DURABLE_LOG_AUDIT_BATCH_ROWS
+            || encoded.len() > DURABLE_LOG_AUDIT_BATCH_BYTES - encoded_bytes
+        {
+            finish_sealed_replication_audit_batch(
+                &mut buffered,
+                &mut encoded_bytes,
+                &mut expected,
+            )?;
         }
-        if entry.tx_id != stored_tx_id {
-            return Err(invalid_data(
-                "persisted session replication transaction ID is inconsistent",
-            ));
+        if encoded.len() > DURABLE_LOG_AUDIT_BATCH_BYTES {
+            // The published journal has no encoded-row ceiling. Preserve its
+            // acceptance by fully decoding one oversized row inline, after all
+            // earlier buffered rows and before reading any later row.
+            #[cfg(test)]
+            record_sealed_replication_audit_stats(|stats| stats.oversized_inline_rows += 1);
+            expected = validate_sealed_replication_audit_row(
+                sequence,
+                tx_id.as_deref(),
+                encoded,
+                expected,
+            )?;
+            continue;
         }
-        entry
-            .validate()
-            .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
-        validate_sealed_replication_op(&entry.op)?;
-        expected = expected
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+        let buffered_row = (|| {
+            if buffered.len() == buffered.capacity() {
+                let remaining = DURABLE_LOG_AUDIT_BATCH_ROWS - buffered.len();
+                let growth = buffered.capacity().max(8).min(remaining);
+                buffered
+                    .try_reserve_exact(growth)
+                    .map_err(|_| io::Error::other("session replication audit allocation failed"))?;
+            }
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(encoded.len())
+                .map_err(|_| io::Error::other("session replication audit allocation failed"))?;
+            owned.push_str(encoded);
+            Ok::<_, io::Error>(EncodedSealedReplicationAuditRow {
+                sequence,
+                tx_id,
+                encoded: owned,
+            })
+        })();
+        match buffered_row {
+            Ok(row) => {
+                encoded_bytes += row.encoded.len();
+                buffered.push(row);
+            }
+            Err(error) => {
+                finish_sealed_replication_audit_batch(
+                    &mut buffered,
+                    &mut encoded_bytes,
+                    &mut expected,
+                )?;
+                return Err(error);
+            }
+        }
     }
+    finish_sealed_replication_audit_batch(&mut buffered, &mut encoded_bytes, &mut expected)?;
     let observed_head = expected
         .checked_sub(1)
         .ok_or_else(|| invalid_data("session replication sequence underflow"))?;
@@ -35060,6 +34245,7 @@ pub(crate) fn build_snapshot_database_with_capture_hook_sync(
     Ok(snapshot)
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SnapshotBuildAuthority<'a> {
     pub(crate) identity: SessionConsensusIdentity,
     pub(crate) profile: ConsensusAuthorityProfile,
@@ -35067,6 +34253,124 @@ pub(crate) struct SnapshotBuildAuthority<'a> {
     pub(crate) expected_bindings:
         &'a BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     pub(crate) fixed_placement_policy: Option<PlacementResiliencePolicy>,
+}
+
+/// Admit the completed native projection before finalization consumes it.
+/// Its source is one immutable native capture; neither
+/// the live owner nor a separately reopened pathname supplies this cut.
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_native_snapshot_export_sync(
+    conn: &Connection,
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    authority: SnapshotBuildAuthority<'_>,
+    expected_cut: &ConsensusAppliedMembership,
+) -> io::Result<()> {
+    validate_native_snapshot_export_inner_sync(conn, pinned, authority, expected_cut).inspect_err(
+        |error| {
+            snapshot_resources::record_failure(
+                "native_export_validation",
+                error,
+                &[("raw", pinned)],
+            )
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_native_snapshot_export_inner_sync(
+    conn: &Connection,
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    authority: SnapshotBuildAuthority<'_>,
+    expected_cut: &ConsensusAppliedMembership,
+) -> io::Result<()> {
+    pinned.verify_linked_identity()?;
+    verify_pinned_snapshot_descriptor(pinned, conn)?;
+    snapshot_database_extent_sync(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
+    validate_durable_authority_for_raw_access(
+        &tx,
+        authority.identity,
+        authority.profile,
+        authority.expected_members,
+        authority.expected_bindings,
+        authority.fixed_placement_policy,
+    )?;
+    validate_existing_schema(&tx, authority.identity)
+        .map_err(|_| invalid_data("native snapshot export schema is invalid"))?;
+    validate_sealed_state_sync(&tx)?;
+    validate_fenced_transition_receipts_sync(&tx, authority.identity)?;
+    if snapshot_applied_membership_sync(&tx, authority.identity)? != *expected_cut {
+        return Err(invalid_data(
+            "native snapshot export cut differs from captured authority",
+        ));
+    }
+    tx.commit().map_err(db_error)?;
+    pinned.verify_linked_identity()?;
+    verify_pinned_snapshot_descriptor(pinned, conn)
+}
+
+/// Finalize the direct native projection on the same owned inode. It contains
+/// no exported local log payload to reclaim, so no second full database is
+/// needed. Publication still receives a synced, independently validated pin.
+#[cfg(target_os = "linux")]
+pub(crate) fn finalize_native_snapshot_database_sync(
+    conn: Connection,
+    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    authority: SnapshotBuildAuthority<'_>,
+    expected_cut: &ConsensusAppliedMembership,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    let finalize = || -> io::Result<Connection> {
+        validate_native_snapshot_export_sync(&conn, &pinned, authority, expected_cut)?;
+        conn.pragma_update(None, "query_only", false)
+            .map_err(db_error)?;
+        prepare_portable_snapshot_metadata_sync(&conn)?;
+        verify_pinned_snapshot_descriptor(&pinned, &conn)?;
+        drop(conn);
+        pinned.capture_created_sidecars();
+        pinned.file().sync_all()?;
+        checked_snapshot_capture_workspace_bytes(&[
+            pinned.file().metadata()?.len(),
+            pinned_snapshot_database_sidecar_bytes_sync(&pinned)?,
+        ])?;
+        pinned.sync_parent_directory()?;
+        let conn = open_pinned_snapshot_database(&pinned)?;
+        validate_native_snapshot_export_sync(&conn, &pinned, authority, expected_cut)?;
+        Ok(conn)
+    };
+    let conn = finalize().inspect_err(|error| {
+        snapshot_resources::record_failure(
+            "native_portable_finalization",
+            error,
+            &[("portable", &pinned)],
+        );
+    })?;
+    pinned = refresh_pinned_snapshot_database(pinned)?;
+    verify_pinned_snapshot_descriptor(&pinned, &conn)?;
+    pinned.verify_linked_identity()?;
+    drop(conn);
+    pinned.capture_created_sidecars();
+    Ok(pinned)
+}
+
+fn prepare_portable_snapshot_metadata_sync(conn: &Connection) -> io::Result<()> {
+    conn.execute_batch(
+        r#"
+        DELETE FROM consensus_vote;
+        DELETE FROM consensus_committed;
+        DELETE FROM consensus_purged;
+        DELETE FROM consensus_log;
+        DELETE FROM consensus_snapshot;
+        "#,
+    )
+    .map_err(db_error)?;
+    // This local upgrade journal cannot authorize admission of an old
+    // unsealed source after rebuilding a portable successor.
+    strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(conn)?;
+    #[cfg(target_os = "linux")]
+    conn.execute_batch("DROP TABLE IF EXISTS consensus_wal_application;")
+        .map_err(db_error)?;
+    ops::rotate_restore_scan_epoch_sync(conn)
+        .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))
 }
 
 #[cfg(test)]
@@ -35342,8 +34646,20 @@ fn pinned_snapshot_uri(
 // A child unit-test process enables the feature-gated safe VFS registration in
 // `opc-sqlite-file-control-sys` and flips this local selector.  Production
 // never builds or selects that VFS.
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+thread_local! {
+    static SNAPSHOT_TEST_MAIN_SYNC_VFS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(all(test, target_os = "linux"))]
 fn snapshot_test_vfs_uri_parameter() -> String {
+    #[cfg(feature = "test-vfs")]
+    if SNAPSHOT_TEST_MAIN_SYNC_VFS.with(std::cell::Cell::get) {
+        return format!(
+            "&vfs={}",
+            opc_sqlite_file_control_sys::TEST_MAIN_SYNC_BLOCK_VFS_NAME
+        );
+    }
     if SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.load(Ordering::Acquire) {
         format!(
             "&vfs={}",
@@ -36210,6 +35526,22 @@ fn compact_pinned_snapshot_database_with_pacer_sync(
     compacted: &crate::consensus::snapshot::PinnedSqliteFile,
     foreground_pacer: &ConsensusSnapshotForegroundPacer,
 ) -> io::Result<()> {
+    compact_pinned_snapshot_database_inner_sync(source, compacted, foreground_pacer).inspect_err(
+        |error| {
+            snapshot_resources::record_failure(
+                "compaction",
+                error,
+                &[("raw", source), ("compacted", compacted)],
+            );
+        },
+    )
+}
+
+fn compact_pinned_snapshot_database_inner_sync(
+    source: &crate::consensus::snapshot::PinnedSqliteFile,
+    compacted: &crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
+) -> io::Result<()> {
     let settings = snapshot_compaction_source_settings_sync(source)?;
     let destination = open_empty_pinned_snapshot_compaction_database(
         compacted,
@@ -36237,6 +35569,16 @@ fn compact_pinned_snapshot_database_with_pacer_sync(
         snapshot_compaction_attached_extent_sync(&destination)?;
         let schema = read_snapshot_compaction_schema_sync(&destination)?;
         validate_snapshot_compaction_table_keys_sync(&destination, &schema)?;
+        // This descriptor is still private staging. Commit its complete
+        // schema and data once, rather than syncing each intermediate table
+        // and schema object. The existing page cap and per-table extent
+        // checks apply inside the transaction; the caller still syncs and
+        // validates the completed inode before sealing or publication. With
+        // journal_mode=OFF an error may leave partial staging bytes, whose
+        // pin remains owned by the caller and is discarded on any failure.
+        let copy_transaction =
+            Transaction::new_unchecked(&destination, TransactionBehavior::Deferred)
+                .map_err(db_error)?;
         for object in schema.iter().filter(|object| object.kind == "table") {
             destination.execute_batch(&object.sql).map_err(db_error)?;
             snapshot_database_extent_sync(&destination)?;
@@ -36275,6 +35617,8 @@ fn compact_pinned_snapshot_database_with_pacer_sync(
             .pragma_update(None, "user_version", settings.user_version)
             .map_err(db_error)?;
         validate_snapshot_compaction_foreign_keys_sync(&destination)?;
+        snapshot_database_extent_sync(&destination)?;
+        copy_transaction.commit().map_err(db_error)?;
         snapshot_database_extent_sync(&destination)?;
         verify_pinned_snapshot_descriptor(compacted, &destination)?;
         Ok(())
@@ -36458,70 +35802,75 @@ pub(crate) fn finalize_captured_snapshot_database_into_sync(
     // pathname cannot replace it between creation and the first SQLite page.
     // The logical copier installs its actual-page-size extent guard on this
     // empty descriptor before it creates any schema page.
-    pinned.verify_linked_identity()?;
-    compacted.verify_linked_identity()?;
-    let destination = open_pinned_snapshot_database(&pinned)?;
-    disable_snapshot_database_journal_sync(&destination)?;
-    destination
-        .execute_batch(
-            r#"
-        DELETE FROM consensus_vote;
-        DELETE FROM consensus_committed;
-        DELETE FROM consensus_purged;
-        DELETE FROM consensus_log;
-        DELETE FROM consensus_snapshot;
-        "#,
-        )
-        .map_err(db_error)?;
-    // This private, local upgrade journal is not consensus state.  A rebuilt
-    // successor must never carry permission to admit its old unsealed source.
-    strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(&destination)?;
-    ops::rotate_restore_scan_epoch_sync(&destination)
-        .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
-    validate_existing_schema(&destination, identity)
-        .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
-    validate_sealed_state_sync(&destination)?;
-    let observed_cut = snapshot_applied_membership_sync(&destination, identity)?;
-    if &observed_cut != expected_cut {
-        return Err(invalid_data(
-            "session consensus snapshot metadata differs from its captured cut",
-        ));
-    }
-    verify_pinned_snapshot_descriptor(&pinned, &destination)?;
-    drop(destination);
+    let prepare_raw = || -> io::Result<()> {
+        pinned.verify_linked_identity()?;
+        compacted.verify_linked_identity()?;
+        let destination = open_pinned_snapshot_database(&pinned)?;
+        disable_snapshot_database_journal_sync(&destination)?;
+        prepare_portable_snapshot_metadata_sync(&destination)?;
+        validate_existing_schema(&destination, identity)
+            .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
+        validate_sealed_state_sync(&destination)?;
+        let observed_cut = snapshot_applied_membership_sync(&destination, identity)?;
+        if &observed_cut != expected_cut {
+            return Err(invalid_data(
+                "session consensus snapshot metadata differs from its captured cut",
+            ));
+        }
+        verify_pinned_snapshot_descriptor(&pinned, &destination)?;
+        drop(destination);
+        Ok(())
+    };
+    prepare_raw().inspect_err(|error| {
+        snapshot_resources::record_failure(
+            "raw_finalization",
+            error,
+            &[("raw", &pinned), ("compacted", &compacted)],
+        );
+    })?;
     pinned.capture_created_sidecars();
     compact_pinned_snapshot_database_with_pacer_sync(&pinned, &compacted, foreground_pacer)?;
 
-    compacted.verify_linked_identity()?;
-    compacted.file().sync_all()?;
-    compacted.capture_created_sidecars();
-    checked_snapshot_capture_workspace_bytes(&[
-        pinned.file().metadata()?.len(),
-        pinned_snapshot_database_sidecar_bytes_sync(&pinned)?,
-        compacted.file().metadata()?.len(),
-        pinned_snapshot_database_sidecar_bytes_sync(&compacted)?,
-    ])?;
-    compacted.sync_parent_directory()?;
-    let compacted_connection = open_pinned_snapshot_database(&compacted)?;
-    validate_durable_authority_for_raw_access(
-        &compacted_connection,
-        identity,
-        authority_profile,
-        expected_members,
-        expected_bindings,
-        fixed_placement_policy,
-    )?;
-    validate_existing_schema(&compacted_connection, identity).map_err(|_| {
-        invalid_data("built session consensus compacted snapshot failed validation")
+    let mut validate_compacted = || -> io::Result<Connection> {
+        compacted.verify_linked_identity()?;
+        compacted.file().sync_all()?;
+        compacted.capture_created_sidecars();
+        checked_snapshot_capture_workspace_bytes(&[
+            pinned.file().metadata()?.len(),
+            pinned_snapshot_database_sidecar_bytes_sync(&pinned)?,
+            compacted.file().metadata()?.len(),
+            pinned_snapshot_database_sidecar_bytes_sync(&compacted)?,
+        ])?;
+        compacted.sync_parent_directory()?;
+        let compacted_connection = open_pinned_snapshot_database(&compacted)?;
+        validate_durable_authority_for_raw_access(
+            &compacted_connection,
+            identity,
+            authority_profile,
+            expected_members,
+            expected_bindings,
+            fixed_placement_policy,
+        )?;
+        validate_existing_schema(&compacted_connection, identity).map_err(|_| {
+            invalid_data("built session consensus compacted snapshot failed validation")
+        })?;
+        validate_sealed_state_sync(&compacted_connection)?;
+        snapshot_database_extent_sync(&compacted_connection)?;
+        let observed_cut = snapshot_applied_membership_sync(&compacted_connection, identity)?;
+        if &observed_cut != expected_cut {
+            return Err(invalid_data(
+                "session consensus compacted snapshot metadata differs from its captured cut",
+            ));
+        }
+        Ok(compacted_connection)
+    };
+    let compacted_connection = validate_compacted().inspect_err(|error| {
+        snapshot_resources::record_failure(
+            "compacted_validation",
+            error,
+            &[("raw", &pinned), ("compacted", &compacted)],
+        );
     })?;
-    validate_sealed_state_sync(&compacted_connection)?;
-    snapshot_database_extent_sync(&compacted_connection)?;
-    let observed_cut = snapshot_applied_membership_sync(&compacted_connection, identity)?;
-    if &observed_cut != expected_cut {
-        return Err(invalid_data(
-            "session consensus compacted snapshot metadata differs from its captured cut",
-        ));
-    }
     compacted = refresh_pinned_snapshot_database(compacted)?;
     verify_pinned_snapshot_descriptor(&compacted, &compacted_connection)?;
     compacted.verify_linked_identity()?;
@@ -38935,7 +38284,10 @@ fn validate_attached_snapshot_database_sync(
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-        validate_uniform_membership(&membership, &incoming_scope.current_members)?;
+        // The existing fixed metadata contract permits pristine membership
+        // only with an absent last log. The exact equality below binds this
+        // check to the attached source's applied and membership rows.
+        validate_fixed_snapshot_metadata(meta, &incoming_scope.current_members)?;
     }
     if let Some(log_id) = meta.last_membership.log_id() {
         validate_membership_for_log(&meta.last_membership, &incoming_scope, log_id.index)?;
@@ -39088,6 +38440,49 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<SnapshotInstallPublicationOutcome> {
+    install_snapshot_database_from_pinned_with_authority_and_hooks_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        pinned,
+        published_snapshot,
+        meta,
+        final_file_name,
+        checksum,
+        byte_length,
+        |_| Ok(()),
+        |tx| {
+            ops::rotate_restore_scan_incarnation_sync(tx)
+                .map_err(|_| invalid_data("installed session snapshot restore metadata failed"))
+        },
+        |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_snapshot_database_from_pinned_with_authority_and_hooks_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: Option<&BTreeSet<SessionConsensusNodeId>>,
+    expected_bindings: Option<&BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    published_snapshot: Option<(&crate::consensus::snapshot::PinnedSqliteFile, &Path)>,
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+    before_write: impl FnOnce(&Transaction<'_>) -> io::Result<()>,
+    rotate_restore_scan: impl FnOnce(&Transaction<'_>) -> io::Result<()>,
+    before_commit: impl FnOnce(&Transaction<'_>) -> io::Result<()>,
+) -> io::Result<SnapshotInstallPublicationOutcome> {
     if pinned.has_immutable_generation() {
         pinned.verify_immutable_generation()?;
     }
@@ -39131,6 +38526,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     let result = (|| {
         let tx =
             Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+        before_write(&tx)?;
         // Re-check under the same transaction that swaps the state image. A
         // second process must not be able to advance the durable floor between
         // validation and replacement even though deployment admission already
@@ -39686,8 +39082,8 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         // authority. Every snapshot destination gets a fresh incarnation so
         // two nodes installing the same coherent snapshot cannot consume one
         // another's continuation token.
-        ops::rotate_restore_scan_incarnation_sync(&tx)
-            .map_err(|_| invalid_data("installed session snapshot restore metadata failed"))?;
+        rotate_restore_scan(&tx)?;
+        before_commit(&tx)?;
         verify_attached_snapshot_descriptor(&pinned, &tx, "consensus_incoming")?;
         if pinned.has_immutable_generation() {
             pinned.verify_immutable_generation()?;
@@ -39960,7 +39356,45 @@ pub(crate) fn save_current_snapshot_with_authority_sync(
     if authority_profile == ConsensusAuthorityProfile::Dynamic {
         return save_current_snapshot_sync(conn, identity, meta, file_name, checksum, byte_length);
     }
+    save_current_snapshot_with_authority_and_hooks_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        meta,
+        file_name,
+        checksum,
+        byte_length,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+/// Internal transaction hooks let the WAL bind its materialized-cache guard
+/// inside the original metadata transaction. Public snapshot calls retain
+/// their existing authority, validation, commit and readback contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_current_snapshot_with_authority_and_hooks_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+    before_write: impl FnOnce(&Transaction<'_>) -> io::Result<()>,
+    before_commit: impl FnOnce(&Transaction<'_>) -> io::Result<()>,
+) -> io::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    before_write(&tx)?;
     validate_durable_authority_for_raw_access(
         &tx,
         identity,
@@ -39969,8 +39403,14 @@ pub(crate) fn save_current_snapshot_with_authority_sync(
         expected_bindings,
         fixed_placement_policy,
     )?;
-    validate_fixed_snapshot_metadata(meta, expected_members)?;
-    if let Some(snapshot_log_id) = meta.last_log_id.as_ref() {
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        validate_fixed_snapshot_metadata(meta, expected_members)?;
+    }
+    if let Some(snapshot_log_id) = meta
+        .last_log_id
+        .as_ref()
+        .filter(|_| authority_profile == ConsensusAuthorityProfile::FixedImmutable)
+    {
         let applied = read_applied_sync(&tx, identity)?.ok_or_else(|| {
             invalid_data("session consensus fixed snapshot is beyond applied state")
         })?;
@@ -39985,14 +39425,17 @@ pub(crate) fn save_current_snapshot_with_authority_sync(
     // has been sealed and bound.  Clear the old compatibility journal in the
     // same transaction as metadata replacement, so interruption cannot leave
     // a permit that matches the newly selected snapshot.
-    clear_legacy_fixed_snapshot_reseed_after_successor_sync(
-        &tx,
-        identity,
-        meta,
-        file_name,
-        checksum,
-        byte_length,
-    )?;
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        clear_legacy_fixed_snapshot_reseed_after_successor_sync(
+            &tx,
+            identity,
+            meta,
+            file_name,
+            checksum,
+            byte_length,
+        )?;
+    }
+    before_commit(&tx)?;
     tx.commit().map_err(db_error)
 }
 
@@ -40386,7 +39829,7 @@ fn strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(conn: &Connection) -> i
 /// Only UUID-named published images may be made durable. Staging prefixes are
 /// never an authority name, even when a corrupt database row attempts to make
 /// one look current.
-fn validate_published_snapshot_file_name(file_name: &str) -> io::Result<()> {
+pub(crate) fn validate_published_snapshot_file_name(file_name: &str) -> io::Result<()> {
     let Some(stem) = file_name
         .strip_prefix("snapshot-")
         .and_then(|name| name.strip_suffix(".opc"))
@@ -40408,12 +39851,218 @@ fn validate_published_snapshot_file_name(file_name: &str) -> io::Result<()> {
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use tests::{
-    initialize_protected_roster_v2_recovery_fixture, ProtectedRosterV2RecoveryFixture,
+    initialize_protected_roster_v2_recovery_fixture,
+    initialize_protected_roster_v2_recovery_fixture_with_members, ProtectedRosterV2RecoveryFixture,
     ProtectedRosterV2RecoveryFixtureState,
 };
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn native_roster_apply_fixture(
+    path: &Path,
+    identity: SessionConsensusIdentity,
+    entries: Vec<Entry<SessionRaftTypeConfig>>,
+) -> io::Result<AppliedBatch> {
+    let backend = SqliteSessionBackend::open(path).map_err(|_| state_machine_intent_fault())?;
+    let conn = backend.conn.blocking_lock();
+    append_logs_sync(&conn, identity, &entries)?;
+    save_committed_sync(&conn, identity, entries.last().map(|entry| entry.log_id))?;
+    let applied = apply_entries_sync(&conn, identity, &backend.caps, entries)?;
+    validate_protected_roster_state_sync(&conn, identity)
+        .map_err(|_| state_machine_intent_fault())?;
+    Ok(applied)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn native_roster_maintenance_fixture(
+    path: &Path,
+    identity: SessionConsensusIdentity,
+    logical_time: Timestamp,
+) -> Result<bool, StoreError> {
+    let backend = SqliteSessionBackend::open(path)?;
+    let conn = backend.conn.blocking_lock();
+    let transaction = conn.unchecked_transaction().map_err(|_| {
+        StoreError::BackendUnavailable("roster maintenance fixture transaction unavailable".into())
+    })?;
+    let changed = maintain_due_protected_roster_reclaim_sync(&transaction, identity, logical_time)?;
+    transaction.commit().map_err(|_| {
+        StoreError::BackendUnavailable("roster maintenance fixture commit unavailable".into())
+    })?;
+    Ok(changed)
+}
+
+#[cfg(test)]
+mod log_row_reuse_test_observer {
+    use std::cell::RefCell;
+
+    use rusqlite::Connection;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Event {
+        FullDecode,
+        TypedDecode,
+        BeforeReservationCas,
+        Reserved,
+        NormalizedRequest,
+        BoxedEntry,
+        Captured,
+        Hit,
+        TypedTransfer,
+        TupleFallback,
+        Ineligible,
+        BudgetFallback,
+        HighestAudit,
+        AfterBytesDrop,
+        AfterEntrySlotDrop,
+        Refund,
+        PrefixContiguityCheck,
+        PrefixLeaderCheck,
+        PrefixProjection,
+        RangeLogIdCheck,
+        RangeContiguityCheck,
+        RangeLeaderCheck,
+        RangeProjection,
+        RangeBatchDecision,
+    }
+
+    type AfterHighestAudit = Box<dyn FnOnce(&Connection)>;
+    type AfterEvent = (Event, usize, Box<dyn FnOnce()>);
+
+    struct Observation {
+        events: Vec<Event>,
+        after_highest_audit: Option<AfterHighestAudit>,
+        after_event: Option<AfterEvent>,
+    }
+
+    thread_local! {
+        static OBSERVATION: RefCell<Option<Observation>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn note(event: Event) {
+        let hook = OBSERVATION.with(|state| {
+            if let Some(observation) = state.borrow_mut().as_mut() {
+                assert!(observation.events.len() < 256, "bounded test observation");
+                observation.events.push(event);
+                if let Some((wanted, remaining, _)) = observation.after_event.as_mut() {
+                    if *wanted == event {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            return observation.after_event.take().map(|(_, _, hook)| hook);
+                        }
+                    }
+                }
+            }
+            None
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(super) fn after_highest_audit(conn: &Connection) {
+        note(Event::HighestAudit);
+        let hook = OBSERVATION.with(|state| {
+            state
+                .borrow_mut()
+                .as_mut()
+                .and_then(|observation| observation.after_highest_audit.take())
+        });
+        if let Some(hook) = hook {
+            hook(conn);
+        }
+    }
+
+    pub(super) struct AfterBytesDrop;
+
+    impl Drop for AfterBytesDrop {
+        fn drop(&mut self) {
+            note(Event::AfterBytesDrop);
+        }
+    }
+
+    // This observes destruction of the slot after its Option<Entry/Box<Entry>>
+    // field. TypedTransfer distinguishes a moved value from one dropped here.
+    // It is zero-sized so observations do not change the charged type layouts.
+    pub(super) struct AfterEntrySlotDrop;
+
+    impl Drop for AfterEntrySlotDrop {
+        fn drop(&mut self) {
+            note(Event::AfterEntrySlotDrop);
+        }
+    }
+
+    pub(super) struct Scope(bool);
+
+    impl Scope {
+        pub(super) fn new() -> Self {
+            OBSERVATION.with(|state| {
+                assert!(state.borrow().is_none(), "one observation per test call");
+                *state.borrow_mut() = Some(Observation {
+                    events: Vec::with_capacity(256),
+                    after_highest_audit: None,
+                    after_event: None,
+                });
+            });
+            Self(true)
+        }
+
+        pub(super) fn after_highest_audit(&self, hook: impl FnOnce(&Connection) + 'static) {
+            OBSERVATION.with(|state| {
+                let mut state = state.borrow_mut();
+                let observation = state.as_mut().expect("active observation");
+                assert!(observation.after_highest_audit.is_none());
+                observation.after_highest_audit = Some(Box::new(hook));
+            });
+        }
+
+        pub(super) fn after_event(
+            &self,
+            event: Event,
+            occurrence: usize,
+            hook: impl FnOnce() + 'static,
+        ) {
+            assert!(occurrence > 0);
+            OBSERVATION.with(|state| {
+                let mut state = state.borrow_mut();
+                let observation = state.as_mut().expect("active observation");
+                assert!(observation.after_event.is_none());
+                observation.after_event = Some((event, occurrence, Box::new(hook)));
+            });
+        }
+
+        pub(super) fn finish(mut self) -> Vec<Event> {
+            let observation = OBSERVATION.with(|state| state.borrow_mut().take().unwrap());
+            assert!(observation.after_highest_audit.is_none(), "test hook ran");
+            assert!(observation.after_event.is_none(), "event hook ran");
+            self.0 = false;
+            observation.events
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if self.0 {
+                OBSERVATION.with(|state| {
+                    state.borrow_mut().take();
+                });
+            }
+        }
+    }
+}
+
+// The sequential WAL is deliberately unreachable from production constructors
+// until adapter, snapshot, recovery and migration qualification (ADR 0021).
+#[cfg(target_os = "linux")]
+pub(crate) mod wal;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod historical_snapshot_fixture;
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod native;
+    #[cfg(target_os = "linux")]
+    mod sequential_wal;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -40429,6 +40078,2451 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+
+    const SDK741_COMPONENT_LAST: u64 = 4;
+
+    #[derive(Clone, Copy)]
+    enum Sdk741Payload {
+        Create,
+        Renew,
+    }
+
+    impl Sdk741Payload {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Create => "create",
+                Self::Renew => "renew_update",
+            }
+        }
+    }
+
+    struct Sdk741Fixture {
+        entries: Vec<Entry<SessionRaftTypeConfig>>,
+        outcomes: Vec<Vec<FencedTransitionOutcome>>,
+    }
+
+    fn sdk741_seal_record(record: &mut StoredSessionRecord, nonce_id: u64, create: bool) {
+        // Public deterministic test-vector API; these are synthetic keys,
+        // identities and plaintext. Each record vector uses a distinct nonce.
+        let handle = opc_key::KeyHandle::new(
+            KeyId::new("sdk741-component-test-vector").unwrap(),
+            opc_key::KeyPurpose::Session,
+            record.key.tenant.clone(),
+            opc_key::Zeroizing::new([0x74; opc_key::AES_256_GCM_SIV_KEY_LEN]),
+        );
+        let namespace = "sdk-702-v2-qualification";
+        let aad = crate::record::build_session_envelope_aad(record, namespace, &handle)
+            .expect("bind actual session AAD");
+        let plaintext: &[u8] = if create {
+            b"qualification"
+        } else {
+            b"qualification-update"
+        };
+        let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
+        nonce[4..].copy_from_slice(&nonce_id.to_be_bytes());
+        let encoded =
+            opc_crypto::encrypt_envelope_with_handle_and_nonce(&handle, &aad, plaintext, nonce)
+                .expect("seal deterministic synthetic record");
+        let opened = opc_crypto::decrypt_envelope_with_handle(&handle, &aad, &encoded)
+            .expect("authenticate every synthetic envelope");
+        assert!(opened.as_slice() == plaintext, "exact envelope round trip");
+        record.payload = EncryptedSessionPayload::try_envelope(encoded)
+            .expect("admitted authenticated envelope");
+    }
+
+    fn sdk741_component_request(
+        payload: Sdk741Payload,
+        row: u64,
+        slot: usize,
+        previous: Option<&FencedTransitionOutcome>,
+    ) -> FencedTransitionV2Request {
+        let mut record_key = key();
+        let key_row = if matches!(payload, Sdk741Payload::Create) {
+            row
+        } else {
+            1
+        };
+        record_key.stable_id = Bytes::from(format!("sdk741-{}-{key_row}-{slot}", payload.name()))
+            .try_into()
+            .expect("bounded distinct synthetic key");
+        let owner = OwnerId::new("sdk741-component-owner").unwrap();
+        let mut record = StoredSessionRecord {
+            key: record_key.clone(),
+            generation: Generation::new(1),
+            owner: owner.clone(),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: crate::StateType::from_static("sdk-702-v2-qualification"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        let create = previous.is_none();
+        let lease = if let Some(previous) = previous {
+            assert!(previous.lease().key() == &record_key);
+            record.owner = previous.lease().owner().clone();
+            record.fence = previous.lease().fence();
+            record.generation = previous.committed_generation().next().unwrap();
+            FencedTransitionLease::renew(previous.lease().clone(), Duration::from_secs(60))
+                .expect("renew exact committed predecessor")
+        } else {
+            FencedTransitionLease::acquire(
+                record_key,
+                owner,
+                FenceToken::new(0),
+                Duration::from_secs(60),
+            )
+            .expect("acquire a distinct fresh key")
+        };
+        let number = row * 8
+            + u64::try_from(slot).unwrap()
+            + if matches!(payload, Sdk741Payload::Create) {
+                128
+            } else {
+                256
+            };
+        sdk741_seal_record(&mut record, number, create);
+        let mutation = if let Some(previous) = previous {
+            FencedTransitionMutation::update(previous.committed_generation(), record)
+        } else {
+            FencedTransitionMutation::create(record)
+        };
+        FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).unwrap(),
+            crate::fenced_transition::FencedTransitionV2CallerNonce::from_bytes(
+                u128::from(number).to_be_bytes(),
+            ),
+            lease,
+            mutation,
+        )
+        .expect("self-authenticating synthetic request")
+    }
+
+    fn sdk741_apply_batch(
+        conn: &Connection,
+        caps: &BackendCapabilities,
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> Vec<FencedTransitionOutcome> {
+        let applied = apply_entries_sync(conn, identity(), caps, vec![entry.clone()])
+            .expect("apply positive component batch");
+        assert_eq!(applied.responses.len(), 1);
+        let Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) =
+            &applied.responses[0].result
+        else {
+            panic!("positive setup must return a V2 batch result");
+        };
+        let EntryPayload::Normal(command) = &entry.payload else {
+            panic!("positive fixture is a normal command");
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = &command.intent else {
+            panic!("positive fixture is an eight-item batch");
+        };
+        assert_eq!(requests.len(), 8);
+        assert_eq!(outcomes.len(), 8);
+        outcomes
+            .iter()
+            .zip(requests)
+            .map(|(outcome, request)| {
+                let outcome = outcome
+                    .as_ref()
+                    .expect("each intended setup mutation succeeds");
+                assert!(
+                    outcome.matches_v2_request(request),
+                    "exact request/result identity"
+                );
+                let expected =
+                    if matches!(request.mutation(), FencedTransitionMutation::Create { .. }) {
+                        FencedTransitionMutationResult::Created
+                    } else {
+                        FencedTransitionMutationResult::Updated
+                    };
+                assert_eq!(outcome.mutation(), expected);
+                assert!(outcome.lease().key() == request.lease().key());
+                assert_eq!(outcome.lease().fence(), FenceToken::new(1));
+                outcome.clone()
+            })
+            .collect()
+    }
+
+    fn sdk741_initialize(conn: &Connection, caps: &BackendCapabilities) {
+        initialize_schema(conn, identity(), &expected_members()).expect("component schema");
+        let membership = membership_entry();
+        append_logs_sync(conn, identity(), std::slice::from_ref(&membership))
+            .expect("append exact membership");
+        save_committed_sync(conn, identity(), Some(membership.log_id)).expect("commit membership");
+        let applied =
+            apply_entries_sync(conn, identity(), caps, vec![membership]).expect("apply membership");
+        assert!(applied
+            .responses
+            .iter()
+            .all(|response| response.result.is_ok()));
+        activate_v2_ledger_fixture(conn);
+        validate_fenced_transition_v2_receipts_sync(conn, identity()).expect("valid activation");
+    }
+
+    fn sdk741_build_fixture(directory: &Path, payload: Sdk741Payload) -> Sdk741Fixture {
+        let backend = SqliteSessionBackend::open(
+            directory.join(format!("{}-witness.sqlite", payload.name())),
+        )
+        .expect("disk-backed component witness");
+        let conn = backend.conn.blocking_lock();
+        sdk741_initialize(&conn, &backend.caps);
+        let mut fixture = Sdk741Fixture {
+            entries: vec![membership_entry()],
+            outcomes: vec![Vec::new()],
+        };
+        for row in 1..=SDK741_COMPONENT_LAST {
+            let requests = (0..8)
+                .map(|slot| {
+                    let previous = if matches!(payload, Sdk741Payload::Renew) && row > 1 {
+                        Some(&fixture.outcomes[usize::try_from(row - 1).unwrap()][slot])
+                    } else {
+                        None
+                    };
+                    sdk741_component_request(payload, row, slot, previous)
+                })
+                .collect();
+            let entry = fenced_transition_v2_batch_entry(
+                row,
+                requests,
+                timestamp(u8::try_from(row).unwrap()),
+            );
+            let encoded = encode_json(&entry).unwrap();
+            assert!(decode_consensus_log_entry(&encoded).unwrap() == entry);
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+                .expect("append positive batch");
+            save_committed_sync(&conn, identity(), Some(entry.log_id))
+                .expect("commit positive batch");
+            let outcomes = sdk741_apply_batch(&conn, &backend.caps, &entry);
+            fixture.entries.push(entry);
+            fixture.outcomes.push(outcomes);
+        }
+        assert_eq!(fixture.entries.len(), 5);
+        assert!(fixture.entries.len() <= 64);
+        assert!(conn.is_autocommit());
+        fixture
+    }
+
+    fn sdk741_seed_case(
+        directory: &Path,
+        label: &str,
+        fixture: &Sdk741Fixture,
+        applied_through: u64,
+    ) -> SqliteSessionBackend {
+        let backend = SqliteSessionBackend::open(directory.join(format!("{label}.sqlite")))
+            .expect("disk-backed component case");
+        {
+            let conn = backend.conn.blocking_lock();
+            sdk741_initialize(&conn, &backend.caps);
+            for entry in fixture.entries.iter().skip(1) {
+                append_logs_sync(&conn, identity(), std::slice::from_ref(entry))
+                    .expect("append exact original fixture");
+                save_committed_sync(&conn, identity(), Some(entry.log_id))
+                    .expect("commit exact original fixture");
+                if entry.log_id.index <= applied_through {
+                    let actual = sdk741_apply_batch(&conn, &backend.caps, entry);
+                    assert!(
+                        actual == fixture.outcomes[usize::try_from(entry.log_id.index).unwrap()]
+                    );
+                }
+            }
+            assert_eq!(
+                read_applied_sync(&conn, identity()).unwrap(),
+                Some(log_id(applied_through))
+            );
+            assert_eq!(
+                last_log_sync(&conn, identity()).unwrap(),
+                Some(log_id(SDK741_COMPONENT_LAST))
+            );
+            assert!(conn.is_autocommit());
+        }
+        backend
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Sdk741Reader {
+        Limited,
+        Strict,
+        Published684,
+        PhysicalRetained,
+        DynamicStrict,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Sdk741Read {
+        reader: Sdk741Reader,
+        start: u64,
+        end: u64,
+    }
+
+    impl Sdk741Read {
+        fn limited(start: u64, end: u64) -> Self {
+            Self {
+                reader: Sdk741Reader::Limited,
+                start,
+                end,
+            }
+        }
+
+        fn run(self, conn: &Connection) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+            match self.reader {
+                Sdk741Reader::Limited => {
+                    read_limited_log_range_sync(conn, identity(), self.start, self.end, 8)
+                }
+                Sdk741Reader::Strict => {
+                    read_log_range_sync(conn, identity(), self.start, Some(self.end), Some(8))
+                }
+                Sdk741Reader::Published684 => read_log_range_for_recovery_sync(
+                    conn,
+                    identity(),
+                    self.start,
+                    Some(self.end),
+                    Some(8),
+                ),
+                Sdk741Reader::PhysicalRetained => read_physical_log_range_for_recovery_sync(
+                    conn,
+                    identity(),
+                    self.start,
+                    Some(self.end),
+                    Some(8),
+                ),
+                Sdk741Reader::DynamicStrict => with_durable_authority_raw_read_sync(
+                    conn,
+                    identity(),
+                    ConsensusAuthorityProfile::Dynamic,
+                    &expected_members(),
+                    &BTreeMap::new(),
+                    None,
+                    |conn| {
+                        read_log_range_sync(conn, identity(), self.start, Some(self.end), Some(8))
+                    },
+                ),
+            }
+        }
+    }
+
+    fn sdk741_hash(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn sdk741_state_hash(conn: &Connection) -> String {
+        let mut digest = Sha256::new();
+        digest.update(format!("{:?}", read_machine_sync(conn, identity()).unwrap()).as_bytes());
+        digest.update(format!("{:?}", read_applied_sync(conn, identity()).unwrap()).as_bytes());
+        digest.update(format!("{:?}", read_purged_sync(conn, identity()).unwrap()).as_bytes());
+        digest.update(format!("{:?}", read_committed_sync(conn, identity()).unwrap()).as_bytes());
+        let mut stmt = conn.prepare("SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log ORDER BY log_index").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            for column in 0..3 {
+                digest.update(row.get::<_, i64>(column).unwrap().to_le_bytes());
+            }
+            let encoded: Vec<u8> = row.get(3).unwrap();
+            digest.update(u64::try_from(encoded.len()).unwrap().to_le_bytes());
+            digest.update(&encoded);
+            count += 1;
+            assert!(count <= 64);
+        }
+        format!("{:x}", digest.finalize())
+    }
+
+    enum Sdk741Expected<'a> {
+        Rows(&'a [Entry<SessionRaftTypeConfig>]),
+        Invalid(&'a str),
+    }
+
+    fn sdk741_oracle(
+        conn: &Connection,
+        name: &str,
+        read: Sdk741Read,
+        expected: Sdk741Expected<'_>,
+        records: &mut Vec<serde_json::Value>,
+    ) {
+        let before = sdk741_state_hash(conn);
+        let autocommit = conn.is_autocommit();
+        let changes = conn.total_changes();
+        let scope = log_row_reuse_test_observer::Scope::new();
+        let result = read.run(conn);
+        let observation = scope.finish();
+        log_row_reuse_assert_closed(&observation);
+        let outcome = match (result, expected) {
+            (Ok(actual), Sdk741Expected::Rows(expected)) => {
+                assert!(actual == expected, "positive oracle mismatch: {name}");
+                serde_json::json!({
+                    "ok": true,
+                    "indices": actual.iter().map(|entry| entry.log_id.index).collect::<Vec<_>>(),
+                    "full_entries_sha256": sdk741_hash(&encode_json(&actual).unwrap()),
+                })
+            }
+            (Err(error), Sdk741Expected::Invalid(expected)) => {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
+                assert_eq!(error.to_string(), expected, "{name}");
+                serde_json::json!({"ok": false, "kind": "InvalidData", "message": error.to_string()})
+            }
+            _ => panic!("oracle result class changed: {name}"),
+        };
+        let after = sdk741_state_hash(conn);
+        assert_eq!(before, after, "reader changed durable state: {name}");
+        assert_eq!(
+            changes,
+            conn.total_changes(),
+            "reader performed SQL writes: {name}"
+        );
+        assert_eq!(
+            autocommit,
+            conn.is_autocommit(),
+            "reader changed transaction ownership: {name}"
+        );
+        let oracle = serde_json::json!({
+            "case": name, "reader": format!("{:?}", read.reader),
+            "start": read.start, "end": read.end, "outcome": outcome,
+            "before_state_sha256": before, "after_state_sha256": after,
+            "autocommit_before": autocommit, "autocommit_after": conn.is_autocommit(),
+            "sql_total_changes_delta": conn.total_changes() - changes,
+        });
+        eprintln!(
+            "SDK741_LOG_REUSE {}",
+            serde_json::json!({
+                "type": "oracle", "oracle": oracle,
+                "full_decodes": log_row_reuse_event_count(&observation, log_row_reuse_test_observer::Event::FullDecode),
+                "proof_hits": log_row_reuse_event_count(&observation, log_row_reuse_test_observer::Event::Hit),
+            })
+        );
+        records.push(oracle);
+    }
+
+    fn sdk741_correctness(
+        directory: &Path,
+        payload: Sdk741Payload,
+        fixture: &Sdk741Fixture,
+        records: &mut Vec<serde_json::Value>,
+    ) {
+        let backend = sdk741_seed_case(
+            directory,
+            &format!("{}-oracles", payload.name()),
+            fixture,
+            4,
+        );
+        let conn = backend.conn.blocking_lock();
+        let intact = sdk741_state_hash(&conn);
+        let malformed = decode_consensus_log_entry(b"{").err().unwrap().to_string();
+        let mismatch = "persisted session consensus log row mismatch";
+        let hole = "persisted session consensus log range contains a hole";
+        for reader in [
+            Sdk741Reader::Limited,
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+            Sdk741Reader::DynamicStrict,
+        ] {
+            sdk741_oracle(
+                &conn,
+                &format!("{}-valid-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 1,
+                    end: 5,
+                },
+                Sdk741Expected::Rows(&fixture.entries[1..]),
+                records,
+            );
+        }
+        for (fault, sql, start, end, error) in [
+            ("malformed-last-outside-range", "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4", 1, 3, malformed.as_str()),
+            ("malformed-returned-row", "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 2", 1, 3, malformed.as_str()),
+            ("last-log-id-sql-term", "UPDATE consensus_log SET term = term + 1 WHERE log_index = 4", 1, 3, mismatch),
+            ("returned-log-id-sql-term", "UPDATE consensus_log SET term = term + 1 WHERE log_index = 2", 1, 3, mismatch),
+            ("leading-hole", "DELETE FROM consensus_log WHERE log_index = 1", 1, 4, hole),
+            ("internal-hole", "DELETE FROM consensus_log WHERE log_index = 2", 1, 4, hole),
+            ("paired-last-before-earlier-row", "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4; UPDATE consensus_log SET term = term + 1 WHERE log_index = 1", 1, 3, malformed.as_str()),
+        ] {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            tx.execute_batch(sql).expect("install bounded uncommitted fault");
+            for reader in [Sdk741Reader::Limited, Sdk741Reader::Strict, Sdk741Reader::Published684,
+                Sdk741Reader::PhysicalRetained, Sdk741Reader::DynamicStrict] {
+                // Physical recovery adopts the first returned index without
+                // a purge predecessor, including when the requested start is 1.
+                let expected = if fault == "leading-hole"
+                    && matches!(reader, Sdk741Reader::PhysicalRetained)
+                {
+                    Sdk741Expected::Rows(&fixture.entries[2..4])
+                } else {
+                    Sdk741Expected::Invalid(error)
+                };
+                sdk741_oracle(&tx, &format!("{}-{fault}-{reader:?}", payload.name()),
+                    Sdk741Read { reader, start, end }, expected, records);
+                assert!(!conn.is_autocommit());
+            }
+            tx.rollback().expect("caller alone rolls back fault");
+            assert!(conn.is_autocommit());
+            assert_eq!(intact, sdk741_state_hash(&conn), "rollback restores exact original rows");
+        }
+        // A valid caller-uncommitted removal changes the visible last row.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert_eq!(
+            tx.execute("DELETE FROM consensus_log WHERE log_index = 4", [])
+                .unwrap(),
+            1
+        );
+        for reader in [
+            Sdk741Reader::Limited,
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+            Sdk741Reader::DynamicStrict,
+        ] {
+            sdk741_oracle(
+                &tx,
+                &format!("{}-caller-uncommitted-visible-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 3,
+                    end: 5,
+                },
+                Sdk741Expected::Rows(&fixture.entries[3..4]),
+                records,
+            );
+        }
+        tx.rollback().unwrap();
+        assert_eq!(intact, sdk741_state_hash(&conn));
+        sdk741_oracle(
+            &conn,
+            &format!("{}-after-caller-rollback", payload.name()),
+            Sdk741Read::limited(3, 5),
+            Sdk741Expected::Rows(&fixture.entries[3..5]),
+            records,
+        );
+
+        // The recovery-only physical cursor may start after an omitted prefix;
+        // the strict and Published684 readers retain their exact start rule.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        tx.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .unwrap();
+        for reader in [Sdk741Reader::Strict, Sdk741Reader::Published684] {
+            sdk741_oracle(
+                &tx,
+                &format!("{}-omitted-prefix-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 0,
+                    end: 5,
+                },
+                Sdk741Expected::Invalid(hole),
+                records,
+            );
+        }
+        sdk741_oracle(
+            &tx,
+            &format!("{}-omitted-prefix-physical", payload.name()),
+            Sdk741Read {
+                reader: Sdk741Reader::PhysicalRetained,
+                start: 0,
+                end: 5,
+            },
+            Sdk741Expected::Rows(&fixture.entries[1..5]),
+            records,
+        );
+        tx.rollback().unwrap();
+        assert_eq!(intact, sdk741_state_hash(&conn));
+        assert!(conn.is_autocommit());
+        drop(conn);
+
+        let prefix_backend = sdk741_seed_case(
+            directory,
+            &format!("{}-prefix-oracles", payload.name()),
+            fixture,
+            1,
+        );
+        let prefix = prefix_backend.conn.blocking_lock();
+        for reader in [
+            Sdk741Reader::Limited,
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+            Sdk741Reader::DynamicStrict,
+        ] {
+            sdk741_oracle(
+                &prefix,
+                &format!("{}-unapplied-middle-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 3,
+                    end: 5,
+                },
+                Sdk741Expected::Rows(&fixture.entries[3..5]),
+                records,
+            );
+            sdk741_oracle(
+                &prefix,
+                &format!("{}-unapplied-beyond-tail-{reader:?}", payload.name()),
+                Sdk741Read {
+                    reader,
+                    start: 5,
+                    end: 6,
+                },
+                Sdk741Expected::Rows(&[]),
+                records,
+            );
+        }
+        assert!(prefix.is_autocommit());
+    }
+
+    fn log_row_reuse_event_count(
+        events: &[log_row_reuse_test_observer::Event],
+        wanted: log_row_reuse_test_observer::Event,
+    ) -> usize {
+        events.iter().filter(|event| **event == wanted).count()
+    }
+
+    fn log_row_reuse_assert_closed(events: &[log_row_reuse_test_observer::Event]) {
+        use log_row_reuse_test_observer::Event;
+        let captured = log_row_reuse_event_count(events, Event::Captured);
+        assert!(captured <= 1, "one candidate per read");
+        assert!(log_row_reuse_event_count(events, Event::Hit) <= captured);
+        assert_eq!(
+            captured,
+            log_row_reuse_event_count(events, Event::AfterBytesDrop)
+        );
+        assert_eq!(captured, log_row_reuse_event_count(events, Event::Refund));
+        assert_eq!(
+            captured,
+            log_row_reuse_event_count(events, Event::AfterEntrySlotDrop)
+        );
+        for (index, event) in events.iter().enumerate() {
+            if *event == Event::AfterBytesDrop {
+                assert_eq!(events.get(index + 1), Some(&Event::AfterEntrySlotDrop));
+                assert_eq!(events.get(index + 2), Some(&Event::Refund));
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_preserves_corrected_baseline_oracles() {
+        let mut records = Vec::new();
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let directory = tempfile::tempdir().expect("private disk fixture");
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            let expected_fixture = match payload {
+                Sdk741Payload::Create => {
+                    "f3e00ff5135f949d270522fecddcfdde801e6ff4296bac62a1b7eab256ad42ad"
+                }
+                Sdk741Payload::Renew => {
+                    "62d2eebf3b0fb5eee269bd7224a6bb7e5ed048489add9f4a068ca3af53395273"
+                }
+            };
+            assert_eq!(
+                sdk741_hash(&encode_json(&fixture.entries).unwrap()),
+                expected_fixture
+            );
+            sdk741_correctness(directory.path(), payload, &fixture, &mut records);
+            for (shape, applied, read, expected) in [
+                (
+                    "last_applied",
+                    4,
+                    Sdk741Read::limited(4, 5),
+                    &fixture.entries[4..5],
+                ),
+                (
+                    "range_ending_last",
+                    4,
+                    Sdk741Read::limited(3, 5),
+                    &fixture.entries[3..5],
+                ),
+                (
+                    "range_before_last",
+                    4,
+                    Sdk741Read::limited(1, 3),
+                    &fixture.entries[1..3],
+                ),
+                (
+                    "unapplied_beyond_tail",
+                    1,
+                    Sdk741Read::limited(5, 6),
+                    &fixture.entries[0..0],
+                ),
+                (
+                    "reclaimed_empty",
+                    4,
+                    Sdk741Read::limited(0, 6),
+                    &fixture.entries[0..0],
+                ),
+            ] {
+                let backend = sdk741_seed_case(
+                    directory.path(),
+                    &format!("{}-{shape}", payload.name()),
+                    &fixture,
+                    applied,
+                );
+                let conn = backend.conn.blocking_lock();
+                if shape == "reclaimed_empty" {
+                    purge_logs_sync(&conn, identity(), &log_id(4)).unwrap();
+                    assert_eq!(
+                        conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        0
+                    );
+                }
+                // Keep the old oracle's historical name to compare its exact
+                // frozen digest. This is one correctness read, with no timer,
+                // warmup, sample loop or measurement campaign.
+                sdk741_oracle(
+                    &conn,
+                    &format!("{}-measured-shape-{shape}", payload.name()),
+                    read,
+                    Sdk741Expected::Rows(expected),
+                    &mut records,
+                );
+            }
+        }
+        assert_eq!(records.len(), 128);
+        let digest = sdk741_hash(&serde_json::to_vec(&records).unwrap());
+        assert_eq!(
+            digest,
+            "9ea2abc4b697f59d7a640b99a11a3ebca92e66863aec2e4ca4a23aed53839b92"
+        );
+        eprintln!("SDK741_LOG_REUSE {{\"type\":\"baseline_oracle_equivalence\",\"count\":128,\"sha256\":\"{digest}\"}}");
+    }
+
+    fn log_row_reuse_local_read(
+        conn: &Connection,
+        start: u64,
+        end: u64,
+        budget_limit: usize,
+        scope: log_row_reuse_test_observer::Scope,
+    ) -> (
+        io::Result<Vec<Entry<SessionRaftTypeConfig>>>,
+        Vec<log_row_reuse_test_observer::Event>,
+    ) {
+        let budget = LogRowRetentionBudget::new(budget_limit);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let result = read_log_range_with_batch_and_reuse_sync(
+            conn,
+            identity(),
+            start,
+            Some(end),
+            Some(8),
+            true,
+            LogRangeRecoveryProfile::Strict,
+            &mut reuse,
+        );
+        drop(reuse);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        (result, events)
+    }
+
+    fn log_row_reuse_error(result: io::Result<Vec<Entry<SessionRaftTypeConfig>>>) -> String {
+        let error = result.expect_err("expected reader rejection");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        error.to_string()
+    }
+
+    #[test]
+    fn log_row_reuse_removes_later_typed_and_canonical_decode_but_runs_consumer_checks() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let directory = tempfile::tempdir().unwrap();
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            for (shape, applied, start, end, expected, original_decodes, hits) in [
+                ("last", 4, 4, 5, &fixture.entries[4..5], 2, 1),
+                ("ending_last", 4, 3, 5, &fixture.entries[3..5], 3, 1),
+                ("before_last", 4, 1, 3, &fixture.entries[1..3], 3, 0),
+                ("prefix_last", 1, 5, 6, &fixture.entries[0..0], 4, 1),
+                ("empty", 4, 0, 6, &fixture.entries[0..0], 0, 0),
+            ] {
+                let backend = sdk741_seed_case(directory.path(), shape, &fixture, applied);
+                let conn = backend.conn.blocking_lock();
+                if shape == "empty" {
+                    purge_logs_sync(&conn, identity(), &log_id(4)).unwrap();
+                }
+                let before = sdk741_state_hash(&conn);
+                let changes = conn.total_changes();
+                for enabled in [false, true] {
+                    let (result, events) = log_row_reuse_local_read(
+                        &conn,
+                        start,
+                        end,
+                        if enabled {
+                            LOG_ROW_REUSE_AGGREGATE_BYTES
+                        } else {
+                            0
+                        },
+                        Scope::new(),
+                    );
+                    assert!(result.unwrap() == expected, "{} {shape}", payload.name());
+                    let expected_hits = if enabled { hits } else { 0 };
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::Hit),
+                        expected_hits
+                    );
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::FullDecode),
+                        original_decodes - expected_hits
+                    );
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::TypedDecode),
+                        original_decodes - expected_hits
+                    );
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::TypedTransfer),
+                        expected_hits
+                    );
+                    let prefix_checks = if shape == "prefix_last" { 3 } else { 0 };
+                    for check in [
+                        Event::PrefixContiguityCheck,
+                        Event::PrefixLeaderCheck,
+                        Event::PrefixProjection,
+                    ] {
+                        assert_eq!(log_row_reuse_event_count(&events, check), prefix_checks);
+                    }
+                    for check in [
+                        Event::RangeLogIdCheck,
+                        Event::RangeContiguityCheck,
+                        Event::RangeProjection,
+                        Event::RangeBatchDecision,
+                    ] {
+                        assert_eq!(log_row_reuse_event_count(&events, check), expected.len());
+                    }
+                    // These fixtures have no purge predecessor. The original
+                    // range loop compares leaders only from its second row.
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::RangeLeaderCheck),
+                        expected.len().saturating_sub(1)
+                    );
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::HighestAudit),
+                        usize::from(shape != "empty")
+                    );
+                    assert_eq!(before, sdk741_state_hash(&conn));
+                    assert_eq!(changes, conn.total_changes());
+                    assert!(conn.is_autocommit());
+                    eprintln!(
+                        "SDK741_LOG_REUSE {}",
+                        serde_json::json!({
+                            "type": "decode_counts", "payload": payload.name(), "shape": shape,
+                            "enabled": enabled, "full_decodes": original_decodes - expected_hits,
+                            "typed_decodes": original_decodes - expected_hits,
+                            "hits": expected_hits, "typed_transfers": expected_hits,
+                            "prefix_check_sets": prefix_checks, "range_check_sets": expected.len(),
+                            "range_leader_checks": expected.len().saturating_sub(1),
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_requires_every_fresh_sql_field_and_byte() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let mut changed = fixture.entries[4].clone();
+        if let EntryPayload::Normal(command) = &mut changed.payload {
+            command.logical_time = timestamp(5);
+        }
+        let changed_bytes = encode_json(&changed).unwrap();
+        assert!(decode_consensus_log_entry(&changed_bytes).unwrap() == changed);
+        assert_eq!(changed.log_id, fixture.entries[4].log_id);
+        let malformed = decode_consensus_log_entry(b"{").err().unwrap().to_string();
+        let mut noncanonical = encode_json(&fixture.entries[4]).unwrap();
+        noncanonical.push(b' ');
+        let canonical_error = decode_consensus_log_entry(&noncanonical)
+            .err()
+            .unwrap()
+            .to_string();
+        for prefix in [false, true] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                if prefix {
+                    "fresh-prefix"
+                } else {
+                    "fresh-range"
+                },
+                &fixture,
+                if prefix { 3 } else { 4 },
+            );
+            let conn = backend.conn.blocking_lock();
+            let intact = sdk741_state_hash(&conn);
+            for fault in [
+                "epoch",
+                "term",
+                "index",
+                "valid-bytes",
+                "malformed-bytes",
+                "noncanonical-bytes",
+                "epoch-before-malformed",
+                "decode-before-term",
+            ] {
+                for enabled in [false, true] {
+                    let tx =
+                        Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+                    // The epoch intentionally violates a foreign key. Keep
+                    // enforcement enabled, but defer it in this caller-owned
+                    // negative fixture so the reader sees the corrupt tuple.
+                    // This transaction always rolls back; no invalid commit
+                    // or production constraint change is admitted.
+                    assert!(conn
+                        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                        .unwrap());
+                    tx.pragma_update(None, "defer_foreign_keys", true).unwrap();
+                    let scope = Scope::new();
+                    let bytes = changed_bytes.clone();
+                    let noncanonical = noncanonical.clone();
+                    scope.after_highest_audit(move |conn| {
+                        let sql = match fault {
+                            "epoch" => "UPDATE consensus_log SET configuration_epoch = configuration_epoch + 1 WHERE log_index = 4",
+                            "term" => "UPDATE consensus_log SET term = term + 1 WHERE log_index = 4",
+                            "index" => "UPDATE consensus_log SET log_index = 5 WHERE log_index = 4",
+                            "epoch-before-malformed" => "UPDATE consensus_log SET configuration_epoch = configuration_epoch + 1, entry_json = X'7B' WHERE log_index = 4",
+                            "decode-before-term" => "UPDATE consensus_log SET term = term + 1, entry_json = X'7B' WHERE log_index = 4",
+                            "malformed-bytes" => "UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4",
+                            "valid-bytes" | "noncanonical-bytes" => {
+                                conn.execute("UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 4",
+                                    [if fault == "valid-bytes" { bytes } else { noncanonical }]).unwrap();
+                                return;
+                            }
+                            _ => unreachable!(),
+                        };
+                        conn.execute(sql, []).unwrap();
+                    });
+                    let before_changes = conn.total_changes();
+                    let (result, events) = log_row_reuse_local_read(
+                        &tx,
+                        if prefix { 5 } else { 4 },
+                        6,
+                        if enabled {
+                            LOG_ROW_REUSE_AGGREGATE_BYTES
+                        } else {
+                            0
+                        },
+                        scope,
+                    );
+                    let expected_error = match fault {
+                        "epoch" | "epoch-before-malformed" => Some("session consensus configuration epoch mismatch"),
+                        "term" if prefix => Some("persisted session consensus unapplied log projection is not contiguous"),
+                        "term" | "index" if !prefix => Some("persisted session consensus log row mismatch"),
+                        "index" => Some("persisted session consensus unapplied log projection has a hole"),
+                        "malformed-bytes" | "decode-before-term" => Some(malformed.as_str()),
+                        "noncanonical-bytes" => Some(canonical_error.as_str()),
+                        "valid-bytes" => None,
+                        _ => unreachable!(),
+                    };
+                    if let Some(expected) = expected_error {
+                        assert_eq!(log_row_reuse_error(result), expected, "{prefix} {fault}");
+                    } else {
+                        let expected = if prefix {
+                            Vec::new()
+                        } else {
+                            vec![changed.clone()]
+                        };
+                        assert!(result.unwrap() == expected);
+                    }
+                    assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::Captured),
+                        usize::from(enabled)
+                    );
+                    let early = matches!(fault, "epoch" | "epoch-before-malformed")
+                        || (prefix && fault == "index");
+                    assert_eq!(
+                        log_row_reuse_event_count(&events, Event::FullDecode),
+                        if early { 1 } else { 2 }
+                    );
+                    assert_eq!(
+                        conn.total_changes() - before_changes,
+                        1,
+                        "only the injected SQL mutation"
+                    );
+                    assert!(!conn.is_autocommit(), "caller still owns its transaction");
+                    tx.rollback().unwrap();
+                    assert!(conn.is_autocommit());
+                    assert!(!conn
+                        .pragma_query_value(None, "defer_foreign_keys", |row| row.get::<_, bool>(0))
+                        .unwrap());
+                    assert!(conn
+                        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                        .unwrap());
+                    assert_eq!(intact, sdk741_state_hash(&conn));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_observes_dynamic_changes_and_fixed_snapshot_ownership() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        for authority in [
+            ConsensusAuthorityProfile::Dynamic,
+            ConsensusAuthorityProfile::FixedImmutable,
+        ] {
+            let database = directory
+                .path()
+                .join(format!("visibility-{authority:?}.sqlite"));
+            let backend = SqliteSessionBackend::open(&database).unwrap();
+            let conn = backend.conn.blocking_lock();
+            initialize_schema_with_profile(&conn, identity(), &members, authority).unwrap();
+            let policy = (authority == ConsensusAuthorityProfile::FixedImmutable)
+                .then_some(PlacementResiliencePolicy::RequireIndependentFailureDomains);
+            let mut entries = fixture.entries.clone();
+            entries[0] = membership_entry_at(0, vec![members.clone()], members.clone());
+            // Exercise the other eligible representation through its actual
+            // authority admission, append, apply and reader paths.
+            if let EntryPayload::Normal(command) = &mut entries[4].payload {
+                command.intent = SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(),
+                    mutation: Box::new(command.intent.clone()),
+                };
+            }
+            for entry in &entries {
+                append_logs_with_authority_sync(
+                    &conn,
+                    identity(),
+                    authority,
+                    &members,
+                    &bindings,
+                    policy,
+                    std::slice::from_ref(entry),
+                )
+                .unwrap();
+                save_committed_with_authority_sync(
+                    &conn,
+                    identity(),
+                    authority,
+                    &members,
+                    &bindings,
+                    policy,
+                    Some(entry.log_id),
+                )
+                .unwrap();
+                let applied = apply_entries_with_authority_sync(
+                    &conn,
+                    identity(),
+                    &backend.caps,
+                    authority,
+                    &members,
+                    &bindings,
+                    policy,
+                    vec![entry.clone()],
+                )
+                .unwrap();
+                assert_eq!(applied.responses.len(), 1);
+                if entry.log_id.index == 0 {
+                    assert!(applied.responses[0].result.is_ok());
+                    activate_v2_ledger_fixture(&conn);
+                } else {
+                    let Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) =
+                        &applied.responses[0].result
+                    else {
+                        panic!("positive authorized batch");
+                    };
+                    assert_eq!(outcomes.len(), 8);
+                    assert!(outcomes.iter().all(Result::is_ok));
+                }
+            }
+            let mut changed = entries[4].clone();
+            if let EntryPayload::Normal(command) = &mut changed.payload {
+                command.logical_time = timestamp(5);
+            }
+            let changed_bytes = encode_json(&changed).unwrap();
+            assert!(decode_consensus_log_entry(&changed_bytes).unwrap() == changed);
+            let writer = Connection::open(&database).unwrap();
+            let scope = Scope::new();
+            let written = changed_bytes.clone();
+            scope.after_highest_audit(move |reader| {
+                assert_eq!(
+                    reader.is_autocommit(),
+                    authority == ConsensusAuthorityProfile::Dynamic
+                );
+                writer
+                    .execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 4",
+                        [written],
+                    )
+                    .unwrap();
+                assert!(writer.is_autocommit());
+            });
+            let (result, events) = with_durable_authority_raw_read_sync(
+                &conn,
+                identity(),
+                authority,
+                &members,
+                &bindings,
+                policy,
+                |conn| {
+                    Ok(log_row_reuse_local_read(
+                        conn,
+                        4,
+                        5,
+                        LOG_ROW_REUSE_AGGREGATE_BYTES,
+                        scope,
+                    ))
+                },
+            )
+            .unwrap();
+            let fixed = authority == ConsensusAuthorityProfile::FixedImmutable;
+            assert!(result.unwrap() == vec![if fixed { entries[4].clone() } else { changed }]);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::Hit),
+                usize::from(fixed)
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                if fixed { 1 } else { 2 }
+            );
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 1);
+            assert!(conn.is_autocommit());
+            let current: Vec<u8> = conn
+                .query_row(
+                    "SELECT entry_json FROM consensus_log WHERE log_index = 4",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                current, changed_bytes,
+                "the next call observes the committed writer"
+            );
+            let (next, events) =
+                log_row_reuse_local_read(&conn, 4, 5, LOG_ROW_REUSE_AGGREGATE_BYTES, Scope::new());
+            assert!(next.unwrap() == vec![decode_consensus_log_entry(&changed_bytes).unwrap()]);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 1);
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_hits_still_enforce_leader_and_projection_checks() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        for prefix in [false, true] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                if prefix {
+                    "leader-prefix"
+                } else {
+                    "leader-range"
+                },
+                &fixture,
+                if prefix { 2 } else { 4 },
+            );
+            let conn = backend.conn.blocking_lock();
+            let mut predecessor = fixture.entries[3].clone();
+            predecessor.log_id = LogId::new(CommittedLeaderId::new(2, node_id()), 3);
+            conn.execute(
+                "UPDATE consensus_log SET term = 2, entry_json = ?1 WHERE log_index = 3",
+                [encode_json(&predecessor).unwrap()],
+            )
+            .unwrap();
+            for enabled in [false, true] {
+                let (result, events) = log_row_reuse_local_read(
+                    &conn,
+                    if prefix { 5 } else { 3 },
+                    6,
+                    if enabled {
+                        LOG_ROW_REUSE_AGGREGATE_BYTES
+                    } else {
+                        0
+                    },
+                    Scope::new(),
+                );
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    if prefix {
+                        "persisted session consensus unapplied log leader ordering regressed"
+                    } else {
+                        "persisted session consensus log leader ordering regressed"
+                    }
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::Hit),
+                    usize::from(enabled)
+                );
+                assert!(conn.is_autocommit());
+            }
+        }
+        // An earlier membership error must still win while the unused,
+        // fully audited tail proof is owned by this same read.
+        for prefix in [false, true] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                if prefix {
+                    "membership-prefix"
+                } else {
+                    "membership-range"
+                },
+                &fixture,
+                if prefix { 2 } else { 4 },
+            );
+            let conn = backend.conn.blocking_lock();
+            let invalid_membership = membership_entry_at(3, vec![members(&[99])], members(&[99]));
+            conn.execute(
+                "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 3",
+                [encode_json(&invalid_membership).unwrap()],
+            )
+            .unwrap();
+            let before = sdk741_state_hash(&conn);
+            let changes = conn.total_changes();
+            for enabled in [false, true] {
+                let (result, events) = log_row_reuse_local_read(
+                    &conn,
+                    if prefix { 5 } else { 3 },
+                    6,
+                    if enabled {
+                        LOG_ROW_REUSE_AGGREGATE_BYTES
+                    } else {
+                        0
+                    },
+                    Scope::new(),
+                );
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    "session consensus membership does not match admitted topology"
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::Captured),
+                    usize::from(enabled)
+                );
+                assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+                assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 2);
+                assert_eq!(before, sdk741_state_hash(&conn));
+                assert_eq!(changes, conn.total_changes());
+                assert!(conn.is_autocommit());
+            }
+        }
+        let backend = sdk741_seed_case(directory.path(), "activation-consumer", &fixture, 3);
+        let conn = backend.conn.blocking_lock();
+        conn.execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+            .unwrap();
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).unwrap(),
+            FencedTransitionV2LedgerLayout::Activated
+        );
+        assert!(
+            !MembershipLogProjection::load(&conn, identity(), false)
+                .unwrap()
+                .projected_v2_scope_activated
+        );
+        for start in [4, 5] {
+            for enabled in [false, true] {
+                let (result, events) = log_row_reuse_local_read(
+                    &conn,
+                    start,
+                    6,
+                    if enabled {
+                        LOG_ROW_REUSE_AGGREGATE_BYTES
+                    } else {
+                        0
+                    },
+                    Scope::new(),
+                );
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    "projected fenced transition V2 batch lacks an exact activation certificate"
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::Hit),
+                    usize::from(enabled)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_leaves_append_audits_and_error_order_unchanged() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        for (applied, full_decodes) in [(4, 2), (1, 5)] {
+            let backend = sdk741_seed_case(
+                directory.path(),
+                &format!("append-{applied}"),
+                &fixture,
+                applied,
+            );
+            let conn = backend.conn.blocking_lock();
+            let intact = sdk741_state_hash(&conn);
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let scope = Scope::new();
+            append_logs_in_tx(&tx, identity(), &[blank_entry(5)]).unwrap();
+            let events = scope.finish();
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                full_decodes
+            );
+            assert_eq!(log_row_reuse_event_count(&events, Event::HighestAudit), 2);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 0);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+            assert!(!conn.is_autocommit());
+            tx.rollback().unwrap();
+            assert_eq!(intact, sdk741_state_hash(&conn));
+        }
+        let backend = sdk741_seed_case(directory.path(), "append-faults", &fixture, 3);
+        let conn = backend.conn.blocking_lock();
+        let intact = sdk741_state_hash(&conn);
+        let malformed = decode_consensus_log_entry(b"{").err().unwrap().to_string();
+        for (sql, next, expected, decodes) in [
+            ("UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 4; UPDATE consensus_log SET term = 99 WHERE log_index = 2", 5, malformed.as_str(), 1),
+            ("UPDATE consensus_log SET entry_json = X'7B' WHERE log_index = 2", 6, "session consensus log append would create a hole", 1),
+            ("DELETE FROM consensus_fenced_transition_v2_activation", 5, "projected fenced transition V2 batch lacks an exact activation certificate", 3),
+        ] {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            tx.execute_batch(sql).unwrap();
+            let before_changes = conn.total_changes();
+            let scope = Scope::new();
+            let error = append_logs_in_tx(&tx, identity(), &[blank_entry(next)]).err().unwrap();
+            let events = scope.finish();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), decodes);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 0);
+            assert_eq!(conn.total_changes(), before_changes);
+            assert!(!conn.is_autocommit());
+            tx.rollback().unwrap();
+            assert_eq!(intact, sdk741_state_hash(&conn));
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_nine_request_raw_mode_and_unsupported_shapes_remain_decoded() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let requests = (0..9)
+            .map(|slot| {
+                let create = sdk741_component_request(Sdk741Payload::Create, 4, slot, None);
+                FencedTransitionV2Request::new(
+                    create.request_id().epoch(),
+                    crate::fenced_transition::FencedTransitionV2CallerNonce::from_bytes(
+                        (slot as u128 + 1).to_be_bytes(),
+                    ),
+                    create.lease().clone(),
+                    FencedTransitionMutation::delete(Generation::new(1)),
+                )
+                .unwrap()
+            })
+            .collect();
+        let entry = fenced_transition_v2_batch_entry(4, requests, timestamp(4));
+        let encoded = encode_json(&entry).unwrap();
+        assert!(encoded.capacity() <= LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+        let audited = decode_consensus_log_entry(&encoded).unwrap();
+        assert!(audited == entry);
+        if let EntryPayload::Normal(command) = &audited.payload {
+            validate_command_for_log(command, identity()).unwrap();
+        }
+        assert!(LogRowReadReuse::typed_retained_bytes(encoded.capacity(), &audited).is_none());
+        let charge = LogRowReadReuse::retained_bytes(encoded.capacity()).unwrap();
+        let budget = LogRowRetentionBudget::new(charge);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let scope = Scope::new();
+        reuse.capture_after_full_audit(
+            epoch_i64(identity()).unwrap(),
+            1,
+            4,
+            encoded.clone(),
+            audited,
+        );
+        assert!(reuse.proof.as_ref().unwrap().entry.is_none());
+        assert_eq!(
+            budget.used.load(Ordering::Acquire),
+            LogRowReadReuse::retained_bytes(encoded.len()).unwrap()
+        );
+        assert!(
+            reuse
+                .decode(epoch_i64(identity()).unwrap(), 1, 4, &encoded)
+                .unwrap()
+                == entry
+        );
+        drop(reuse);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 0);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 0);
+        assert_eq!(
+            log_row_reuse_event_count(&events, Event::NormalizedRequest),
+            0
+        );
+        for entry in [
+            blank_entry(4),
+            membership_entry_at(4, vec![expected_members()], expected_members()),
+        ] {
+            let encoded = encode_json(&entry).unwrap();
+            let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+            let mut reuse = LogRowReadReuse::new(&budget);
+            let scope = Scope::new();
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                encoded.clone(),
+                entry.clone(),
+            );
+            assert!(reuse.proof.is_none());
+            assert!(
+                reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &encoded)
+                    .unwrap()
+                    == entry
+            );
+            drop(reuse);
+            let events = scope.finish();
+            assert_eq!(log_row_reuse_event_count(&events, Event::Ineligible), 1);
+            assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 1);
+            assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 1);
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    fn log_row_reuse_requests(
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> &Vec<FencedTransitionV2Request> {
+        let EntryPayload::Normal(command) = &entry.payload else {
+            panic!("normal test entry")
+        };
+        let intent = match &command.intent {
+            SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+            intent => intent,
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+            panic!("batch test entry")
+        };
+        requests
+    }
+
+    fn log_row_reuse_requests_mut(
+        entry: &mut Entry<SessionRaftTypeConfig>,
+    ) -> &mut Vec<FencedTransitionV2Request> {
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            panic!("normal test entry")
+        };
+        let intent = match &mut command.intent {
+            SessionMutationIntent::Authorized { mutation, .. } => mutation.as_mut(),
+            intent => intent,
+        };
+        let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent else {
+            panic!("batch test entry")
+        };
+        requests
+    }
+
+    fn log_row_reuse_weak_payloads(
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) -> Vec<std::sync::Weak<zeroize::Zeroizing<Vec<u8>>>> {
+        log_row_reuse_requests(entry)
+            .iter()
+            .filter_map(|request| request.mutation().record())
+            .map(|record| record.payload.log_row_reuse_test_weak_bytes())
+            .collect()
+    }
+
+    fn log_row_reuse_edit_request(
+        entry: &mut Entry<SessionRaftTypeConfig>,
+        index: usize,
+        edit: impl FnOnce(&mut FencedTransitionLease, &mut FencedTransitionMutation),
+    ) {
+        let request = &log_row_reuse_requests(entry)[index];
+        let id = request.request_id();
+        let mut lease = request.lease().clone();
+        let mut mutation = request.mutation().clone();
+        edit(&mut lease, &mut mutation);
+        log_row_reuse_requests_mut(entry)[index] =
+            FencedTransitionV2Request::from_parts(id, lease, mutation).unwrap();
+    }
+
+    #[test]
+    fn log_row_reuse_cas_race_falls_through_without_retrying_in_raw_mode() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        let entry = decode_consensus_log_entry(&canonical).unwrap();
+        let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+        let between_load_and_cas = Arc::new(std::sync::Barrier::new(2));
+        let reservation_live = Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Barrier::new(2);
+        let scope = Scope::new();
+        let before = Arc::clone(&between_load_and_cas);
+        let live = Arc::clone(&reservation_live);
+        scope.after_event(Event::BeforeReservationCas, 1, move || {
+            before.wait();
+            live.wait();
+        });
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                between_load_and_cas.wait();
+                let competing_permit = budget.try_reserve(1).unwrap();
+                reservation_live.wait();
+                release.wait();
+                drop(competing_permit);
+            });
+            let mut reuse = LogRowReadReuse::new(&budget);
+            reuse.capture_after_full_audit(epoch_i64(identity()).unwrap(), 1, 4, canonical, entry);
+            let retained = reuse.proof.is_some();
+            let used = budget.used.load(Ordering::Acquire);
+            drop(reuse);
+            // Release the real competing owner before test assertions can unwind.
+            release.wait();
+            assert!(!retained);
+            assert_eq!(used, 1);
+        });
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let events = scope.finish();
+        assert_eq!(
+            log_row_reuse_event_count(&events, Event::BeforeReservationCas),
+            1
+        );
+        assert_eq!(log_row_reuse_event_count(&events, Event::BudgetFallback), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Reserved), 0);
+    }
+
+    fn log_row_reuse_external_identifier_backing(
+        entry: &mut Entry<SessionRaftTypeConfig>,
+        drops: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    ) {
+        struct ExternalOwner {
+            bytes: Box<[u8]>,
+            drops: Arc<AtomicUsize>,
+            panic_on_drop: bool,
+        }
+        impl AsRef<[u8]> for ExternalOwner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for ExternalOwner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    !self.panic_on_drop,
+                    "controlled external identifier destructor unwind"
+                );
+            }
+        }
+        let mut backing = vec![0; 1024 * 1024].into_boxed_slice();
+        let lengths: Vec<_> = log_row_reuse_requests(entry)
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let value = &request.lease().key().stable_id;
+                backing[index * 64..index * 64 + value.len()].copy_from_slice(value);
+                value.len()
+            })
+            .collect();
+        let shared = Bytes::from_owner(ExternalOwner {
+            bytes: backing,
+            drops,
+            panic_on_drop,
+        });
+        for (index, len) in lengths.into_iter().enumerate() {
+            let stable_id =
+                crate::StableId::new(shared.slice(index * 64..index * 64 + len)).unwrap();
+            log_row_reuse_edit_request(entry, index, |lease, mutation| {
+                match lease {
+                    FencedTransitionLease::Acquire { key, .. } => key.stable_id = stable_id.clone(),
+                    FencedTransitionLease::Renew { lease, .. } => {
+                        let mut key = lease.key().clone();
+                        key.stable_id = stable_id.clone();
+                        *lease = crate::LeaseGuard::new(
+                            key,
+                            lease.owner().clone(),
+                            lease.fence(),
+                            lease.acquired_at(),
+                            lease.expires_at(),
+                            lease.credential_id(),
+                        );
+                    }
+                }
+                match mutation {
+                    FencedTransitionMutation::Create { record }
+                    | FencedTransitionMutation::Update { record, .. } => {
+                        record.key.stable_id = stable_id;
+                    }
+                    _ => unreachable!(),
+                }
+            });
+        }
+        // All sixteen occurrences now own this one oversized external backing.
+        drop(shared);
+    }
+
+    #[test]
+    fn log_row_reuse_normalization_releases_all_shared_external_backing_and_unwinds() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            let canonical = encode_json(&fixture.entries[4]).unwrap();
+            for panic_on_drop in [false, true] {
+                let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+                let drops = Arc::new(AtomicUsize::new(0));
+                log_row_reuse_external_identifier_backing(
+                    &mut entry,
+                    Arc::clone(&drops),
+                    panic_on_drop,
+                );
+                assert!(encode_json(&entry).unwrap() == canonical);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                let weak = log_row_reuse_weak_payloads(&entry);
+                let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+                let scope = Scope::new();
+                let observed_drops = Arc::clone(&drops);
+                let observed_budget = Arc::clone(&budget);
+                let observed_weak = weak.clone();
+                scope.after_event(Event::Refund, 1, move || {
+                    assert_eq!(observed_drops.load(Ordering::SeqCst), 1);
+                    assert_eq!(observed_budget.used.load(Ordering::Acquire), 0);
+                    assert!(observed_weak
+                        .iter()
+                        .all(|payload| payload.strong_count() == usize::from(!panic_on_drop)));
+                });
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut reuse = LogRowReadReuse::new(&budget);
+                    reuse.capture_after_full_audit(
+                        epoch_i64(identity()).unwrap(),
+                        1,
+                        4,
+                        canonical.clone(),
+                        entry,
+                    );
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    let result = reuse
+                        .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                        .unwrap();
+                    assert!(encode_json(&result).unwrap() == canonical);
+                    for request in log_row_reuse_requests(&result) {
+                        request.validate().unwrap();
+                    }
+                }));
+                assert_eq!(unwind.is_err(), panic_on_drop);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+                assert_eq!(budget.used.load(Ordering::Acquire), 0);
+                let events = scope.finish();
+                assert_eq!(log_row_reuse_event_count(&events, Event::Refund), 1);
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::TypedTransfer),
+                    usize::from(!panic_on_drop)
+                );
+                assert_eq!(
+                    log_row_reuse_event_count(&events, Event::NormalizedRequest),
+                    if panic_on_drop { 7 } else { 8 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_transferred_payload_drops_on_real_consumer_error_and_unwind() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for prefix in [false, true] {
+            for panic_consumer in [false, true] {
+                let backend = sdk741_seed_case(
+                    directory.path(),
+                    &format!("typed-consumer-{prefix}-{panic_consumer}"),
+                    &fixture,
+                    3,
+                );
+                let conn = backend.conn.blocking_lock();
+                conn.execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+                    .unwrap();
+                let entry = decode_consensus_log_entry(&canonical).unwrap();
+                let weak = log_row_reuse_weak_payloads(&entry);
+                let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+                let scope = Scope::new();
+                let observed_budget = Arc::clone(&budget);
+                let observed_weak = weak.clone();
+                let checkpoint = if prefix {
+                    Event::PrefixProjection
+                } else {
+                    Event::RangeProjection
+                };
+                scope.after_event(checkpoint, 1, move || {
+                    assert_eq!(observed_budget.used.load(Ordering::Acquire), 0);
+                    assert!(observed_weak
+                        .iter()
+                        .all(|payload| payload.strong_count() == 1));
+                    assert!(!panic_consumer, "controlled original consumer unwind");
+                });
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut reuse = LogRowReadReuse::new(&budget);
+                    // Supply the same fully audited candidate before entering
+                    // the real consumer; its highest helper cannot recapture.
+                    reuse.capture_after_full_audit(
+                        epoch_i64(identity()).unwrap(),
+                        1,
+                        4,
+                        canonical.clone(),
+                        entry,
+                    );
+                    let result = read_log_range_with_batch_and_reuse_sync(
+                        &conn,
+                        identity(),
+                        if prefix { 5 } else { 4 },
+                        Some(6),
+                        Some(8),
+                        true,
+                        LogRangeRecoveryProfile::Strict,
+                        &mut reuse,
+                    );
+                    assert_eq!(log_row_reuse_error(result),
+                        "projected fenced transition V2 batch lacks an exact activation certificate");
+                }));
+                assert_eq!(unwind.is_err(), panic_consumer);
+                assert_eq!(budget.used.load(Ordering::Acquire), 0);
+                assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+                let events = scope.finish();
+                assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 1);
+                assert_eq!(log_row_reuse_event_count(&events, checkpoint), 1);
+                log_row_reuse_assert_closed(&events);
+                assert!(conn.is_autocommit());
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_actual_string_capacity_enforces_exact_typed_boundary() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for excess in [0, 1] {
+            let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+            // Normalize only the test's incidental String clone capacities
+            // before calculating the exact remaining room for one owner.
+            log_row_reuse_edit_request(&mut entry, 0, |_, _| {});
+            let owner = log_row_reuse_requests(&entry)[0].lease().owner();
+            let owner_value = owner.as_str().to_owned();
+            let original_capacity = owner.allocation_capacity();
+            let before = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+            let owner_capacity =
+                LOG_ROW_REUSE_MAX_TYPED_BYTES - before + original_capacity + excess;
+            log_row_reuse_edit_request(&mut entry, 0, |lease, _| {
+                let FencedTransitionLease::Acquire { owner, .. } = lease else {
+                    panic!("acquire fixture")
+                };
+                let mut backing = String::with_capacity(owner_capacity);
+                backing.push_str(&owner_value);
+                *owner = OwnerId::new(backing).unwrap();
+                assert_eq!(owner.allocation_capacity(), owner_capacity);
+            });
+            assert!(encode_json(&entry).unwrap() == canonical);
+            assert_eq!(
+                LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry),
+                (excess == 0).then_some(LOG_ROW_REUSE_MAX_TYPED_BYTES),
+            );
+            let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_MAX_TYPED_BYTES);
+            let mut reuse = LogRowReadReuse::new(&budget);
+            let scope = Scope::new();
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry,
+            );
+            assert_eq!(reuse.proof.as_ref().unwrap().entry.is_some(), excess == 0);
+            assert_eq!(
+                budget.used.load(Ordering::Acquire),
+                if excess == 0 {
+                    LOG_ROW_REUSE_MAX_TYPED_BYTES
+                } else {
+                    LogRowReadReuse::retained_bytes(canonical.len()).unwrap()
+                }
+            );
+            assert!(
+                reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                    .unwrap()
+                    == fixture.entries[4]
+            );
+            drop(reuse);
+            let events = scope.finish();
+            log_row_reuse_assert_closed(&events);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::TypedTransfer),
+                usize::from(excess == 0)
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::TypedDecode),
+                excess
+            );
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_payload_and_record_string_slack_are_in_the_full_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for field in ["payload", "owner", "state_type"] {
+            let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+            log_row_reuse_edit_request(&mut entry, 0, |_, _| {});
+            let record = log_row_reuse_requests(&entry)[0]
+                .mutation()
+                .record()
+                .unwrap();
+            let original_allocation = match field {
+                "payload" => {
+                    record.payload.log_row_reuse_allocation_bytes().unwrap()
+                        - EncryptedSessionPayload::log_row_reuse_arc_allocation_bytes().unwrap()
+                }
+                "owner" => record.owner.allocation_capacity(),
+                "state_type" => record.state_type.allocation_capacity(),
+                _ => unreachable!(),
+            };
+            let before = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+            let capacity = 65536;
+            log_row_reuse_edit_request(&mut entry, 0, |_, mutation| {
+                let FencedTransitionMutation::Create { record } = mutation else {
+                    panic!("create fixture")
+                };
+                match field {
+                    "payload" => {
+                        let mut bytes = Vec::with_capacity(capacity);
+                        bytes.extend_from_slice(record.payload.as_bytes());
+                        record.payload = EncryptedSessionPayload::try_from_vec_with_encoding(
+                            bytes,
+                            record.payload.encoding(),
+                        )
+                        .unwrap();
+                    }
+                    "owner" => {
+                        let mut value = String::with_capacity(capacity);
+                        value.push_str(record.owner.as_str());
+                        record.owner = OwnerId::new(value).unwrap();
+                    }
+                    "state_type" => {
+                        let mut value = String::with_capacity(capacity);
+                        value.push_str(record.state_type.as_str());
+                        record.state_type = crate::StateType::new(value).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let after = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+            assert_eq!(after - before, capacity - original_allocation);
+            assert!(encode_json(&entry).unwrap() == canonical);
+            assert!(after <= LOG_ROW_REUSE_MAX_TYPED_BYTES);
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_authorized_box_and_all_lease_mutation_variants_are_accounted() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        for payload in [Sdk741Payload::Create, Sdk741Payload::Renew] {
+            let fixture = sdk741_build_fixture(directory.path(), payload);
+            for mutation_kind in ["record", "delete", "refresh"] {
+                if mutation_kind == "refresh" && matches!(payload, Sdk741Payload::Create) {
+                    continue; // Refresh requires a committed renewal credential.
+                }
+                let original = &log_row_reuse_requests(&fixture.entries[4])[0];
+                let mutation = match mutation_kind {
+                    "record" => original.mutation().clone(),
+                    "delete" => FencedTransitionMutation::delete(Generation::new(1)),
+                    "refresh" => FencedTransitionMutation::refresh_ttl(
+                        Generation::new(1),
+                        Duration::from_secs(30),
+                    )
+                    .unwrap(),
+                    _ => unreachable!(),
+                };
+                let request = FencedTransitionV2Request::new(
+                    original.request_id().epoch(),
+                    original.request_id().nonce(),
+                    original.lease().clone(),
+                    mutation,
+                )
+                .unwrap();
+                let mut entry = fenced_transition_v2_batch_entry(4, vec![request], timestamp(4));
+                let before =
+                    LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY, &entry)
+                        .unwrap();
+                let EntryPayload::Normal(command) = &mut entry.payload else {
+                    unreachable!()
+                };
+                command.intent = SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(),
+                    mutation: Box::new(std::mem::replace(
+                        &mut command.intent,
+                        SessionMutationIntent::AdvanceLogicalTime,
+                    )),
+                };
+                validate_command_for_log(command, identity()).unwrap();
+                let after =
+                    LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY, &entry)
+                        .unwrap();
+                assert_eq!(after - before, std::mem::size_of::<SessionMutationIntent>());
+                let canonical = encode_json(&entry).unwrap();
+                assert!(decode_consensus_log_entry(&canonical).unwrap() == entry);
+                let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+                let mut reuse = LogRowReadReuse::new(&budget);
+                let scope = Scope::new();
+                reuse.capture_after_full_audit(
+                    epoch_i64(identity()).unwrap(),
+                    1,
+                    4,
+                    canonical.clone(),
+                    entry,
+                );
+                let result = reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                    .unwrap();
+                assert!(encode_json(&result).unwrap() == canonical);
+                for request in log_row_reuse_requests(&result) {
+                    request.validate().unwrap();
+                }
+                drop(reuse);
+                let events = scope.finish();
+                log_row_reuse_assert_closed(&events);
+                assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 1);
+                assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_charges_request_slack_and_selects_mode_before_one_reservation() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+        let before = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+        let old_capacity = log_row_reuse_requests(&entry).capacity();
+        log_row_reuse_requests_mut(&mut entry).reserve_exact(32);
+        let new_capacity = log_row_reuse_requests(&entry).capacity();
+        let after = LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).unwrap();
+        assert_eq!(
+            after - before,
+            (new_capacity - old_capacity) * std::mem::size_of::<FencedTransitionV2Request>()
+        );
+        assert!(encode_json(&entry).unwrap() == canonical);
+        // The raw charge would fit. Once typed mode was chosen, budget denial
+        // must still fall directly through with no second reservation.
+        let raw_charge = LogRowReadReuse::retained_bytes(canonical.len()).unwrap();
+        assert!(after > raw_charge);
+        let budget = LogRowRetentionBudget::new(raw_charge);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let scope = Scope::new();
+        reuse.capture_after_full_audit(
+            epoch_i64(identity()).unwrap(),
+            1,
+            4,
+            canonical.clone(),
+            entry,
+        );
+        assert!(reuse.proof.is_none());
+        let events = scope.finish();
+        assert_eq!(log_row_reuse_event_count(&events, Event::BudgetFallback), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Reserved), 0);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        // Actual Vec slack over the typed bound chooses raw BEFORE its CAS.
+        let mut entry = decode_consensus_log_entry(&canonical).unwrap();
+        log_row_reuse_requests_mut(&mut entry).reserve_exact(1024);
+        assert!(LogRowReadReuse::typed_retained_bytes(canonical.len(), &entry).is_none());
+        let budget = LogRowRetentionBudget::new(raw_charge);
+        let mut reuse = LogRowReadReuse::new(&budget);
+        let scope = Scope::new();
+        reuse.capture_after_full_audit(
+            epoch_i64(identity()).unwrap(),
+            1,
+            4,
+            canonical.clone(),
+            entry,
+        );
+        assert!(reuse.proof.as_ref().unwrap().entry.is_none());
+        assert_eq!(budget.used.load(Ordering::Acquire), raw_charge);
+        assert!(
+            reuse
+                .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                .unwrap()
+                == fixture.entries[4]
+        );
+        drop(reuse);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedDecode), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::TypedTransfer), 0);
+        assert!(LogRowReadReuse::request_allocation_bytes(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn log_row_reuse_typed_payload_lifetime_distinguishes_transfer_from_destruction() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for outcome in ["transfer", "mismatch", "unused"] {
+            let entry = decode_consensus_log_entry(&canonical).unwrap();
+            let weak = log_row_reuse_weak_payloads(&entry);
+            assert_eq!(weak.len(), 8);
+            assert!(weak.iter().all(|payload| payload.strong_count() == 1));
+            let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+            let mut reuse = LogRowReadReuse::new(&budget);
+            let scope = Scope::new();
+            let observed_weak = weak.clone();
+            let observed_budget = Arc::clone(&budget);
+            scope.after_event(Event::Refund, 1, move || {
+                assert_eq!(observed_budget.used.load(Ordering::Acquire), 0);
+                assert!(observed_weak
+                    .iter()
+                    .all(|payload| payload.strong_count() == usize::from(outcome == "transfer")));
+            });
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry,
+            );
+            assert!(weak.iter().all(|payload| payload.strong_count() == 1));
+            let result = match outcome {
+                "transfer" => Some(
+                    reuse
+                        .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                        .unwrap(),
+                ),
+                "mismatch" => Some(
+                    reuse
+                        .decode(epoch_i64(identity()).unwrap(), 2, 4, &canonical)
+                        .unwrap(),
+                ),
+                "unused" => None,
+                _ => unreachable!(),
+            };
+            drop(reuse);
+            if let Some(result) = &result {
+                assert!(*result == fixture.entries[4]);
+            }
+            assert!(weak
+                .iter()
+                .all(|payload| payload.strong_count() == usize::from(outcome == "transfer")));
+            drop(result);
+            assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+            let events = scope.finish();
+            log_row_reuse_assert_closed(&events);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::TypedTransfer),
+                usize::from(outcome == "transfer")
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                usize::from(outcome == "mismatch")
+            );
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_construction_and_transfer_unwind_drop_allocations_before_refund() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let canonical = encode_json(&fixture.entries[4]).unwrap();
+        for (event, occurrence) in [
+            (Event::Reserved, 1),
+            (Event::NormalizedRequest, 1),
+            (Event::NormalizedRequest, 8),
+            (Event::BoxedEntry, 1),
+            (Event::Captured, 1),
+            (Event::TypedTransfer, 1),
+            (Event::Hit, 1),
+        ] {
+            let entry = decode_consensus_log_entry(&canonical).unwrap();
+            let weak = log_row_reuse_weak_payloads(&entry);
+            let budget = Arc::new(LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES));
+            let scope = Scope::new();
+            let observed_budget = Arc::clone(&budget);
+            scope.after_event(event, occurrence, move || {
+                assert_eq!(
+                    observed_budget.used.load(Ordering::Acquire) == 0,
+                    event == Event::Hit
+                );
+                panic!("controlled typed ownership unwind");
+            });
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut reuse = LogRowReadReuse::new(&budget);
+                reuse.capture_after_full_audit(
+                    epoch_i64(identity()).unwrap(),
+                    1,
+                    4,
+                    canonical.clone(),
+                    entry,
+                );
+                let _entry = reuse
+                    .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                    .unwrap();
+            }));
+            assert!(unwind.is_err());
+            assert!(weak.iter().all(|payload| payload.strong_count() == 0));
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            let events = scope.finish();
+            assert_eq!(log_row_reuse_event_count(&events, Event::Reserved), 1);
+            assert_eq!(log_row_reuse_event_count(&events, Event::Refund), 1);
+            let bytes = events
+                .iter()
+                .position(|event| *event == Event::AfterBytesDrop)
+                .unwrap();
+            let slot = events
+                .iter()
+                .position(|event| *event == Event::AfterEntrySlotDrop)
+                .unwrap();
+            let refund = events
+                .iter()
+                .position(|event| *event == Event::Refund)
+                .unwrap();
+            assert!(bytes < slot && slot < refund);
+        }
+    }
+
+    #[test]
+    fn log_row_reuse_preparation_complete_layout_and_checked_charge() {
+        use std::mem::size_of;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let entry = &fixture.entries[4];
+        let encoded = encode_json(entry).unwrap();
+        let charge = LogRowReadReuse::typed_retained_bytes(encoded.capacity(), entry).unwrap();
+        assert!(charge <= LOG_ROW_REUSE_MAX_TYPED_BYTES);
+        assert!(LogRowReadReuse::typed_retained_bytes(usize::MAX, entry).is_none());
+        assert!(LogRowReadReuse::request_allocation_bytes(usize::MAX).is_none());
+        assert!(
+            LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY + 1, entry)
+                .is_none()
+        );
+        let owner_bytes = size_of::<LogRowReadReuse<'_>>();
+        let proof_bytes = size_of::<LogRowCanonicalProof<'_>>();
+        let raw_maximum = LogRowReadReuse::retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY).unwrap();
+        assert_eq!(
+            raw_maximum,
+            LOG_ROW_REUSE_MAX_RAW_CAPACITY + owner_bytes + proof_bytes
+        );
+        assert!(raw_maximum <= LOG_ROW_REUSE_MAX_RETAINED_BYTES);
+        assert!(owner_bytes <= 128);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            (
+                owner_bytes,
+                proof_bytes,
+                size_of::<LogRowPendingProof<'_>>()
+            ),
+            (88, 72, 368)
+        );
+        assert_eq!(LOG_ROW_REUSE_MAX_TYPED_BYTES, 256 * 1024);
+        assert_eq!(LOG_ROW_REUSE_AGGREGATE_BYTES, 4 * 1024 * 1024);
+        eprintln!(
+            "SDK741_TYPED_REUSE {}",
+            serde_json::json!({
+                "type": "complete_layout",
+                "owner_bytes": owner_bytes,
+                "proof_bytes": proof_bytes,
+                "pending_bytes": size_of::<LogRowPendingProof<'_>>(),
+                "permit_bytes": size_of::<LogRowRetentionPermit<'_>>(),
+                "budget_bytes": size_of::<LogRowRetentionBudget>(),
+                "entry_bytes": size_of::<Entry<SessionRaftTypeConfig>>(),
+                "entry_box_option_bytes": size_of::<Option<Box<Entry<SessionRaftTypeConfig>>>>(),
+                "authorization_box_bytes": size_of::<SessionMutationIntent>(),
+                "request_bytes": size_of::<crate::FencedTransitionV2Request>(),
+                "record_bytes": size_of::<crate::StoredSessionRecord>(),
+                "key_bytes": size_of::<crate::SessionKey>(),
+                "normalization_transient_bytes": crate::SessionKey::log_row_reuse_normalization_bytes().unwrap(),
+                "identifier_backing_per_occurrence": crate::StableId::MAX_BYTES,
+                "identifier_promotion_bytes": size_of::<[usize; 3]>(),
+                "payload_arc_bytes": crate::EncryptedSessionPayload::log_row_reuse_arc_allocation_bytes().unwrap(),
+                "raw_capacity_limit": LOG_ROW_REUSE_MAX_RAW_CAPACITY,
+                "raw_maximum_actual_charge": raw_maximum,
+                "raw_charge_limit": LOG_ROW_REUSE_MAX_RETAINED_BYTES,
+                "typed_charge_limit": LOG_ROW_REUSE_MAX_TYPED_BYTES,
+                "aggregate_charged_limit": LOG_ROW_REUSE_AGGREGATE_BYTES,
+                "fixture_raw_capacity": encoded.capacity(),
+                "fixture_typed_charge": charge,
+            })
+        );
+    }
+
+    #[test]
+    fn log_row_reuse_charges_capacity_and_consumes_at_most_once() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let entry = &fixture.entries[4];
+        let canonical = encode_json(entry).unwrap();
+        assert!(canonical.len() < LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+        for capacity in [
+            LOG_ROW_REUSE_MAX_RAW_CAPACITY,
+            LOG_ROW_REUSE_MAX_RAW_CAPACITY + 1,
+        ] {
+            let mut encoded = Vec::with_capacity(capacity);
+            encoded.extend_from_slice(&canonical);
+            assert_eq!(encoded.capacity(), capacity);
+            let expected_charge = LogRowReadReuse::typed_retained_bytes(encoded.capacity(), entry);
+            let budget = LogRowRetentionBudget::new(LOG_ROW_REUSE_AGGREGATE_BYTES);
+            let mut reuse = LogRowReadReuse::new(&budget);
+            assert!(decode_consensus_log_entry(&encoded).unwrap() == *entry);
+            validate_command_for_log(
+                match &entry.payload {
+                    EntryPayload::Normal(command) => command,
+                    _ => unreachable!(),
+                },
+                identity(),
+            )
+            .unwrap();
+            let scope = Scope::new();
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                encoded,
+                entry.clone(),
+            );
+            assert_eq!(
+                budget.used.load(Ordering::Acquire),
+                expected_charge.unwrap_or(0)
+            );
+            for _ in 0..2 {
+                assert!(
+                    reuse
+                        .decode(epoch_i64(identity()).unwrap(), 1, 4, &canonical)
+                        .unwrap()
+                        == *entry
+                );
+            }
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            // Even after consumption, this owner cannot retain another row.
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry.clone(),
+            );
+            assert!(reuse.proof.is_none());
+            drop(reuse);
+            let events = scope.finish();
+            log_row_reuse_assert_closed(&events);
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::Hit),
+                usize::from(expected_charge.is_some())
+            );
+            assert_eq!(
+                log_row_reuse_event_count(&events, Event::FullDecode),
+                if expected_charge.is_some() { 1 } else { 2 }
+            );
+        }
+        assert!(LogRowReadReuse::retained_bytes(usize::MAX).is_none());
+        assert_eq!(SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES, 16 * 1024 * 1024);
+        eprintln!(
+            "SDK741_LOG_REUSE {}",
+            serde_json::json!({
+                "type": "memory_layout", "owner_bytes": std::mem::size_of::<LogRowReadReuse<'_>>(),
+                "proof_bytes": std::mem::size_of::<LogRowCanonicalProof<'_>>(),
+                "maximum_raw_capacity": LOG_ROW_REUSE_MAX_RAW_CAPACITY,
+                "maximum_actual_charge": LogRowReadReuse::retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY).unwrap(),
+                "per_eligible_owner_limit": LOG_ROW_REUSE_MAX_RETAINED_BYTES,
+                "aggregate_retention_limit": LOG_ROW_REUSE_AGGREGATE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn log_row_reuse_keeps_oversized_valid_batches_on_the_original_path() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let backend = SqliteSessionBackend::open(directory.path().join("large.sqlite")).unwrap();
+        let conn = backend.conn.blocking_lock();
+        sdk741_initialize(&conn, &backend.caps);
+        let requests: Vec<_> = (0..32)
+            .map(|slot| sdk741_component_request(Sdk741Payload::Create, 1, slot, None))
+            .collect();
+        let entry = fenced_transition_v2_batch_entry(1, requests.clone(), timestamp(1));
+        let bytes = encode_json(&entry).unwrap();
+        assert!(bytes.len() > LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+        assert!(bytes.len() < SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES);
+        assert!(decode_consensus_log_entry(&bytes).unwrap() == entry);
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&entry)).unwrap();
+        save_committed_sync(&conn, identity(), Some(entry.log_id)).unwrap();
+        let applied =
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![entry.clone()]).unwrap();
+        let Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) =
+            &applied.responses[0].result
+        else {
+            panic!("positive large batch");
+        };
+        assert_eq!(outcomes.len(), requests.len());
+        for (outcome, request) in outcomes.iter().zip(&requests) {
+            assert!(outcome
+                .as_ref()
+                .expect("every large batch mutation succeeds")
+                .matches_v2_request(request));
+        }
+        let (result, events) =
+            log_row_reuse_local_read(&conn, 1, 2, LOG_ROW_REUSE_AGGREGATE_BYTES, Scope::new());
+        assert!(result.unwrap() == vec![entry]);
+        assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 2);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Ineligible), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+    }
+
+    #[test]
+    fn log_row_reuse_budget_closes_concurrent_and_unwinding_owners() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = sdk741_build_fixture(directory.path(), Sdk741Payload::Create);
+        let entry = &fixture.entries[4];
+        let canonical = encode_json(entry).unwrap();
+        let charge =
+            LogRowReadReuse::typed_retained_bytes(LOG_ROW_REUSE_MAX_RAW_CAPACITY, entry).unwrap();
+        let budget = LogRowRetentionBudget::new(charge * 2);
+        let ready = std::sync::Barrier::new(9);
+        let release = std::sync::Barrier::new(9);
+        let retained = AtomicUsize::new(0);
+        std::thread::scope(|threads| {
+            for _ in 0..8 {
+                threads.spawn(|| {
+                    let mut bytes = Vec::with_capacity(LOG_ROW_REUSE_MAX_RAW_CAPACITY);
+                    bytes.extend_from_slice(&canonical);
+                    let mut reuse = LogRowReadReuse::new(&budget);
+                    reuse.capture_after_full_audit(
+                        epoch_i64(identity()).unwrap(),
+                        1,
+                        4,
+                        bytes,
+                        entry.clone(),
+                    );
+                    if reuse.proof.is_some() {
+                        retained.fetch_add(1, Ordering::AcqRel);
+                    }
+                    ready.wait();
+                    release.wait();
+                    drop(reuse);
+                });
+            }
+            ready.wait();
+            let retained = retained.load(Ordering::Acquire);
+            assert!((1..=2).contains(&retained));
+            assert_eq!(budget.used.load(Ordering::Acquire), retained * charge);
+            release.wait();
+        });
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let overflow = LogRowRetentionBudget::new(usize::MAX);
+        overflow.used.store(usize::MAX - 8, Ordering::Release);
+        assert!(overflow.try_reserve(16).is_none());
+        assert_eq!(overflow.used.load(Ordering::Acquire), usize::MAX - 8);
+        let scope = Scope::new();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut reuse = LogRowReadReuse::new(&budget);
+            reuse.capture_after_full_audit(
+                epoch_i64(identity()).unwrap(),
+                1,
+                4,
+                canonical.clone(),
+                entry.clone(),
+            );
+            assert!(reuse.proof.is_some());
+            panic!("controlled retained-owner unwind");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        let events = scope.finish();
+        log_row_reuse_assert_closed(&events);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 1);
+        assert_eq!(log_row_reuse_event_count(&events, Event::Hit), 0);
+        // No test callback or retained proof survives an observation unwind.
+        let _ = std::panic::catch_unwind(|| {
+            let _scope = Scope::new();
+            panic!("controlled observer unwind");
+        });
+        assert!(Scope::new().finish().is_empty());
+    }
+
+    #[test]
+    fn log_row_reuse_preserves_true_published_684_reader_distinctions() {
+        use log_row_reuse_test_observer::{Event, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let backend =
+            SqliteSessionBackend::open(directory.path().join("published.sqlite")).unwrap();
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).unwrap();
+        let entries = vec![membership_entry(), blank_entry(1)];
+        append_logs_sync(&conn, identity(), &entries).unwrap();
+        save_committed_sync(&conn, identity(), Some(log_id(1))).unwrap();
+        let applied =
+            apply_entries_sync(&conn, identity(), &backend.caps, entries.clone()).unwrap();
+        assert!(applied
+            .responses
+            .iter()
+            .all(|response| response.result.is_ok()));
+        drop_protected_roster_namespace_fixture(&conn);
+        conn.execute_batch("DROP TABLE consensus_fenced_transition_receipts; DROP TABLE consensus_fenced_transition_activation; ALTER TABLE consensus_identity DROP COLUMN fenced_transition_receipt_ledger_activated;").unwrap();
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_sync(&conn).unwrap(),
+            FencedTransitionReceiptLedgerLayout::Published684
+        );
+        for reader in [
+            Sdk741Reader::Strict,
+            Sdk741Reader::Published684,
+            Sdk741Reader::PhysicalRetained,
+        ] {
+            let scope = Scope::new();
+            let result = Sdk741Read {
+                reader,
+                start: 0,
+                end: 2,
+            }
+            .run(&conn);
+            let events = scope.finish();
+            if matches!(reader, Sdk741Reader::Strict) {
+                assert_eq!(
+                    log_row_reuse_error(result),
+                    "persisted fenced transition receipt activation is invalid"
+                );
+                assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 0);
+            } else {
+                assert!(result.unwrap() == entries);
+                assert_eq!(log_row_reuse_event_count(&events, Event::FullDecode), 3);
+                assert_eq!(log_row_reuse_event_count(&events, Event::Ineligible), 1);
+            }
+            assert_eq!(log_row_reuse_event_count(&events, Event::Captured), 0);
+            assert!(conn.is_autocommit());
+        }
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        tx.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .unwrap();
+        assert_eq!(
+            log_row_reuse_error(read_log_range_for_recovery_sync(
+                &tx,
+                identity(),
+                0,
+                Some(2),
+                Some(8)
+            )),
+            "persisted session consensus log range contains a hole"
+        );
+        assert!(
+            read_physical_log_range_for_recovery_sync(&tx, identity(), 0, Some(2), Some(8))
+                .unwrap()
+                == entries[1..]
+        );
+        assert!(!conn.is_autocommit());
+        tx.rollback().unwrap();
+        assert!(
+            read_log_range_for_recovery_sync(&conn, identity(), 0, Some(2), Some(8)).unwrap()
+                == entries
+        );
+    }
 
     #[test]
     fn durable_log_audit_parallelism_is_fixed_and_skips_small_frontier_advances() {
@@ -40567,20 +42661,92 @@ mod tests {
             Arc::clone(&primary_writers),
             Arc::clone(&writer_generation),
         );
+        let now = std::cell::Cell::new(Instant::now());
+        let advance = || now.set(now.get() + SNAPSHOT_FOREGROUND_PACING_PAUSE);
         let mut pauses = Vec::new();
 
-        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(!pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
         writer_generation.fetch_add(1, Ordering::AcqRel);
-        assert!(pacer.pace_with(|pause| pauses.push(pause)));
-        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
+        assert!(!pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
 
         primary_writers.store(1, Ordering::Release);
-        assert!(pacer.pace_with(|pause| pauses.push(pause)));
-        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        advance();
+        assert!(pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
+        advance();
+        assert!(pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
         primary_writers.store(0, Ordering::Release);
-        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        advance();
+        assert!(!pacer.pace_with(|| now.get(), |pause| pauses.push(pause)));
 
         assert_eq!(pauses, vec![SNAPSHOT_FOREGROUND_PACING_PAUSE; 3]);
+    }
+
+    #[test]
+    fn snapshot_foreground_pacer_does_not_recharge_writers_served_during_its_pause() {
+        let primary_writers = Arc::new(AtomicUsize::new(0));
+        let writer_generation = Arc::new(AtomicU64::new(0));
+        let pacer = ConsensusSnapshotForegroundPacer::new(
+            Arc::clone(&primary_writers),
+            Arc::clone(&writer_generation),
+        );
+        let now = std::cell::Cell::new(Instant::now());
+        writer_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(pacer.pace_with(
+            || now.get(),
+            |_| {
+                // These writers have already received the entire foreground
+                // pause. No writer is pending when snapshot work resumes.
+                writer_generation.fetch_add(4, Ordering::AcqRel);
+            }
+        ));
+        now.set(now.get() + SNAPSHOT_FOREGROUND_PACING_PAUSE);
+        assert!(
+            !pacer.pace_with(|| now.get(), |_| {}),
+            "writes completed during a foreground pause must not charge another pause"
+        );
+        writer_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            pacer.pace_with(|| now.get(), |_| {}),
+            "new foreground work still yields"
+        );
+        primary_writers.store(1, Ordering::Release);
+        now.set(now.get() + SNAPSHOT_FOREGROUND_PACING_PAUSE);
+        assert!(
+            pacer.pace_with(|| now.get(), |_| {}),
+            "pending writers still yield"
+        );
+    }
+
+    #[test]
+    fn snapshot_foreground_pacer_reserves_progress_under_continuous_writer_pressure() {
+        let primary_writers = Arc::new(AtomicUsize::new(1));
+        let generation = Arc::new(AtomicU64::new(0));
+        let pacer = ConsensusSnapshotForegroundPacer::new(primary_writers, Arc::clone(&generation));
+        let now = std::cell::Cell::new(Instant::now());
+        let mut pauses = 0;
+        for _ in 0..3 {
+            assert!(pacer.pace_with(
+                || now.get(),
+                |duration| {
+                    pauses += 1;
+                    now.set(now.get() + duration);
+                    generation.fetch_add(1, Ordering::AcqRel);
+                }
+            ));
+            for _ in 0..32 {
+                generation.fetch_add(1, Ordering::AcqRel);
+                assert!(
+                    !pacer.pace_with(|| now.get(), |_| panic!("snapshot work turn was starved")),
+                    "even continuously active writers cannot recharge a pause within a snapshot work turn"
+                );
+                now.set(now.get() + Duration::from_millis(1));
+            }
+        }
+        assert_eq!(
+            pauses, 3,
+            "foreground receives its full turn after each bounded work turn"
+        );
     }
 
     #[test]
@@ -42547,6 +44713,7 @@ mod tests {
         let observed_preemption = Arc::new(AtomicBool::new(false));
         let guard = ConsensusLogPruneProgressGuard::install(
             &conn,
+            Arc::new(AtomicBool::new(false)),
             Arc::clone(&primary_writers),
             Arc::clone(&observed_preemption),
             #[cfg(all(test, target_os = "linux"))]
@@ -42973,6 +45140,143 @@ mod tests {
                 .expect("read untouched compacted descriptor")
                 .len(),
             "C+1 input is rejected before compaction writes the target"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg(feature = "test-vfs")]
+    fn private_snapshot_compaction_commits_once_and_rejects_failed_copies() {
+        use opc_sqlite_file_control_sys::{block_test_main_sync, install_test_main_sync_block_vfs};
+
+        const CHILD: &str = "OPC_SESSION_STORE_TEST_COMPACTION_SYNC_VFS";
+        const TEST_NAME: &str = "sqlite::consensus::tests::private_snapshot_compaction_commits_once_and_rejects_failed_copies";
+        // The sync fault controller is process-global. Keep both its failure
+        // injection and exact physical callback counts isolated from peers.
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/proc/self/exe")
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated compaction sync regression");
+            assert!(status.success(), "isolated compaction regression succeeds");
+            return;
+        }
+        install_test_main_sync_block_vfs().expect("register compaction sync VFS");
+        let directory = tempfile::tempdir().expect("compaction regression directory");
+        let source_path = directory.path().join("source.sqlite");
+        let source = create_pinned_snapshot_database(&source_path).expect("private source pin");
+        let source_connection = open_pinned_snapshot_database(&source).expect("source connection");
+        source_connection
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE); \
+                 CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL \
+                     REFERENCES parent(id), payload BLOB NOT NULL); \
+                 CREATE INDEX child_parent ON child(parent_id); \
+                 INSERT INTO parent VALUES (1, 'retained'); \
+                 INSERT INTO child VALUES (2, 1, zeroblob(4096)); \
+                 CREATE TRIGGER child_insert AFTER INSERT ON child BEGIN \
+                     UPDATE parent SET value = 'trigger-ran' WHERE id = NEW.parent_id; END; \
+                 PRAGMA application_id = 18437; PRAGMA user_version = 42;",
+            )
+            .expect("seed keyed tables, index, foreign key and post-copy trigger");
+        let expected_schema =
+            schema_manifest_in_sync(&source_connection, false).expect("source schema");
+        drop(source_connection);
+        let source_before = std::fs::read(&source_path).expect("source bytes before copy");
+        SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.set(true));
+        let compacted = create_pinned_snapshot_database(&directory.path().join("success.sqlite"))
+            .expect("private compacted pin");
+        let mut syncs = block_test_main_sync();
+        syncs.release();
+        compact_pinned_snapshot_database_sync(&source, &compacted).expect("complete logical copy");
+        assert_eq!(
+            1,
+            syncs.main_sync_count(),
+            "one completed image commit sync"
+        );
+        assert_eq!(0, syncs.wal_sync_count(), "private staging has no WAL");
+        let compacted_connection =
+            open_pinned_snapshot_database(&compacted).expect("read completed compacted image");
+        assert_eq!(
+            expected_schema,
+            schema_manifest_in_sync(&compacted_connection, false).expect("compacted schema")
+        );
+        assert_eq!(
+            (1_i64, "retained".to_owned(), 2_i64, 4_096_i64),
+            compacted_connection
+                .query_row(
+                    "SELECT parent.id, parent.value, child.id, length(child.payload) \
+                     FROM parent JOIN child ON child.parent_id = parent.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("retained values and keys; copy does not execute the trigger")
+        );
+        for (pragma, expected) in [("application_id", 18_437), ("user_version", 42)] {
+            assert_eq!(
+                expected,
+                compacted_connection
+                    .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+                    .expect("copied header metadata")
+            );
+        }
+        validate_snapshot_compaction_foreign_keys_sync(&compacted_connection)
+            .expect("retained foreign key remains valid");
+        assert!(
+            compacted_connection.is_autocommit(),
+            "copy committed before return"
+        );
+        drop(compacted_connection);
+
+        let failed_path = directory.path().join("failed-sync.sqlite");
+        let failed = create_pinned_snapshot_database(&failed_path).expect("failed-copy pin");
+        let worker_source = source.try_clone().expect("duplicate source descriptor");
+        let mut failure = block_test_main_sync();
+        let worker = std::thread::spawn(move || {
+            SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.set(true));
+            let result = compact_pinned_snapshot_database_sync(&worker_source, &failed);
+            (result, failed)
+        });
+        let observed = failure.wait_until_main_sync(Duration::from_secs(2));
+        failure.fail_and_release();
+        let (result, failed) = worker.join().expect("join the failed commit worker");
+        assert!(observed, "final image commit reaches real main-file xSync");
+        assert!(
+            result.is_err(),
+            "failed commit cannot return a compacted image"
+        );
+        drop(failed);
+        assert!(
+            !failed_path.exists(),
+            "failed staging pin owns exact cleanup"
+        );
+        assert!(
+            source_before == std::fs::read(&source_path).expect("source after failed sync"),
+            "successful and failed copies leave source bytes unchanged"
+        );
+
+        let source_connection = open_pinned_snapshot_database(&source).expect("corruption fixture");
+        source_connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable source enforcement only to construct an invalid fixture");
+        source_connection
+            .execute("DELETE FROM parent", [])
+            .expect("make an orphan while source FK enforcement is disabled");
+        drop(source_connection);
+        let rejected_path = directory.path().join("rejected.sqlite");
+        let rejected = create_pinned_snapshot_database(&rejected_path).expect("rejected-copy pin");
+        let error = compact_pinned_snapshot_database_sync(&source, &rejected)
+            .expect_err("complete foreign-key validation still rejects the source");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(
+            "session consensus compacted snapshot foreign key check failed",
+            error.to_string()
+        );
+        drop(rejected);
+        assert!(
+            !rejected_path.exists(),
+            "invalid staging pin owns exact cleanup"
         );
     }
 
@@ -46912,6 +49216,74 @@ mod tests {
     }
 
     #[test]
+    fn roster_schema_validation_rereads_main_and_attached_objects() {
+        let directory = tempfile::tempdir().expect("roster schema fixture directory");
+        let incoming_path = directory.path().join("incoming.sqlite");
+        let incoming = SqliteSessionBackend::open(&incoming_path).expect("incoming backend");
+        {
+            let conn = incoming.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members())
+                .expect("incoming consensus schema");
+        }
+        drop(incoming);
+        let backend = SqliteSessionBackend::in_memory().expect("local backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("local consensus schema");
+        conn.execute(
+            "ATTACH DATABASE ?1 AS consensus_incoming",
+            [incoming_path.to_string_lossy().as_ref()],
+        )
+        .expect("attach incoming schema");
+
+        for (attached, schema) in [(false, "main"), (true, "consensus_incoming")] {
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("initial exact schema")
+            );
+            conn.execute_batch(&format!(
+                "CREATE TABLE {schema}.consensus_protected_roster_unexpected (value INTEGER);"
+            ))
+            .expect("add unexpected roster namespace object");
+            assert!(
+                !protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread added namespace object")
+            );
+            conn.execute_batch(&format!(
+                "DROP TABLE {schema}.consensus_protected_roster_unexpected;"
+            ))
+            .expect("remove unexpected namespace object");
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread restored namespace")
+            );
+
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER {schema}.unexpected_roster_observer \
+                 AFTER INSERT ON consensus_protected_roster_rows BEGIN SELECT 1; END;"
+            ))
+            .expect("add roster trigger with unrelated name");
+            assert!(
+                !protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread added roster table trigger")
+            );
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, !attached)
+                    .expect("other database remains independently exact")
+            );
+            conn.execute_batch(&format!(
+                "DROP TRIGGER {schema}.unexpected_roster_observer;"
+            ))
+            .expect("remove unexpected roster trigger");
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread restored roster objects")
+            );
+        }
+        conn.execute("DETACH DATABASE consensus_incoming", [])
+            .expect("detach incoming schema");
+    }
+
+    #[test]
     fn aggregate_roster_schema_validation_is_select_only() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
@@ -47767,6 +50139,778 @@ mod tests {
         );
     }
 
+    async fn portable_snapshot_prefix_audit_fixture(
+        last_index: u64,
+        snapshot_index: u64,
+    ) -> SqliteSessionBackend {
+        let backend = backend_with_blank_logs(last_index).await;
+        {
+            let conn = backend.conn.lock().await;
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("apply exact predecessor membership");
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(snapshot_index));
+            set_test_log_pointer(&conn, "consensus_committed", &log_id(last_index));
+            set_test_purge_floor(&conn, &log_id(7));
+            save_test_snapshot_marker(&conn, log_id(snapshot_index), "portable-prefix-audit");
+        }
+        backend
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_prefix_audit_reuses_exact_projected_retained_range() {
+        use log_row_reuse_test_observer::{Event, Scope};
+
+        let backend = portable_snapshot_prefix_audit_fixture(15, 20).await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin unchanged portable prefix audit");
+        let changes = tx.total_changes();
+        let observation = Scope::new();
+        validate_exact_log_prefix_after_portable_snapshot_install_sync(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(log_id(15)),
+            Some(log_id(11)),
+            &log_id(20),
+            false,
+        )
+        .expect("exact retained prefix and absent authenticated tail");
+        let events = observation.finish();
+        let projected = events
+            .iter()
+            .filter(|event| **event == Event::RangeProjection)
+            .count();
+        eprintln!("portable_snapshot_prefix_audit retained_rows=8 projected_rows={projected}");
+        assert_eq!(tx.total_changes(), changes, "the full proof is read-only");
+        assert_eq!(
+            projected, 8,
+            "the retained subset must reuse the original complete membership projection"
+        );
+        for event in [
+            Event::RangeLogIdCheck,
+            Event::RangeContiguityCheck,
+            Event::RangeLeaderCheck,
+        ] {
+            assert_eq!(events.iter().filter(|actual| **actual == event).count(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_prefix_audit_reuses_complete_prefix_witnesses() {
+        let backend = portable_snapshot_prefix_audit_fixture(15, 15).await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin complete retained target audit");
+        let changes = tx.total_changes();
+        reset_committed_log_validation_decoded_rows_for_test();
+        validate_exact_log_prefix_after_portable_snapshot_install_sync(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(log_id(15)),
+            Some(log_id(11)),
+            &log_id(15),
+            true,
+        )
+        .expect("complete physical prefix requires every exact witness");
+        let decoded = committed_log_validation_decoded_rows_for_test();
+        eprintln!("portable_snapshot_prefix_audit physical_rows=16 witness_decoded_rows={decoded}");
+        assert_eq!(tx.total_changes(), changes);
+        assert_eq!(decoded, 16, "reuse the original full strict witness audit");
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_prefix_audit_rechecks_corruption_in_the_same_transaction() {
+        for snapshot in [15, 20] {
+            for corruption in [
+                "prefix-json",
+                "tail-json",
+                "prefix-v2",
+                "tail-v2",
+                "prefix-row",
+                "tail-row",
+                "tail-gap",
+                "boundary-gap",
+                "purge-marker",
+                "membership-scope",
+            ] {
+                let backend = portable_snapshot_prefix_audit_fixture(15, snapshot).await;
+                let conn = backend.conn.lock().await;
+                let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                    .expect("begin same transaction mutation control");
+                let audit = || {
+                    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+                        &tx,
+                        identity(),
+                        ConsensusAuthorityProfile::Dynamic,
+                        Some(log_id(15)),
+                        Some(log_id(11)),
+                        &log_id(snapshot),
+                        false,
+                    )
+                };
+                audit().expect("initial exact source must pass");
+                let index = if corruption.starts_with("prefix-") {
+                    4
+                } else {
+                    12
+                };
+                match corruption {
+                    "prefix-json" | "tail-json" => {
+                        tx.execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                            params![b"invalid-json".as_slice(), index],
+                        )
+                        .expect("corrupt original JSON payload");
+                    }
+                    "prefix-v2" | "tail-v2" => {
+                        let entry = fenced_transition_v2_entry(
+                            index as u64,
+                            fenced_transition_v2_request(0x96, 1, "portable-prefix-audit"),
+                            timestamp(2),
+                        );
+                        let bytes = noncanonical_v2_log_json(&entry);
+                        assert!(decode_consensus_log_entry(&bytes).is_err());
+                        tx.execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                            params![bytes, index],
+                        )
+                        .expect("corrupt strict V2 payload");
+                    }
+                    "prefix-row" | "tail-row" => {
+                        tx.execute(
+                            "UPDATE consensus_log SET term = 2 WHERE log_index = ?1",
+                            [index],
+                        )
+                        .expect("disagree with decoded full LogId");
+                    }
+                    "tail-gap" | "boundary-gap" => {
+                        tx.execute(
+                            "DELETE FROM consensus_log WHERE log_index = ?1",
+                            [if corruption == "boundary-gap" { 15 } else { 12 }],
+                        )
+                        .expect("remove required retained witness");
+                    }
+                    "purge-marker" => {
+                        save_log_pointer(
+                            &tx,
+                            "consensus_purged",
+                            identity(),
+                            &LogId::new(CommittedLeaderId::new(2, node_id()), 7),
+                        )
+                        .expect("change exact purge lineage");
+                    }
+                    "membership-scope" => {
+                        let entry: Entry<SessionRaftTypeConfig> = Entry {
+                            log_id: log_id(12),
+                            payload: EntryPayload::Membership(
+                                opc_consensus::engine::Membership::new(
+                                    vec![BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()])],
+                                    BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()]),
+                                ),
+                            ),
+                        };
+                        tx.execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 12",
+                            [encode_json(&entry).unwrap()],
+                        )
+                        .expect("inject decoded membership outside the storage scope");
+                    }
+                    _ => unreachable!(),
+                }
+                let changes = tx.total_changes();
+                assert_eq!(
+                    audit()
+                        .expect_err("successful earlier proof never admits changed source")
+                        .kind(),
+                    io::ErrorKind::InvalidData,
+                    "snapshot={snapshot}, corruption={corruption}",
+                );
+                assert_eq!(tx.total_changes(), changes, "rejection writes nothing");
+                tx.rollback().expect("discard explicit corruption fixture");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_purge_audit_reuses_identical_applied_cut() {
+        let backend = portable_snapshot_prefix_audit_fixture(15, 20).await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin exact portable purge publication");
+        reset_committed_log_validation_decoded_rows_for_test();
+        logical_purge_logs_after_portable_snapshot_install_in_tx(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(log_id(15)),
+            Some(log_id(11)),
+            &log_id(20),
+            20,
+        )
+        .expect("publish the fully proved identical applied and snapshot cut");
+        let decoded = committed_log_validation_decoded_rows_for_test();
+        eprintln!("portable_snapshot_purge_audit physical_rows=16 witness_decoded_rows={decoded}");
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(20)));
+        assert_eq!(
+            decoded, 32,
+            "audit the original floor and the new applied cut, without repeating the identical target"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_purge_audit_keeps_the_distinct_applied_cut_proof() {
+        for corrupt_applied in [false, true] {
+            let backend = portable_snapshot_prefix_audit_fixture(21, 20).await;
+            let conn = backend.conn.lock().await;
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(21));
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin distinct applied frontier control");
+            if corrupt_applied {
+                tx.execute("UPDATE consensus_log SET term = 2 WHERE log_index = 21", [])
+                    .expect("corrupt only the applied row beyond the snapshot cut");
+            }
+            let changes = tx.total_changes();
+            let result = logical_purge_logs_after_portable_snapshot_install_in_tx(
+                &tx,
+                identity(),
+                ConsensusAuthorityProfile::Dynamic,
+                Some(log_id(15)),
+                Some(log_id(11)),
+                &log_id(20),
+                20,
+            );
+            if corrupt_applied {
+                assert_eq!(
+                    result
+                        .expect_err("distinct applied proof is required")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(7)));
+                assert_eq!(
+                    tx.total_changes(),
+                    changes,
+                    "failed proof cannot publish purge"
+                );
+            } else {
+                result.expect("prove both distinct exact cuts before publishing purge");
+                assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(20)));
+            }
+        }
+    }
+
+    fn snapshot_install_retained_rows_collecting_oracle(
+        conn: &Connection,
+        identity: SessionConsensusIdentity,
+        authority_profile: ConsensusAuthorityProfile,
+        fixed_expected_members: &BTreeSet<SessionConsensusNodeId>,
+        incoming: Option<&LogId<SessionConsensusNodeId>>,
+    ) -> io::Result<()> {
+        let purged = read_purged_sync(conn, identity)?;
+        let current_snapshot = read_current_snapshot_sync(conn, identity)?;
+        let snapshot = current_snapshot
+            .as_ref()
+            .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref());
+        let first_index: Option<i64> = conn
+            .query_row("SELECT MIN(log_index) FROM consensus_log", [], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)?;
+        let first_index = first_index.map(checked_u64).transpose()?;
+        let snapshot_successor = snapshot
+            .map(|snapshot| {
+                snapshot
+                    .index
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("session consensus snapshot index is exhausted"))
+            })
+            .transpose()?;
+        let start = if purged.is_none()
+            && snapshot_successor.is_some_and(|successor| first_index == Some(successor))
+        {
+            snapshot_successor.expect("selected snapshot successor was matched")
+        } else {
+            0
+        };
+        let entries = read_log_range_sync(conn, identity, start, None, None)?;
+        if start != 0 {
+            if let (Some(snapshot), Some(first)) = (snapshot, entries.first()) {
+                ensure_log_id_not_after(
+                    snapshot,
+                    &first.log_id,
+                    "session consensus retained log regresses selected snapshot",
+                )?;
+            }
+        }
+        if incoming.is_none() && !entries.is_empty() {
+            return Err(invalid_data(
+                "session consensus pristine snapshot cannot replace retained logs",
+            ));
+        }
+        for entry in &entries {
+            if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                validate_fixed_log_id(&entry.log_id)?;
+                if fixed_profile_entry_changes_topology(entry, fixed_expected_members) {
+                    return Err(invalid_data("session consensus fixed log entry is invalid"));
+                }
+            }
+            if incoming.is_some_and(|incoming| {
+                entry.log_id.index == incoming.index && entry.log_id != *incoming
+            }) {
+                return Err(invalid_data(
+                    "session consensus incoming snapshot conflicts with retained log",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_retained_rows_preserves_collecting_policy_and_error_order() {
+        for (case, accepted) in [
+            ("normal", true),
+            ("same-cut", true),
+            ("retained-suffix", true),
+            ("pristine", true),
+            ("empty-retained", true),
+            ("none-incoming", false),
+            ("fixed-members", true),
+            ("fixed-mismatch", false),
+            ("none-fixed-mismatch", false),
+            ("conflict", false),
+            ("fixed-conflict", false),
+            ("policy-before-row-json", false),
+            ("incoming-before-row-json", false),
+            ("none-before-row-json", false),
+            ("row-json", false),
+            ("highest-json", false),
+            ("row-epoch", false),
+            ("row-term", false),
+            ("row-index", false),
+            ("leader-regression", false),
+            ("internal-gap", false),
+            ("first-gap", false),
+            ("hidden-v2", false),
+            ("snapshot-successor", true),
+            ("snapshot-first-gap", false),
+            ("snapshot-regression", false),
+            ("snapshot-policy-priority", false),
+            ("snapshot-row-priority", false),
+            ("purged", true),
+            ("purged-prefix-not-retained", true),
+        ] {
+            let backend = backend_with_blank_logs(7).await;
+            let conn = backend.conn.lock().await;
+            let fixture = &*conn;
+            let mut incoming = Some(log_id(8));
+            let mut profile = ConsensusAuthorityProfile::Dynamic;
+            let mut fixed_members = expected_members();
+            if case == "pristine" {
+                fixture.execute("DELETE FROM consensus_log", []).unwrap();
+                incoming = None;
+            } else {
+                apply_entries_sync(fixture, identity(), &backend.caps, vec![membership_entry()])
+                    .unwrap();
+            }
+            if case.contains("fixed") || case == "policy-before-row-json" {
+                profile = ConsensusAuthorityProfile::FixedImmutable;
+                if case != "fixed-members" {
+                    fixed_members.clear();
+                }
+            }
+            if case.starts_with("none-") || case == "snapshot-policy-priority" {
+                incoming = None;
+            } else if case.contains("conflict") || case == "incoming-before-row-json" {
+                incoming = Some(LogId::new(CommittedLeaderId::new(2, node_id()), 2));
+            } else if case == "same-cut" {
+                incoming = Some(log_id(7));
+            } else if case == "retained-suffix" {
+                incoming = Some(log_id(4));
+            }
+            if case.starts_with("snapshot-") {
+                set_test_log_pointer(fixture, "consensus_applied", &log_id(3));
+                let term = if matches!(
+                    case,
+                    "snapshot-regression" | "snapshot-policy-priority" | "snapshot-row-priority"
+                ) {
+                    2
+                } else {
+                    1
+                };
+                save_test_snapshot_marker(
+                    fixture,
+                    LogId::new(CommittedLeaderId::new(term, node_id()), 3),
+                    "retained-row-oracle",
+                );
+                fixture
+                    .execute("DELETE FROM consensus_log WHERE log_index <= 3", [])
+                    .unwrap();
+                if case == "snapshot-first-gap" {
+                    fixture
+                        .execute("DELETE FROM consensus_log WHERE log_index = 4", [])
+                        .unwrap();
+                }
+            } else if case.starts_with("purged") || case == "empty-retained" {
+                let floor = if case == "empty-retained" { 7 } else { 3 };
+                set_test_log_pointer(fixture, "consensus_applied", &log_id(floor));
+                set_test_purge_floor(fixture, &log_id(floor));
+                if case == "purged-prefix-not-retained" {
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 2",
+                            [b"invalid-json".as_slice()],
+                        )
+                        .unwrap();
+                } else {
+                    fixture
+                        .execute(
+                            "DELETE FROM consensus_log WHERE log_index <= ?1",
+                            [checked_i64(floor).unwrap()],
+                        )
+                        .unwrap();
+                }
+            }
+            if case.ends_with("row-json") || case == "snapshot-row-priority" {
+                fixture
+                    .execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                        [b"invalid-json".as_slice()],
+                    )
+                    .unwrap();
+            }
+            match case {
+                "highest-json" => {
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 7",
+                            [b"invalid-json".as_slice()],
+                        )
+                        .unwrap();
+                }
+                "row-epoch" => {
+                    // Inject on this private fixture connection only, then
+                    // restore enforcement before either read-only audit.
+                    fixture.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+                    fixture.execute(
+                        "UPDATE consensus_log SET configuration_epoch = configuration_epoch + 1 WHERE log_index = 6",
+                        [],
+                    )
+                    .unwrap();
+                    fixture.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+                }
+                "row-term" => {
+                    fixture
+                        .execute("UPDATE consensus_log SET term = 2 WHERE log_index = 6", [])
+                        .unwrap();
+                }
+                "row-index" => {
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                            [encode_json(&blank_entry(99)).unwrap()],
+                        )
+                        .unwrap();
+                }
+                "leader-regression" => {
+                    replace_test_blank_log(
+                        fixture,
+                        &LogId::new(CommittedLeaderId::new(2, node_id()), 5),
+                    );
+                }
+                "internal-gap" | "first-gap" => {
+                    fixture
+                        .execute(
+                            "DELETE FROM consensus_log WHERE log_index = ?1",
+                            [if case == "internal-gap" { 4 } else { 0 }],
+                        )
+                        .unwrap();
+                }
+                "hidden-v2" => {
+                    let entry = fenced_transition_v2_entry(
+                        6,
+                        fenced_transition_v2_request(0x96, 1, "retained-row-oracle"),
+                        timestamp(2),
+                    );
+                    let bytes = noncanonical_v2_log_json(&entry);
+                    assert!(decode_consensus_log_entry(&bytes).is_err());
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                            [bytes],
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let changes = tx.total_changes();
+            let outcome =
+                |result: io::Result<()>| result.map_err(|error| (error.kind(), error.to_string()));
+            let expected = outcome(snapshot_install_retained_rows_collecting_oracle(
+                &tx,
+                identity(),
+                profile,
+                &fixed_members,
+                incoming.as_ref(),
+            ));
+            assert_eq!(
+                expected.is_ok(),
+                accepted,
+                "independent fixture: {case}: {expected:?}"
+            );
+            assert_eq!(
+                outcome(validate_snapshot_install_retained_rows_sync(
+                    &tx,
+                    identity(),
+                    profile,
+                    &fixed_members,
+                    incoming.as_ref(),
+                )),
+                expected,
+                "original collecting error precedence: {case}",
+            );
+            assert_eq!(tx.total_changes(), changes, "read-only audit: {case}");
+            if case == "normal" {
+                tx.execute(
+                    "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                    [b"invalid-json".as_slice()],
+                )
+                .unwrap();
+                let changed = tx.total_changes();
+                let expected = outcome(snapshot_install_retained_rows_collecting_oracle(
+                    &tx,
+                    identity(),
+                    profile,
+                    &fixed_members,
+                    incoming.as_ref(),
+                ));
+                assert!(expected.is_err());
+                assert_eq!(
+                    outcome(validate_snapshot_install_retained_rows_sync(
+                        &tx,
+                        identity(),
+                        profile,
+                        &fixed_members,
+                        incoming.as_ref(),
+                    )),
+                    expected,
+                    "a prior successful audit must not hide a changed row in the same transaction",
+                );
+                assert_eq!(tx.total_changes(), changed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_retained_rows_scratch_does_not_scale_with_log_count() {
+        let members = BTreeSet::new();
+        let mut measurements = Vec::new();
+        for row_count in [512, 4096] {
+            let backend = backend_with_blank_logs(row_count - 1).await;
+            let conn = backend.conn.lock().await;
+            let incoming = log_id(row_count + 100);
+            let changes = conn.total_changes();
+            let validate = || {
+                validate_snapshot_install_retained_rows_sync(
+                    &conn,
+                    identity(),
+                    ConsensusAuthorityProfile::Dynamic,
+                    &members,
+                    Some(&incoming),
+                )
+                .expect("audit the complete retained log before snapshot installation");
+            };
+            validate();
+            let started = Instant::now();
+            let memory = allocation_counter::measure(validate);
+            eprintln!(
+                "snapshot_install_retained_rows_allocation rows={row_count} peak={} retained={} total={} elapsed_us={}",
+                memory.bytes_max, memory.bytes_current, memory.bytes_total,
+                started.elapsed().as_micros(),
+            );
+            assert_eq!(memory.bytes_current, 0, "the audit retains no allocation");
+            assert_eq!(conn.total_changes(), changes, "the audit writes nothing");
+            measurements.push(memory);
+        }
+        // Eight times as many fixed-shape rows must not retain eight times
+        // as many decoded Entries. Allow transient allocator/decoder scratch
+        // to double; fixture construction and SQLite's C heap are excluded.
+        assert!(
+            measurements[1].bytes_max <= measurements[0].bytes_max * 2,
+            "snapshot admission must discard each decoded row after validation: {measurements:?}",
+        );
+    }
+
+    async fn snapshot_install_pointer_audit_fixture() -> SqliteSessionBackend {
+        let backend = backend_with_blank_logs(127).await;
+        {
+            let conn = backend.conn.lock().await;
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("apply exact predecessor membership");
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(95));
+            set_test_log_pointer(&conn, "consensus_committed", &log_id(127));
+            set_test_purge_floor(&conn, &log_id(63));
+            save_test_snapshot_marker(&conn, log_id(63), "install-pointer-audit");
+        }
+        backend
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_pointer_audit_shares_one_exact_superset_payload_scan() {
+        let backend = snapshot_install_pointer_audit_fixture().await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin original predecessor pointer audit");
+        let changes = tx.total_changes();
+        reset_committed_log_validation_decoded_rows_for_test();
+        let started = Instant::now();
+        validate_snapshot_install_replaced_pointers_sync(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(&log_id(160)),
+        )
+        .expect("all four exact predecessor pointers retain their full prefix proofs");
+        let decoded = committed_log_validation_decoded_rows_for_test();
+        eprintln!(
+            "snapshot_install_pointer_audit retained_rows=128 decoded_rows={decoded} elapsed_us={}",
+            started.elapsed().as_micros(),
+        );
+        assert_eq!(
+            tx.total_changes(),
+            changes,
+            "pointer admission remains read-only"
+        );
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(63)));
+        assert_eq!(
+            read_applied_sync(&tx, identity()).unwrap(),
+            Some(log_id(95))
+        );
+        assert_eq!(
+            read_committed_sync(&tx, identity()).unwrap(),
+            Some(log_id(127))
+        );
+        assert_eq!(
+            decoded, 128,
+            "one transaction must share a complete original payload audit across all exact pointers",
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_pointer_audit_rejects_corruption_and_rechecks_same_transaction() {
+        for corruption in [
+            "prefix-json",
+            "tail-json",
+            "prefix-v2",
+            "tail-v2",
+            "prefix-row",
+            "tail-row",
+            "tail-gap",
+            "applied-gap",
+            "purge-marker",
+            "membership",
+        ] {
+            let backend = snapshot_install_pointer_audit_fixture().await;
+            let conn = backend.conn.lock().await;
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin source mutation fixture");
+            validate_snapshot_install_replaced_pointers_sync(
+                &tx,
+                identity(),
+                ConsensusAuthorityProfile::Dynamic,
+                Some(&log_id(160)),
+            )
+            .expect("the same transaction is initially valid");
+            let index = if corruption.starts_with("prefix-") {
+                32
+            } else {
+                96
+            };
+            match corruption {
+                "prefix-json" | "tail-json" => {
+                    tx.execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                        params![b"invalid-json".as_slice(), index],
+                    )
+                    .expect("inject malformed original payload");
+                }
+                "prefix-v2" | "tail-v2" => {
+                    let entry = fenced_transition_v2_entry(
+                        index as u64,
+                        fenced_transition_v2_request(0x96, 1, "install-pointer-audit"),
+                        timestamp(2),
+                    );
+                    let bytes = noncanonical_v2_log_json(&entry);
+                    assert!(decode_consensus_log_entry(&bytes).is_err());
+                    tx.execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                        params![bytes, index],
+                    )
+                    .expect("inject strict V2 corruption in retained source");
+                }
+                "prefix-row" | "tail-row" => {
+                    tx.execute(
+                        "UPDATE consensus_log SET term = 2 WHERE log_index = ?1",
+                        [index],
+                    )
+                    .expect("inject SQL and decoded LogId disagreement");
+                }
+                "tail-gap" | "applied-gap" => {
+                    tx.execute(
+                        "DELETE FROM consensus_log WHERE log_index = ?1",
+                        [if corruption == "applied-gap" { 95 } else { 96 }],
+                    )
+                    .expect("remove an exact pointer or its required prefix witness");
+                }
+                "purge-marker" => {
+                    save_log_pointer(
+                        &tx,
+                        "consensus_purged",
+                        identity(),
+                        &LogId::new(CommittedLeaderId::new(2, node_id()), 63),
+                    )
+                    .expect("inject conflicting full marker identity");
+                }
+                "membership" => {
+                    let altered = StoredMembership::<
+                        SessionConsensusNodeId,
+                        opc_consensus::engine::EmptyNode,
+                    >::new(
+                        Some(log_id(0)),
+                        opc_consensus::engine::Membership::new(
+                            vec![BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()])],
+                            BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()]),
+                        ),
+                    );
+                    tx.execute(
+                        "UPDATE consensus_membership SET membership_json = ?1 WHERE singleton = 1",
+                        [encode_json(&altered).unwrap()],
+                    )
+                    .expect("inject different retained membership payload");
+                }
+                _ => unreachable!(),
+            }
+            let changes = tx.total_changes();
+            assert_eq!(
+                validate_snapshot_install_replaced_pointers_sync(
+                    &tx,
+                    identity(),
+                    ConsensusAuthorityProfile::Dynamic,
+                    Some(&log_id(160)),
+                )
+                .expect_err("a prior successful audit cannot admit changed source rows")
+                .kind(),
+                io::ErrorKind::InvalidData,
+                "corruption={corruption}",
+            );
+            assert_eq!(tx.total_changes(), changes, "rejection writes nothing");
+            tx.rollback()
+                .expect("discard only this explicit corruption fixture");
+        }
+    }
+
     #[tokio::test]
     async fn logical_purge_shares_one_exact_superset_payload_scan() {
         const SNAPSHOT_INDEX: u64 = 4_095;
@@ -47799,6 +50943,283 @@ mod tests {
             read_purged_sync(&conn, identity()).expect("read one-scan purge floor"),
             Some(log_id(PURGE_INDEX)),
         );
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_reuses_exact_rows_and_audits_the_applied_tail() {
+        const CURRENT_INDEX: u64 = 3_071;
+        const SNAPSHOT_INDEX: u64 = 8_191;
+        const APPLIED_INDEX: u64 = SNAPSHOT_INDEX + 64;
+        const PURGE_INDEX: u64 = 7_167;
+
+        let backend = backend_with_blank_logs(APPLIED_INDEX).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        set_test_purge_floor(&conn, &log_id(CURRENT_INDEX));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(APPLIED_INDEX));
+        save_test_snapshot_marker(&conn, log_id(SNAPSHOT_INDEX), "later-purge-one-scan");
+
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin later purge");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+            .expect("audit the current floor, new floor and applied tail");
+        tx.commit().expect("commit later purge");
+        assert_eq!(
+            committed_log_validation_decoded_rows_for_test(),
+            usize::try_from(APPLIED_INDEX + 1).expect("fixture row count"),
+            "each retained payload must be audited exactly once within this transaction",
+        );
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("new exact purge floor"),
+            Some(log_id(PURGE_INDEX)),
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM consensus_log", [], |row| row
+                .get::<_, i64>(0))
+                .expect("logical publication retains physical rows"),
+            i64::try_from(APPLIED_INDEX + 1).expect("fixture row count"),
+        );
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_rejects_corruption_in_both_audit_intervals() {
+        for corruption in [
+            "prefix-v2",
+            "tail-v2",
+            "prefix-hole",
+            "tail-hole",
+            "tail-row-mismatch",
+            "tail-lineage",
+            "snapshot-marker",
+            "purge-marker",
+        ] {
+            let backend = backend_with_blank_logs(191).await;
+            let conn = backend.conn.lock().await;
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("fixture membership");
+            set_test_purge_floor(&conn, &log_id(31));
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(191));
+            save_test_snapshot_marker(&conn, log_id(127), "later-purge-corruption");
+            let index = match corruption {
+                "prefix-v2" | "prefix-hole" => 64,
+                "snapshot-marker" => 127,
+                "purge-marker" => 31,
+                _ => 160,
+            };
+            match corruption {
+                "prefix-v2" | "tail-v2" => {
+                    let entry = fenced_transition_v2_entry(
+                        index,
+                        fenced_transition_v2_request(0x96, 1, "later-purge-strict-owner"),
+                        timestamp(2),
+                    );
+                    conn.execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                        params![
+                            noncanonical_v2_log_json(&entry),
+                            i64::try_from(index).unwrap()
+                        ],
+                    )
+                    .expect("strict interior V2 corruption");
+                }
+                "prefix-hole" | "tail-hole" => {
+                    conn.execute("DELETE FROM consensus_log WHERE log_index = ?1", [index])
+                        .expect("interior hole");
+                }
+                "tail-row-mismatch" => {
+                    conn.execute(
+                        "UPDATE consensus_log SET term = 2 WHERE log_index = ?1",
+                        [index],
+                    )
+                    .expect("row column disagrees with exact JSON LogId");
+                }
+                _ => {
+                    let mut entry = blank_entry(index);
+                    let term = if corruption == "tail-lineage" { 0 } else { 2 };
+                    entry.log_id = LogId::new(CommittedLeaderId::new(term, node_id()), index);
+                    conn.execute(
+                        "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = ?3",
+                        params![term, encode_json(&entry).unwrap(), index],
+                    )
+                    .expect("exact but conflicting lineage");
+                }
+            }
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin rejected later purge");
+            assert_eq!(
+                logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+                    .expect_err(corruption)
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "{corruption}",
+            );
+            assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(31)));
+            drop(tx);
+            assert_eq!(
+                read_purged_sync(&conn, identity()).unwrap(),
+                Some(log_id(31))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_preserves_current_audit_and_idempotence_error_order() {
+        let backend = backend_with_blank_logs(191).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("fixture membership");
+        set_test_purge_floor(&conn, &log_id(31));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(191));
+        save_test_snapshot_marker(&conn, log_id(127), "later-purge-error-order");
+        let corrupt = |index| {
+            noncanonical_v2_log_json(&fenced_transition_v2_entry(
+                index,
+                fenced_transition_v2_request(0x96, 1, "later-purge-order-owner"),
+                timestamp(2),
+            ))
+        };
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 160",
+            [corrupt(160)],
+        )
+        .expect("invalid unapplied-audit tail");
+        for through in [log_id(31), log_id(30)] {
+            reset_committed_log_validation_decoded_rows_for_test();
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin idempotent notification");
+            logical_purge_logs_in_tx(&tx, identity(), &through, through.index as i64)
+                .expect("idempotence follows the complete current audit without extending it");
+            assert_eq!(committed_log_validation_decoded_rows_for_test(), 128);
+            assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(31)));
+        }
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin conflicting notification");
+        let conflicting = LogId::new(CommittedLeaderId::new(2, node_id()), 31);
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &conflicting, 31)
+                .expect_err("current-floor conflict precedes later tail corruption")
+                .to_string(),
+            "session consensus purged index regressed",
+        );
+        drop(tx);
+
+        conn.execute("DELETE FROM consensus_applied", [])
+            .expect("missing applied pointer");
+        let encoded = corrupt(64);
+        let expected = decode_consensus_log_entry(&encoded)
+            .expect_err("strict V2 fixture")
+            .to_string();
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 64",
+            [encoded],
+        )
+        .expect("invalid row inside the current audit");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin rejected current audit");
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+                .expect_err("current-row corruption precedes a missing applied pointer")
+                .to_string(),
+            expected,
+        );
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(31)));
+    }
+
+    #[tokio::test]
+    async fn later_logical_purge_keeps_the_snapshot_witness_beyond_applied() {
+        let backend = backend_with_blank_logs(191).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("fixture membership");
+        set_test_purge_floor(&conn, &log_id(31));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(127));
+        save_test_snapshot_marker(&conn, log_id(191), "later-purge-future-marker");
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin purge with later snapshot");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+            .expect("full witness range extends through snapshot beyond applied");
+        assert_eq!(committed_log_validation_decoded_rows_for_test(), 192);
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(95)));
+        tx.rollback().expect("restore prior logical floor");
+        conn.execute("DELETE FROM consensus_log WHERE log_index <= 31", [])
+            .expect("model completed physical reclamation through prior floor");
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin purge after physical reclamation");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(95), 95)
+            .expect("current marker and fully decoded suffix prove the new floor");
+        assert_eq!(committed_log_validation_decoded_rows_for_test(), 160);
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(95)));
+    }
+
+    #[tokio::test]
+    #[ignore = "release-profile later logical purge diagnosis for SDK-741"]
+    async fn later_logical_purge_cost_diagnostic() {
+        const CURRENT_INDEX: u64 = 3_071;
+        const SNAPSHOT_INDEX: u64 = 8_191;
+        const APPLIED_INDEX: u64 = SNAPSHOT_INDEX + 64;
+        const PURGE_INDEX: u64 = 7_167;
+
+        let directory = tempfile::tempdir().expect("private disk-backed purge fixture");
+        let backend = SqliteSessionBackend::open(directory.path().join("purge.sqlite"))
+            .expect("open purge fixture");
+        let conn = backend.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("fixture schema");
+        append_logs_sync(&conn, identity(), &[membership_entry()]).expect("fixture membership");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        let mut entry = fenced_transition_v2_batch_entry(
+            1,
+            (1..=8)
+                .map(|nonce| fenced_transition_v2_request(nonce, 1, "purge-cost-fixture"))
+                .collect(),
+            timestamp(1),
+        );
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin bounded row-by-row fixture construction");
+        for index in 1..=APPLIED_INDEX {
+            entry.log_id = log_id(index);
+            let encoded = encode_json(&entry).expect("canonical eight-item V2 row");
+            tx.execute(
+                "INSERT INTO consensus_log (configuration_epoch, term, log_index, entry_json) VALUES (?1, ?2, ?3, ?4)",
+                params![epoch_i64(identity()).unwrap(), 1_i64, i64::try_from(index).unwrap(), encoded],
+            )
+            .expect("write one complete fixture row");
+        }
+        tx.commit()
+            .expect("commit purge fixture before measurement");
+        set_test_purge_floor(&conn, &log_id(CURRENT_INDEX));
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(APPLIED_INDEX));
+        save_test_snapshot_marker(&conn, log_id(SNAPSHOT_INDEX), "later-purge-cost");
+        let row_bytes = encode_json(&entry).expect("fixture dimensions").len();
+        for iteration in 0..3 {
+            reset_committed_log_validation_decoded_rows_for_test();
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin actual later purge transaction");
+            let started = Instant::now();
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+                .expect("actual later purge fully audits rows");
+            let elapsed = started.elapsed();
+            assert_eq!(
+                read_purged_sync(&tx, identity()).unwrap(),
+                Some(log_id(PURGE_INDEX))
+            );
+            eprintln!(
+                "sdk-741 later purge: iteration={iteration} retained_rows={} batch_items=8 row_bytes={row_bytes} decoded_rows={} purge_us={}",
+                APPLIED_INDEX + 1,
+                committed_log_validation_decoded_rows_for_test(),
+                elapsed.as_micros(),
+            );
+            tx.rollback()
+                .expect("restore the same current floor for the next measurement");
+            assert_eq!(
+                read_purged_sync(&conn, identity()).unwrap(),
+                Some(log_id(CURRENT_INDEX))
+            );
+        }
     }
 
     #[tokio::test]
@@ -48921,6 +52342,48 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn consensus_log_prune_lane_shutdown_cancels_active_turn_and_reopen_drains_backlog() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            true,
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_shutdown_between_statements_does_not_require_a_primary_writer() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            false,
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_shutdown_before_delete_preserves_backlog_without_a_primary() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            false,
+            ConsensusLogPruneTurnGatePoint::BeforeDelete,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_shutdown_before_commit_rolls_back_without_a_primary() {
+        assert_consensus_log_prune_shutdown_cancels_and_reopens(
+            false,
+            ConsensusLogPruneTurnGatePoint::BeforeCommit,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_consensus_log_prune_shutdown_cancels_and_reopens(
+        with_waiting_primary: bool,
+        point: ConsensusLogPruneTurnGatePoint,
+    ) {
         let directory = tempfile::tempdir().expect("prune shutdown directory");
         let source_path = directory.path().join("prune-shutdown.sqlite");
         let backend =
@@ -48993,8 +52456,7 @@ mod tests {
             .expect("pin prune shutdown primary descriptor"),
         );
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
-        let gate =
-            ConsensusLogPruneTurnGateForTest::install_before_authority_read(directory.path());
+        let gate = ConsensusLogPruneTurnGateForTest::install_at(directory.path(), point);
         let lane = ConsensusLogPruneLane::start(
             Arc::clone(&pinned),
             None,
@@ -49026,7 +52488,7 @@ mod tests {
         );
 
         let shutdown_lane = Arc::clone(&lane);
-        let shutdown = tokio::spawn(async move {
+        let mut shutdown = tokio::spawn(async move {
             shutdown_lane.shutdown().await;
         });
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -49037,19 +52499,38 @@ mod tests {
         .await
         .expect("shutdown publishes stop before joining the active worker");
 
-        let primary_lane = Arc::clone(&lane);
-        let primary_preemption =
-            tokio::spawn(async move { primary_lane.request_primary_preemption().await });
-        tokio::task::yield_now().await;
-        assert!(
-            !primary_preemption.is_finished(),
-            "a stopping primary still waits for the prune writer transaction to roll back",
-        );
+        let primary_preemption = with_waiting_primary.then(|| {
+            let primary_lane = Arc::clone(&lane);
+            tokio::spawn(async move { primary_lane.request_primary_preemption().await })
+        });
+        if let Some(preemption) = &primary_preemption {
+            tokio::task::yield_now().await;
+            assert!(
+                !preemption.is_finished(),
+                "a stopping primary still waits for the prune writer transaction to roll back",
+            );
+        } else {
+            assert_eq!(lane.primary_writers_for_test(), 0);
+        }
         gate.release();
-        let primary_guard = tokio::time::timeout(Duration::from_secs(1), primary_preemption)
-            .await
-            .expect("primary preemption waits for the interrupted prune rollback")
-            .expect("join primary preemption after shutdown");
+        let primary_guard = match primary_preemption {
+            Some(preemption) => Some(
+                tokio::time::timeout(Duration::from_secs(1), preemption)
+                    .await
+                    .expect("primary preemption waits for the interrupted prune rollback")
+                    .expect("join primary preemption after shutdown"),
+            ),
+            None => {
+                // In this variant shutdown is the sole source of cancellation.
+                // Join it before probing SQLite so the probe cannot supply
+                // the foreground pressure that would hide a lost interrupt.
+                tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
+                    .await
+                    .expect("shutdown joins without a primary preemption")
+                    .expect("shutdown task completes without a primary preemption");
+                None
+            }
+        };
         let primary_writer =
             Connection::open(pinned.path()).expect("open primary writer after shutdown preemption");
         apply_pragma_profile(&primary_writer, false, true)
@@ -49067,10 +52548,12 @@ mod tests {
             .commit()
             .expect("commit primary write after prune rollback/autocommit");
         drop(primary_guard);
-        tokio::time::timeout(Duration::from_secs(1), shutdown)
-            .await
-            .expect("shutdown joins the interrupted real worker within the bounded budget")
-            .expect("shutdown task completes");
+        if with_waiting_primary {
+            tokio::time::timeout(Duration::from_secs(1), shutdown)
+                .await
+                .expect("shutdown joins the interrupted real worker within the bounded budget")
+                .expect("shutdown task completes");
+        }
 
         let stopped = diagnostics.snapshot();
         assert_eq!(stopped.consensus_log_prune_permanent_failures, 0);
@@ -49973,13 +53456,20 @@ mod tests {
         conn: &Connection,
         fixture: &crate::consensus::types::RosterV2PersistenceFixture,
     ) {
-        let members = expected_members();
-        let bindings = test_member_bindings(&members);
+        initialize_v2_persistence_fixture_with_members(conn, fixture, &expected_members());
+    }
+
+    fn initialize_v2_persistence_fixture_with_members(
+        conn: &Connection,
+        fixture: &crate::consensus::types::RosterV2PersistenceFixture,
+        members: &BTreeSet<SessionConsensusNodeId>,
+    ) {
+        let bindings = test_member_bindings(members);
         initialize_schema_with_storage_anchor_and_pending_and_bindings(
             conn,
             None,
             fixture.identity,
-            &members,
+            members,
             &bindings,
             None,
             ConsensusAuthorityProfile::Dynamic,
@@ -49991,7 +53481,7 @@ mod tests {
             conn,
             fixture.identity,
             fixture.identity,
-            &members,
+            members,
             crate::fenced_mutation_roster::Profile::v2().digest(),
         )
         .expect("activate exact V2 persistence fixture");
@@ -50076,6 +53566,20 @@ mod tests {
         path: &Path,
         state: ProtectedRosterV2RecoveryFixtureState,
     ) -> Result<ProtectedRosterV2RecoveryFixture, ()> {
+        initialize_protected_roster_v2_recovery_fixture_with_members(
+            path,
+            state,
+            expected_members(),
+        )
+    }
+
+    /// Use the same signed persistence fixture and normal apply helpers with
+    /// an explicit voter set for complete native/SQLite response parity.
+    pub(crate) fn initialize_protected_roster_v2_recovery_fixture_with_members(
+        path: &Path,
+        state: ProtectedRosterV2RecoveryFixtureState,
+        members: BTreeSet<SessionConsensusNodeId>,
+    ) -> Result<ProtectedRosterV2RecoveryFixture, ()> {
         // Recovery's normal fixture connection intentionally opens SQLite
         // read-only.  Materialize through the backend here so the exact
         // writer UDFs and pragma profile used by the durable DDL are present.
@@ -50090,8 +53594,7 @@ mod tests {
                 crate::consensus::types::roster_v2_aborted_persistence_fixture()
             }
         };
-        let members = expected_members();
-        initialize_v2_persistence_fixture(&conn, &fixture);
+        initialize_v2_persistence_fixture_with_members(&conn, &fixture, &members);
         // The sealed persistence fixture establishes the V2 authority lease
         // directly because its focused tests do not exercise the legacy lease
         // allocator.  Recovery certifies the entire durable namespace, so
@@ -56441,6 +59944,96 @@ LIMIT 20000;
                 }
             ))),
         );
+    }
+
+    #[test]
+    fn cached_authority_and_pointer_queries_read_current_rows() {
+        let backend = SqliteSessionBackend::in_memory().expect("query cache backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        for _ in 0..2 {
+            assert_eq!(
+                read_membership_scope_sync(&conn, identity())
+                    .expect("read and warm complete scope queries")
+                    .current_identity,
+                identity(),
+            );
+        }
+        for table in [
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_applied",
+        ] {
+            for _ in 0..2 {
+                assert_eq!(read_log_pointer(&conn, table, identity()).unwrap(), None);
+            }
+            set_test_log_pointer(&conn, table, &log_id(1));
+            assert_eq!(
+                read_log_pointer(&conn, table, identity()).unwrap(),
+                Some(log_id(1))
+            );
+            conn.execute(&format!("UPDATE {table} SET term = term + 1"), [])
+                .expect("mismatch the current term and encoded exact pointer");
+            assert_eq!(
+                read_log_pointer(&conn, table, identity())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+            );
+            conn.execute(&format!("DELETE FROM {table}"), [])
+                .expect("restore the absent pointer fixture");
+        }
+        read_membership_scope_sync(&conn, identity())
+            .expect("scope remains valid before corruption");
+        conn.execute(
+            "UPDATE consensus_membership_scope SET current_members_json = x'5b5d'",
+            [],
+        )
+        .expect("change the current authority row after warming its statement");
+        assert_eq!(
+            read_membership_scope_sync(&conn, identity())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+
+        let (epoch, revision, _) =
+            ops::read_restore_scan_state_sync(&conn).expect("read and warm restore revision");
+        for increment in 1..=2 {
+            ops::advance_restore_scan_revision_sync(&conn).expect("advance the fresh revision");
+            let (observed_epoch, observed_revision, _) = ops::read_restore_scan_state_sync(&conn)
+                .expect("read the current revision from a reused statement");
+            assert_eq!(
+                (observed_epoch, observed_revision),
+                (epoch, revision + increment)
+            );
+        }
+    }
+
+    #[test]
+    fn cached_v2_schema_queries_recheck_live_schema_and_format() {
+        let backend = SqliteSessionBackend::in_memory().expect("schema cache backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        activate_v2_ledger_fixture(&conn);
+        for _ in 0..2 {
+            assert_eq!(
+                fenced_transition_v2_ledger_layout_sync(&conn).expect("warm exact schema query"),
+                FencedTransitionV2LedgerLayout::Activated,
+            );
+        }
+        conn.execute_batch("DROP INDEX consensus_fenced_transition_v2_receipts_due")
+            .expect("remove required index after caching statement");
+        assert!(fenced_transition_v2_ledger_layout_sync(&conn).is_err());
+        conn.execute_batch(FENCED_TRANSITION_V2_DUE_INDEX_SCHEMA_SQL)
+            .expect("restore exact index");
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).expect("observe restored exact index"),
+            FencedTransitionV2LedgerLayout::Activated,
+        );
+        conn.execute_batch("UPDATE consensus_identity SET schema_version = 1 WHERE singleton = 1")
+            .expect("change format while statements remain cached");
+        assert!(fenced_transition_v2_ledger_layout_sync(&conn).is_err());
     }
 
     #[test]
@@ -64273,6 +67866,826 @@ BEGIN IMMEDIATE;
     }
 
     #[test]
+    fn membership_projection_load_uses_one_current_sqlite_snapshot() {
+        let directory = tempfile::tempdir().expect("projection database directory");
+        let path = directory.path().join("projection.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("projection backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        activate_v2_ledger_fixture(&conn);
+        let writer = std::sync::Mutex::new(Connection::open(&path).expect("independent writer"));
+        let changed = Arc::new(AtomicBool::new(false));
+        let observed_changed = Arc::clone(&changed);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "consensus_fenced_transition_v2_history",
+                    ..
+                }
+            ) && !observed_changed.swap(true, Ordering::SeqCst)
+            {
+                assert_eq!(
+                    writer
+                        .lock()
+                        .expect("writer lock")
+                        .execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+                        .expect("commit concurrent certificate removal"),
+                    1,
+                );
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+        let projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load the snapshot that preceded the concurrent write");
+        conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        assert!(
+            changed.load(Ordering::SeqCst),
+            "writer must run during load"
+        );
+        assert!(projection.projected_v2_scope_activated);
+        assert!(conn.is_autocommit(), "load must release its read snapshot");
+        assert!(
+            !MembershipLogProjection::load(&conn, identity(), false)
+                .expect("next load must read the committed removal")
+                .projected_v2_scope_activated,
+        );
+
+        conn.execute_batch(
+            "CREATE TRIGGER unexpected_projection_activation_trigger \
+             AFTER INSERT ON consensus_fenced_transition_v2_activation BEGIN SELECT 1; END;",
+        )
+        .expect("introduce hostile schema after a successful load");
+        assert_eq!(
+            MembershipLogProjection::load(&conn, identity(), false)
+                .err()
+                .expect("next load must reject changed schema")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(
+            conn.is_autocommit(),
+            "failed load must release its snapshot"
+        );
+    }
+
+    #[test]
+    fn membership_projection_load_preserves_the_callers_transaction() {
+        let backend = SqliteSessionBackend::in_memory().expect("projection backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        activate_v2_ledger_fixture(&conn);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("caller's transaction");
+        tx.execute("DELETE FROM consensus_fenced_transition_v2_activation", [])
+            .expect("uncommitted certificate removal");
+        assert!(
+            !MembershipLogProjection::load(&tx, identity(), false)
+                .expect("load must observe caller's writes")
+                .projected_v2_scope_activated,
+        );
+        assert!(!conn.is_autocommit(), "load must not commit its caller");
+        tx.rollback().expect("caller rolls back");
+        assert!(
+            MembershipLogProjection::load(&conn, identity(), false)
+                .expect("read rolled-back certificate")
+                .projected_v2_scope_activated,
+        );
+    }
+
+    #[test]
+    #[ignore = "release-profile membership query cost diagnosis for SDK-741"]
+    fn membership_projection_query_cost_diagnostic() {
+        let backend = SqliteSessionBackend::in_memory().expect("diagnostic backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership");
+        activate_v2_ledger_fixture(&conn);
+        for capacity in [0, 16, 32, 64] {
+            conn.flush_prepared_statement_cache();
+            conn.set_prepared_statement_cache_capacity(capacity);
+            let selects = Arc::new(AtomicUsize::new(0));
+            let observed_selects = Arc::clone(&selects);
+            conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(context.action, rusqlite::hooks::AuthAction::Select) {
+                    observed_selects.fetch_add(1, Ordering::Relaxed);
+                }
+                rusqlite::hooks::Authorization::Allow
+            }));
+            for _ in 0..16 {
+                let projection = MembershipLogProjection::load(&conn, identity(), false)
+                    .expect("warm exact projection queries");
+                assert!(projection.projected_v2_scope_activated);
+            }
+            selects.store(0, Ordering::Relaxed);
+            let mut samples = Vec::with_capacity(4_096);
+            for _ in 0..4_096 {
+                let started = Instant::now();
+                std::hint::black_box(
+                    MembershipLogProjection::load(&conn, identity(), false)
+                        .expect("fully validate current projection"),
+                );
+                samples.push(started.elapsed());
+            }
+            let total = samples.iter().sum::<Duration>();
+            samples.sort_unstable();
+            eprintln!(
+                "sdk-741 membership component: cache_capacity={capacity} samples={} select_authorizations={} total_us={} p50_ns={} p99_ns={} p999_ns={}",
+                samples.len(),
+                selects.load(Ordering::Relaxed),
+                total.as_micros(),
+                samples[2_047].as_nanos(),
+                samples[4_055].as_nanos(),
+                samples[4_091].as_nanos(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-profile component cost diagnosis for SDK-741"]
+    fn durable_v2_log_decode_cost_diagnostic() {
+        fn measure(stage: &str, mut work: impl FnMut()) {
+            let mut samples = Vec::with_capacity(4_096);
+            for _ in 0..4_096 {
+                let started = Instant::now();
+                work();
+                samples.push(started.elapsed());
+            }
+            let total = samples.iter().sum::<Duration>();
+            samples.sort_unstable();
+            eprintln!(
+                "sdk-741 component: stage={stage} samples={} total_us={} p50_ns={} p99_ns={} p999_ns={}",
+                samples.len(),
+                total.as_micros(),
+                samples[2_047].as_nanos(),
+                samples[4_055].as_nanos(),
+                samples[4_091].as_nanos(),
+            );
+        }
+
+        let entry = fenced_transition_v2_batch_entry(
+            1,
+            (1..=8)
+                .map(|nonce| fenced_transition_v2_request(nonce, 1, "decode-cost-fixture"))
+                .collect(),
+            timestamp(1),
+        );
+        let bytes = encode_json(&entry).expect("encode eight-item diagnostic row");
+        eprintln!("sdk-741 component: batch_items=8 row_bytes={}", bytes.len());
+        assert_eq!(
+            decode_consensus_log_entry(&bytes).expect("exact row"),
+            entry
+        );
+        measure("full_durable_decode", || {
+            std::hint::black_box(decode_consensus_log_entry(std::hint::black_box(&bytes)))
+                .expect("full row decoding");
+        });
+        measure("typed_decode", || {
+            std::hint::black_box(decode_json::<Entry<SessionRaftTypeConfig>>(
+                std::hint::black_box(&bytes),
+            ))
+            .expect("typed row decoding");
+        });
+        measure("exact_schema_validation", || {
+            validate_exact_fenced_transition_v2_log_json(
+                std::hint::black_box(&bytes),
+                std::hint::black_box(&entry),
+            )
+            .expect("exact row schema");
+        });
+        measure("canonical_encoding", || {
+            std::hint::black_box(encode_json(std::hint::black_box(&entry)))
+                .expect("canonical row encoding");
+        });
+        measure("profile_digest", || {
+            std::hint::black_box(fenced_transition_v2_profile_digest());
+        });
+        measure("available_parallelism", || {
+            let _ = std::hint::black_box(std::thread::available_parallelism());
+        });
+    }
+
+    fn sealed_audit_fixture_row(sequence: u64) -> EncodedSealedReplicationAuditRow {
+        let entry = ReplicationEntry {
+            sequence,
+            tx_id: format!("sealed-audit-{sequence}")
+                .try_into()
+                .expect("fixture ID"),
+            op: ReplicationOp::DeleteFenced {
+                key: key(),
+                owner: OwnerId::new("sealed-audit-owner").expect("fixture owner"),
+                fence: crate::FenceToken::new(1),
+            },
+            timestamp: timestamp(1),
+        };
+        EncodedSealedReplicationAuditRow {
+            sequence: i64::try_from(sequence).expect("fixture SQLite sequence"),
+            tx_id: Some(entry.tx_id.as_str().to_owned()),
+            encoded: serde_json::to_string(&entry).expect("fixture row"),
+        }
+    }
+
+    fn sealed_audit_fixture(start: u64, count: usize, row_bytes: usize) -> SqliteSessionBackend {
+        let backend = SqliteSessionBackend::in_memory().expect("sealed audit fixture");
+        {
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("fixture schema");
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("fixture transaction");
+            for offset in 0..count {
+                let mut row = sealed_audit_fixture_row(start + u64::try_from(offset).unwrap());
+                if row_bytes > row.encoded.len() {
+                    row.encoded
+                        .extend(std::iter::repeat_n(' ', row_bytes - row.encoded.len()));
+                }
+                tx.execute(
+                    "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        row.sequence,
+                        row.tx_id,
+                        row.encoded,
+                        timestamp(1).to_string()
+                    ],
+                )
+                .expect("persist audit fixture row");
+            }
+            tx.execute(
+                "UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = ?1",
+                [i64::try_from(start - 1).unwrap()],
+            )
+            .expect("fixture cursor floor");
+            tx.execute(
+                "UPDATE consensus_machine SET watch_sequence = ?1",
+                [i64::try_from(start - 1 + u64::try_from(count).unwrap()).unwrap()],
+            )
+            .expect("fixture cursor head");
+            tx.commit().expect("commit fixture");
+        }
+        backend
+    }
+
+    fn assert_sealed_audit_matches_serial(conn: &Connection, case: &str) -> bool {
+        let serial = sealed_replication_log_serial_reference(conn)
+            .map_err(|error| (error.kind(), error.to_string()));
+        let actual =
+            validate_sealed_state_sync(conn).map_err(|error| (error.kind(), error.to_string()));
+        assert_eq!(actual, serial, "case {case}");
+        actual.is_ok()
+    }
+
+    #[test]
+    fn sealed_replication_audit_matches_serial_acceptance_and_corruption_order() {
+        for (case, mutation) in [
+            ("valid", "SELECT 1"),
+            ("gap", "DELETE FROM session_replication_log WHERE sequence = 65"),
+            ("negative-sequence", "UPDATE session_replication_log SET sequence = -1 WHERE sequence = 1"),
+            ("empty-id", "UPDATE session_replication_log SET tx_id = '' WHERE sequence = 65"),
+            ("wide-id", "UPDATE session_replication_log SET tx_id = printf('%0130d', 1) WHERE sequence = 65"),
+            ("blob-id", "UPDATE session_replication_log SET tx_id = X'3132' WHERE sequence = 65"),
+            ("different-id", "UPDATE session_replication_log SET tx_id = 'different' WHERE sequence = 65"),
+            ("malformed-json", "UPDATE session_replication_log SET entry_json = '{' WHERE sequence = 65"),
+            ("blob-json", "UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 65"),
+            ("invalid-utf8", "UPDATE session_replication_log SET entry_json = CAST(X'ff' AS TEXT) WHERE sequence = 65"),
+            ("wrong-inner-sequence", "UPDATE session_replication_log SET entry_json = json_set(entry_json, '$.sequence', 66) WHERE sequence = 65"),
+            ("head-drift", "UPDATE consensus_machine SET watch_sequence = 129"),
+            ("floor-drift", "UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = 1"),
+            ("row-error-before-fetch-error", "UPDATE session_replication_log SET entry_json = '{' WHERE sequence = 2; UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 127"),
+            ("fetch-error-before-row-error", "UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 2; UPDATE session_replication_log SET entry_json = '{' WHERE sequence = 127"),
+            ("scalar-error-before-later-fetch-error", "UPDATE session_replication_log SET sequence = -1 WHERE sequence = 1; UPDATE session_replication_log SET entry_json = X'7b7d' WHERE sequence = 127"),
+        ] {
+            let backend = sealed_audit_fixture(1, 128, 0);
+            let conn = backend.conn.blocking_lock();
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON").expect("hostile fixture");
+            conn.execute_batch(mutation).expect("mutate fixture");
+            assert_eq!(assert_sealed_audit_matches_serial(&conn, case), case == "valid");
+        }
+        for (start, count) in [(1, 0), (19, 128), (i64::MAX as u64 - 127, 128)] {
+            let backend = sealed_audit_fixture(start, count, 0);
+            let conn = backend.conn.blocking_lock();
+            assert!(assert_sealed_audit_matches_serial(
+                &conn,
+                "valid retained range"
+            ));
+        }
+    }
+
+    #[test]
+    fn sealed_replication_audit_keeps_full_ttl_structure_payload_and_envelope_checks() {
+        let mut unsealed = sealed_record_for_key(key(), 64 * 1024);
+        unsealed.payload = crate::EncryptedSessionPayload::new(b"unsealed".as_slice());
+        let mut different_key = key();
+        different_key.stable_id = Bytes::from_static(b"different-sealed-audit-key")
+            .try_into()
+            .expect("fixture key");
+        for op in [
+            ReplicationOp::RefreshTtl {
+                key: key(),
+                owner: OwnerId::new("sealed-audit-owner").unwrap(),
+                fence: crate::FenceToken::new(1),
+                ttl: Duration::from_secs(1),
+                expires_at: timestamp(30),
+            },
+            ReplicationOp::Batch {
+                ops: (0..crate::backend::MAX_REPLICATION_OPERATIONS_PER_ENTRY)
+                    .map(|_| ReplicationOp::Batch { ops: Vec::new() })
+                    .collect(),
+            },
+            sealed_replication_cas(key(), key(), 1_048_577),
+            sealed_replication_cas(key(), different_key, 64 * 1024),
+            ReplicationOp::CompareAndSet {
+                key: key(),
+                expected_generation: None,
+                credential_id: 1,
+                guard_expires_at: timestamp(1),
+                new_record: unsealed,
+            },
+        ] {
+            let backend = sealed_audit_fixture(1, 128, 0);
+            let conn = backend.conn.blocking_lock();
+            let mut entry: ReplicationEntry =
+                serde_json::from_str(&sealed_audit_fixture_row(65).encoded).expect("typed fixture");
+            entry.op = op;
+            conn.execute(
+                "UPDATE session_replication_log SET entry_json = ?1 WHERE sequence = 65",
+                [serde_json::to_string(&entry).expect("hostile typed row")],
+            )
+            .expect("replace operation");
+            assert!(!assert_sealed_audit_matches_serial(
+                &conn,
+                "full operation validation"
+            ));
+        }
+    }
+
+    #[test]
+    fn sealed_replication_audit_bounds_encoded_batches_and_preserves_wide_legacy_rows() {
+        for (count, row_bytes) in [
+            (DURABLE_LOG_AUDIT_BATCH_ROWS + 65, 0),
+            (128, DURABLE_LOG_AUDIT_BATCH_BYTES / 64),
+        ] {
+            let backend = sealed_audit_fixture(1, count, row_bytes);
+            let conn = backend.conn.blocking_lock();
+            SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+            assert!(assert_sealed_audit_matches_serial(
+                &conn,
+                "bounded full scan"
+            ));
+            let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+            assert!(stats.maximum_rows <= DURABLE_LOG_AUDIT_BATCH_ROWS);
+            assert!(stats.maximum_encoded_bytes <= DURABLE_LOG_AUDIT_BATCH_BYTES);
+            assert!(stats.maximum_workers <= DURABLE_LOG_AUDIT_WORKERS);
+            assert_eq!(stats.spawned_workers, stats.joined_workers);
+            if row_bytes == 0 {
+                assert_eq!(stats.maximum_rows, DURABLE_LOG_AUDIT_BATCH_ROWS);
+            } else {
+                assert_eq!(stats.maximum_encoded_bytes, DURABLE_LOG_AUDIT_BATCH_BYTES);
+            }
+        }
+        let backend = sealed_audit_fixture(1, 129, 0);
+        let conn = backend.conn.blocking_lock();
+        let mut wide = sealed_audit_fixture_row(65).encoded;
+        wide.extend(std::iter::repeat_n(' ', DURABLE_LOG_AUDIT_BATCH_BYTES + 1));
+        conn.execute(
+            "UPDATE session_replication_log SET entry_json = ?1 WHERE sequence = 65",
+            [wide],
+        )
+        .expect("legacy-compatible wide JSON with trailing whitespace");
+        SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+        assert!(assert_sealed_audit_matches_serial(
+            &conn,
+            "oversized legacy row"
+        ));
+        let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+        assert_eq!(stats.oversized_inline_rows, 1);
+        assert_eq!(stats.maximum_rows, 64);
+        assert!(stats.maximum_encoded_bytes < DURABLE_LOG_AUDIT_BATCH_BYTES);
+        assert_eq!(stats.spawned_workers, stats.joined_workers);
+        conn.execute(
+            "UPDATE session_replication_log SET tx_id = 'different' WHERE sequence = 65",
+            [],
+        )
+        .expect("corrupt wide row binding");
+        assert!(!assert_sealed_audit_matches_serial(
+            &conn,
+            "wide row remains fully checked"
+        ));
+    }
+
+    fn with_sealed_replication_audit_faults<T>(
+        faults: DurableLogAuditFaultsForTest,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(DurableLogAuditFaultsForTest);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SEALED_REPLICATION_AUDIT_FAULTS.with(|faults| faults.set(self.0));
+            }
+        }
+        let previous = SEALED_REPLICATION_AUDIT_FAULTS.with(|current| current.replace(faults));
+        let _reset = Reset(previous);
+        run()
+    }
+
+    #[test]
+    fn sealed_replication_audit_joins_workers_on_row_spawn_and_panic_failure() {
+        for (spawn_failure_worker, panic_worker, corrupt_first, expected_error, expected_workers) in [
+            (
+                Some(3),
+                None,
+                false,
+                "session replication audit worker spawn failed",
+                3,
+            ),
+            (
+                None,
+                Some(3),
+                false,
+                "session replication audit worker failed",
+                8,
+            ),
+            (
+                Some(5),
+                Some(2),
+                false,
+                "session replication audit worker failed",
+                5,
+            ),
+            (
+                Some(3),
+                None,
+                true,
+                "persisted session replication entry is invalid",
+                3,
+            ),
+            (
+                None,
+                Some(3),
+                true,
+                "persisted session replication entry is invalid",
+                8,
+            ),
+        ] {
+            let mut rows = (1..=128).map(sealed_audit_fixture_row).collect::<Vec<_>>();
+            if corrupt_first {
+                rows[0].encoded = "{".to_owned();
+            }
+            SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+            let error = with_sealed_replication_audit_faults(
+                DurableLogAuditFaultsForTest {
+                    spawn_failure_worker,
+                    panic_worker,
+                },
+                || validate_sealed_replication_audit_batch_with_parallelism(&rows, 1, 64),
+            )
+            .expect_err("no partial audit can be accepted");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected_error);
+            let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+            assert_eq!(stats.spawned_workers, expected_workers);
+            assert_eq!(stats.joined_workers, expected_workers);
+            assert_eq!(stats.maximum_workers, DURABLE_LOG_AUDIT_WORKERS);
+        }
+    }
+
+    #[test]
+    fn sealed_replication_audit_keeps_small_ranges_inline() {
+        let rows = vec![sealed_audit_fixture_row(1)];
+        SEALED_REPLICATION_AUDIT_STATS.with(|stats| stats.set(Default::default()));
+        let next = with_sealed_replication_audit_faults(
+            DurableLogAuditFaultsForTest {
+                spawn_failure_worker: Some(0),
+                panic_worker: Some(0),
+            },
+            || validate_sealed_replication_audit_batch_with_parallelism(&rows, 1, 64),
+        )
+        .expect("one row never starts a worker");
+        assert_eq!(next, 2);
+        let stats = SEALED_REPLICATION_AUDIT_STATS.with(std::cell::Cell::get);
+        assert_eq!(stats.spawned_workers, 0);
+        assert_eq!(stats.joined_workers, 0);
+    }
+
+    // Retain the original serial snapshot journal audit as an independent
+    // acceptance/error-order oracle for the bounded audit implementation.
+    fn sealed_replication_log_serial_reference(conn: &Connection) -> io::Result<()> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sequence, CASE WHEN typeof(tx_id) = 'text' \
+                 AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2 THEN tx_id END, \
+                 entry_json FROM session_replication_log ORDER BY sequence ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(
+                params![REPLICATION_TX_ID_MIN_BYTES, REPLICATION_TX_ID_MAX_BYTES],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(db_error)?;
+        let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+        for row in rows {
+            let (stored_sequence, stored_tx_id, encoded) = row.map_err(db_error)?;
+            let stored_sequence = checked_u64(stored_sequence)?;
+            let stored_tx_id: ReplicationTxId = stored_tx_id
+                .ok_or_else(|| {
+                    invalid_data("persisted session replication transaction ID is invalid")
+                })?
+                .try_into()
+                .map_err(|_| {
+                    invalid_data("persisted session replication transaction ID is invalid")
+                })?;
+            let entry: ReplicationEntry = serde_json::from_str(&encoded)
+                .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+            if stored_sequence != expected || entry.sequence != stored_sequence {
+                return Err(invalid_data(
+                    "persisted session replication log is not contiguous",
+                ));
+            }
+            if entry.tx_id != stored_tx_id {
+                return Err(invalid_data(
+                    "persisted session replication transaction ID is inconsistent",
+                ));
+            }
+            entry
+                .validate()
+                .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
+            validate_sealed_replication_op(&entry.op)?;
+            expected = expected
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
+        }
+        let observed_head = expected
+            .checked_sub(1)
+            .ok_or_else(|| invalid_data("session replication sequence underflow"))?;
+        if table_exists(conn, "consensus_machine").map_err(db_error)? {
+            let watch_sequence: i64 = conn
+                .query_row(
+                    "SELECT watch_sequence FROM consensus_machine WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if checked_u64(watch_sequence)? != observed_head {
+                return Err(invalid_data(
+                    "session replication cursor does not match the persisted log",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "release-profile private snapshot compaction diagnosis for SDK-741"]
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    fn private_snapshot_compaction_cost_diagnostic() {
+        use opc_sqlite_file_control_sys::{block_test_main_sync, install_test_main_sync_block_vfs};
+
+        let source_path = std::env::var_os("OPC_741_SNAPSHOT_AUDIT_SOURCE")
+            .expect("explicit immutable diagnostic snapshot source");
+        let root = std::env::var_os("OPC_741_COMPACTION_DIRECTORY")
+            .expect("explicit disk-backed diagnostic workspace");
+        install_test_main_sync_block_vfs().expect("register diagnostic sync observation VFS");
+        struct RestoreVfs(bool);
+        impl Drop for RestoreVfs {
+            fn drop(&mut self) {
+                SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.set(self.0));
+            }
+        }
+        let _restore =
+            RestoreVfs(SNAPSHOT_TEST_MAIN_SYNC_VFS.with(|enabled| enabled.replace(true)));
+        let directory =
+            tempfile::tempdir_in(root).expect("private compaction diagnostic directory");
+        for iteration in 0..3 {
+            let raw = create_pinned_snapshot_database(&directory.path().join("raw.sqlite"))
+                .expect("create owned raw snapshot descriptor");
+            let mut input = std::fs::File::open(&source_path).expect("read immutable source");
+            let mut output = raw.file();
+            let copied_bytes = io::copy(&mut input, &mut output).expect("copy to owned raw image");
+            raw.file()
+                .sync_all()
+                .expect("sync raw fixture before measurement");
+            let raw = raw
+                .refresh_identity()
+                .expect("pin copied raw content identity");
+            let compacted =
+                create_pinned_snapshot_database(&directory.path().join("compact.sqlite"))
+                    .expect("create owned empty compacted descriptor");
+            let mut syncs = block_test_main_sync();
+            syncs.release();
+            let started = Instant::now();
+            compact_pinned_snapshot_database_sync(&raw, &compacted)
+                .expect("run the actual private snapshot compactor");
+            let compact_elapsed = started.elapsed();
+            let main_syncs = syncs.main_sync_count();
+            let wal_syncs = syncs.wal_sync_count();
+            let sync_started = Instant::now();
+            compacted
+                .file()
+                .sync_all()
+                .expect("unchanged explicit final file sync");
+            let final_sync_elapsed = sync_started.elapsed();
+            let raw_connection = open_pinned_snapshot_database(&raw).expect("read raw schema");
+            let compacted_connection =
+                open_pinned_snapshot_database(&compacted).expect("read compacted schema");
+            assert_eq!(
+                schema_manifest_in_sync(&raw_connection, false).expect("full raw schema"),
+                schema_manifest_in_sync(&compacted_connection, false)
+                    .expect("full compacted schema")
+            );
+            validate_sealed_state_sync(&compacted_connection)
+                .expect("full compacted row validation");
+            let journal_rows: i64 = compacted_connection
+                .query_row("SELECT count(*) FROM session_replication_log", [], |row| {
+                    row.get(0)
+                })
+                .expect("count copied journal rows");
+            eprintln!(
+                "sdk-741 private compaction: iteration={iteration} source_bytes={copied_bytes} output_bytes={} journal_rows={journal_rows} compaction_us={} main_syncs={main_syncs} wal_syncs={wal_syncs} explicit_final_sync_us={}",
+                compacted.file().metadata().expect("output length").len(),
+                compact_elapsed.as_micros(),
+                final_sync_elapsed.as_micros(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-profile read-only sealed snapshot audit diagnosis for SDK-741"]
+    fn sealed_snapshot_replication_audit_cost_diagnostic() {
+        let path = std::env::var_os("OPC_741_SNAPSHOT_AUDIT_SOURCE")
+            .expect("explicit immutable qualification snapshot fixture");
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open immutable snapshot read-only");
+        let (rows, encoded_bytes, maximum_row_bytes): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(entry_json AS BLOB))), 0), \
+                 COALESCE(MAX(length(CAST(entry_json AS BLOB))), 0) \
+                 FROM session_replication_log",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("count the bounded fixture dimensions");
+        for iteration in 0..3 {
+            let started = Instant::now();
+            validate_sealed_state_sync(&conn).expect("full current sealed-state validation");
+            let full_us = started.elapsed().as_micros();
+            let started = Instant::now();
+            sealed_replication_log_serial_reference(&conn)
+                .expect("original full typed serial replication validation");
+            let serial_replication_us = started.elapsed().as_micros();
+            eprintln!(
+                "sdk-741 sealed snapshot component: iteration={iteration} rows={rows} \
+                 encoded_bytes={encoded_bytes} maximum_row_bytes={maximum_row_bytes} \
+                 full_us={full_us} serial_replication_us={serial_replication_us}",
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_v2_batch_validation_matches_complete_structural_audit() {
+        fn strict_v2_json_reference(
+            bytes: &[u8],
+            entry: &Entry<SessionRaftTypeConfig>,
+        ) -> io::Result<()> {
+            let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+            let audited =
+                <ExactFencedTransitionV2Json as serde::Deserialize>::deserialize(&mut deserializer)
+                    .map_err(|_| {
+                        invalid_data("session consensus V2 log entry schema is invalid")
+                    })?;
+            deserializer
+                .end()
+                .map_err(|_| invalid_data("session consensus V2 log entry schema is invalid"))?;
+            let canonical = encode_json(entry)
+                .map_err(|_| invalid_data("session consensus V2 log entry encoding failed"))?;
+            // The visitor checks every nested object for duplicates; canonical bytes
+            // remain the authority for the exact schema, ordering and scalar values.
+            if audited.has_duplicate_key
+                || !audited.contains_v2_discriminant
+                || bytes != canonical.as_slice()
+            {
+                return Err(invalid_data(
+                    "session consensus V2 log entry schema is invalid",
+                ));
+            }
+            Ok(())
+        }
+
+        for count in [0_usize, 1, 8] {
+            let mut direct = fenced_transition_v2_batch_entry(
+                1,
+                (0..count.max(1))
+                    .map(|nonce| {
+                        fenced_transition_v2_request(nonce as u8 + 1, 1, "canonical-batch-schema")
+                    })
+                    .collect(),
+                timestamp(1),
+            );
+            if count == 0 {
+                let EntryPayload::Normal(command) = &mut direct.payload else {
+                    panic!("normal batch fixture");
+                };
+                // Durable decoding has always accepted this typed shape;
+                // semantic admission separately rejects an empty batch.
+                command.intent = SessionMutationIntent::FencedTransitionV2Batch(Vec::new());
+            }
+            let mut authorized = direct.clone();
+            let EntryPayload::Normal(command) = &mut authorized.payload else {
+                panic!("batch fixture must contain a normal command");
+            };
+            command.intent = SessionMutationIntent::Authorized {
+                origin: node_id(),
+                authority_identity: identity(),
+                mutation: Box::new(command.intent.clone()),
+            };
+            for entry in [direct, authorized] {
+                let canonical = encode_json(&entry).expect("encode exact batch shape");
+                strict_v2_json_reference(&canonical, &entry).expect("old full structural audit");
+                assert_eq!(
+                    decode_consensus_log_entry(&canonical).expect("full typed canonical row"),
+                    entry
+                );
+
+                // Splice fields at every object, retaining all existing byte
+                // order. This includes objects whose derived decoder ignores
+                // unknown fields, so typed decoding alone cannot pass this
+                // regression by accident.
+                for (offset, byte) in canonical.iter().enumerate() {
+                    if *byte != b'{' {
+                        continue;
+                    }
+                    for extra in [
+                        br#""future":null,"#.as_slice(),
+                        br#""future":{"x":1,"x":2},"#.as_slice(),
+                        br#""future":{"\u0046encedTransitionV2":null},"#.as_slice(),
+                    ] {
+                        let mut hostile = canonical[..=offset].to_vec();
+                        hostile.extend_from_slice(extra);
+                        hostile.extend_from_slice(&canonical[offset + 1..]);
+                        assert!(strict_v2_json_reference(&hostile, &entry).is_err());
+                        assert!(decode_consensus_log_entry(&hostile).is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_v2_json_traversal_preserves_nested_duplicate_and_discriminant_evidence() {
+        for (encoded, duplicate, v2) in [
+            (r#"{"a":[{"x":1},{"x":2}]}"#, false, false),
+            (r#"{"a":[{"x":1,"x":2}]}"#, true, false),
+            (r#"{"a":[{"x":1,"\u0078":2}]}"#, true, false),
+            (
+                r#"{"a":[{"x":1,"x":2},{"FencedTransitionV2":null}]}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"a":[{"\u0046encedTransitionV2":null},{"x":1,"x":2}]}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"a":[{"FinalizeOperatorRecoveryV2":null}]}"#,
+                false,
+                true,
+            ),
+            (
+                r#"{"a":["FencedTransitionV2",null,true,1,1.5]}"#,
+                false,
+                false,
+            ),
+        ] {
+            let audit: ExactFencedTransitionV2Json =
+                serde_json::from_str(encoded).expect("complete JSON traversal");
+            assert_eq!(audit.has_duplicate_key, duplicate);
+            assert_eq!(audit.contains_v2_discriminant, v2);
+        }
+        for malformed in [
+            r#"{"FencedTransitionV2":null}{}"#,
+            r#"{"FencedTransitionV2":null,"a":[0,]}"#,
+            r#"{"FencedTransitionV2":null,"a":1e999}"#,
+        ] {
+            assert!(serde_json::from_str::<ExactFencedTransitionV2Json>(malformed).is_err());
+        }
+    }
+
+    #[test]
     fn durable_v2_log_decoder_requires_canonical_bytes_for_every_exact_intent_shape() {
         let request = fenced_transition_v2_request(0x91, 1, "v2-json-owner");
         let initial_epoch =
@@ -64578,6 +68991,71 @@ BEGIN IMMEDIATE;
         assert_eq!(
             decode_consensus_log_entry(escaped_hidden.as_bytes())
                 .expect_err("JSON escaping cannot hide a V2 discriminant")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn durable_log_decoder_finds_hidden_v2_after_unicode_and_partial_stems() {
+        let entry = acquire_entry(1, [0x97; 16], "legacy-v2-search-owner");
+        let canonical = encode_json(&entry).expect("canonical legacy JSON");
+        for padding in [0, 1, 15, 16, 17, 31, 32, 33, 127, 128, 129, 1024] {
+            // Exercise substring boundaries after multibyte UTF-8 and many
+            // partial matches. Ordinary ignored values remain compatible.
+            let noise = "é🦀FencedTransitionVFinalizeOperatorRecovery".repeat(padding);
+            for discriminant in [
+                "FencedTransitionV2",
+                "ActivateFencedTransitionV2",
+                "MaintainFencedTransitionV2History",
+                "FencedTransitionV2Batch",
+                "FinalizeOperatorRecoveryV2",
+            ] {
+                let compatible = format!(
+                    "{{\"noise\":\"{noise}{discriminant}\",{}",
+                    std::str::from_utf8(&canonical[1..]).expect("canonical object tail")
+                );
+                assert_eq!(
+                    decode_consensus_log_entry(compatible.as_bytes())
+                        .expect("V2 text in an ignored string is ordinary legacy data"),
+                    entry,
+                );
+                for key in [
+                    discriminant.to_owned(),
+                    format!(
+                        "\\u{:04x}{}",
+                        u32::from(discriminant.as_bytes()[0]),
+                        &discriminant[1..]
+                    ),
+                ] {
+                    let hidden = format!(
+                        "{{\"noise\":\"{noise}\",\"future\":[{{\"{key}\":null}}],{}",
+                        std::str::from_utf8(&canonical[1..]).expect("canonical object tail")
+                    );
+                    assert_eq!(
+                        decode_json::<Entry<SessionRaftTypeConfig>>(hidden.as_bytes())
+                            .expect("typed decoder alone ignores the hostile outer field"),
+                        entry,
+                    );
+                    assert_eq!(
+                        decode_consensus_log_entry(hidden.as_bytes())
+                            .expect_err("full durable decoder must reject hidden V2")
+                            .kind(),
+                        io::ErrorKind::InvalidData,
+                        "padding={padding} key={key}",
+                    );
+                }
+            }
+        }
+        let owner_offset = canonical
+            .windows(b"legacy-v2-search-owner".len())
+            .position(|window| window == b"legacy-v2-search-owner")
+            .expect("the typed owner string is present");
+        let mut invalid_utf8 = canonical.clone();
+        invalid_utf8[owner_offset] = 0xff;
+        assert_eq!(
+            decode_consensus_log_entry(&invalid_utf8)
+                .expect_err("the prescan cannot bypass typed UTF-8 validation")
                 .kind(),
             io::ErrorKind::InvalidData,
         );

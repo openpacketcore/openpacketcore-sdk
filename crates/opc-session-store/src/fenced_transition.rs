@@ -1456,6 +1456,59 @@ pub struct FencedTransitionV2Request {
 }
 
 impl FencedTransitionV2Request {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_for_native_read(&self) -> std::io::Result<Self> {
+        // The original durable-log decoder has already admitted the complete
+        // row. Preserve even a conflicting body/ID exactly: from_parts would
+        // run business validation and change that existing log vocabulary.
+        Ok(Self {
+            request_id: self.request_id,
+            lease: crate::consensus::native::owned::transition_lease(&self.lease)?,
+            mutation: crate::consensus::native::owned::transition_mutation(&self.mutation)?,
+        })
+    }
+
+    pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
+        let lease = match &self.lease {
+            FencedTransitionLease::Acquire { key, owner, .. } => key
+                .log_row_reuse_allocation_bytes()?
+                .checked_add(owner.allocation_capacity())?,
+            FencedTransitionLease::Renew { lease, .. } => lease.log_row_reuse_allocation_bytes()?,
+        };
+        match &self.mutation {
+            FencedTransitionMutation::Create { record }
+            | FencedTransitionMutation::Update { record, .. } => lease
+                .checked_add(std::mem::size_of::<StoredSessionRecord>())?
+                .checked_add(record.key.log_row_reuse_allocation_bytes()?)?
+                .checked_add(record.owner.allocation_capacity())?
+                .checked_add(record.state_type.allocation_capacity())?
+                // Sharing is deliberately charged per occurrence; no uniqueness
+                // assumption or payload clone is needed for this upper bound.
+                .checked_add(record.payload.log_row_reuse_allocation_bytes()?),
+            FencedTransitionMutation::Delete { .. }
+            | FencedTransitionMutation::RefreshTtl { .. } => Some(lease),
+        }
+    }
+
+    pub(crate) fn normalize_log_row_reuse_backing(&mut self) {
+        match &mut self.lease {
+            FencedTransitionLease::Acquire { key, .. } => {
+                key.normalize_log_row_reuse_backing();
+            }
+            FencedTransitionLease::Renew { lease, .. } => {
+                lease.normalize_log_row_reuse_backing();
+            }
+        }
+        match &mut self.mutation {
+            FencedTransitionMutation::Create { record }
+            | FencedTransitionMutation::Update { record, .. } => {
+                record.key.normalize_log_row_reuse_backing();
+            }
+            FencedTransitionMutation::Delete { .. }
+            | FencedTransitionMutation::RefreshTtl { .. } => {}
+        }
+    }
+
     /// Construct a new self-authenticating V2 request.
     ///
     /// Reusing the same `epoch` and `nonce` with the same lease and mutation
@@ -1881,9 +1934,16 @@ impl fmt::Debug for FencedTransitionV2Request {
 /// has no negotiable history-limit fields: two implementations advertising
 /// [`FencedTransitionV2Capability::V2`] must report the same digest.
 pub fn fenced_transition_v2_profile_digest() -> [u8; FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES] {
-    fenced_transition_v2_profile_digest_with_retention_inputs(
-        FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
-    )
+    // Every input is an immutable protocol constant. Receipt validation still
+    // authenticates each row; rehashing these same descriptors for every row
+    // only repeats the construction of the protocol's fixed domain separator.
+    static DIGEST: std::sync::OnceLock<[u8; FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES]> =
+        std::sync::OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        fenced_transition_v2_profile_digest_with_retention_inputs(
+            FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -4621,6 +4681,12 @@ mod tests {
                         + FENCED_TRANSITION_V2_RECLAIM_BATCH
             );
         }
+        assert_eq!(
+            fenced_transition_v2_profile_digest(),
+            fenced_transition_v2_profile_digest_with_retention_inputs(
+                FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
+            ),
+        );
         assert_eq!(
             fenced_transition_v2_profile_digest(),
             [

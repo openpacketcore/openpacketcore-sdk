@@ -381,7 +381,7 @@ async fn test_task_fails_twice_then_succeeds() {
     assert_eq!(readiness, Readiness::Ready);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_task_exhausts_max_restarts() {
     let profile = make_profile();
     let shutdown = ShutdownToken::new();
@@ -417,7 +417,9 @@ async fn test_task_exhausts_max_restarts() {
         .await
         .unwrap();
 
-    // Give it time to run, fail, retry up to max_restarts (2) and exhaust budget (total 3 attempts)
+    // Let both backoffs complete within the original observation window.
+    // Paused Tokio time prevents host descheduling from consuming this window
+    // before the supervisor can execute its two allowed restarts.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Verify task ran 3 times (1 initial run + 2 restarts)

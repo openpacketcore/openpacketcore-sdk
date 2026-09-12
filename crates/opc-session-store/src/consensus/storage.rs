@@ -43,8 +43,8 @@ use super::snapshot::{
     pending_snapshot_namespace_recovery_authority, PendingSnapshotNamespaceRecoveryAuthority,
 };
 use super::{
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
-    SessionTopologyMemberBinding, SnapshotIntegrityPolicy,
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionPersistenceMode,
+    SessionRaftTypeConfig, SessionTopologyMemberBinding, SnapshotIntegrityPolicy,
 };
 use crate::backend::ReplicationEntry;
 use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
@@ -322,14 +322,14 @@ fn snapshot_install_applied_progress_gates(
 }
 
 #[cfg(test)]
-struct SnapshotInstallAppliedProgressGateGuard {
+pub(crate) struct SnapshotInstallAppliedProgressGateGuard {
     directory: PathBuf,
     gate: Arc<SnapshotArtifactGate>,
 }
 
 #[cfg(test)]
 impl SnapshotInstallAppliedProgressGateGuard {
-    fn install(directory: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
+    pub(crate) fn install(directory: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
         snapshot_install_applied_progress_gates()
             .lock()
             .expect("install snapshot applied-progress gate")
@@ -1852,14 +1852,33 @@ fn fixed_install_source_copy_gates(
 }
 
 #[cfg(all(test, target_os = "linux"))]
-struct FixedInstallSourceCopyGateGuard {
+pub(crate) struct FixedInstallSourceCopyGateGuard {
     snapshot_directory: PathBuf,
     gate: std::sync::Arc<SnapshotArtifactGate>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
 impl FixedInstallSourceCopyGateGuard {
-    fn install(snapshot_directory: PathBuf, gate: std::sync::Arc<SnapshotArtifactGate>) -> Self {
+    pub(crate) fn for_live_directory(directory: &Path, gate: Arc<SnapshotArtifactGate>) -> Self {
+        let canonical =
+            std::fs::canonicalize(directory).expect("canonical live snapshot directory");
+        let lease = snapshot_directory_leases()
+            .lock()
+            .unwrap()
+            .get(&canonical)
+            .and_then(std::sync::Weak::upgrade)
+            .expect("live snapshot directory lease");
+        let path = lease
+            .namespace
+            .sqlite_child_path(std::ffi::OsStr::new("snapshot-test-hook"))
+            .expect("retained snapshot namespace hook");
+        Self::install(path.parent().unwrap().to_path_buf(), gate)
+    }
+
+    pub(crate) fn install(
+        snapshot_directory: PathBuf,
+        gate: std::sync::Arc<SnapshotArtifactGate>,
+    ) -> Self {
         fixed_install_source_copy_gates()
             .lock()
             .expect("set fixed install source-copy gate")
@@ -2104,11 +2123,70 @@ async fn wait_before_fixed_snapshot_return(final_path: &Path) {
     }
 }
 
+/// Hold a serving caller after it has opened its selected descriptor, before
+/// admission. A builder must not retire that inode during this interval.
+#[cfg(test)]
+fn current_snapshot_admission_gates(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct CurrentSnapshotAdmissionGateGuard {
+    path: PathBuf,
+    gate: Arc<SnapshotArtifactGate>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl CurrentSnapshotAdmissionGateGuard {
+    fn install(path: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
+        current_snapshot_admission_gates()
+            .lock()
+            .expect("install current snapshot admission gate")
+            .insert(path.clone(), Arc::clone(&gate));
+        Self { path, gate }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for CurrentSnapshotAdmissionGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut gates = current_snapshot_admission_gates()
+            .lock()
+            .expect("remove current snapshot admission gate");
+        if gates
+            .get(&self.path)
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.gate))
+        {
+            gates.remove(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_before_current_snapshot_admission(path: &Path) {
+    let gate = current_snapshot_admission_gates()
+        .lock()
+        .expect("find current snapshot admission gate")
+        .get(path)
+        .cloned();
+    if let Some(gate) = gate {
+        gate.block_if_armed().await;
+    }
+}
+
 /// Fail-closed errors emitted while binding an existing SQLite database to a
 /// durable consensus identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SessionConsensusStorageError {
+    /// An existing native root selected a different acknowledgement policy.
+    #[error("session consensus persistence mode does not match this storage root")]
+    PersistenceModeMismatch,
     /// The explicitly required snapshot integrity capability is unavailable.
     #[error("required session consensus snapshot integrity is unavailable")]
     SnapshotIntegrityUnavailable,
@@ -2225,7 +2303,7 @@ async fn seal_snapshot_pin(
         let _retention = retention;
         pinned.seal_with_integrity(policy)?;
         if let Some(checksum) = expected_payload_checksum {
-            pinned.verify_payload_checksum(checksum)?;
+            pinned.verify_and_bind_payload_checksum(checksum)?;
         }
         Ok(pinned)
     })
@@ -2273,8 +2351,10 @@ async fn verify_admitted_snapshot(
     policy: SnapshotIntegrityPolicy,
     checksum: [u8; 32],
     length: u64,
+    retention: Option<SnapshotIntegrityWork>,
 ) -> io::Result<PinnedSqliteFile> {
     tokio::task::spawn_blocking(move || {
+        let _retention = retention;
         let path = lease.namespace.sqlite_child_path(&name)?;
         let mut pinned = PinnedSqliteFile::from_file_and_verify_in_namespace(
             file,
@@ -2295,6 +2375,163 @@ async fn verify_admitted_snapshot(
     })
     .await
     .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
+}
+
+#[cfg(target_os = "linux")]
+struct WalSnapshotAdmissions {
+    pins: Vec<(consensus::CurrentSnapshot, PinnedSqliteFile, PathBuf, u64)>,
+    installation: Option<(
+        consensus::wal::snapshot::InstallSource,
+        UnpublishedSnapshotArtifact,
+    )>,
+}
+
+#[cfg(target_os = "linux")]
+impl WalSnapshotAdmissions {
+    fn verify(&self) -> io::Result<()> {
+        for (_, pin, path, length) in &self.pins {
+            pin.verify_bound_immutable_snapshot_envelope(path, *length)?;
+        }
+        if let Some((source, _)) = &self.installation {
+            source.verify()?;
+        }
+        Ok(())
+    }
+    fn install_source(&self) -> Option<&consensus::wal::snapshot::InstallSource> {
+        self.installation.as_ref().map(|(source, _)| source)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn admit_wal_snapshots(
+    snapshots: Vec<consensus::CurrentSnapshot>,
+    install_candidate: Option<consensus::CurrentSnapshot>,
+    lease: Arc<SnapshotDirectoryLease>,
+    policy: SnapshotIntegrityPolicy,
+) -> io::Result<WalSnapshotAdmissions> {
+    let mut pins = Vec::with_capacity(snapshots.len());
+    for candidate in snapshots {
+        let (_, name, checksum, length) = &candidate;
+        let name = std::ffi::OsString::from(name);
+        let path = lease.namespace.sqlite_child_path(&name)?;
+        let file =
+            open_snapshot_child_in_namespace(Arc::clone(&lease.namespace), name.clone()).await?;
+        let pin = verify_admitted_snapshot(
+            file,
+            Arc::clone(&lease),
+            name,
+            policy,
+            *checksum,
+            *length,
+            None,
+        )
+        .await?;
+        let length = *length;
+        pins.push((candidate, pin, path, length));
+    }
+    let installation = if let Some(candidate) = install_candidate {
+        let (_, pin, path, _) = pins
+            .iter()
+            .find(|(snapshot, _, _, _)| *snapshot == candidate)
+            .ok_or_else(|| consensus::invalid_data("private WAL install envelope is missing"))?;
+        Some(
+            derive_private_wal_install_source(
+                candidate,
+                pin.try_clone()?,
+                path.clone(),
+                Arc::clone(&lease),
+                policy,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(WalSnapshotAdmissions { pins, installation })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+async fn attach_private_wal_before_snapshot_cleanup(
+    core: &mut SqliteConsensusCore,
+    test: &consensus::wal::integration::PrivateWalTest,
+    lease: Arc<SnapshotDirectoryLease>,
+) -> io::Result<()> {
+    let policy = core.snapshot_integrity;
+    test.attach_with_descriptors(
+        core,
+        |snapshots, install| admit_wal_snapshots(snapshots, install, lease, policy),
+        WalSnapshotAdmissions::verify,
+        WalSnapshotAdmissions::install_source,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn attach_native_wal_before_snapshot_cleanup(
+    core: &mut SqliteConsensusCore,
+    owner: &consensus::wal::owner::NativeOwner,
+    lease: Arc<SnapshotDirectoryLease>,
+    persistence: SessionPersistenceMode,
+) -> io::Result<()> {
+    let policy = core.snapshot_integrity;
+    owner
+        .attach_with_descriptors(
+            core,
+            persistence,
+            |snapshots, install| admit_wal_snapshots(snapshots, install, lease, policy),
+            WalSnapshotAdmissions::verify,
+            WalSnapshotAdmissions::install_source,
+        )
+        .await
+}
+
+#[cfg(target_os = "linux")]
+async fn derive_private_wal_install_source(
+    candidate: consensus::CurrentSnapshot,
+    published: PinnedSqliteFile,
+    published_path: PathBuf,
+    lease: Arc<SnapshotDirectoryLease>,
+    policy: SnapshotIntegrityPolicy,
+) -> io::Result<(
+    consensus::wal::snapshot::InstallSource,
+    UnpublishedSnapshotArtifact,
+)> {
+    // Admission may create one bounded private derivative, but cannot
+    // scavenge any authority before the complete install replay succeeds.
+    let entries = lease.namespace.entries(SNAPSHOT_DIRECTORY_MAX_ENTRIES)?;
+    reserve_snapshot_directory_entries(entries.len(), SNAPSHOT_FIXED_INSTALL_RESERVATION_ENTRIES)
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    published.verify_bound_immutable_snapshot_envelope(&published_path, candidate.3)?;
+    let payload_length = candidate
+        .3
+        .checked_sub(SNAPSHOT_ENVELOPE_FOOTER_BYTES)
+        .ok_or_else(|| consensus::invalid_data("private WAL install envelope extent differs"))?;
+    let mut reader =
+        SessionSnapshotFile::from_pinned(published.try_clone()?, published_path.clone()).await?;
+    let name = std::ffi::OsString::from(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
+    let raw = extract_snapshot_database_from_reader_in_namespace(
+        &mut reader,
+        Arc::clone(&lease.namespace),
+        &name,
+        payload_length,
+        candidate.2,
+    )
+    .await?;
+    let raw_pin = raw.pin_readonly_from_writer()?;
+    let (file, cleanup) = raw.into_file_with_cleanup();
+    let cleanup = cleanup.ok_or_else(|| {
+        consensus::invalid_data("private WAL install derivative cleanup is missing")
+    })?;
+    file.sync_all()?;
+    drop(file);
+    let raw_pin = seal_snapshot_pin(raw_pin, policy, Some(candidate.2), None).await?;
+    let source = consensus::wal::snapshot::InstallSource::new(
+        candidate,
+        raw_pin,
+        published,
+        published_path,
+    )?;
+    Ok((source, cleanup))
 }
 
 impl LiveTerminalRecoveryHandoffConsumer {
@@ -2360,6 +2597,10 @@ impl LiveTerminalRecoveryHandoffConsumer {
     async fn probe_live_recovery_handoff(
         &self,
     ) -> Result<consensus::LiveTerminalRecoveryHandoffProbe, SessionConsensusStorageError> {
+        #[cfg(target_os = "linux")]
+        if let Some(probe) = self.core.native_recovery_probe() {
+            return probe.map_err(|_| SessionConsensusStorageError::CorruptState);
+        }
         let database = self
             .core
             .database_file
@@ -2367,7 +2608,12 @@ impl LiveTerminalRecoveryHandoffConsumer {
             .map(|file| file.path())
             .ok_or(SessionConsensusStorageError::CorruptState)?;
         let conn = self.core.conn.lock().await;
-        consensus::probe_live_terminal_recovery_handoff_with_connection_sync(database, &conn)
+        self.core
+            .with_application_cache_read(&conn, || {
+                consensus::probe_live_terminal_recovery_handoff_with_connection_sync(
+                    database, &conn,
+                )
+            })
             .map_err(|_| SessionConsensusStorageError::CorruptState)
     }
 
@@ -2377,6 +2623,12 @@ impl LiveTerminalRecoveryHandoffConsumer {
         &self,
         gate: &LiveTerminalRecoveryHandoffGate,
     ) -> Result<LiveTerminalRecoveryHandoffState, SessionConsensusStorageError> {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.core.private_wal.as_ref() {
+            let conn = self.core.conn.lock().await;
+            wal.validate_application_cache(&conn)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        }
         if !Arc::ptr_eq(&self.core.snapshot_gate, &gate.snapshot_gate) {
             return Err(SessionConsensusStorageError::CorruptState);
         }
@@ -2394,7 +2646,8 @@ impl LiveTerminalRecoveryHandoffConsumer {
 
         let current = {
             let conn = self.core.conn.lock().await;
-            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
+            self.core
+                .read_selected_snapshot(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?
         };
         let admitted_current_file = match current.as_ref() {
@@ -2461,7 +2714,8 @@ impl LiveTerminalRecoveryHandoffConsumer {
             if core.terminal_recovery_handoff_pending()? {
                 return Err(SessionConsensusStorageError::BackendUnavailable);
             }
-            let current = consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+            let current = core
+                .read_selected_snapshot(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
             let (selected_name, admitted_snapshot_file) = match current {
                 Some((_, file_name, _, _)) => {
@@ -2540,6 +2794,32 @@ impl SqliteConsensusLogStore {
 struct ConsensusStorageShutdownCompletion {
     active_owners: AtomicUsize,
     notify: tokio::sync::Notify,
+    #[cfg(target_os = "linux")]
+    snapshot_shutdown: AtomicBool,
+    runtime_write_handoff: AtomicBool,
+    runtime_write_handoff_pending: AtomicBool,
+}
+
+// Shared by all stores and runtimes in this SDK instance, including closed
+// stores whose scheduler jobs have not retired. Each admission can queue at
+// most one replacement worker and one completion marker. This cap bounds those
+// jobs independently of store churn; exhaustion keeps the existing inline path.
+const MAX_RUNTIME_WRITE_HANDOFFS: usize = 64;
+static RUNTIME_WRITE_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
+
+// This unique admission deliberately has no Drop refund. A lost or cancelled
+// marker cannot prove that its replacement worker left the runtime queue.
+struct RuntimeWriteHandoff {
+    completion: Arc<ConsensusStorageShutdownCompletion>,
+}
+
+impl RuntimeWriteHandoff {
+    fn complete(self) {
+        RUNTIME_WRITE_HANDOFFS.fetch_sub(1, Ordering::AcqRel);
+        self.completion
+            .runtime_write_handoff_pending
+            .store(false, Ordering::Release);
+    }
 }
 
 /// Observation that every Openraft-owned SQLite storage handle has exited.
@@ -2547,6 +2827,21 @@ struct ConsensusStorageShutdownCompletion {
 pub(crate) struct ConsensusStorageShutdownObserver(Arc<ConsensusStorageShutdownCompletion>);
 
 impl ConsensusStorageShutdownObserver {
+    /// Raft's core has exited, so an unfinished native export can retire its
+    /// private staging image. The observer still waits for every real owner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stop_native_snapshot_exports(&self) {
+        self.0.snapshot_shutdown.store(true, Ordering::Release);
+    }
+
+    /// Enable scheduler handoff only after `Raft::new` has finished recovery
+    /// and moved both write handles into its Tokio-spawned engine tasks.
+    /// Startup itself may run on the caller's LocalSet, where block_in_place
+    /// is forbidden even when the underlying runtime is multi-threaded.
+    pub(crate) fn enable_runtime_write_handoff(&self) {
+        self.0.runtime_write_handoff.store(true, Ordering::Release);
+    }
+
     pub(crate) async fn wait(&self) {
         loop {
             if self.0.active_owners.load(Ordering::Acquire) == 0 {
@@ -2570,11 +2865,49 @@ impl ConsensusStorageShutdownGuard {
         Self(Some(Arc::new(ConsensusStorageShutdownCompletion {
             active_owners: AtomicUsize::new(1),
             notify: tokio::sync::Notify::new(),
+            #[cfg(target_os = "linux")]
+            snapshot_shutdown: AtomicBool::new(false),
+            runtime_write_handoff: AtomicBool::new(false),
+            runtime_write_handoff_pending: AtomicBool::new(false),
         })))
     }
 
     const fn detached() -> Self {
         Self(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_shutdown_requested(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|completion| completion.snapshot_shutdown.load(Ordering::Acquire))
+    }
+
+    fn try_admit_runtime_write_handoff(&self) -> Option<RuntimeWriteHandoff> {
+        let completion = self.0.as_ref()?;
+        if !completion.runtime_write_handoff.load(Ordering::Acquire) {
+            return None;
+        }
+        completion
+            .runtime_write_handoff_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        if RUNTIME_WRITE_HANDOFFS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < MAX_RUNTIME_WRITE_HANDOFFS).then(|| admitted + 1)
+            })
+            .is_err()
+        {
+            // No scheduler job has been submitted for this reservation, so
+            // only this failed admission may release its tracker immediately.
+            completion
+                .runtime_write_handoff_pending
+                .store(false, Ordering::Release);
+            return None;
+        }
+        Some(RuntimeWriteHandoff {
+            completion: Arc::clone(completion),
+        })
     }
 
     fn observer(&self) -> Option<ConsensusStorageShutdownObserver> {
@@ -2622,6 +2955,11 @@ impl SqliteConsensusLogStore {
 
     pub(crate) fn consensus_log_prune_lane(&self) -> Option<Arc<consensus::ConsensusLogPruneLane>> {
         self.core.consensus_log_prune_lane()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn private_wal(&self) -> Option<Arc<consensus::wal::Wal>> {
+        self.core.private_wal.clone()
     }
 }
 
@@ -2785,6 +3123,7 @@ pub(crate) async fn open_with_member_bindings(
         None,
         None,
         SnapshotIntegrityPolicy::FsVerity,
+        SessionPersistenceMode::Durable,
     )
     .await
 }
@@ -2820,11 +3159,13 @@ pub(crate) async fn open_with_member_bindings_and_roster_attestation_root(
         None,
         roster_attestation_trust_root,
         SnapshotIntegrityPolicy::FsVerity,
+        SessionPersistenceMode::Durable,
     )
     .await
 }
 
 /// Fixed-quorum counterpart that persists the immutable roster root.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
     backend: &SqliteSessionBackend,
@@ -2844,6 +3185,41 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
     ),
     SessionConsensusStorageError,
 > {
+    open_fixed_with_persistence_and_roster_attestation_root(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        placement_policy,
+        roster_attestation_trust_root,
+        snapshot_integrity,
+        SessionPersistenceMode::Durable,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_fixed_with_persistence_and_roster_attestation_root(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    placement_policy: PlacementResiliencePolicy,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    snapshot_integrity: SnapshotIntegrityPolicy,
+    persistence: SessionPersistenceMode,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
     open_with_member_bindings_for_profile(
         backend,
         snapshot_dir,
@@ -2855,6 +3231,7 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
         Some(placement_policy),
         roster_attestation_trust_root,
         snapshot_integrity,
+        persistence,
     )
     .await
 }
@@ -2904,6 +3281,7 @@ async fn open_with_member_bindings_for_profile(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     snapshot_integrity: SnapshotIntegrityPolicy,
+    persistence: SessionPersistenceMode,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -2912,6 +3290,19 @@ async fn open_with_member_bindings_for_profile(
     ),
     SessionConsensusStorageError,
 > {
+    if persistence == SessionPersistenceMode::Async
+        && authority_profile != ConsensusAuthorityProfile::FixedImmutable
+    {
+        return Err(SessionConsensusStorageError::PersistenceModeMismatch);
+    }
+    // Reject an existing mode mismatch before initialization, filesystem
+    // probes, or cleanup can mutate either storage namespace.
+    #[cfg(target_os = "linux")]
+    if let Some(selected) = backend.native_persistence_preflight(identity).await? {
+        if selected != persistence {
+            return Err(SessionConsensusStorageError::PersistenceModeMismatch);
+        }
+    }
     let snapshot_dir = snapshot_dir.into();
     let snapshot_directory_lease = acquire_snapshot_directory_lease(backend, &snapshot_dir)
         .await
@@ -2922,6 +3313,29 @@ async fn open_with_member_bindings_for_profile(
         preflight_fs_verity(Arc::clone(&snapshot_directory_lease)).await?;
     }
     run_snapshot_directory_admission_test_hook(&snapshot_directory_lease.canonical_directory);
+    #[cfg(target_os = "linux")]
+    let native_owner = {
+        #[cfg(test)]
+        let private_fixture = backend.private_wal_test.is_some();
+        #[cfg(not(test))]
+        let private_fixture = false;
+        if private_fixture {
+            None
+        } else if let Some(owner) = &backend.native_owner {
+            if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                owner.select();
+                Some(Arc::clone(owner))
+            } else if owner.selected() {
+                // Preflight already verified this selected fixed native
+                // root. A dynamic opener requests another authority profile.
+                return Err(SessionConsensusStorageError::IdentityMismatch);
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
     let mut core = SqliteConsensusCore::initialize_with_roster_attestation_root_with_admitted_snapshot_directory(
         backend,
         snapshot_directory_lease.canonical_directory.clone(),
@@ -2934,6 +3348,27 @@ async fn open_with_member_bindings_for_profile(
     )
     .await?;
     core.snapshot_integrity = snapshot_integrity;
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = native_owner {
+        attach_native_wal_before_snapshot_cleanup(
+            &mut core,
+            &owner,
+            Arc::clone(&snapshot_directory_lease),
+            persistence,
+        )
+        .await
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(test) = backend.private_wal_test.as_ref() {
+        attach_private_wal_before_snapshot_cleanup(
+            &mut core,
+            test,
+            Arc::clone(&snapshot_directory_lease),
+        )
+        .await
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    }
     // Validate the selected legacy descriptor before constructing a successor.
     // The compatibility branch accepts only the journal-bound `measure(2)`
     // ENODATA result and never reads the old payload.  Running this after a
@@ -2988,11 +3423,12 @@ async fn reseed_legacy_fixed_snapshot_from_authoritative_database(
     }
     let should_reseed = {
         let conn = core.conn.lock().await;
-        let current = consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+        let current = core
+            .read_selected_snapshot(&conn)
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-        let reseed =
-            consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, core.storage_identity)
-                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        let reseed = core
+            .read_selected_legacy_reseed(&conn)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
         match (reseed.as_ref(), current.as_ref()) {
             (Some(reseed), Some(current)) => reseed
                 .matches_current(core.storage_identity, current)
@@ -3103,6 +3539,10 @@ pub(crate) async fn open_with_pending_membership_and_roster_attestation_root(
     ),
     SessionConsensusStorageError,
 > {
+    #[cfg(all(test, target_os = "linux"))]
+    if backend.private_wal_test.is_some() {
+        return Err(SessionConsensusStorageError::CorruptState);
+    }
     let snapshot_dir = snapshot_dir.into();
     let snapshot_directory_lease = acquire_snapshot_directory_lease(backend, &snapshot_dir)
         .await
@@ -3268,10 +3708,28 @@ async fn reclaim_detached_failed_snapshot_namespace(
     Ok(())
 }
 
+fn retained_snapshot_metadata(
+    core: &SqliteConsensusCore,
+    current: Option<&consensus::CurrentSnapshot>,
+) -> io::Result<Vec<consensus::CurrentSnapshot>> {
+    #[cfg(target_os = "linux")]
+    if let Some(wal) = core.private_wal.as_ref().filter(|wal| wal.is_native()) {
+        return wal.native_retained_snapshots();
+    }
+    let _ = core;
+    Ok(current.cloned().into_iter().collect())
+}
+
 async fn validate_and_clean_snapshot_directory(
     core: &SqliteConsensusCore,
     lease: Option<&Arc<SnapshotDirectoryLease>>,
 ) -> Result<usize, SessionConsensusStorageError> {
+    #[cfg(target_os = "linux")]
+    if let Some(wal) = core.private_wal.as_ref() {
+        let conn = core.conn.lock().await;
+        wal.validate_application_cache(&conn)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    }
     // `core.snapshot_dir` remains the durable/logical key.  Every operation
     // on its children is instead issued through the retained descriptor. A
     // parent-directory rename must not make this owner inspect a replacement
@@ -3310,12 +3768,43 @@ async fn validate_and_clean_snapshot_directory(
     let (current, legacy_fixed_snapshot_reseed) = {
         let conn = core.conn.lock().await;
         (
-            consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+            core.read_selected_snapshot(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?,
-            consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, core.storage_identity)
+            core.read_selected_legacy_reseed(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?,
         )
     };
+    let retained = retained_snapshot_metadata(core, current.as_ref())
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    // CURRENT can depend on the original incoming envelope after a newer
+    // local export becomes current. Authenticate every additional retained
+    // descriptor before any orphan cleanup and keep its pin through the pass.
+    let mut retained_pins = Vec::new();
+    for candidate in retained
+        .iter()
+        .filter(|candidate| Some(*candidate) != current.as_ref())
+    {
+        let (_, name, checksum, length) = candidate;
+        let path = lease
+            .namespace
+            .sqlite_child_path(std::ffi::OsStr::new(name))
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        let file = open_snapshot_child_in_namespace(Arc::clone(&lease.namespace), name.into())
+            .await
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        let pin = verify_admitted_snapshot(
+            file,
+            Arc::clone(lease),
+            name.into(),
+            core.snapshot_integrity,
+            *checksum,
+            *length,
+            None,
+        )
+        .await
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        retained_pins.push((pin, path, *length));
+    }
     let legacy_reseed_matches_current =
         match (legacy_fixed_snapshot_reseed.as_ref(), current.as_ref()) {
             (Some(reseed), Some(current)) => reseed
@@ -3440,6 +3929,7 @@ async fn validate_and_clean_snapshot_directory(
                         core.snapshot_integrity,
                         *expected_checksum,
                         *expected_length,
+                        None,
                     )
                     .await
                     .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -3510,9 +4000,9 @@ async fn validate_and_clean_snapshot_directory(
         let cleanup_original = sdk_snapshot_restart_cleanup_original_name(&file_name);
         let reclaimable = cleanup_original.is_some_and(|original| {
             !(is_sdk_published_snapshot_name(original)
-                && current
-                    .as_ref()
-                    .is_some_and(|(_, current_name, _, _)| current_name == original))
+                && retained
+                    .iter()
+                    .any(|(_, retained_name, _, _)| retained_name == original))
         });
         if !reclaimable || (live_receiver && is_sdk_snapshot_incoming_name(&file_name)) {
             durable_survivors = durable_survivors
@@ -3608,6 +4098,10 @@ async fn validate_and_clean_snapshot_directory(
             Ok(_) | Err(_) => return Err(SessionConsensusStorageError::BackendUnavailable),
         }
         removed = true;
+    }
+    for (pin, path, length) in retained_pins {
+        pin.verify_bound_immutable_snapshot_envelope(&path, length)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     }
     // A dropped cleanup can unlink its final child and fail only the parent
     // fsync. Its next validation pass may therefore see an empty namespace,
@@ -3918,6 +4412,15 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) = self
+            .core
+            .private_wal_log_store()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?
+        {
+            return wal.try_get_log_entries(range).await;
+        }
         let (start, end) = range_to_half_open(&range)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
         let conn = self.core.conn.lock().await;
@@ -3943,6 +4446,15 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<Entry<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) = self
+            .core
+            .private_wal_log_store()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?
+        {
+            return wal.limited_get_log_entries(start, end).await;
+        }
         let conn = self.core.conn.lock().await;
         let entries = consensus::with_durable_authority_raw_read_sync(
             &conn,
@@ -3981,12 +4493,78 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     }
 }
 
+/// Marks an already serialized synchronous write as blocking for Tokio's
+/// multi-thread scheduler. SQLite, its full row decoders, and the transaction
+/// remain on the calling thread; this does not submit a detached storage job.
+/// Callers acquire all async admission/connection guards before entering and
+/// retain them until the synchronous transaction returns, including on error.
+/// A current-thread runtime has no worker to hand off, so retain inline behavior
+/// there (and when called without a Tokio runtime). Startup recovery also stays
+/// inline until both write handles belong to the spawned Openraft tasks.
+///
+/// Each store admits at most one handoff until a completion marker runs in the
+/// same blocking pool. The pinned Tokio pool dequeues jobs in FIFO order, so
+/// running that marker proves its preceding replacement-worker job has left
+/// the queue. This bounds pending scheduler work to one replacement plus one
+/// marker per store, including while the pool is saturated. Other writes stay
+/// inline. The marker owns only the tracker, never SQLite or an owner guard.
+/// A shared 64-admission cap also bounds this SDK instance to 128 queued jobs
+/// across all stores and runtimes, including trackers for closed stores.
+/// Cancellation retires both admissions instead of releasing either early.
+fn run_admitted_sqlite_write<R>(
+    shutdown_guard: &ConsensusStorageShutdownGuard,
+    operation: impl FnOnce() -> R,
+) -> R {
+    let Some(runtime) = tokio::runtime::Handle::try_current()
+        .ok()
+        .filter(|runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    else {
+        return operation();
+    };
+    let Some(completion) = shutdown_guard.try_admit_runtime_write_handoff() else {
+        return operation();
+    };
+
+    // Preserve an operation panic after accounting for any queued replacement
+    // worker. Releasing admission while unwinding would allow that queue to grow.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::task::block_in_place(operation)
+    }));
+    drop(enqueue_runtime_write_handoff_completion(
+        &runtime, completion,
+    ));
+    match result {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn enqueue_runtime_write_handoff_completion(
+    runtime: &tokio::runtime::Handle,
+    completion: RuntimeWriteHandoff,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn_blocking(move || {
+        // Only execution rearms admission. Dropping a rejected or cancelled
+        // closure leaves the reservation retired without blocking cleanup.
+        completion.complete();
+    })
+}
+
 impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     type LogReader = Self;
 
     async fn get_log_state(
         &mut self,
     ) -> Result<LogState<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) = self
+            .core
+            .private_wal_log_store()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?
+        {
+            return wal.get_log_state().await;
+        }
         let conn = self.core.conn.lock().await;
         let (last_purged_log_id, last_log_id) = consensus::with_durable_authority_raw_read_sync(
             &conn,
@@ -4017,18 +4595,29 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) = self
+            .core
+            .private_wal_log_store()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))?
+        {
+            return wal.save_vote(vote).await;
+        }
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::save_vote_with_authority_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                vote,
-            )
+            run_admitted_sqlite_write(&self.shutdown_guard, || {
+                consensus::save_vote_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    vote,
+                )
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error));
         if result.is_ok() {
@@ -4040,6 +4629,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     async fn read_vote(
         &mut self,
     ) -> Result<Option<Vote<SessionConsensusNodeId>>, StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) = self
+            .core
+            .private_wal_log_store()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Read, error))?
+        {
+            return wal.read_vote().await;
+        }
         let conn = self.core.conn.lock().await;
         consensus::with_durable_authority_raw_read_sync(
             &conn,
@@ -4057,18 +4655,29 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) = self
+            .core
+            .private_wal_log_store()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?
+        {
+            return wal.save_committed(committed).await;
+        }
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::save_committed_with_authority_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                committed,
-            )
+            run_admitted_sqlite_write(&self.shutdown_guard, || {
+                consensus::save_committed_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    committed,
+                )
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
         if result.is_ok() {
@@ -4080,6 +4689,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     async fn read_committed(
         &mut self,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) = self
+            .core
+            .private_wal_log_store()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?
+        {
+            return wal.read_committed().await;
+        }
         let conn = self.core.conn.lock().await;
         consensus::with_durable_authority_raw_read_sync(
             &conn,
@@ -4102,21 +4720,33 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         I: IntoIterator<Item = Entry<SessionRaftTypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        #[cfg(target_os = "linux")]
+        match self.core.private_wal_log_store().await {
+            Ok(Some(mut wal)) => return wal.append(entries, callback).await,
+            Ok(None) => {}
+            Err(error) => {
+                callback
+                    .log_io_completed(Err(io::Error::other("session consensus log append failed")));
+                return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
+            }
+        }
         let entries: Vec<_> = entries.into_iter().collect();
         let has_entries = !entries.is_empty();
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::append_logs_with_authority_and_diagnostics_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                &entries,
-                self.core.diagnostics.as_deref(),
-            )
+            run_admitted_sqlite_write(&self.shutdown_guard, || {
+                consensus::append_logs_with_authority_and_diagnostics_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &entries,
+                    self.core.diagnostics.as_deref(),
+                )
+            })
         };
         match result {
             Ok(()) => {
@@ -4138,10 +4768,18 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) =
+            self.core.private_wal_log_store().await.map_err(|error| {
+                storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error)
+            })?
+        {
+            return wal.truncate(log_id).await;
+        }
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            (|| -> io::Result<()> {
+            run_admitted_sqlite_write(&self.shutdown_guard, || -> io::Result<()> {
                 ensure_recovery_terminal_allows_log_compaction(&self.core, &conn)
                     .map_err(|_| io::Error::other("operator recovery blocks log truncation"))?;
                 consensus::truncate_logs_with_authority_sync(
@@ -4153,7 +4791,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                     self.core.fixed_placement_policy,
                     &log_id,
                 )
-            })()
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error));
         if result.is_ok() {
@@ -4168,11 +4806,19 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         wait_until_applied(&self.core, &log_id)
             .await
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
+            .map_err(|error| *error)?;
+        #[cfg(target_os = "linux")]
+        if let Some(mut wal) =
+            self.core.private_wal_log_store().await.map_err(|error| {
+                storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error)
+            })?
+        {
+            return wal.purge(log_id).await;
+        }
         let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
             let conn = self.core.conn.lock().await;
-            (|| -> io::Result<()> {
+            run_admitted_sqlite_write(&self.shutdown_guard, || -> io::Result<()> {
                 ensure_recovery_terminal_allows_log_compaction(&self.core, &conn)
                     .map_err(|_| io::Error::other("operator recovery blocks log purge"))?;
                 if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable
@@ -4198,7 +4844,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                         &log_id,
                     )
                 }
-            })()
+            })
         }
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error));
         if result.is_ok() {
@@ -4251,24 +4897,42 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         ),
         StorageError<SessionConsensusNodeId>,
     > {
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.core.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            let _membership_apply = self.begin_membership_apply().await;
+            let (applied, membership) = wal
+                .with_native_read(|state| Ok((state.applied(), state.membership())))
+                .map_err(|error| {
+                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
+                })?;
+            self.observe_applied_membership(&membership)
+                .map_err(membership_admission_storage_error)?;
+            return Ok((applied, membership));
+        }
         let (applied, membership) = {
             let _membership_apply = self.begin_membership_apply().await;
             let conn = self.core.conn.lock().await;
-            let (applied, membership) = consensus::with_durable_authority_raw_read_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                |conn| {
-                    Ok((
-                        consensus::read_applied_sync(conn, self.core.storage_identity)?,
-                        consensus::read_membership_sync(conn, self.core.storage_identity)?,
-                    ))
-                },
-            )
-            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
+            let (applied, membership) = self
+                .core
+                .with_application_cache_read(&conn, || {
+                    consensus::with_durable_authority_raw_read_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        &self.core.expected_members,
+                        &self.core.expected_bindings,
+                        self.core.fixed_placement_policy,
+                        |conn| {
+                            Ok((
+                                consensus::read_applied_sync(conn, self.core.storage_identity)?,
+                                consensus::read_membership_sync(conn, self.core.storage_identity)?,
+                            ))
+                        },
+                    )
+                })
+                .map_err(|error| {
+                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
+                })?;
             self.observe_applied_membership(&membership)
                 .map_err(membership_admission_storage_error)?;
             (applied, membership)
@@ -4306,6 +4970,48 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             })
         });
         let last_applied = entries.last().map(|entry| entry.log_id);
+        #[cfg(target_os = "linux")]
+        if let Some(wal) = self.core.private_wal.as_ref().filter(|wal| wal.is_native()) {
+            let _membership_apply = if applies_uniform_cutover {
+                self.begin_membership_apply().await
+            } else {
+                None
+            };
+            let roster_started = entries
+                .iter()
+                .any(|entry| match &entry.payload {
+                    EntryPayload::Normal(command) => {
+                        consensus::contains_protected_roster_command(&command.intent)
+                    }
+                    _ => false,
+                })
+                .then(std::time::Instant::now);
+            let applied = run_admitted_sqlite_write(&self.shutdown_guard, || {
+                wal.native_apply_committed(&entries)
+            })
+            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
+            if let Some(diagnostics) = &self.core.diagnostics {
+                if let Some(started) = roster_started {
+                    diagnostics
+                        .observe_protected_roster_state_machine_native_apply(started.elapsed());
+                }
+                wal.publish_native_roster_occupancy(diagnostics);
+            }
+            if applies_membership {
+                let membership = wal
+                    .with_native_read(|state| Ok(state.membership()))
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
+                    })?;
+                self.observe_applied_membership(&membership)
+                    .map_err(membership_admission_storage_error)?;
+            }
+            if let Some(last_applied) = last_applied {
+                self.core.applied_progress.send_replace(Some(last_applied));
+            }
+            notify_watchers(&self.core, &applied.notifications).await;
+            return Ok(applied.responses);
+        }
         let applied = {
             let _membership_apply = if applies_uniform_cutover {
                 self.begin_membership_apply().await
@@ -4314,17 +5020,29 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             };
             let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
-            let applied = consensus::apply_entries_with_authority_and_diagnostics_sync(
-                &conn,
-                self.core.storage_identity,
-                &self.core.caps,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                entries,
-                self.core.diagnostics.as_deref(),
-            )
+            let applied = run_admitted_sqlite_write(&self.shutdown_guard, || {
+                #[cfg(target_os = "linux")]
+                if let Some(wal) = self.core.private_wal.as_ref() {
+                    wal.validate_application_cache(&conn)?;
+                    return wal.apply_committed(
+                        &conn,
+                        &self.core.caps,
+                        entries,
+                        consensus::wal::application::ApplyControl::Normal,
+                    );
+                }
+                consensus::apply_entries_with_authority_and_diagnostics_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    &self.core.caps,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    entries,
+                    self.core.diagnostics.as_deref(),
+                )
+            })
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
             if applies_membership {
                 let membership = consensus::read_membership_sync(&conn, self.core.storage_identity)
@@ -4360,6 +5078,13 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<SessionSnapshotFile>, StorageError<SessionConsensusNodeId>> {
+        #[cfg(target_os = "linux")]
+        self.core
+            .validate_private_wal_snapshot_cache()
+            .await
+            .map_err(|error| {
+                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+            })?;
         // Serialize receive creation with build/install admission. The file
         // returned below remains its durable reservation after this guard is
         // released, while `snapshot_receive_admission` prevents a second
@@ -4422,6 +5147,199 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
         snapshot: Box<SessionSnapshotFile>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let result = self
+            .install_snapshot_inner(meta, snapshot)
+            .await
+            .map_err(|error| *error);
+        if let Err(error) = &result {
+            self.core
+                .snapshot_install_failure
+                .send_if_modified(|first| {
+                    if first.is_none() {
+                        *first = Some(error.clone());
+                        true
+                    } else {
+                        false
+                    }
+                });
+        }
+        result
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
+        // Selection, descriptor admission and handoff share the builder's
+        // transaction gate. Otherwise a legitimate successor can retire the
+        // selected inode while its original integrity checks are running.
+        let consumer = LiveTerminalRecoveryHandoffConsumer::from_live_snapshot_owner(
+            &self.core,
+            &self._snapshot_directory_lease,
+        );
+        let snapshot_guard = consumer.acquire_gate().await.map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                io::Error::other(error),
+            )
+        })?;
+        let current = self
+            .core
+            .read_current_snapshot_for_serving()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+        let Some((meta, file_name, expected_checksum, expected_length)) = current else {
+            return Ok(None);
+        };
+        let path = self
+            ._snapshot_directory_lease
+            .namespace
+            .sqlite_child_path(std::ffi::OsStr::new(&file_name))
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
+        let (mut snapshot, checksum, length) =
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                // Validate and return the measured descriptor itself. A pathname
+                // reopen after measurement could substitute an unsealed inode.
+                let file = open_snapshot_child_in_namespace(
+                    Arc::clone(&self._snapshot_directory_lease.namespace),
+                    std::ffi::OsString::from(&file_name),
+                )
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+                #[cfg(test)]
+                wait_before_current_snapshot_admission(&path).await;
+                let pinned = verify_admitted_snapshot(
+                    file,
+                    Arc::clone(&self._snapshot_directory_lease),
+                    std::ffi::OsString::from(&file_name),
+                    self.core.snapshot_integrity,
+                    expected_checksum,
+                    expected_length,
+                    Some(SnapshotIntegrityWork {
+                        _gate: snapshot_guard.clone(),
+                        _lease: Arc::clone(&self._snapshot_directory_lease),
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+                let snapshot = SessionSnapshotFile::from_pinned(pinned, path.clone())
+                    .await
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                (snapshot, expected_checksum, expected_length)
+            } else {
+                let file = open_snapshot_child_in_namespace(
+                    Arc::clone(&self._snapshot_directory_lease.namespace),
+                    std::ffi::OsString::from(&file_name),
+                )
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+                let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
+                    .await
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
+                    .await
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                (snapshot, checksum, length)
+            };
+        if checksum != expected_checksum || length != expected_length {
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                consensus::invalid_data("session consensus snapshot metadata is inconsistent"),
+            ));
+        }
+        snapshot.rewind().await.map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
+        {
+            let conn = self.core.conn.lock().await;
+            consensus::with_durable_authority_raw_read_sync(
+                &conn,
+                self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
+                |_| Ok(()),
+            )
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
+        }
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: Box::new(snapshot),
+        }))
+    }
+}
+
+impl SqliteConsensusStateMachine {
+    async fn install_snapshot_inner(
+        &mut self,
+        meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+        snapshot: Box<SessionSnapshotFile>,
+    ) -> Result<(), Box<StorageError<SessionConsensusNodeId>>> {
+        #[cfg(target_os = "linux")]
+        self.core
+            .validate_private_wal_snapshot_cache()
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
         let live_terminal_consumer = LiveTerminalRecoveryHandoffConsumer::from_live_snapshot_owner(
             &self.core,
             &self._snapshot_directory_lease,
@@ -4535,6 +5453,10 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             })?;
         let promoted_name =
             std::ffi::OsString::from(format!("promote-{}.part", uuid::Uuid::new_v4()));
+        let immutable_install =
+            self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable;
+        #[cfg(target_os = "linux")]
+        let immutable_install = immutable_install || self.core.private_wal.is_some();
         let (
             raw_snapshot,
             _raw_snapshot_cleanup,
@@ -4542,7 +5464,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             promoted_pin,
             checksum,
             total_length,
-        ) = if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        ) = if immutable_install {
             // The received stream is mutable until it is copied.  Consume it
             // exactly once into a fresh SDK-owned envelope, keep the output's
             // O_NOFOLLOW read pin continuously, then seal and validate that
@@ -4640,13 +5562,13 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     )
                 })?
             {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     consensus::invalid_data(
                         "session consensus extracted snapshot path was replaced",
                     ),
-                ));
+                )));
             }
             raw_artifact
                 .record_identity_from_file(raw_snapshot.file())
@@ -4736,13 +5658,13 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     )
                 })?
             {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     consensus::invalid_data(
                         "session consensus extracted snapshot path was replaced",
                     ),
-                ));
+                )));
             }
             raw_artifact
                 .record_identity_from_file(raw_snapshot.file())
@@ -4810,11 +5732,11 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         )
                     })?;
             if promoted_checksum != checksum || promoted_length != total_length {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Read,
                     consensus::invalid_data("session consensus promoted snapshot is inconsistent"),
-                ));
+                )));
             }
             (
                 raw_snapshot,
@@ -4836,27 +5758,25 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         // publisher, so it does not need either primary writer guard.
         let (previous, legacy_reseed_predecessor) = {
             let conn = self.core.conn.lock().await;
-            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
+            let previous = self.core.read_selected_snapshot(&conn).map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
             let legacy_reseed_predecessor =
                 if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                    let reseed = consensus::read_legacy_fixed_snapshot_reseed_sync(
-                        &conn,
-                        self.core.storage_identity,
-                    )
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
+                    let reseed = self
+                        .core
+                        .read_selected_legacy_reseed(&conn)
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?;
                     match (reseed.as_ref(), previous.as_ref()) {
                         (Some(reseed), Some(previous)) => reseed
                             .matches_current(self.core.storage_identity, previous)
@@ -4868,13 +5788,13 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                                 )
                             })?,
                         (Some(_), None) => {
-                            return Err(storage_error(
+                            return Err(Box::new(storage_error(
                                 ErrorSubject::Snapshot(Some(meta.signature())),
                                 ErrorVerb::Read,
                                 consensus::invalid_data(
                                     "legacy fixed snapshot reseed has no current snapshot",
                                 ),
-                            ));
+                            )));
                         }
                         (None, _) => false,
                     }
@@ -4924,24 +5844,21 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 )
             })?;
         let install_result = {
-            let observed_previous =
-                consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
-                    |error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    },
-                )?;
+            let observed_previous = self.core.read_selected_snapshot(&conn).map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
             if observed_previous != previous {
-                return Err(storage_error(
+                return Err(Box::new(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     consensus::invalid_data(
                         "session consensus current snapshot changed under the publication owner",
                     ),
-                ));
+                )));
             }
             if let Some(promoted_pin) = &promoted_pin {
                 promoted_pin
@@ -4954,32 +5871,98 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         )
                     })?;
             }
-            match publish_snapshot_metadata_with_readback(
-                &conn,
-                self.core.storage_identity,
-                meta,
-                &file_name,
-                checksum,
-                total_length,
-                &mut promoted_cleanup,
-                self.core.snapshot_publication_indeterminate.as_ref(),
-                || {
-                    consensus::install_snapshot_database_from_pinned_with_authority_sync(
-                        &conn,
-                        self.core.storage_identity,
-                        self.core.authority_profile,
-                        Some(&self.core.expected_members),
-                        Some(&self.core.expected_bindings),
-                        self.core.fixed_placement_policy,
-                        raw_snapshot,
-                        promoted_pin.as_ref().map(|pin| (pin, final_path.as_path())),
-                        meta,
-                        &file_name,
-                        checksum,
-                        total_length,
+            #[cfg(target_os = "linux")]
+            let private_installation = self
+                .core
+                .private_wal
+                .as_ref()
+                .map(|wal| {
+                    let published = promoted_pin.as_ref().ok_or_else(|| {
+                        consensus::invalid_data(
+                            "private WAL install lacks an immutable published source",
+                        )
+                    })?;
+                    let source = if wal.is_native() {
+                        consensus::wal::snapshot::InstallSource::new_native(
+                            meta,
+                            &file_name,
+                            checksum,
+                            total_length,
+                            raw_snapshot.try_clone()?,
+                            published.try_clone()?,
+                            &final_path,
+                        )?
+                    } else {
+                        consensus::wal::snapshot::InstallSource::new(
+                            (meta.clone(), file_name.clone(), checksum, total_length),
+                            raw_snapshot.try_clone()?,
+                            published.try_clone()?,
+                            final_path.clone(),
+                        )?
+                    };
+                    Ok::<_, io::Error>((wal, source))
+                })
+                .transpose()
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
                     )
-                },
-            ) {
+                })?;
+            let publish_legacy = |cleanup: &mut UnpublishedSnapshotArtifact| {
+                publish_snapshot_metadata_with_readback(
+                    &conn,
+                    self.core.storage_identity,
+                    meta,
+                    &file_name,
+                    checksum,
+                    total_length,
+                    cleanup,
+                    self.core.snapshot_publication_indeterminate.as_ref(),
+                    || {
+                        consensus::install_snapshot_database_from_pinned_with_authority_sync(
+                            &conn,
+                            self.core.storage_identity,
+                            self.core.authority_profile,
+                            Some(&self.core.expected_members),
+                            Some(&self.core.expected_bindings),
+                            self.core.fixed_placement_policy,
+                            raw_snapshot,
+                            promoted_pin.as_ref().map(|pin| (pin, final_path.as_path())),
+                            meta,
+                            &file_name,
+                            checksum,
+                            total_length,
+                        )
+                    },
+                )
+            };
+            #[cfg(target_os = "linux")]
+            let publication = if let Some((wal, source)) = private_installation {
+                // The pending WAL proof may need this exact envelope after
+                // any preparation error. SQL readback cannot revive a fenced
+                // owner or decide this two-image publication by itself.
+                promoted_cleanup.disarm();
+                // This synchronous handoff waits for the sole WAL writer.
+                // Keep its original caller and publication guards through
+                // completion while admitting the existing bounded scheduler
+                // handoff used by the other serialized storage writes.
+                let publication = run_admitted_sqlite_write(&self.shutdown_guard, || {
+                    wal.install_snapshot(&conn, source)
+                });
+                if publication.is_err() {
+                    self.core
+                        .snapshot_publication_indeterminate
+                        .store(true, Ordering::Release);
+                }
+                publication
+            } else {
+                publish_legacy(&mut promoted_cleanup)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let publication = publish_legacy(&mut promoted_cleanup);
+            match publication {
                 Err(error) => Err(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
@@ -5000,7 +5983,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         drop(conn);
         let (previous, previous_artifact) = match install_result {
             Ok(previous) => previous,
-            Err(error) => return Err(error),
+            Err(error) => return Err(Box::new(error)),
         };
         // OpenRaft may enqueue PurgeLog immediately after dispatching this
         // install to its independent state-machine worker.  The replacement
@@ -5019,16 +6002,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         drop(prune_preemption.take());
         #[cfg(test)]
         wait_after_snapshot_install_applied_progress(self.core.snapshot_dir.as_ref()).await;
-        if let Some(diagnostics) = &self.core.diagnostics {
-            let conn = self.core.conn.lock().await;
-            match consensus::protected_roster_diagnostic_occupancy_sync(
-                &conn,
-                self.core.storage_identity,
-            ) {
-                Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
-                Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
-            }
-        }
+        self.core.refresh_protected_roster_occupancy().await;
         self.core.signal_proactive_checkpoint();
         raw_artifact.remove().await.map_err(|error| {
             storage_error(
@@ -5038,199 +6012,75 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             )
         })?;
         if !legacy_reseed_predecessor {
-            remove_old_snapshot(
-                previous,
-                &file_name,
-                previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
-            )
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
-                    error,
-                )
-            })?;
+            remove_old_snapshot(&self.core, previous, &file_name, previous_artifact)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        error,
+                    )
+                })?;
         }
         Ok(())
-    }
-
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
-        let current = {
-            let conn = self.core.conn.lock().await;
-            consensus::with_durable_authority_raw_read_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                |conn| consensus::read_current_snapshot_sync(conn, self.core.storage_identity),
-            )
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?
-        };
-        let Some((meta, file_name, expected_checksum, expected_length)) = current else {
-            return Ok(None);
-        };
-        let path = self
-            ._snapshot_directory_lease
-            .namespace
-            .sqlite_child_path(std::ffi::OsStr::new(&file_name))
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
-        let (mut snapshot, checksum, length) =
-            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                // Validate and return the measured descriptor itself. A pathname
-                // reopen after measurement could substitute an unsealed inode.
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let pinned = verify_admitted_snapshot(
-                    file,
-                    Arc::clone(&self._snapshot_directory_lease),
-                    std::ffi::OsString::from(&file_name),
-                    self.core.snapshot_integrity,
-                    expected_checksum,
-                    expected_length,
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let snapshot = SessionSnapshotFile::from_pinned(pinned, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, expected_checksum, expected_length)
-            } else {
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, checksum, length)
-            };
-        if checksum != expected_checksum || length != expected_length {
-            return Err(storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                consensus::invalid_data("session consensus snapshot metadata is inconsistent"),
-            ));
-        }
-        snapshot.rewind().await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                error,
-            )
-        })?;
-        {
-            let conn = self.core.conn.lock().await;
-            consensus::with_durable_authority_raw_read_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                |_| Ok(()),
-            )
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
-        }
-        Ok(Some(Snapshot {
-            meta,
-            snapshot: Box::new(snapshot),
-        }))
     }
 }
 
 async fn wait_until_applied(
     core: &SqliteConsensusCore,
     through: &LogId<SessionConsensusNodeId>,
-) -> io::Result<()> {
+) -> Result<(), Box<StorageError<SessionConsensusNodeId>>> {
+    let waiting_error =
+        |error| storage_error(ErrorSubject::Log(*through), ErrorVerb::Delete, error);
+    let timed_out = || {
+        waiting_error(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "session consensus apply wait timed out",
+        ))
+    };
     let deadline = tokio::time::Instant::now()
         .checked_add(SNAPSHOT_APPLY_WAIT)
-        .ok_or_else(|| consensus::invalid_data("session consensus apply wait is invalid"))?;
+        .ok_or_else(|| {
+            waiting_error(consensus::invalid_data(
+                "session consensus apply wait is invalid",
+            ))
+        })?;
     let mut applied_progress = core.applied_progress.subscribe();
+    let mut install_failure = core.snapshot_install_failure.subscribe();
     loop {
+        if let Some(error) = install_failure.borrow_and_update().clone() {
+            return Err(Box::new(error));
+        }
         let applied = *applied_progress.borrow_and_update();
+        // A ready watch can win over an expired timeout when this task was
+        // not polled in time. Observe coverage within the original absolute
+        // deadline, including after partial progress wakes this loop again.
+        if tokio::time::Instant::now() > deadline {
+            return Err(Box::new(timed_out()));
+        }
         if let Some(applied) = applied {
             if applied.index > through.index || &applied == through {
                 return Ok(());
             }
             if applied.index == through.index {
-                return Err(consensus::invalid_data(
+                return Err(Box::new(waiting_error(consensus::invalid_data(
                     "session consensus applied log conflicts with purge",
-                ));
+                ))));
             }
         }
-        tokio::time::timeout_at(deadline, applied_progress.changed())
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "session consensus apply wait timed out",
-                )
-            })?
-            .map_err(|_| {
-                consensus::invalid_data("session consensus apply progress channel closed")
-            })?;
+        tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                changed = applied_progress.changed() => changed,
+                changed = install_failure.changed() => changed,
+            }
+        })
+        .await
+        .map_err(|_| timed_out())?
+        .map_err(|_| {
+            waiting_error(consensus::invalid_data(
+                "session consensus apply progress channel closed",
+            ))
+        })?;
     }
 }
 
@@ -5281,6 +6131,67 @@ async fn build_file_backed_snapshot_database(
     ),
     StorageError<SessionConsensusNodeId>,
 > {
+    #[cfg(target_os = "linux")]
+    if let Some(wal) = core.private_wal.as_ref().filter(|wal| wal.is_native()) {
+        let wal = Arc::clone(wal);
+        let identity = core.storage_identity;
+        let profile = core.authority_profile;
+        let expected_members = core.expected_members.clone();
+        let expected_bindings = core.expected_bindings.clone();
+        let fixed_placement_policy = core.fixed_placement_policy;
+        let (result, snapshot_guard) = tokio::task::spawn_blocking(move || {
+            let result = (|| {
+                // Native export writes the portable projection directly into
+                // the eventual sealed inode. Reclaim the empty raw reservation
+                // before allocating pages; there is no full-size compaction copy.
+                drop(raw_snapshot);
+                let Some((export, captured_cut)) = wal
+                    .native_export_portable_snapshot_into(&vacuum_snapshot, &|| {
+                        worker_shutdown_guard.snapshot_shutdown_requested()
+                    })?
+                else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native snapshot export stopped after Raft shutdown",
+                    ));
+                };
+                if worker_shutdown_guard.snapshot_shutdown_requested() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native snapshot export stopped after Raft shutdown",
+                    ));
+                }
+                consensus::finalize_native_snapshot_database_sync(
+                    export,
+                    vacuum_snapshot,
+                    consensus::SnapshotBuildAuthority {
+                        identity,
+                        profile,
+                        expected_members: &expected_members,
+                        expected_bindings: &expected_bindings,
+                        fixed_placement_policy,
+                    },
+                    &captured_cut,
+                )
+                .map(|pin| (captured_cut, pin, 0))
+            })();
+            drop(snapshot_directory_lease);
+            drop(worker_shutdown_guard);
+            (result, snapshot_guard)
+        })
+        .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                io::Error::other("native cold snapshot worker unavailable"),
+            )
+        })?;
+        let captured = result.map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
+        return Ok((snapshot_guard, Some(captured)));
+    }
     let Some(database_file) = &core.database_file else {
         // The caller normally avoids this branch, but retaining it makes an
         // accidental in-memory call fail closed without stranding either
@@ -5295,46 +6206,57 @@ async fn build_file_backed_snapshot_database(
     };
     let source_cut = {
         let conn = core.conn.lock().await;
-        match consensus::begin_snapshot_read_sync(&worker.reader, core.storage_identity) {
-            Ok(source_cut) => {
-                let live_file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
-                    .map_err(|_| {
-                        consensus::invalid_data(
-                            "session consensus live source descriptor is unavailable",
-                        )
-                    })
-                    .and_then(|file| {
-                        PinnedSqliteFile::from_file(file, database_file.path().to_path_buf())
-                    });
-                match live_file {
-                    Ok(live_file) if live_file.identity() != database_file.identity() => Err(
-                        consensus::invalid_data("session consensus live source descriptor changed"),
-                    ),
-                    Err(error) => Err(error),
-                    Ok(_) => consensus::with_durable_authority_raw_read_sync(
-                        &conn,
-                        core.storage_identity,
-                        core.authority_profile,
-                        &core.expected_members,
-                        &core.expected_bindings,
-                        core.fixed_placement_policy,
-                        |conn| {
-                            consensus::snapshot_applied_membership_sync(conn, core.storage_identity)
-                        },
-                    )
-                    .and_then(|live_cut| {
-                        if live_cut == source_cut {
-                            Ok(source_cut)
-                        } else {
+        core.with_application_cache_read(&conn, || {
+            match consensus::begin_snapshot_read_sync(&worker.reader, core.storage_identity) {
+                Ok(source_cut) => {
+                    let live_file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
+                        .map_err(|_| {
+                            consensus::invalid_data(
+                                "session consensus live source descriptor is unavailable",
+                            )
+                        })
+                        .and_then(|file| {
+                            PinnedSqliteFile::from_file(file, database_file.path().to_path_buf())
+                        });
+                    match live_file {
+                        Ok(live_file) if live_file.identity() != database_file.identity() => {
                             Err(consensus::invalid_data(
-                                "session consensus snapshot reader does not match the live cut",
+                                "session consensus live source descriptor changed",
                             ))
                         }
-                    }),
+                        Err(error) => Err(error),
+                        Ok(_) => consensus::with_durable_authority_raw_read_sync(
+                            &conn,
+                            core.storage_identity,
+                            core.authority_profile,
+                            &core.expected_members,
+                            &core.expected_bindings,
+                            core.fixed_placement_policy,
+                            |conn| {
+                                consensus::snapshot_applied_membership_sync(
+                                    conn,
+                                    core.storage_identity,
+                                )
+                            },
+                        )
+                        .and_then(|live_cut| {
+                            if live_cut == source_cut {
+                                #[cfg(all(test, target_os = "linux"))]
+                                if let Some(wal) = &core.private_wal {
+                                    wal.snapshot_source_cut_for_test()?;
+                                }
+                                Ok(source_cut)
+                            } else {
+                                Err(consensus::invalid_data(
+                                    "session consensus snapshot reader does not match the live cut",
+                                ))
+                            }
+                        }),
+                    }
                 }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
+        })
     };
     let source_cut = match source_cut {
         Ok(source_cut) => source_cut,
@@ -5502,19 +6424,22 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // preflight can reclaim only this exact sealed namespace child before
         // reserving another successor. Ordinary snapshots do not create or
         // broaden this compatibility state.
-        let legacy_reseed_candidate = if self.core.authority_profile
-            == ConsensusAuthorityProfile::FixedImmutable
-        {
-            let conn = self.core.conn.lock().await;
-            consensus::reserve_legacy_fixed_snapshot_reseed_candidate_sync(
-                &conn,
-                self.core.storage_identity,
-                &file_name,
-            )
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?
-        } else {
-            false
-        };
+        let legacy_reseed_candidate =
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                // Reservation takes BEGIN IMMEDIATE even when no legacy journal
+                // exists. Use the same writer handoff as append/apply/publication
+                // before taking core.conn, so our own prune lane cannot turn
+                // snapshot startup into a fatal SQLITE_BUSY storage error.
+                let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
+                let conn = self.core.conn.lock().await;
+                self.core
+                    .reserve_selected_legacy_reseed(&conn, &file_name)
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                    })?
+            } else {
+                false
+            };
         #[cfg(not(test))]
         let _ = legacy_reseed_candidate;
         let final_path = self
@@ -5779,6 +6704,15 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             wait_before_fixed_prepublication_verify(&final_path).await;
         }
         let snapshot_id = format!("session-{}", uuid::Uuid::new_v4());
+        #[cfg(target_os = "linux")]
+        let snapshot_id =
+            if let Some(wal) = self.core.private_wal.as_ref().filter(|wal| wal.is_native()) {
+                wal.native_snapshot_id().map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?
+            } else {
+                snapshot_id
+            };
         let meta = SnapshotMeta {
             last_log_id,
             last_membership,
@@ -5790,27 +6724,25 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // envelope scan and must not stall unrelated Raft work.
         let (previous, legacy_reseed_predecessor) = {
             let conn = self.core.conn.lock().await;
-            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
+            let previous = self.core.read_selected_snapshot(&conn).map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
             let legacy_reseed_predecessor =
                 if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                    let reseed = consensus::read_legacy_fixed_snapshot_reseed_sync(
-                        &conn,
-                        self.core.storage_identity,
-                    )
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
+                    let reseed = self
+                        .core
+                        .read_selected_legacy_reseed(&conn)
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?;
                     match (reseed.as_ref(), previous.as_ref()) {
                         (Some(reseed), Some(previous)) => reseed
                             .matches_current(self.core.storage_identity, previous)
@@ -5872,16 +6804,13 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     io::Error::other(error),
                 )
             })?;
-        let observed_previous =
-            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
-                |error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                },
-            )?;
+        let observed_previous = self.core.read_selected_snapshot(&conn).map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
         if observed_previous != previous {
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -5902,32 +6831,59 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     )
                 })?;
         }
-        publish_snapshot_metadata_with_readback(
-            &conn,
-            self.core.storage_identity,
-            &meta,
-            &file_name,
-            checksum,
-            byte_length,
-            &mut published_cleanup,
-            self.core.snapshot_publication_indeterminate.as_ref(),
-            || {
-                consensus::save_current_snapshot_with_authority_sync(
+        let publication = {
+            let publish_legacy = |cleanup: &mut UnpublishedSnapshotArtifact| {
+                publish_snapshot_metadata_with_readback(
                     &conn,
                     self.core.storage_identity,
-                    self.core.authority_profile,
-                    &self.core.expected_members,
-                    &self.core.expected_bindings,
-                    self.core.fixed_placement_policy,
                     &meta,
                     &file_name,
                     checksum,
                     byte_length,
+                    cleanup,
+                    self.core.snapshot_publication_indeterminate.as_ref(),
+                    || {
+                        consensus::save_current_snapshot_with_authority_sync(
+                            &conn,
+                            self.core.storage_identity,
+                            self.core.authority_profile,
+                            &self.core.expected_members,
+                            &self.core.expected_bindings,
+                            self.core.fixed_placement_policy,
+                            &meta,
+                            &file_name,
+                            checksum,
+                            byte_length,
+                        )
+                        .map(|_| consensus::SnapshotInstallPublicationOutcome::Clean)
+                    },
                 )
-                .map(|_| consensus::SnapshotInstallPublicationOutcome::Clean)
-            },
-        )
-        .map_err(|error| {
+            };
+            #[cfg(target_os = "linux")]
+            let publication = if let Some(wal) = self.core.private_wal.as_ref() {
+                // Preserve the actual published candidate before the WAL's first
+                // fallible preparation. A proof rename or sync error may already
+                // bind it even though SQLite has not been touched. WAL failures
+                // bypass generic exact-SQL readback and keep this owner fenced.
+                published_cleanup.disarm();
+                let publication = wal.publish_compacting_snapshot(
+                    &conn,
+                    (meta.clone(), file_name.clone(), checksum, byte_length),
+                );
+                if publication.is_err() {
+                    self.core
+                        .snapshot_publication_indeterminate
+                        .store(true, Ordering::Release);
+                }
+                publication
+            } else {
+                publish_legacy(&mut published_cleanup)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let publication = publish_legacy(&mut published_cleanup);
+            publication
+        };
+        publication.map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Write,
@@ -5946,19 +6902,15 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // finalization or transferred its exact cleanup guard to
         // `published_cleanup`; no separate pathname artifact may race it.
         if !legacy_reseed_predecessor {
-            remove_old_snapshot(
-                previous,
-                &file_name,
-                previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
-            )
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
-                    error,
-                )
-            })?;
+            remove_old_snapshot(&self.core, previous, &file_name, previous_artifact)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        error,
+                    )
+                })?;
         }
         let snapshot = if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
             // The descriptor was sealed, measured, scanned, and bound before
@@ -6404,7 +7356,9 @@ where
     let mut destination = tokio::fs::File::from_std(raw_snapshot.file().try_clone()?);
     let mut copied = 0_u64;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    // This buffer lives across reads. Keeping it inline also embeds 64 KiB
+    // in every enclosing startup future, overflowing ordinary debug stacks.
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = source.read(&mut buffer).await?;
         if read == 0 {
@@ -6648,15 +7602,34 @@ async fn open_snapshot_child_in_namespace(
 }
 
 async fn remove_old_snapshot(
+    core: &SqliteConsensusCore,
     previous: Option<consensus::CurrentSnapshot>,
     current_file_name: &str,
-    previous_artifact: Option<SnapshotArtifact>,
+    previous_artifact: Option<RetainedCurrentSnapshotArtifact>,
 ) -> io::Result<()> {
+    // Native recovery can still depend on an installed origin after a newer
+    // local snapshot is selected. This retention rule applies to live stores.
+    #[cfg(target_os = "linux")]
+    if let Some(wal) = core.private_wal.as_ref().filter(|wal| wal.is_native()) {
+        let retained = wal.native_retained_snapshots()?;
+        if previous
+            .as_ref()
+            .is_some_and(|candidate| retained.contains(candidate))
+        {
+            // RetainedCurrentSnapshotArtifact disarms its cleanup on Drop.
+            // Superseded origins become ordinary bounded scavenger orphans
+            // only after the next durable selection stops naming them.
+            return Ok(());
+        }
+    }
+    let _ = core;
     if let Some((_, file_name, _, _)) = previous {
         if file_name != current_file_name {
-            let artifact = previous_artifact.ok_or_else(|| {
-                io::Error::other("session consensus previous snapshot has no identity pin")
-            })?;
+            let artifact = previous_artifact
+                .ok_or_else(|| {
+                    io::Error::other("session consensus previous snapshot has no identity pin")
+                })?
+                .into_cleanup_artifact();
             if artifact.path().file_name() != Some(std::ffi::OsStr::new(&file_name)) {
                 return Err(io::Error::other(
                     "session consensus previous snapshot identity pin has wrong path",
@@ -6708,6 +7681,7 @@ async fn track_previous_snapshot_artifact(
             snapshot_integrity,
             *expected_checksum,
             *expected_length,
+            None,
         )
         .await?;
         pinned.into_file()
@@ -6965,6 +7939,32 @@ mod tests {
     use crate::record::{EncryptedSessionPayload, StoredSessionRecord};
 
     const PLAINTEXT_CANARY: &[u8] = b"never-persist-this-plaintext-canary";
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_snapshot_shutdown_request_does_not_retire_an_owned_worker() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let root = ConsensusStorageShutdownGuard::tracked();
+        let observer = root.observer().unwrap();
+        let worker = root.child();
+        drop(root);
+        let waiting = observer.wait();
+        tokio::pin!(waiting);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+        assert!(!worker.snapshot_shutdown_requested());
+        observer.stop_native_snapshot_exports();
+        assert!(worker.snapshot_shutdown_requested());
+        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        drop(worker);
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context),
+            Poll::Ready(())
+        ));
+    }
 
     #[derive(Debug)]
     struct MembershipObservationProbePeer {
@@ -9610,6 +10610,182 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    async fn sealed_payload_checksum_fixture_pin(
+        path: &Path,
+        policy: SnapshotIntegrityPolicy,
+        checksum: Option<[u8; 32]>,
+    ) -> Option<PinnedSqliteFile> {
+        let pinned = PinnedSqliteFile::from_file(
+            std::fs::File::open(path).expect("open checksum fixture"),
+            path.to_path_buf(),
+        )
+        .expect("pin checksum fixture");
+        match seal_snapshot_pin(pinned, policy, checksum, None).await {
+            Ok(pinned) => Some(pinned),
+            Err(error)
+                if error.kind() == io::ErrorKind::Unsupported
+                    && policy == SnapshotIntegrityPolicy::FsVerity
+                    && std::env::var_os("OPC_FS_VERITY_QUALIFICATION").as_deref()
+                        != Some(std::ffi::OsStr::new("required")) =>
+            {
+                None
+            }
+            Err(error) => panic!("seal checksum fixture: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_payload_checksum_handoff_checks_candidates_clones_and_reopen() {
+        for policy in [
+            SnapshotIntegrityPolicy::FsVerity,
+            SnapshotIntegrityPolicy::PortableVerified,
+        ] {
+            let directory = fs_verity_snapshot_tempdir("payload-checksum-handoff-");
+            let path = directory.path().join("raw.sqlite");
+            let payload = (0..(70 * 1024))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let checksum: [u8; 32] = Sha256::digest(&payload).into();
+            std::fs::write(&path, &payload).expect("write checksum fixture");
+            let mut unsealed = PinnedSqliteFile::from_file(
+                std::fs::File::open(&path).expect("open unsealed fixture"),
+                path.clone(),
+            )
+            .expect("pin unsealed fixture");
+            assert!(unsealed.verify_and_bind_payload_checksum(checksum).is_err());
+            drop(unsealed);
+
+            let Some(mut pinned) =
+                sealed_payload_checksum_fixture_pin(&path, policy, Some(checksum)).await
+            else {
+                continue;
+            };
+            let cloned = pinned.try_clone().expect("clone verified raw source");
+            let reopened = PinnedSqliteFile::from_file_and_verify(
+                std::fs::File::open(&path).expect("independent raw open"),
+                path.clone(),
+                policy,
+            )
+            .expect("independent immutable admission");
+            let mut wrong = checksum;
+            wrong[0] ^= 1;
+            for source in [&pinned, &cloned, &reopened] {
+                source
+                    .verify_payload_checksum(checksum)
+                    .expect("exact admitted payload");
+                let error = source
+                    .verify_payload_checksum(wrong)
+                    .expect_err("different candidate checksum must fail");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    "extracted snapshot checksum differs from its envelope"
+                );
+            }
+            assert!(pinned.verify_and_bind_payload_checksum(wrong).is_err());
+            pinned
+                .verify_payload_checksum(checksum)
+                .expect("failed candidate does not replace successful proof");
+
+            let corrupt_path = directory.path().join("corrupt.sqlite");
+            let mut corrupt = payload;
+            corrupt[65 * 1024] ^= 1;
+            std::fs::write(&corrupt_path, &corrupt).expect("write corrupted tail");
+            let mut corrupt_pin = sealed_payload_checksum_fixture_pin(&corrupt_path, policy, None)
+                .await
+                .expect("same supported integrity policy");
+            assert!(corrupt_pin
+                .verify_and_bind_payload_checksum(checksum)
+                .is_err());
+            corrupt_pin
+                .verify_and_bind_payload_checksum(Sha256::digest(&corrupt).into())
+                .expect("failed first scan did not install a checksum proof");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_payload_checksum_handoff_rejects_identical_path_replacement() {
+        for policy in [
+            SnapshotIntegrityPolicy::FsVerity,
+            SnapshotIntegrityPolicy::PortableVerified,
+        ] {
+            let directory = fs_verity_snapshot_tempdir("payload-checksum-replacement-");
+            let path = directory.path().join("raw.sqlite");
+            let payload = b"exact original payload";
+            let checksum: [u8; 32] = Sha256::digest(payload).into();
+            std::fs::write(&path, payload).expect("write original payload");
+            let Some(pinned) =
+                sealed_payload_checksum_fixture_pin(&path, policy, Some(checksum)).await
+            else {
+                continue;
+            };
+            let cloned = pinned.try_clone().expect("clone original generation");
+            std::fs::remove_file(&path).expect("unlink original test source");
+            std::fs::write(&path, payload).expect("write identical foreign replacement");
+            assert!(pinned.verify_payload_checksum(checksum).is_err());
+            assert!(cloned.verify_payload_checksum(checksum).is_err());
+            let replacement = sealed_payload_checksum_fixture_pin(&path, policy, Some(checksum))
+                .await
+                .expect("independently sealed replacement");
+            replacement
+                .verify_payload_checksum(checksum)
+                .expect("new source requires its own completed admission");
+            assert!(pinned.verify_payload_checksum(checksum).is_err());
+            assert!(cloned.verify_payload_checksum(checksum).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_payload_checksum_handoff_rejects_changed_portable_generation() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().expect("portable checksum directory");
+        let path = directory.path().join("raw.sqlite");
+        let original = b"original portable payload";
+        let checksum: [u8; 32] = Sha256::digest(original).into();
+        std::fs::write(&path, original).expect("write portable payload");
+        let mut pinned = sealed_payload_checksum_fixture_pin(
+            &path,
+            SnapshotIntegrityPolicy::PortableVerified,
+            Some(checksum),
+        )
+        .await
+        .expect("portable verified source");
+        let cloned = pinned.try_clone().expect("clone portable proof");
+        let before = std::fs::metadata(&path).expect("original inode");
+        let mut changed = original.to_vec();
+        changed[0] ^= 1;
+        std::fs::write(&path, &changed).expect("mutate through a writable alias");
+        let after = std::fs::metadata(&path).expect("mutated inode");
+        assert_eq!(
+            (before.dev(), before.ino(), before.len()),
+            (after.dev(), after.ino(), after.len())
+        );
+        assert!(pinned.verify_payload_checksum(checksum).is_err());
+        assert!(cloned.verify_payload_checksum(checksum).is_err());
+
+        pinned
+            .seal_with_integrity(SnapshotIntegrityPolicy::PortableVerified)
+            .expect("capture a new generation through the held descriptor");
+        let changed_checksum: [u8; 32] = Sha256::digest(&changed).into();
+        pinned
+            .verify_and_bind_payload_checksum(changed_checksum)
+            .expect("new generation must not inherit the original checksum");
+        assert!(pinned.verify_payload_checksum(checksum).is_err());
+        assert!(cloned.verify_payload_checksum(changed_checksum).is_err());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open truncation alias")
+            .set_len(1)
+            .expect("change portable extent");
+        assert!(pinned.verify_payload_checksum(changed_checksum).is_err());
+    }
+
     async fn open_fixed_raw_read_store(
         directory: &FixedRawReadStoreFixture,
     ) -> (
@@ -9685,6 +10861,2620 @@ mod tests {
             },
             database,
         )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn open_private_snapshot_store(
+        directory: &FixedRawReadStoreFixture,
+        token: Arc<consensus::wal::integration::PrivateWalTest>,
+    ) -> io::Result<(
+        SqliteSessionBackend,
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+    )> {
+        let mut backend =
+            SqliteSessionBackend::open(directory.path().join("snapshot-cache.sqlite"))
+                .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        backend.private_wal_test = Some(Arc::clone(&token));
+        let lease = acquire_snapshot_directory_lease(
+            &backend,
+            &directory.snapshot_path().join("snapshots"),
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let members = fixed_raw_read_members();
+        let mut core = SqliteConsensusCore::initialize_with_admitted_snapshot_directory(
+            &backend,
+            lease.canonical_directory.clone(),
+            identity(1),
+            members.clone(),
+            fixed_raw_read_bindings(&members),
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(PlacementResiliencePolicy::AllowReducedResilience),
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        core.snapshot_integrity = SnapshotIntegrityPolicy::FsVerity;
+        // The same private attachment and scavenger used by the constructor.
+        // Earlier generic constructor migrations have their separate audit.
+        attach_private_wal_before_snapshot_cleanup(&mut core, &token, Arc::clone(&lease)).await?;
+        validate_and_clean_snapshot_directory(&core, Some(&lease))
+            .await
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        Ok((
+            backend,
+            SqliteConsensusLogStore {
+                core: core.clone(),
+                _snapshot_directory_lease: Arc::clone(&lease),
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+            },
+            SqliteConsensusStateMachine {
+                core,
+                _snapshot_directory_lease: lease,
+                membership_admission: None,
+                membership_observations: Arc::new(AtomicUsize::new(0)),
+                membership_observation_readback_witness: None,
+                membership_observations_before_readback: Arc::new(AtomicUsize::new(0)),
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+            },
+        ))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    fn private_snapshot_files(path: &Path) -> BTreeMap<String, ([u8; 32], u64)> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    (
+                        Sha256::digest(std::fs::read(entry.path()).unwrap()).into(),
+                        entry.metadata().unwrap().ino(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    // Construct large debug futures in separate boxed helpers so the test
+    // poll frame does not retain constructor/install temporaries while polling
+    // those operations. Runtime worker stack limits stay at their defaults.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    fn open_private_install_store<'a>(
+        directory: &'a FixedRawReadStoreFixture,
+        token: Arc<consensus::wal::integration::PrivateWalTest>,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                    Output = io::Result<(
+                        SqliteSessionBackend,
+                        SqliteConsensusLogStore,
+                        SqliteConsensusStateMachine,
+                    )>,
+                > + 'a,
+        >,
+    > {
+        Box::pin(open_private_snapshot_store(directory, token))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    fn install_private_snapshot<'a>(
+        machine: &'a mut SqliteConsensusStateMachine,
+        meta: &'a SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+        snapshot: Box<SessionSnapshotFile>,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = Result<(), StorageError<SessionConsensusNodeId>>> + 'a,
+        >,
+    > {
+        Box::pin(machine.install_snapshot(meta, snapshot))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    fn strict_private_install_snapshot() -> std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                Output = (FixedRawReadStoreFixture, Snapshot<SessionRaftTypeConfig>),
+            >,
+        >,
+    > {
+        Box::pin(async {
+            let directory = FixedRawReadStoreFixture::new();
+            let token = Arc::new(consensus::wal::integration::PrivateWalTest::new(
+                directory.path().join("wal"),
+                [0xE1; 32],
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry()],
+                "install source membership",
+            )
+            .await;
+            drop(
+                machine
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .unwrap(),
+            );
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [blank_entry(1), blank_entry(2)],
+                "install source successor",
+            )
+            .await;
+            let built = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+            assert_eq!(built.meta.last_log_id, Some(log_id(2)));
+            token.current().unwrap().shutdown().unwrap();
+            drop(machine);
+            drop(log);
+            drop(backend);
+            (directory, built)
+        })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn receive_private_install_snapshot(
+        machine: &mut SqliteConsensusStateMachine,
+        built: &mut Snapshot<SessionRaftTypeConfig>,
+    ) -> Box<SessionSnapshotFile> {
+        let mut receiving = machine.begin_receiving_snapshot().await.unwrap();
+        built.snapshot.rewind().await.unwrap();
+        tokio::io::copy(&mut built.snapshot, &mut receiving)
+            .await
+            .unwrap();
+        receiving.flush().await.unwrap();
+        receiving
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    fn private_install_selector(directory: &FixedRawReadStoreFixture) -> serde_json::Value {
+        let bytes = std::fs::read(directory.path().join("wal/CURRENT")).unwrap();
+        serde_json::from_slice(&bytes[8..bytes.len() - 32]).unwrap()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn native_install_keeps_runtime_progress_while_publication_is_held() {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+
+        let (_source_directory, mut incoming) = strict_private_install_snapshot().await;
+        let directory = FixedRawReadStoreFixture::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let armed = Arc::new(AtomicBool::new(false));
+        let made_progress = Arc::new(AtomicBool::new(false));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let progress_rx = std::sync::Mutex::new(progress_rx);
+        let hook_entered = Arc::clone(&entered);
+        let hook_armed = Arc::clone(&armed);
+        let hook_progress = Arc::clone(&made_progress);
+        let token = Arc::new(PrivateWalTest::new_native_with_hook(
+            directory.path().join("wal"),
+            [0xF1; 32],
+            Arc::new(move |point| {
+                if point == Point::BeforeBasisCreate && hook_armed.swap(false, Ordering::AcqRel) {
+                    hook_entered.notify_one();
+                    // Cleanup fallback only. Passing requires a separately
+                    // spawned runtime task to respond during the actual WAL
+                    // install, before this writer may select its successor.
+                    hook_progress.store(
+                        progress_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .is_ok(),
+                        Ordering::Release,
+                    );
+                }
+                Ok(())
+            }),
+        ));
+        let (backend, mut log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        let shutdown = track_admitted_sqlite_fixture(&mut log, &mut machine);
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry()],
+            "scheduler install predecessor",
+        )
+        .await;
+        let receiving = receive_private_install_snapshot(&mut machine, &mut incoming).await;
+        let observer_core = machine.core.clone();
+        shutdown.enable_runtime_write_handoff();
+        armed.store(true, Ordering::Release);
+        let meta = incoming.meta.clone();
+        let install = tokio::spawn(async move {
+            let result = install_private_snapshot(&mut machine, &meta, receiving).await;
+            (machine, result)
+        });
+        let observer_entered = Arc::clone(&entered);
+        let observer = tokio::spawn(async move {
+            observer_entered.notified().await;
+            let connection_held = observer_core.conn.try_lock().is_err();
+            let applied = *observer_core.applied_progress.borrow();
+            let _ = progress_tx.send(());
+            (connection_held, applied)
+        });
+        let (machine, installed) = install.await.unwrap();
+        // Reap the observer even if an earlier install error missed the hook.
+        // A late notification cannot change the hook's progress observation.
+        entered.notify_one();
+        let observation = observer.await.unwrap();
+        let applied = *machine.core.applied_progress.borrow();
+        let stopped = token.current().unwrap().shutdown();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        shutdown.wait().await;
+
+        installed.unwrap();
+        stopped.unwrap();
+        assert_eq!(applied, Some(log_id(2)));
+        assert!(
+            made_progress.load(Ordering::Acquire),
+            "the synchronous native install stranded unrelated Tokio work while waiting for its WAL writer"
+        );
+        assert_eq!(
+            observation,
+            (true, Some(log_id(0))),
+            "runtime progress must retain the original connection and unpublished applied frontier"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_durable_install_core_keeps_selected_origin_and_reclaims_superseded_artifacts_after_reopen(
+    ) {
+        let (_source_directory, mut incoming) = strict_private_install_snapshot().await;
+        let directory = FixedRawReadStoreFixture::new();
+        let token = Arc::new(consensus::wal::integration::PrivateWalTest::new_native(
+            directory.path().join("wal"),
+            [0xEF; 32],
+        ));
+        let (backend, mut log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        let receiving = receive_private_install_snapshot(&mut machine, &mut incoming).await;
+        install_private_snapshot(&mut machine, &incoming.meta, receiving)
+            .await
+            .unwrap();
+        let origin = token
+            .current()
+            .unwrap()
+            .native_retained_snapshots()
+            .unwrap()
+            .remove(0);
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(3)],
+            "native installed local successor",
+        )
+        .await;
+        let mut later = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let retained = token
+            .current()
+            .unwrap()
+            .native_retained_snapshots()
+            .unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0], origin);
+        assert_eq!(retained[1].0, later.meta);
+        assert_eq!(later.meta.last_log_id, Some(log_id(3)));
+        let snapshots = directory.snapshot_path().join("snapshots");
+        for snapshot in &retained {
+            assert!(snapshots.join(&snapshot.1).is_file());
+        }
+        // The next real receive/build/startup scavenger must keep both linked
+        // names. A retained descriptor alone does not prevent unlink.
+        validate_and_clean_snapshot_directory(
+            &machine.core,
+            Some(&machine._snapshot_directory_lease),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            private_snapshot_files(&snapshots)
+                .keys()
+                .filter(|name| name.ends_with(".opc"))
+                .count(),
+            2
+        );
+        let before = private_snapshot_files(&snapshots);
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        let (backend, mut log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        assert_eq!(
+            private_snapshot_files(&snapshots),
+            before,
+            "strict source derivation and startup cleanup preserve both exact linked inodes"
+        );
+        assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(3)));
+        assert_eq!(
+            machine.get_current_snapshot().await.unwrap().unwrap().meta,
+            later.meta
+        );
+        assert_eq!(
+            token
+                .current()
+                .unwrap()
+                .native_retained_snapshots()
+                .unwrap(),
+            retained
+        );
+        // Installing the actual later image replaces the origin. Only after
+        // that durable selection can the old origin become a cleanup orphan.
+        let receiving = receive_private_install_snapshot(&mut machine, &mut later).await;
+        install_private_snapshot(&mut machine, &later.meta, receiving)
+            .await
+            .unwrap();
+        drop(later);
+        let replacement = token
+            .current()
+            .unwrap()
+            .native_retained_snapshots()
+            .unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_ne!(replacement[0].1, origin.1);
+        assert_ne!(replacement[0].1, retained[1].1);
+        validate_and_clean_snapshot_directory(
+            &machine.core,
+            Some(&machine._snapshot_directory_lease),
+        )
+        .await
+        .unwrap();
+        let names = private_snapshot_files(&snapshots);
+        assert!(!names.contains_key(&origin.1));
+        assert!(!names.contains_key(&retained[1].1));
+        assert!(names.contains_key(&replacement[0].1));
+        assert_eq!(
+            names.keys().filter(|name| name.ends_with(".opc")).count(),
+            1,
+            "superseded origin and current reclaim through the original identity-bound cleanup"
+        );
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(4)],
+            "native replacement successor",
+        )
+        .await;
+        let built = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(built.meta.last_log_id, Some(log_id(4)));
+        drop(built);
+        let final_retained = token
+            .current()
+            .unwrap()
+            .native_retained_snapshots()
+            .unwrap();
+        assert_eq!(final_retained.len(), 2);
+        assert_eq!(final_retained[0], replacement[0]);
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        let (backend, log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(4)));
+        assert_eq!(
+            token
+                .current()
+                .unwrap()
+                .native_retained_snapshots()
+                .unwrap(),
+            final_retained
+        );
+        assert_eq!(
+            token
+                .current()
+                .unwrap()
+                .native_sql_fallback_count()
+                .unwrap(),
+            0
+        );
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_install_transfers_strict_images_and_reopens() {
+        let (_source_directory, mut built) = strict_private_install_snapshot().await;
+        for empty in [true, false] {
+            let directory = FixedRawReadStoreFixture::new();
+            let token = Arc::new(consensus::wal::integration::PrivateWalTest::new(
+                directory.path().join("wal"),
+                [0xE2; 32],
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            if !empty {
+                append_commit_and_apply(
+                    &mut log,
+                    &mut machine,
+                    [fixed_initial_membership_entry(), blank_entry(1)],
+                    "install target predecessor",
+                )
+                .await;
+                log.blocking_append([blank_entry(2), blank_entry(3)])
+                    .await
+                    .unwrap();
+            }
+            // The sequential SQL WAL initially selects basis.sqlite directly;
+            // CURRENT first exists after a checkpoint or snapshot handoff.
+            // Publish a real selector before requiring its exact sequence.
+            token.current().unwrap().checkpoint().unwrap();
+            let sequence = private_install_selector(&directory)["position"]["sequence"].clone();
+            // CURRENT may precede ordinary WAL acknowledgements. Remember the
+            // physical sequence after the handoff, then require a repeat to
+            // remain at exactly that sequence with a fresh local incarnation.
+            let mut last_sequence = None;
+            let mut last_epoch = None;
+            for _ in 0..2 {
+                let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
+                install_private_snapshot(&mut machine, &built.meta, receiving)
+                    .await
+                    .unwrap();
+                let selector = private_install_selector(&directory);
+                let installed_sequence = selector["position"]["sequence"].as_u64().unwrap();
+                if empty {
+                    assert_eq!(installed_sequence, 0);
+                    assert_eq!(sequence, 0);
+                }
+                if let Some(previous) = last_sequence {
+                    assert_eq!(installed_sequence, previous);
+                }
+                last_sequence = Some(installed_sequence);
+                let origin = &selector["cuts"][installed_sequence.to_string()]["installed"];
+                assert_eq!(origin["epoch"], selector["epoch"]);
+                assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(2)));
+                assert_eq!(
+                    machine.get_current_snapshot().await.unwrap().unwrap().meta,
+                    built.meta
+                );
+                let conn = machine.core.conn.lock().await;
+                assert_eq!(
+                    consensus::read_committed_sync(&conn, identity(1)).unwrap(),
+                    Some(log_id(2))
+                );
+                assert_eq!(
+                    conn.query_row::<u64, _, _>("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap(),
+                    0
+                );
+                let restore = crate::sqlite::ops::read_restore_scan_state_sync(&conn).unwrap();
+                if let Some(previous) = last_epoch {
+                    assert_ne!(restore.0, previous);
+                }
+                last_epoch = Some(restore.0);
+            }
+            token.current().unwrap().shutdown().unwrap();
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let (backend, mut log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                machine.get_current_snapshot().await.unwrap().unwrap().meta,
+                built.meta
+            );
+            if empty {
+                log.blocking_append([blank_entry(3)]).await.unwrap();
+            }
+            assert_eq!(
+                log.try_get_log_entries(0..4).await.unwrap(),
+                vec![blank_entry(3)]
+            );
+            log.save_committed(Some(log_id(3))).await.unwrap();
+            machine.apply([blank_entry(3)]).await.unwrap();
+            let successor = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+            assert_eq!(successor.meta.last_log_id, Some(log_id(3)));
+            drop(successor);
+            token.current().unwrap().shutdown().unwrap();
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let (backend, log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(3)));
+            token.current().unwrap().shutdown().unwrap();
+            drop(machine);
+            drop(log);
+            drop(backend);
+            eprintln!(
+                "SEQUENTIAL_WAL_INSTALL_CASE {}",
+                serde_json::json!({"case":"actual_strict_transfer_repeat_reopen", "initially_empty":empty, "fs_verity":true, "repeat_same_sequence":true, "fresh_incarnation":true, "retained_suffix_and_successor":true, "successor_snapshot_reopen":true})
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_install_recovers_actual_published_source_after_faults() {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+        let (_source_directory, mut built) = strict_private_install_snapshot().await;
+        for (point, occurrence, committed) in [
+            (Point::AfterSnapshotProofRename, 1, false),
+            (Point::BeforeSnapshotCacheWrite, 1, false),
+            (Point::BeforeSnapshotCacheCommit, 1, false),
+            (Point::AfterSnapshotCacheCommit, 1, true),
+            (Point::AfterBasisSelectorRename, 2, true),
+            (Point::AfterSnapshotProofUnlink, 1, true),
+        ] {
+            eprintln!(
+                "SEQUENTIAL_WAL_INSTALL_PHASE {}",
+                serde_json::json!({"test":"actual_install_fault_rederive", "point":format!("{point:?}"), "phase":"prepare_target"})
+            );
+            let directory = FixedRawReadStoreFixture::new();
+            let armed = Arc::new(AtomicBool::new(false));
+            let hook_armed = Arc::clone(&armed);
+            let observed = Arc::new(AtomicUsize::new(0));
+            let hook_observed = Arc::clone(&observed);
+            let token = Arc::new(PrivateWalTest::with_snapshot_hook(
+                directory.path().join("wal"),
+                [0xE3; 32],
+                Arc::new(move |actual| {
+                    if actual == point
+                        && hook_armed.load(Ordering::SeqCst)
+                        && hook_observed.fetch_add(1, Ordering::SeqCst) + 1 == occurrence
+                    {
+                        hook_armed.store(false, Ordering::SeqCst);
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    Ok(())
+                }),
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry(), blank_entry(1)],
+                "install fault predecessor",
+            )
+            .await;
+            drop(
+                machine
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .unwrap(),
+            );
+            let previous = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            log.blocking_append([blank_entry(2), blank_entry(3)])
+                .await
+                .unwrap();
+            let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
+            eprintln!(
+                "SEQUENTIAL_WAL_INSTALL_PHASE {}",
+                serde_json::json!({"test":"actual_install_fault_rederive", "point":format!("{point:?}"), "phase":"install"})
+            );
+            armed.store(true, Ordering::SeqCst);
+            assert!(
+                install_private_snapshot(&mut machine, &built.meta, receiving)
+                    .await
+                    .is_err(),
+                "{point:?}"
+            );
+            assert_eq!(
+                observed.load(Ordering::SeqCst),
+                occurrence,
+                "{point:?}: actual phase executed"
+            );
+            assert!(machine.applied_state().await.is_err());
+            assert!(machine.begin_receiving_snapshot().await.is_err());
+            assert!(log.save_committed(Some(log_id(2))).await.is_err());
+            let snapshots = directory.snapshot_path().join("snapshots");
+            let before = private_snapshot_files(&snapshots);
+            assert_eq!(
+                before.keys().filter(|name| name.ends_with(".opc")).count(),
+                2,
+                "actual published cleanup retains both inputs"
+            );
+            assert!(before.contains_key(&previous.1));
+            assert!(token.current().unwrap().shutdown().is_err());
+            drop(machine);
+            drop(log);
+            drop(backend);
+            eprintln!(
+                "SEQUENTIAL_WAL_INSTALL_PHASE {}",
+                serde_json::json!({"test":"actual_install_fault_rederive", "point":format!("{point:?}"), "phase":"reopen"})
+            );
+            let pending_install_proof = directory.path().join("wal/SNAPSHOT.pending").exists();
+            assert_eq!(
+                pending_install_proof,
+                point != Point::AfterSnapshotProofUnlink
+            );
+            // A pending install has no live InstallSource and must derive
+            // RAW from the retained sealed envelope. Proof-unlinked recovery
+            // instead opens the already completed selected installation.
+            let (backend, mut log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap_or_else(|error| panic!("{point:?}: {error}"));
+            assert_eq!(
+                machine.applied_state().await.unwrap().0,
+                Some(log_id(if committed { 2 } else { 1 }))
+            );
+            assert_eq!(
+                machine.get_current_snapshot().await.unwrap().unwrap().meta,
+                if committed {
+                    built.meta.clone()
+                } else {
+                    previous.0
+                }
+            );
+            assert!(!directory.path().join("wal/SNAPSHOT.pending").exists());
+            assert!(
+                !private_snapshot_files(&snapshots)
+                    .keys()
+                    .any(|name| name.starts_with("install-")),
+                "recovery derivative and sidecars reclaimed by exact owner"
+            );
+            if !committed {
+                let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
+                install_private_snapshot(&mut machine, &built.meta, receiving)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                log.try_get_log_entries(0..4).await.unwrap(),
+                vec![blank_entry(3)]
+            );
+            log.save_committed(Some(log_id(3))).await.unwrap();
+            machine.apply([blank_entry(3)]).await.unwrap();
+            token.current().unwrap().checkpoint().unwrap();
+            token.current().unwrap().shutdown().unwrap();
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let (backend, log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(3)));
+            token.current().unwrap().shutdown().unwrap();
+            drop(machine);
+            drop(log);
+            drop(backend);
+            eprintln!(
+                "SEQUENTIAL_WAL_INSTALL_CASE {}",
+                serde_json::json!({"case":"actual_install_fault_rederive", "point":format!("{point:?}"), "occurrence":occurrence, "cache_committed":committed, "fs_verity":true, "actual_cleanup_candidate_retained":true, "pending_install_proof_before_reopen":pending_install_proof, "raw_rederived_on_reopen":pending_install_proof, "completed_selected_image_recovery":!pending_install_proof, "exact_old_or_new":true, "successor_checkpoint_reopen":true})
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_install_rejects_external_damage_before_repair_or_cleanup() {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+        let (_source_directory, mut built) = strict_private_install_snapshot().await;
+        for damage in [
+            "missing_candidate",
+            "unsealed_candidate",
+            "missing_predecessor",
+            "bounded_derivation",
+        ] {
+            let directory = FixedRawReadStoreFixture::new();
+            let token = Arc::new(PrivateWalTest::with_snapshot_failure(
+                directory.path().join("wal"),
+                [0xE4; 32],
+                Point::AfterSnapshotCacheCommit,
+                2,
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry(), blank_entry(1)],
+                "install damaged predecessor",
+            )
+            .await;
+            drop(
+                machine
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .unwrap(),
+            );
+            let previous = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
+            assert!(
+                install_private_snapshot(&mut machine, &built.meta, receiving)
+                    .await
+                    .is_err()
+            );
+            let candidate = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(candidate.0, built.meta);
+            assert!(token.current().unwrap().shutdown().is_err());
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let snapshots = directory.snapshot_path().join("snapshots");
+            if damage == "bounded_derivation" {
+                // Known temporary names still count before any scavenging.
+                for _ in
+                    private_snapshot_files(&snapshots).len()..(SNAPSHOT_DIRECTORY_MAX_ENTRIES - 3)
+                {
+                    std::fs::write(
+                        snapshots.join(format!("install-{}.sqlite", uuid::Uuid::new_v4())),
+                        b"retained evidence",
+                    )
+                    .unwrap();
+                }
+            } else {
+                let target = snapshots.join(if damage == "missing_predecessor" {
+                    &previous.1
+                } else {
+                    &candidate.1
+                });
+                let bytes = std::fs::read(&target).unwrap();
+                std::fs::remove_file(&target).unwrap();
+                if damage == "unsealed_candidate" {
+                    std::fs::write(&target, bytes).unwrap();
+                }
+            }
+            let wal_before = private_snapshot_files(&directory.path().join("wal"));
+            let snapshots_before = private_snapshot_files(&snapshots);
+            let cache_before = crate::sqlite::consensus::wal::application::full_image_digest(
+                &rusqlite::Connection::open(directory.path().join("snapshot-cache.sqlite"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .is_err(),
+                "{damage}"
+            );
+            assert_eq!(
+                private_snapshot_files(&directory.path().join("wal")),
+                wal_before
+            );
+            assert_eq!(
+                private_snapshot_files(&snapshots),
+                snapshots_before,
+                "{damage}: all evidence names, inodes and bytes preserved"
+            );
+            assert_eq!(
+                crate::sqlite::consensus::wal::application::full_image_digest(
+                    &rusqlite::Connection::open(directory.path().join("snapshot-cache.sqlite"))
+                        .unwrap()
+                )
+                .unwrap(),
+                cache_before
+            );
+            eprintln!(
+                "SEQUENTIAL_WAL_INSTALL_CASE {}",
+                serde_json::json!({"case":"actual_install_external_damage", "damage":damage, "fs_verity_required":true, "bounded_derivation":true, "cache_wal_snapshot_evidence_preserved":true})
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_install_source_and_cache_races_fence_exact_owner() {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+        let (_source_directory, mut built) = strict_private_install_snapshot().await;
+        for case in [
+            "foreign_before_cache_write",
+            "foreign_after_cache_commit",
+            "foreign_during_transaction",
+            "source_before_cache_commit",
+            "source_after_cache_commit",
+        ] {
+            let directory = FixedRawReadStoreFixture::new();
+            let database = directory.path().join("snapshot-cache.sqlite");
+            let snapshots = directory.snapshot_path().join("snapshots");
+            let hook_database = database.clone();
+            let hook_snapshots = snapshots.clone();
+            let armed = Arc::new(AtomicBool::new(false));
+            let hook_armed = Arc::clone(&armed);
+            let observed = Arc::new(AtomicUsize::new(0));
+            let hook_observed = Arc::clone(&observed);
+            let boundary = match case {
+                "foreign_before_cache_write" => Point::BeforeSnapshotCacheWrite,
+                "foreign_after_cache_commit" | "source_after_cache_commit" => {
+                    Point::AfterSnapshotCacheCommit
+                }
+                _ => Point::BeforeSnapshotCacheCommit,
+            };
+            let token = Arc::new(PrivateWalTest::with_snapshot_hook(
+                directory.path().join("wal"),
+                [0xE5; 32],
+                Arc::new(move |point| {
+                    if point != boundary || !hook_armed.swap(false, Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    if case.starts_with("source_") {
+                        let candidate = std::fs::read_dir(&hook_snapshots)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().path())
+                            .find(|path| {
+                                path.extension().is_some_and(|extension| extension == "opc")
+                            })
+                            .unwrap();
+                        let bytes = std::fs::read(&candidate).unwrap();
+                        std::fs::rename(&candidate, hook_snapshots.join("retained-source.opc"))
+                            .unwrap();
+                        std::fs::write(&candidate, bytes).unwrap();
+                    } else {
+                        let foreign = rusqlite::Connection::open(&hook_database).unwrap();
+                        foreign.busy_timeout(Duration::ZERO).unwrap();
+                        let result = foreign.execute_batch("CREATE TABLE wal_install_foreign_write(value INTEGER NOT NULL); INSERT INTO wal_install_foreign_write VALUES (7)");
+                        if case == "foreign_during_transaction" {
+                            assert!(
+                                matches!(result, Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy)
+                            );
+                        } else {
+                            result.unwrap();
+                        }
+                    }
+                    hook_observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry(), blank_entry(1)],
+                "install race predecessor",
+            )
+            .await;
+            let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
+            armed.store(true, Ordering::SeqCst);
+            let result = install_private_snapshot(&mut machine, &built.meta, receiving).await;
+            assert_eq!(
+                observed.load(Ordering::SeqCst),
+                1,
+                "{case}: actual boundary executed"
+            );
+            let intact = case == "foreign_during_transaction";
+            if intact {
+                result.unwrap();
+                assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(2)));
+                token.current().unwrap().shutdown().unwrap();
+            } else {
+                assert!(result.is_err(), "{case}");
+                assert!(machine.applied_state().await.is_err());
+                assert!(log.save_committed(Some(log_id(2))).await.is_err());
+                assert!(token.current().unwrap().shutdown().is_err());
+            }
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let wal_before = private_snapshot_files(&directory.path().join("wal"));
+            let snapshots_before = private_snapshot_files(&snapshots);
+            let cache_before = consensus::wal::application::full_image_digest(
+                &rusqlite::Connection::open(&database).unwrap(),
+            )
+            .unwrap();
+            if intact {
+                let (backend, mut log, mut machine) =
+                    open_private_install_store(&directory, Arc::clone(&token))
+                        .await
+                        .unwrap();
+                append_commit_and_apply(
+                    &mut log,
+                    &mut machine,
+                    [blank_entry(3)],
+                    "install race successor",
+                )
+                .await;
+                token.current().unwrap().shutdown().unwrap();
+                drop(machine);
+                drop(log);
+                drop(backend);
+            } else {
+                assert!(
+                    open_private_install_store(&directory, Arc::clone(&token))
+                        .await
+                        .is_err(),
+                    "{case}"
+                );
+                assert_eq!(
+                    private_snapshot_files(&directory.path().join("wal")),
+                    wal_before
+                );
+                assert_eq!(private_snapshot_files(&snapshots), snapshots_before);
+                assert_eq!(
+                    consensus::wal::application::full_image_digest(
+                        &rusqlite::Connection::open(&database).unwrap()
+                    )
+                    .unwrap(),
+                    cache_before
+                );
+            }
+            eprintln!(
+                "SEQUENTIAL_WAL_INSTALL_CASE {}",
+                serde_json::json!({"case":"actual_install_source_cache_race", "boundary":case, "boundary_executed":true, "strict_fs_verity":true, "foreign_writer_excluded":intact, "successor_reopen":intact, "fenced_evidence_preserved":!intact})
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_install_committed_detach_failure_stays_fenced() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let (_source_directory, mut built) = strict_private_install_snapshot().await;
+        let directory = FixedRawReadStoreFixture::new();
+        let token = Arc::new(consensus::wal::integration::PrivateWalTest::new(
+            directory.path().join("wal"),
+            [0xE6; 32],
+        ));
+        let (backend, log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&attempts);
+        {
+            let conn = machine.core.conn.lock().await;
+            conn.authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Detach { .. }) {
+                    hook_attempts.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }));
+        }
+        assert!(
+            install_private_snapshot(&mut machine, &built.meta, receiving)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "only the original detach cleanup attempts run; generic readback cannot revive the WAL"
+        );
+        assert!(machine.applied_state().await.is_err());
+        {
+            let conn = machine.core.conn.lock().await;
+            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+            assert_eq!(
+                consensus::read_applied_sync(&conn, identity(1)).unwrap(),
+                Some(log_id(2))
+            );
+        }
+        assert!(token.current().unwrap().shutdown().is_err());
+        drop(machine);
+        drop(log);
+        drop(backend);
+        let (backend, mut log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(2)));
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(3)],
+            "install detach recovery successor",
+        )
+        .await;
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        eprintln!(
+            "SEQUENTIAL_WAL_INSTALL_CASE {}",
+            serde_json::json!({"case":"actual_install_committed_detach_failure", "original_attempts":2, "fenced_readback_stays_error":true, "strict_rederive_reopen_successor":true})
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_install_publishes_progress_before_concurrent_purge() {
+        let (_source_directory, mut built) = strict_private_install_snapshot().await;
+        let directory = FixedRawReadStoreFixture::new();
+        let token = Arc::new(consensus::wal::integration::PrivateWalTest::new(
+            directory.path().join("wal"),
+            [0xE7; 32],
+        ));
+        let (backend, mut log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry()],
+            "install purge predecessor",
+        )
+        .await;
+        let receiving = receive_private_install_snapshot(&mut machine, &mut built).await;
+        let recovery_consumer = log.live_terminal_recovery_handoff_consumer();
+        let purge = tokio::spawn(async move {
+            let result = log.purge(log_id(2)).await;
+            (log, result)
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while machine.core.applied_progress.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let gate_guard = SnapshotInstallAppliedProgressGateGuard::install(
+            machine.core.snapshot_dir.as_ref().clone(),
+            Arc::clone(&gate),
+        );
+        let meta = built.meta.clone();
+        let mut installer = machine.clone();
+        let install =
+            tokio::spawn(async move { installer.install_snapshot(&meta, receiving).await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .unwrap();
+        assert_eq!(*machine.core.applied_progress.borrow(), Some(log_id(2)));
+        let mut recovery_gate = tokio::spawn(async move { recovery_consumer.acquire_gate().await });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut recovery_gate).await.is_err(), "original live recovery gate excludes a competing recovery owner throughout install cleanup");
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), machine.core.conn.lock())
+                .await
+                .unwrap(),
+        );
+        let (mut log, purge_result) = tokio::time::timeout(Duration::from_secs(5), purge)
+            .await
+            .unwrap()
+            .unwrap();
+        purge_result.unwrap();
+        assert!(
+            !install.is_finished(),
+            "matching purge completes while install cleanup is still gated"
+        );
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), install)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), recovery_gate)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        drop(gate_guard);
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(3)],
+            "install purge successor",
+        )
+        .await;
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        let (backend, log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(3)));
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        eprintln!(
+            "SEQUENTIAL_WAL_INSTALL_CASE {}",
+            serde_json::json!({"case":"actual_install_concurrent_purge", "fs_verity":true, "connection_and_prune_permit_released":true, "matching_purge_completed_before_install_cleanup":true, "original_live_recovery_gate_excludes_competing_owner":true, "successor_reopen":true})
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_builder_publishes_two_strict_images_and_reopens() {
+        let directory = FixedRawReadStoreFixture::new();
+        let token = Arc::new(consensus::wal::integration::PrivateWalTest::new(
+            directory.path().join("wal"),
+            [0xD1; 32],
+        ));
+        let (backend, mut log, mut machine) =
+            open_private_snapshot_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry()],
+            "snapshot membership",
+        )
+        .await;
+        let first = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(first.meta.last_log_id, Some(log_id(0)));
+        {
+            let conn = machine.core.conn.lock().await;
+            assert_eq!(
+                conn.query_row::<u64, _, _>("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get(0))
+                    .unwrap(),
+                0,
+                "first snapshot physically compacts the cache"
+            );
+        }
+        drop(first);
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(1)],
+            "snapshot successor cut",
+        )
+        .await;
+        let second = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let metadata = {
+            let conn = machine.core.conn.lock().await;
+            assert_eq!(
+                conn.query_row::<u64, _, _>("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get(0))
+                    .unwrap(),
+                0,
+                "second snapshot physically compacts the cache"
+            );
+            consensus::read_current_snapshot_sync(&conn, identity(1))
+                .unwrap()
+                .unwrap()
+        };
+        let selector = std::fs::read(directory.path().join("wal/CURRENT")).unwrap();
+        let selector: serde_json::Value =
+            serde_json::from_slice(&selector[8..selector.len() - 32]).unwrap();
+        let basis = rusqlite::Connection::open_with_flags(
+            directory.path().join("wal").join(format!(
+                "basis-{:020}.sqlite",
+                selector["epoch"].as_u64().unwrap()
+            )),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            basis
+                .query_row::<u64, _, _>("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+                .unwrap(),
+            0,
+            "selected basis has the same compacted physical prefix"
+        );
+        assert_eq!(
+            consensus::read_purged_sync(&basis, identity(1)).unwrap(),
+            Some(log_id(1))
+        );
+        drop(basis);
+        let path = directory
+            .snapshot_path()
+            .join("snapshots")
+            .join(&metadata.1);
+        let portable = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert!(!portable.query_row::<bool, _, _>("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'consensus_wal_application')", [], |row| row.get(0)).unwrap(), "local cache lineage never leaks into the portable image");
+        drop(portable);
+        log.purge(log_id(1)).await.unwrap();
+        assert_eq!(second.meta, metadata.0);
+        drop(second);
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        let (backend, mut log, mut machine) =
+            open_private_snapshot_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        assert_eq!(
+            machine.get_current_snapshot().await.unwrap().unwrap().meta,
+            metadata.0
+        );
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(2)],
+            "post-snapshot application",
+        )
+        .await;
+        assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(2)));
+        token.current().unwrap().shutdown().unwrap();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        eprintln!(
+            "SEQUENTIAL_WAL_SNAPSHOT_CASE {}",
+            serde_json::json!({"case":"actual_builder_two_strict_images", "fs_verity":true, "portable_marker_absent":true, "logical_purge_and_reopen":true, "original_later_apply":true})
+        );
+        eprintln!(
+            "SEQUENTIAL_WAL_COMPACTION_CASE {}",
+            serde_json::json!({"case":"actual_builder_two_strict_images", "fs_verity":true, "both_cache_prefixes_compacted":true, "selected_basis_raw_rows":0, "exact_reopen_and_original_later_apply":true})
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_source_and_cache_races_preserve_exact_ownership() {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+        const FOREIGN_SQL: &str = "CREATE TABLE wal_snapshot_foreign_write(value INTEGER NOT NULL); INSERT INTO wal_snapshot_foreign_write VALUES (7)";
+        struct ReleaseCapture(Arc<consensus::SnapshotCaptureGate>);
+        impl Drop for ReleaseCapture {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        for case in [
+            "during_source_cut",
+            "after_source_capture",
+            "before_cache_write",
+            "after_cache_commit",
+            "during_cache_transaction",
+            "legitimate_apply_after_capture",
+        ] {
+            let directory = FixedRawReadStoreFixture::new();
+            let database = directory.path().join("snapshot-cache.sqlite");
+            let hook_path = database.clone();
+            let armed = Arc::new(AtomicBool::new(false));
+            let hook_armed = Arc::clone(&armed);
+            let observed = Arc::new(AtomicUsize::new(0));
+            let hook_observed = Arc::clone(&observed);
+            let boundary = match case {
+                "during_source_cut" => Some(Point::AfterSnapshotSourceCut),
+                "before_cache_write" => Some(Point::BeforeSnapshotCacheWrite),
+                "after_cache_commit" => Some(Point::AfterSnapshotCacheCommit),
+                "during_cache_transaction" => Some(Point::BeforeSnapshotCacheCommit),
+                _ => None,
+            };
+            let token = Arc::new(PrivateWalTest::with_snapshot_hook(
+                directory.path().join("wal"),
+                [0xD4; 32],
+                Arc::new(move |point| {
+                    if Some(point) != boundary || !hook_armed.swap(false, Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    let foreign = rusqlite::Connection::open(&hook_path).unwrap();
+                    foreign.busy_timeout(Duration::ZERO).unwrap();
+                    let result = foreign.execute_batch(FOREIGN_SQL);
+                    if case == "during_cache_transaction" {
+                        assert!(
+                            matches!(result, Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy),
+                            "the cache Immediate transaction excludes the foreign writer"
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                    hook_observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_snapshot_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry()],
+                "race initial membership",
+            )
+            .await;
+            drop(
+                machine
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .unwrap(),
+            );
+            let previous = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            armed.store(true, Ordering::SeqCst);
+            let capture = backend.snapshot_capture_gate();
+            let _release = ReleaseCapture(Arc::clone(&capture));
+            let after_capture = matches!(
+                case,
+                "after_source_capture" | "legitimate_apply_after_capture"
+            );
+            if after_capture {
+                capture.arm();
+            }
+            let mut builder = machine.get_snapshot_builder().await;
+            let building = tokio::spawn(async move { builder.build_snapshot().await });
+            if after_capture {
+                tokio::time::timeout(Duration::from_secs(5), capture.wait_started())
+                    .await
+                    .unwrap();
+                if case == "legitimate_apply_after_capture" {
+                    append_commit_and_apply(
+                        &mut log,
+                        &mut machine,
+                        [blank_entry(1)],
+                        "apply after immutable source cut",
+                    )
+                    .await;
+                    assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(1)));
+                } else {
+                    rusqlite::Connection::open(&database)
+                        .unwrap()
+                        .execute_batch(FOREIGN_SQL)
+                        .unwrap();
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                capture.release();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(20), building)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                observed.load(Ordering::SeqCst),
+                1,
+                "{case}: intended boundary executed once"
+            );
+            let intact = matches!(
+                case,
+                "during_cache_transaction" | "legitimate_apply_after_capture"
+            );
+            let metadata = {
+                let conn = machine.core.conn.lock().await;
+                let foreign_table = conn.query_row::<bool, _, _>("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'wal_snapshot_foreign_write')", [], |row| row.get(0)).unwrap();
+                assert_eq!(foreign_table, !intact);
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            if intact {
+                let snapshot = result.unwrap();
+                assert_eq!(
+                    snapshot.meta.last_log_id,
+                    Some(log_id(0)),
+                    "the portable source retains its captured cut"
+                );
+                assert_eq!(snapshot.meta, metadata.0);
+                drop(snapshot);
+                if case == "during_cache_transaction" {
+                    append_commit_and_apply(
+                        &mut log,
+                        &mut machine,
+                        [blank_entry(1)],
+                        "apply after excluded foreign writer",
+                    )
+                    .await;
+                }
+                assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(1)));
+                token.current().unwrap().shutdown().unwrap();
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{case}: a racing foreign commit cannot publish success"
+                );
+                assert!(machine.applied_state().await.is_err());
+                assert!(machine.get_current_snapshot().await.is_err());
+                assert!(log.save_committed(Some(log_id(0))).await.is_err());
+                if case == "after_cache_commit" {
+                    assert_ne!(metadata, previous);
+                } else {
+                    assert_eq!(metadata, previous);
+                }
+                assert!(token.current().unwrap().shutdown().is_err());
+            }
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let wal_before = private_snapshot_files(&directory.path().join("wal"));
+            let snapshots_before =
+                private_snapshot_files(&directory.snapshot_path().join("snapshots"));
+            if intact {
+                let (backend, mut log, mut machine) =
+                    open_private_snapshot_store(&directory, Arc::clone(&token))
+                        .await
+                        .unwrap();
+                assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(1)));
+                assert_eq!(
+                    machine.get_current_snapshot().await.unwrap().unwrap().meta,
+                    metadata.0
+                );
+                append_commit_and_apply(
+                    &mut log,
+                    &mut machine,
+                    [blank_entry(2)],
+                    "race control reopen successor",
+                )
+                .await;
+                token.current().unwrap().shutdown().unwrap();
+                drop(machine);
+                drop(log);
+                drop(backend);
+            } else {
+                assert!(open_private_snapshot_store(&directory, Arc::clone(&token))
+                    .await
+                    .is_err());
+                assert_eq!(
+                    private_snapshot_files(&directory.path().join("wal")),
+                    wal_before
+                );
+                assert_eq!(
+                    private_snapshot_files(&directory.snapshot_path().join("snapshots")),
+                    snapshots_before
+                );
+                let damaged = rusqlite::Connection::open(&database).unwrap();
+                assert_eq!(
+                    damaged
+                        .query_row::<u64, _, _>(
+                            "SELECT value FROM wal_snapshot_foreign_write",
+                            [],
+                            |row| row.get(0)
+                        )
+                        .unwrap(),
+                    7
+                );
+            }
+            eprintln!(
+                "SEQUENTIAL_WAL_SNAPSHOT_CASE {}",
+                serde_json::json!({"case":"actual_builder_source_cache_race", "boundary":case, "boundary_executed":true, "intact_control":intact, "reopen_successor":intact, "foreign_commit_fenced_and_evidence_preserved":!intact, "strict_fs_verity_builder":true})
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_builder_retains_actual_cleanup_candidate_on_handoff_fault() {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+        for point in [
+            Point::AfterSnapshotProofRename,
+            Point::AfterSnapshotProofDirectorySync,
+            Point::BeforeSnapshotCacheWrite,
+            Point::AfterSnapshotCacheCommit,
+            Point::AfterBasisSelectorRename,
+            Point::AfterSnapshotProofUnlink,
+        ] {
+            let directory = FixedRawReadStoreFixture::new();
+            let occurrence = if point == Point::AfterBasisSelectorRename {
+                4
+            } else {
+                2
+            };
+            let token = Arc::new(PrivateWalTest::with_snapshot_failure(
+                directory.path().join("wal"),
+                [0xD2; 32],
+                point,
+                occurrence,
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_snapshot_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry()],
+                "fault predecessor membership",
+            )
+            .await;
+            let first = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+            drop(first);
+            let previous = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [blank_entry(1)],
+                "fault successor cut",
+            )
+            .await;
+            assert!(
+                machine
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .is_err(),
+                "{point:?}: fenced WAL cannot be revived by metadata readback"
+            );
+            let snapshots = directory.snapshot_path().join("snapshots");
+            let names = std::fs::read_dir(&snapshots)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.ends_with(".opc"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names.len(),
+                2,
+                "{point:?}: actual published_cleanup retained both descriptors"
+            );
+            assert!(names.contains(&previous.1));
+            assert!(machine.get_current_snapshot().await.is_err());
+            assert!(machine.applied_state().await.is_err());
+            assert!(log.save_committed(Some(log_id(1))).await.is_err());
+            let files_before = private_snapshot_files(&snapshots);
+            assert!(machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .is_err());
+            assert_eq!(
+                private_snapshot_files(&snapshots),
+                files_before,
+                "fenced builder cannot scavenge pending evidence"
+            );
+            let expected = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert!(token.current().unwrap().shutdown().is_err());
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let (backend, mut log, mut machine) =
+                open_private_snapshot_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap_or_else(|error| panic!("{point:?}: {error}"));
+            assert_eq!(
+                machine.get_current_snapshot().await.unwrap().unwrap().meta,
+                expected.0
+            );
+            let successor = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+            assert_eq!(successor.meta.last_log_id, Some(log_id(1)));
+            drop(successor);
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [blank_entry(2)],
+                "fault recovery successor",
+            )
+            .await;
+            token.current().unwrap().shutdown().unwrap();
+            drop(machine);
+            drop(log);
+            drop(backend);
+            eprintln!(
+                "SEQUENTIAL_WAL_SNAPSHOT_CASE {}",
+                serde_json::json!({"case":"actual_builder_fault", "point":format!("{point:?}"), "actual_cleanup_candidate_retained":true, "fenced_readback_stays_error":true, "strict_recovery_and_successor":true})
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_snapshot_pending_reopen_verifies_both_external_descriptors_before_cleanup(
+    ) {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+        for damage in [
+            "missing_candidate",
+            "unsealed_candidate",
+            "missing_predecessor",
+        ] {
+            let directory = FixedRawReadStoreFixture::new();
+            let token = Arc::new(PrivateWalTest::with_snapshot_failure(
+                directory.path().join("wal"),
+                [0xD3; 32],
+                Point::AfterSnapshotCacheCommit,
+                2,
+            ));
+            let (backend, mut log, mut machine) =
+                open_private_snapshot_store(&directory, Arc::clone(&token))
+                    .await
+                    .unwrap();
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [fixed_initial_membership_entry()],
+                "descriptor predecessor",
+            )
+            .await;
+            drop(
+                machine
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .unwrap(),
+            );
+            let previous = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            append_commit_and_apply(
+                &mut log,
+                &mut machine,
+                [blank_entry(1)],
+                "descriptor successor",
+            )
+            .await;
+            assert!(machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .is_err());
+            let candidate = {
+                let conn = machine.core.conn.lock().await;
+                consensus::read_current_snapshot_sync(&conn, identity(1))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_ne!(candidate.1, previous.1);
+            assert!(token.current().unwrap().shutdown().is_err());
+            drop(machine);
+            drop(log);
+            drop(backend);
+            let snapshots = directory.snapshot_path().join("snapshots");
+            let target = snapshots.join(if damage == "missing_predecessor" {
+                &previous.1
+            } else {
+                &candidate.1
+            });
+            let original = std::fs::read(&target).unwrap();
+            std::fs::remove_file(&target).unwrap();
+            if damage == "unsealed_candidate" {
+                std::fs::write(&target, original).unwrap();
+            }
+            let wal_before = private_snapshot_files(&directory.path().join("wal"));
+            let snapshots_before = private_snapshot_files(&snapshots);
+            assert!(
+                open_private_snapshot_store(&directory, Arc::clone(&token))
+                    .await
+                    .is_err(),
+                "{damage}"
+            );
+            assert_eq!(
+                private_snapshot_files(&directory.path().join("wal")),
+                wal_before
+            );
+            assert_eq!(
+                private_snapshot_files(&snapshots),
+                snapshots_before,
+                "{damage}: no scavenging precedes descriptor audit"
+            );
+            eprintln!(
+                "SEQUENTIAL_WAL_SNAPSHOT_CASE {}",
+                serde_json::json!({"case":"external_descriptor_damage", "damage":damage, "wal_and_snapshot_files_preserved":true, "fs_verity_required":true})
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_wal_cache_guards_actual_storage_and_sdk_physical_readers() {
+        use consensus::wal::integration::PrivateWalTest;
+        use futures_util::FutureExt;
+
+        for surface in 0..9 {
+            let directory = FixedRawReadStoreFixture::new();
+            let database = directory.path().join("wal-cache-read.sqlite");
+            let mut backend = SqliteSessionBackend::open(&database).expect("read fixture database");
+            let token = Arc::new(PrivateWalTest::new(
+                directory.path().join("wal"),
+                [0xC4; 32],
+            ));
+            backend.private_wal_test = Some(Arc::clone(&token));
+            let members = fixed_raw_read_members();
+            let bindings = fixed_raw_read_bindings(&members);
+            let placement = PlacementResiliencePolicy::AllowReducedResilience;
+            let mut core = SqliteConsensusCore::initialize(
+                &backend,
+                directory.snapshot_path().join("snapshots"),
+                identity(1),
+                members.clone(),
+                bindings.clone(),
+                ConsensusAuthorityProfile::FixedImmutable,
+                Some(placement),
+            )
+            .await
+            .expect("fixed read fixture core");
+            token
+                .attach(&mut core)
+                .await
+                .expect("attach private cache owner");
+            let wal = core.private_wal.clone().expect("selected WAL");
+            let lease = acquire_snapshot_directory_lease(&backend, core.snapshot_dir.as_ref())
+                .await
+                .expect("read fixture snapshot lease");
+            let mut log = SqliteConsensusLogStore {
+                core: core.clone(),
+                _snapshot_directory_lease: Arc::clone(&lease),
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+            };
+            let mut machine = SqliteConsensusStateMachine {
+                core: core.clone(),
+                _snapshot_directory_lease: lease,
+                membership_admission: None,
+                membership_observations: Arc::new(AtomicUsize::new(0)),
+                membership_observation_readback_witness: None,
+                membership_observations_before_readback: Arc::new(AtomicUsize::new(0)),
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+            };
+            let result = std::panic::AssertUnwindSafe(async {
+                append_commit_and_apply(
+                    &mut log,
+                    &mut machine,
+                    [fixed_initial_membership_entry()],
+                    "WAL read fixture membership",
+                )
+                .await;
+                let mut command = acquire_command(
+                    identity(1),
+                    SessionConsensusRequestId::from_bytes([0xC5; 16]),
+                );
+                command.intent = SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(1),
+                    mutation: Box::new(command.intent),
+                };
+                append_commit_and_apply(
+                    &mut log,
+                    &mut machine,
+                    [normal_entry(1, command)],
+                    "WAL read fixture durable business receipt",
+                )
+                .await;
+                assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id(1)));
+                assert!(machine.get_current_snapshot().await.unwrap().is_none());
+                assert!(backend
+                    .consensus_get_at(&key(), timestamp(2))
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(backend
+                    .fixed_quorum_scope_snapshot(identity(1))
+                    .await
+                    .is_ok());
+                assert!(backend
+                    .consensus_padding_receipt_status_for_test(
+                        identity(1),
+                        identity(1),
+                        SessionConsensusRequestId::from_bytes([0xC6; 16]),
+                    )
+                    .await
+                    .is_ok());
+                assert!(backend
+                    .consensus_scan_restore_records_at(
+                        crate::RestoreScanRequest::default(),
+                        timestamp(2),
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+                    .is_ok());
+                let receiving = machine.begin_receiving_snapshot().await.unwrap();
+                let receiving_path = receiving.path().to_path_buf();
+                receiving.close_and_cleanup().await.unwrap();
+                assert!(!receiving_path.exists());
+                assert!(machine.applied_state().await.is_ok());
+                let snapshot_files_before = private_snapshot_files(&core.snapshot_dir);
+
+                let foreign = rusqlite::Connection::open(&database).expect("foreign cache writer");
+                assert!(
+                    foreign
+                        .execute("DELETE FROM consensus_request_outcomes", [])
+                        .unwrap()
+                        > 0
+                );
+                // The frontier and fixed authority remain structurally exact.
+                // Each independent case makes the named read detect the
+                // otherwise unrelated receipt loss as its first operation.
+                let rejected = match surface {
+                    0 => machine.applied_state().await.is_err(),
+                    1 => machine.get_current_snapshot().await.is_err(),
+                    2 => backend
+                        .consensus_get_at(&key(), timestamp(2))
+                        .await
+                        .is_err(),
+                    3 => backend
+                        .fixed_quorum_scope_snapshot(identity(1))
+                        .await
+                        .is_err(),
+                    4 => backend
+                        .consensus_padding_receipt_status_for_test(
+                            identity(1),
+                            identity(1),
+                            SessionConsensusRequestId::from_bytes([0xC6; 16]),
+                        )
+                        .await
+                        .is_err(),
+                    5 => backend
+                        .consensus_scan_restore_records_at(
+                            crate::RestoreScanRequest::default(),
+                            timestamp(2),
+                            tokio::time::Instant::now() + Duration::from_secs(5),
+                        )
+                        .await
+                        .is_err(),
+                    6 => !backend.fixed_quorum_authority_is_exact_now(
+                        identity(1),
+                        &members,
+                        &bindings,
+                        placement,
+                    ),
+                    7 => {
+                        !backend
+                            .fixed_quorum_authority_record_is_exact(
+                                identity(1),
+                                &members,
+                                &bindings,
+                                placement,
+                                false,
+                            )
+                            .await
+                    }
+                    8 => machine.begin_receiving_snapshot().await.is_err(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    private_snapshot_files(&core.snapshot_dir),
+                    snapshot_files_before,
+                    "corrupt-cache admission must create no receiving artifact"
+                );
+                assert!(
+                    rejected,
+                    "physical cache reader {surface} must reject foreign commit"
+                );
+                assert!(
+                    log.read_vote().await.is_err(),
+                    "reader {surface} must fence the shared WAL"
+                );
+                let conn = core.conn.lock().await;
+                assert_eq!(
+                    consensus::read_applied_sync(&conn, identity(1)).unwrap(),
+                    Some(log_id(1))
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM consensus_request_outcomes",
+                        [],
+                        |row| row.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                    0,
+                    "rejected read preserves evidence instead of rebuilding the cache"
+                );
+                eprintln!("private_wal_actual_cache_reader_{surface}=rejected_and_fenced");
+            })
+            .catch_unwind()
+            .await;
+            if let Some(lane) = core.consensus_log_prune_lane() {
+                lane.shutdown().await;
+            }
+            if let Some(lane) = core.proactive_checkpoint_lane() {
+                lane.shutdown().await;
+            }
+            let shutdown = wal.shutdown();
+            assert_eq!(
+                wal.integration_observations().unwrap()["writer_joined"],
+                true
+            );
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            assert!(
+                shutdown.is_err(),
+                "detected corruption remains fenced after join"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_commit_allows_independent_runtime_progress() {
+        exercise_admitted_sqlite_commit(false, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_commit_retains_ownership_after_cancellation() {
+        exercise_admitted_sqlite_commit(true, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_commit_error_rolls_back_before_releasing_ownership() {
+        exercise_admitted_sqlite_commit(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn admitted_sqlite_write_supports_current_thread_borrowed_scope() {
+        assert_admitted_sqlite_write_borrowed_scope();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_write_stays_on_the_multi_thread_caller() {
+        tokio::spawn(async { assert_admitted_sqlite_write_borrowed_scope() })
+            .await
+            .expect("join synchronous caller scope");
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_keeps_one_marker_under_pool_pressure() {
+        exercise_admitted_sqlite_handoff_marker(false);
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_panic_preserves_marker_ownership() {
+        exercise_admitted_sqlite_handoff_marker(true);
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_bounds_closed_trackers_across_runtimes() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_handoff_bounds_closed_trackers_across_runtimes",
+        ) {
+            return;
+        }
+
+        let mut retained_by_case = Vec::new();
+        for lifetimes in [256, 512] {
+            let fixtures = [
+                AdmittedSqliteHandoffFixture::new(),
+                AdmittedSqliteHandoffFixture::new(),
+            ];
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut releases = Vec::new();
+            let mut tasks = Vec::new();
+            for fixture in &fixtures {
+                let entered_tx = entered_tx.clone();
+                let (release, start) = std::sync::mpsc::channel();
+                releases.push(release);
+                tasks.push(fixture.runtime().spawn(async move {
+                    entered_tx.send(()).expect("signal a ready runtime caller");
+                    start
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release both concurrent runtime callers");
+                    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+                    let mut trackers = Vec::new();
+                    for _ in 0..lifetimes / 2 {
+                        let owner = ConsensusStorageShutdownGuard::tracked();
+                        let observer = owner.observer().expect("tracked caller");
+                        observer.enable_runtime_write_handoff();
+                        trackers.push(Arc::downgrade(&observer.0));
+                        let caller = std::thread::current().id();
+                        run_admitted_sqlite_write(&owner, || {
+                            assert_eq!(std::thread::current().id(), caller);
+                            calls.set(calls.get() + 1);
+                        });
+                        drop(owner);
+                        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+                        assert!(futures_util::FutureExt::now_or_never(observer.wait()).is_some());
+                        drop(observer);
+                    }
+                    assert_eq!(calls.get(), lifetimes / 2);
+                    trackers
+                }));
+            }
+            for _ in &fixtures {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("both runtime callers are ready");
+            }
+            for release in releases {
+                release.send(()).expect("start the concurrent callers");
+            }
+            let mut trackers = Vec::new();
+            for (fixture, task) in fixtures.iter().zip(tasks) {
+                trackers.extend(
+                    fixture
+                        .runtime()
+                        .block_on(task)
+                        .expect("join completed owner lifetimes"),
+                );
+            }
+            let retained = trackers
+                .iter()
+                .filter(|tracker| tracker.strong_count() != 0)
+                .count();
+            for fixture in fixtures {
+                fixture.close();
+            }
+            assert!(trackers.iter().all(|tracker| tracker.strong_count() == 0));
+            retained_by_case.push(retained);
+            eprintln!("admitted SQLite closed trackers: lifetimes={lifetimes} retained_while_blocked={retained} retained_after_drain=0 runtimes_stopped=2");
+        }
+        // Each case has completed all SQL owners, drained both pools, and
+        // stopped every runtime thread before evaluating the aggregate bound.
+        // The second case also proves that ordinary retirement restores it.
+        assert_eq!(retained_by_case, [64, 64]);
+    }
+
+    fn run_admitted_sqlite_resource_case_in_child(test_name: &str) -> bool {
+        const CHILD_CASE: &str = "OPC_SESSION_STORE_ADMITTED_SQLITE_RESOURCE_CHILD";
+        if std::env::var(CHILD_CASE).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let test = format!("consensus::storage::tests::{test_name}");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([&test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_CASE, test_name)
+            .output()
+            .expect("run isolated handoff resource case");
+        assert!(
+            output.status.success(),
+            "isolated handoff resource case failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_cancelled_marker_retires_admission() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_handoff_cancelled_marker_retires_admission",
+        ) {
+            return;
+        }
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked handoff owner");
+        observer.enable_runtime_write_handoff();
+        let completion = owner
+            .try_admit_runtime_write_handoff()
+            .expect("admit one controlled handoff");
+        let (marker,) = fixture
+            .runtime()
+            .block_on(fixture.runtime().spawn(async move {
+                tokio::task::block_in_place(|| ());
+                // Return the queued handle to the controlling thread so it
+                // can cancel the marker before releasing the blocking slot.
+                (enqueue_runtime_write_handoff_completion(
+                    &tokio::runtime::Handle::current(),
+                    completion,
+                ),)
+            }))
+            .expect("queue the exact production marker behind the held pool");
+        marker.abort();
+        fixture.close();
+        assert!(futures_util::FutureExt::now_or_never(marker)
+            .expect("the drained marker is complete")
+            .expect_err("the queued marker was cancelled")
+            .is_cancelled());
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+
+        // Production handles stay in their original Openraft runtime. Even
+        // moving this private fixture to another runtime must not rearm a
+        // cancelled completion marker and admit more compensation jobs.
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = fixture.exercise(owner, false, false);
+        drop(owner);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+        fixture.runtime().block_on(observer.wait());
+        fixture.close();
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&observer.0), 1);
+        drop(observer);
+        assert_eq!(RUNTIME_WRITE_HANDOFFS.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn admitted_sqlite_handoff_shutdown_before_marker_retires_admission() {
+        if run_admitted_sqlite_resource_case_in_child(
+            "admitted_sqlite_handoff_shutdown_before_marker_retires_admission",
+        ) {
+            return;
+        }
+        let mut fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked shutdown owner");
+        observer.enable_runtime_write_handoff();
+        let operation_owner = owner.child();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let task = fixture.runtime().spawn(async move {
+            let value = run_admitted_sqlite_write(&operation_owner, || {
+                entered_tx
+                    .send(())
+                    .expect("signal admitted synchronous turn");
+                resume_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release synchronous turn after shutdown begins");
+                1
+            });
+            returned_tx
+                .send(value)
+                .expect("report exact completed turn");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("synchronous turn holds the calling worker");
+        fixture
+            .runtime
+            .take()
+            .expect("live runtime before shutdown")
+            .shutdown_timeout(Duration::ZERO);
+        resume_tx.send(()).expect("release the admitted turn");
+        assert_eq!(
+            returned_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("synchronous result survives runtime shutdown"),
+            1
+        );
+        fixture.close();
+        if let Err(error) =
+            futures_util::FutureExt::now_or_never(task).expect("the old runtime task exited")
+        {
+            assert!(error.is_cancelled());
+        }
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = fixture.exercise(owner, false, false);
+        drop(owner);
+        fixture.runtime().block_on(observer.wait());
+        fixture.close();
+        assert!(observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&observer.0), 1);
+        drop(observer);
+        assert_eq!(RUNTIME_WRITE_HANDOFFS.load(Ordering::Acquire), 1);
+    }
+
+    fn exercise_admitted_sqlite_handoff_marker(panic_first: bool) {
+        let fixture = AdmittedSqliteHandoffFixture::new();
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked handoff owner");
+        observer.enable_runtime_write_handoff();
+        let owner = fixture.exercise(owner, true, panic_first);
+        drop(owner);
+        // The pending marker holds bookkeeping only, never a SQLite owner.
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+        fixture.runtime().block_on(observer.wait());
+        fixture.close();
+        assert!(!observer
+            .0
+            .runtime_write_handoff_pending
+            .load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&observer.0), 1);
+    }
+
+    struct AdmittedSqliteHandoffFixture {
+        runtime: Option<tokio::runtime::Runtime>,
+        blocker: Option<tokio::task::JoinHandle<bool>>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        stopped: std::sync::mpsc::Receiver<std::thread::ThreadId>,
+    }
+
+    impl AdmittedSqliteHandoffFixture {
+        fn new() -> Self {
+            let (stopped_tx, stopped) = std::sync::mpsc::channel();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .on_thread_stop(move || {
+                    let _ = stopped_tx.send(std::thread::current().id());
+                })
+                .build()
+                .expect("create isolated handoff runtime");
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let blocker = runtime.spawn_blocking(move || {
+                entered_tx.send(()).expect("signal occupied blocking slot");
+                // Cleanup fallback only: success requires an explicit release.
+                release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            });
+            let fixture = Self {
+                runtime: Some(runtime),
+                blocker: Some(blocker),
+                release: Some(release),
+                stopped,
+            };
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the only blocking slot is occupied");
+            fixture
+        }
+
+        fn runtime(&self) -> &tokio::runtime::Runtime {
+            self.runtime.as_ref().expect("live fixture runtime")
+        }
+
+        fn exercise(
+            &self,
+            owner: ConsensusStorageShutdownGuard,
+            expect_new_marker: bool,
+            panic_first: bool,
+        ) -> ConsensusStorageShutdownGuard {
+            self.runtime()
+                .block_on(self.runtime().spawn(async move {
+                    let tracker = owner.observer().expect("tracked fixture writes").0;
+                    let expected_references =
+                        Arc::strong_count(&tracker) + usize::from(expect_new_marker);
+                    let caller = std::thread::current().id();
+                    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+                    for index in 0..256 {
+                        let operation = || {
+                            assert_eq!(std::thread::current().id(), caller);
+                            calls.set(calls.get() + 1);
+                            if panic_first && index == 0 {
+                                panic!("controlled admitted SQLite panic");
+                            }
+                        };
+                        if panic_first && index == 0 {
+                            let failure =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    run_admitted_sqlite_write(&owner, operation)
+                                }))
+                                .expect_err("the original panic must propagate");
+                            assert_eq!(
+                                failure.downcast_ref::<&str>(),
+                                Some(&"controlled admitted SQLite panic")
+                            );
+                        } else {
+                            run_admitted_sqlite_write(&owner, operation);
+                        }
+                        assert!(tracker
+                            .runtime_write_handoff_pending
+                            .load(Ordering::Acquire));
+                        assert_eq!(Arc::strong_count(&tracker), expected_references);
+                    }
+                    assert_eq!(calls.get(), 256, "each inline operation executes once");
+                    owner
+                }))
+                .expect("join synchronous caller under pool pressure")
+        }
+
+        fn close(mut self) {
+            self.release
+                .take()
+                .expect("owned blocking release")
+                .send(())
+                .expect("explicitly release the blocking slot");
+            if self.runtime.is_some() {
+                let blocker = self.blocker.take().expect("owned blocking task");
+                assert!(self
+                    .runtime()
+                    .block_on(blocker)
+                    .expect("join owned blocker"));
+                self.runtime()
+                    .block_on(self.runtime().spawn_blocking(|| ()))
+                    .expect("drain the SDK completion marker");
+                self.runtime
+                    .take()
+                    .expect("drained runtime")
+                    .shutdown_timeout(Duration::from_secs(2));
+            }
+            let first = self
+                .stopped
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first owned runtime thread exited");
+            let second = self
+                .stopped
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second owned runtime thread exited");
+            assert_ne!(first, second);
+            if let Some(blocker) = self.blocker.take() {
+                assert!(futures_util::FutureExt::now_or_never(blocker)
+                    .expect("exited blocking task is complete")
+                    .expect("join exited blocking task"));
+            }
+        }
+    }
+
+    impl Drop for AdmittedSqliteHandoffFixture {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(runtime) = self.runtime.take() {
+                runtime.shutdown_timeout(Duration::from_secs(2));
+            }
+        }
+    }
+
+    fn assert_admitted_sqlite_write_borrowed_scope() {
+        let shutdown = ConsensusStorageShutdownGuard::tracked();
+        shutdown
+            .observer()
+            .expect("tracked write owner")
+            .enable_runtime_write_handoff();
+        let caller = std::thread::current().id();
+        let value = std::rc::Rc::new(std::cell::Cell::new(0));
+        run_admitted_sqlite_write(&shutdown, || {
+            assert_eq!(std::thread::current().id(), caller);
+            value.set(1);
+        });
+        assert_eq!(value.get(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_write_cancelled_before_connection_never_commits() {
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "cancelled writer initial membership",
+        )
+        .await;
+        log_store
+            .blocking_append([blank_entry(1)])
+            .await
+            .expect("append the uncommitted next row");
+        shutdown.enable_runtime_write_handoff();
+        let conn = state_machine.core.conn.lock().await;
+        let mut pending = Box::pin(log_store.save_committed(Some(log_id(1))));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(conn.is_autocommit(), "no transaction was submitted");
+        assert_eq!(
+            consensus::read_committed_sync(&conn, state_machine.core.storage_identity)
+                .expect("read retained committed frontier"),
+            Some(log_id(0))
+        );
+        drop(conn);
+        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+            lane.shutdown().await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn admitted_sqlite_startup_recovery_supports_local_set() {
+        use futures_util::FutureExt;
+
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let _shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "local recovery initial membership",
+        )
+        .await;
+        append_and_commit(
+            &mut log_store,
+            [blank_entry(1)],
+            "local recovery unapplied row",
+        )
+        .await;
+        let local = tokio::task::LocalSet::new();
+        let recovery = std::panic::AssertUnwindSafe(local.run_until(async {
+            opc_consensus::engine::StorageHelper::new(&mut log_store, &mut state_machine)
+                .get_initial_state()
+                .await
+        }))
+        .catch_unwind()
+        .await;
+        let applied = state_machine.applied_state().await;
+        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+            lane.shutdown().await;
+        }
+        recovery
+            .expect("Openraft startup must not panic on the caller's LocalSet")
+            .expect("Openraft startup recovers the unapplied row");
+        assert_eq!(
+            applied.expect("read recovered applied frontier").0,
+            Some(log_id(1))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_admitted_sqlite_commit(cancel_admitted: bool, reject_commit: bool) {
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let shutdown = track_admitted_sqlite_fixture(&mut log_store, &mut state_machine);
+        append_commit_and_apply(
+            &mut log_store,
+            &mut state_machine,
+            [fixed_initial_membership_entry()],
+            "runtime progress initial membership",
+        )
+        .await;
+        log_store
+            .blocking_append([blank_entry(1)])
+            .await
+            .expect("append one exact frontier advance");
+        shutdown.enable_runtime_write_handoff();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_progress = Arc::clone(&made_progress);
+        let commits = Arc::new(AtomicUsize::new(0));
+        let observed_commits = Arc::clone(&commits);
+        let mut entered_tx = Some(entered_tx);
+        state_machine
+            .core
+            .conn
+            .lock()
+            .await
+            .commit_hook(Some(move || {
+                observed_commits.fetch_add(1, Ordering::Relaxed);
+                if let Some(entered_tx) = entered_tx.take() {
+                    let _ = entered_tx.send(());
+                    // The timeout only releases a broken implementation so the
+                    // test can join every task; success requires an independent
+                    // task to respond while this real transaction is still held.
+                    observed_progress.store(
+                        progress_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                        Ordering::Relaxed,
+                    );
+                }
+                reject_commit
+            }));
+        let commit = tokio::spawn(async move { log_store.save_committed(Some(log_id(1))).await });
+        let abort_commit = commit.abort_handle();
+        let observer_core = state_machine.core.clone();
+        let observer = tokio::spawn(async move {
+            entered_rx
+                .await
+                .expect("the admitted transaction reaches commit");
+            if cancel_admitted {
+                abort_commit.abort();
+            }
+            assert!(
+                observer_core.conn.try_lock().is_err(),
+                "the original caller still owns the primary connection"
+            );
+            let _ = progress_tx.send(());
+        });
+        let commit_result = commit.await;
+        state_machine
+            .core
+            .conn
+            .lock()
+            .await
+            .commit_hook(None::<fn() -> bool>);
+        let observer_result = observer.await;
+        let (committed, autocommit) = {
+            let conn = state_machine.core.conn.lock().await;
+            (
+                consensus::read_committed_sync(&conn, state_machine.core.storage_identity),
+                conn.is_autocommit(),
+            )
+        };
+        if let Some(lane) = state_machine.core.consensus_log_prune_lane() {
+            lane.shutdown().await;
+        }
+        match commit_result {
+            Ok(result) if reject_commit => assert!(result.is_err()),
+            Ok(result) => result.expect("the original commit succeeds"),
+            Err(error) => assert!(cancel_admitted && error.is_cancelled()),
+        }
+        observer_result.expect("join independent runtime observer");
+        assert_eq!(
+            committed.expect("read exact committed frontier"),
+            Some(log_id(u64::from(!reject_commit)))
+        );
+        assert!(autocommit, "the transaction has completed before returning");
+        assert_eq!(commits.load(Ordering::Relaxed), 1, "no replayed commit");
+        assert!(
+            made_progress.load(Ordering::Relaxed),
+            "an admitted synchronous SQLite commit must not strand unrelated runtime work"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn track_admitted_sqlite_fixture(
+        log_store: &mut SqliteConsensusLogStore,
+        state_machine: &mut SqliteConsensusStateMachine,
+    ) -> ConsensusStorageShutdownObserver {
+        let owner = ConsensusStorageShutdownGuard::tracked();
+        let observer = owner.observer().expect("tracked fixture write owners");
+        state_machine.shutdown_guard = owner.child();
+        log_store.shutdown_guard = owner;
+        observer
     }
 
     #[cfg(target_os = "linux")]
@@ -9874,6 +13664,45 @@ mod tests {
             "the completed physical prune drains the durable logical backlog"
         );
         drop(conn);
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_snapshot_startup_yields_prune_writer_before_reserving_legacy_candidate() {
+        let directory = FixedRawReadStoreFixture::new();
+        prepare_dormant_fixed_prune_backlog(&directory).await;
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "physical prune owns the SQLite writer before snapshot startup"
+        );
+
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), builder.build_snapshot())
+            .await
+            .expect("snapshot startup coordinates with the existing prune writer")
+            .expect("snapshot reservation must not fail with SQLITE_BUSY");
+        assert!(
+            gate.preemption_requested(),
+            "snapshot startup yields the prune turn"
+        );
+        assert_eq!(snapshot.meta.last_log_id, Some(log_id(129)));
+        drop(snapshot);
+        log_store
+            .blocking_append([blank_entry(130)])
+            .await
+            .expect("primary append remains usable after snapshot startup");
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("the preempted physical prune resumes and drains its backlog");
         lane.shutdown().await;
     }
 
@@ -11125,7 +14954,7 @@ mod tests {
         );
         let candidate_file_name = {
             let conn = core.conn.lock().await;
-            consensus::read_legacy_fixed_snapshot_reseed_sync(&conn, core.storage_identity)
+            core.read_selected_legacy_reseed(&conn)
                 .expect("read reseed journal after simulated stop")
                 .expect("reseed journal remains after simulated stop")
                 .candidate_file_name
@@ -11265,6 +15094,209 @@ mod tests {
         assert!(
             !old_bytes.is_empty(),
             "fixture started from a real sealed selected snapshot"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_current_snapshot_admission_survives_concurrent_publication() {
+        current_snapshot_admission_survives_concurrent_publication(true).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_current_snapshot_admission_survives_concurrent_publication() {
+        current_snapshot_admission_survives_concurrent_publication(false).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn current_snapshot_admission_survives_concurrent_publication(native: bool) {
+        use consensus::wal::integration::PrivateWalTest;
+
+        let directory = FixedRawReadStoreFixture::new();
+        let (mut log, mut machine, backend, token) = if native {
+            let token = Arc::new(PrivateWalTest::new_native(
+                directory.path().join("wal"),
+                [0xA7; 32],
+            ));
+            let (backend, log, machine) =
+                open_private_install_store(&directory, Arc::clone(&token))
+                    .await
+                    .expect("open native snapshot serving owner");
+            (log, machine, Some(backend), Some(token))
+        } else {
+            let (log, machine, _) = open_fixed_raw_read_store(&directory).await;
+            (log, machine, None, None)
+        };
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry()],
+            "snapshot serving predecessor membership",
+        )
+        .await;
+        let mut initial = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish original snapshot");
+        let initial_meta = initial.meta.clone();
+        let initial_path = initial.snapshot.path().to_path_buf();
+        let mut initial_bytes = Vec::new();
+        initial
+            .snapshot
+            .read_to_end(&mut initial_bytes)
+            .await
+            .expect("read original sealed snapshot");
+        drop(initial);
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [blank_entry(1)],
+            "snapshot serving successor cut",
+        )
+        .await;
+
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard =
+            CurrentSnapshotAdmissionGateGuard::install(initial_path.clone(), Arc::clone(&gate));
+        let mut reader = machine.clone();
+        let serving = tokio::spawn(async move { reader.get_current_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("serving opens the selected predecessor before admission");
+        let mut builder = machine.get_snapshot_builder().await;
+        let mut building = tokio::spawn(async move { builder.build_snapshot().await });
+        let early_build = tokio::time::timeout(Duration::from_secs(1), &mut building)
+            .await
+            .ok();
+        let retired_during_admission = !initial_path.exists();
+        gate.release();
+        let served = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("serving completes after releasing its exact gate")
+            .expect("join serving caller");
+        let successor = match early_build {
+            Some(result) => result,
+            None => tokio::time::timeout(SNAPSHOT_APPLY_WAIT, building)
+                .await
+                .expect("builder completes after descriptor handoff"),
+        }
+        .expect("join concurrent snapshot builder")
+        .expect("publish successor through the original builder");
+        eprintln!(
+            "snapshot_serving_publication_race native={native} retired_during_admission={retired_during_admission} served={served:?}"
+        );
+        let mut served = served
+            .expect("legitimate successor publication must not invalidate snapshot admission")
+            .expect("selected snapshot exists");
+        assert!(!retired_during_admission);
+        assert_eq!(served.meta, initial_meta);
+        assert_eq!(successor.meta.last_log_id, Some(log_id(1)));
+        assert_ne!(successor.meta.snapshot_id, served.meta.snapshot_id);
+        assert!(
+            !initial_path.exists(),
+            "retire the predecessor after admission"
+        );
+        let mut served_bytes = Vec::new();
+        served
+            .snapshot
+            .read_to_end(&mut served_bytes)
+            .await
+            .expect("sealed descriptor remains readable after authorized retirement");
+        assert_eq!(served_bytes, initial_bytes);
+        assert_eq!(
+            machine
+                .get_current_snapshot()
+                .await
+                .expect("admit current successor")
+                .expect("published successor exists")
+                .meta,
+            successor.meta
+        );
+        if let Some(token) = token {
+            token
+                .current()
+                .expect("native owner")
+                .shutdown()
+                .expect("clean native stop");
+        }
+        drop(backend);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_fixed_current_snapshot_scan_retains_worker_ownership() {
+        cancelled_current_snapshot_scan_retains_worker_ownership(SnapshotIntegrityPolicy::FsVerity)
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_portable_current_snapshot_scan_retains_worker_ownership() {
+        cancelled_current_snapshot_scan_retains_worker_ownership(
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn cancelled_current_snapshot_scan_retains_worker_ownership(
+        policy: SnapshotIntegrityPolicy,
+    ) {
+        let directory = FixedRawReadStoreFixture::new();
+        let (_, mut machine, _) =
+            open_fixed_raw_read_store_with_integrity(&directory, None, policy).await;
+        machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply membership before current snapshot");
+        let original = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish current snapshot before cancellation");
+        let core = machine.core.clone();
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let hook_directory =
+            snapshot_namespace_test_hook_directory(&machine._snapshot_directory_lease);
+        let _gate_guard =
+            FixedPrepublicationScanGateGuard::install(hook_directory, Arc::clone(&gate));
+        let mut reader = machine.clone();
+        let serving = tokio::spawn(async move { reader.get_current_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("current snapshot reaches detached descriptor scan");
+        serving.abort();
+        assert!(serving
+            .await
+            .expect_err("cancel snapshot caller")
+            .is_cancelled());
+        let worker_owns_snapshot = Arc::clone(&core.snapshot_gate).try_lock_owned().is_err();
+        gate.release();
+        let released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&core.snapshot_gate).lock_owned(),
+        )
+        .await
+        .expect("detached scan releases snapshot transaction after completion");
+        drop(released);
+        assert!(
+            worker_owns_snapshot,
+            "cancelled admission must retain the snapshot transaction until its worker stops"
+        );
+        assert_eq!(
+            machine
+                .get_current_snapshot()
+                .await
+                .expect("read original snapshot after cancelled scan")
+                .expect("original snapshot remains selected")
+                .meta,
+            original.meta
         );
     }
 
@@ -11821,7 +15853,7 @@ mod tests {
         );
         let conn = core.conn.lock().await;
         assert!(
-            consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+            core.read_selected_snapshot(&conn)
                 .expect("read current snapshot after cancellation")
                 .is_none(),
             "a cancelled descriptor scan cannot publish snapshot metadata"
@@ -12111,6 +16143,157 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(SessionConsensusStorageError::RecoveryRequired, error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_rejects_progress_first_observed_after_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        for applied in [log_id(1), log_id(2)] {
+            log_store.core.applied_progress.send_replace(None);
+            let through = log_id(1);
+            let wait = wait_until_applied(&log_store.core, &through);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+
+            // Hold the waiter unpolled until both the watch and timer are ready.
+            // Tokio may poll the completed watch first; that cannot extend the
+            // original absolute ten-second application guard.
+            tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+            log_store.core.applied_progress.send_replace(Some(applied));
+            let error = wait.await.expect_err("late applied coverage must time out");
+            assert!(error
+                .to_string()
+                .contains("session consensus apply wait timed out"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_accepts_coverage_through_exact_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        for elapsed in [Duration::ZERO, SNAPSHOT_APPLY_WAIT] {
+            log_store.core.applied_progress.send_replace(None);
+            let through = log_id(1);
+            let wait = wait_until_applied(&log_store.core, &through);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            tokio::time::advance(elapsed).await;
+            log_store.core.applied_progress.send_replace(Some(through));
+            wait.await.expect("coverage within original deadline");
+        }
+        log_store
+            .core
+            .applied_progress
+            .send_replace(Some(log_id(2)));
+        wait_until_applied(&log_store.core, &log_id(1))
+            .await
+            .expect("preexisting later coverage remains immediately usable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_keeps_one_deadline_across_partial_progress() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        let through = log_id(4);
+        let wait = wait_until_applied(&log_store.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        for index in [1, 2] {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            log_store
+                .core
+                .applied_progress
+                .send_replace(Some(log_id(index)));
+            assert!(futures_util::poll!(&mut wait).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(2) + Duration::from_nanos(1)).await;
+        log_store
+            .core
+            .applied_progress
+            .send_replace(Some(log_id(3)));
+        let error = wait
+            .await
+            .expect_err("partial progress cannot reset the guard");
+        assert!(error
+            .to_string()
+            .contains("session consensus apply wait timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_preserves_conflict_and_install_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        let through = log_id(1);
+        {
+            let wait = wait_until_applied(&log_store.core, &through);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            log_store
+                .core
+                .applied_progress
+                .send_replace(Some(log_id_with_term(2, 1)));
+            let error = wait.await.expect_err("equal index must retain full LogId");
+            assert!(error
+                .to_string()
+                .contains("session consensus applied log conflicts with purge"));
+        }
+        log_store.core.applied_progress.send_replace(None);
+        let wait = wait_until_applied(&log_store.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        log_store
+            .core
+            .snapshot_install_failure
+            .send_replace(Some(storage_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                io::Error::other("original snapshot installation failure"),
+            )));
+        log_store.core.applied_progress.send_replace(Some(through));
+        let error = wait
+            .await
+            .expect_err("original install failure has priority");
+        assert!(error
+            .to_string()
+            .contains("original snapshot installation failure"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -14878,7 +19061,7 @@ mod tests {
         );
         let current = {
             let conn = core.conn.lock().await;
-            consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+            core.read_selected_snapshot(&conn)
                 .expect("read consumed fixed terminal row")
                 .expect("current fixed terminal row")
         };

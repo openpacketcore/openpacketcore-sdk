@@ -382,6 +382,137 @@ async fn open() -> Result<(), opc_session_store::StoreError> {
 }
 ```
 
+### Fixed-quorum asynchronous persistence
+
+Fixed three- and five-voter stores support an explicit
+`SessionPersistenceMode::{Durable, Async}` storage choice. Existing constructors
+and `SessionPersistenceMode::default()` select `Durable`. Use the same fixed
+topology, authenticated peers, encryption wrappers, and operation APIs as in
+the recipe above; select the persistence mode when opening each voter:
+
+```rust
+let store = ConsensusSessionStore::open_fixed_quorum_with_clock_and_persistence(
+    topology,
+    SqliteSessionBackend::open("voter-0.sqlite")?,
+    "snapshots-voter-0",
+    consensus_peers,
+    std::sync::Arc::new(opc_session_store::clock::SystemClock),
+    std::time::Duration::from_millis(800),
+    SnapshotIntegrityPolicy::PortableVerified,
+    SessionPersistenceMode::Async,
+).await?;
+```
+
+`open_fixed_quorum_with_persistence(topology, backend, snapshot_dir, peers,
+snapshot_integrity, persistence)` supplies `SystemClock` and the existing
+ten-second SDK default instead. The explicit clock constructor above preserves
+an 800 ms complete-operation deadline for consumers requiring that bound.
+Background scheduling never extends the supplied foreground deadline.
+Both constructors are Linux-only and require file-backed storage.
+
+| Contract | `Durable` | `Async` |
+|:--|:--|:--|
+| Successful mutation | Durable log acknowledgement, real quorum replication, and committed application. | Validated resident storage, real quorum replication, and committed application. |
+| Disk progress | Required before the durable storage acknowledgement. | One coalescing writer persists and selects complete local generations after resident acknowledgement. |
+| Ordinary restart | Reopens the validated durable state under the existing admission checks. | Every existing root starts quarantined and requires catch-up from a surviving live quorum. |
+| Readiness API | Existing durable probes or `probe_fixed_quorum_readiness`. | `probe_fixed_quorum_readiness`; durable probes return `PersistenceNotDurable`. |
+
+An Async success can precede disk persistence. Loss of the live volatile quorum
+can lose acknowledged results. Even a completed local generation is only
+local recovery input; it does not grant current quorum or traffic authority.
+Every voter must select the same mode. The durable root binds that choice and
+rejects a different mode on reopen; engine and forwarded-control traffic also
+reject mixed modes. Changing snapshot integrity does not select persistence.
+No automatic conversion or cross-mode recovery is provided.
+
+Install `rpc_handler()` before calling `initialize_cluster()` on every startup.
+For an existing Async root, this call obtains a genuinely new committed entry
+from the other live voters, admits repair only from its certified leader, and
+waits for exact local application before allowing votes and traffic. A timeout
+or missing live majority returns `RecoveryRequired`. A later call may continue
+validated catch-up or obtain a fresh attempt. An all-cold quorum stays closed;
+local disk progress, cached responses, and recreating storage do not supply a
+supported recovery authority.
+
+If a restarted voter lost a previously acknowledged volatile tail, its
+certified live leader restores that prefix through ordinary snapshot
+installation and a real matching append. Recovery preserves the leader's vote
+and the configured initialization deadline. Snapshot installation alone does
+not admit the voter.
+
+Gate traffic on
+`store.probe_fixed_quorum_readiness().await.traffic_authority().is_granted()`.
+The returned `SessionQuorumReadinessReport` includes the selected mode,
+committed barrier, separate placement assessment, and passive persistence
+health. Each subsequent operation still performs its own authority checks.
+The `_at` and placement-attestation variants preserve the same quorum contract.
+
+`persistence_health()` reports engine/storage lifecycle, first typed failure,
+Async admission posture, resident/completed generation and sequence, local
+completed committed/applied indices, lag, extent limit, and saturation. It is
+a passive observation. The writer coalesces changes with a 250 ms capture
+schedule and at most one detached generation per voter; 250 ms is not a
+persistence-latency guarantee. The current generation extent ceiling is 8 GiB,
+separate from the bounded journal/verification working set and any process RSS
+qualification. There is no per-operation disk queue to fill before success.
+
+Ordinary background I/O failures are latched and stop persistence. Resident
+quorum operations may continue while the storage owner remains usable and its
+finite allocation permits progress. Corruption or ownership failures fence
+the owner. Monitor both `storage_failure` and `asynchronous.background_failure`;
+`saturated` identifies a recorded storage/memory capacity failure. A failed
+writer does not retry indefinitely or erase an already returned operation
+result.
+
+`drain_async_persistence().await` explicitly requests local persistence through
+the resident cut captured by that call, within the configured operation
+deadline. Later concurrent mutations need not be included. A timeout or caller
+cancellation leaves the writer responsible for its accepted work; typed drain
+errors distinguish deadline, failure, unavailable owner, and wrong mode.
+`shutdown()` joins owned work and reports failed drain. Neither operation
+establishes quorum persistence or permits an all-cold restart. See
+[ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md) for the
+storage and cold-admission contract.
+
+### Memory measurements and deployment sizing
+
+The SDK-741 in-process workloads place all three voters, the load generator
+and its request/outcome fixtures in one process. Their aggregate RSS is an
+observation, not a per-voter or per-pod limit. The historical 2 GiB aggregate
+regression budget is reported for comparison; exceeding it does not establish
+that any one voter needs more than 2 GiB. Dividing the total by three does not
+measure an individual voter either. Historical failures retain their original
+results, and the frozen SDK-702 v1 evidence validator retains its aggregate
+profile for compatibility.
+
+The workload summaries identify this scope in `memory`, leave `per_voter_rss_kib`
+unset and report `deployment_memory_qualified: false`. Correcting that scope
+does not change operation deadlines, exact outcome checks, retention bounds,
+disk/snapshot limits or throughput requirements. Async throughput does not
+qualify DURABLE throughput; offered load does not measure achieved capacity.
+RSS reporting retains the largest observed VmHWM estimate even when a later
+kernel reading is lower. It cannot establish that every transient peak was
+captured.
+
+The ignored `one_voter_cold_image_memory_in_a_fresh_process` test reconstructs
+one historical voter image through the complete original snapshot installer,
+native catalog admission and image validation. The observer
+[`observe-session-store-isolated-memory.py`](../../scripts/observe-session-store-isolated-memory.py)
+runs each voter in a separate fresh process and records sampled RSS/PSS,
+the kernel's VmHWM estimate, stage observations and actual native root
+deallocations. It preserves the original three-member topology and verifies
+the sealed input identity before and after the run. Its cold image measurement
+includes conversion overhead and does not include a live replica runtime or
+public workload; it cannot set a production pod memory limit.
+
+A deployment budget still requires separate live voter processes, an external
+load generator, the required retained cardinality, snapshot/recovery activity
+and measured operating headroom. Measure the deployment cgroup as well as
+process RSS: the [Linux memory controller](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory)
+also accounts for filesystem cache and kernel memory. Neither a cold-image component result nor a
+lower aggregate RSS is deployment qualification. See the observer's `--help`
+for its required existing fs-verity directory and manifest inputs.
+
 ### Identity invariants and legacy SQLite admission
 
 `StableId` contains exactly 1 through 64 opaque bytes. Its private storage and
@@ -864,6 +995,122 @@ matching permit through its fresh transaction; a lost or unusable reader is
 replenished or permanently retires that permit. This prevents a write-held
 SQLite connection from globally serializing unrelated acceptance reads without
 creating a connection, task, or pool entry per caller or subscriber.
+
+After Openraft startup recovery finishes, log and state-machine writes may mark
+their synchronous SQLite turn as blocking after acquiring the existing writer
+and connection guards. On a multi-thread Tokio runtime, an admitted handoff can
+let other runnable tasks progress while the calling thread completes the
+transaction and its full row checks. The write is never detached from its
+caller, and ordinary one-row frontier decoding stays inline. Cancellation
+cannot release an admitted transaction's guards early or replay its work.
+Startup recovery, including on a caller's LocalSet, and current-thread runtimes
+retain inline execution.
+
+Each store admits one runtime handoff until a completion marker runs in the
+same blocking pool. Pending scheduler work is bounded to one replacement-worker
+job and one marker; other writes execute inline while admission is occupied.
+The marker holds only bookkeeping, with no SQLite connection, transaction or
+storage owner guard. One static counter shared by all stores and runtimes in
+this SDK instance admits at most 64 handoffs, bounding this change to 128 queued
+replacement and marker jobs even across concurrent opens, shutdown and reopen.
+That accounting survives SQLite owner exit. Only marker execution returns its
+capacity; exhausted callers complete their original SQL inline without waiting
+for a scheduler slot. Running pool jobs remain subject to the existing runtime
+thread caps, separately from this queued-work bound.
+
+If cancellation or runtime shutdown prevents a marker from executing, its store
+reservation and its shared capacity retire for the lifetime of this SDK
+instance. There is no destructor refund or blocking cleanup. Retiring all 64
+slots disables the handoff optimization and keeps writes inline. Independent
+progress therefore still depends on available runtime capacity.
+
+This retirement proof uses Tokio 1.53.1's FIFO blocking-pool dequeue order.
+The SDK manifest requires that exact crates.io version for consuming applications,
+independently of this repository's lockfile, with the original runtime features.
+An upgrade or dependency source override requires revalidating the actual
+helper's queue, owner-lifetime, panic, cancellation and runtime-shutdown matrix.
+
+Snapshot copy and compaction share the store's primary-writer pressure signal.
+An existing 32 ms foreground pause earns a 32 ms snapshot work turn before
+another pause, so sustained traffic cannot repeatedly charge a pause at every
+SQLite progress callback. Snapshot startup also yields the physical-prune
+writer before reserving its legacy reseed candidate, using the same writer
+handoff as append and apply.
+
+Private snapshot compaction commits its schema and copied rows together. The
+same writer page cap and per-table extent checks remain active throughout the
+copy. A failed copy discards its owned staging inode; a successful copy still
+receives the final file sync, complete validation, sealing and publication
+checks before it becomes a snapshot.
+
+Durable V2 batches still undergo complete typed decoding and exact comparison
+with their canonical JSON encoding. For the fixed batch shape, optionally
+inside one authority envelope, that byte comparison also proves the complete
+structural schema without parsing all payload byte arrays a second time.
+Other V2 shapes retain the generic duplicate-aware structural audit. Prepared
+SQLite statements cache query plans only: schema, complete membership authority,
+exact log witnesses, and restore revisions are read and authenticated again on
+every use. The existing statement cache capacity is unchanged. The immutable
+V2 protocol digest is computed once; every persisted receipt and request
+binding is still verified.
+
+A range read can retain its completely audited highest row for one later read
+within that invocation. The later read still fetches the complete SQL tuple and
+checks its epoch before comparing all three stored integers and every encoded
+byte. A typed match moves the audited entry into the original decoder result
+position; all range, leader, membership, projection and batching checks retain
+their original order. The entry then has the ordinary consumer/output lifetime.
+A mismatch destroys the retained raw and decoded values before falling back to
+the full decoder. Ordinary highest-row queries and append replay retain their
+separate full audits; transaction ownership and visibility are unchanged.
+
+Typed retention accepts only a Normal V2 batch with 1–8 requests, directly or
+inside one authority envelope, whose raw Vec capacity is at most 32 KiB. Its
+checked charge includes actual request Vec, String and payload Vec capacities,
+all retained boxes, aligned payload Arc control/value storage per occurrence,
+and fixed ownership and conversion storage. Each StableId backing is replaced
+sequentially by an exact-length boxed copy of its existing bytes, avoiding
+retention of oversized or sliced external backing. The accounting also reserves
+identifier promotion storage and one extra conversion transient. This accounting
+uses the pinned bytes 1.12.1 representation and must be revalidated on upgrade.
+
+The mode is selected before one nonwaiting reservation against a shared 4 MiB
+charged budget per linked SDK copy. Typed retention is limited to 256 KiB per
+owner. Ineligible typed rows can retain only their raw canonical proof, limited
+to 32 KiB raw capacity and 64 KiB charged storage, or use the full decoder.
+Reservation contention falls through without a second attempt. On the tested
+x86_64 layout, raw mode charges at most 32,928 bytes; each empty owner occupies
+88 bytes and the fixed budget object occupies 16 bytes. With E active proofs
+among N live owners, the additional accounted capacity is at most
+4 MiB + 88 × (N − E) + 16 bytes. There is no global owner-count limit. Baseline
+SQL/decoder/output allocations, compiler stack frames, allocator rounding and
+metadata, RSS, and separately linked SDK copies are outside that capacity bound.
+The existing 16 MiB row acceptance limit is unchanged.
+
+Logical purge reuses its complete current-floor row audit within the same
+transaction when proving the next floor and applied frontier. Any applied tail
+beyond that first scan is fully decoded before publication. Exact marker,
+lineage and no-hole checks remain; each new purge call audits its current
+durable rows again. Physical pruning keeps its separate validation and limits.
+
+The physical-prune worker retains shutdown cancellation across SQL statements,
+including when SQLite clears an interrupt delivered between statements. It
+removes its cancellation callback before rolling back and returns its writer
+ownership only after the transaction has ended. Shutdown still joins the worker
+under the configured complete-operation deadline before permitting a reopen.
+
+Membership projection loading shares complete layout, certificate, history and
+scope validation within one SQLite read transaction. An autocommit caller gets
+a read transaction for that load; an existing caller transaction retains its
+ownership. Each later load validates the current durable state again.
+
+Full snapshot replication-log audits keep SQLite reads on the caller thread
+and decode bounded batches with at most eight workers, 4,096 rows and 16 MiB
+of encoded row data. Every row still receives the complete typed, sequence,
+transaction-ID, TTL, payload and envelope checks. Workers are joined in source
+order, including on rejection or failed spawn. Small audits stay inline;
+legacy rows wider than the batch budget are fully validated individually after
+earlier buffered rows finish. No encoded-row acceptance limit is added.
 
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal
@@ -1654,6 +1901,13 @@ by issue #143.
   audit/readiness latching, terminal idempotency, and exact legacy
   confirmation.
 - Run with: `cargo test -p opc-session-store`.
+- Fixed-quorum fault, snapshot, and election qualification requires the existing
+  test controls: `cargo test --locked -p opc-session-store --all-features --test fixed_quorum_authority`.
+  On Linux, live authority faults execute against both the selected native WAL
+  and an explicitly selected legacy SQLite fixture, with independent readback.
+  Native resident drift is distinct from persisted snapshot corruption and the
+  actual inode-bound recovery latch. These controls keep the original watch and
+  complete-operation deadlines and restore each fault before clean shutdown.
 
 ## License
 

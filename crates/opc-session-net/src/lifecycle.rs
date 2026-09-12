@@ -863,6 +863,35 @@ impl fmt::Debug for ConnectionAuthenticationEvidence {
     }
 }
 
+/// One wall/monotonic observation at the existing TLS completion boundary.
+/// Both certificate expiries use this same pair even if identity parsing or
+/// application bootstrap runs later. The monotonic instant also remains the
+/// original anchor for maximum authentication age.
+#[derive(Clone, Copy)]
+pub(crate) struct TlsCompletionTime {
+    instant: tokio::time::Instant,
+    wall: opc_types::Timestamp,
+}
+
+impl TlsCompletionTime {
+    /// Capture both clocks before subsequent identity or bootstrap work.
+    pub(crate) fn now() -> Self {
+        let instant = tokio::time::Instant::now();
+        let wall = opc_types::Timestamp::now_utc();
+        Self { instant, wall }
+    }
+
+    /// The unchanged monotonic anchor for connection authentication age.
+    pub(crate) fn instant(self) -> tokio::time::Instant {
+        self.instant
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(instant: tokio::time::Instant, wall: opc_types::Timestamp) -> Self {
+        Self { instant, wall }
+    }
+}
+
 /// Exact leaf and effective presented-certificate-chain expiries plus the
 /// monotonic deadline captured at TLS completion. Keeping all three values
 /// prevents a later wall-clock adjustment or slow application bootstrap from
@@ -878,7 +907,7 @@ impl CertificateExpiryEvidence {
     pub(crate) fn capture(
         leaf_expires_at: opc_types::Timestamp,
         certificate_chain_expires_at: opc_types::Timestamp,
-        tls_completed_at: tokio::time::Instant,
+        tls_completed_at: TlsCompletionTime,
     ) -> Self {
         Self {
             leaf_expires_at,
@@ -1178,13 +1207,13 @@ impl ConnectionLifecycle {
 
 pub(crate) fn wall_expiry_deadline(
     expiry: opc_types::Timestamp,
-    now: tokio::time::Instant,
+    completed: TlsCompletionTime,
 ) -> tokio::time::Instant {
-    let wall_now = opc_types::Timestamp::now_utc();
+    let now = completed.instant;
     let remaining = expiry
         .as_offset_datetime()
         .unix_timestamp_nanos()
-        .saturating_sub(wall_now.as_offset_datetime().unix_timestamp_nanos());
+        .saturating_sub(completed.wall.as_offset_datetime().unix_timestamp_nanos());
     if remaining <= 0 {
         return now;
     }
@@ -1261,6 +1290,108 @@ mod tests {
             certificate_chain_expires_at,
             deadline,
         }
+    }
+
+    #[test]
+    fn certificate_expiry_capture_preserves_handshake_time_after_delayed_identity_parse() {
+        // Model two seconds of identity parsing or scheduler delay after the
+        // handshake's paired wall/monotonic observation. No host clock change
+        // or real sleep is needed to expose a fresh wall sample used with the
+        // old monotonic instant.
+        let handshake_at = tokio::time::Instant::now() - Duration::from_secs(2);
+        let handshake_wall = opc_types::Timestamp::now_utc()
+            .add_seconds(-2)
+            .expect("modeled TLS wall clock");
+        let expiry = handshake_wall.add_seconds(30).expect("certificate expiry");
+        let evidence = CertificateExpiryEvidence::capture(
+            expiry,
+            expiry,
+            TlsCompletionTime::for_test(handshake_at, handshake_wall),
+        );
+        assert_eq!(evidence.deadline, handshake_at + Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn certificate_expiry_pair_keeps_exact_ties_and_age_after_bootstrap() {
+        let completed = TlsCompletionTime::now();
+        let leaf = completed.wall.add_seconds(40).expect("leaf expiry");
+        let chain = completed.wall.add_seconds(30).expect("chain expiry");
+        let local = CertificateExpiryEvidence::capture(leaf, chain, completed);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let peer = CertificateExpiryEvidence::capture(leaf, chain, completed);
+        assert_eq!(local, peer);
+        let lifecycle = ConnectionLifecycle::new(
+            policy(),
+            completed.instant(),
+            Some(local),
+            Some(peer),
+            0,
+            None,
+        )
+        .expect("lifecycle after delayed bootstrap");
+        assert_eq!(
+            lifecycle.retire_at(),
+            completed.instant() + Duration::from_secs(20)
+        );
+        assert_eq!(
+            lifecycle.hard_deadline().expect("hard expiry"),
+            completed.instant() + Duration::from_secs(30)
+        );
+        assert_eq!(
+            lifecycle.retirement(completed.instant() + Duration::from_secs(20)),
+            Some(RetirementReason::PeerCertificateChainExpiry)
+        );
+        assert_eq!(
+            lifecycle.evidence().handshake_completed_at,
+            completed.instant()
+        );
+        let age_only = ConnectionLifecycle::new(policy(), completed.instant(), None, None, 0, None)
+            .expect("original authentication age");
+        assert_eq!(
+            age_only.hard_deadline().expect("age deadline"),
+            completed.instant() + Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn certificate_expiry_pair_retains_expired_and_fixed_wall_bounds() {
+        let completed = TlsCompletionTime::now();
+        let past = completed.wall.add_seconds(-1).expect("expired leaf");
+        assert_eq!(wall_expiry_deadline(past, completed), completed.instant());
+        assert_eq!(
+            wall_expiry_deadline(completed.wall, completed),
+            completed.instant()
+        );
+        let expiry = completed.wall.add_seconds(30).expect("expiry");
+        let later_wall = TlsCompletionTime::for_test(
+            completed.instant(),
+            completed.wall.add_seconds(60).expect("later wall sample"),
+        );
+        let earlier_wall = TlsCompletionTime::for_test(
+            completed.instant(),
+            completed
+                .wall
+                .add_seconds(-60)
+                .expect("earlier wall sample"),
+        );
+        let original = CertificateExpiryEvidence::capture(expiry, expiry, completed);
+        assert_eq!(
+            original.deadline,
+            completed.instant() + Duration::from_secs(30)
+        );
+        assert_eq!(
+            wall_expiry_deadline(expiry, later_wall),
+            completed.instant()
+        );
+        assert_eq!(
+            wall_expiry_deadline(expiry, earlier_wall),
+            completed.instant() + Duration::from_secs(90)
+        );
+        // Independent later observations cannot replace the captured evidence.
+        assert_eq!(
+            CertificateExpiryEvidence::capture(expiry, expiry, completed),
+            original
+        );
     }
 
     #[test]
