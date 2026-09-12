@@ -34,6 +34,7 @@ use crate::lifecycle::{
     directed_connection_key, material_status_matches_admission, CertificateExpiryEvidence,
     ConnectionAttemptMetricGuard, ConnectionLifecycle, ConnectionLifecyclePolicy,
     ReconnectAdmission, ReconnectGate, RetirementReason, SessionReauthenticationControl,
+    TlsCompletionTime,
 };
 use crate::membership::SessionMembershipAdmission;
 use crate::protocol::{
@@ -1319,16 +1320,17 @@ impl ConsensusColdConnector {
                         {
                             return Err(SessionConsensusPeerError::Authentication);
                         }
-                        let tls_completed_at = tokio::time::Instant::now();
+                        let tls_completion = TlsCompletionTime::now();
+                        let tls_completed_at = tls_completion.instant();
                         let local_expiry = CertificateExpiryEvidence::capture(
                             attempt.leaf_expires_at(),
                             attempt.certificate_chain_expires_at(),
-                            tls_completed_at,
+                            tls_completion,
                         );
                         let peer_expiry = CertificateExpiryEvidence::capture(
                             peer.leaf_expires_at(),
                             peer.certificate_chain_expires_at(),
-                            tls_completed_at,
+                            tls_completion,
                         );
                         let lifecycle = ConnectionLifecycle::new(
                             connector.lifecycle_policy,
@@ -3522,7 +3524,8 @@ async fn handle_consensus_connection(
             .await
             .map_err(|_| consensus_setup_timeout_error())?
             .map_err(classify_tls_io_error)?;
-        let established_at = tokio::time::Instant::now();
+        let tls_completion = TlsCompletionTime::now();
+        let established_at = tls_completion.instant();
         if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
             return Err(ProtocolError::UnexpectedResponse);
         }
@@ -3531,12 +3534,12 @@ async fn handle_consensus_connection(
         let local_certificate_expiry = CertificateExpiryEvidence::capture(
             handshake.leaf_expires_at(),
             handshake.certificate_chain_expires_at(),
-            established_at,
+            tls_completion,
         );
         let peer_certificate_expiry = CertificateExpiryEvidence::capture(
             peer.leaf_expires_at(),
             peer.certificate_chain_expires_at(),
-            established_at,
+            tls_completion,
         );
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
         dispatch_consensus(
@@ -5386,7 +5389,11 @@ mod tests {
         let expired = opc_types::Timestamp::from_offset_datetime(
             time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
         );
-        let peer_expiry = CertificateExpiryEvidence::capture(expired, expired, now);
+        let peer_expiry = CertificateExpiryEvidence::capture(
+            expired,
+            expired,
+            TlsCompletionTime::for_test(now, opc_types::Timestamp::now_utc()),
+        );
         let lifecycle = ConnectionLifecycle::new(
             ConnectionLifecyclePolicy::default(),
             now,
@@ -5666,8 +5673,11 @@ mod tests {
             opc_types::Timestamp::from_offset_datetime(wall_now + time::Duration::seconds(30));
         let accepted_peer_expiry =
             opc_types::Timestamp::from_offset_datetime(wall_now + time::Duration::seconds(60));
-        let accepted_peer_evidence =
-            CertificateExpiryEvidence::capture(accepted_peer_expiry, accepted_peer_expiry, now);
+        let accepted_peer_evidence = CertificateExpiryEvidence::capture(
+            accepted_peer_expiry,
+            accepted_peer_expiry,
+            TlsCompletionTime::for_test(now, opc_types::Timestamp::now_utc()),
+        );
         {
             let mut state = coordinator.state.lock().await;
             state.phase = ConsensusColdConnectionPhase::Connecting {
@@ -6167,7 +6177,11 @@ mod tests {
         let expired = opc_types::Timestamp::from_offset_datetime(
             time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
         );
-        let peer_expiry = CertificateExpiryEvidence::capture(expired, expired, now);
+        let peer_expiry = CertificateExpiryEvidence::capture(
+            expired,
+            expired,
+            TlsCompletionTime::for_test(now, opc_types::Timestamp::now_utc()),
+        );
         let lifecycle = ConnectionLifecycle::new(
             ConnectionLifecyclePolicy::default(),
             now,
@@ -9207,7 +9221,11 @@ mod tests {
         let expired = opc_types::Timestamp::from_offset_datetime(
             time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
         );
-        let peer_expiry = CertificateExpiryEvidence::capture(expired, expired, now);
+        let peer_expiry = CertificateExpiryEvidence::capture(
+            expired,
+            expired,
+            TlsCompletionTime::for_test(now, opc_types::Timestamp::now_utc()),
+        );
         let lifecycle = || {
             ConnectionLifecycle::new(policy, now, None, Some(peer_expiry), 0, None)
                 .expect("peer-expired cached lifecycle")
@@ -9301,7 +9319,11 @@ mod tests {
         let expires_at = opc_types::Timestamp::from_offset_datetime(
             time::OffsetDateTime::now_utc() + time::Duration::seconds(2),
         );
-        let peer_expiry = CertificateExpiryEvidence::capture(expires_at, expires_at, now);
+        let peer_expiry = CertificateExpiryEvidence::capture(
+            expires_at,
+            expires_at,
+            TlsCompletionTime::for_test(now, opc_types::Timestamp::now_utc()),
+        );
         let successor_lifecycle = ConnectionLifecycle::new(
             policy,
             now,
