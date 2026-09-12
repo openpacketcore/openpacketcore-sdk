@@ -11955,6 +11955,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reattach_same_paa_new_teid_consumes_exact_retired_predecessor() {
+        // Both cases use real protected coordinator transitions and opaque
+        // backend retirement receipts. The first is the supported whole-set
+        // control; the second models an ordinary new GTP-C negotiation.
+        for changed_teid in [false, true] {
+            let paa = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 1));
+            let original = group_with_paa(1, 1, 0x1000_0001, paa, None);
+            let successor = group_with_paa(
+                2,
+                1,
+                if changed_teid {
+                    0x1000_0002
+                } else {
+                    0x1000_0001
+                },
+                paa,
+                None,
+            );
+            let authority = production_authority(original.device_id()).await;
+            let backend = Arc::new(FaultingSelectorBackend::default());
+            authority.provision(backend.as_ref()).await.unwrap();
+            let active = authority
+                .reconcile_fresh(backend.clone(), original.clone())
+                .await
+                .unwrap();
+            let retired = authority
+                .retire(backend.clone(), active, original.clone())
+                .await
+                .unwrap();
+            assert_eq!(backend.effect_calls(), 1);
+            assert_eq!(backend.removal_calls(), 1);
+            let (_, before) = authority.read_state().await.unwrap();
+            assert!(matches!(
+                authority
+                    .reconcile_fresh(backend.clone(), successor.clone())
+                    .await,
+                Err(GtpuSessionSelectorCoordinatorError::Namespace)
+            ));
+            let (_, after_fresh) = authority.read_state().await.unwrap();
+            assert_eq!(before.encode(), after_fresh.encode());
+            assert_eq!(backend.effect_calls(), 1);
+
+            let authorization = authority
+                .authorize_reuse(backend.clone(), successor.clone(), retired)
+                .await;
+            let result = match authorization {
+                Ok(authorization) => {
+                    authority
+                        .reconcile_reused(backend.clone(), authorization)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            assert!(
+                result.is_ok(),
+                "an exact retired source must permit a new bearer with its PAA and a fresh TEID; changed_teid={changed_teid}, outcome={result:?}"
+            );
+            assert_eq!(backend.effect_calls(), 2);
+            assert_eq!(backend.reused_effect_calls(), 1);
+            assert!(authority
+                .recover_active(backend.clone(), successor)
+                .await
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn reused_install_recovery_reconstructs_durable_predecessor_provenance() {
         let reusable_paa = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 1));
         let original = group_with_paa(1, 1, 0x1000_0001, reusable_paa, None);
