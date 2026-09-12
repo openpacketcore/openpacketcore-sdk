@@ -129,6 +129,29 @@ stronger status. Documentation MUST distinguish:
 
 Only the first claim is an SDK claim. The other two remain product claims.
 
+### Traffic-proof renewal boundary
+
+Issue #777 adds bounded assessment renewal to the SDK-owned GTP-U proof
+mechanism. For unchanged canonical group, owner, fence, revision, policy and
+dataplane authority, the eBPF adapter may retain one issued predecessor while
+collecting one successor. A private relation authenticates that overlap; no
+caller-supplied lineage, observation, cached boolean or extended expiry can
+authorize it. Fresh registration and sample authority remain SDK-owned.
+
+The predecessor keeps its immutable expiry. The successor needs independent
+paired observations, and validation continues to check the current source,
+registration and full authority. Loss or drift is terminal. Cancellation owns
+at most one pending successor, recoverable by exact retry and retired with its
+predecessor if never delivered. Delivered sessions own independent exact
+cleanup; predecessor retirement cannot delete a later registration. Ordinary
+begin and authority rebind retain their supersession semantics.
+
+The CNF owns renewal scheduling, publication under its live configuration and
+ownership guards, and live qualification. SDK unit tests with a fake runtime
+prove mechanism behavior only. They do not establish continuous product
+readiness, forwarding, latency or carrier acceptance. This boundary preserves
+the separation between SDK mechanism and product policy above.
+
 ## Consequences
 
 - The SDK can grow reusable EPC and untrusted-access mechanisms without importing
