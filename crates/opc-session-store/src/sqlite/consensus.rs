@@ -33115,16 +33115,23 @@ fn validate_snapshot_install_replaced_pointers_sync(
             }
         }
     }
-    for pointer in [
+    let pointers = [
         purged.as_ref(),
         applied.as_ref(),
         committed.as_ref(),
         snapshot,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        validate_exact_log_prefix_through_sync(conn, identity, pointer, false)?;
+    ];
+    if let Some(highest) = pointers.into_iter().flatten().max_by_key(|id| id.index) {
+        // The same read-only audit runs inside one unchanged transaction.
+        // Decode the complete union once, then retain every original exact
+        // identity and no-hole proof for each individual pointer. No witness
+        // escapes this invocation or survives a source mutation.
+        let witnesses = validated_log_witnesses_through_sync(conn, identity, highest)?;
+        for pointer in pointers.into_iter().flatten() {
+            validate_exact_log_prefix_from_witnesses_sync(
+                conn, identity, pointer, false, &witnesses,
+            )?;
+        }
     }
     if purged.is_none() && snapshot.is_none() {
         for pointer in [applied.as_ref(), committed.as_ref()].into_iter().flatten() {
@@ -50041,6 +50048,174 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    async fn snapshot_install_pointer_audit_fixture() -> SqliteSessionBackend {
+        let backend = backend_with_blank_logs(127).await;
+        {
+            let conn = backend.conn.lock().await;
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("apply exact predecessor membership");
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(95));
+            set_test_log_pointer(&conn, "consensus_committed", &log_id(127));
+            set_test_purge_floor(&conn, &log_id(63));
+            save_test_snapshot_marker(&conn, log_id(63), "install-pointer-audit");
+        }
+        backend
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_pointer_audit_shares_one_exact_superset_payload_scan() {
+        let backend = snapshot_install_pointer_audit_fixture().await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin original predecessor pointer audit");
+        let changes = tx.total_changes();
+        reset_committed_log_validation_decoded_rows_for_test();
+        let started = Instant::now();
+        validate_snapshot_install_replaced_pointers_sync(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(&log_id(160)),
+        )
+        .expect("all four exact predecessor pointers retain their full prefix proofs");
+        let decoded = committed_log_validation_decoded_rows_for_test();
+        eprintln!(
+            "snapshot_install_pointer_audit retained_rows=128 decoded_rows={decoded} elapsed_us={}",
+            started.elapsed().as_micros(),
+        );
+        assert_eq!(
+            tx.total_changes(),
+            changes,
+            "pointer admission remains read-only"
+        );
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(63)));
+        assert_eq!(
+            read_applied_sync(&tx, identity()).unwrap(),
+            Some(log_id(95))
+        );
+        assert_eq!(
+            read_committed_sync(&tx, identity()).unwrap(),
+            Some(log_id(127))
+        );
+        assert_eq!(
+            decoded, 128,
+            "one transaction must share a complete original payload audit across all exact pointers",
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_pointer_audit_rejects_corruption_and_rechecks_same_transaction() {
+        for corruption in [
+            "prefix-json",
+            "tail-json",
+            "prefix-v2",
+            "tail-v2",
+            "prefix-row",
+            "tail-row",
+            "tail-gap",
+            "applied-gap",
+            "purge-marker",
+            "membership",
+        ] {
+            let backend = snapshot_install_pointer_audit_fixture().await;
+            let conn = backend.conn.lock().await;
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin source mutation fixture");
+            validate_snapshot_install_replaced_pointers_sync(
+                &tx,
+                identity(),
+                ConsensusAuthorityProfile::Dynamic,
+                Some(&log_id(160)),
+            )
+            .expect("the same transaction is initially valid");
+            let index = if corruption.starts_with("prefix-") {
+                32
+            } else {
+                96
+            };
+            match corruption {
+                "prefix-json" | "tail-json" => {
+                    tx.execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                        params![b"invalid-json".as_slice(), index],
+                    )
+                    .expect("inject malformed original payload");
+                }
+                "prefix-v2" | "tail-v2" => {
+                    let entry = fenced_transition_v2_entry(
+                        index as u64,
+                        fenced_transition_v2_request(0x96, 1, "install-pointer-audit"),
+                        timestamp(2),
+                    );
+                    let bytes = noncanonical_v2_log_json(&entry);
+                    assert!(decode_consensus_log_entry(&bytes).is_err());
+                    tx.execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                        params![bytes, index],
+                    )
+                    .expect("inject strict V2 corruption in retained source");
+                }
+                "prefix-row" | "tail-row" => {
+                    tx.execute(
+                        "UPDATE consensus_log SET term = 2 WHERE log_index = ?1",
+                        [index],
+                    )
+                    .expect("inject SQL and decoded LogId disagreement");
+                }
+                "tail-gap" | "applied-gap" => {
+                    tx.execute(
+                        "DELETE FROM consensus_log WHERE log_index = ?1",
+                        [if corruption == "applied-gap" { 95 } else { 96 }],
+                    )
+                    .expect("remove an exact pointer or its required prefix witness");
+                }
+                "purge-marker" => {
+                    save_log_pointer(
+                        &tx,
+                        "consensus_purged",
+                        identity(),
+                        &LogId::new(CommittedLeaderId::new(2, node_id()), 63),
+                    )
+                    .expect("inject conflicting full marker identity");
+                }
+                "membership" => {
+                    let altered = StoredMembership::<
+                        SessionConsensusNodeId,
+                        opc_consensus::engine::EmptyNode,
+                    >::new(
+                        Some(log_id(0)),
+                        opc_consensus::engine::Membership::new(
+                            vec![BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()])],
+                            BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()]),
+                        ),
+                    );
+                    tx.execute(
+                        "UPDATE consensus_membership SET membership_json = ?1 WHERE singleton = 1",
+                        [encode_json(&altered).unwrap()],
+                    )
+                    .expect("inject different retained membership payload");
+                }
+                _ => unreachable!(),
+            }
+            let changes = tx.total_changes();
+            assert_eq!(
+                validate_snapshot_install_replaced_pointers_sync(
+                    &tx,
+                    identity(),
+                    ConsensusAuthorityProfile::Dynamic,
+                    Some(&log_id(160)),
+                )
+                .expect_err("a prior successful audit cannot admit changed source rows")
+                .kind(),
+                io::ErrorKind::InvalidData,
+                "corruption={corruption}",
+            );
+            assert_eq!(tx.total_changes(), changes, "rejection writes nothing");
+            tx.rollback()
+                .expect("discard only this explicit corruption fixture");
+        }
     }
 
     #[tokio::test]
