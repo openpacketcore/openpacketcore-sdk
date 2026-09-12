@@ -1368,6 +1368,13 @@ fn state_indeterminate(operation: &'static str) -> GtpuError {
 }
 
 pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
+    /// Complete the qualified kernel grace boundary for the non-sleepable
+    /// grouped XDP/TC readers. No map, hook or packet-source mutation is allowed.
+    fn synchronize_grouped_readers(&self) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "grouped_selector_quiescence",
+        })
+    }
     /// Reconcile one exclusively owned workload graph to absence.
     fn reset_workload_graph(
         &self,
@@ -7136,7 +7143,20 @@ impl EbpfGtpuDataplaneBackend {
         provenance: &GtpuSessionSelectorProvenance,
         currentness: &mut SelectorNamespaceCurrentnessGate<'_>,
     ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
-        let GtpuSessionSelectorProvenance::Reused(proof) = provenance;
+        let (proof, reattach) = match provenance {
+            GtpuSessionSelectorProvenance::Reused(proof) => (proof, false),
+            GtpuSessionSelectorProvenance::Reattached(proof) => (proof, true),
+        };
+        if proof.is_single_bearer_reattach() != reattach
+            || (reattach
+                && (base.is_some()
+                    || !crate::selector_namespace::single_bearer_reattach_is_exact(
+                        proof.retired_group(),
+                        desired,
+                    )))
+        {
+            return Err(GtpuSessionGroupIndeterminateReason::GraceUnproven);
+        }
         let retired = proof.retired_group();
         self.validate_grouped_model_attachment(retired, context)?;
         let desired_record = grouped_record_from_model(desired, GtpuSessionGeneration::INITIAL)
@@ -7158,9 +7178,10 @@ impl EbpfGtpuDataplaneBackend {
             .copied()
             .collect::<Vec<_>>();
         if introduced_keys.is_empty()
-            || !introduced_keys
-                .iter()
-                .all(|key| retired_keys.contains_key(key))
+            || (!reattach
+                && !introduced_keys
+                    .iter()
+                    .all(|key| retired_keys.contains_key(key)))
         {
             return Err(GtpuSessionGroupIndeterminateReason::GraceUnproven);
         }
@@ -13630,6 +13651,83 @@ impl EbpfGtpuDataplaneBackend {
 
 #[async_trait]
 impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
+    async fn authorize_selector_reuse(
+        &self,
+        request: crate::GtpuSessionSelectorReuseRequest,
+    ) -> Result<crate::GtpuSessionSelectorReuseReceipt, GtpuError> {
+        let request = self
+            .run_blocking("ebpf_selector_reuse_quiescence", move |backend| {
+                let _operation = backend.operation_guard()?;
+                let context = backend
+                    .grouped_attachment_context(request.binding().stable_device())
+                    .map_err(|_| state_indeterminate("ebpf_selector_reuse_attachment"))?;
+                backend
+                    .validate_grouped_model_attachment(request.retired_group(), &context)
+                    .map_err(|_| state_indeterminate("ebpf_selector_reuse_attachment"))?;
+                let effect = backend
+                    .inner
+                    .runtime
+                    .acquire_selector_namespace_effect(context.device.ifindex, request.binding())?;
+                let validate = || -> Result<(), GtpuError> {
+                    if !request.is_current() {
+                        return Err(state_indeterminate("ebpf_selector_reuse_window"));
+                    }
+                    let observed = backend
+                        .stable_grouped_observation(&context, request.retired_group().id())
+                        .map_err(|_| state_indeterminate("ebpf_selector_reuse_readback"))?
+                        .ok_or_else(|| state_indeterminate("ebpf_selector_reuse_readback"))?;
+                    if observed.authority.is_some()
+                        || observed.transaction.is_some()
+                        || !observed.indexes.is_empty()
+                        || !observed.selector_stamp.is_some_and(|stamp| {
+                            request.verifies_exact_terminal_retired_stamp(&stamp)
+                        })
+                    {
+                        return Err(state_indeterminate("ebpf_selector_reuse_retirement"));
+                    }
+                    // Source-key absence is also exact: an index repointed to a
+                    // different group must not disappear from source enumeration.
+                    let record = grouped_record_from_model(
+                        request.retired_group(),
+                        GtpuSessionGeneration::INITIAL,
+                    )
+                    .ok_or_else(|| state_indeterminate("ebpf_selector_reuse_graph"))?;
+                    let indexes = grouped_record_candidates(record)
+                        .ok_or_else(|| state_indeterminate("ebpf_selector_reuse_graph"))?;
+                    for key in indexes.keys() {
+                        if backend
+                            .grouped_index_get(context.device.ifindex, *key)?
+                            .is_some()
+                        {
+                            return Err(state_indeterminate(
+                                "ebpf_selector_reuse_selector_conflict",
+                            ));
+                        }
+                    }
+                    backend
+                        .ensure_grouped_attachment(&context)
+                        .map_err(|_| state_indeterminate("ebpf_selector_reuse_attachment"))?;
+                    request
+                        .is_current()
+                        .then_some(())
+                        .ok_or_else(|| state_indeterminate("ebpf_selector_reuse_window"))
+                };
+                validate()?;
+                backend.inner.runtime.synchronize_grouped_readers()?;
+                validate()?;
+                effect.finish()?;
+                request
+                    .is_current()
+                    .then_some(request)
+                    .ok_or_else(|| state_indeterminate("ebpf_selector_reuse_window"))
+            })
+            .await?;
+        if !request.is_current() {
+            return Err(state_indeterminate("ebpf_selector_reuse_window"));
+        }
+        Ok(request.confirm_rcu_grace_period())
+    }
+
     async fn acquire_selector_namespace_lease(
         &self,
         lease: crate::GtpuSessionSelectorBindingLease,
@@ -38479,7 +38577,78 @@ mod aya_runtime {
         }
     }
 
+    fn grouped_reader_grace_kernel_profile(version: &[u8]) -> bool {
+        // Linux init/Makefile puts the build number, SMP, and preemption
+        // configuration before the timestamp in UTS_VERSION. Realtime
+        // bottom-half readers can be preempted on a single online CPU, where
+        // GLOBAL takes a shortcut, so that kernel profile is unsupported.
+        // An unrecognized/truncated configuration cannot attest this boundary.
+        let Ok(version) = std::str::from_utf8(version) else {
+            return false;
+        };
+        let mut fields = version.split_ascii_whitespace();
+        let Some(build) = fields.next().and_then(|field| field.strip_prefix('#')) else {
+            return false;
+        };
+        if build.is_empty()
+            || !build.bytes().all(|byte| byte.is_ascii_digit())
+            || fields.next() != Some("SMP")
+        {
+            return false;
+        }
+        let remaining = fields.collect::<Vec<_>>();
+        !remaining.is_empty()
+            && remaining.iter().all(|field| {
+                !field.starts_with("PREEMPT") || matches!(*field, "PREEMPT" | "PREEMPT_DYNAMIC")
+            })
+    }
+
+    #[test]
+    fn grouped_reader_grace_refuses_realtime_and_unknown_kernel_profiles() {
+        for version in [
+            "#1 SMP PREEMPT_DYNAMIC Wed Sep 9 00:00:00 UTC 2026",
+            "#2 SMP PREEMPT Wed Sep 9 00:00:00 UTC 2026",
+            "#3 SMP Wed Sep 9 00:00:00 UTC 2026",
+        ] {
+            assert!(grouped_reader_grace_kernel_profile(version.as_bytes()));
+        }
+        for version in [
+            "#1 SMP PREEMPT_RT Wed Sep 9 00:00:00 UTC 2026",
+            "#1 SMP PREEMPT_RT_FULL Wed Sep 9 00:00:00 UTC 2026",
+            "#1 SMP PREEMPT_UNKNOWN Wed Sep 9 00:00:00 UTC 2026",
+            "#1 PREEMPT Wed Sep 9 00:00:00 UTC 2026",
+            "#1 SMP",
+            "# SMP Wed Sep 9 00:00:00 UTC 2026",
+            "unknown",
+            "",
+        ] {
+            assert!(!grouped_reader_grace_kernel_profile(version.as_bytes()));
+        }
+        assert!(!grouped_reader_grace_kernel_profile(&[0xff]));
+    }
+
     impl EbpfGtpuRuntime for AyaGtpuRuntime {
+        fn synchronize_grouped_readers(&self) -> Result<(), GtpuError> {
+            // Linux's non-expedited GLOBAL command executes synchronize_rcu
+            // with multiple online CPUs. The one-CPU shortcut is applicable
+            // to this profile's non-sleepable XDP/TC read-side sections: a
+            // process cannot overtake an interrupted bottom-half reader.
+            // Expedited/private commands are memory-ordering IPIs and are
+            // deliberately NOT substitutes. nohz_full/blocked syscalls fail.
+            use rustix::thread::{
+                membarrier, membarrier_query, MembarrierCommand, MembarrierQuery,
+            };
+            if !grouped_reader_grace_kernel_profile(rustix::system::uname().version().to_bytes())
+                || !membarrier_query().contains(MembarrierQuery::GLOBAL)
+            {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "grouped_selector_global_grace",
+                });
+            }
+            membarrier(MembarrierCommand::Global)
+                .map_err(|_| state_indeterminate("ebpf_selector_global_grace"))
+        }
+
         fn reset_workload_graph(
             &self,
             ifindex: Option<u32>,
@@ -54025,6 +54194,11 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        grouped_reader_grace_enabled: bool,
+        grouped_reader_grace_calls: usize,
+        grouped_reader_grace_fault: bool,
+        grouped_reader_grace_corrupt_group: Option<[u8; 16]>,
+        grouped_reader_grace_replace_path: bool,
         attached: HashMap<u32, FakeAttachment>,
         // Simulates pinned state that survives detach-free process restarts.
         pinned_config: HashMap<PathBuf, [u8; 4]>,
@@ -56521,6 +56695,31 @@ mod tests {
     }
 
     impl EbpfGtpuRuntime for FakeRuntime {
+        fn synchronize_grouped_readers(&self) -> Result<(), GtpuError> {
+            assert!(self.selector_namespace_effect_held.load(Ordering::Acquire));
+            let mut state = self.state();
+            if !state.grouped_reader_grace_enabled {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "grouped_selector_quiescence",
+                });
+            }
+            state.grouped_reader_grace_calls += 1;
+            if state.grouped_reader_grace_fault {
+                return Err(state_indeterminate("fake_grouped_reader_grace"));
+            }
+            if let Some(group) = state.grouped_reader_grace_corrupt_group {
+                state
+                    .selector_operation_stamps
+                    .get_mut(&(S2BU_IFINDEX, group))
+                    .unwrap()[0] ^= 1;
+            }
+            if state.grouped_reader_grace_replace_path {
+                self.selector_namespace_effect_path_replaced_on_finish
+                    .store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
             self.ifindexes.get(name).copied().ok_or(GtpuError::NotFound)
         }
@@ -64854,9 +65053,11 @@ mod tests {
             keys,
             "selector-fixture",
         ));
-        let authority = crate::GtpuSessionSelectorNamespaceAuthority::provision_protected(
-            store,
-            SelectorLedgerStorageScope::new(tenant, NetworkFunctionKind::from_static("epdg")),
+        let scope =
+            SelectorLedgerStorageScope::new(tenant, NetworkFunctionKind::from_static("epdg"));
+        let mut authority = crate::GtpuSessionSelectorNamespaceAuthority::provision_protected(
+            store.clone(),
+            scope.clone(),
             backend
                 .selector_namespace_bootstrap(device_id)
                 .await
@@ -64901,6 +65102,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        runtime.state().grouped_reader_grace_enabled = true;
         let mut predecessor = old;
         for cycle in 0..4_u8 {
             let successor = grouped_group(
@@ -64913,14 +65115,75 @@ mod tests {
             );
             let before_sibling =
                 runtime.state().session_groups[&(S2BU_IFINDEX, sibling.id().to_bytes())];
+            if cycle == 0 {
+                let key = (S2BU_IFINDEX, predecessor.id().to_bytes());
+                let stamp = runtime.state().selector_operation_stamps[&key];
+                runtime.state().grouped_reader_grace_enabled = false;
+                assert!(authority
+                    .reconcile_reattached(backend.clone(), successor.clone())
+                    .await
+                    .is_err());
+                runtime.state().grouped_reader_grace_enabled = true;
+                runtime.state().grouped_reader_grace_fault = true;
+                assert!(authority
+                    .reconcile_reattached(backend.clone(), successor.clone())
+                    .await
+                    .is_err());
+                runtime.state().grouped_reader_grace_fault = false;
+                runtime.state().selector_operation_stamps.remove(&key);
+                for _ in 0..32 {
+                    assert!(authority
+                        .reconcile_reattached(backend.clone(), successor.clone())
+                        .await
+                        .is_err());
+                }
+                runtime.state().selector_operation_stamps.insert(key, stamp);
+                runtime.state().grouped_reader_grace_corrupt_group =
+                    Some(predecessor.id().to_bytes());
+                assert!(authority
+                    .reconcile_reattached(backend.clone(), successor.clone())
+                    .await
+                    .is_err());
+                runtime.state().grouped_reader_grace_corrupt_group = None;
+                runtime.state().selector_operation_stamps.insert(key, stamp);
+                runtime.state().grouped_reader_grace_replace_path = true;
+                assert!(authority
+                    .reconcile_reattached(backend.clone(), successor.clone())
+                    .await
+                    .is_err());
+                runtime.state().grouped_reader_grace_replace_path = false;
+                runtime
+                    .selector_namespace_effect_path_replaced_on_finish
+                    .store(false, Ordering::Release);
+                assert!(
+                    runtime.state().session_groups[&(S2BU_IFINDEX, sibling.id().to_bytes())]
+                        == before_sibling
+                );
+                assert!(!runtime
+                    .state()
+                    .session_groups
+                    .contains_key(&(S2BU_IFINDEX, successor.id().to_bytes())));
+            }
             let admitted = authority
-                .reconcile_fresh(backend.clone(), successor.clone())
+                .reconcile_reattached(backend.clone(), successor.clone())
                 .await;
             assert!(
                 admitted.is_ok(),
                 "returning subscriber must attach with the retired PAA and a fresh TEID"
             );
             let active = admitted.unwrap();
+            let collision = grouped_group(
+                0x70 + cycle,
+                device_id,
+                vec![grouped_v4_entry(
+                    0x1100_0020 + u32::from(cycle),
+                    0x2100_0020 + u32::from(cycle),
+                )],
+            );
+            assert!(authority
+                .reconcile_reattached(backend.clone(), collision)
+                .await
+                .is_err());
             drop(
                 authority
                     .recover_active(backend.clone(), sibling.clone())
@@ -64955,6 +65218,25 @@ mod tests {
                     .unwrap(),
             );
             predecessor = successor;
+            if cycle == 1 {
+                // Reopen the protected ledger under a new authority instance;
+                // keep the exact retained kernel graph and sibling authority.
+                drop(authority);
+                authority = crate::GtpuSessionSelectorNamespaceAuthority::open_protected(
+                    store.clone(),
+                    scope.clone(),
+                    backend
+                        .selector_namespace_bootstrap(device_id)
+                        .await
+                        .unwrap(),
+                    backend.clone(),
+                    OwnerId::new("selector-reopened-worker").unwrap(),
+                    std::time::Duration::from_secs(30),
+                    32,
+                )
+                .await
+                .unwrap();
+            }
         }
         drop(authority.recover_active(backend, sibling).await.unwrap());
     }

@@ -504,7 +504,6 @@ impl GtpuSessionSelectorReuseRequest {
 
     /// Check the short durable-worker fence immediately before the backend
     /// performs terminal-stamp readback or its quiescence barrier.
-    #[cfg(test)]
     pub(crate) fn is_current(&self) -> bool {
         self.window.is_current()
     }
@@ -4342,6 +4341,9 @@ where
         D: GtpuDataplaneBackend + ?Sized,
     {
         let GtpuSessionSelectorReuseAuthorization { desired, proof } = authorization;
+        if proof.is_single_bearer_reattach() {
+            return Err(GtpuSessionSelectorCoordinatorError::Namespace);
+        }
         let mut lease = self
             .acquire_worker_lease()
             .await
@@ -4374,6 +4376,143 @@ where
                         desired,
                         admission,
                         Some(reuse),
+                        &mut lease,
+                    )
+                    .await
+                }
+                BackendStartHandoff::AlreadyStarted(admission) => {
+                    self.recover_install_after_competing_start(
+                        backend, desired, admission, &mut lease,
+                    )
+                    .await
+                }
+            }
+        }
+        .await;
+        self.finish_worker_operation(lease, result).await
+    }
+
+    /// Admit a returning single-bearer session using its exact retired PAA
+    /// and mark selectors plus a never-published local TEID. The predecessor
+    /// is discovered inside the protected ledger, completely retired and
+    /// qualified by the backend's real quiescence boundary. Its one successor
+    /// edge, the new atom reservation and the complete Installing intent are
+    /// committed together before any forwarding effect.
+    ///
+    /// Active, ambiguous, already-consumed or differently shaped predecessors
+    /// fail closed. This bounded profile is separate from whole-set reissue
+    /// and does not implement general mixed-selector transfer or graph restore.
+    pub fn reconcile_reattached<D>(
+        &self,
+        backend: Arc<D>,
+        desired: GtpuSessionGroup,
+    ) -> GtpuSessionSelectorOperation<GtpuSessionSelectorActiveClaim>
+    where
+        B: Send + Sync + 'static,
+        D: GtpuDataplaneBackend + Send + Sync + 'static,
+    {
+        let authority = self.clone();
+        let scope = self.storage_scope_commitment;
+        spawn_selector_operation(
+            scope,
+            GtpuSessionSelectorCoordinatorError::Backend,
+            async move {
+                authority
+                    .reconcile_reattached_owned(backend.as_ref(), desired)
+                    .await
+            },
+        )
+    }
+
+    async fn reconcile_reattached_owned<D>(
+        &self,
+        backend: &D,
+        desired: GtpuSessionGroup,
+    ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorCoordinatorError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
+        let mut lease = self
+            .acquire_worker_lease()
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+        let result = async {
+            self.ensure_backend_namespace(backend, &mut lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let (_, state) = self
+                .read_state()
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let source = state
+                .single_bearer_reattach_source(&desired)
+                .ok_or(GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let admission = self
+                .retired_admission(&source)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let window = self
+                .mint_backend_mutation_window(&mut lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let receipt = settle_selector_backend_step(backend.authorize_selector_reuse(
+                GtpuSessionSelectorReuseRequest {
+                    retired: GtpuSessionSelectorRetiredClaim {
+                        group: source,
+                        admission,
+                    },
+                    desired: desired.clone(),
+                    window,
+                },
+            ))
+            .await
+            .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
+            let GtpuSessionSelectorReuseReceipt {
+                retired,
+                desired: received,
+                evidence,
+                window,
+            } = receipt;
+            if !window.is_current()
+                || canonical_desired_bytes(&received) != canonical_desired_bytes(&desired)
+                || !retired.admission.validates(&retired.group)
+                || retired.admission.phase != SelectorAdmissionPhase::Retired
+            {
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
+            }
+            let proof = match evidence {
+                crate::GtpuSessionSelectorReuseEvidence::TrafficDrained => {
+                    crate::GtpuSessionSelectorReuseProof::after_traffic_drain(retired.group)
+                }
+                crate::GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed => {
+                    crate::GtpuSessionSelectorReuseProof::after_rcu_grace_period(retired.group)
+                }
+            }
+            .for_single_bearer_reattach();
+            // The lease remains held throughout qualification, precommit,
+            // handoff and terminal acknowledgement. The claim rechecks the
+            // exact protected predecessor after the backend receipt.
+            self.claim_reused_with_lease(backend, &desired, &proof, &mut lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            match self
+                .mark_install_backend_started_with_lease(&desired, &mut lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?
+            {
+                BackendStartHandoff::Transitioned(admission) => {
+                    let proof = self
+                        .installing_reuse_proof(&desired)
+                        .await
+                        .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?
+                        .filter(|proof| proof.is_single_bearer_reattach())
+                        .ok_or(GtpuSessionSelectorCoordinatorError::Namespace)?;
+                    self.effect_and_activate_with_lease(
+                        backend,
+                        desired,
+                        admission,
+                        Some(proof),
                         &mut lease,
                     )
                     .await
@@ -5088,6 +5227,9 @@ where
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let request = match reuse {
+            Some(reuse) if reuse.is_single_bearer_reattach() => {
+                GtpuSessionGroupReconcileRequest::new_reattached(desired.clone(), admission, reuse)
+            }
             Some(reuse) => {
                 GtpuSessionGroupReconcileRequest::new_reused(desired.clone(), admission, reuse)
             }
@@ -5477,7 +5619,11 @@ where
         let source_canonical = CanonicalClaim::from_group(proof.retired_group());
         if desired.device_id() != proof.retired_group().device_id()
             || desired.id() == proof.retired_group().id()
-            || canonical.atoms != source_canonical.atoms
+            || if proof.is_single_bearer_reattach() {
+                !single_bearer_reattach_is_exact(proof.retired_group(), desired)
+            } else {
+                canonical.atoms != source_canonical.atoms
+            }
         {
             return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
         }
@@ -5495,17 +5641,30 @@ where
             let atoms = claim
                 .selector_atoms(&state.selector_digest_key)
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
-            let source_is_exact = matches!(state.groups.get(&source.group_fingerprint), Some(GroupState::Retired { device, selectors, desired: source_desired, atoms: source_atoms, successor: None, .. }) if *device == source.device_fingerprint && *selectors == source.selector_set_fingerprint && *source_desired == source.desired_fingerprint && *source_atoms == atoms);
+            let old_atoms = source
+                .selector_atoms(&state.selector_digest_key)
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+            let source_is_exact = matches!(state.groups.get(&source.group_fingerprint), Some(GroupState::Retired { device, selectors, desired: source_desired, atoms: source_atoms, successor: None, .. }) if *device == source.device_fingerprint && *selectors == source.selector_set_fingerprint && *source_desired == source.desired_fingerprint && *source_atoms == old_atoms);
             if state.group_was_reserved(&claim.group_fingerprint)
                 || !source_is_exact
-                || !atoms.iter().all(|atom| {
+                || !old_atoms.iter().all(|atom| {
                     matches!(state.selectors.get(atom), Some(SelectorState::Retired))
                         && state.tombstones.contains(atom)
+                })
+                || atoms.difference(&old_atoms).any(|atom| {
+                    state.selectors.contains_key(atom)
+                        || state.published_atoms.contains(atom)
+                        || state.tombstones.contains(atom)
                 })
             {
                 return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
             }
-            state.preflight_reissue(atoms.len())?;
+            if proof.is_single_bearer_reattach() {
+                state.preflight_reattach(atoms.len())?;
+                state.reattach_sources.insert(source.group_fingerprint);
+            } else {
+                state.preflight_reissue(atoms.len())?;
+            }
             state.retain_canonical_desired(claim.group_fingerprint, desired)?;
             let generation = state.next_generation()?;
             let operation_nonce = random_nonzero_nonce()?;
@@ -6990,6 +7149,9 @@ struct NamespaceState {
     /// Permanent no-admission decisions. These groups own no selectors and
     /// have no backend stamp. They share the permanent group capacity bound.
     unadmitted_groups: BTreeMap<[u8; 32], UnadmittedGroup>,
+    /// Immutable discriminator for bounded reattach edges. Their source rows
+    /// retain the complete old graph and their one consumed successor forever.
+    reattach_sources: BTreeSet<[u8; 32]>,
     /// Protected canonical desired descriptors for every permanent group.
     /// This is the durable source of operation-stamp key reconstruction.
     canonical_desired: BTreeMap<[u8; 32], Zeroizing<Vec<u8>>>,
@@ -7008,6 +7170,121 @@ struct UnadmittedGroup {
 }
 
 impl NamespaceState {
+    fn single_bearer_reattach_source(
+        &self,
+        desired: &GtpuSessionGroup,
+    ) -> Option<GtpuSessionGroup> {
+        let claim = CanonicalClaim::from_group(desired).with_key(&self.selector_digest_key)?;
+        if self.group_was_reserved(&claim.group_fingerprint) {
+            return None;
+        }
+        let desired_atoms = claim.selector_atoms(&self.selector_digest_key)?;
+        let mut source = None;
+        for (fingerprint, state) in &self.groups {
+            let GroupState::Retired {
+                atoms,
+                successor: None,
+                ..
+            } = state
+            else {
+                continue;
+            };
+            let candidate = self.canonical_group_for(*fingerprint)?;
+            if !single_bearer_reattach_is_exact(&candidate, desired) {
+                continue;
+            }
+            if source.is_some()
+                || !atoms.iter().all(|atom| {
+                    matches!(self.selectors.get(atom), Some(SelectorState::Retired))
+                        && self.tombstones.contains(atom)
+                })
+                || desired_atoms.difference(atoms).any(|atom| {
+                    self.selectors.contains_key(atom)
+                        || self.published_atoms.contains(atom)
+                        || self.tombstones.contains(atom)
+                })
+            {
+                return None;
+            }
+            source = Some(candidate);
+        }
+        source
+    }
+
+    fn preflight_reattach(&self, atoms: usize) -> Result<(), GtpuSessionSelectorNamespaceError> {
+        // Conservatively reserve every desired atom, although the PAA/mark
+        // slots already exist. Never consume the old TEID's permanent slots.
+        self.preflight_fresh_claim(atoms)?;
+        let additional = atoms
+            .checked_mul(169)
+            .and_then(|value| {
+                value.checked_add(
+                    157 + 34
+                        + MAX_CANONICAL_DESIRED_BYTES
+                        + MAX_REUSED_INSTALL_DESCRIPTOR_BYTES
+                        + 40
+                        + 36,
+                )
+            })
+            .ok_or(GtpuSessionSelectorNamespaceError::CapacityExhausted)?;
+        self.preflight_encoded_growth(additional)
+    }
+
+    fn group_is_in_lineage(&self, mut root: [u8; 32], target: [u8; 32]) -> bool {
+        for _ in 0..=self.groups.len() {
+            if root == target {
+                return true;
+            }
+            let Some(GroupState::Retired {
+                successor: Some(next),
+                ..
+            }) = self.groups.get(&root)
+            else {
+                return false;
+            };
+            root = next.group;
+        }
+        false
+    }
+
+    fn successor_provenance_is_exact(&self, source: [u8; 32], successor: RetiredSuccessor) -> bool {
+        let Some(old) = self.canonical_group_for(source) else {
+            return false;
+        };
+        let Some(new) = self.canonical_group_for(successor.group) else {
+            return false;
+        };
+        let old_claim = CanonicalClaim::from_group(&old);
+        let new_claim = CanonicalClaim::from_group(&new);
+        if !self.reattach_sources.contains(&source) {
+            return old_claim.atoms == new_claim.atoms;
+        }
+        if !single_bearer_reattach_is_exact(&old, &new) {
+            return false;
+        }
+        // Freshness survives reopen: the new TEID may occur only at this
+        // successor or later in its exact one-successor chain, never in an
+        // independent or earlier reservation (including poisoned history).
+        let Some(new_atoms) = new_claim.selector_atoms(&self.selector_digest_key) else {
+            return false;
+        };
+        let Some(old_atoms) = old_claim.selector_atoms(&self.selector_digest_key) else {
+            return false;
+        };
+        new_atoms.difference(&old_atoms).all(|fresh| {
+            self.groups.iter().all(|(group, state)| {
+                let contains = match state {
+                    GroupState::Installing { atoms, .. }
+                    | GroupState::Active { atoms, .. }
+                    | GroupState::Retiring { atoms, .. }
+                    | GroupState::Retired { atoms, .. } => atoms.contains(fresh),
+                    GroupState::Poisoned(poison) => poison.atoms.contains(fresh),
+                    GroupState::LegacyPoisoned => true,
+                };
+                !contains || self.group_is_in_lineage(successor.group, *group)
+            })
+        })
+    }
     fn group_was_reserved(&self, fingerprint: &[u8; 32]) -> bool {
         self.groups.contains_key(fingerprint) || self.unadmitted_groups.contains_key(fingerprint)
     }
@@ -7060,6 +7337,7 @@ impl NamespaceState {
             || !self.selectors.is_empty()
             || !self.groups.is_empty()
             || !self.unadmitted_groups.is_empty()
+            || !self.reattach_sources.is_empty()
             || !self.canonical_desired.is_empty()
             || !self.published_atoms.is_empty()
             || !self.tombstones.is_empty()
@@ -7879,27 +8157,38 @@ impl NamespaceState {
         let Some(source_atoms) = source.selector_atoms(&self.selector_digest_key) else {
             return false;
         };
-        source_atoms == *successor_atoms
-            && matches!(
-                self.groups.get(&source.group_fingerprint),
-                Some(GroupState::Retired {
-                    device,
-                    selectors,
-                    desired,
-                    generation,
-                    operation_nonce,
-                    retired_dataplane_generation,
-                    successor: Some(edge),
-                    ..
-                }) if *device == descriptor.source_device
-                    && *selectors == descriptor.source_selectors
-                    && *desired == descriptor.source_desired_fingerprint
-                    && *generation == descriptor.source_generation
-                    && *operation_nonce == descriptor.source_operation_nonce
-                    && *retired_dataplane_generation == descriptor.source_retired_dataplane_generation
-                    && edge.group == successor_group
-                    && edge.generation == successor_generation
-            )
+        (if descriptor.single_bearer_reattach {
+            self.reattach_sources.contains(&source.group_fingerprint)
+                && self.successor_provenance_is_exact(
+                    source.group_fingerprint,
+                    RetiredSuccessor {
+                        group: successor_group,
+                        generation: successor_generation,
+                    },
+                )
+        } else {
+            !self.reattach_sources.contains(&source.group_fingerprint)
+                && source_atoms == *successor_atoms
+        }) && matches!(
+            self.groups.get(&source.group_fingerprint),
+            Some(GroupState::Retired {
+                device,
+                selectors,
+                desired,
+                generation,
+                operation_nonce,
+                retired_dataplane_generation,
+                successor: Some(edge),
+                ..
+            }) if *device == descriptor.source_device
+                && *selectors == descriptor.source_selectors
+                && *desired == descriptor.source_desired_fingerprint
+                && *generation == descriptor.source_generation
+                && *operation_nonce == descriptor.source_operation_nonce
+                && *retired_dataplane_generation == descriptor.source_retired_dataplane_generation
+                && edge.group == successor_group
+                && edge.generation == successor_generation
+        )
     }
 
     fn successor_lineage_is_exact(&self, successor: RetiredSuccessor) -> bool {
@@ -7964,7 +8253,9 @@ impl NamespaceState {
         // OPCSN16 adds a permanent, disjoint no-admission index. Existing
         // OPCSN15 ledgers keep their exact encoding until the first seal CAS;
         // older readers then reject the new schema before issuing authority.
-        output.extend_from_slice(if self.unadmitted_groups.is_empty() {
+        output.extend_from_slice(if !self.reattach_sources.is_empty() {
+            b"OPCSN17"
+        } else if self.unadmitted_groups.is_empty() {
             b"OPCSN15"
         } else {
             b"OPCSN16"
@@ -8059,7 +8350,7 @@ impl NamespaceState {
                     match reuse {
                         None => output.push(0),
                         Some(reuse) => {
-                            output.push(1);
+                            output.push(if reuse.single_bearer_reattach { 2 } else { 1 });
                             output.extend_from_slice(
                                 &u16::try_from(reuse.source_desired.len())
                                     .unwrap_or(u16::MAX)
@@ -8194,13 +8485,19 @@ impl NamespaceState {
         for tombstone in &self.tombstones {
             output.extend_from_slice(tombstone);
         }
-        if !self.unadmitted_groups.is_empty() {
+        if !self.unadmitted_groups.is_empty() || !self.reattach_sources.is_empty() {
             output.extend_from_slice(&(self.unadmitted_groups.len() as u32).to_be_bytes());
             for (group, sealed) in &self.unadmitted_groups {
                 output.extend_from_slice(group);
                 output.extend_from_slice(&sealed.generation.get().to_be_bytes());
                 output.extend_from_slice(&(sealed.desired.len() as u16).to_be_bytes());
                 output.extend_from_slice(&sealed.desired);
+            }
+        }
+        if !self.reattach_sources.is_empty() {
+            output.extend_from_slice(&(self.reattach_sources.len() as u32).to_be_bytes());
+            for source in &self.reattach_sources {
+                output.extend_from_slice(source);
             }
         }
         output
@@ -8212,7 +8509,7 @@ impl NamespaceState {
         }
         let mut cursor = 0_usize;
         let version = take(bytes, &mut cursor, 7)?;
-        (version == b"OPCSN15" || version == b"OPCSN16").then_some(())?;
+        (version == b"OPCSN15" || version == b"OPCSN16" || version == b"OPCSN17").then_some(())?;
         let lifecycle = match *take(bytes, &mut cursor, 1)?.first()? {
             0 => NamespaceLifecycle::Unprovisioned,
             1 => NamespaceLifecycle::Provisioned,
@@ -8386,7 +8683,7 @@ impl NamespaceState {
                     let reuse = if tag == 0 {
                         match *take(bytes, &mut cursor, 1)?.first()? {
                             0 => None,
-                            1 => {
+                            kind @ (1 | 2) if kind == 1 || version == b"OPCSN17" => {
                                 let len = usize::from(u16::from_be_bytes(take_array(take(
                                     bytes,
                                     &mut cursor,
@@ -8421,6 +8718,7 @@ impl NamespaceState {
                                 (source_operation_nonce != [0; 16]
                                     && decode_canonical_desired(&source_desired).is_some())
                                 .then_some(ReusedInstallDescriptor {
+                                    single_bearer_reattach: kind == 2,
                                     source_desired,
                                     evidence,
                                     source_device,
@@ -8577,9 +8875,9 @@ impl NamespaceState {
             tombstones.insert(tombstone);
         }
         let mut unadmitted_groups = BTreeMap::new();
-        if version == b"OPCSN16" {
+        if version == b"OPCSN16" || version == b"OPCSN17" {
             let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
-            if count == 0
+            if (count == 0 && version == b"OPCSN16")
                 || count > MAX_PERMANENT_GROUPS
                 || groups.len().checked_add(count)? > MAX_PERMANENT_GROUPS
             {
@@ -8609,6 +8907,22 @@ impl NamespaceState {
                 );
             }
         }
+        let mut reattach_sources = BTreeSet::new();
+        if version == b"OPCSN17" {
+            let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
+            if count == 0 || count > MAX_PERMANENT_GROUPS {
+                return None;
+            }
+            let mut previous = None;
+            for _ in 0..count {
+                let source = take_array(take(bytes, &mut cursor, 32)?)?;
+                if previous.is_some_and(|value| value >= source) {
+                    return None;
+                }
+                previous = Some(source);
+                reattach_sources.insert(source);
+            }
+        }
         let state = Self {
             lifecycle,
             stable_device,
@@ -8624,6 +8938,7 @@ impl NamespaceState {
             selectors,
             groups,
             unadmitted_groups,
+            reattach_sources,
             canonical_desired,
             published_atoms,
             tombstones,
@@ -8919,6 +9234,8 @@ impl NamespaceState {
             && self.canonical_desired.len() <= MAX_CANONICAL_DESIRED_RECORDS
             && self.canonical_desired.len() == self.groups.len()
             && self.canonical_desired_index_is_exact()
+            && self.reattach_sources.iter().all(|source|
+                matches!(self.groups.get(source), Some(GroupState::Retired { successor: Some(_), .. })))
             && self.unadmitted_groups.iter().all(|(fingerprint, sealed)| {
                 if self.groups.contains_key(fingerprint) || sealed.generation.get() > self.generation {
                     return false;
@@ -8986,6 +9303,9 @@ impl NamespaceState {
                                 && generation.get() < successor.generation.get()
                                 && successor.generation.get() <= self.generation
                                 && self.successor_lineage_is_exact(successor)
+                                && self.successor_provenance_is_exact(*group_digest, successor)
+                                && self.groups.values().filter(|other| matches!(other,
+                                    GroupState::Retired { successor: Some(edge), .. } if edge.group == successor.group)).count() == 1
                         })
                 }
                 GroupState::Poisoned(poison) => selector_atoms_for(
@@ -9724,6 +10044,7 @@ struct RetiredSuccessor {
 /// trusting a caller to restate a predecessor after the pending CAS.
 #[derive(Clone)]
 struct ReusedInstallDescriptor {
+    single_bearer_reattach: bool,
     source_desired: Zeroizing<Vec<u8>>,
     evidence: crate::GtpuSessionSelectorReuseEvidence,
     source_device: [u8; 32],
@@ -9746,6 +10067,7 @@ impl ReusedInstallDescriptor {
     ) -> Option<Self> {
         let source_desired = canonical_desired_bytes(proof.retired_group());
         (source_desired.len() <= MAX_CANONICAL_DESIRED_BYTES).then_some(Self {
+            single_bearer_reattach: proof.is_single_bearer_reattach(),
             source_desired: Zeroizing::new(source_desired),
             evidence: proof.evidence(),
             source_device,
@@ -9768,15 +10090,53 @@ impl ReusedInstallDescriptor {
             && source.desired_fingerprint == self.source_desired_fingerprint
             && canonical_desired_bytes(&source_group) == *self.source_desired)
             .then_some(())?;
-        match self.evidence {
+        let proof = match self.evidence {
             crate::GtpuSessionSelectorReuseEvidence::TrafficDrained => Some(
                 crate::GtpuSessionSelectorReuseProof::after_traffic_drain(source_group),
             ),
             crate::GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed => {
                 Some(crate::GtpuSessionSelectorReuseProof::after_rcu_grace_period(source_group))
             }
-        }
+        }?;
+        Some(if self.single_bearer_reattach {
+            proof.for_single_bearer_reattach()
+        } else {
+            proof
+        })
     }
+}
+
+/// The bounded profile changes only one single-bearer local TEID selector.
+/// PAA, mark, local endpoint and transport family remain exact. Complete
+/// old/new graphs (including peer routing policy) are independently bound to
+/// the source tombstone and the new opaque admission.
+pub(crate) fn single_bearer_reattach_is_exact(
+    old: &GtpuSessionGroup,
+    new: &GtpuSessionGroup,
+) -> bool {
+    if old.id() == new.id() || old.device_id() != new.device_id() {
+        return false;
+    }
+    let ([old_entry], [new_entry]) = (old.entries(), new.entries()) else {
+        return false;
+    };
+    let old_claim = CanonicalClaim::from_group(old);
+    let new_claim = CanonicalClaim::from_group(new);
+    let non_teid = |atoms: &BTreeSet<Vec<u8>>| {
+        atoms
+            .iter()
+            .filter(|atom| atom.first() != Some(&b'T'))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
+    old_entry.inner_paa() == new_entry.inner_paa()
+        && old_entry.local_outer_address() == new_entry.local_outer_address()
+        && old_entry.outer_family() == new_entry.outer_family()
+        && old_entry.context().bearer_mark == new_entry.context().bearer_mark
+        && old_claim.atoms != new_claim.atoms
+        && non_teid(&old_claim.atoms) == non_teid(&new_claim.atoms)
+        && old_claim.atoms.difference(&new_claim.atoms).count() == 1
+        && new_claim.atoms.difference(&old_claim.atoms).count() == 1
 }
 
 #[derive(Clone)]
@@ -12611,13 +12971,24 @@ mod tests {
             let authorization = authority
                 .authorize_reuse(backend.clone(), successor.clone(), retired)
                 .await;
-            let result = match authorization {
+            let legacy = match authorization {
                 Ok(authorization) => {
                     authority
                         .reconcile_reused(backend.clone(), authorization)
                         .await
                 }
                 Err(error) => Err(error),
+            };
+            let result = if changed_teid {
+                assert!(
+                    legacy.is_err(),
+                    "the legacy whole-set API still rejects mixed selectors"
+                );
+                authority
+                    .reconcile_reattached(backend.clone(), successor.clone())
+                    .await
+            } else {
+                legacy
             };
             assert!(
                 result.is_ok(),
@@ -12630,6 +13001,239 @@ mod tests {
                 .await
                 .is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn reattach_admission_rejects_active_changed_and_previously_published_selectors() {
+        let paa = IpAddr::V4(Ipv4Addr::new(10, 25, 0, 1));
+        let old = group_with_paa(1, 1, 0x1000_0001, paa, None);
+        let next = group_with_paa(2, 1, 0x1000_0002, paa, None);
+        let authority = production_authority(old.device_id()).await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        let active = authority
+            .reconcile_fresh(backend.clone(), old.clone())
+            .await
+            .unwrap();
+        for _ in 0..32 {
+            assert!(authority
+                .reconcile_reattached(backend.clone(), next.clone())
+                .await
+                .is_err());
+        }
+        drop(
+            authority
+                .retire(backend.clone(), active, old.clone())
+                .await
+                .unwrap(),
+        );
+        let before = authority.read_state().await.unwrap().1.encode();
+        let wrong_paa = group_with_paa(
+            2,
+            1,
+            0x1000_0002,
+            IpAddr::V4(Ipv4Addr::new(10, 25, 0, 2)),
+            None,
+        );
+        let wrong_mark = group_with_paa(2, 1, 0x1000_0002, paa, Some(7));
+        let old_teid = group_with_paa(2, 1, 0x1000_0001, paa, None);
+        let wrong_device = group_with_paa(2, 2, 0x1000_0002, paa, None);
+        let same_id = group_with_paa(1, 1, 0x1000_0002, paa, None);
+        for invalid in [wrong_paa, wrong_mark, old_teid, wrong_device, same_id] {
+            assert!(authority
+                .reconcile_reattached(backend.clone(), invalid)
+                .await
+                .is_err());
+            assert_eq!(authority.read_state().await.unwrap().1.encode(), before);
+        }
+        assert_eq!(backend.effect_calls(), 1);
+        assert_eq!(backend.removal_calls(), 1);
+        let active = authority
+            .reconcile_reattached(backend.clone(), next.clone())
+            .await
+            .unwrap();
+        let replacement = group_with_paa(3, 1, 0x1000_0003, paa, None);
+        assert!(authority
+            .reconcile_reattached(backend.clone(), replacement.clone())
+            .await
+            .is_err());
+        drop(
+            authority
+                .retire(backend.clone(), active, next)
+                .await
+                .unwrap(),
+        );
+        // The original TEID remains burned even after another generation.
+        let stale = group_with_paa(3, 1, 0x1000_0001, paa, None);
+        assert!(authority
+            .reconcile_reattached(backend.clone(), stale)
+            .await
+            .is_err());
+        drop(
+            authority
+                .reconcile_reattached(backend.clone(), replacement)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(backend.effect_calls(), 3);
+        assert_eq!(backend.removal_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn reattach_codec_preserves_history_and_rejects_forged_or_downgraded_edges() {
+        let paa = IpAddr::V4(Ipv4Addr::new(10, 26, 0, 1));
+        let old = group_with_paa(1, 1, 0x1000_0001, paa, None);
+        let next = group_with_paa(2, 1, 0x1000_0002, paa, None);
+        let authority = production_authority(old.device_id()).await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        let active = authority
+            .reconcile_fresh(backend.clone(), old.clone())
+            .await
+            .unwrap();
+        drop(
+            authority
+                .retire(backend.clone(), active, old.clone())
+                .await
+                .unwrap(),
+        );
+        let before = authority.read_state().await.unwrap().1;
+        assert!(before.encode().starts_with(b"OPCSN15"));
+        let active = authority
+            .reconcile_reattached(backend.clone(), next.clone())
+            .await
+            .unwrap();
+        let state = authority.read_state().await.unwrap().1;
+        let encoded = state.encode();
+        assert!(encoded.starts_with(b"OPCSN17"));
+        assert!(NamespaceState::decode(&encoded).is_some());
+        assert!(before.published_atoms.is_subset(&state.published_atoms));
+        assert!(before.tombstones.is_subset(&state.tombstones));
+        assert_eq!(
+            state.published_atoms.len(),
+            before.published_atoms.len() + 1
+        );
+        for length in 0..encoded.len() {
+            assert!(NamespaceState::decode(&encoded[..length]).is_none());
+        }
+        for old_version in [b"OPCSN15", b"OPCSN16"] {
+            let mut downgraded = encoded.clone();
+            downgraded[..7].copy_from_slice(old_version);
+            assert!(NamespaceState::decode(&downgraded).is_none());
+        }
+        let source = *state.reattach_sources.first().unwrap();
+        let mut lost_edge = state.clone();
+        lost_edge.reattach_sources.clear();
+        assert!(NamespaceState::decode(&lost_edge.encode()).is_none());
+        let mut forged_source = state.clone();
+        forged_source.reattach_sources.insert([0x55; 32]);
+        assert!(NamespaceState::decode(&forged_source.encode()).is_none());
+        let mut forged_generation = state.clone();
+        if let Some(GroupState::Retired {
+            successor: Some(edge),
+            ..
+        }) = forged_generation.groups.get_mut(&source)
+        {
+            edge.generation = GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(1).unwrap());
+        }
+        assert!(NamespaceState::decode(&forged_generation.encode()).is_none());
+        drop(
+            authority
+                .retire(backend.clone(), active, next)
+                .await
+                .unwrap(),
+        );
+        // Sealing an unrelated refused group keeps the same complete history
+        // and exercises the coexistence of the v16 and v17 appendices.
+        let refused = group_with_paa(4, 1, 0x1000_0004, paa, None);
+        drop(authority.seal_unadmitted(backend, refused).await.unwrap());
+        let final_state = authority.read_state().await.unwrap().1;
+        assert!(NamespaceState::decode(&final_state.encode()).is_some());
+        assert_eq!(final_state.reattach_sources, state.reattach_sources);
+    }
+
+    #[tokio::test]
+    async fn reattach_pending_intent_survives_database_reopen_and_observer_drop() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("opc-reattach-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("namespace.db");
+        let paa = IpAddr::V4(Ipv4Addr::new(10, 27, 0, 1));
+        let old = group_with_paa(1, 1, 0x1000_0001, paa, None);
+        let next = group_with_paa(2, 1, 0x1000_0002, paa, None);
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        let authority = raw_production_authority(
+            SessionStore::new(SqliteSessionBackend::open(&path).unwrap()),
+            production_namespace_key(old.device_id()),
+            "reattach-original",
+            32,
+        )
+        .await;
+        authority.provision(backend.as_ref()).await.unwrap();
+        let active = authority
+            .reconcile_fresh(backend.clone(), old.clone())
+            .await
+            .unwrap();
+        let retired = authority
+            .retire(backend.clone(), active, old)
+            .await
+            .unwrap();
+        let authorization = authority
+            .authorize_reuse(backend.clone(), next.clone(), retired)
+            .await
+            .unwrap();
+        let proof = authorization.proof.for_single_bearer_reattach();
+        authority
+            .claim_reused(backend.as_ref(), &next, &proof)
+            .await
+            .unwrap();
+        assert_eq!(backend.effect_calls(), 1);
+        let pending = authority.read_state().await.unwrap().1.encode();
+        drop(authority);
+        let reopened = raw_production_authority(
+            SessionStore::new(SqliteSessionBackend::open(&path).unwrap()),
+            production_namespace_key(next.device_id()),
+            "reattach-reopened",
+            32,
+        )
+        .await;
+        assert_eq!(reopened.read_state().await.unwrap().1.encode(), pending);
+        let retained = reopened
+            .installing_reuse_proof(&next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.is_single_bearer_reattach());
+        backend.set_dataplane(FaultingSelectorDataplaneState::NoEffect);
+        drop(reopened.recover_install(backend.clone(), next.clone()));
+        // The SDK supervisor owns completion after the observer is gone.
+        let active = reopened
+            .recover_active(backend.clone(), next.clone())
+            .await
+            .unwrap();
+        for _ in 0..32 {
+            drop(
+                reopened
+                    .recover_active(backend.clone(), next.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(backend.effect_calls(), 2);
+        assert_eq!(backend.reused_effect_calls(), 1);
+        drop(
+            reopened
+                .retire(backend.clone(), active, next)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(backend.removal_calls(), 2);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -13968,6 +14572,7 @@ mod tests {
             selectors: BTreeMap::new(),
             groups: BTreeMap::new(),
             unadmitted_groups: BTreeMap::new(),
+            reattach_sources: BTreeSet::new(),
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
@@ -14157,6 +14762,7 @@ mod tests {
             selectors: BTreeMap::new(),
             groups: BTreeMap::new(),
             unadmitted_groups: BTreeMap::new(),
+            reattach_sources: BTreeSet::new(),
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),

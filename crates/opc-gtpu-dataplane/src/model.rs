@@ -4993,7 +4993,7 @@ impl fmt::Debug for GtpuSessionGroupSelector {
     }
 }
 
-/// Caller evidence that makes one retired selector graph safe to reuse.
+/// Backend completion class for one exact retired selector graph.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GtpuSessionSelectorReuseEvidence {
@@ -5010,14 +5010,17 @@ pub enum GtpuSessionSelectorReuseEvidence {
 /// This value carries the complete old semantic graph so a backend can compare
 /// only overlapping selectors and reject invented or cross-device evidence.
 /// It does not authorize direct transfer from a still-live source authority:
-/// exact source removal must already be proven. The one retired graph must
-/// cover every selector newly introduced by the desired reconciliation.
-/// Combining selectors from multiple retired groups is deliberately
-/// fail-closed by the current single-proof API.
+/// exact source removal must already be proven. Whole-set reuse requires the
+/// one retired graph to cover every introduced selector. The separately
+/// issued single-bearer reattach profile permits one never-published local
+/// TEID reserved by the SDK alongside the predecessor's exact PAA/mark.
+/// Combining selectors from multiple retired groups remains fail-closed.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GtpuSessionSelectorReuseProof {
     retired_group: GtpuSessionGroup,
     evidence: GtpuSessionSelectorReuseEvidence,
+    // A distinct SDK admission profile, never asserted by a public caller.
+    single_bearer_reattach: bool,
 }
 
 impl GtpuSessionSelectorReuseProof {
@@ -5032,6 +5035,7 @@ impl GtpuSessionSelectorReuseProof {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::TrafficDrained,
+            single_bearer_reattach: false,
         }
     }
 
@@ -5042,7 +5046,17 @@ impl GtpuSessionSelectorReuseProof {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed,
+            single_bearer_reattach: false,
         }
+    }
+
+    pub(crate) fn for_single_bearer_reattach(mut self) -> Self {
+        self.single_bearer_reattach = true;
+        self
+    }
+
+    pub(crate) const fn is_single_bearer_reattach(&self) -> bool {
+        self.single_bearer_reattach
     }
 
     /// Exact graph whose selectors have been retired.
@@ -5051,7 +5065,7 @@ impl GtpuSessionSelectorReuseProof {
         &self.retired_group
     }
 
-    /// Kind of external completion evidence supplied by the caller.
+    /// Kind of external completion observed by the selected backend.
     #[must_use]
     pub const fn evidence(&self) -> GtpuSessionSelectorReuseEvidence {
         self.evidence
@@ -5082,6 +5096,10 @@ impl fmt::Debug for GtpuSessionSelectorReuseProof {
 pub enum GtpuSessionSelectorProvenance {
     /// Reuse after exact removal and explicit drain/grace evidence.
     Reused(GtpuSessionSelectorReuseProof),
+    /// One completely retired single-bearer predecessor supplies the exact
+    /// PAA/mark selectors; the SDK reserves a never-published local TEID in
+    /// the same protected transaction. This is a distinct admission profile.
+    Reattached(GtpuSessionSelectorReuseProof),
 }
 
 /// Complete request for grouped-session convergence.
@@ -5134,6 +5152,7 @@ impl GtpuSessionGroupReconcileRequest {
         if !selector_admission.validates(&desired)
             || !selector_admission.authorizes_install_effect()
             || !selector_admission.is_retired_reissue()
+            || reuse.is_single_bearer_reattach()
             || reuse.retired_group.device_id != desired.device_id
             || reuse.retired_group.id == desired.id
         {
@@ -5143,6 +5162,29 @@ impl GtpuSessionGroupReconcileRequest {
             desired,
             selector_admission,
             selector_provenance: Some(GtpuSessionSelectorProvenance::Reused(reuse)),
+        })
+    }
+
+    pub(crate) fn new_reattached(
+        desired: GtpuSessionGroup,
+        selector_admission: crate::GtpuSessionSelectorAdmission,
+        reuse: GtpuSessionSelectorReuseProof,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
+            || !selector_admission.is_retired_reissue()
+            || !reuse.is_single_bearer_reattach()
+            || !crate::selector_namespace::single_bearer_reattach_is_exact(
+                reuse.retired_group(),
+                &desired,
+            )
+        {
+            return Err(GtpuSessionModelError::SelectorAdmissionMismatch);
+        }
+        Ok(Self {
+            desired,
+            selector_admission,
+            selector_provenance: Some(GtpuSessionSelectorProvenance::Reattached(reuse)),
         })
     }
 

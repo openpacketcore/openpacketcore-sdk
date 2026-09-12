@@ -102,16 +102,20 @@ remains closed under RFC 016.
 
 ### 2.4 Implemented V1 Baseline and Upgrade Boundary
 
-The merged RFC 016 implementation is the v1 baseline, not an implementation of
-this RFC. It admits either a fresh complete set or one identical complete set
-from one retired predecessor. Its current public reuse proof/evidence helpers,
-single-predecessor request, one-successor tombstone, and direct backend
+The RFC 016 implementation is the v1 baseline, not an implementation of
+this RFC. It admits a fresh complete set, one identical complete set from one
+retired predecessor, or the separately named bounded single-bearer reattach
+profile in RFC 016 §5.4. That profile transfers the exact retired PAA/mark plus
+one never-published local TEID under the existing one-successor rule; its
+`OPCSN17` record extension is not the v2 migration specified here. Its
+SDK-private reuse proof constructors, single-predecessor request,
+one-successor tombstone, and direct backend
 quiescence response do not establish a durable RFC 017 drain qualification and
 cannot be accepted as v2 provenance or restore authority.
 
 RFC 017 implementation therefore includes an explicit API and durable-schema
-migration. The v2 coordinator removes direct caller construction of reuse
-evidence from every v2 path, consumes backend quiescence only into the durable
+migration. The v2 coordinator keeps direct caller construction of reuse
+evidence excluded from every v2 path, consumes backend quiescence only into the durable
 `Qualified` annotation, and admits subsets only from that annotation and the
 current atom rows. Legacy `Fresh`, `Reused`, `GtpuSessionSelectorReuseProof`,
 `GtpuSessionGroupReconcileRequest::new_reused`,

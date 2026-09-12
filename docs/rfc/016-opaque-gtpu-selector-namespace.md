@@ -83,8 +83,9 @@ after a complete durable namespace transaction.
   traffic admission, readiness, drain, retry, and deployment policy.
 - A product's persistence provider, retention tier, key-custody choice, or
   operator workflow, subject to this RFC's durability and conformance rules.
-- Per-selector mixed provenance and same-group republish. They require a
-  distinct proposal tracked by issue #663.
+- General per-selector mixed provenance and same-group republish. They require
+  RFC 017, tracked by issue #663. Section 5.4 defines a bounded single-bearer
+  reattach profile inside the existing one-successor lifecycle.
 - Rebinding traffic-proof authority after a selector authority change. That is
   distinct work tracked by issue #664.
 - A claim that reconcile/readback proves forwarding traffic, a carrier
@@ -539,7 +540,7 @@ new group or newly shaped complete set that contains any previously published
 TEID, PAA, or mark atom; checking only the candidate group or complete-set
 commitment is forbidden.
 
-This RFC permits exactly one other admission form: SDK-mediated transfer of the
+The whole-set reissue admission form permits SDK-mediated transfer of the
 *identical complete atom set* from one exact, permanently retired predecessor
 to one distinct successor group. Reissue MUST require the SDK's exact retired
 capability and an opaque SDK/backend quiescence authorization, validate the
@@ -547,8 +548,9 @@ retained source tombstone, terminal-retired stamp, authoritative absence, and
 all namespace bindings, and create a higher generation and new nonce while
 preserving the permanent predecessor tombstone/lineage. It MUST NOT admit a
 subset, superset, mixed provenance set, multiple predecessors, the same group
-identity, or a changed selector set. Mixed transfers and exact same-group
-republish are #663 work. Thus no caller can cause accidental reuse merely by
+identity, or a changed selector set. The separately named §5.4 profile is the
+only bounded exception to this unchanged API. General mixed transfers and
+exact same-group republish are #663 work. Thus no caller can cause accidental reuse merely by
 reasserting `Fresh`, retaining old values, or constructing a drain enum.
 
 Exact removal returns an opaque retired capability. A separately named,
@@ -557,9 +559,9 @@ and returns the opaque quiescence authorization only after it revalidates the
 terminal-retired stamp and absence and performs its trusted drain/RCU barrier.
 The backend-neutral port permits a backend with a separately reviewed concrete
 quiescence boundary to implement this operation. The built-in eBPF backend
-leaves it `Unsupported` until it has a real kernel/network quiescence mechanism;
-ordinary map deletion, userspace sleep, or an in-process RCU assumption is not
-such a mechanism. A conformance fake can exercise protocol state transitions
+uses the restricted Linux mechanism in §5.4 and refuses unsupported kernel
+profiles. Ordinary map deletion, userspace sleep, or an in-process RCU
+assumption is not such a mechanism. A conformance fake can exercise protocol state transitions
 with test-only authority, but a product MUST NOT pass that fake to a production
 lifecycle. Doing so would select it into the TCB and let it assert a production
 receipt. Any other backend must be deliberately selected into the TCB and
@@ -572,6 +574,63 @@ detect a malicious selected adapter that lies about its own barrier.
 authorization, and distinct successor group in one ledger transition; neither
 input is cloneable or reusable. This RFC does not treat traffic-proof authority
 as drain evidence and does not implement #664.
+
+### 5.4 Single-Bearer Reattach
+
+`reconcile_reattached` admits one distinct single-entry successor using exactly
+the predecessor's PAA and optional mark atoms plus one never-published local
+TEID atom. The protected ledger, not a caller-supplied source or assertion,
+selects the unique completely `Retired` predecessor with no successor. Both
+complete graphs must retain the stable device, inner address, local outer
+address/family, and mark. Active, incomplete, ambiguous, consumed, same-group,
+cross-device, changed-PAA/mark, or previously published new-TEID candidates are
+rejected before any claim or effect. Multi-entry groups, multiple predecessors,
+partial drain, arbitrary subset transfers, and same-group republish remain
+unsupported here. `Fresh` and whole-set reuse keep their existing validation.
+
+One supervised operation holds the durable worker lease across source
+discovery, backend quiescence qualification, claim, handoff, and terminal
+acknowledgement. The backend holds the namespace host effect lock while it
+checks the exact terminal-retired operation stamp and full source graph/index
+absence, performs the real reader barrier, and checks those facts again. The
+lease window and filesystem authority must remain current through receipt
+completion. The claim revalidates the protected predecessor and atom history,
+then atomically writes its sole successor edge, the fresh TEID reservation,
+a higher generation/new nonce, and the full `Installing` intent. All earlier
+group/atom/tombstone history, including the old TEID, remains permanent. No
+product can construct the private reattach proof or grouped request.
+
+The first such claim atomically upgrades `OPCSN15` or `OPCSN16` to `OPCSN17`.
+The latter retains the former fields, always includes the bounded unadmitted
+index (which may be empty), and appends a nonempty u32 big-endian count followed
+by strictly sorted 32-byte predecessor group commitments. These entries mark
+reattach successor edges; they are not a second authority store. The existing
+Installing reuse-descriptor tag is `1` for whole-set reuse and `2` for this
+profile, with the same exact predecessor descriptor. Tag `2` is valid only in
+`OPCSN17`. Decode validates each edge's complete shape, generation, one incoming
+predecessor, and fresh-TEID lineage; missing, forged, duplicated, truncated,
+downgraded, or inconsistent provenance closes the record. Existing canonical
+15/16 records keep their encoding until this transition; old readers refuse
+17. Existing record, atom, and permanent-group ceilings stay unchanged.
+Recovery reconstructs a pending request from that protected intent and uses
+the existing supervised exact install recovery. Lost responses or dropped
+observers never authorize a second effect.
+
+The Linux eBPF profile uses non-expedited `MEMBARRIER_CMD_GLOBAL` after exact
+source removal. The reviewed Linux implementation calls `synchronize_rcu()`
+when multiple CPUs are online. Its single-online-CPU shortcut is usable only
+for qualified non-realtime XDP/TC bottom-half readers, which a userspace caller
+cannot overtake. The adapter requires a recognized kernel-reported SMP
+build/preemption profile and rejects realtime/unknown profiles. Unsupported or
+blocked membarrier and `nohz_full` return failure; expedited/private commands,
+time delays, and empty map readback are never substitutes. This mechanism
+depends on the selected kernel implementation and attached program profile,
+not just the syscall's userspace memory-ordering API. Deployment qualification
+must verify that boundary; simulated runtime tests do not prove kernel RCU,
+packet drain, forwarding, or performance. Primary implementation references:
+Linux [membarrier.c](https://github.com/torvalds/linux/blob/v6.12/kernel/sched/membarrier.c),
+[network reader context](https://github.com/torvalds/linux/blob/v6.12/net/core/dev.c),
+and [kernel build profile](https://github.com/torvalds/linux/blob/v6.12/init/Makefile).
 
 ## 6. Public Capability Surface
 
