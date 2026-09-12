@@ -61,7 +61,7 @@ struct NativeInstallPreparation {
 /// immutable files. In recovery, RAW is derived again from the retained
 /// envelope; the proposed installed basis is never treated as incoming data.
 pub(crate) struct InstallSource {
-    candidate: CurrentSnapshot,
+    candidate: Arc<CurrentSnapshot>,
     raw: PinnedSqliteFile,
     published: PinnedSqliteFile,
     published_path: PathBuf,
@@ -107,7 +107,7 @@ impl InstallSource {
         published_path: PathBuf,
     ) -> io::Result<Self> {
         let source = Self {
-            candidate,
+            candidate: Arc::new(candidate),
             raw,
             published,
             published_path,
@@ -342,7 +342,7 @@ impl InstallSource {
         let cut = self.candidate.0.last_log_id;
         if installed_incarnation.native_image() != incarnation.native_image()
             || consensus::read_current_snapshot_sync(conn, binding.identity)?.as_ref()
-                != Some(&self.candidate)
+                != Some(self.candidate.as_ref())
             || read_applied_sync(conn, binding.identity)? != cut
             || read_committed_sync(conn, binding.identity)? != cut
             || consensus::read_purged_sync(conn, binding.identity)? != cut
@@ -356,7 +356,7 @@ impl InstallSource {
         self.verify()?;
         check()?;
         let proof = Arc::new(NativeSnapshotAuthority {
-            candidate: self.candidate.clone(),
+            candidate: self.candidate.as_ref().clone(),
             binding: binding.digest()?,
             identity: binding.identity,
             members: authority.members,
@@ -663,7 +663,7 @@ impl Pending {
                 // mutation, and no usable owner, precedes the complete replay.
                 return Ok((old, new));
             };
-            if source.candidate != candidate {
+            if source.candidate.as_ref() != &candidate {
                 return Err(invalid_data("private WAL incoming snapshot source differs"));
             }
             let incarnation = RestoreScanIncarnation::from_installed_sync(&new)
@@ -785,11 +785,23 @@ fn save_original(
 }
 
 pub(super) struct Handoff {
-    candidate: CurrentSnapshot,
+    candidate: Arc<CurrentSnapshot>,
     transform: Transform,
     installation: Option<Arc<Installation>>,
     phase: Phase,
 }
+
+fn same_snapshot_candidate(left: &CurrentSnapshot, right: &CurrentSnapshot) -> bool {
+    // The native handoff and its source share immutable metadata. Repeated
+    // liveness checks can recognize that exact object without traversing its
+    // membership trees. Distinct objects retain the complete value comparison;
+    // this identity is never authority for a SQL or native snapshot image.
+    std::ptr::eq(left, right) || left == right
+}
+
+#[cfg(test)]
+#[path = "snapshot_candidate_tests.rs"]
+mod candidate_tests;
 
 enum Phase {
     Requested,
@@ -887,7 +899,6 @@ impl Wal {
         } else {
             None
         };
-        let candidate = source.candidate.clone();
         let installation = Arc::new(Installation {
             source,
             incarnation: RestoreScanIncarnation::new()
@@ -897,6 +908,7 @@ impl Wal {
         if self.is_native() {
             return self.native_install_snapshot(installation);
         }
+        let candidate = installation.source.candidate.as_ref().clone();
         self.publish_snapshot_with_transform(
             conn,
             candidate,
@@ -937,7 +949,7 @@ impl Wal {
             return Err(error);
         }
         state.snapshot = Some(Handoff {
-            candidate: candidate.clone(),
+            candidate: Arc::new(candidate.clone()),
             transform,
             installation: installation.clone(),
             phase: Phase::Requested,
@@ -1043,7 +1055,7 @@ impl Wal {
                     .ok_or_else(|| invalid_data("private WAL snapshot commit guard is missing"))?,
             )?;
             state.snapshot = Some(Handoff {
-                candidate,
+                candidate: Arc::new(candidate),
                 transform,
                 installation,
                 phase: Phase::Committed(pending),
@@ -1093,7 +1105,7 @@ pub(super) fn advance(
             state.applied_prefix = None;
             if let Some(installation) = &handoff.installation {
                 if handoff.transform != Transform::Install
-                    || handoff.candidate != installation.source.candidate
+                    || !same_snapshot_candidate(&handoff.candidate, &installation.source.candidate)
                 {
                     return Err(invalid_data("private WAL install request source differs"));
                 }

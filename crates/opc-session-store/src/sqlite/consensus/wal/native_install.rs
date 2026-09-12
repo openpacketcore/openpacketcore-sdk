@@ -61,7 +61,7 @@ impl Wal {
                     return Err(invalid_data("native install owner closed during drain"));
                 }
                 state.snapshot = Some(Handoff {
-                    candidate: installation.source.candidate.clone(),
+                    candidate: Arc::clone(&installation.source.candidate),
                     transform: Transform::Install,
                     installation: Some(Arc::clone(&installation)),
                     phase: Phase::Requested,
@@ -123,7 +123,7 @@ fn require_live(
             .is_none_or(|current| !std::ptr::eq(current, old) && current != old)
         || handoff.transform != Transform::Install
         || !matches!(handoff.phase, Phase::Requested)
-        || handoff.candidate != installation.source.candidate
+        || !same_snapshot_candidate(&handoff.candidate, &installation.source.candidate)
         || !handoff
             .installation
             .as_ref()
@@ -255,7 +255,7 @@ fn advance_inner(
         .filter(|epoch| *epoch != u64::MAX)
         .ok_or_else(|| invalid_data("native install file epoch exhausted"))?;
     let position = disk.position();
-    let candidate = &installation.source.candidate;
+    let candidate = installation.source.candidate();
     let cut = DurableCut {
         chain: position.chain,
         committed: candidate.0.last_log_id,
