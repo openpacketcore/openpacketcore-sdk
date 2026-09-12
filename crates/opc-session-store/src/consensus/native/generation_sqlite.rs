@@ -1,7 +1,8 @@
 //! Two-pass conversion of a detached original SQL image to a complete V4
 //! native generation. The exclusive connection borrow and read transaction
 //! span validation, counting and encoding. Notification decoding uses only a
-//! charged, bounded temporary batch; no payload cache survives either pass.
+//! charged, bounded temporary batch, as does hashing of decoded Unit receipts.
+//! No payload cache survives either pass.
 //! The caller must sync and cold-admit the result before selecting any file.
 
 use super::*;
@@ -18,6 +19,9 @@ use std::collections::BTreeMap;
 
 #[path = "generation_sqlite_notifications.rs"]
 mod notifications;
+
+#[path = "generation_sqlite_ordinary.rs"]
+mod ordinary;
 
 fn db(error: rusqlite::Error) -> io::Error {
     io::Error::other(error)
@@ -581,11 +585,9 @@ impl<'a> SqlitePreparedBase<'a> {
                 }
             }
         }
-        for (fenced, table) in [
-            (false, "consensus_request_outcomes"),
-            (true, "consensus_fenced_transition_receipts"),
-        ] {
-            let mut statement = self.tx.prepare(&format!("SELECT request_id,COALESCE(length(response_json),0) FROM {table} ORDER BY request_id")).map_err(db)?;
+        ordinary::write(&self.tx, writer, &mut binary_rows, &mut context, check)?;
+        {
+            let mut statement = self.tx.prepare("SELECT request_id,COALESCE(length(response_json),0) FROM consensus_fenced_transition_receipts ORDER BY request_id").map_err(db)?;
             let mut rows = statement.query([]).map_err(db)?;
             while let Some(row) = rows.next().map_err(db)? {
                 check()?;
@@ -597,22 +599,13 @@ impl<'a> SqlitePreparedBase<'a> {
                     ));
                 }
                 let _memory = row_memory(length)?;
-                let receipt = if fenced {
-                    let (payload_digest, retained_until, response) =
-                        source::v1(&self.tx, context.business.identity, id)?;
-                    NativeGenericReceipt::FencedV1(NativeV1Receipt {
-                        payload_digest,
-                        retained_until,
-                        response: response.map(Box::new),
-                    })
-                } else {
-                    let (payload_digest, response) =
-                        source::ordinary(&self.tx, context.business.identity, id)?;
-                    NativeGenericReceipt::Ordinary(NativeOrdinaryReceipt {
-                        payload_digest,
-                        response: Box::new(response),
-                    })
-                };
+                let (payload_digest, retained_until, response) =
+                    source::v1(&self.tx, context.business.identity, id)?;
+                let receipt = NativeGenericReceipt::FencedV1(NativeV1Receipt {
+                    payload_digest,
+                    retained_until,
+                    response: response.map(Box::new),
+                });
                 validation::validate_generic(&id, &receipt, &context.business.frontiers)?;
                 account(
                     &mut context.business.counts[2],
