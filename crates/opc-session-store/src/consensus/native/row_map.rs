@@ -79,7 +79,6 @@ impl<K, V> RowMap<K, V> {
         self.rows.len()
     }
 
-    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }

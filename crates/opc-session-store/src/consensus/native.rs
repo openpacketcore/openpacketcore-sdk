@@ -139,14 +139,14 @@ struct NativeReceipt {
     cold: Option<resident::ColdReceipt>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeOrdinaryReceipt {
     payload_digest: [u8; 32],
     response: Box<SessionConsensusResponse>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeV1Receipt {
     payload_digest: [u8; 32],
@@ -154,7 +154,7 @@ struct NativeV1Receipt {
     response: Option<Box<SessionConsensusResponse>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum NativeGenericReceipt {
     Ordinary(NativeOrdinaryReceipt),
     FencedV1(NativeV1Receipt),

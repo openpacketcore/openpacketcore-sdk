@@ -255,7 +255,7 @@ fn native_ordinary_generic_codec_matches_every_result_and_detaches_retained_reco
         );
         let (actual_id, facts) =
             inspect_generic(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
-        let copied = owned_generic(
+        let (copied, content) = owned_generic(
             &bytes,
             actual_id,
             facts.unwrap(),
@@ -263,6 +263,10 @@ fn native_ordinary_generic_codec_matches_every_result_and_detaches_retained_reco
             &|| Ok(()),
         )
         .unwrap();
+        assert_eq!(
+            content,
+            changes::fingerprint(2, &actual_id, &copied).unwrap()
+        );
         assert_eq!(
             postcard::to_allocvec(&copied).unwrap(),
             postcard::to_allocvec(&row).unwrap()
@@ -984,7 +988,7 @@ fn native_v1_codec_preflights_closed_results_versions_and_expired_tombstones() {
         let bytes = postcard::to_allocvec(&(id, Some(&row))).unwrap();
         assert_eq!(generic_scratch(&bytes).unwrap(), METADATA);
         let (_, facts) = inspect_generic(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
-        let copied = owned_generic(
+        let (copied, content) = owned_generic(
             &bytes,
             id,
             facts.unwrap(),
@@ -992,6 +996,7 @@ fn native_v1_codec_preflights_closed_results_versions_and_expired_tombstones() {
             &|| Ok(()),
         )
         .unwrap();
+        assert_eq!(content, changes::fingerprint(2, &id, &copied).unwrap());
         assert_eq!(
             postcard::to_allocvec(&copied).unwrap(),
             postcard::to_allocvec(&row).unwrap()

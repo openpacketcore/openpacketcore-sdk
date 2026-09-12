@@ -298,6 +298,7 @@ impl Catalog {
         }
         generic_order.sort_unstable_by_key(|id| generic.get(id).map(|row| row.range.offset));
         check()?;
+        let mut selected_generic = changes::SelectedGenericRows::new(&storage.business.frontiers);
         for id in generic_order {
             let indexed = generic
                 .remove(&id)
@@ -310,23 +311,7 @@ impl Catalog {
                 MAX_ITEM,
             )?;
             let input = range.read(check)?;
-            let row = decode::owned_generic(
-                input.bytes(),
-                id,
-                indexed.row,
-                &storage.business.frontiers,
-                check,
-            )?;
-            if storage
-                .business
-                .generic_receipts
-                .insert(id, SharedRow::new(row)?)
-                .is_some()
-            {
-                return Err(invalid(
-                    "native resident clock conversion repeats an identity",
-                ));
-            }
+            selected_generic.insert(input.bytes(), id, indexed.row, check)?;
         }
         if !generic.is_empty() {
             return Err(invalid("native generic conversion omitted a row"));
@@ -398,6 +383,7 @@ impl Catalog {
             SharedRow::new(row)
         });
         storage.business.admit_selected_roster(
+            selected_generic,
             roster_rows,
             partitions,
             context

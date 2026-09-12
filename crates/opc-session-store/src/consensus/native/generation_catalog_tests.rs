@@ -195,11 +195,13 @@ fn native_catalog_generic_conversion_bounds_verified_block_reads_and_preserves_e
     let blocks = selected.identity().length / BLOCK as u64;
     assert!(blocks >= 4, "exercise several authenticated blocks");
     let before = selected.blocks_read();
+    let hashes_before = changes::generic_fingerprint_calls();
     let started = std::time::Instant::now();
     let cold = catalog.into_storage(&|| Ok(())).unwrap();
+    let hashes = changes::generic_fingerprint_calls() - hashes_before;
     let reads = selected.blocks_read() - before;
     eprintln!(
-        "native_generic_conversion rows=1024 blocks={blocks} block_reads={reads} elapsed_us={}",
+        "native_generic_conversion rows=1024 blocks={blocks} block_reads={reads} fingerprints={hashes} elapsed_us={}",
         started.elapsed().as_micros(),
     );
     cold.validate_image().unwrap();
@@ -224,6 +226,126 @@ fn native_catalog_generic_conversion_bounds_verified_block_reads_and_preserves_e
         reads <= 4 * blocks,
         "selected generic conversion rereads blocks"
     );
+    assert_eq!(
+        hashes, 1024,
+        "each independently decoded generic receipt needs one content hash during resident conversion",
+    );
+}
+
+#[test]
+fn native_selected_generic_admission_rejects_unchecked_rows_and_changed_destination() {
+    let (mut original, _, _) = fixture();
+    apply(&mut original, &[clock(2, time(2))]);
+    let (_files, catalog) = Files::new(&original);
+    let (&id, indexed) = catalog.rows.generic.iter().next().unwrap();
+    let bytes = row_bytes(&catalog, indexed);
+    let frontiers = &original.business.frontiers;
+    let mut selected = changes::SelectedGenericRows::new(frontiers);
+    let mut wrong_hash = indexed.row;
+    wrong_hash.content[0] ^= 1;
+    assert!(selected.insert(&bytes, id, wrong_hash, &|| Ok(())).is_err());
+    assert!(selected
+        .insert(
+            &bytes,
+            SessionConsensusRequestId::from_bytes([0xEE; 16]),
+            indexed.row,
+            &|| Ok(()),
+        )
+        .is_err());
+    for changed in [
+        &bytes[..bytes.len() - 1],
+        &[bytes.as_slice(), &[0]].concat(),
+    ] {
+        assert!(selected
+            .insert(changed, id, indexed.row, &|| Ok(()))
+            .is_err());
+    }
+    assert_eq!(
+        selected
+            .insert(&bytes, id, indexed.row, &|| {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+            })
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted,
+    );
+    // A self-consistent supplied hash cannot authorize an invalid response.
+    let mut invalid_row = (**original.business.generic_receipts.get(&id).unwrap()).clone();
+    let NativeGenericReceipt::Ordinary(row) = &mut invalid_row else {
+        panic!("ordinary clock receipt fixture");
+    };
+    row.response.sequence = frontiers.sequence + 1;
+    let invalid_bytes = postcard::to_allocvec(&(id, Some(&invalid_row))).unwrap();
+    let invalid_facts = facts::Row {
+        content: changes::fingerprint(2, &id, &invalid_row).unwrap(),
+        facts: facts::Request::of(&invalid_row, Format::V4).unwrap(),
+    };
+    assert!(selected
+        .insert(&invalid_bytes, id, invalid_facts, &|| Ok(()))
+        .is_err());
+    selected
+        .insert(&bytes, id, indexed.row, &|| Ok(()))
+        .unwrap();
+    assert!(selected
+        .insert(&bytes, id, indexed.row, &|| Ok(()))
+        .is_err());
+    let mut destination = original.business.clone();
+    destination.generic_receipts.clear();
+    destination
+        .admit_selected_roster(selected, [], [], None, &|| Ok(()))
+        .unwrap();
+    assert_eq!(destination.generic_receipts.len(), 1);
+    assert!(
+        **destination.generic_receipts.get(&id).unwrap()
+            == **original.business.generic_receipts.get(&id).unwrap(),
+        "the exact request ID retains every original receipt field",
+    );
+    assert_eq!(
+        serde_json::to_vec(
+            &destination
+                .require_business_proof()
+                .unwrap()
+                .generation_context()
+        )
+        .unwrap(),
+        serde_json::to_vec(
+            &original
+                .business
+                .require_business_proof()
+                .unwrap()
+                .generation_context()
+        )
+        .unwrap(),
+    );
+
+    for case in 0..4 {
+        let mut selected = changes::SelectedGenericRows::new(frontiers);
+        selected
+            .insert(&bytes, id, indexed.row, &|| Ok(()))
+            .unwrap();
+        let mut destination = original.business.clone();
+        if case != 0 {
+            if case == 2 {
+                destination.begin_changes().unwrap();
+            }
+            destination.generic_receipts.clear();
+        }
+        if case == 1 {
+            destination.frontiers.sequence += 1;
+        } else if case == 3 {
+            let (key, row) = destination.keys.iter().next().unwrap();
+            let key = key.clone();
+            let mut row = (**row).clone();
+            row.fence = destination.frontiers.next_fence;
+            destination.keys.insert(key, SharedRow::new(row).unwrap());
+        }
+        assert!(
+            destination
+                .admit_selected_roster(selected, [], [], None, &|| Ok(()))
+                .is_err(),
+            "case {case}: existing rows, changed frontiers, dirty owner or invalid business row must reject admission",
+        );
+    }
 }
 
 struct Files {

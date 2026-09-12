@@ -631,13 +631,13 @@ pub(super) fn inspect_generic_format(
     Ok((id, facts))
 }
 
-pub(super) fn owned_generic(
+pub(in crate::consensus::native) fn owned_generic(
     bytes: &[u8],
     expected_id: SessionConsensusRequestId,
     expected: facts::Row<facts::Request>,
     frontiers: &NativeFrontiers,
     check: &impl Fn() -> io::Result<()>,
-) -> io::Result<NativeGenericReceipt> {
+) -> io::Result<(NativeGenericReceipt, [u8; 32])> {
     check()?;
     let format = expected.facts.format;
     let _memory = VerificationMemory::reserve(generic_scratch_format(bytes, format)?)?;
@@ -645,15 +645,24 @@ pub(super) fn owned_generic(
     let decoded =
         decoded.ok_or_else(|| invalid("native resident request receipt selected a removal"))?;
     validation::validate_generic(&id, &decoded, frontiers)?;
-    if id != expected_id || changes::fingerprint(2, &id, &decoded)? != expected.content {
+    let content = changes::fingerprint(2, &id, &decoded)?;
+    if id != expected_id || content != expected.content {
         return Err(invalid(
             "native resident request receipt differs from admitted catalog",
         ));
     }
     let row = decoded.owned_copy()?;
+    // Bind the independently owned result to every checked field before
+    // reusing its content hash. Equality also covers future response fields;
+    // no decoder-owned payload or backing allocation escapes this boundary.
+    if row != decoded {
+        return Err(invalid(
+            "native resident request copy differs from decoded row",
+        ));
+    }
     drop(decoded);
     check()?;
-    Ok(row)
+    Ok((row, content))
 }
 
 #[cfg(test)]

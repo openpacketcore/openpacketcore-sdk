@@ -92,6 +92,47 @@ fn notification_stamp(value: &NotificationRow) -> io::Result<RowStamp> {
     ))
 }
 
+/// A private, consuming preparation owns both the exact immutable generic
+/// rows and their process revisions. Only the closed decoder can add rows;
+/// supplied catalog hashes are checked against the complete decoded value
+/// and its independent copy. No per-row hash cache survives publication.
+pub(super) struct SelectedGenericRows {
+    frontiers: NativeFrontiers,
+    rows: RowMap<SessionConsensusRequestId, SharedRow<NativeGenericReceipt>>,
+    table: TableSummary,
+}
+
+impl SelectedGenericRows {
+    pub(super) fn new(frontiers: &NativeFrontiers) -> Self {
+        Self {
+            frontiers: frontiers.clone(),
+            rows: RowMap::new(),
+            table: TableSummary::default(),
+        }
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        bytes: &[u8],
+        id: SessionConsensusRequestId,
+        expected: generation::facts::Row<generation::facts::Request>,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.rows.contains_key(&id) {
+            return Err(invalid(
+                "native resident request conversion repeats an identity",
+            ));
+        }
+        let (row, content) =
+            generation::decode::owned_generic(bytes, id, expected, &self.frontiers, check)?;
+        let row = SharedRow::new(row)?;
+        self.table
+            .replace(None, Some(RowStamp::new(content, row.revision())))?;
+        self.rows.insert(id, row);
+        Ok(())
+    }
+}
+
 // JSON emits punctuation and numeric array elements in many small writes.
 // Coalesce those writes without allocating or retaining an encoded row. The
 // buffer is synchronous scratch, and every byte still enters the same hash.
@@ -157,11 +198,25 @@ impl Write for HashWriter {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static GENERIC_FINGERPRINT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn generic_fingerprint_calls() -> u64 {
+    GENERIC_FINGERPRINT_CALLS.get()
+}
+
 pub(super) fn fingerprint(
     table: u8,
     key: &impl Serialize,
     value: &impl Serialize,
 ) -> io::Result<[u8; 32]> {
+    #[cfg(test)]
+    if table == 2 {
+        GENERIC_FINGERPRINT_CALLS.set(GENERIC_FINGERPRINT_CALLS.get() + 1);
+    }
     let mut writer = HashWriter::new(b"OPC-native-process-row-v1\0");
     writer.write_all(&[table])?;
     // Streaming serialization allocates no encoded row buffer. These hashes
@@ -1189,7 +1244,7 @@ impl NativeState {
     }
 
     pub(super) fn admit_business(&mut self) -> io::Result<()> {
-        self.admit_business_using(|state| state.admit_full_roster(&|| Ok(())))
+        self.admit_business_using(None, |state| state.admit_full_roster(&|| Ok(())))
     }
 
     /// Consume the prospective selected rows directly into their sole ledger.
@@ -1197,6 +1252,7 @@ impl NativeState {
     /// construction; the iterator cannot mint a certificate from metadata.
     pub(super) fn admit_selected_roster(
         &mut self,
+        generic: SelectedGenericRows,
         rows: impl IntoIterator<Item = io::Result<SharedRow<roster::Row>>>,
         partitions: impl IntoIterator<
             Item = (
@@ -1207,20 +1263,36 @@ impl NativeState {
         witness: Option<crate::fenced_mutation_roster_storage::GlobalChargeWitness>,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.admit_business_using(|state| state.admit_roster_rows(rows, partitions, witness, check))
+        self.admit_business_using(Some(generic), |state| {
+            state.admit_roster_rows(rows, partitions, witness, check)
+        })
     }
 
     fn admit_business_using(
         &mut self,
+        generic: Option<SelectedGenericRows>,
         admit: impl FnOnce(&Self) -> io::Result<roster::Ledger>,
     ) -> io::Result<()> {
         if self.changes.is_some() {
             return Err(invalid("native cannot readmit a live dirty state"));
         }
         self.proof = None;
+        let generic_table = match generic {
+            Some(generic) => {
+                if !self.generic_receipts.is_empty() || self.frontiers != generic.frontiers {
+                    return Err(invalid(
+                        "native selected requests do not match empty destination",
+                    ));
+                }
+                self.generic_receipts = generic.rows;
+                Some(generic.table)
+            }
+            None => None,
+        };
         let receipt_order = self.validate_full_business_rows()?;
         self.roster = admit(self)?;
         let mut tables = [TableSummary::default(); 4];
+        tables[2] = generic_table.unwrap_or_default();
         let mut expiry = expiry::ExpiryIndex::default();
         for (key, row) in &self.keys {
             tables[0].replace(None, Some(stamp(0, key, row)?))?;
@@ -1230,7 +1302,9 @@ impl NativeState {
             tables[1].replace(None, Some(stamp(1, id, row)?))?;
         }
         for (id, row) in &self.generic_receipts {
-            tables[2].replace(None, Some(stamp(2, id, row)?))?;
+            if generic_table.is_none() {
+                tables[2].replace(None, Some(stamp(2, id, row)?))?;
+            }
             expiry.replace_request(*id, None, Some(row))?;
         }
         expiry.validate_requests(&self.frontiers)?;
