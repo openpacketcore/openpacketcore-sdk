@@ -6032,6 +6032,12 @@ async fn wait_until_applied(
 ) -> Result<(), Box<StorageError<SessionConsensusNodeId>>> {
     let waiting_error =
         |error| storage_error(ErrorSubject::Log(*through), ErrorVerb::Delete, error);
+    let timed_out = || {
+        waiting_error(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "session consensus apply wait timed out",
+        ))
+    };
     let deadline = tokio::time::Instant::now()
         .checked_add(SNAPSHOT_APPLY_WAIT)
         .ok_or_else(|| {
@@ -6046,6 +6052,12 @@ async fn wait_until_applied(
             return Err(Box::new(error));
         }
         let applied = *applied_progress.borrow_and_update();
+        // A ready watch can win over an expired timeout when this task was
+        // not polled in time. Observe coverage within the original absolute
+        // deadline, including after partial progress wakes this loop again.
+        if tokio::time::Instant::now() > deadline {
+            return Err(Box::new(timed_out()));
+        }
         if let Some(applied) = applied {
             if applied.index > through.index || &applied == through {
                 return Ok(());
@@ -6063,12 +6075,7 @@ async fn wait_until_applied(
             }
         })
         .await
-        .map_err(|_| {
-            waiting_error(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "session consensus apply wait timed out",
-            ))
-        })?
+        .map_err(|_| timed_out())?
         .map_err(|_| {
             waiting_error(consensus::invalid_data(
                 "session consensus apply progress channel closed",
@@ -16136,6 +16143,157 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(SessionConsensusStorageError::RecoveryRequired, error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_rejects_progress_first_observed_after_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        for applied in [log_id(1), log_id(2)] {
+            log_store.core.applied_progress.send_replace(None);
+            let through = log_id(1);
+            let wait = wait_until_applied(&log_store.core, &through);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+
+            // Hold the waiter unpolled until both the watch and timer are ready.
+            // Tokio may poll the completed watch first; that cannot extend the
+            // original absolute ten-second application guard.
+            tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+            log_store.core.applied_progress.send_replace(Some(applied));
+            let error = wait.await.expect_err("late applied coverage must time out");
+            assert!(error
+                .to_string()
+                .contains("session consensus apply wait timed out"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_accepts_coverage_through_exact_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        for elapsed in [Duration::ZERO, SNAPSHOT_APPLY_WAIT] {
+            log_store.core.applied_progress.send_replace(None);
+            let through = log_id(1);
+            let wait = wait_until_applied(&log_store.core, &through);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            tokio::time::advance(elapsed).await;
+            log_store.core.applied_progress.send_replace(Some(through));
+            wait.await.expect("coverage within original deadline");
+        }
+        log_store
+            .core
+            .applied_progress
+            .send_replace(Some(log_id(2)));
+        wait_until_applied(&log_store.core, &log_id(1))
+            .await
+            .expect("preexisting later coverage remains immediately usable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_keeps_one_deadline_across_partial_progress() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        let through = log_id(4);
+        let wait = wait_until_applied(&log_store.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        for index in [1, 2] {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            log_store
+                .core
+                .applied_progress
+                .send_replace(Some(log_id(index)));
+            assert!(futures_util::poll!(&mut wait).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(2) + Duration::from_nanos(1)).await;
+        log_store
+            .core
+            .applied_progress
+            .send_replace(Some(log_id(3)));
+        let error = wait
+            .await
+            .expect_err("partial progress cannot reset the guard");
+        assert!(error
+            .to_string()
+            .contains("session consensus apply wait timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_wait_preserves_conflict_and_install_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (log_store, _state_machine) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        let through = log_id(1);
+        {
+            let wait = wait_until_applied(&log_store.core, &through);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            log_store
+                .core
+                .applied_progress
+                .send_replace(Some(log_id_with_term(2, 1)));
+            let error = wait.await.expect_err("equal index must retain full LogId");
+            assert!(error
+                .to_string()
+                .contains("session consensus applied log conflicts with purge"));
+        }
+        log_store.core.applied_progress.send_replace(None);
+        let wait = wait_until_applied(&log_store.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        log_store
+            .core
+            .snapshot_install_failure
+            .send_replace(Some(storage_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                io::Error::other("original snapshot installation failure"),
+            )));
+        log_store.core.applied_progress.send_replace(Some(through));
+        let error = wait
+            .await
+            .expect_err("original install failure has priority");
+        assert!(error
+            .to_string()
+            .contains("original snapshot installation failure"));
     }
 
     #[tokio::test(start_paused = true)]
