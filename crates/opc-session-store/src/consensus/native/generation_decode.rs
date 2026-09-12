@@ -505,6 +505,16 @@ pub(in crate::consensus::native) fn inspect_notification(
 ) -> io::Result<facts::Row<facts::Notification>> {
     check()?;
     let _memory = VerificationMemory::reserve(notification_scratch(bytes)?)?;
+    let facts = inspect_notification_row(bytes, sequence, frontiers)?;
+    check()?;
+    Ok(facts)
+}
+
+fn inspect_notification_row(
+    bytes: &[u8],
+    sequence: u64,
+    frontiers: &NativeFrontiers,
+) -> io::Result<facts::Row<facts::Notification>> {
     let row: ReplicationEntry = binary::decode(bytes)?;
     // The original complete semantic validator remains authoritative.
     validation::validate_notification(&row, sequence, frontiers)?;
@@ -516,7 +526,6 @@ pub(in crate::consensus::native) fn inspect_notification(
         },
     };
     drop(row);
-    check()?;
     Ok(facts)
 }
 
@@ -613,6 +622,19 @@ pub(super) fn inspect_generic_format(
 )> {
     check()?;
     let _memory = VerificationMemory::reserve(generic_scratch_format(bytes, format)?)?;
+    let facts = inspect_generic_row(bytes, format, frontiers)?;
+    check()?;
+    Ok(facts)
+}
+
+fn inspect_generic_row(
+    bytes: &[u8],
+    format: Format,
+    frontiers: &NativeFrontiers,
+) -> io::Result<(
+    SessionConsensusRequestId,
+    Option<facts::Row<facts::Request>>,
+)> {
     let (id, row) = decode_generic(bytes, format)?;
     if let Some(row) = &row {
         validation::validate_generic(&id, row, frontiers)?;
@@ -627,8 +649,117 @@ pub(super) fn inspect_generic_format(
         })
         .transpose()?;
     drop(row);
-    check()?;
     Ok((id, facts))
+}
+
+/// The original inspection kind, bound to one complete input owner below.
+#[derive(Clone, Copy)]
+pub(super) enum CatalogKind {
+    Generic(Format),
+    Notification(u64),
+}
+
+/// Only fixed comparison facts leave a complete row inspection.
+pub(super) enum CatalogRow {
+    Generic(
+        SessionConsensusRequestId,
+        Option<facts::Row<facts::Request>>,
+    ),
+    Notification(facts::Row<facts::Notification>),
+}
+
+pub(super) fn inspect_catalog(
+    bytes: &[u8],
+    kind: CatalogKind,
+    frontiers: &NativeFrontiers,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<CatalogRow> {
+    match kind {
+        CatalogKind::Generic(format) => {
+            let (id, row) = inspect_generic_format(bytes, format, frontiers, check)?;
+            Ok(CatalogRow::Generic(id, row))
+        }
+        CatalogKind::Notification(sequence) => {
+            inspect_notification(bytes, sequence, frontiers, check).map(CatalogRow::Notification)
+        }
+    }
+}
+
+/// Shape preflight and its exact input remain inseparable. This does not carry
+/// semantic proof: the admitted worker still runs the entire original codec.
+pub(super) struct CatalogInput {
+    input: super::Input,
+    kind: CatalogKind,
+    scratch: usize,
+}
+
+impl CatalogInput {
+    pub(super) fn new(input: super::Input, kind: CatalogKind) -> io::Result<Self> {
+        let scratch = match kind {
+            CatalogKind::Generic(format) => generic_scratch_format(input.bytes(), format)?,
+            CatalogKind::Notification(_) => notification_scratch(input.bytes())?,
+        };
+        Ok(Self {
+            input,
+            kind,
+            scratch,
+        })
+    }
+
+    pub(super) fn charged_bytes(&self) -> io::Result<usize> {
+        self.scratch
+            .checked_add(self.input.bytes().len())
+            .ok_or_else(|| invalid("native catalog inspection charge overflows"))
+    }
+
+    pub(super) fn reserve(
+        self,
+        reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
+    ) -> CatalogPreparation {
+        match reserve(self.scratch) {
+            Ok(memory) => CatalogPreparation::Ready(PreparedCatalogRow {
+                input: self,
+                _memory: memory,
+            }),
+            Err(_) => CatalogPreparation::Serial(self),
+        }
+    }
+
+    pub(super) fn inspect_serial(
+        self,
+        frontiers: &NativeFrontiers,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<CatalogRow> {
+        inspect_catalog(self.input.bytes(), self.kind, frontiers, check)
+    }
+}
+
+/// Memory pressure retains the same input for original single-row admission.
+pub(super) enum CatalogPreparation {
+    Ready(PreparedCatalogRow),
+    Serial(CatalogInput),
+}
+
+/// Original input and decoder charges are held until the full decoder drops
+/// all payloads. Only the original fixed catalog facts can leave this owner.
+pub(super) struct PreparedCatalogRow {
+    input: CatalogInput,
+    _memory: VerificationMemory,
+}
+
+impl PreparedCatalogRow {
+    pub(super) fn inspect(self, frontiers: &NativeFrontiers) -> io::Result<CatalogRow> {
+        match self.input.kind {
+            CatalogKind::Generic(format) => {
+                let (id, row) = inspect_generic_row(self.input.input.bytes(), format, frontiers)?;
+                Ok(CatalogRow::Generic(id, row))
+            }
+            CatalogKind::Notification(sequence) => {
+                inspect_notification_row(self.input.input.bytes(), sequence, frontiers)
+                    .map(CatalogRow::Notification)
+            }
+        }
+    }
 }
 
 pub(in crate::consensus::native) fn owned_generic(

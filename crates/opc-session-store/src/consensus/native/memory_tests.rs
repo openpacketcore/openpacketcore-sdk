@@ -6,6 +6,35 @@ use crate::sqlite::consensus::wal::Operation;
 use allocation_counter::{measure, opt_out};
 use changes::tests::{command, fixture, request, time};
 
+#[cfg(target_os = "linux")]
+struct MeasurementCpu(nix::sched::CpuSet);
+
+#[cfg(target_os = "linux")]
+impl MeasurementCpu {
+    fn current() -> Self {
+        use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
+        use nix::unistd::Pid;
+
+        let previous = sched_getaffinity(Pid::from_raw(0)).unwrap();
+        let cpu = (0..CpuSet::count())
+            .find(|cpu| previous.is_set(*cpu).unwrap())
+            .unwrap();
+        let mut selected = CpuSet::new();
+        selected.set(cpu).unwrap();
+        sched_setaffinity(Pid::from_raw(0), &selected).unwrap();
+        let restore = Self(previous);
+        assert_eq!(std::thread::available_parallelism().unwrap().get(), 1);
+        restore
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MeasurementCpu {
+    fn drop(&mut self) {
+        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &self.0).unwrap();
+    }
+}
+
 fn populated(count: u64) -> NativeStorage {
     let (mut storage, _, mut outcome) = fixture();
     for index in 2..=count {
@@ -116,6 +145,15 @@ fn report_owners(label: &str, mut storage: NativeStorage) {
 
 #[test]
 fn native_memory_ownership_profiles_resident_selected_and_captured_rows() {
+    // measure() counts only this thread, including allocations later moved
+    // elsewhere but excluding their release on another thread. Exercise the
+    // actual single-CPU decoder path for these model-owner measurements. The
+    // parallel batch tests separately cover all worker charges and releases;
+    // this component bound never substitutes for whole-process RSS checks.
+    // Only this test thread changes affinity, within its existing allocation,
+    // and the guard restores it after all original assertions (also on panic).
+    #[cfg(target_os = "linux")]
+    let _cpu = MeasurementCpu::current();
     const ROWS: u64 = 4096;
     let whole = measure(|| {
         let mut hot = None;

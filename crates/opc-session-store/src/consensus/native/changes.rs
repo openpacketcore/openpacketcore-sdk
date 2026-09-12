@@ -221,6 +221,11 @@ pub(super) fn generic_fingerprint_calls() -> u64 {
     GENERIC_FINGERPRINT_CALLS.get()
 }
 
+#[cfg(test)]
+pub(super) fn record_joined_generic_fingerprint_calls(calls: u64) {
+    GENERIC_FINGERPRINT_CALLS.set(GENERIC_FINGERPRINT_CALLS.get() + calls);
+}
+
 pub(super) fn fingerprint(
     table: u8,
     key: &impl Serialize,

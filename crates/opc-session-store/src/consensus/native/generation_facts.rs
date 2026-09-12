@@ -27,6 +27,7 @@ impl KeyId {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(in crate::consensus::native) struct Row<T> {
     pub(in crate::consensus::native) content: [u8; 32],
     pub(in crate::consensus::native) facts: T,
@@ -87,6 +88,7 @@ impl Key {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(in crate::consensus::native) struct Response {
     pub(in crate::consensus::native) sequence: u64,
     pub(in crate::consensus::native) logical_time: Timestamp,
@@ -123,6 +125,7 @@ impl Response {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(in crate::consensus::native) struct Request {
     pub(super) format: Format,
     payload_digest: [u8; 32],
@@ -201,6 +204,7 @@ impl Receipt {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(in crate::consensus::native) struct Notification {
     pub(in crate::consensus::native) sequence: u64,
     pub(in crate::consensus::native) timestamp: Timestamp,

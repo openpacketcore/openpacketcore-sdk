@@ -79,6 +79,10 @@ tokio = { workspace = true, features = ["time", "sync", "test-util"] }
 tempfile = "3"
 proptest = "1.9"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The allocation counter is thread-local; pin only its model-measurement thread.
+nix = { workspace = true, features = ["sched"] }
+
 [[test]]
 name = "sqlite_checkpoint_hotpath"
 path = "tests/sqlite_checkpoint_hotpath.rs"

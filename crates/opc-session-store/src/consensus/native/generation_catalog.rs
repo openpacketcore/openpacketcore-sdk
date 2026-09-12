@@ -30,6 +30,9 @@ use ordinal_index::Ordinals;
 mod roster_index;
 use roster_index::Rosters;
 
+#[path = "generation_catalog_batch.rs"]
+mod batch;
+
 #[derive(Clone, Copy)]
 struct Range {
     offset: u64,
@@ -80,6 +83,7 @@ struct Rows {
 }
 
 /// Encoding and predecessor rules for one complete row section.
+#[derive(Clone, Copy)]
 struct RowSection {
     checkpoint: u64,
     counts: [usize; 5],
@@ -1049,59 +1053,8 @@ impl Rows {
             )?;
         }
         ordinals.validate(frontiers.history)?;
-        for _ in 0..counts[2] {
-            check()?;
-            expect(reader, &[2])?;
-            let before = reader.before()?;
-            let (range, input) = reader.bytes(MAX_ITEM)?;
-            let (id, row) =
-                decode::inspect_generic_format(input.bytes(), format, frontiers, check)?;
-            predecessor(self.generic.get(&id), before, checkpoint, base)?;
-            let row = row.ok_or_else(|| {
-                invalid("native generation generic removal lacks its lifecycle codec")
-            })?;
-            if let Some(before) = self.generic.get(&id) {
-                row.facts
-                    .validate_replacement(before.row.facts, before.row.content != row.content)?;
-            } else if row.facts.retained_until.is_some() {
-                self.v1_count += 1;
-                if self.v1_count > crate::fenced_transition::FENCED_TRANSITION_MAX_HISTORY_ENTRIES {
-                    return Err(invalid(
-                        "native catalog V1 count exceeds original lifetime bound",
-                    ));
-                }
-            }
-            self.summary[2].replace(before, Some(row.content))?;
-            put(
-                &mut self.generic,
-                id,
-                Indexed {
-                    range,
-                    row,
-                    checkpoint,
-                },
-                validation::MAX_ITEMS,
-            )?;
-        }
-        for _ in 0..counts[3] {
-            check()?;
-            expect(reader, &[3])?;
-            if self.notifications.len() >= validation::MAX_ITEMS {
-                return Err(invalid("native catalog watch count exceeds original bound"));
-            }
-            let (range, input) = reader.bytes(MAX_ITEM)?;
-            let sequence = self.notifications.len() as u64 + 1;
-            let row = decode::inspect_notification(input.bytes(), sequence, frontiers, check)?;
-            self.summary[3].replace(None, Some(row.content))?;
-            self.notifications
-                .try_reserve(1)
-                .map_err(|_| invalid("native resident watch catalog allocation failed"))?;
-            self.notifications.push(Indexed {
-                range,
-                row,
-                checkpoint,
-            });
-        }
+        self.read_catalog_table(reader, after, section, batch::Table::Generic, check)?;
+        self.read_catalog_table(reader, after, section, batch::Table::Notification, check)?;
         let mut changed = ChangedLogs::new(if base { 0 } else { counts[4] })?;
         for _ in 0..counts[4] {
             check()?;

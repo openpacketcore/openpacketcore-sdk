@@ -17,6 +17,51 @@ const ROOT: [u8; 32] = [0xBD; 32];
 const CUT: [u8; 32] = [0xCE; 32];
 
 #[test]
+fn native_catalog_batch_complete_base_and_delta_preserve_all_encoded_rows() {
+    let (mut storage, _, mut outcome) = fixture();
+    for index in 2..66 {
+        let request = request(index, Some(&outcome));
+        let result = apply(&mut storage, &[command(index, &request, time(2), false)]);
+        let Ok(SessionMutationOutcome::FencedTransition(next)) = &result.responses[0].result else {
+            panic!("successful renewed mutation");
+        };
+        outcome = next.clone();
+    }
+    apply(
+        &mut storage,
+        &(66..130)
+            .map(|index| clock(index, time(2)))
+            .collect::<Vec<_>>(),
+    );
+    let (mut files, catalog) = Files::new(&storage);
+    assert!(catalog.rows.generic.len() >= 64);
+    assert!(catalog.rows.notifications.len() >= 64);
+    drop(catalog);
+    storage.begin_changes().unwrap();
+    for index in 130..194 {
+        let request = request(index, Some(&outcome));
+        let result = apply(&mut storage, &[command(index, &request, time(2), false)]);
+        let Ok(SessionMutationOutcome::FencedTransition(next)) = &result.responses[0].result else {
+            panic!("successful renewed mutation");
+        };
+        outcome = next.clone();
+    }
+    apply(
+        &mut storage,
+        &(194..258)
+            .map(|index| clock(index, time(2)))
+            .collect::<Vec<_>>(),
+    );
+    let catalog = files.append(&mut storage, 19);
+    let restored = catalog.into_storage(&|| Ok(())).unwrap();
+    restored.validate_image().unwrap();
+    assert!(
+        Version::capture(&restored).unwrap().context()
+            == Version::capture(&storage).unwrap().context()
+    );
+}
+
+#[test]
 fn native_selected_notification_read_uses_one_bounded_decode() {
     use crate::consensus::native::notification::NativeNotification;
 
