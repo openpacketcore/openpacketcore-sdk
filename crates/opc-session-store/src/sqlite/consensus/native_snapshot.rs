@@ -6,6 +6,10 @@ use super::*;
 use crate::consensus::verified_snapshot::VerificationMemory;
 use rusqlite::types::ValueRef;
 
+#[path = "native_snapshot_checked.rs"]
+mod checked;
+pub(crate) use checked::{Scope, ValidatedSource};
+
 pub(crate) struct Metadata {
     pub(crate) machine: (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
     pub(crate) v1: Option<(SessionConsensusIdentity, [u8; 32])>,

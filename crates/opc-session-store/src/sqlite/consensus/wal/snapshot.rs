@@ -51,6 +51,12 @@ pub(super) fn installed_marker(
     }))
 }
 
+struct NativeInstallPreparation {
+    authority: Authority,
+    placement: PlacementResiliencePolicy,
+    memory: crate::consensus::verified_snapshot::VerificationMemory,
+}
+
 /// The raw input and published envelope are distinct continuously pinned
 /// immutable files. In recovery, RAW is derived again from the retained
 /// envelope; the proposed installed basis is never treated as incoming data.
@@ -193,6 +199,68 @@ impl InstallSource {
         incarnation: &RestoreScanIncarnation,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Arc<NativeSnapshotAuthority>> {
+        let prepared =
+            self.prepare_native_install_original(conn, binding, root, incarnation, check)?;
+        let (_, installed_memory) = consensus::native_snapshot::validate(
+            conn,
+            binding.identity,
+            &prepared.authority.members,
+            &prepared.authority.bindings,
+            prepared.placement,
+            root,
+            check,
+        )?;
+        let proof =
+            self.finish_native_install_original(conn, binding, root, incarnation, prepared, check)?;
+        drop(installed_memory);
+        Ok(proof)
+    }
+
+    /// Preserve the same final installed-image audit under a read transaction
+    /// which conversion consumes. No mutable connection can escape that borrow.
+    pub(in crate::sqlite::consensus) fn apply_native_validated<'a>(
+        &self,
+        conn: &'a mut Connection,
+        binding: Binding,
+        root: Option<&RosterAttestationTrustRootV1>,
+        incarnation: &RestoreScanIncarnation,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<(
+        Arc<NativeSnapshotAuthority>,
+        consensus::native_snapshot::ValidatedSource<'a>,
+    )> {
+        let prepared =
+            self.prepare_native_install_original(conn, binding, root, incarnation, check)?;
+        let source = consensus::native_snapshot::ValidatedSource::new(
+            conn,
+            consensus::native_snapshot::Scope {
+                identity: binding.identity,
+                members: &prepared.authority.members,
+                bindings: &prepared.authority.bindings,
+                placement: prepared.placement,
+                root,
+            },
+            check,
+        )?;
+        let proof = self.finish_native_install_original(
+            source.connection(),
+            binding,
+            root,
+            incarnation,
+            prepared,
+            check,
+        )?;
+        Ok((proof, source))
+    }
+
+    fn prepare_native_install_original(
+        &self,
+        conn: &Connection,
+        binding: Binding,
+        root: Option<&RosterAttestationTrustRootV1>,
+        incarnation: &RestoreScanIncarnation,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<NativeInstallPreparation> {
         check()?;
         let memory = crate::consensus::native::generation::reserve_install_metadata(
             &self.candidate,
@@ -250,15 +318,25 @@ impl InstallSource {
         drop(incoming);
         drop(incoming_memory);
         drop(local_memory);
-        let (_, installed_memory) = consensus::native_snapshot::validate(
-            conn,
-            binding.identity,
-            &authority.members,
-            &authority.bindings,
+        Ok(NativeInstallPreparation {
+            authority,
             placement,
-            root,
-            check,
-        )?;
+            memory,
+        })
+    }
+
+    fn finish_native_install_original(
+        &self,
+        conn: &Connection,
+        binding: Binding,
+        root: Option<&RosterAttestationTrustRootV1>,
+        incarnation: &RestoreScanIncarnation,
+        prepared: NativeInstallPreparation,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Arc<NativeSnapshotAuthority>> {
+        let NativeInstallPreparation {
+            authority, memory, ..
+        } = prepared;
         let installed_incarnation = RestoreScanIncarnation::from_installed_sync(conn)
             .map_err(|_| invalid_data("native installed restore identity invalid"))?;
         let cut = self.candidate.0.last_log_id;
@@ -288,7 +366,6 @@ impl InstallSource {
             published_path: self.published_path.clone(),
             _memory: memory,
         });
-        drop(installed_memory);
         Ok(proof)
     }
 

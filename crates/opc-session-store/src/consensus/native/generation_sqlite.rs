@@ -6,15 +6,20 @@
 //! The caller must sync and cold-admit the result before selecting any file.
 
 use super::*;
+#[cfg(test)]
 use crate::consensus::SessionTopologyMemberBinding;
 use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::fenced_mutation_roster_storage::ProductionFloorKey;
+#[cfg(test)]
 use crate::readiness::PlacementResiliencePolicy;
 use crate::sqlite::{consensus as sql, ops};
 use resident::RowFingerprint;
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::{params, OptionalExtension, Row, Transaction};
 use sql::native_snapshot as source;
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 #[path = "generation_sqlite_notifications.rs"]
@@ -175,6 +180,7 @@ impl<'a> SqlitePreparedBase<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn prepare_with_origin(
         conn: &'a mut Connection,
         identity: SessionConsensusIdentity,
@@ -198,10 +204,74 @@ impl<'a> SqlitePreparedBase<'a> {
             origin.verify()?;
         }
         let memory = VerificationMemory::reserve(HEADER_MEMORY)?;
-        conn.pragma_update(None, "query_only", true).map_err(db)?;
-        let tx = conn.transaction().map_err(db)?;
-        let (metadata, metadata_memory) =
-            source::validate(&tx, identity, members, bindings, placement, root, check)?;
+        let scope = source::Scope {
+            identity,
+            members,
+            bindings,
+            placement,
+            root,
+        };
+        let validated = source::ValidatedSource::new(conn, scope, check)?;
+        Self::from_validated(
+            validated,
+            scope,
+            snapshot_origin,
+            BaseParameters {
+                binding,
+                file_epoch,
+                checkpoint_epoch,
+                operation_sequence,
+                cut_binding,
+                block_bytes,
+                maximum,
+            },
+            memory,
+            check,
+        )
+    }
+
+    pub(crate) fn prepare_validated(
+        validated: source::ValidatedSource<'a>,
+        scope: source::Scope<'_, 'a>,
+        snapshot_origin: Option<Arc<NativeSnapshotAuthority>>,
+        parameters: BaseParameters,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        check()?;
+        if let Some(origin) = &snapshot_origin {
+            origin.require_scope(
+                parameters.binding,
+                scope.identity,
+                scope.members,
+                scope.root,
+            )?;
+            origin.verify()?;
+        }
+        let memory = VerificationMemory::reserve(HEADER_MEMORY)?;
+        Self::from_validated(validated, scope, snapshot_origin, parameters, memory, check)
+    }
+
+    fn from_validated(
+        validated: source::ValidatedSource<'a>,
+        scope: source::Scope<'_, 'a>,
+        snapshot_origin: Option<Arc<NativeSnapshotAuthority>>,
+        parameters: BaseParameters,
+        memory: VerificationMemory,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let BaseParameters {
+            binding,
+            file_epoch,
+            checkpoint_epoch,
+            operation_sequence,
+            cut_binding,
+            block_bytes,
+            maximum,
+        } = parameters;
+        let identity = scope.identity;
+        let members = scope.members;
+        let root = scope.root;
+        let (tx, metadata, metadata_memory) = validated.into_parts(scope, check)?;
         let (sequence, digest, logical_time, watch_sequence) = metadata.machine;
         let global = |name| {
             tx.query_row(

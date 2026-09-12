@@ -10,6 +10,9 @@ use crate::sqlite::ops::RestoreScanIncarnation;
 use opc_consensus::engine::Vote;
 use std::io::Write;
 
+#[path = "validated_source.rs"]
+mod validated_source;
+
 const MAXIMUM: u64 = crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
 const BLOCK: usize = 64 * 1024;
 const CUT: [u8; 32] = [0xEA; 32];

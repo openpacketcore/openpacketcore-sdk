@@ -4,7 +4,7 @@
 //! and reclamation. No live SQL cache participates in native authority.
 
 use super::*;
-use crate::consensus::native::generation::{Catalog, SqlitePreparedBase, Version};
+use crate::consensus::native::generation::{BaseParameters, Catalog, SqlitePreparedBase, Version};
 use crate::consensus::verified_snapshot::VerificationMemory;
 
 impl Wal {
@@ -233,14 +233,14 @@ fn advance_inner(
     let root = capture.storage.business.roster_root().cloned();
     let members = capture.storage.business.members().clone();
     drop(capture);
-    let origin = installation.source.apply_native_original(
-        &conn,
+    let (origin, validated) = installation.source.apply_native_validated(
+        &mut conn,
         binding,
         root.as_deref(),
         &installation.incarnation,
         &check,
     )?;
-    let authority = Authority::load(&conn, binding.identity)?;
+    let authority = Authority::load(validated.connection(), binding.identity)?;
     let placement = authority
         .placement
         .ok_or_else(|| invalid_data("native install fixed placement missing"))?;
@@ -329,21 +329,25 @@ fn advance_inner(
         .open(&preparing)?;
     (control.hook)(Point::AfterBasisCreate)?;
     let prefix = {
-        let prepared = SqlitePreparedBase::prepare_with_origin(
-            &mut conn,
-            binding.identity,
-            &members,
-            &authority.bindings,
-            placement,
-            root.as_deref(),
+        let prepared = SqlitePreparedBase::prepare_validated(
+            validated,
+            consensus::native_snapshot::Scope {
+                identity: binding.identity,
+                members: &members,
+                bindings: &authority.bindings,
+                placement,
+                root: root.as_deref(),
+            },
             Some(Arc::clone(&origin)),
-            binding.digest()?,
-            file_epoch,
-            epoch,
-            anchor.native_sequence(),
-            cut_binding,
-            64 * 1024,
-            MAX_BASIS,
+            BaseParameters {
+                binding: binding.digest()?,
+                file_epoch,
+                checkpoint_epoch: epoch,
+                operation_sequence: anchor.native_sequence(),
+                cut_binding,
+                block_bytes: 64 * 1024,
+                maximum: MAX_BASIS,
+            },
             &check,
         )?;
         let mut output = io::BufWriter::with_capacity(64 * 1024, &mut file);
