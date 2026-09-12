@@ -421,6 +421,58 @@ impl fmt::Debug for GtpuSessionSelectorRetiredClaim {
     }
 }
 
+/// Terminal proof that this exact group was never admitted for a backend effect.
+///
+/// The protected namespace permanently seals the group identity before issuing
+/// this claim. It grants no removal, selector reuse, or absence authority for
+/// another group, even when that group owns overlapping selectors. Unlike an
+/// error classification, the claim survives loss of the operation acknowledgement
+/// through the namespace's durable no-admission record.
+///
+/// ```compile_fail
+/// use opc_gtpu_dataplane::GtpuSessionSelectorUnadmittedClaim;
+/// fn cannot_copy(claim: GtpuSessionSelectorUnadmittedClaim) {
+///     let _ = claim.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use opc_gtpu_dataplane::{GtpuSessionGroup, GtpuSessionSelectorUnadmittedClaim};
+/// fn cannot_mint(group: GtpuSessionGroup) -> GtpuSessionSelectorUnadmittedClaim {
+///     GtpuSessionSelectorUnadmittedClaim { group }
+/// }
+/// ```
+#[must_use = "use the exact no-admission claim to settle only this group's cleanup"]
+pub struct GtpuSessionSelectorUnadmittedClaim {
+    group: GtpuSessionGroup,
+    storage_scope_commitment: [u8; 32],
+    authority_instance: Arc<()>,
+}
+
+impl fmt::Debug for GtpuSessionSelectorUnadmittedClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GtpuSessionSelectorUnadmittedClaim(<redacted>)")
+    }
+}
+
+impl GtpuSessionSelectorUnadmittedClaim {
+    /// Check the complete desired graph and the authority that issued this claim.
+    /// A match permits only no-effect completion for the permanently sealed group.
+    #[must_use]
+    pub fn confirms_group<B>(
+        &self,
+        authority: &GtpuSessionSelectorNamespaceAuthority<B>,
+        desired: &GtpuSessionGroup,
+    ) -> bool
+    where
+        B: SessionBackend + SessionLeaseManager,
+    {
+        Arc::ptr_eq(&self.authority_instance, &authority.instance)
+            && self.storage_scope_commitment == authority.storage_scope_commitment
+            && canonical_desired_bytes(&self.group) == canonical_desired_bytes(desired)
+    }
+}
+
 /// Opaque backend request to attest quiescence for one exact retired source
 /// before its selectors may be reused by one exact successor graph.
 pub struct GtpuSessionSelectorReuseRequest {
@@ -2411,7 +2463,7 @@ impl InMemoryGtpuSessionSelectorNamespace {
                 return Err(GtpuSessionSelectorNamespaceError::StaleGeneration);
             }
         }
-        if state.groups.contains_key(&claim.group_fingerprint) {
+        if state.group_was_reserved(&claim.group_fingerprint) {
             return Err(GtpuSessionSelectorNamespaceError::GroupClaimed);
         }
         let atoms = claim
@@ -2500,7 +2552,7 @@ impl InMemoryGtpuSessionSelectorNamespace {
             SELECTOR_NAMESPACE_MAX_READBACK_ATOMS,
             Some(self.key),
         )?;
-        if state.groups.contains_key(&claim.group_fingerprint)
+        if state.group_was_reserved(&claim.group_fingerprint)
             || !matches!(
                 state.groups.get(&source.group_fingerprint),
                 Some(GroupState::Retired { device, selectors, desired: source_desired, atoms: source_atoms, successor: None, .. })
@@ -2998,7 +3050,7 @@ impl<S: GtpuSessionSelectorNamespaceStore> TestGtpuSessionSelectorNamespaceAutho
                     return Err(GtpuSessionSelectorNamespaceError::StaleGeneration);
                 }
             }
-            if state.groups.contains_key(&claim.group_fingerprint) {
+            if state.group_was_reserved(&claim.group_fingerprint) {
                 return Err(GtpuSessionSelectorNamespaceError::GroupClaimed);
             }
             if atoms.iter().any(|atom| {
@@ -3121,7 +3173,7 @@ impl<S: GtpuSessionSelectorNamespaceStore> TestGtpuSessionSelectorNamespaceAutho
                 self.maximum_operation_atoms,
                 Some(self.key),
             )?;
-            if state.groups.contains_key(&claim.group_fingerprint)
+            if state.group_was_reserved(&claim.group_fingerprint)
                 || !matches!(
                     state.groups.get(&source.group_fingerprint),
                     Some(GroupState::Retired { device, selectors, desired: source_desired, atoms: source_atoms, successor: None, .. })
@@ -3758,6 +3810,9 @@ where
     storage_scope_commitment: [u8; 32],
     stable_device: GtpuSessionDeviceId,
     pin_commitment: [u8; 32],
+    /// Binds newly minted no-admission receipts to this opened authority and
+    /// its clones. Reopening recovers a new receipt from the durable decision.
+    instance: Arc<()>,
     #[cfg(test)]
     allows_test_raw_open: bool,
 }
@@ -3785,6 +3840,7 @@ where
             storage_scope_commitment: self.storage_scope_commitment,
             stable_device: self.stable_device,
             pin_commitment: self.pin_commitment,
+            instance: Arc::clone(&self.instance),
             #[cfg(test)]
             allows_test_raw_open: self.allows_test_raw_open,
         }
@@ -3922,6 +3978,7 @@ where
             storage_scope_commitment: scope.storage_scope_commitment,
             stable_device: scope.stable_device,
             pin_commitment: scope.pin_commitment,
+            instance: Arc::new(()),
             #[cfg(test)]
             allows_test_raw_open: false,
         })
@@ -4070,6 +4127,94 @@ where
         }
         .await;
         self.finish_worker_operation(lease, result).await
+    }
+
+    /// Permanently close an exact group that never reached namespace admission.
+    ///
+    /// The same supervised worker and fenced ledger CAS used by installation
+    /// serialize this decision with every admission path. Any existing Installing,
+    /// Active, Retiring, Retired, or Poisoned group is refused, including an
+    /// Installing group whose backend handoff has not started. No map readback is
+    /// interpreted as absence, and no backend effect or selector removal occurs.
+    /// Repeating the operation recovers only the identical durable closed graph.
+    pub fn seal_unadmitted<D>(
+        &self,
+        backend: Arc<D>,
+        desired: GtpuSessionGroup,
+    ) -> GtpuSessionSelectorOperation<GtpuSessionSelectorUnadmittedClaim>
+    where
+        B: Send + Sync + 'static,
+        D: GtpuDataplaneBackend + Send + Sync + 'static,
+    {
+        let authority = self.clone();
+        let scope = self.storage_scope_commitment;
+        spawn_selector_operation(
+            scope,
+            GtpuSessionSelectorCoordinatorError::Namespace,
+            async move {
+                authority
+                    .seal_unadmitted_owned(backend.as_ref(), desired)
+                    .await
+            },
+        )
+    }
+
+    async fn seal_unadmitted_owned<D>(
+        &self,
+        backend: &D,
+        desired: GtpuSessionGroup,
+    ) -> Result<GtpuSessionSelectorUnadmittedClaim, GtpuSessionSelectorCoordinatorError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
+        let mut lease = self
+            .acquire_worker_lease()
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+        let result = async {
+            self.ensure_backend_namespace(backend, &mut lease).await?;
+            for _ in 0..MAX_CAS_RETRIES {
+                let (record, mut state) = self.read_state().await?;
+                state.bind_or_validate(desired.device_id(), self.maximum_operation_atoms, None)?;
+                let claim = CanonicalClaim::from_group(&desired)
+                    .with_key(&state.selector_digest_key)
+                    .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+                if state.groups.contains_key(&claim.group_fingerprint) {
+                    return Err(GtpuSessionSelectorNamespaceError::GroupClaimed);
+                }
+                let encoded = canonical_desired_bytes(&desired);
+                if let Some(existing) = state.unadmitted_groups.get(&claim.group_fingerprint) {
+                    if existing.desired.as_slice() != encoded.as_slice() {
+                        return Err(GtpuSessionSelectorNamespaceError::ConfigurationMismatch);
+                    }
+                    return Ok(());
+                }
+                state.preflight_unadmitted_group(encoded.len())?;
+                let generation = state.next_generation()?;
+                state.unadmitted_groups.insert(
+                    claim.group_fingerprint,
+                    UnadmittedGroup {
+                        desired: Zeroizing::new(encoded),
+                        generation,
+                    },
+                );
+                if self
+                    .replace_with_lease(record.as_ref(), state, &mut lease)
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+            Err(GtpuSessionSelectorNamespaceError::Indeterminate)
+        }
+        .await
+        .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace);
+        self.finish_worker_operation(lease, result).await?;
+        Ok(GtpuSessionSelectorUnadmittedClaim {
+            group: desired,
+            storage_scope_commitment: self.storage_scope_commitment,
+            authority_instance: Arc::clone(&self.instance),
+        })
     }
 
     /// Ask the backend to prove quiescence for an exact retired source before
@@ -5231,7 +5376,7 @@ where
             if atoms.len() > self.maximum_operation_atoms {
                 return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
             }
-            if state.groups.contains_key(&claim.group_fingerprint) {
+            if state.group_was_reserved(&claim.group_fingerprint) {
                 return Err(GtpuSessionSelectorNamespaceError::GroupClaimed);
             }
             if atoms.iter().any(|atom| {
@@ -5351,7 +5496,7 @@ where
                 .selector_atoms(&state.selector_digest_key)
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
             let source_is_exact = matches!(state.groups.get(&source.group_fingerprint), Some(GroupState::Retired { device, selectors, desired: source_desired, atoms: source_atoms, successor: None, .. }) if *device == source.device_fingerprint && *selectors == source.selector_set_fingerprint && *source_desired == source.desired_fingerprint && *source_atoms == atoms);
-            if state.groups.contains_key(&claim.group_fingerprint)
+            if state.group_was_reserved(&claim.group_fingerprint)
                 || !source_is_exact
                 || !atoms.iter().all(|atom| {
                     matches!(state.selectors.get(atom), Some(SelectorState::Retired))
@@ -6842,6 +6987,9 @@ struct NamespaceState {
     decommission_fence: Option<DecommissionFence>,
     selectors: BTreeMap<[u8; 32], SelectorState>,
     groups: BTreeMap<[u8; 32], GroupState>,
+    /// Permanent no-admission decisions. These groups own no selectors and
+    /// have no backend stamp. They share the permanent group capacity bound.
+    unadmitted_groups: BTreeMap<[u8; 32], UnadmittedGroup>,
     /// Protected canonical desired descriptors for every permanent group.
     /// This is the durable source of operation-stamp key reconstruction.
     canonical_desired: BTreeMap<[u8; 32], Zeroizing<Vec<u8>>>,
@@ -6853,7 +7001,35 @@ struct NamespaceState {
     tombstones: BTreeSet<[u8; 32]>,
 }
 
+#[derive(Clone)]
+struct UnadmittedGroup {
+    desired: Zeroizing<Vec<u8>>,
+    generation: GtpuSessionSelectorAuthorityGeneration,
+}
+
 impl NamespaceState {
+    fn group_was_reserved(&self, fingerprint: &[u8; 32]) -> bool {
+        self.groups.contains_key(fingerprint) || self.unadmitted_groups.contains_key(fingerprint)
+    }
+
+    fn permanent_group_count(&self) -> usize {
+        self.groups
+            .len()
+            .saturating_add(self.unadmitted_groups.len())
+    }
+
+    fn preflight_unadmitted_group(
+        &self,
+        bytes: usize,
+    ) -> Result<(), GtpuSessionSelectorNamespaceError> {
+        if self.permanent_group_count() >= MAX_PERMANENT_GROUPS
+            || bytes == 0
+            || bytes > MAX_CANONICAL_DESIRED_BYTES
+        {
+            return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
+        }
+        self.preflight_encoded_growth(4 + 32 + 8 + 2 + bytes)
+    }
     fn provisioned(
         stable_device: GtpuSessionDeviceId,
         pin_commitment: [u8; 32],
@@ -6883,6 +7059,7 @@ impl NamespaceState {
             || self.decommission_fence.is_some()
             || !self.selectors.is_empty()
             || !self.groups.is_empty()
+            || !self.unadmitted_groups.is_empty()
             || !self.canonical_desired.is_empty()
             || !self.published_atoms.is_empty()
             || !self.tombstones.is_empty()
@@ -7255,6 +7432,7 @@ impl NamespaceState {
                 && self.storage_scope_commitment == [0; 32]
                 && self.selectors.is_empty()
                 && self.groups.is_empty()
+                && self.unadmitted_groups.is_empty()
                 && self.canonical_desired.is_empty()
                 && self.published_atoms.is_empty()
                 && self.tombstones.is_empty()
@@ -7345,8 +7523,7 @@ impl NamespaceState {
             return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
         }
         if self
-            .groups
-            .len()
+            .permanent_group_count()
             .checked_add(1)
             .is_none_or(|value| value > MAX_PERMANENT_GROUPS)
             || self
@@ -7397,8 +7574,7 @@ impl NamespaceState {
         if atoms == 0
             || atoms > SELECTOR_NAMESPACE_MAX_READBACK_ATOMS
             || self
-                .groups
-                .len()
+                .permanent_group_count()
                 .checked_add(1)
                 .is_none_or(|value| value > MAX_PERMANENT_GROUPS)
             || self
@@ -7785,7 +7961,14 @@ impl NamespaceState {
         // poisoned-retiring prior terminal coordinate needed for exact
         // operation-stamp inventory reconstruction. Older schemas lack this
         // authority and therefore fail closed on production open.
-        output.extend_from_slice(b"OPCSN15");
+        // OPCSN16 adds a permanent, disjoint no-admission index. Existing
+        // OPCSN15 ledgers keep their exact encoding until the first seal CAS;
+        // older readers then reject the new schema before issuing authority.
+        output.extend_from_slice(if self.unadmitted_groups.is_empty() {
+            b"OPCSN15"
+        } else {
+            b"OPCSN16"
+        });
         output.push(match self.lifecycle {
             NamespaceLifecycle::Unprovisioned => 0,
             NamespaceLifecycle::Provisioned => 1,
@@ -8011,6 +8194,15 @@ impl NamespaceState {
         for tombstone in &self.tombstones {
             output.extend_from_slice(tombstone);
         }
+        if !self.unadmitted_groups.is_empty() {
+            output.extend_from_slice(&(self.unadmitted_groups.len() as u32).to_be_bytes());
+            for (group, sealed) in &self.unadmitted_groups {
+                output.extend_from_slice(group);
+                output.extend_from_slice(&sealed.generation.get().to_be_bytes());
+                output.extend_from_slice(&(sealed.desired.len() as u16).to_be_bytes());
+                output.extend_from_slice(&sealed.desired);
+            }
+        }
         output
     }
 
@@ -8020,7 +8212,7 @@ impl NamespaceState {
         }
         let mut cursor = 0_usize;
         let version = take(bytes, &mut cursor, 7)?;
-        (version == b"OPCSN15").then_some(())?;
+        (version == b"OPCSN15" || version == b"OPCSN16").then_some(())?;
         let lifecycle = match *take(bytes, &mut cursor, 1)?.first()? {
             0 => NamespaceLifecycle::Unprovisioned,
             1 => NamespaceLifecycle::Provisioned,
@@ -8384,6 +8576,39 @@ impl NamespaceState {
             previous_tombstone = Some(tombstone);
             tombstones.insert(tombstone);
         }
+        let mut unadmitted_groups = BTreeMap::new();
+        if version == b"OPCSN16" {
+            let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
+            if count == 0
+                || count > MAX_PERMANENT_GROUPS
+                || groups.len().checked_add(count)? > MAX_PERMANENT_GROUPS
+            {
+                return None;
+            }
+            let mut previous = None;
+            for _ in 0..count {
+                let group = take_array(take(bytes, &mut cursor, 32)?)?;
+                if previous.is_some_and(|prior| prior >= group) || groups.contains_key(&group) {
+                    return None;
+                }
+                previous = Some(group);
+                let generation = GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(
+                    u64::from_be_bytes(take_array(take(bytes, &mut cursor, 8)?)?),
+                )?);
+                let length = u16::from_be_bytes(take_array(take(bytes, &mut cursor, 2)?)?) as usize;
+                if length == 0 || length > MAX_CANONICAL_DESIRED_BYTES {
+                    return None;
+                }
+                let desired = Zeroizing::new(take(bytes, &mut cursor, length)?.to_vec());
+                unadmitted_groups.insert(
+                    group,
+                    UnadmittedGroup {
+                        desired,
+                        generation,
+                    },
+                );
+            }
+        }
         let state = Self {
             lifecycle,
             stable_device,
@@ -8398,6 +8623,7 @@ impl NamespaceState {
             decommission_fence,
             selectors,
             groups,
+            unadmitted_groups,
             canonical_desired,
             published_atoms,
             tombstones,
@@ -8484,6 +8710,7 @@ impl NamespaceState {
             && self.decommission_fence.is_none()
             && self.selectors.is_empty()
             && self.groups.is_empty()
+            && self.unadmitted_groups.is_empty()
             && self.canonical_desired.is_empty()
             && self.published_atoms.is_empty()
             && self.tombstones.is_empty();
@@ -8514,6 +8741,7 @@ impl NamespaceState {
             && self.decommission_fence.is_none()
             && self.selectors.is_empty()
             && self.groups.is_empty()
+            && self.unadmitted_groups.is_empty()
             && self.canonical_desired.is_empty()
             && self.published_atoms.is_empty()
             && self.tombstones.is_empty();
@@ -8687,10 +8915,24 @@ impl NamespaceState {
                 SelectorState::Poisoned { generation, .. } => generation.get() <= self.generation,
             })
             && self.capacity <= SELECTOR_NAMESPACE_MAX_READBACK_ATOMS as u32
-            && self.groups.len() <= MAX_PERMANENT_GROUPS
+            && self.permanent_group_count() <= MAX_PERMANENT_GROUPS
             && self.canonical_desired.len() <= MAX_CANONICAL_DESIRED_RECORDS
             && self.canonical_desired.len() == self.groups.len()
             && self.canonical_desired_index_is_exact()
+            && self.unadmitted_groups.iter().all(|(fingerprint, sealed)| {
+                if self.groups.contains_key(fingerprint) || sealed.generation.get() > self.generation {
+                    return false;
+                }
+                let Some(group) = decode_canonical_desired(&sealed.desired) else {
+                    return false;
+                };
+                let Some(claim) = CanonicalClaim::from_group(&group).with_key(&self.selector_digest_key) else {
+                    return false;
+                };
+                claim.group_fingerprint == *fingerprint
+                    && stable_device_fingerprint == Some(claim.device_fingerprint)
+                    && canonical_desired_bytes(&group) == *sealed.desired
+            })
             && self.live_group_count() <= MAX_LIVE_GROUPS
             && self.selectors.len() <= MAX_KNOWN_ATOMS
             && self.published_atoms.len() <= MAX_KNOWN_ATOMS
@@ -11955,6 +12197,344 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_fresh_attach_has_terminal_no_effect_cleanup() {
+        let paa = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 1));
+        let serving = group_with_paa(1, 1, 0x1000_0001, paa, None);
+        let refused = group_with_paa(2, 1, 0x1000_0002, paa, None);
+        let authority = production_authority(serving.device_id()).await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        drop(
+            authority
+                .reconcile_fresh(backend.clone(), serving.clone())
+                .await
+                .unwrap(),
+        );
+        assert!(matches!(
+            authority
+                .reconcile_fresh(backend.clone(), refused.clone())
+                .await,
+            Err(GtpuSessionSelectorCoordinatorError::Namespace)
+        ));
+        assert_eq!(backend.effect_calls(), 1);
+        assert_eq!(backend.removal_calls(), 0);
+
+        // This is the product's current recovery sequence. None of these
+        // methods may misrepresent the rejected group as Active or Retired.
+        // A separate terminal no-admission outcome is required for cleanup.
+        let cleanup = match authority
+            .recover_active(backend.clone(), refused.clone())
+            .await
+        {
+            Ok(active) => authority
+                .retire(backend.clone(), active, refused.clone())
+                .await
+                .map(drop),
+            Err(_) => match authority
+                .recover_retired(backend.clone(), refused.clone())
+                .await
+            {
+                Ok(retired) => {
+                    drop(retired);
+                    Ok(())
+                }
+                Err(_) => match authority
+                    .recover_retiring(backend.clone(), refused.clone())
+                    .await
+                {
+                    Ok(retired) => {
+                        drop(retired);
+                        Ok(())
+                    }
+                    Err(_) => authority
+                        .seal_unadmitted(backend.clone(), refused.clone())
+                        .await
+                        .map(|claim| {
+                            assert!(claim.confirms_group(&authority, &refused));
+                        }),
+                },
+            },
+        };
+        assert!(cleanup.is_ok(), "a rejected, unadmitted group needs terminal cleanup without touching the serving group");
+        assert_eq!(backend.effect_calls(), 1);
+        assert_eq!(backend.removal_calls(), 0);
+        assert!(authority.recover_active(backend, serving).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unadmitted_seal_preserves_retired_lineage_and_bounds_repeated_cleanup() {
+        let paa = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 1));
+        let original = group_with_paa(1, 1, 0x1000_0001, paa, None);
+        let refused = group_with_paa(2, 1, 0x1000_0002, paa, None);
+        let authority = production_authority(original.device_id()).await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        let active = authority
+            .reconcile_fresh(backend.clone(), original.clone())
+            .await
+            .unwrap();
+        drop(
+            authority
+                .retire(backend.clone(), active, original.clone())
+                .await
+                .unwrap(),
+        );
+        assert!(authority
+            .reconcile_fresh(backend.clone(), refused.clone())
+            .await
+            .is_err());
+        let (_, prior) = authority.read_state().await.unwrap();
+        let sealed = authority
+            .seal_unadmitted(backend.clone(), refused.clone())
+            .await
+            .unwrap();
+        assert!(sealed.confirms_group(&authority, &refused));
+        assert!(!sealed.confirms_group(&authority, &original));
+        let (_, after) = authority.read_state().await.unwrap();
+        assert_eq!(prior.groups.len(), after.groups.len());
+        assert_eq!(prior.canonical_desired, after.canonical_desired);
+        assert_eq!(prior.published_atoms, after.published_atoms);
+        assert_eq!(prior.tombstones, after.tombstones);
+        let encoded = after.encode();
+        assert_eq!(&encoded[..7], b"OPCSN16");
+        assert_eq!(NamespaceState::decode(&encoded).unwrap().encode(), encoded);
+        for _ in 0..64 {
+            let proof = authority
+                .seal_unadmitted(backend.clone(), refused.clone())
+                .await
+                .unwrap();
+            assert!(proof.confirms_group(&authority, &refused));
+            assert_eq!(authority.read_state().await.unwrap().1.encode(), encoded);
+        }
+        assert!(authority
+            .recover_retired(backend.clone(), original)
+            .await
+            .is_ok());
+        assert!(authority
+            .reconcile_fresh(backend.clone(), refused)
+            .await
+            .is_err());
+        assert_eq!(backend.effect_calls(), 1);
+        assert_eq!(backend.removal_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn unadmitted_seal_refuses_every_admitted_or_ambiguous_phase() {
+        for phase in [
+            "installing_unstarted",
+            "installing_started",
+            "active",
+            "retiring",
+            "retired",
+            "poisoned_effect",
+            "poisoned_ack",
+        ] {
+            let desired = group(1, 1, 0x1000_0001, None);
+            let authority = production_authority(desired.device_id()).await;
+            let backend = Arc::new(FaultingSelectorBackend::default());
+            authority.provision(backend.as_ref()).await.unwrap();
+            match phase {
+                "installing_unstarted" | "installing_started" => {
+                    drop(
+                        authority
+                            .claim_fresh(backend.as_ref(), &desired)
+                            .await
+                            .unwrap(),
+                    );
+                    if phase == "installing_started" {
+                        drop(
+                            authority
+                                .mark_install_backend_started(&desired)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                }
+                "poisoned_effect" | "poisoned_ack" => {
+                    if phase == "poisoned_effect" {
+                        backend.set_effect_fault(true);
+                    } else {
+                        backend.set_effect_ack_lost(true);
+                    }
+                    assert!(authority
+                        .reconcile_fresh(backend.clone(), desired.clone())
+                        .await
+                        .is_err());
+                }
+                _ => {
+                    let active = authority
+                        .reconcile_fresh(backend.clone(), desired.clone())
+                        .await
+                        .unwrap();
+                    if phase == "retiring" {
+                        drop(authority.transition_retiring(&active.0).await.unwrap());
+                    } else if phase == "retired" {
+                        drop(
+                            authority
+                                .retire(backend.clone(), active, desired.clone())
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                }
+            }
+            let before = authority.read_state().await.unwrap().1.encode();
+            let effects = backend.effect_calls();
+            let removals = backend.removal_calls();
+            assert!(
+                matches!(
+                    authority.seal_unadmitted(backend.clone(), desired).await,
+                    Err(GtpuSessionSelectorCoordinatorError::Namespace)
+                ),
+                "phase={phase}"
+            );
+            assert_eq!(
+                authority.read_state().await.unwrap().1.encode(),
+                before,
+                "phase={phase}"
+            );
+            assert_eq!(backend.effect_calls(), effects);
+            assert_eq!(backend.removal_calls(), removals);
+        }
+    }
+
+    #[tokio::test]
+    async fn unadmitted_seal_fences_changed_graph_and_foreign_authority() {
+        let paa = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 1));
+        let desired = group_with_paa(1, 1, 0x1000_0001, paa, None);
+        let authority = production_authority(desired.device_id()).await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        let proof = authority
+            .seal_unadmitted(backend.clone(), desired.clone())
+            .await
+            .unwrap();
+        let foreign = production_authority(desired.device_id()).await;
+        assert!(!proof.confirms_group(&foreign, &desired));
+        assert!(proof.confirms_group(&authority.clone(), &desired));
+        let before = authority.read_state().await.unwrap().1.encode();
+        for changed in [
+            group_with_paa(1, 1, 0x1000_0002, paa, None),
+            group_with_paa(1, 2, 0x1000_0001, paa, None),
+            group_with_paa(
+                1,
+                1,
+                0x1000_0001,
+                IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
+                None,
+            ),
+        ] {
+            assert!(!proof.confirms_group(&authority, &changed));
+            assert!(authority
+                .seal_unadmitted(backend.clone(), changed.clone())
+                .await
+                .is_err());
+            assert!(authority
+                .reconcile_fresh(backend.clone(), changed)
+                .await
+                .is_err());
+        }
+        assert_eq!(authority.read_state().await.unwrap().1.encode(), before);
+        assert_eq!(backend.effect_calls(), 0);
+        assert_eq!(backend.removal_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn unadmitted_seal_survives_observer_drop_and_database_reopen() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("opc-unadmitted-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("namespace.db");
+        let desired = group(1, 1, 0x1000_0001, None);
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        let authority = raw_production_authority(
+            SessionStore::new(SqliteSessionBackend::open(&path).unwrap()),
+            production_namespace_key(desired.device_id()),
+            "unadmitted-original",
+            32,
+        )
+        .await;
+        authority.provision(backend.as_ref()).await.unwrap();
+        // Dropping the observation must not cancel the submitted terminal CAS.
+        drop(authority.seal_unadmitted(backend.clone(), desired.clone()));
+        // The common scope supervisor serializes this fresh admission after
+        // the dropped observation's worker; a sealed identity cannot install.
+        assert!(authority
+            .reconcile_fresh(backend.clone(), desired.clone())
+            .await
+            .is_err());
+        let encoded = authority.read_state().await.unwrap().1.encode();
+        drop(authority);
+        let reopened = raw_production_authority(
+            SessionStore::new(SqliteSessionBackend::open(&path).unwrap()),
+            production_namespace_key(desired.device_id()),
+            "unadmitted-reopened",
+            32,
+        )
+        .await;
+        let claim = reopened
+            .seal_unadmitted(backend.clone(), desired.clone())
+            .await
+            .unwrap();
+        assert!(claim.confirms_group(&reopened, &desired));
+        assert_eq!(reopened.read_state().await.unwrap().1.encode(), encoded);
+        assert_eq!(backend.effect_calls(), 0);
+        assert_eq!(backend.removal_calls(), 0);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unadmitted_codec_rejects_truncation_forgery_and_schema_downgrade() {
+        let desired = group(1, 1, 0x1000_0001, None);
+        let authority = production_authority(desired.device_id()).await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        drop(authority.seal_unadmitted(backend, desired).await.unwrap());
+        let (_, state) = authority.read_state().await.unwrap();
+        let bytes = state.encode();
+        for end in 0..bytes.len() {
+            assert!(
+                NamespaceState::decode(&bytes[..end]).is_none(),
+                "truncation={end}"
+            );
+        }
+        let mut downgrade = bytes.clone();
+        downgrade[..7].copy_from_slice(b"OPCSN15");
+        assert!(NamespaceState::decode(&downgrade).is_none());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(NamespaceState::decode(&trailing).is_none());
+        let fingerprint = *state.unadmitted_groups.keys().next().unwrap();
+        let mut wrong_identity = state.clone();
+        let sealed = wrong_identity
+            .unadmitted_groups
+            .remove(&fingerprint)
+            .unwrap();
+        wrong_identity.unadmitted_groups.insert([0; 32], sealed);
+        assert!(NamespaceState::decode(&wrong_identity.encode()).is_none());
+        let mut future_generation = state.clone();
+        future_generation
+            .unadmitted_groups
+            .get_mut(&fingerprint)
+            .unwrap()
+            .generation = inventory_generation(state.generation + 1);
+        assert!(NamespaceState::decode(&future_generation.encode()).is_none());
+        let mut malformed = state;
+        malformed
+            .unadmitted_groups
+            .get_mut(&fingerprint)
+            .unwrap()
+            .desired
+            .truncate(1);
+        assert!(NamespaceState::decode(&malformed.encode()).is_none());
+    }
+
+    #[tokio::test]
     async fn reattach_same_paa_new_teid_consumes_exact_retired_predecessor() {
         // Both cases use real protected coordinator transitions and opaque
         // backend retirement receipts. The first is the supported whole-set
@@ -13387,6 +13967,7 @@ mod tests {
             decommission_fence: None,
             selectors: BTreeMap::new(),
             groups: BTreeMap::new(),
+            unadmitted_groups: BTreeMap::new(),
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
@@ -13575,6 +14156,7 @@ mod tests {
             decommission_fence: None,
             selectors: BTreeMap::new(),
             groups: BTreeMap::new(),
+            unadmitted_groups: BTreeMap::new(),
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),

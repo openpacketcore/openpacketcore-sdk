@@ -914,6 +914,41 @@ same rule recovers the retired capability needed for exact reissue.
 An in-process retry joins the existing supervised operation instead of
 re-minting while its delivery owner remains live.
 
+#### 7.4.1 Terminal No-Admission Completion
+
+An attempted group can be rejected before its Installing CAS, for example
+because a different retired or active group already owns one of its selectors.
+That rejection is not an Active or Retired state, and a generic coordinator
+error is not proof of no mutation. Cleanup MUST NOT remove overlapping
+selectors or claim another group's terminal stamp to settle the attempt.
+
+The experimental `seal_unadmitted` operation serializes with every admission
+through the existing namespace supervisor and durable worker lease. After
+validating the exact backend namespace, it requires the complete group identity
+to be absent from every admitted phase, then commits a permanent no-admission
+record in the same protected ledger. Even an unstarted Installing reservation
+is refused. The record retains the canonical desired graph and a nonzero
+monotonic generation; it owns no selector atom and creates no backend stamp.
+Fresh and reused admission both reject the sealed group identity permanently.
+
+Only the acknowledged, fenced record or its exact later recovery can issue
+`GtpuSessionSelectorUnadmittedClaim`. The affine claim matches the complete
+desired graph and the opened authority instance, including its clones. A new
+opener must recover a new claim from the durable record. The claim grants
+no removal or reuse permission and says nothing about other groups that
+previously forwarded through the same selectors. Caller cancellation does not
+cancel the supervised seal, and a lost acknowledgement is recovered by reading
+the same decision rather than guessing that the operation failed.
+
+The no-admission index shares the 1,024 permanent-group and 512 KiB encoded
+record limits; repeated exact cleanup reads add no new record or generation.
+Its first insertion atomically upgrades the ledger encoding from `OPCSN15` to
+`OPCSN16`. New readers accept existing canonical `OPCSN15` records without
+rewriting them. Older readers reject `OPCSN16` before issuing authority; they
+cannot silently discard its admission barriers. The backend epoch, existing
+group lineage, selector reservations, and tombstones do not change. This is
+terminal completion for an unadmitted group, not RFC 017 mixed-selector reuse.
+
 ### 7.5 Process and Cancellation Ownership
 
 One namespace operation owns a bounded SDK coordinator task and its capability
