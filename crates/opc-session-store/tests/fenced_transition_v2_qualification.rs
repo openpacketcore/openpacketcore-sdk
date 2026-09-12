@@ -10,6 +10,10 @@
 #[path = "fenced_transition_v2_qualification/native_capacity.rs"]
 mod native_capacity;
 
+#[cfg(target_os = "linux")]
+#[path = "fenced_transition_v2_qualification/memory_scope.rs"]
+mod memory_scope;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -146,6 +150,10 @@ const QUALIFICATION_PER_VOTER_DATABASE_CEILING_BYTES: u64 =
 const QUALIFICATION_PER_VOTER_SNAPSHOT_CEILING_BYTES: u64 =
     FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES * 2;
 #[cfg(target_os = "linux")]
+// Legacy v1 evidence compares the entire process (three voters, runtime and
+// load generator) with this regression budget. It is not a per-voter or pod
+// memory requirement. SDK-741 diagnostics report it as historical context;
+// deployment sizing requires separate voter processes and workload evidence.
 const QUALIFICATION_PROCESS_PEAK_RSS_CEILING_KIB: u64 = 2 * 1024 * 1024;
 const _: () = {
     assert!(QUALIFICATION_IN_FLIGHT_CLIENTS >= 1);
@@ -2579,9 +2587,10 @@ fn assert_voter_resource_ceiling(label: &str, values: &[u64], ceiling: u64) {
 
 #[cfg(target_os = "linux")]
 fn process_peak_rss_kib() -> u64 {
+    static OBSERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
     let status = std::fs::read_to_string("/proc/self/status")
         .expect("read Linux process status for release resource qualification");
-    status
+    let current = status
         .lines()
         .find_map(|line| {
             line.strip_prefix("VmHWM:")?
@@ -2590,7 +2599,10 @@ fn process_peak_rss_kib() -> u64 {
                 .parse::<u64>()
                 .ok()
         })
-        .expect("Linux process status contains VmHWM")
+        .expect("Linux process status contains VmHWM");
+    // VmHWM is an estimate. Preserve every larger observation even if later
+    // kernel accounting returns a lower value; do not infer missed peaks.
+    memory_scope::record_vmhwm_estimate(&OBSERVED_HIGH_WATER, current)
 }
 
 #[cfg(not(target_os = "linux"))]

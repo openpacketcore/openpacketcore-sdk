@@ -117,9 +117,9 @@ fn report_owners(label: &str, mut storage: NativeStorage) {
             "selected receipt owner retains {} allocations for 4096 rows",
             -receipts.count_current,
         );
-        // The full retained profile allows 2 GiB for three voters. Receipt
-        // rows need headroom for watch history, keys, logs, captures and the
-        // runtime. Keep this one owner below 360 bytes per fixture receipt;
+        // Receipt rows need headroom for watch history, keys, logs, captures
+        // and the runtime. Keep the existing measured allocation regression
+        // bound of 360 bytes per fixture receipt;
         // retaining the duplicate response time exceeds this bound even
         // after selecting the payload and removing the identity allocation.
         assert!(

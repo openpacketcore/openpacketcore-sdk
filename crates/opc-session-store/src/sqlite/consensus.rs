@@ -39983,6 +39983,9 @@ mod log_row_reuse_test_observer {
 #[cfg(target_os = "linux")]
 pub(crate) mod wal;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod historical_snapshot_fixture;
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]

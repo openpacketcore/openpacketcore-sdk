@@ -13,6 +13,8 @@ mod expiry;
 mod export;
 mod history_order;
 mod image;
+#[cfg(all(test, target_os = "linux"))]
+mod isolated_snapshot_memory;
 mod lifecycle;
 #[cfg(test)]
 pub(crate) mod lifecycle_tests;

@@ -474,6 +474,45 @@ establishes quorum persistence or permits an all-cold restart. See
 [ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md) for the
 storage and cold-admission contract.
 
+### Memory measurements and deployment sizing
+
+The SDK-741 in-process workloads place all three voters, the load generator
+and its request/outcome fixtures in one process. Their aggregate RSS is an
+observation, not a per-voter or per-pod limit. The historical 2 GiB aggregate
+regression budget is reported for comparison; exceeding it does not establish
+that any one voter needs more than 2 GiB. Dividing the total by three does not
+measure an individual voter either. Historical failures retain their original
+results, and the frozen SDK-702 v1 evidence validator retains its aggregate
+profile for compatibility.
+
+The workload summaries identify this scope in `memory`, leave `per_voter_rss_kib`
+unset and report `deployment_memory_qualified: false`. Correcting that scope
+does not change operation deadlines, exact outcome checks, retention bounds,
+disk/snapshot limits or throughput requirements. Async throughput does not
+qualify DURABLE throughput; offered load does not measure achieved capacity.
+RSS reporting retains the largest observed VmHWM estimate even when a later
+kernel reading is lower. It cannot establish that every transient peak was
+captured.
+
+The ignored `one_voter_cold_image_memory_in_a_fresh_process` test reconstructs
+one historical voter image through the complete original snapshot installer,
+native catalog admission and image validation. The observer
+[`observe-session-store-isolated-memory.py`](../../scripts/observe-session-store-isolated-memory.py)
+runs each voter in a separate fresh process and records sampled RSS/PSS,
+the kernel's VmHWM estimate, stage observations and actual native root
+deallocations. It preserves the original three-member topology and verifies
+the sealed input identity before and after the run. Its cold image measurement
+includes conversion overhead and does not include a live replica runtime or
+public workload; it cannot set a production pod memory limit.
+
+A deployment budget still requires separate live voter processes, an external
+load generator, the required retained cardinality, snapshot/recovery activity
+and measured operating headroom. Measure the deployment cgroup as well as
+process RSS: the [Linux memory controller](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory)
+also accounts for filesystem cache and kernel memory. Neither a cold-image component result nor a
+lower aggregate RSS is deployment qualification. See the observer's `--help`
+for its required existing fs-verity directory and manifest inputs.
+
 ### Identity invariants and legacy SQLite admission
 
 `StableId` contains exactly 1 through 64 opaque bytes. Its private storage and
