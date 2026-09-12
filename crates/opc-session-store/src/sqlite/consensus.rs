@@ -25040,6 +25040,14 @@ fn read_log_range_with_batch_sync(
     )
 }
 
+struct LogRangeReadOptions {
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    append_entries_batch: bool,
+    recovery_profile: LogRangeRecoveryProfile,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_log_range_with_batch_and_reuse_sync(
     conn: &Connection,
@@ -25051,6 +25059,40 @@ fn read_log_range_with_batch_and_reuse_sync(
     recovery_profile: LogRangeRecoveryProfile,
     reuse: &mut LogRowReadReuse<'_>,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    let mut entries = Vec::new();
+    visit_log_range_with_reuse_sync(
+        conn,
+        identity,
+        LogRangeReadOptions {
+            start,
+            end,
+            limit,
+            append_entries_batch,
+            recovery_profile,
+        },
+        reuse,
+        |entry| entries.push(entry),
+    )?;
+    Ok(entries)
+}
+
+/// Run the complete range decoder, membership projection and original batch
+/// decisions before handing each included row to its consumer. A consumer
+/// cannot stop this audit early or hide a later malformed retained row.
+fn visit_log_range_with_reuse_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    options: LogRangeReadOptions,
+    reuse: &mut LogRowReadReuse<'_>,
+    mut visit: impl FnMut(Entry<SessionRaftTypeConfig>),
+) -> io::Result<()> {
+    let LogRangeReadOptions {
+        start,
+        end,
+        limit,
+        append_entries_batch,
+        recovery_profile,
+    } = options;
     let start_u64 = start;
     let start = checked_i64(start)?;
     let end = end.map(checked_i64).transpose()?;
@@ -25092,7 +25134,7 @@ fn read_log_range_with_batch_and_reuse_sync(
         &mut projection,
         Some(reuse),
     )?;
-    let mut entries = Vec::new();
+    let mut first_entry = true;
     let sql = match (end, limit) {
         (Some(_), Some(_)) => {
             "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC LIMIT ?3"
@@ -25133,7 +25175,7 @@ fn read_log_range_with_batch_and_reuse_sync(
         }
         if recovery_profile.scans_physical_retained_suffix()
             && previous_log.is_none()
-            && entries.is_empty()
+            && first_entry
         {
             expected_log_index = entry.log_id.index;
         }
@@ -25181,9 +25223,12 @@ fn read_log_range_with_batch_and_reuse_sync(
             })
             .transpose()?;
         match decision {
-            Some(AppendEntriesBatchDecision::Include) | None => entries.push(entry),
+            Some(AppendEntriesBatchDecision::Include) | None => {
+                visit(entry);
+                first_entry = false;
+            }
             Some(AppendEntriesBatchDecision::IncludeAndStop) => {
-                entries.push(entry);
+                visit(entry);
                 break;
             }
             Some(AppendEntriesBatchDecision::StopBefore) => break,
@@ -25194,7 +25239,7 @@ fn read_log_range_with_batch_and_reuse_sync(
             .checked_add(1)
             .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
     }
-    Ok(entries)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -33192,44 +33237,70 @@ fn validate_snapshot_install_retained_rows_sync(
                 .ok_or_else(|| invalid_data("session consensus snapshot index is exhausted"))
         })
         .transpose()?;
-    let start = if purged.is_none()
-        && snapshot_successor.is_some_and(|successor| first_index == Some(successor))
-    {
-        snapshot_successor.expect("selected snapshot successor was matched")
-    } else {
-        0
-    };
-    let entries = read_log_range_sync(conn, identity, start, None, None)?;
+    let start = snapshot_successor
+        .filter(|successor| purged.is_none() && first_index == Some(*successor))
+        .unwrap_or(0);
+    let mut first_log_id = None;
+    let mut entry_validation = Ok(());
+    let mut entry_error_message = None;
+    let mut reuse = LogRowReadReuse::new(&LOG_ROW_RETENTION_BUDGET);
+    visit_log_range_with_reuse_sync(
+        conn,
+        identity,
+        LogRangeReadOptions {
+            start: logical_log_start(conn, identity, start)?,
+            end: None,
+            limit: None,
+            append_entries_batch: false,
+            recovery_profile: LogRangeRecoveryProfile::Strict,
+        },
+        &mut reuse,
+        |entry| {
+            first_log_id.get_or_insert(entry.log_id);
+            // The original collecting reader finishes all row/projection
+            // checks before reporting snapshot-policy errors. Keep only the
+            // first policy error and continue that same complete audit.
+            if entry_validation.is_err() || entry_error_message.is_some() {
+                return;
+            }
+            if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                entry_validation = validate_fixed_log_id(&entry.log_id);
+                if entry_validation.is_err() {
+                    return;
+                }
+                if fixed_profile_entry_changes_topology(&entry, fixed_expected_members) {
+                    entry_error_message = Some("session consensus fixed log entry is invalid");
+                    return;
+                }
+            }
+            if incoming.is_some_and(|incoming| {
+                entry.log_id.index == incoming.index && entry.log_id != *incoming
+            }) {
+                entry_error_message =
+                    Some("session consensus incoming snapshot conflicts with retained log");
+            }
+        },
+    )?;
+    drop(reuse);
     if start != 0 {
-        if let (Some(snapshot), Some(first)) = (snapshot, entries.first()) {
+        if let (Some(snapshot), Some(first)) = (snapshot, first_log_id.as_ref()) {
             ensure_log_id_not_after(
                 snapshot,
-                &first.log_id,
+                first,
                 "session consensus retained log regresses selected snapshot",
             )?;
         }
     }
-    if incoming.is_none() && !entries.is_empty() {
+    if incoming.is_none() && first_log_id.is_some() {
         return Err(invalid_data(
             "session consensus pristine snapshot cannot replace retained logs",
         ));
     }
-    for entry in &entries {
-        if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-            validate_fixed_log_id(&entry.log_id)?;
-            if fixed_profile_entry_changes_topology(entry, fixed_expected_members) {
-                return Err(invalid_data("session consensus fixed log entry is invalid"));
-            }
-        }
-        if incoming.is_some_and(|incoming| {
-            entry.log_id.index == incoming.index && entry.log_id != *incoming
-        }) {
-            return Err(invalid_data(
-                "session consensus incoming snapshot conflicts with retained log",
-            ));
-        }
+    entry_validation?;
+    match entry_error_message {
+        Some(message) => Err(invalid_data(message)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Audit every local pointer and retained row after a portable snapshot
@@ -50328,6 +50399,348 @@ mod tests {
                 assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(20)));
             }
         }
+    }
+
+    fn snapshot_install_retained_rows_collecting_oracle(
+        conn: &Connection,
+        identity: SessionConsensusIdentity,
+        authority_profile: ConsensusAuthorityProfile,
+        fixed_expected_members: &BTreeSet<SessionConsensusNodeId>,
+        incoming: Option<&LogId<SessionConsensusNodeId>>,
+    ) -> io::Result<()> {
+        let purged = read_purged_sync(conn, identity)?;
+        let current_snapshot = read_current_snapshot_sync(conn, identity)?;
+        let snapshot = current_snapshot
+            .as_ref()
+            .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref());
+        let first_index: Option<i64> = conn
+            .query_row("SELECT MIN(log_index) FROM consensus_log", [], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)?;
+        let first_index = first_index.map(checked_u64).transpose()?;
+        let snapshot_successor = snapshot
+            .map(|snapshot| {
+                snapshot
+                    .index
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("session consensus snapshot index is exhausted"))
+            })
+            .transpose()?;
+        let start = if purged.is_none()
+            && snapshot_successor.is_some_and(|successor| first_index == Some(successor))
+        {
+            snapshot_successor.expect("selected snapshot successor was matched")
+        } else {
+            0
+        };
+        let entries = read_log_range_sync(conn, identity, start, None, None)?;
+        if start != 0 {
+            if let (Some(snapshot), Some(first)) = (snapshot, entries.first()) {
+                ensure_log_id_not_after(
+                    snapshot,
+                    &first.log_id,
+                    "session consensus retained log regresses selected snapshot",
+                )?;
+            }
+        }
+        if incoming.is_none() && !entries.is_empty() {
+            return Err(invalid_data(
+                "session consensus pristine snapshot cannot replace retained logs",
+            ));
+        }
+        for entry in &entries {
+            if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                validate_fixed_log_id(&entry.log_id)?;
+                if fixed_profile_entry_changes_topology(entry, fixed_expected_members) {
+                    return Err(invalid_data("session consensus fixed log entry is invalid"));
+                }
+            }
+            if incoming.is_some_and(|incoming| {
+                entry.log_id.index == incoming.index && entry.log_id != *incoming
+            }) {
+                return Err(invalid_data(
+                    "session consensus incoming snapshot conflicts with retained log",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_retained_rows_preserves_collecting_policy_and_error_order() {
+        for (case, accepted) in [
+            ("normal", true),
+            ("same-cut", true),
+            ("retained-suffix", true),
+            ("pristine", true),
+            ("empty-retained", true),
+            ("none-incoming", false),
+            ("fixed-members", true),
+            ("fixed-mismatch", false),
+            ("none-fixed-mismatch", false),
+            ("conflict", false),
+            ("fixed-conflict", false),
+            ("policy-before-row-json", false),
+            ("incoming-before-row-json", false),
+            ("none-before-row-json", false),
+            ("row-json", false),
+            ("highest-json", false),
+            ("row-epoch", false),
+            ("row-term", false),
+            ("row-index", false),
+            ("leader-regression", false),
+            ("internal-gap", false),
+            ("first-gap", false),
+            ("hidden-v2", false),
+            ("snapshot-successor", true),
+            ("snapshot-first-gap", false),
+            ("snapshot-regression", false),
+            ("snapshot-policy-priority", false),
+            ("snapshot-row-priority", false),
+            ("purged", true),
+            ("purged-prefix-not-retained", true),
+        ] {
+            let backend = backend_with_blank_logs(7).await;
+            let conn = backend.conn.lock().await;
+            let fixture = &*conn;
+            let mut incoming = Some(log_id(8));
+            let mut profile = ConsensusAuthorityProfile::Dynamic;
+            let mut fixed_members = expected_members();
+            if case == "pristine" {
+                fixture.execute("DELETE FROM consensus_log", []).unwrap();
+                incoming = None;
+            } else {
+                apply_entries_sync(fixture, identity(), &backend.caps, vec![membership_entry()])
+                    .unwrap();
+            }
+            if case.contains("fixed") || case == "policy-before-row-json" {
+                profile = ConsensusAuthorityProfile::FixedImmutable;
+                if case != "fixed-members" {
+                    fixed_members.clear();
+                }
+            }
+            if case.starts_with("none-") || case == "snapshot-policy-priority" {
+                incoming = None;
+            } else if case.contains("conflict") || case == "incoming-before-row-json" {
+                incoming = Some(LogId::new(CommittedLeaderId::new(2, node_id()), 2));
+            } else if case == "same-cut" {
+                incoming = Some(log_id(7));
+            } else if case == "retained-suffix" {
+                incoming = Some(log_id(4));
+            }
+            if case.starts_with("snapshot-") {
+                set_test_log_pointer(fixture, "consensus_applied", &log_id(3));
+                let term = if matches!(
+                    case,
+                    "snapshot-regression" | "snapshot-policy-priority" | "snapshot-row-priority"
+                ) {
+                    2
+                } else {
+                    1
+                };
+                save_test_snapshot_marker(
+                    fixture,
+                    LogId::new(CommittedLeaderId::new(term, node_id()), 3),
+                    "retained-row-oracle",
+                );
+                fixture
+                    .execute("DELETE FROM consensus_log WHERE log_index <= 3", [])
+                    .unwrap();
+                if case == "snapshot-first-gap" {
+                    fixture
+                        .execute("DELETE FROM consensus_log WHERE log_index = 4", [])
+                        .unwrap();
+                }
+            } else if case.starts_with("purged") || case == "empty-retained" {
+                let floor = if case == "empty-retained" { 7 } else { 3 };
+                set_test_log_pointer(fixture, "consensus_applied", &log_id(floor));
+                set_test_purge_floor(fixture, &log_id(floor));
+                if case == "purged-prefix-not-retained" {
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 2",
+                            [b"invalid-json".as_slice()],
+                        )
+                        .unwrap();
+                } else {
+                    fixture
+                        .execute(
+                            "DELETE FROM consensus_log WHERE log_index <= ?1",
+                            [checked_i64(floor).unwrap()],
+                        )
+                        .unwrap();
+                }
+            }
+            if case.ends_with("row-json") || case == "snapshot-row-priority" {
+                fixture
+                    .execute(
+                        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                        [b"invalid-json".as_slice()],
+                    )
+                    .unwrap();
+            }
+            match case {
+                "highest-json" => {
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 7",
+                            [b"invalid-json".as_slice()],
+                        )
+                        .unwrap();
+                }
+                "row-epoch" => {
+                    // Inject on this private fixture connection only, then
+                    // restore enforcement before either read-only audit.
+                    fixture.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+                    fixture.execute(
+                        "UPDATE consensus_log SET configuration_epoch = configuration_epoch + 1 WHERE log_index = 6",
+                        [],
+                    )
+                    .unwrap();
+                    fixture.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+                }
+                "row-term" => {
+                    fixture
+                        .execute("UPDATE consensus_log SET term = 2 WHERE log_index = 6", [])
+                        .unwrap();
+                }
+                "row-index" => {
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                            [encode_json(&blank_entry(99)).unwrap()],
+                        )
+                        .unwrap();
+                }
+                "leader-regression" => {
+                    replace_test_blank_log(
+                        fixture,
+                        &LogId::new(CommittedLeaderId::new(2, node_id()), 5),
+                    );
+                }
+                "internal-gap" | "first-gap" => {
+                    fixture
+                        .execute(
+                            "DELETE FROM consensus_log WHERE log_index = ?1",
+                            [if case == "internal-gap" { 4 } else { 0 }],
+                        )
+                        .unwrap();
+                }
+                "hidden-v2" => {
+                    let entry = fenced_transition_v2_entry(
+                        6,
+                        fenced_transition_v2_request(0x96, 1, "retained-row-oracle"),
+                        timestamp(2),
+                    );
+                    let bytes = noncanonical_v2_log_json(&entry);
+                    assert!(decode_consensus_log_entry(&bytes).is_err());
+                    fixture
+                        .execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                            [bytes],
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let changes = tx.total_changes();
+            let outcome =
+                |result: io::Result<()>| result.map_err(|error| (error.kind(), error.to_string()));
+            let expected = outcome(snapshot_install_retained_rows_collecting_oracle(
+                &tx,
+                identity(),
+                profile,
+                &fixed_members,
+                incoming.as_ref(),
+            ));
+            assert_eq!(
+                expected.is_ok(),
+                accepted,
+                "independent fixture: {case}: {expected:?}"
+            );
+            assert_eq!(
+                outcome(validate_snapshot_install_retained_rows_sync(
+                    &tx,
+                    identity(),
+                    profile,
+                    &fixed_members,
+                    incoming.as_ref(),
+                )),
+                expected,
+                "original collecting error precedence: {case}",
+            );
+            assert_eq!(tx.total_changes(), changes, "read-only audit: {case}");
+            if case == "normal" {
+                tx.execute(
+                    "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 6",
+                    [b"invalid-json".as_slice()],
+                )
+                .unwrap();
+                let changed = tx.total_changes();
+                let expected = outcome(snapshot_install_retained_rows_collecting_oracle(
+                    &tx,
+                    identity(),
+                    profile,
+                    &fixed_members,
+                    incoming.as_ref(),
+                ));
+                assert!(expected.is_err());
+                assert_eq!(
+                    outcome(validate_snapshot_install_retained_rows_sync(
+                        &tx,
+                        identity(),
+                        profile,
+                        &fixed_members,
+                        incoming.as_ref(),
+                    )),
+                    expected,
+                    "a prior successful audit must not hide a changed row in the same transaction",
+                );
+                assert_eq!(tx.total_changes(), changed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_retained_rows_scratch_does_not_scale_with_log_count() {
+        let members = BTreeSet::new();
+        let mut measurements = Vec::new();
+        for row_count in [512, 4096] {
+            let backend = backend_with_blank_logs(row_count - 1).await;
+            let conn = backend.conn.lock().await;
+            let incoming = log_id(row_count + 100);
+            let changes = conn.total_changes();
+            let validate = || {
+                validate_snapshot_install_retained_rows_sync(
+                    &conn,
+                    identity(),
+                    ConsensusAuthorityProfile::Dynamic,
+                    &members,
+                    Some(&incoming),
+                )
+                .expect("audit the complete retained log before snapshot installation");
+            };
+            validate();
+            let started = Instant::now();
+            let memory = allocation_counter::measure(validate);
+            eprintln!(
+                "snapshot_install_retained_rows_allocation rows={row_count} peak={} retained={} total={} elapsed_us={}",
+                memory.bytes_max, memory.bytes_current, memory.bytes_total,
+                started.elapsed().as_micros(),
+            );
+            assert_eq!(memory.bytes_current, 0, "the audit retains no allocation");
+            assert_eq!(conn.total_changes(), changes, "the audit writes nothing");
+            measurements.push(memory);
+        }
+        // Eight times as many fixed-shape rows must not retain eight times
+        // as many decoded Entries. Allow transient allocator/decoder scratch
+        // to double; fixture construction and SQLite's C heap are excluded.
+        assert!(
+            measurements[1].bytes_max <= measurements[0].bytes_max * 2,
+            "snapshot admission must discard each decoded row after validation: {measurements:?}",
+        );
     }
 
     async fn snapshot_install_pointer_audit_fixture() -> SqliteSessionBackend {
