@@ -12811,8 +12811,22 @@ mod tests {
         let path = directory.join("namespace.db");
         let desired = group(1, 1, 0x1000_0001, None);
         let backend = Arc::new(FaultingSelectorBackend::default());
+        let opened = SqliteSessionBackend::open(&path);
+        if !cfg!(target_os = "linux") {
+            // File-backed session storage requires Linux descriptor binding.
+            // Unsupported hosts must refuse before granting any authority.
+            assert!(matches!(
+                opened,
+                Err(opc_session_store::StoreError::BackendUnavailable(reason))
+                    if reason == "session operator recovery latch is unavailable"
+            ));
+            assert_eq!(backend.effect_calls(), 0);
+            assert_eq!(backend.removal_calls(), 0);
+            std::fs::remove_dir_all(directory).unwrap();
+            return;
+        }
         let authority = raw_production_authority(
-            SessionStore::new(SqliteSessionBackend::open(&path).unwrap()),
+            SessionStore::new(opened.unwrap()),
             production_namespace_key(desired.device_id()),
             "unadmitted-original",
             32,
@@ -13166,8 +13180,22 @@ mod tests {
         let old = group_with_paa(1, 1, 0x1000_0001, paa, None);
         let next = group_with_paa(2, 1, 0x1000_0002, paa, None);
         let backend = Arc::new(FaultingSelectorBackend::default());
+        let opened = SqliteSessionBackend::open(&path);
+        if !cfg!(target_os = "linux") {
+            // Refusal is the storage contract on hosts without descriptor
+            // binding; it cannot be replaced with an in-memory reopen claim.
+            assert!(matches!(
+                opened,
+                Err(opc_session_store::StoreError::BackendUnavailable(reason))
+                    if reason == "session operator recovery latch is unavailable"
+            ));
+            assert_eq!(backend.effect_calls(), 0);
+            assert_eq!(backend.removal_calls(), 0);
+            std::fs::remove_dir_all(directory).unwrap();
+            return;
+        }
         let authority = raw_production_authority(
-            SessionStore::new(SqliteSessionBackend::open(&path).unwrap()),
+            SessionStore::new(opened.unwrap()),
             production_namespace_key(old.device_id()),
             "reattach-original",
             32,
