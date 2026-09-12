@@ -111,6 +111,22 @@ pub(in crate::consensus::native) struct LogMemory {
 }
 
 impl LogMemory {
+    /// Admit only scratch below the existing large-log scheduling threshold.
+    /// The caller performs its owner checks before this memory-only attempt;
+    /// a refusal can release an earlier batch without retrying cancellation.
+    pub(in crate::consensus::native) fn reserve_small(
+        bytes: usize,
+        reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
+    ) -> Option<Self> {
+        if bytes >= LARGE_LOG_BYTES {
+            return None;
+        }
+        reserve(bytes).ok().map(|memory| Self {
+            memory,
+            _permit: None,
+        })
+    }
+
     pub(in crate::consensus::native) fn reserve(
         bytes: usize,
         check: &impl Fn() -> io::Result<()>,

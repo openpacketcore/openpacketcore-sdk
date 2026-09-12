@@ -91,8 +91,14 @@ impl SelectedRange {
     }
 
     pub(super) fn reserve_read(&self) -> io::Result<ReservedSelectedRead<'_>> {
-        let memory =
-            crate::consensus::verified_snapshot::VerificationMemory::reserve(self.length as usize)?;
+        self.reserve_read_with(&crate::consensus::verified_snapshot::VerificationMemory::reserve)
+    }
+
+    pub(super) fn reserve_read_with(
+        &self,
+        reserve: &impl Fn(usize) -> io::Result<crate::consensus::verified_snapshot::VerificationMemory>,
+    ) -> io::Result<ReservedSelectedRead<'_>> {
+        let memory = reserve(self.length as usize)?;
         Ok(ReservedSelectedRead {
             range: self,
             memory,

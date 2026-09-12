@@ -252,16 +252,21 @@ impl NativeStorage {
             }
         }
         let ordered_logs = OrderedLogs::new(self, purpose, check)?;
-        for entry in &ordered_logs.rows {
-            check()?;
+        NativeLogEntry::visit_export(
+            &ordered_logs.rows,
+            state.identity,
+            &state.members,
+            check,
             // Omission from the portable image is not permission to trust an
             // unread selected range. Preserve the raw export's full byte and
             // authority checks even though these pages will not be written.
-            let bytes = entry.read_bytes(state.identity, &state.members, check)?;
-            if !portable {
-                tx.prepare_cached("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)").map_err(|error| db!(error))?.execute(params![entry.id().index,epoch,entry.id().leader_id.term,bytes.bytes()]).map_err(|error| db!(error))?;
-            }
-        }
+            &mut |id, bytes| {
+                if !portable {
+                    tx.prepare_cached("INSERT INTO consensus_log (log_index,configuration_epoch,term,entry_json) VALUES (?1,?2,?3,?4)").map_err(|error| db!(error))?.execute(params![id.index,epoch,id.leader_id.term,bytes]).map_err(|error| db!(error))?;
+                }
+                Ok(())
+            },
+        )?;
         drop(ordered_logs);
         if preserve_origin {
             if let Some((meta, name, checksum, length)) = &frontiers.current_snapshot {
@@ -556,7 +561,7 @@ mod tests {
             assert_eq!(ordered.rows.len(), expected_len);
             let before = selected.blocks_read();
             let mut indexes = BTreeSet::new();
-            for entry in ordered.rows {
+            for entry in &ordered.rows {
                 assert!(indexes.insert(entry.id().index), "visit each full row once");
                 let actual = entry
                     .read_bytes(cold.business.identity, &cold.business.members, &|| Ok(()))
@@ -574,6 +579,24 @@ mod tests {
                 "native_delta_log_export rows={expected_len} blocks={blocks} block_reads={reads}"
             );
             assert!(reads <= blocks, "export rereads authenticated delta blocks");
+            let before = selected.blocks_read();
+            let mut emitted = BTreeSet::new();
+            NativeLogEntry::visit_export(
+                &ordered.rows,
+                cold.business.identity,
+                &cold.business.members,
+                &|| Ok(()),
+                &mut |id, bytes| {
+                    assert!(emitted.insert(id.index));
+                    let expected = original.log.entries.get(&id.index).unwrap();
+                    assert_eq!(id, expected.id());
+                    assert_eq!(bytes, expected.encoded_for_test().unwrap());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(emitted, indexes);
+            assert!(selected.blocks_read() - before <= blocks);
         }
     }
 

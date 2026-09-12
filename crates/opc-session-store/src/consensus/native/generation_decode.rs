@@ -925,6 +925,19 @@ pub(in crate::consensus::native) fn inspect_log(
     check()?;
     let bytes_to_reserve = json::log_scratch_checked(bytes, check)?;
     let _memory = scratch::LogMemory::reserve(bytes_to_reserve, check)?;
+    let facts = inspect_log_row(bytes, index, identity, members)?;
+    check()?;
+    Ok(facts)
+}
+
+// Both entry points hold the original shape-derived decoder reservation for
+// these exact bytes. Keep the complete codec and every semantic fact together.
+fn inspect_log_row(
+    bytes: &[u8],
+    index: u64,
+    identity: SessionConsensusIdentity,
+    members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<facts::Row<facts::Log>> {
     let row = crate::sqlite::consensus::decode_consensus_log_entry(bytes)?;
     if row.log_id.index != index {
         return Err(invalid("native generation log index differs"));
@@ -942,8 +955,133 @@ pub(in crate::consensus::native) fn inspect_log(
         },
     };
     drop(row);
-    check()?;
     Ok(facts)
+}
+
+/// Exact selected input with an optional complete original allocation
+/// preflight. Refused preflight has no scratch size and cannot enter a worker.
+/// This is not semantic admission; every decoded field is still checked.
+pub(in crate::consensus::native) struct LogInput {
+    input: resident::SelectedBytes,
+    expected: facts::Row<facts::Log>,
+    scratch: Option<usize>,
+}
+
+impl LogInput {
+    pub(in crate::consensus::native) fn read_charge(length: usize) -> io::Result<usize> {
+        length
+            .checked_add(json::log_preflight_bytes(length)?)
+            .ok_or_else(|| invalid("native log inspection input charge overflows"))
+    }
+
+    pub(in crate::consensus::native) fn new(
+        input: resident::SelectedBytes,
+        expected: facts::Row<facts::Log>,
+        reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        check()?;
+        let scratch = json::log_scratch_small(input.bytes(), reserve, check)?;
+        Ok(Self {
+            input,
+            expected,
+            scratch,
+        })
+    }
+
+    pub(in crate::consensus::native) fn charged_bytes(&self) -> io::Result<Option<usize>> {
+        self.scratch
+            .map(|scratch| {
+                scratch
+                    .checked_add(self.input.bytes().len())
+                    .ok_or_else(|| invalid("native log inspection decoder charge overflows"))
+            })
+            .transpose()
+    }
+
+    pub(in crate::consensus::native) fn reserve_small(
+        self,
+        reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<LogPreparation> {
+        // Preserve the original small LogMemory admission's two owner checks.
+        // A cancellation error is never converted to a memory-pressure retry.
+        check()?;
+        check()?;
+        let Some(scratch) = self.scratch else {
+            return Ok(LogPreparation::Serial(self));
+        };
+        Ok(match scratch::LogMemory::reserve_small(scratch, reserve) {
+            Some(memory) => LogPreparation::Ready(PreparedLog {
+                input: self,
+                _memory: memory,
+            }),
+            None => LogPreparation::Serial(self),
+        })
+    }
+
+    pub(in crate::consensus::native) fn inspect_serial(
+        self,
+        identity: SessionConsensusIdentity,
+        members: &BTreeSet<SessionConsensusNodeId>,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<resident::SelectedBytes> {
+        let actual = inspect_log(
+            self.input.bytes(),
+            self.expected.facts.id.index,
+            identity,
+            members,
+            check,
+        )?;
+        self.compare(actual)?;
+        Ok(self.input)
+    }
+
+    fn compare(&self, actual: facts::Row<facts::Log>) -> io::Result<()> {
+        if actual.content != self.expected.content
+            || actual.facts.id != self.expected.facts.id
+            || actual.facts.membership != self.expected.facts.membership
+        {
+            return Err(invalid("native selected log differs from admitted row"));
+        }
+        Ok(())
+    }
+}
+
+pub(in crate::consensus::native) enum LogPreparation {
+    Ready(PreparedLog),
+    Serial(LogInput),
+}
+
+/// Keep selected bytes and their full decoder charge until the caller emits
+/// the checked row. Workers borrow this owner and drop all decoded payloads.
+pub(in crate::consensus::native) struct PreparedLog {
+    input: LogInput,
+    _memory: scratch::LogMemory,
+}
+
+impl PreparedLog {
+    pub(in crate::consensus::native) fn inspect(
+        &self,
+        identity: SessionConsensusIdentity,
+        members: &BTreeSet<SessionConsensusNodeId>,
+    ) -> io::Result<()> {
+        let actual = inspect_log_row(
+            self.input.input.bytes(),
+            self.input.expected.facts.id.index,
+            identity,
+            members,
+        )?;
+        self.input.compare(actual)
+    }
+
+    pub(in crate::consensus::native) fn id(&self) -> LogId<SessionConsensusNodeId> {
+        self.input.expected.facts.id
+    }
+
+    pub(in crate::consensus::native) fn bytes(&self) -> &[u8] {
+        self.input.input.bytes()
+    }
 }
 
 pub(in crate::consensus::native) struct OwnedLog {

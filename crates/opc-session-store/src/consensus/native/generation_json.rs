@@ -398,28 +398,57 @@ pub(super) fn log_scratch(bytes: &[u8]) -> io::Result<usize> {
     log_scratch_checked(bytes, &|| Ok(()))
 }
 
+pub(super) fn log_preflight_bytes(length: usize) -> io::Result<usize> {
+    length
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(METADATA))
+        .ok_or_else(|| invalid("native generation JSON preflight overflow"))
+}
+
 pub(super) fn log_scratch_checked(
     bytes: &[u8],
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<usize> {
     check()?;
+    log_size(bytes)?;
+    // serde_json's escaped-string scratch is the only growable preflight
+    // buffer. Charge its old/new Vec growth before creating the parser.
+    let _memory = scratch::LogMemory::reserve(log_preflight_bytes(bytes.len())?, check)?;
+    log_shape(bytes)
+}
+
+/// Optional admission of the same small preflight, before parsing any byte.
+/// Only memory refusal produces None; cancellation and malformed input keep
+/// their original errors. Large preflights retain the original gated lane.
+pub(super) fn log_scratch_small(
+    bytes: &[u8],
+    reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<Option<usize>> {
+    check()?;
+    log_size(bytes)?;
+    let charge = log_preflight_bytes(bytes.len())?;
+    check()?;
+    check()?;
+    let Some(_memory) = scratch::LogMemory::reserve_small(charge, reserve) else {
+        return Ok(None);
+    };
+    log_shape(bytes).map(Some)
+}
+
+fn log_size(bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty()
         || bytes.len() > crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES
     {
         return Err(invalid("native generation raw log size invalid"));
     }
+    Ok(())
+}
+
+fn log_shape(bytes: &[u8]) -> io::Result<usize> {
     let shape = {
-        // serde_json's escaped-string scratch is the only growable preflight
-        // buffer. Charge its old/new Vec growth before creating the parser.
+        // Both callers own the complete original preflight reservation.
         // IgnoredAny skips arbitrary legacy metadata without retaining it.
-        let _memory = scratch::LogMemory::reserve(
-            bytes
-                .len()
-                .checked_mul(3)
-                .and_then(|bytes| bytes.checked_add(METADATA))
-                .ok_or_else(|| invalid("native generation JSON preflight overflow"))?,
-            check,
-        )?;
         let mut decoder = serde_json::Deserializer::from_slice(bytes);
         let log = Log::deserialize(&mut decoder)
             .map_err(|_| invalid("native generation raw log shape invalid"))?;

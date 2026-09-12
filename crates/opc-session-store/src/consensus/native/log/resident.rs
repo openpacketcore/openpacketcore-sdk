@@ -5,6 +5,9 @@
 use super::*;
 use crate::consensus::native::resident::{authority_binding, RowBytes, SelectedRange};
 
+#[path = "export.rs"]
+mod export;
+
 #[derive(Clone)]
 pub(crate) struct NativeLogEntry {
     body: Body,
