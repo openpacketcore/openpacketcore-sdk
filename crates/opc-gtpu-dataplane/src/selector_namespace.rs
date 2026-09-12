@@ -11997,6 +11997,37 @@ mod tests {
             assert_eq!(before.encode(), after_fresh.encode());
             assert_eq!(backend.effect_calls(), 1);
 
+            // A product cannot turn the rejected fresh invocation into an
+            // exact cleanup receipt by trying another lifecycle entrypoint.
+            // This successor was never admitted; the prior group's Retired
+            // proof remains valid only for that exact prior group.
+            assert!(authority
+                .recover_retired(backend.clone(), original.clone())
+                .await
+                .is_ok());
+            assert!(matches!(
+                authority
+                    .recover_active(backend.clone(), successor.clone())
+                    .await,
+                Err(GtpuSessionSelectorCoordinatorError::Namespace)
+            ));
+            assert!(matches!(
+                authority
+                    .recover_retired(backend.clone(), successor.clone())
+                    .await,
+                Err(GtpuSessionSelectorCoordinatorError::Namespace)
+            ));
+            assert!(matches!(
+                authority
+                    .recover_retiring(backend.clone(), successor.clone())
+                    .await,
+                Err(GtpuSessionSelectorCoordinatorError::Namespace)
+            ));
+            let (_, after_recovery) = authority.read_state().await.unwrap();
+            assert_eq!(before.encode(), after_recovery.encode());
+            assert_eq!(backend.effect_calls(), 1);
+            assert_eq!(backend.removal_calls(), 1);
+
             let authorization = authority
                 .authorize_reuse(backend.clone(), successor.clone(), retired)
                 .await;
