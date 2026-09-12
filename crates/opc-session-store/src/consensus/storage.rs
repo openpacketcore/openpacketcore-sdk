@@ -2303,7 +2303,7 @@ async fn seal_snapshot_pin(
         let _retention = retention;
         pinned.seal_with_integrity(policy)?;
         if let Some(checksum) = expected_payload_checksum {
-            pinned.verify_payload_checksum(checksum)?;
+            pinned.verify_and_bind_payload_checksum(checksum)?;
         }
         Ok(pinned)
     })
@@ -10595,6 +10595,182 @@ mod tests {
                 .tempdir()
                 .expect("create local snapshot fixture directory"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn sealed_payload_checksum_fixture_pin(
+        path: &Path,
+        policy: SnapshotIntegrityPolicy,
+        checksum: Option<[u8; 32]>,
+    ) -> Option<PinnedSqliteFile> {
+        let pinned = PinnedSqliteFile::from_file(
+            std::fs::File::open(path).expect("open checksum fixture"),
+            path.to_path_buf(),
+        )
+        .expect("pin checksum fixture");
+        match seal_snapshot_pin(pinned, policy, checksum, None).await {
+            Ok(pinned) => Some(pinned),
+            Err(error)
+                if error.kind() == io::ErrorKind::Unsupported
+                    && policy == SnapshotIntegrityPolicy::FsVerity
+                    && std::env::var_os("OPC_FS_VERITY_QUALIFICATION").as_deref()
+                        != Some(std::ffi::OsStr::new("required")) =>
+            {
+                None
+            }
+            Err(error) => panic!("seal checksum fixture: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_payload_checksum_handoff_checks_candidates_clones_and_reopen() {
+        for policy in [
+            SnapshotIntegrityPolicy::FsVerity,
+            SnapshotIntegrityPolicy::PortableVerified,
+        ] {
+            let directory = fs_verity_snapshot_tempdir("payload-checksum-handoff-");
+            let path = directory.path().join("raw.sqlite");
+            let payload = (0..(70 * 1024))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let checksum: [u8; 32] = Sha256::digest(&payload).into();
+            std::fs::write(&path, &payload).expect("write checksum fixture");
+            let mut unsealed = PinnedSqliteFile::from_file(
+                std::fs::File::open(&path).expect("open unsealed fixture"),
+                path.clone(),
+            )
+            .expect("pin unsealed fixture");
+            assert!(unsealed.verify_and_bind_payload_checksum(checksum).is_err());
+            drop(unsealed);
+
+            let Some(mut pinned) =
+                sealed_payload_checksum_fixture_pin(&path, policy, Some(checksum)).await
+            else {
+                continue;
+            };
+            let cloned = pinned.try_clone().expect("clone verified raw source");
+            let reopened = PinnedSqliteFile::from_file_and_verify(
+                std::fs::File::open(&path).expect("independent raw open"),
+                path.clone(),
+                policy,
+            )
+            .expect("independent immutable admission");
+            let mut wrong = checksum;
+            wrong[0] ^= 1;
+            for source in [&pinned, &cloned, &reopened] {
+                source
+                    .verify_payload_checksum(checksum)
+                    .expect("exact admitted payload");
+                let error = source
+                    .verify_payload_checksum(wrong)
+                    .expect_err("different candidate checksum must fail");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    "extracted snapshot checksum differs from its envelope"
+                );
+            }
+            assert!(pinned.verify_and_bind_payload_checksum(wrong).is_err());
+            pinned
+                .verify_payload_checksum(checksum)
+                .expect("failed candidate does not replace successful proof");
+
+            let corrupt_path = directory.path().join("corrupt.sqlite");
+            let mut corrupt = payload;
+            corrupt[65 * 1024] ^= 1;
+            std::fs::write(&corrupt_path, &corrupt).expect("write corrupted tail");
+            let mut corrupt_pin = sealed_payload_checksum_fixture_pin(&corrupt_path, policy, None)
+                .await
+                .expect("same supported integrity policy");
+            assert!(corrupt_pin
+                .verify_and_bind_payload_checksum(checksum)
+                .is_err());
+            corrupt_pin
+                .verify_and_bind_payload_checksum(Sha256::digest(&corrupt).into())
+                .expect("failed first scan did not install a checksum proof");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_payload_checksum_handoff_rejects_identical_path_replacement() {
+        for policy in [
+            SnapshotIntegrityPolicy::FsVerity,
+            SnapshotIntegrityPolicy::PortableVerified,
+        ] {
+            let directory = fs_verity_snapshot_tempdir("payload-checksum-replacement-");
+            let path = directory.path().join("raw.sqlite");
+            let payload = b"exact original payload";
+            let checksum: [u8; 32] = Sha256::digest(payload).into();
+            std::fs::write(&path, payload).expect("write original payload");
+            let Some(pinned) =
+                sealed_payload_checksum_fixture_pin(&path, policy, Some(checksum)).await
+            else {
+                continue;
+            };
+            let cloned = pinned.try_clone().expect("clone original generation");
+            std::fs::remove_file(&path).expect("unlink original test source");
+            std::fs::write(&path, payload).expect("write identical foreign replacement");
+            assert!(pinned.verify_payload_checksum(checksum).is_err());
+            assert!(cloned.verify_payload_checksum(checksum).is_err());
+            let replacement = sealed_payload_checksum_fixture_pin(&path, policy, Some(checksum))
+                .await
+                .expect("independently sealed replacement");
+            replacement
+                .verify_payload_checksum(checksum)
+                .expect("new source requires its own completed admission");
+            assert!(pinned.verify_payload_checksum(checksum).is_err());
+            assert!(cloned.verify_payload_checksum(checksum).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_payload_checksum_handoff_rejects_changed_portable_generation() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().expect("portable checksum directory");
+        let path = directory.path().join("raw.sqlite");
+        let original = b"original portable payload";
+        let checksum: [u8; 32] = Sha256::digest(original).into();
+        std::fs::write(&path, original).expect("write portable payload");
+        let mut pinned = sealed_payload_checksum_fixture_pin(
+            &path,
+            SnapshotIntegrityPolicy::PortableVerified,
+            Some(checksum),
+        )
+        .await
+        .expect("portable verified source");
+        let cloned = pinned.try_clone().expect("clone portable proof");
+        let before = std::fs::metadata(&path).expect("original inode");
+        let mut changed = original.to_vec();
+        changed[0] ^= 1;
+        std::fs::write(&path, &changed).expect("mutate through a writable alias");
+        let after = std::fs::metadata(&path).expect("mutated inode");
+        assert_eq!(
+            (before.dev(), before.ino(), before.len()),
+            (after.dev(), after.ino(), after.len())
+        );
+        assert!(pinned.verify_payload_checksum(checksum).is_err());
+        assert!(cloned.verify_payload_checksum(checksum).is_err());
+
+        pinned
+            .seal_with_integrity(SnapshotIntegrityPolicy::PortableVerified)
+            .expect("capture a new generation through the held descriptor");
+        let changed_checksum: [u8; 32] = Sha256::digest(&changed).into();
+        pinned
+            .verify_and_bind_payload_checksum(changed_checksum)
+            .expect("new generation must not inherit the original checksum");
+        assert!(pinned.verify_payload_checksum(checksum).is_err());
+        assert!(cloned.verify_payload_checksum(changed_checksum).is_err());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open truncation alias")
+            .set_len(1)
+            .expect("change portable extent");
+        assert!(pinned.verify_payload_checksum(changed_checksum).is_err());
     }
 
     async fn open_fixed_raw_read_store(
