@@ -28,6 +28,12 @@ const REQUEST_BUDGET: Duration = Duration::from_secs(1);
 // This is an owned cleanup/functional containment bound, never a request budget.
 const CLEANUP_BOUND: Duration = Duration::from_secs(20);
 
+// Each lab owns three durable voters on the same test filesystem. Keep these
+// independent labs from adding disk load to the singleton request measurement.
+// The permit spans startup through shutdown; each lab still runs its original
+// concurrent voters, fault gates, and request deadlines.
+static DISK_FIXTURE_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 type Authority<B> = GtpuSessionSelectorNamespaceAuthority<B>;
 
 fn checked<T, E>(result: Result<T, E>, category: &'static str) -> T {
@@ -83,9 +89,14 @@ struct Lab<B: ProtectedSessionBackend> {
     group: GtpuSessionGroup,
     scope: SelectorLedgerStorageScope,
     descriptor: SessionKey,
+    _disk_fixture_permit: tokio::sync::SemaphorePermit<'static>,
 }
 
 async fn start_lab(seed: u8) -> Lab<impl ProtectedSessionBackend + Clone + 'static> {
+    let disk_fixture_permit = checked(
+        DISK_FIXTURE_PERMIT.acquire().await,
+        "fixture disk isolation",
+    );
     let tenant = TenantId::from_static("sdk-selector-regression");
     let nf = NetworkFunctionKind::smf();
     let scope = SelectorLedgerStorageScope::new(tenant.clone(), nf.clone());
@@ -188,6 +199,7 @@ async fn start_lab(seed: u8) -> Lab<impl ProtectedSessionBackend + Clone + 'stat
         group,
         scope,
         descriptor,
+        _disk_fixture_permit: disk_fixture_permit,
     }
 }
 
@@ -522,7 +534,7 @@ async fn singleton_public_protected_flow_keeps_original_request_deadline() {
     let storage_before = lab.fixture.local_storage_timing();
     // Startup, required voter activation, stopped namespace provisioning, and
     // protected open precede this request. All ordinary request storage calls
-    // share this one original deadline. 830ms is NOT an SDK API constant.
+    // share this one original one-second deadline.
     let mut timing = RequestTiming::new();
     let mut pending_descriptor_commit = None;
     let outcome = async {
