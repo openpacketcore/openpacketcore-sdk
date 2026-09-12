@@ -117,7 +117,10 @@ fn require_live(
         || state.application_marker.is_some()
         || state.checkpoint_epoch != old.epoch
         || state.base_sequence != old.native_sequence()
-        || disk.anchor.as_ref() != Some(old)
+        || disk
+            .anchor
+            .as_ref()
+            .is_none_or(|current| !std::ptr::eq(current, old) && current != old)
         || handoff.transform != Transform::Install
         || !matches!(handoff.phase, Phase::Requested)
         || handoff.candidate != installation.source.candidate
@@ -192,11 +195,15 @@ fn advance_inner(
 ) -> io::Result<()> {
     let started = Instant::now();
     let _memory = VerificationMemory::reserve(256 * 1024)?;
+    // Borrow the selected checkpoint throughout detached reconstruction. The
+    // sole WAL writer cannot mutate it before the final predecessor check, so
+    // exact identity avoids repeatedly walking its snapshot memberships. A
+    // different reference still receives the complete value comparison above.
     let old = disk
         .anchor
-        .clone()
+        .as_ref()
         .ok_or_else(|| invalid_data("native install selected predecessor absent"))?;
-    basis.require_install_owner(&old)?;
+    basis.require_install_owner(old)?;
     let (installation, capture, version) = {
         let state = lock_state(shared)?;
         let installation = Arc::clone(
@@ -211,12 +218,12 @@ fn advance_inner(
             .as_ref()
             .ok_or_else(|| invalid_data("native install state absent"))?;
         let version = Version::capture(native)?;
-        require_live(&state, disk, &old, &installation, &version)?;
+        require_live(&state, disk, old, &installation, &version)?;
         (installation, native.capture_snapshot()?, version)
     };
     let check = || {
         let state = lock_state(shared)?;
-        require_live(&state, disk, &old, &installation, &version)
+        require_live(&state, disk, old, &installation, &version)
     };
     installation.source.verify()?;
     let mut conn = native::cold_basis(&disk.directory, binding)?;
@@ -399,8 +406,8 @@ fn advance_inner(
     // roots. Admissions remain held until durable reclamation also completes.
     let (retired, old_selected) = {
         let mut state = lock_state(shared)?;
-        require_live(&state, disk, &old, &installation, &version)?;
-        let old_selected = basis.replace_for_install(&old, selected)?;
+        require_live(&state, disk, old, &installation, &version)?;
+        let old_selected = basis.replace_for_install(old, selected)?;
         let retired = state.native.replace(native);
         state.base_sequence = anchor.native_sequence();
         state.history_bytes = 0;

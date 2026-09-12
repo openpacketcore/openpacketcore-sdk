@@ -17,6 +17,71 @@ use std::str::FromStr;
 use std::time::Duration;
 
 #[test]
+fn native_frontier_captures_preserve_nested_authority_without_allocating() {
+    let (mut storage, _, _) = fixture();
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: storage.business.applied(),
+        last_membership: storage.business.membership(),
+        snapshot_id: format!("{}frontiers", snapshot_prefix([0xAD; 32])),
+    };
+    storage
+        .business
+        .set_current_snapshot((
+            meta,
+            "snapshot-00000000-0000-4000-8000-000000000001.opc".to_owned(),
+            [0xAD; 32],
+            100,
+        ))
+        .unwrap();
+    let captured = storage.business.frontiers.clone();
+    let json = serde_json::to_vec(&captured).unwrap();
+    let binary = postcard::to_stdvec(&captured).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&json)),
+        "0cf2ee2600b40ea04bec298850fba698f1f6b7de2e57f3b6972f0bc0e732113e"
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&binary)),
+        "badd582d92db1e313b45d8e0ae7e8a848a155f4766e63bd1699c3e0af57259ae"
+    );
+    let decoded_json: NativeFrontiers = serde_json::from_slice(&json).unwrap();
+    let decoded_binary: NativeFrontiers = image::binary::decode(&binary).unwrap();
+    assert!(decoded_json == captured && decoded_binary == captured);
+    for variant in 0..4 {
+        let mut changed = storage.business.clone();
+        match variant {
+            0 => changed.frontiers.membership = StoredMembership::default(),
+            1 => changed.frontiers.current_snapshot.as_mut().unwrap().2[0] ^= 1,
+            2 => changed.frontiers.sequence += 1,
+            _ => changed.frontiers.next_fence += 1,
+        }
+        assert!(changed.require_business_proof().is_err());
+        assert!(changed.frontiers != captured);
+        assert!(storage.business.require_business_proof().is_ok());
+        assert_eq!(serde_json::to_vec(&captured).unwrap(), json);
+        assert_eq!(postcard::to_stdvec(&captured).unwrap(), binary);
+        assert_eq!(
+            serde_json::to_vec(&storage.business.frontiers).unwrap(),
+            json
+        );
+    }
+    let memory = allocation_counter::measure(|| {
+        for _ in 0..256 {
+            drop(std::hint::black_box(captured.clone()));
+        }
+    });
+    eprintln!(
+        "native_frontier_capture clones=256 allocation_count={} allocation_bytes={} json_sha256={:x} binary_sha256={:x}",
+        memory.count_total, memory.bytes_total, Sha256::digest(&json), Sha256::digest(&binary)
+    );
+    assert_eq!(memory.bytes_current, 0);
+    assert_eq!(
+        memory.count_total, 0,
+        "immutable frontier captures must not allocate membership and snapshot trees"
+    );
+}
+
+#[test]
 fn native_timestamp_fingerprint_and_decode_need_no_owned_text() {
     let timestamp = Timestamp::from_str("2026-09-11T10:20:30.123456789Z").unwrap();
     let canonical = timestamp

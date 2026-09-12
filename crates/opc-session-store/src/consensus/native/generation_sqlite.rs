@@ -74,6 +74,48 @@ fn account(
     Ok(())
 }
 
+const SMALL_BINARY_ROW_BYTES: usize = 4 * 1024;
+
+// One charged buffer is reused by the detached SQL pass. Small rows supply
+// their length from the completed encoding; larger rows keep the original
+// bounded streaming encoder. Neither pass retains a decoded row collection,
+// and the complete context comparison and cold admission remain mandatory.
+struct SqliteBinaryRows {
+    // Wipe and free the buffer before returning its reservation.
+    buffer: Zeroizing<Vec<u8>>,
+    _memory: VerificationMemory,
+}
+
+impl SqliteBinaryRows {
+    fn new() -> io::Result<Self> {
+        let memory = VerificationMemory::reserve(SMALL_BINARY_ROW_BYTES)?;
+        let mut buffer = Zeroizing::new(Vec::new());
+        buffer
+            .try_reserve_exact(SMALL_BINARY_ROW_BYTES)
+            .map_err(|_| invalid("native SQL row buffer allocation failed"))?;
+        buffer.resize(SMALL_BINARY_ROW_BYTES, 0);
+        Ok(Self {
+            buffer,
+            _memory: memory,
+        })
+    }
+
+    fn write(&mut self, writer: &mut dyn Write, value: &impl Serialize) -> io::Result<()> {
+        match postcard::to_slice(value, &mut self.buffer) {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    return Err(invalid("native generation binary row empty"));
+                }
+                write_bytes(writer, bytes, MAX_ITEM)
+            }
+            Err(postcard::Error::SerializeBufferFull) => write_binary(writer, value),
+            Err(_) => Err(invalid(
+                "native binary canonical encoding differs or exceeds bound",
+            )),
+        }
+    }
+}
+
 pub(crate) struct SqlitePreparedBase<'a> {
     tx: Transaction<'a>,
     root: Option<&'a RosterAttestationTrustRootV1>,
@@ -163,7 +205,7 @@ impl<'a> SqlitePreparedBase<'a> {
             business: BusinessContext {
                 identity,
                 members: members.clone(),
-                frontiers: NativeFrontiers {
+                frontiers: NativeFrontiers(Arc::new(NativeFrontierValues {
                     applied: sql::read_applied_sync(&tx, identity)?,
                     membership: sql::read_membership_sync(&tx, identity)?,
                     sequence,
@@ -199,7 +241,7 @@ impl<'a> SqlitePreparedBase<'a> {
                         }
                     }),
                     current_snapshot: sql::read_current_snapshot_sync(&tx, identity)?,
-                },
+                })),
                 counts: [0; 4],
                 content: [[0; 32]; 4],
                 roster: Some(RosterContext {
@@ -448,6 +490,7 @@ impl<'a> SqlitePreparedBase<'a> {
         writer: &mut dyn Write,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Context> {
+        let mut binary_rows = SqliteBinaryRows::new()?;
         let mut context = self.header.context.clone();
         context.business.counts = [0; 4];
         context.business.content = [[0; 32]; 4];
@@ -573,7 +616,7 @@ impl<'a> SqlitePreparedBase<'a> {
                 )?;
                 writer.write_all(&[2])?;
                 write_before(writer, None)?;
-                write_binary(writer, &(id, Some(&receipt)))?;
+                binary_rows.write(writer, &(id, Some(&receipt)))?;
             }
         }
         let mut notifications = self.tx.prepare("SELECT sequence,tx_id,entry_json,timestamp FROM session_replication_log ORDER BY sequence").map_err(db)?;
@@ -606,7 +649,7 @@ impl<'a> SqlitePreparedBase<'a> {
                 validation::MAX_ITEMS,
             )?;
             writer.write_all(&[3])?;
-            write_binary(writer, &entry)?;
+            binary_rows.write(writer, &entry)?;
         }
         let mut logs = self.tx.prepare("SELECT log_index,configuration_epoch,term,entry_json FROM consensus_log ORDER BY log_index").map_err(db)?;
         let mut rows = logs.query([]).map_err(db)?;
@@ -755,5 +798,118 @@ impl<'a> SqlitePreparedBase<'a> {
             origin.verify()?;
         }
         self.identity(output.hash.finalize().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct Counted<'a, T> {
+        calls: &'a Cell<usize>,
+        value: T,
+    }
+
+    impl<T: Serialize> Serialize for Counted<'_, T> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.calls.set(self.calls.get() + 1);
+            self.value.serialize(serializer)
+        }
+    }
+
+    #[test]
+    fn native_sql_small_row_encoding_avoids_duplicate_traversal() {
+        let calls = Cell::new(0);
+        let row = Counted {
+            calls: &calls,
+            value: (vec![0xa5_u8; 512], 123_u64, "native SQL row"),
+        };
+        let expected = postcard::to_stdvec(&row.value).unwrap();
+        let mut actual = Vec::new();
+        SqliteBinaryRows::new()
+            .unwrap()
+            .write(&mut actual, &row)
+            .unwrap();
+        let mut framed = (expected.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&expected);
+        assert_eq!(actual, framed);
+        eprintln!(
+            "native_sql_small_row serialized_bytes={} serialization_calls={}",
+            expected.len(),
+            calls.get()
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "small SQL rows must serialize once per pass"
+        );
+    }
+
+    struct FailAfter(usize);
+
+    impl Write for FailAfter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.0 == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "fixed fault",
+                ));
+            }
+            let count = self.0.min(bytes.len());
+            self.0 -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CannotSerialize;
+
+    impl Serialize for CannotSerialize {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("fixed serialization fault"))
+        }
+    }
+
+    #[test]
+    fn native_sql_row_buffer_preserves_exact_frames_and_write_failures() {
+        let mut rows = SqliteBinaryRows::new().unwrap();
+        for length in [0, 1, 512, 4090, 4096, 8192] {
+            let row = (vec![0xa5_u8; length], 123_u64, "native SQL row");
+            let mut expected = Vec::new();
+            write_binary(&mut expected, &row).unwrap();
+            let mut actual = Vec::new();
+            rows.write(&mut actual, &row).unwrap();
+            assert_eq!(actual, expected);
+            for limit in [0, 1, 3, 4, 17, expected.len() - 1] {
+                let error = rows.write(&mut FailAfter(limit), &row).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
+        }
+        let mut untouched = Vec::new();
+        assert!(rows.write(&mut untouched, &()).is_err());
+        assert!(rows.write(&mut untouched, &CannotSerialize).is_err());
+        assert!(untouched.is_empty());
+    }
+
+    #[test]
+    fn native_sql_row_buffer_reuses_one_bounded_allocation() {
+        let row = (vec![0xa5_u8; 512], 123_u64, "native SQL row");
+        let memory = allocation_counter::measure(|| {
+            let mut rows = SqliteBinaryRows::new().unwrap();
+            for _ in 0..128 {
+                rows.write(&mut io::sink(), &row).unwrap();
+            }
+        });
+        eprintln!(
+            "native_sql_row_buffer rows=128 allocations={} bytes={} retained={}",
+            memory.count_total, memory.bytes_total, memory.bytes_current
+        );
+        assert_eq!(memory.count_total, 1);
+        assert_eq!(memory.bytes_total, SMALL_BINARY_ROW_BYTES as u64);
+        assert_eq!(memory.bytes_current, 0);
     }
 }

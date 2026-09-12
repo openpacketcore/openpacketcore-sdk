@@ -574,6 +574,10 @@ static ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = O
 // add-on and ALTER-based operator-recovery products remain supported, but
 // only their exact emitted DDL is admitted once that object is populated.
 static OPERATOR_RECOVERY_CERTIFICATE_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
+// Only the expected SDK-defined manifest is shared. Every validation still
+// reads all matching objects from the actual main or attached database.
+static PROTECTED_ROSTER_SCHEMA_MANIFEST: OnceLock<BTreeMap<(String, String), String>> =
+    OnceLock::new();
 // Recovery sidecars are self-bound to their persistent Linux file handle.
 // Earlier unbound OPCRL001/OPCRL002 records are intentionally not accepted:
 // a same-byte copy at the public pathname must remain invalid after a retry
@@ -10720,6 +10724,16 @@ fn protected_roster_schema_objects_are_exact_in_sync(
     conn: &Connection,
     attached: bool,
 ) -> io::Result<bool> {
+    let expected = expected_protected_roster_schema_manifest()?;
+    let observed = protected_roster_schema_manifest(conn, attached)?;
+    Ok(&observed == expected)
+}
+
+fn expected_protected_roster_schema_manifest(
+) -> io::Result<&'static BTreeMap<(String, String), String>> {
+    if let Some(expected) = PROTECTED_ROSTER_SCHEMA_MANIFEST.get() {
+        return Ok(expected);
+    }
     let canonical = SqliteSessionBackend::canonical_schema_connection()
         .map_err(|_| invalid_data("protected roster canonical schema is unavailable"))?;
     canonical
@@ -10732,8 +10746,12 @@ fn protected_roster_schema_objects_are_exact_in_sync(
         .execute_batch(PROTECTED_ROSTER_SCHEMA)
         .map_err(db_error)?;
     let expected = protected_roster_schema_manifest(&canonical, false)?;
-    let observed = protected_roster_schema_manifest(conn, attached)?;
-    Ok(observed == expected)
+    // Concurrent first users may construct the same immutable manifest. A
+    // failed construction publishes nothing and remains fallible on retry.
+    let _ = PROTECTED_ROSTER_SCHEMA_MANIFEST.set(expected);
+    PROTECTED_ROSTER_SCHEMA_MANIFEST
+        .get()
+        .ok_or_else(|| invalid_data("protected roster canonical schema is unavailable"))
 }
 
 /// A predecessor has no roster object of any kind.  Do not reuse the manifest
@@ -49099,6 +49117,74 @@ mod tests {
             ],
         )
         .expect("seed raw snapshot marker");
+    }
+
+    #[test]
+    fn roster_schema_validation_rereads_main_and_attached_objects() {
+        let directory = tempfile::tempdir().expect("roster schema fixture directory");
+        let incoming_path = directory.path().join("incoming.sqlite");
+        let incoming = SqliteSessionBackend::open(&incoming_path).expect("incoming backend");
+        {
+            let conn = incoming.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members())
+                .expect("incoming consensus schema");
+        }
+        drop(incoming);
+        let backend = SqliteSessionBackend::in_memory().expect("local backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("local consensus schema");
+        conn.execute(
+            "ATTACH DATABASE ?1 AS consensus_incoming",
+            [incoming_path.to_string_lossy().as_ref()],
+        )
+        .expect("attach incoming schema");
+
+        for (attached, schema) in [(false, "main"), (true, "consensus_incoming")] {
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("initial exact schema")
+            );
+            conn.execute_batch(&format!(
+                "CREATE TABLE {schema}.consensus_protected_roster_unexpected (value INTEGER);"
+            ))
+            .expect("add unexpected roster namespace object");
+            assert!(
+                !protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread added namespace object")
+            );
+            conn.execute_batch(&format!(
+                "DROP TABLE {schema}.consensus_protected_roster_unexpected;"
+            ))
+            .expect("remove unexpected namespace object");
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread restored namespace")
+            );
+
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER {schema}.unexpected_roster_observer \
+                 AFTER INSERT ON consensus_protected_roster_rows BEGIN SELECT 1; END;"
+            ))
+            .expect("add roster trigger with unrelated name");
+            assert!(
+                !protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread added roster table trigger")
+            );
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, !attached)
+                    .expect("other database remains independently exact")
+            );
+            conn.execute_batch(&format!(
+                "DROP TRIGGER {schema}.unexpected_roster_observer;"
+            ))
+            .expect("remove unexpected roster trigger");
+            assert!(
+                protected_roster_schema_objects_are_exact_in_sync(&conn, attached)
+                    .expect("reread restored roster objects")
+            );
+        }
+        conn.execute("DETACH DATABASE consensus_incoming", [])
+            .expect("detach incoming schema");
     }
 
     #[test]

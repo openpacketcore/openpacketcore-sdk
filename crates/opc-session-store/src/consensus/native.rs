@@ -227,9 +227,31 @@ struct NativeActivation {
     profile: [u8; 32],
 }
 
+// Captures and admission proofs share immutable frontier values. A mutation
+// copies the complete values before changing them, so old captures keep their
+// exact membership and snapshot metadata. Equality retains the full value
+// comparison for distinct allocations; serialized bytes are unchanged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct NativeFrontiers(Arc<NativeFrontierValues>);
+
+impl std::ops::Deref for NativeFrontiers {
+    type Target = NativeFrontierValues;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for NativeFrontiers {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeFrontiers {
+#[serde(deny_unknown_fields, rename = "NativeFrontiers")]
+struct NativeFrontierValues {
     applied: Option<LogId<SessionConsensusNodeId>>,
     membership: StoredMembership<SessionConsensusNodeId, EmptyNode>,
     sequence: u64,
@@ -250,7 +272,7 @@ struct NativeFrontiers {
     current_snapshot: Option<crate::sqlite::consensus::CurrentSnapshot>,
 }
 
-impl Serialize for NativeFrontiers {
+impl Serialize for NativeFrontierValues {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         // Only JSON can omit a named field without shifting following data.
@@ -490,7 +512,7 @@ impl NativeState {
         let mut state = Self {
             identity,
             members,
-            frontiers: NativeFrontiers {
+            frontiers: NativeFrontiers(Arc::new(NativeFrontierValues {
                 applied: None,
                 membership: StoredMembership::default(),
                 sequence: 0,
@@ -506,7 +528,7 @@ impl NativeState {
                 roster_v1_namespace: false,
                 roster_v2_activation: None,
                 current_snapshot: None,
-            },
+            })),
             keys: RowMap::new(),
             receipts: RowMap::new(),
             generic_receipts: RowMap::new(),
