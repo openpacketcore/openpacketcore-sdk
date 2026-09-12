@@ -24580,11 +24580,16 @@ fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
         let retained_through_target =
             read_log_range_sync(conn, identity, start, Some(target_end), None)?;
         if retained_through_target.last().map(|entry| entry.log_id) == Some(*target) {
-            return validate_exact_log_prefix_through_sync(
+            // The complete original payload audit above already includes this
+            // exact target. No source row or marker changed during the range
+            // projection in this transaction; retain every ordinary prefix
+            // predicate without decoding the same witness set again.
+            return validate_exact_log_prefix_from_witnesses_sync(
                 conn,
                 identity,
                 target,
                 require_retained_target,
+                &witnesses,
             );
         }
         // The exact P+1..C retained prefix followed by an entirely absent
@@ -24618,7 +24623,13 @@ fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
             .index
             .checked_add(1)
             .ok_or_else(|| invalid_data("session consensus retained tail index is exhausted"))?;
-        let retained = read_log_range_sync(conn, identity, start, Some(retained_end), None)?;
+        checked_i64(retained_end)?;
+        // The original P+1..S read strictly decoded and projected this entire
+        // P+1..C subset from the same membership state and purge floor. Reuse
+        // its rows only within this unchanged transaction. Exact full LogId
+        // boundaries and the absent-suffix query below remain mandatory.
+        let retained = &retained_through_target
+            [..retained_through_target.partition_point(|entry| entry.log_id.index < retained_end)];
         if retained.first().map(|entry| entry.log_id.index) != Some(start)
             || retained.last().map(|entry| entry.log_id) != Some(committed)
         {
@@ -25589,15 +25600,19 @@ fn logical_purge_logs_after_portable_snapshot_install_in_tx(
         &applied,
         "session consensus cannot purge unapplied logs",
     )?;
-    validate_exact_log_prefix_after_portable_snapshot_install_sync(
-        tx,
-        identity,
-        authority_profile,
-        preinstall_committed,
-        preinstall_applied,
-        through,
-        false,
-    )?;
+    if through != &applied {
+        // Equal full LogIds have just received this exact proof, with no
+        // intervening write. Distinct applied and purge cuts keep both audits.
+        validate_exact_log_prefix_after_portable_snapshot_install_sync(
+            tx,
+            identity,
+            authority_profile,
+            preinstall_committed,
+            preinstall_applied,
+            through,
+            false,
+        )?;
+    }
     save_log_pointer(tx, "consensus_purged", identity, through)
 }
 
@@ -50048,6 +50063,268 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    async fn portable_snapshot_prefix_audit_fixture(
+        last_index: u64,
+        snapshot_index: u64,
+    ) -> SqliteSessionBackend {
+        let backend = backend_with_blank_logs(last_index).await;
+        {
+            let conn = backend.conn.lock().await;
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("apply exact predecessor membership");
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(snapshot_index));
+            set_test_log_pointer(&conn, "consensus_committed", &log_id(last_index));
+            set_test_purge_floor(&conn, &log_id(7));
+            save_test_snapshot_marker(&conn, log_id(snapshot_index), "portable-prefix-audit");
+        }
+        backend
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_prefix_audit_reuses_exact_projected_retained_range() {
+        use log_row_reuse_test_observer::{Event, Scope};
+
+        let backend = portable_snapshot_prefix_audit_fixture(15, 20).await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin unchanged portable prefix audit");
+        let changes = tx.total_changes();
+        let observation = Scope::new();
+        validate_exact_log_prefix_after_portable_snapshot_install_sync(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(log_id(15)),
+            Some(log_id(11)),
+            &log_id(20),
+            false,
+        )
+        .expect("exact retained prefix and absent authenticated tail");
+        let events = observation.finish();
+        let projected = events
+            .iter()
+            .filter(|event| **event == Event::RangeProjection)
+            .count();
+        eprintln!("portable_snapshot_prefix_audit retained_rows=8 projected_rows={projected}");
+        assert_eq!(tx.total_changes(), changes, "the full proof is read-only");
+        assert_eq!(
+            projected, 8,
+            "the retained subset must reuse the original complete membership projection"
+        );
+        for event in [
+            Event::RangeLogIdCheck,
+            Event::RangeContiguityCheck,
+            Event::RangeLeaderCheck,
+        ] {
+            assert_eq!(events.iter().filter(|actual| **actual == event).count(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_prefix_audit_reuses_complete_prefix_witnesses() {
+        let backend = portable_snapshot_prefix_audit_fixture(15, 15).await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin complete retained target audit");
+        let changes = tx.total_changes();
+        reset_committed_log_validation_decoded_rows_for_test();
+        validate_exact_log_prefix_after_portable_snapshot_install_sync(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(log_id(15)),
+            Some(log_id(11)),
+            &log_id(15),
+            true,
+        )
+        .expect("complete physical prefix requires every exact witness");
+        let decoded = committed_log_validation_decoded_rows_for_test();
+        eprintln!("portable_snapshot_prefix_audit physical_rows=16 witness_decoded_rows={decoded}");
+        assert_eq!(tx.total_changes(), changes);
+        assert_eq!(decoded, 16, "reuse the original full strict witness audit");
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_prefix_audit_rechecks_corruption_in_the_same_transaction() {
+        for snapshot in [15, 20] {
+            for corruption in [
+                "prefix-json",
+                "tail-json",
+                "prefix-v2",
+                "tail-v2",
+                "prefix-row",
+                "tail-row",
+                "tail-gap",
+                "boundary-gap",
+                "purge-marker",
+                "membership-scope",
+            ] {
+                let backend = portable_snapshot_prefix_audit_fixture(15, snapshot).await;
+                let conn = backend.conn.lock().await;
+                let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                    .expect("begin same transaction mutation control");
+                let audit = || {
+                    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+                        &tx,
+                        identity(),
+                        ConsensusAuthorityProfile::Dynamic,
+                        Some(log_id(15)),
+                        Some(log_id(11)),
+                        &log_id(snapshot),
+                        false,
+                    )
+                };
+                audit().expect("initial exact source must pass");
+                let index = if corruption.starts_with("prefix-") {
+                    4
+                } else {
+                    12
+                };
+                match corruption {
+                    "prefix-json" | "tail-json" => {
+                        tx.execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                            params![b"invalid-json".as_slice(), index],
+                        )
+                        .expect("corrupt original JSON payload");
+                    }
+                    "prefix-v2" | "tail-v2" => {
+                        let entry = fenced_transition_v2_entry(
+                            index as u64,
+                            fenced_transition_v2_request(0x96, 1, "portable-prefix-audit"),
+                            timestamp(2),
+                        );
+                        let bytes = noncanonical_v2_log_json(&entry);
+                        assert!(decode_consensus_log_entry(&bytes).is_err());
+                        tx.execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                            params![bytes, index],
+                        )
+                        .expect("corrupt strict V2 payload");
+                    }
+                    "prefix-row" | "tail-row" => {
+                        tx.execute(
+                            "UPDATE consensus_log SET term = 2 WHERE log_index = ?1",
+                            [index],
+                        )
+                        .expect("disagree with decoded full LogId");
+                    }
+                    "tail-gap" | "boundary-gap" => {
+                        tx.execute(
+                            "DELETE FROM consensus_log WHERE log_index = ?1",
+                            [if corruption == "boundary-gap" { 15 } else { 12 }],
+                        )
+                        .expect("remove required retained witness");
+                    }
+                    "purge-marker" => {
+                        save_log_pointer(
+                            &tx,
+                            "consensus_purged",
+                            identity(),
+                            &LogId::new(CommittedLeaderId::new(2, node_id()), 7),
+                        )
+                        .expect("change exact purge lineage");
+                    }
+                    "membership-scope" => {
+                        let entry: Entry<SessionRaftTypeConfig> = Entry {
+                            log_id: log_id(12),
+                            payload: EntryPayload::Membership(
+                                opc_consensus::engine::Membership::new(
+                                    vec![BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()])],
+                                    BTreeSet::from([SessionConsensusNodeId::new(8).unwrap()]),
+                                ),
+                            ),
+                        };
+                        tx.execute(
+                            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 12",
+                            [encode_json(&entry).unwrap()],
+                        )
+                        .expect("inject decoded membership outside the storage scope");
+                    }
+                    _ => unreachable!(),
+                }
+                let changes = tx.total_changes();
+                assert_eq!(
+                    audit()
+                        .expect_err("successful earlier proof never admits changed source")
+                        .kind(),
+                    io::ErrorKind::InvalidData,
+                    "snapshot={snapshot}, corruption={corruption}",
+                );
+                assert_eq!(tx.total_changes(), changes, "rejection writes nothing");
+                tx.rollback().expect("discard explicit corruption fixture");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_purge_audit_reuses_identical_applied_cut() {
+        let backend = portable_snapshot_prefix_audit_fixture(15, 20).await;
+        let conn = backend.conn.lock().await;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin exact portable purge publication");
+        reset_committed_log_validation_decoded_rows_for_test();
+        logical_purge_logs_after_portable_snapshot_install_in_tx(
+            &tx,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            Some(log_id(15)),
+            Some(log_id(11)),
+            &log_id(20),
+            20,
+        )
+        .expect("publish the fully proved identical applied and snapshot cut");
+        let decoded = committed_log_validation_decoded_rows_for_test();
+        eprintln!("portable_snapshot_purge_audit physical_rows=16 witness_decoded_rows={decoded}");
+        assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(20)));
+        assert_eq!(
+            decoded, 32,
+            "audit the original floor and the new applied cut, without repeating the identical target"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_purge_audit_keeps_the_distinct_applied_cut_proof() {
+        for corrupt_applied in [false, true] {
+            let backend = portable_snapshot_prefix_audit_fixture(21, 20).await;
+            let conn = backend.conn.lock().await;
+            set_test_log_pointer(&conn, "consensus_applied", &log_id(21));
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin distinct applied frontier control");
+            if corrupt_applied {
+                tx.execute("UPDATE consensus_log SET term = 2 WHERE log_index = 21", [])
+                    .expect("corrupt only the applied row beyond the snapshot cut");
+            }
+            let changes = tx.total_changes();
+            let result = logical_purge_logs_after_portable_snapshot_install_in_tx(
+                &tx,
+                identity(),
+                ConsensusAuthorityProfile::Dynamic,
+                Some(log_id(15)),
+                Some(log_id(11)),
+                &log_id(20),
+                20,
+            );
+            if corrupt_applied {
+                assert_eq!(
+                    result
+                        .expect_err("distinct applied proof is required")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(7)));
+                assert_eq!(
+                    tx.total_changes(),
+                    changes,
+                    "failed proof cannot publish purge"
+                );
+            } else {
+                result.expect("prove both distinct exact cuts before publishing purge");
+                assert_eq!(read_purged_sync(&tx, identity()).unwrap(), Some(log_id(20)));
+            }
+        }
     }
 
     async fn snapshot_install_pointer_audit_fixture() -> SqliteSessionBackend {
