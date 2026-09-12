@@ -12,7 +12,6 @@ const MAX_DEPTH: usize = 128;
 enum Destination<'a> {
     Count,
     Writer(&'a mut dyn Write),
-    Compare(&'a [u8]),
 }
 
 struct CanonicalSink<'a, 'error> {
@@ -77,11 +76,6 @@ impl postcard::ser_flavors::Flavor for CanonicalSink<'_, '_> {
                     return Err(postcard::Error::SerializeBufferFull);
                 }
             }
-            Destination::Compare(expected) => {
-                if expected.get(self.position..end) != Some(bytes) {
-                    return Err(postcard::Error::SerializeBufferFull);
-                }
-            }
         }
         self.position = end;
         Ok(())
@@ -96,9 +90,6 @@ impl postcard::ser_flavors::Flavor for CanonicalSink<'_, '_> {
         };
         if let Err(error) = written {
             *self.error = Some(error);
-            return Err(postcard::Error::SerializeBufferFull);
-        }
-        if matches!(self.destination,Destination::Compare(bytes) if bytes.len() != self.position) {
             return Err(postcard::Error::SerializeBufferFull);
         }
         Ok(self.position)
@@ -128,10 +119,8 @@ fn serialize(
     result.map_err(|_| super::invalid("native binary canonical encoding differs or exceeds bound"))
 }
 
-// The same postcard serializer now counts, writes and compares without a
-// second complete encoded allocation. No schema, depth, work, collection or
-// canonical acceptance rule changes. All callers still own their allocation
-// reservations and must keep decoded values inside the appropriate lifetime.
+// Postcard counts and writes without a second complete encoded allocation.
+// Callers retain their reservations throughout the decoded value's lifetime.
 pub(in crate::consensus::native) fn encoded_len(
     value: &(impl Serialize + ?Sized),
     maximum: usize,
@@ -147,11 +136,49 @@ pub(in crate::consensus::native) fn write_to(
     serialize(value, Destination::Writer(writer), maximum)
 }
 
+// Compare the original serializer output directly against the remaining
+// canonical bytes. Consuming the whole slice proves the same exact length
+// and byte equality without the counting/writer destination on each scalar.
+struct CanonicalComparison<'a> {
+    remaining: &'a [u8],
+}
+
+impl postcard::ser_flavors::Flavor for CanonicalComparison<'_> {
+    type Output = ();
+
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        match self.remaining.split_first() {
+            Some((expected, remaining)) if *expected == byte => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            _ => Err(postcard::Error::SerializeBufferFull),
+        }
+    }
+
+    fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+        self.remaining = self
+            .remaining
+            .strip_prefix(bytes)
+            .ok_or(postcard::Error::SerializeBufferFull)?;
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        if self.remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(postcard::Error::SerializeBufferFull)
+        }
+    }
+}
+
 pub(in crate::consensus::native) fn compare(
     value: &(impl Serialize + ?Sized),
     bytes: &[u8],
 ) -> io::Result<()> {
-    serialize(value, Destination::Compare(bytes), bytes.len()).map(|_| ())
+    postcard::serialize_with_flavor(value, CanonicalComparison { remaining: bytes })
+        .map_err(|_| super::invalid("native binary canonical encoding differs or exceeds bound"))
 }
 
 struct Budget {
@@ -159,7 +186,10 @@ struct Budget {
     collection: usize,
 }
 
+// These thin adapters run for every scalar, including each payload byte.
+// Inline their forwarding while retaining every depth, work and size check.
 impl Budget {
+    #[inline(always)]
     fn enter<E: de::Error>(&self, depth: usize) -> Result<(), E> {
         if depth > MAX_DEPTH {
             return Err(E::custom("native binary nesting exceeds bound"));
@@ -173,6 +203,7 @@ impl Budget {
         Ok(())
     }
 
+    #[inline(always)]
     fn collection<E: de::Error>(&self, length: Option<usize>) -> Result<(), E> {
         if length.is_some_and(|length| length > self.collection) {
             return Err(E::custom("native binary collection exceeds frame bound"));
@@ -226,6 +257,7 @@ struct Seed<'a, S> {
 
 impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<'_, S> {
     type Value = S::Value;
+    #[inline(always)]
     fn deserialize<D: de::Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
         self.inner.deserialize(Bounded {
             inner: decoder,
@@ -237,6 +269,7 @@ impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<'_, S> {
 
 macro_rules! forward {
     ($($method:ident),* $(,)?) => {$(
+        #[inline(always)]
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
             self.budget.enter(self.depth)?;
             self.inner.$method(CheckedVisitor { inner:visitor, budget:self.budget, depth:self.depth })
@@ -377,6 +410,7 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Bounded<'_, D> {
 
 macro_rules! scalar {
     ($($method:ident : $ty:ty),* $(,)?) => {$(
+        #[inline(always)]
         fn $method<E: de::Error>(self, value: $ty) -> Result<Self::Value, E> { self.inner.$method(value) }
     )*};
 }
@@ -440,6 +474,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for CheckedVisitor<'_, V> {
 
 impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Bounded<'_, A> {
     type Error = A::Error;
+    #[inline(always)]
     fn next_element_seed<S: DeserializeSeed<'de>>(
         &mut self,
         seed: S,
