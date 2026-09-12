@@ -5944,7 +5944,13 @@ impl SqliteConsensusStateMachine {
                 // any preparation error. SQL readback cannot revive a fenced
                 // owner or decide this two-image publication by itself.
                 promoted_cleanup.disarm();
-                let publication = wal.install_snapshot(&conn, source);
+                // This synchronous handoff waits for the sole WAL writer.
+                // Keep its original caller and publication guards through
+                // completion while admitting the existing bounded scheduler
+                // handoff used by the other serialized storage writes.
+                let publication = run_admitted_sqlite_write(&self.shutdown_guard, || {
+                    wal.install_snapshot(&conn, source)
+                });
                 if publication.is_err() {
                     self.core
                         .snapshot_publication_indeterminate
@@ -11033,6 +11039,97 @@ mod tests {
     fn private_install_selector(directory: &FixedRawReadStoreFixture) -> serde_json::Value {
         let bytes = std::fs::read(directory.path().join("wal/CURRENT")).unwrap();
         serde_json::from_slice(&bytes[8..bytes.len() - 32]).unwrap()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn native_install_keeps_runtime_progress_while_publication_is_held() {
+        use consensus::wal::{integration::PrivateWalTest, Point};
+
+        let (_source_directory, mut incoming) = strict_private_install_snapshot().await;
+        let directory = FixedRawReadStoreFixture::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let armed = Arc::new(AtomicBool::new(false));
+        let made_progress = Arc::new(AtomicBool::new(false));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let progress_rx = std::sync::Mutex::new(progress_rx);
+        let hook_entered = Arc::clone(&entered);
+        let hook_armed = Arc::clone(&armed);
+        let hook_progress = Arc::clone(&made_progress);
+        let token = Arc::new(PrivateWalTest::new_native_with_hook(
+            directory.path().join("wal"),
+            [0xF1; 32],
+            Arc::new(move |point| {
+                if point == Point::BeforeBasisCreate && hook_armed.swap(false, Ordering::AcqRel) {
+                    hook_entered.notify_one();
+                    // Cleanup fallback only. Passing requires a separately
+                    // spawned runtime task to respond during the actual WAL
+                    // install, before this writer may select its successor.
+                    hook_progress.store(
+                        progress_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .is_ok(),
+                        Ordering::Release,
+                    );
+                }
+                Ok(())
+            }),
+        ));
+        let (backend, mut log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .unwrap();
+        let shutdown = track_admitted_sqlite_fixture(&mut log, &mut machine);
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry()],
+            "scheduler install predecessor",
+        )
+        .await;
+        let receiving = receive_private_install_snapshot(&mut machine, &mut incoming).await;
+        let observer_core = machine.core.clone();
+        shutdown.enable_runtime_write_handoff();
+        armed.store(true, Ordering::Release);
+        let meta = incoming.meta.clone();
+        let install = tokio::spawn(async move {
+            let result = install_private_snapshot(&mut machine, &meta, receiving).await;
+            (machine, result)
+        });
+        let observer_entered = Arc::clone(&entered);
+        let observer = tokio::spawn(async move {
+            observer_entered.notified().await;
+            let connection_held = observer_core.conn.try_lock().is_err();
+            let applied = *observer_core.applied_progress.borrow();
+            let _ = progress_tx.send(());
+            (connection_held, applied)
+        });
+        let (machine, installed) = install.await.unwrap();
+        // Reap the observer even if an earlier install error missed the hook.
+        // A late notification cannot change the hook's progress observation.
+        entered.notify_one();
+        let observation = observer.await.unwrap();
+        let applied = *machine.core.applied_progress.borrow();
+        let stopped = token.current().unwrap().shutdown();
+        drop(machine);
+        drop(log);
+        drop(backend);
+        shutdown.wait().await;
+
+        installed.unwrap();
+        stopped.unwrap();
+        assert_eq!(applied, Some(log_id(2)));
+        assert!(
+            made_progress.load(Ordering::Acquire),
+            "the synchronous native install stranded unrelated Tokio work while waiting for its WAL writer"
+        );
+        assert_eq!(
+            observation,
+            (true, Some(log_id(0))),
+            "runtime progress must retain the original connection and unpublished applied frontier"
+        );
     }
 
     #[cfg(all(target_os = "linux", feature = "test-control"))]
