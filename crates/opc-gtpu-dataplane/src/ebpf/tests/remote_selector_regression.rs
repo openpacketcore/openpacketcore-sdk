@@ -298,9 +298,18 @@ impl RequestTiming {
                 Err(_) => Err(Classification::Deadline),
             }
         };
+        // Timeout polls the work first and cannot interrupt synchronous work
+        // within that poll. Classify the observed completion against the same
+        // absolute deadline even when the wrapped future returned Ready.
+        let completed_at = Instant::now();
+        let result = if completed_at > self.deadline {
+            Err(Classification::Deadline)
+        } else {
+            result
+        };
         self.steps.push((
             stage,
-            start.elapsed(),
+            completed_at.duration_since(start),
             result
                 .as_ref()
                 .map_or_else(|error| *error, |_| Classification::Complete),
@@ -319,6 +328,155 @@ impl RequestTiming {
         eprintln!("sdk_selector_singleton stage=Total elapsed_us={} budget_us={} result={classification:?} setup=Excluded qualification=LocalObservation",
             total.as_micros(), REQUEST_BUDGET.as_micros());
     }
+}
+
+async fn join_owned_commit<T>(
+    commit: &mut Option<tokio::task::JoinHandle<Result<T, ()>>>,
+) -> Result<T, ()> {
+    let result = commit.as_mut().ok_or(())?.await.map_err(|_| ());
+    // A ready result consumes the join handle, even if RequestTiming then
+    // classifies it as late. Cancellation while pending leaves it for cleanup.
+    *commit = None;
+    result?
+}
+
+#[tokio::test]
+async fn request_timing_rejects_non_yielding_late_completion() {
+    let mut timing = RequestTiming::new();
+    let mut completed = false;
+    let result = timing
+        .step(Stage::DescriptorReadBefore, || async {
+            // Deliberately occupy one poll beyond the original request budget.
+            // A timeout future cannot interrupt this synchronous work.
+            std::thread::sleep(REQUEST_BUDGET);
+            completed = true;
+            Ok::<_, ()>(())
+        })
+        .await;
+    assert!(completed, "the late work must actually execute");
+    assert!(Instant::now() >= timing.deadline);
+    assert!(
+        matches!(result, Err(Classification::Deadline)),
+        "work completing after the original deadline must not pass"
+    );
+}
+
+#[tokio::test]
+async fn request_timing_preserves_early_success_and_rejection() {
+    let mut timing = RequestTiming::new();
+    let deadline = timing.deadline;
+    assert!(timing
+        .step(Stage::DescriptorReadBefore, || async { Ok::<_, ()>(17) })
+        .await
+        .is_ok_and(|value| value == 17));
+    assert!(matches!(
+        timing
+            .step(Stage::DescriptorCommit, || async { Err::<(), _>(()) })
+            .await,
+        Err(Classification::Rejected)
+    ));
+    assert_eq!(timing.deadline, deadline);
+    assert!(matches!(timing.steps[0].2, Classification::Complete));
+    assert!(matches!(timing.steps[1].2, Classification::Rejected));
+}
+
+#[tokio::test]
+async fn request_timing_does_not_start_work_after_expiry() {
+    let mut timing = RequestTiming::new();
+    timing.start -= REQUEST_BUDGET;
+    timing.deadline = timing.start + REQUEST_BUDGET;
+    let mut called = false;
+    let result = timing
+        .step(Stage::DescriptorCommit, || {
+            called = true;
+            std::future::ready(Ok::<_, ()>(()))
+        })
+        .await;
+    assert!(!called, "an expired request must not dispatch more work");
+    assert!(matches!(result, Err(Classification::Deadline)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_timing_completion_uses_exact_deadline_before_quantization() {
+    for elapsed in [REQUEST_BUDGET, REQUEST_BUDGET + Duration::from_nanos(1)] {
+        let mut timing = RequestTiming::new();
+        let result = timing
+            .step(Stage::DescriptorReadBefore, || async {
+                tokio::time::advance(elapsed).await;
+                Ok::<_, ()>(())
+            })
+            .await;
+        assert_eq!(timing.steps[0].1, elapsed);
+        if elapsed == REQUEST_BUDGET {
+            assert!(result.is_ok(), "the exact completion boundary is accepted");
+        } else {
+            assert!(
+                matches!(result, Err(Classification::Deadline)),
+                "one nanosecond late must fail before reporting microseconds"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_timing_shares_one_budget_across_steps() {
+    let mut timing = RequestTiming::new();
+    let original_deadline = timing.deadline;
+    // Each step fits a fresh budget; their sum must exhaust the single budget.
+    let step_time = REQUEST_BUDGET / 2 + Duration::from_millis(50);
+    let first = timing
+        .step(Stage::DescriptorReadBefore, || async {
+            tokio::time::advance(step_time).await;
+            Ok::<_, ()>(())
+        })
+        .await;
+    assert!(first.is_ok(), "the first step must complete before expiry");
+    let second = timing
+        .step(Stage::DescriptorReadAfter, || async {
+            tokio::time::advance(step_time).await;
+            Ok::<_, ()>(())
+        })
+        .await;
+    assert!(matches!(second, Err(Classification::Deadline)));
+    assert_eq!(timing.deadline, original_deadline);
+}
+
+#[tokio::test]
+async fn request_timing_late_completed_commit_is_already_joined() {
+    let mut timing = RequestTiming::new();
+    let mut commit = Some(tokio::spawn(async {
+        std::thread::sleep(REQUEST_BUDGET);
+        Ok::<_, ()>(())
+    }));
+    let result = timing
+        .step(Stage::DescriptorCommit, || join_owned_commit(&mut commit))
+        .await;
+    assert!(matches!(result, Err(Classification::Deadline)));
+    assert!(
+        commit.is_none(),
+        "a completed task must not be joined twice"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_timing_pending_commit_remains_owned_for_cleanup() {
+    let mut timing = RequestTiming::new();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let mut commit = Some(tokio::spawn(async { held.await.map_err(|_| ()) }));
+    let result = timing
+        .step(Stage::DescriptorCommit, || join_owned_commit(&mut commit))
+        .await;
+    assert!(matches!(result, Err(Classification::Deadline)));
+    assert!(commit.is_some(), "timeout must retain the pending owner");
+    release.send(()).expect("pending commit still owned");
+    checked(
+        timeout(CLEANUP_BOUND, join_owned_commit(&mut commit)).await,
+        "pending timer control cleanup bound",
+    )
+    .expect("pending commit completed during cleanup");
+    assert!(commit.is_none());
+    assert!(matches!(result, Err(Classification::Deadline)));
+    assert!(matches!(timing.steps[0].2, Classification::Deadline));
 }
 
 async fn descriptor_commit<B: ProtectedSessionBackend>(
@@ -379,11 +537,11 @@ async fn singleton_public_protected_flow_keeps_original_request_deadline() {
         let mut commit = None;
         let committed = timing
             .step(Stage::DescriptorCommit, || async {
-                let task = commit.insert(tokio::spawn(descriptor_commit(
+                commit = Some(tokio::spawn(descriptor_commit(
                     lab.store.clone(),
                     lab.descriptor.clone(),
                 )));
-                task.await.map_err(|_| ())?
+                join_owned_commit(&mut commit).await
             })
             .await;
         if matches!(committed, Err(Classification::Deadline)) {
