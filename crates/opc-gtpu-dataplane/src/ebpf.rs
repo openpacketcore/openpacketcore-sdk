@@ -64826,6 +64826,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_grouped_returning_subscriber_reuses_paa_with_new_teid() {
+        use opc_session_store::{
+            EncryptingSessionBackend, OwnerId, SelectorLedgerStorageScope, SessionStore,
+            SqliteSessionBackend,
+        };
+        use opc_types::{NetworkFunctionKind, TenantId};
+
+        // Real protected coordinator and real eBPF adapter logic. Only kernel
+        // IO is synthetic; this test does not qualify RCU or packet forwarding.
+        let runtime = Arc::new(FakeRuntime::new());
+        let device_id = grouped_device_id(0x61);
+        let local = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let endpoints = GtpuLocalEndpointSet::new(local, None).unwrap();
+        let backend = Arc::new(attach_grouped_fake(runtime.clone(), device_id, endpoints).await);
+        let tenant = TenantId::from_static("selector-reattach-fixture");
+        let keys = Arc::new(opc_key::MemoryKeyProvider::new());
+        keys.insert_active_key(
+            opc_key::KeyId::new("selector-fixture-key").unwrap(),
+            opc_key::KeyPurpose::Session,
+            tenant.clone(),
+            opc_key::Zeroizing::new([0x53; 32]),
+        )
+        .unwrap();
+        let store = SessionStore::new(EncryptingSessionBackend::new(
+            Arc::new(SqliteSessionBackend::in_memory().unwrap()),
+            keys,
+            "selector-fixture",
+        ));
+        let authority = crate::GtpuSessionSelectorNamespaceAuthority::provision_protected(
+            store,
+            SelectorLedgerStorageScope::new(tenant, NetworkFunctionKind::from_static("epdg")),
+            backend
+                .selector_namespace_bootstrap(device_id)
+                .await
+                .unwrap(),
+            backend.clone(),
+            OwnerId::new("selector-fixture-worker").unwrap(),
+            std::time::Duration::from_secs(30),
+            32,
+        )
+        .await
+        .unwrap();
+        let old = grouped_group(
+            0x62,
+            device_id,
+            vec![grouped_v4_entry(0x1100_0001, 0x2100_0001)],
+        );
+        let sibling = grouped_group(
+            0x63,
+            device_id,
+            vec![grouped_entry_for_addresses(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 222)),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                local,
+                0x1100_0002,
+                0x2100_0002,
+                None,
+            )],
+        );
+        let active = authority
+            .reconcile_fresh(backend.clone(), old.clone())
+            .await
+            .unwrap();
+        drop(
+            authority
+                .reconcile_fresh(backend.clone(), sibling.clone())
+                .await
+                .unwrap(),
+        );
+        drop(
+            authority
+                .retire(backend.clone(), active, old.clone())
+                .await
+                .unwrap(),
+        );
+        let mut predecessor = old;
+        for cycle in 0..4_u8 {
+            let successor = grouped_group(
+                0x64 + cycle,
+                device_id,
+                vec![grouped_v4_entry(
+                    0x1100_0010 + u32::from(cycle),
+                    0x2100_0010 + u32::from(cycle),
+                )],
+            );
+            let before_sibling =
+                runtime.state().session_groups[&(S2BU_IFINDEX, sibling.id().to_bytes())];
+            let admitted = authority
+                .reconcile_fresh(backend.clone(), successor.clone())
+                .await;
+            assert!(
+                admitted.is_ok(),
+                "returning subscriber must attach with the retired PAA and a fresh TEID"
+            );
+            let active = admitted.unwrap();
+            drop(
+                authority
+                    .recover_active(backend.clone(), sibling.clone())
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                runtime.state().session_groups[&(S2BU_IFINDEX, sibling.id().to_bytes())]
+                    == before_sibling
+            );
+            // A delayed prior cleanup cannot retire the successor or its sibling.
+            drop(
+                authority
+                    .recover_retired(backend.clone(), predecessor.clone())
+                    .await
+                    .unwrap(),
+            );
+            drop(
+                authority
+                    .recover_active(backend.clone(), successor.clone())
+                    .await
+                    .unwrap(),
+            );
+            assert!(authority
+                .seal_unadmitted(backend.clone(), successor.clone())
+                .await
+                .is_err());
+            drop(
+                authority
+                    .retire(backend.clone(), active, successor.clone())
+                    .await
+                    .unwrap(),
+            );
+            predecessor = successor;
+        }
+        drop(authority.recover_active(backend, sibling).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn protected_grouped_refused_reattach_cleanup_preserves_serving_sibling() {
         use opc_session_store::{
             EncryptingSessionBackend, OwnerId, SelectorLedgerStorageScope, SessionStore,
