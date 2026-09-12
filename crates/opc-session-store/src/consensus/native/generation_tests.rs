@@ -6,6 +6,59 @@ use std::fs::OpenOptions;
 const BLOCK: usize = 64 * 1024;
 const ROOT: [u8; 32] = [0xBD; 32];
 
+#[test]
+fn native_generation_capture_preserves_business_and_log_admission_boundaries() {
+    let (mut storage, _, _) = fixture();
+    apply(&mut storage, &[clock(2, time(2))]);
+    let version = Version::capture(&storage).unwrap();
+    let snapshot = storage.capture_snapshot().unwrap();
+    version.require_current(&snapshot.storage).unwrap();
+    for case in 0..8 {
+        let mut candidate = storage.clone();
+        match case {
+            0 => candidate.business.members.clear(),
+            1 => candidate.business.frontiers.sequence += 1,
+            2 => {
+                assert!(!candidate.business.keys.is_empty());
+                candidate.business.keys.clear();
+            }
+            3 => {
+                assert!(!candidate.business.generic_receipts.is_empty());
+                candidate.business.generic_receipts.clear();
+            }
+            4 => {
+                assert!(!candidate.business.notifications.is_empty());
+                candidate.business.notifications.clear();
+            }
+            5 => {
+                assert!(candidate.log.committed.is_some());
+                candidate.log.committed = None;
+            }
+            6 => candidate.log.entries.clear(),
+            7 => {
+                assert_ne!(candidate.log.purged, candidate.log.committed);
+                candidate.log.purged = candidate.log.committed;
+            }
+            _ => unreachable!(),
+        }
+        assert!(Version::capture(&candidate).is_err(), "case {case}");
+        assert!(version.require_current(&candidate).is_err(), "case {case}");
+        assert!(candidate.capture_snapshot().is_err(), "case {case}");
+        assert!(
+            snapshot.require_current_authority(&candidate).is_err(),
+            "case {case}"
+        );
+    }
+    // A valid later application keeps export authority but changes the exact
+    // generation predecessor. Both contracts must remain independently checked.
+    apply(&mut storage, &[clock(3, time(3))]);
+    Version::capture(&storage).unwrap();
+    storage.capture_snapshot().unwrap();
+    assert!(version.require_current(&storage).is_err());
+    snapshot.require_current_authority(&storage).unwrap();
+    version.require_current(&snapshot.storage).unwrap();
+}
+
 struct FileFixture {
     _directory: tempfile::TempDir,
     owner: VerifiedAppendOwner,

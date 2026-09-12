@@ -23,9 +23,8 @@ impl SnapshotCapture {
     /// return. The WAL adapter separately checks its current running owner.
     pub(crate) fn require_current_authority(&self, current: &NativeStorage) -> io::Result<()> {
         let (identity, members, _) = self.storage.business.require_business_proof()?.context();
-        let (current_identity, current_members, _) =
-            current.business.require_business_proof()?.context();
-        current.log.generation_version(&current.business)?;
+        let (current_business, _) = current.log.generation_versions(&current.business)?;
+        let (current_identity, current_members, _) = current_business.context();
         if identity != current_identity
             || members != current_members
             || self.storage.business.roster_root != current.business.roster_root
@@ -74,7 +73,7 @@ impl NativeStorage {
     }
 
     pub(crate) fn capture_snapshot(&self) -> io::Result<SnapshotCapture> {
-        self.business.require_business_proof()?;
+        // Log admission includes the complete business proof admission.
         self.log.generation_version(&self.business)?;
         let memory = crate::consensus::verified_snapshot::VerificationMemory::reserve(
             128 * 1024 + std::mem::size_of::<SnapshotCapture>(),

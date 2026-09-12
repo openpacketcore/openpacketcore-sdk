@@ -3,6 +3,7 @@
 //! durable committed watermark remains the authority for business application.
 
 use super::*;
+use crate::consensus::native::changes::BusinessProof;
 use crate::consensus::verified_snapshot::VerificationMemory;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -770,7 +771,17 @@ impl NativeLog {
     }
 
     pub(super) fn require_proof(&self, state: &NativeState) -> io::Result<&Arc<LogProof>> {
-        state.require_business_proof()?;
+        self.require_proofs(state).map(|(_, log)| log)
+    }
+
+    pub(super) fn require_proofs<'a>(
+        &self,
+        state: &'a NativeState,
+    ) -> io::Result<(&'a Arc<BusinessProof>, &Arc<LogProof>)> {
+        // Both immutable borrows span the complete admission. Return the
+        // business proof already checked here when a caller needs both roots;
+        // recapturing it cannot observe a different state within this borrow.
+        let business = state.require_business_proof()?;
         let proof = self
             .proof
             .as_ref()
@@ -791,7 +802,7 @@ impl NativeLog {
                 "native log proof no longer matches admission state",
             ));
         }
-        Ok(proof)
+        Ok((business, proof))
     }
 
     pub(crate) fn admit(&mut self, state: &NativeState) -> io::Result<()> {

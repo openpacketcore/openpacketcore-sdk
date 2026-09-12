@@ -321,7 +321,8 @@ impl Relocations {
         &mut self,
         storage: &mut NativeStorage,
     ) -> io::Result<RetiredRows<'_>> {
-        storage.business.require_business_proof()?;
+        // Log admission includes the complete business proof admission under
+        // this same exclusive storage borrow, before any row is relocated.
         storage.log.generation_version(&storage.business)?;
         if storage.business.identity != self.identity
             || storage.business.members != self.members

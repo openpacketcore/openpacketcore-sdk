@@ -21,6 +21,14 @@ impl GenerationLogVersion {
 }
 
 impl NativeLog {
+    pub(in crate::consensus::native) fn generation_versions(
+        &self,
+        state: &NativeState,
+    ) -> io::Result<(Arc<BusinessProof>, GenerationLogVersion)> {
+        let (business, log) = self.require_proofs(state)?;
+        Ok((Arc::clone(business), GenerationLogVersion(Arc::clone(log))))
+    }
+
     pub(in crate::consensus::native) fn generation_version(
         &self,
         state: &NativeState,

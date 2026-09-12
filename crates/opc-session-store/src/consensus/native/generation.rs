@@ -241,10 +241,8 @@ pub(crate) struct Version {
 
 impl Version {
     pub(crate) fn capture(storage: &NativeStorage) -> io::Result<Self> {
-        Ok(Self {
-            business: Arc::clone(storage.business.require_business_proof()?),
-            log: storage.log.generation_version(&storage.business)?,
-        })
+        let (business, log) = storage.log.generation_versions(&storage.business)?;
+        Ok(Self { business, log })
     }
 
     pub(crate) fn require_current(&self, storage: &NativeStorage) -> io::Result<()> {
