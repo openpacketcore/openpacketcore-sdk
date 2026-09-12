@@ -1912,3 +1912,29 @@ by issue #143.
 ## License
 
 Licensed under the [Apache License, Version 2.0](../../LICENSE).
+## Volatile call-development lab build
+
+The opt-in `lab-memory` feature adds `FakeSessionBackend::in_memory_lab()` and
+`PreparedFencedTransitionJournal::in_memory_lab()`. These are process-local
+allocations with no session database, preparation-journal file, voter or
+remote session-store client. Share one backend and journal throughout a worker.
+Compose the backend with the existing encrypting or remote-sealing wrapper
+when storing key-bearing session payloads.
+
+The lab backend preserves atomic same-key lease/record transitions, exact
+request receipts, CAS, expiry and fencing within that allocation. Prepared
+tokens bind the allocation that created them. Ordinary `FakeSessionBackend`
+construction still withholds atomic prepared-transition capability.
+
+Lab restore scans use the SDK's authenticated `DurableOpaqueV1` seek-cursor
+format with an allocation-local key and incarnation. Cursors reject another
+allocation, changed scope, record mutation, expiry pruning, or state rebuild;
+pages retain the existing row and byte bounds. The profile names the cursor
+format, not persistence: the lab loses its cursor authority on restart too.
+
+The process retains at most 100,000 tracked keys and 65,536 transition receipts
+and preparation tokens. History exhaustion rejects new requests rather than
+evicting request identities or fence floors. Restart loses all state and is
+the lab reset boundary; it is not HA recovery. This feature does not implement
+the protected-roster V2 protocol or qualify durable throughput. It is disabled
+by default and must not be selected as production persistence.

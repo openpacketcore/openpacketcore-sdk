@@ -1055,14 +1055,27 @@ impl fmt::Debug for FencedTransitionRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PreparedFencedTransitionProtection {
-    LocalAeadV1 { scope_commitment: [u8; 32] },
-    RemoteSealV1 { scope_commitment: [u8; 32] },
-    ConsensusPhysicalV1 { storage_commitment: [u8; 32] },
+    LocalAeadV1 {
+        scope_commitment: [u8; 32],
+    },
+    RemoteSealV1 {
+        scope_commitment: [u8; 32],
+    },
+    ConsensusPhysicalV1 {
+        storage_commitment: [u8; 32],
+    },
     // Append-only: the discriminants above are part of the prepared-token V1
     // compatibility corpus. This binds an opaque token to one authenticated
     // application-consumer physical boundary without retaining any identity
     // text or endpoint/topology details.
-    AuthenticatedConsumerPhysicalV1 { binding_commitment: [u8; 32] },
+    AuthenticatedConsumerPhysicalV1 {
+        binding_commitment: [u8; 32],
+    },
+    // Lab tokens bind only one process-local allocation, never a voter.
+    #[cfg(feature = "lab-memory")]
+    LabMemoryPhysicalV1 {
+        instance_commitment: [u8; 32],
+    },
 }
 
 /// Frozen payload of the prepared-transition V1 wire frame.
@@ -1703,6 +1716,17 @@ fn valid_v1_protection_stack(layers: &[Option<PreparedFencedTransitionProtection
     use PreparedFencedTransitionProtection::{
         AuthenticatedConsumerPhysicalV1, ConsensusPhysicalV1, LocalAeadV1, RemoteSealV1,
     };
+
+    #[cfg(feature = "lab-memory")]
+    if matches!(
+        layers,
+        [
+            Some(PreparedFencedTransitionProtection::LabMemoryPhysicalV1 { .. }),
+            Some(LocalAeadV1 { .. } | RemoteSealV1 { .. })
+        ]
+    ) {
+        return true;
+    }
 
     matches!(
         layers,

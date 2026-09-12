@@ -229,6 +229,39 @@ ownership and returns unsupported without mutating another backend's authority.
 The publish transaction is crate-private, so only SDK-owned trusted adapters
 can complete rebind.
 
+For an unchanged canonical authority, `renew_gtpu_traffic_proof` starts a new
+assessment while the predecessor remains valid through its original expiry.
+Pass the current opaque proof and a lease from the same registered store. The
+eBPF adapter retains at most two attempts for that group, inside its existing
+global capacity: one issued predecessor and one successor. The successor gets
+a fresh registration, publication identity, secret and sample stream; it must
+collect its own paired bidirectional observations. Its traffic cannot extend
+the predecessor's assessment. Ordinary `begin_gtpu_traffic_proof` still
+supersedes the group's existing attempts.
+
+Keep the predecessor session until the successor has yielded an opaque proof
+and the product has validated and published it under its current guards. Then
+close the predecessor before another renewal. This exact cleanup cannot delete
+the successor registration. During collection, validation of the predecessor
+checks the SDK-owned successor relation and its current registration, source,
+attachment, group and canonical authority. Old challenges cannot prove the
+successor. Source loss, malformed or stale observations, hook drift and
+authority replacement still fail closed; no positive readiness flag is cached.
+
+Cancellation before session delivery leaves one pending successor recoverable
+by repeating renewal with the same current predecessor. No third registration
+is allocated. Closing or dropping the predecessor retires an undelivered
+successor; after delivery the new session owns its own cleanup. Expiry during
+the async handoff refuses delivery, and the caller must close the predecessor
+before beginning a fresh assessment. Failed publication remains terminal and
+exactly recoverable; renewal does not promise continuity across an uncertain
+kernel effect. Unsupported backends inherit a fail-closed default.
+
+Scheduling early enough to gather the replacement observations, publishing
+under product guards, and qualifying uninterrupted readiness remain CNF
+responsibilities. The renewal tests exercise the adapter with a fake runtime;
+they are not live packet-forwarding or carrier qualification evidence.
+
 The product drives an authenticated ICMP Echo challenge through the live
 session by calling `GtpuTrafficProofSession::challenge` with a distinct nonzero
 sample ID. The sample's high and low 16-bit halves are the exact ICMP Echo
@@ -2142,6 +2175,28 @@ reissuing a retired selector set. Product assertions do not qualify.
 Diagnostics expose only bounded state classifications,
 never selector, subscriber, or digest values.
 
+For a returning single-bearer session with the retired PAA/mark and a new local
+TEID, call `reconcile_reattached`. The SDK finds the unique completely retired
+predecessor in the same protected ledger, obtains exact backend retirement and
+reader-quiescence proof, and commits one successor edge plus the never-published
+TEID and complete install intent in one transaction. Active, stale, incomplete,
+changed, or already-consumed predecessors cannot authorize reuse. Old TEIDs and
+all history remain reserved. This bounded admission preserves the original
+`reconcile_fresh` and whole-set reuse checks; it does not implement general
+mixed-selector admission or backend-loss restore. Its first claim upgrades the
+ledger to `OPCSN17`, which older readers refuse. Pending intent recovery uses
+the same supervised exact recovery path after reopen or caller cancellation.
+The record and permanent-group capacity limits remain unchanged.
+
+The built-in eBPF quiescence mechanism requires a qualified non-realtime Linux
+XDP/TC profile with non-expedited `MEMBARRIER_CMD_GLOBAL` available. Exact
+retirement and selector absence are checked before and after that boundary
+under the host effect lock and current durable lease. Realtime/unknown kernel
+profiles, `nohz_full`, denied syscalls, or changed authority fail closed; there
+is no delay or expedited-barrier fallback. See [RFC 016 §5.4](../../docs/rfc/016-opaque-gtpu-selector-namespace.md#54-single-bearer-reattach)
+for the kernel assumptions and durable codec. Simulated adapter regressions
+prove lifecycle decisions, not real kernel RCU or forwarding qualification.
+
 Each process admits a bounded queue of selector operations but polls exactly
 one worker per protected storage-scope commitment from durable lease
 acquisition through release. This is part of the fence: a same-owner
@@ -2206,12 +2261,14 @@ A tc consumer retains the decoded index value first, extracts the group ID,
 performs one authority lookup, validates the selected generation and slot, and
 never re-reads the index. An old RCU holder may finish with its retained values.
 Consequently, `GtpuSessionGroupReconcileRequest` requires explicit selector
-provenance. `Fresh` attests through the caller's durable registry that an
+provenance. `Fresh` attests through the SDK's protected selector ledger that an
 introduced selector has never been published in the pin namespace. Reuse
 carries the complete exact retired source group plus an attestation that
 traffic was drained or an RCU grace period completed after exact removal.
-One retired proof must cover every selector introduced relative to the active
-base generation; combining selectors from several retired groups fails closed.
+For whole-set reuse, one retired proof must cover every selector introduced
+relative to the active base generation. The separately issued `Reattached`
+profile reserves one never-published local TEID with the exact retired PAA/mark
+as described above; combining selectors from several retired groups fails closed.
 Direct transfer from a live source group remains forbidden, and cross-device
 or same-group reuse evidence is rejected before mutation.
 
