@@ -149,6 +149,10 @@ first negotiated RPC, so an AppendEntries soft TTL cannot be exhausted by a
 successful handshake before the connection sends useful work. A cached lane
 resets shared reconnect backoff only after a complete validated reusable
 response proves the connection usable.
+Failure or cancellation during a negotiated call publishes one shared
+reconnect cooldown using the existing lifecycle policy. The loss retains the
+connection's admitted epoch, so a late predecessor cannot delay a newer epoch.
+A complete correlated semantic response does not count as transport loss.
 At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
 outbound lanes. During one bounded retirement step, at most one retiring
 generation per lane may overlap its replacement, for up to 120 server-side
