@@ -22,6 +22,32 @@ pub(super) struct SelectedBytes {
     _memory: crate::consensus::verified_snapshot::VerificationMemory,
 }
 
+// The reservation is bound to this exact selected range. Batch readers can
+// release earlier scratch on admission failure without retrying an integrity
+// or I/O failure, or trusting a caller-supplied reservation size.
+pub(super) struct ReservedSelectedRead<'a> {
+    range: &'a SelectedRange,
+    memory: crate::consensus::verified_snapshot::VerificationMemory,
+}
+
+impl ReservedSelectedRead<'_> {
+    pub(super) fn read(self, check: &impl Fn() -> io::Result<()>) -> io::Result<SelectedBytes> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.range.length as usize)
+            .map_err(|_| invalid("native selected row input allocation failed"))?;
+        bytes.resize(self.range.length as usize, 0);
+        self.range
+            .source
+            .read_exact_at(self.range.offset, &mut bytes)?;
+        check()?;
+        Ok(SelectedBytes {
+            bytes,
+            _memory: self.memory,
+        })
+    }
+}
+
 impl SelectedBytes {
     pub(super) fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -57,18 +83,19 @@ impl SelectedRange {
 
     pub(super) fn read(&self, check: &impl Fn() -> io::Result<()>) -> io::Result<SelectedBytes> {
         check()?;
+        self.reserve_read()?.read(check)
+    }
+
+    pub(super) fn length(&self) -> usize {
+        self.length as usize
+    }
+
+    pub(super) fn reserve_read(&self) -> io::Result<ReservedSelectedRead<'_>> {
         let memory =
             crate::consensus::verified_snapshot::VerificationMemory::reserve(self.length as usize)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(self.length as usize)
-            .map_err(|_| invalid("native selected row input allocation failed"))?;
-        bytes.resize(self.length as usize, 0);
-        self.source.read_exact_at(self.offset, &mut bytes)?;
-        check()?;
-        Ok(SelectedBytes {
-            bytes,
-            _memory: memory,
+        Ok(ReservedSelectedRead {
+            range: self,
+            memory,
         })
     }
 }

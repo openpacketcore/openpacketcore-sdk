@@ -591,7 +591,7 @@ pub(in crate::consensus::native) fn full_generic(
 }
 
 #[cfg(test)]
-pub(super) fn inspect_generic(
+pub(in crate::consensus::native) fn inspect_generic(
     bytes: &[u8],
     frontiers: &NativeFrontiers,
     check: &impl Fn() -> io::Result<()>,
@@ -641,6 +641,21 @@ pub(in crate::consensus::native) fn owned_generic(
     check()?;
     let format = expected.facts.format;
     let _memory = VerificationMemory::reserve(generic_scratch_format(bytes, format)?)?;
+    let result = owned_generic_row(bytes, expected_id, expected, frontiers)?;
+    check()?;
+    Ok(result)
+}
+
+// Both callers own the original preflight reservation for these exact bytes.
+// Keep complete decode, validation, fingerprint and independent-copy equality
+// together; parallel preparation cannot accept an externally supplied proof.
+fn owned_generic_row(
+    bytes: &[u8],
+    expected_id: SessionConsensusRequestId,
+    expected: facts::Row<facts::Request>,
+    frontiers: &NativeFrontiers,
+) -> io::Result<(NativeGenericReceipt, [u8; 32])> {
+    let format = expected.facts.format;
     let (id, decoded) = decode_generic(bytes, format)?;
     let decoded =
         decoded.ok_or_else(|| invalid("native resident request receipt selected a removal"))?;
@@ -661,8 +676,101 @@ pub(in crate::consensus::native) fn owned_generic(
         ));
     }
     drop(decoded);
-    check()?;
     Ok((row, content))
+}
+
+/// Exact selected bytes and their original, allocation-free shape preflight.
+/// This owns no semantic proof; admission below still decodes every field.
+pub(in crate::consensus::native) struct GenericInput {
+    input: resident::SelectedBytes,
+    id: SessionConsensusRequestId,
+    expected: facts::Row<facts::Request>,
+    scratch: usize,
+}
+
+impl GenericInput {
+    pub(in crate::consensus::native) fn new(
+        input: resident::SelectedBytes,
+        id: SessionConsensusRequestId,
+        expected: facts::Row<facts::Request>,
+    ) -> io::Result<Self> {
+        let scratch = generic_scratch_format(input.bytes(), expected.facts.format)?;
+        Ok(Self {
+            input,
+            id,
+            expected,
+            scratch,
+        })
+    }
+
+    pub(in crate::consensus::native) fn charged_bytes(&self) -> io::Result<usize> {
+        self.scratch
+            .checked_add(self.input.bytes().len())
+            .ok_or_else(|| invalid("native generic input charge overflows"))
+    }
+
+    pub(in crate::consensus::native) fn bytes(&self) -> &[u8] {
+        self.input.bytes()
+    }
+
+    pub(in crate::consensus::native) fn reserve(
+        self,
+        reserve: &impl Fn(usize) -> io::Result<VerificationMemory>,
+    ) -> GenericPreparation {
+        match reserve(self.scratch) {
+            Ok(memory) => GenericPreparation::Ready(PreparedGeneric {
+                input: self,
+                memory,
+            }),
+            Err(_) => GenericPreparation::Serial(self),
+        }
+    }
+}
+
+/// Pressure returns the same owned input to the original serial decoder.
+/// Neither outcome allocates a box or loses the exact selected byte owner.
+pub(in crate::consensus::native) enum GenericPreparation {
+    Ready(PreparedGeneric),
+    Serial(GenericInput),
+}
+
+/// The original scratch charge is inseparable from its preflighted input.
+pub(in crate::consensus::native) struct PreparedGeneric {
+    input: GenericInput,
+    memory: VerificationMemory,
+}
+
+/// Fully checked independent output, charged until resident insertion.
+pub(in crate::consensus::native) struct OwnedGeneric {
+    row: NativeGenericReceipt,
+    content: [u8; 32],
+    // The independent output stays charged until it enters the resident map.
+    _memory: VerificationMemory,
+}
+
+impl PreparedGeneric {
+    pub(in crate::consensus::native) fn decode(
+        self,
+        frontiers: &NativeFrontiers,
+    ) -> io::Result<OwnedGeneric> {
+        let (row, content) = owned_generic_row(
+            self.input.bytes(),
+            self.input.id,
+            self.input.expected,
+            frontiers,
+        )?;
+        Ok(OwnedGeneric {
+            row,
+            content,
+            _memory: self.memory,
+        })
+    }
+}
+
+impl OwnedGeneric {
+    pub(in crate::consensus::native) fn into_resident(self) -> (NativeGenericReceipt, [u8; 32]) {
+        (self.row, self.content)
+    }
 }
 
 #[cfg(test)]

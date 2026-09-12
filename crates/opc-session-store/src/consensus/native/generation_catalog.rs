@@ -299,7 +299,7 @@ impl Catalog {
         generic_order.sort_unstable_by_key(|id| generic.get(id).map(|row| row.range.offset));
         check()?;
         let mut selected_generic = changes::SelectedGenericRows::new(&storage.business.frontiers);
-        for id in generic_order {
+        let selections = generic_order.into_iter().map(|id| {
             let indexed = generic
                 .remove(&id)
                 .ok_or_else(|| invalid("native generic conversion ordered row missing"))?;
@@ -310,9 +310,13 @@ impl Catalog {
                 indexed.range.length,
                 MAX_ITEM,
             )?;
-            let input = range.read(check)?;
-            selected_generic.insert(input.bytes(), id, indexed.row, check)?;
-        }
+            Ok(changes::GenericSelection {
+                id,
+                row: indexed.row,
+                range,
+            })
+        });
+        selected_generic.insert_selected(selections, check)?;
         if !generic.is_empty() {
             return Err(invalid("native generic conversion omitted a row"));
         }

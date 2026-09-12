@@ -19,6 +19,10 @@ use sha2::{Digest as _, Sha256};
 mod frames;
 pub(super) use frames::{generic_payload, notification_payload, ordinary_payload};
 
+#[path = "changes_selected_generic.rs"]
+mod selected_generic;
+pub(super) use selected_generic::GenericSelection;
+
 const PROOF_MEMORY: usize = 64 * 1024 + size_of::<BusinessProof>() + 2 * size_of::<usize>();
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -125,6 +129,15 @@ impl SelectedGenericRows {
         }
         let (row, content) =
             generation::decode::owned_generic(bytes, id, expected, &self.frontiers, check)?;
+        self.insert_owned(id, row, content)
+    }
+
+    fn insert_owned(
+        &mut self,
+        id: SessionConsensusRequestId,
+        row: NativeGenericReceipt,
+        content: [u8; 32],
+    ) -> io::Result<()> {
         let row = SharedRow::new(row)?;
         self.table
             .replace(None, Some(RowStamp::new(content, row.revision())))?;
