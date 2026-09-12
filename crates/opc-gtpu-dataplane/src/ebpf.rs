@@ -64826,6 +64826,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_grouped_refused_reattach_cleanup_preserves_serving_sibling() {
+        use opc_session_store::{
+            EncryptingSessionBackend, OwnerId, SelectorLedgerStorageScope, SessionStore,
+            SqliteSessionBackend,
+        };
+        use opc_types::{NetworkFunctionKind, TenantId};
+
+        // Real protected coordinator and real eBPF adapter logic. Only kernel
+        // IO is synthetic; this test does not qualify RCU or packet forwarding.
+        let runtime = Arc::new(FakeRuntime::new());
+        let device_id = grouped_device_id(0x61);
+        let local = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let endpoints = GtpuLocalEndpointSet::new(local, None).unwrap();
+        let backend = Arc::new(attach_grouped_fake(runtime.clone(), device_id, endpoints).await);
+        let tenant = TenantId::from_static("selector-reattach-fixture");
+        let keys = Arc::new(opc_key::MemoryKeyProvider::new());
+        keys.insert_active_key(
+            opc_key::KeyId::new("selector-fixture-key").unwrap(),
+            opc_key::KeyPurpose::Session,
+            tenant.clone(),
+            opc_key::Zeroizing::new([0x53; 32]),
+        )
+        .unwrap();
+        let store = SessionStore::new(EncryptingSessionBackend::new(
+            Arc::new(SqliteSessionBackend::in_memory().unwrap()),
+            keys,
+            "selector-fixture",
+        ));
+        let authority = crate::GtpuSessionSelectorNamespaceAuthority::provision_protected(
+            store,
+            SelectorLedgerStorageScope::new(tenant, NetworkFunctionKind::from_static("epdg")),
+            backend
+                .selector_namespace_bootstrap(device_id)
+                .await
+                .unwrap(),
+            backend.clone(),
+            OwnerId::new("selector-fixture-worker").unwrap(),
+            std::time::Duration::from_secs(30),
+            32,
+        )
+        .await
+        .unwrap();
+        let old = grouped_group(
+            0x62,
+            device_id,
+            vec![grouped_v4_entry(0x1100_0001, 0x2100_0001)],
+        );
+        let sibling = grouped_group(
+            0x63,
+            device_id,
+            vec![grouped_entry_for_addresses(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 222)),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                local,
+                0x1100_0002,
+                0x2100_0002,
+                None,
+            )],
+        );
+        let active = authority
+            .reconcile_fresh(backend.clone(), old.clone())
+            .await
+            .unwrap();
+        drop(
+            authority
+                .reconcile_fresh(backend.clone(), sibling.clone())
+                .await
+                .unwrap(),
+        );
+        drop(
+            authority
+                .retire(backend.clone(), active, old.clone())
+                .await
+                .unwrap(),
+        );
+        let successor = grouped_group(
+            0x64,
+            device_id,
+            vec![grouped_v4_entry(0x1100_0003, 0x2100_0003)],
+        );
+        let before = {
+            let state = runtime.state();
+            (
+                state.session_groups.clone(),
+                state.session_uplink_index.clone(),
+                state.session_downlink_index.clone(),
+                state.session_transactions.clone(),
+                state.selector_operation_stamps.clone(),
+            )
+        };
+        assert!(authority
+            .reconcile_fresh(backend.clone(), successor.clone())
+            .await
+            .is_err());
+        assert!(authority
+            .recover_active(backend.clone(), successor.clone())
+            .await
+            .is_err());
+        assert!(authority
+            .recover_retired(backend.clone(), successor.clone())
+            .await
+            .is_err());
+        let terminal = match authority
+            .recover_retiring(backend.clone(), successor.clone())
+            .await
+        {
+            Ok(retired) => {
+                drop(retired);
+                true
+            }
+            Err(_) => authority
+                .seal_unadmitted(backend.clone(), successor.clone())
+                .await
+                .is_ok_and(|claim| claim.confirms_group(&authority, &successor)),
+        };
+        assert!(
+            terminal,
+            "a refused new group must settle exact no-effect cleanup"
+        );
+        for _ in 0..64 {
+            let claim = authority
+                .seal_unadmitted(backend.clone(), successor.clone())
+                .await
+                .unwrap();
+            assert!(claim.confirms_group(&authority, &successor));
+            assert!(!claim.confirms_group(&authority, &old));
+            assert!(!claim.confirms_group(&authority, &sibling));
+        }
+        assert!(authority
+            .reconcile_fresh(backend.clone(), successor.clone())
+            .await
+            .is_err());
+        assert!(authority
+            .seal_unadmitted(backend.clone(), sibling.clone())
+            .await
+            .is_err());
+        assert!(authority
+            .seal_unadmitted(backend.clone(), old.clone())
+            .await
+            .is_err());
+
+        // No proof may be recovered under missing or corrupted backend
+        // authority. Restoring the exact stamp permits another local attempt.
+        let key = (S2BU_IFINDEX, old.id().to_bytes());
+        let stamp = runtime
+            .state()
+            .selector_operation_stamps
+            .remove(&key)
+            .unwrap();
+        assert!(authority
+            .seal_unadmitted(backend.clone(), successor.clone())
+            .await
+            .is_err());
+        let mut corrupt = stamp;
+        corrupt[0] ^= 1;
+        runtime
+            .state()
+            .selector_operation_stamps
+            .insert(key, corrupt);
+        assert!(authority
+            .seal_unadmitted(backend.clone(), successor.clone())
+            .await
+            .is_err());
+        runtime.state().selector_operation_stamps.insert(key, stamp);
+        assert!(authority
+            .seal_unadmitted(backend.clone(), successor.clone())
+            .await
+            .unwrap()
+            .confirms_group(&authority, &successor));
+        drop(
+            authority
+                .recover_active(backend.clone(), sibling.clone())
+                .await
+                .unwrap(),
+        );
+        drop(
+            authority
+                .recover_retired(backend.clone(), old.clone())
+                .await
+                .unwrap(),
+        );
+        let state = runtime.state();
+        assert!(before.0 == state.session_groups);
+        assert!(before.1 == state.session_uplink_index);
+        assert!(before.2 == state.session_downlink_index);
+        assert!(before.3 == state.session_transactions);
+        assert!(before.4 == state.selector_operation_stamps);
+    }
+
+    #[tokio::test]
     async fn grouped_selector_bootstrap_is_minted_only_for_a_qualified_attachment() {
         let (backend, _runtime) = backend_with_fake();
         let device_id = grouped_device_id(0x79);
