@@ -33,6 +33,9 @@ use roster_index::Rosters;
 #[path = "generation_catalog_batch.rs"]
 mod batch;
 
+#[path = "generation_catalog_order.rs"]
+mod source_order;
+
 #[derive(Clone, Copy)]
 struct Range {
     offset: u64,
@@ -284,24 +287,17 @@ impl Catalog {
         // can repeatedly reload and verify blocks holding adjacent small rows.
         // Order only complete request IDs by their admitted source offsets;
         // each row still passes the same bound, decoder and semantic checks.
-        // Charge the temporary IDs before allocating, and remove each old
-        // catalog row before constructing its resident replacement.
-        let generic_order_memory = VerificationMemory::reserve(
-            generic
-                .len()
-                .checked_mul(size_of::<SessionConsensusRequestId>())
-                .ok_or_else(|| invalid("native generic conversion order overflows"))?,
+        // Charge temporary IDs and optional cached offsets before allocating;
+        // use the original IDs-only path if the cache cannot fit. Remove each
+        // old catalog row before constructing its resident replacement.
+        let source_order::Order {
+            ids: generic_order,
+            memory: generic_order_memory,
+        } = source_order::new(
+            generic.keys().copied(),
+            |id| generic.get(id).map(|row| row.range.offset),
+            check,
         )?;
-        let mut generic_order = Vec::new();
-        generic_order
-            .try_reserve_exact(generic.len())
-            .map_err(|_| invalid("native generic conversion order allocation failed"))?;
-        for id in generic.keys() {
-            check()?;
-            generic_order.push(*id);
-        }
-        generic_order.sort_unstable_by_key(|id| generic.get(id).map(|row| row.range.offset));
-        check()?;
         let mut selected_generic = changes::SelectedGenericRows::new(&storage.business.frontiers);
         let selections = generic_order.into_iter().map(|id| {
             let indexed = generic
