@@ -1,6 +1,7 @@
 //! Two-pass conversion of a detached original SQL image to a complete V4
 //! native generation. The exclusive connection borrow and read transaction
-//! span validation, counting and encoding. No decoded payload set is retained.
+//! span validation, counting and encoding. Notification decoding uses only a
+//! charged, bounded temporary batch; no payload cache survives either pass.
 //! The caller must sync and cold-admit the result before selecting any file.
 
 use super::*;
@@ -14,6 +15,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use sql::native_snapshot as source;
 use std::collections::BTreeMap;
+
+#[path = "generation_sqlite_notifications.rs"]
+mod notifications;
 
 fn db(error: rusqlite::Error) -> io::Error {
     io::Error::other(error)
@@ -40,12 +44,14 @@ fn scalar<const N: usize>(row: &Row<'_>, column: usize) -> io::Result<[u8; N]> {
 }
 
 fn row_memory(bytes: usize) -> io::Result<VerificationMemory> {
-    VerificationMemory::reserve(
-        bytes
-            .checked_mul(12)
-            .and_then(|bytes| bytes.checked_add(64 * 1024))
-            .ok_or_else(|| invalid("native SQL row reservation overflow"))?,
-    )
+    VerificationMemory::reserve(row_memory_bytes(bytes)?)
+}
+
+fn row_memory_bytes(bytes: usize) -> io::Result<usize> {
+    bytes
+        .checked_mul(12)
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .ok_or_else(|| invalid("native SQL row reservation overflow"))
 }
 
 fn timestamp(value: String) -> io::Result<Timestamp> {
@@ -78,8 +84,8 @@ const SMALL_BINARY_ROW_BYTES: usize = 4 * 1024;
 
 // One charged buffer is reused by the detached SQL pass. Small rows supply
 // their length from the completed encoding; larger rows keep the original
-// bounded streaming encoder. Neither pass retains a decoded row collection,
-// and the complete context comparison and cold admission remain mandatory.
+// bounded streaming encoder. The complete context comparison and independent
+// cold admission remain mandatory in addition to each bounded row batch.
 struct SqliteBinaryRows {
     // Wipe and free the buffer before returning its reservation.
     buffer: Zeroizing<Vec<u8>>,
@@ -619,38 +625,7 @@ impl<'a> SqlitePreparedBase<'a> {
                 binary_rows.write(writer, &(id, Some(&receipt)))?;
             }
         }
-        let mut notifications = self.tx.prepare("SELECT sequence,tx_id,entry_json,timestamp FROM session_replication_log ORDER BY sequence").map_err(db)?;
-        let mut rows = notifications.query([]).map_err(db)?;
-        while let Some(row) = rows.next().map_err(db)? {
-            check()?;
-            let encoded = bytes(row, 2, MAX_ITEM)?;
-            let _memory = row_memory(encoded.len())?;
-            let entry: ReplicationEntry = serde_json::from_slice(encoded)
-                .map_err(|_| invalid("native SQL notification cannot decode"))?;
-            let sequence: u64 = row.get(0).map_err(db)?;
-            if sequence != context.business.counts[3] as u64 + 1
-                || entry.tx_id.as_str().as_bytes()
-                    != bytes(row, 1, crate::backend::REPLICATION_TX_ID_MAX_BYTES)?
-                || entry.timestamp
-                    != timestamp(
-                        std::str::from_utf8(bytes(row, 3, 30)?)
-                            .map_err(|_| invalid("native SQL notification timestamp invalid"))?
-                            .to_owned(),
-                    )?
-            {
-                return Err(invalid("native SQL notification projection differs"));
-            }
-            validation::validate_notification(&entry, sequence, &context.business.frontiers)?;
-            sql::validate_sealed_replication_op(&entry.op)?;
-            account(
-                &mut context.business.counts[3],
-                &mut context.business.content[3],
-                changes::fingerprint(3, &sequence, &entry)?,
-                validation::MAX_ITEMS,
-            )?;
-            writer.write_all(&[3])?;
-            binary_rows.write(writer, &entry)?;
-        }
+        notifications::write(&self.tx, writer, &mut binary_rows, &mut context, check)?;
         let mut logs = self.tx.prepare("SELECT log_index,configuration_epoch,term,entry_json FROM consensus_log ORDER BY log_index").map_err(db)?;
         let mut rows = logs.query([]).map_err(db)?;
         while let Some(row) = rows.next().map_err(db)? {
