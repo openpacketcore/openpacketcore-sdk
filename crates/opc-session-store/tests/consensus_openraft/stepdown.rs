@@ -2,7 +2,7 @@
 
 use super::*;
 use opc_consensus::engine::raft::AppendEntriesResponse;
-use opc_consensus::engine::{CommittedLeaderId, LogId, Vote};
+use opc_consensus::engine::{LogId, Vote};
 
 // The entries vector is deliberately empty. Keep the exact engine request
 // field order and use its real vote/log types without exposing a storage port.
@@ -23,6 +23,7 @@ struct PrefixOnlyAppend {
     request_id: [u8; 16],
     matched: LogId<SessionConsensusNodeId>,
     responses: Arc<AtomicUsize>,
+    prefix_only: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -45,11 +46,24 @@ impl SessionConsensusRpcHandler for PrefixOnlyAppend {
                 result: Ok(encode_bounded(&reply).expect("bounded exact prefix reply")),
             };
         }
+        if self.prefix_only.load(Ordering::SeqCst) {
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Unavailable),
+            };
+        }
         self.inner.handle(authenticated_sender, request).await
     }
 }
 
 fn retained_sql_log_id(cluster: &TestCluster, node: usize) -> LogId<SessionConsensusNodeId> {
+    retained_sql_log_id_at(cluster, node, None)
+}
+
+fn retained_sql_log_id_at(
+    cluster: &TestCluster,
+    node: usize,
+    index: Option<u64>,
+) -> LogId<SessionConsensusNodeId> {
     let connection = rusqlite::Connection::open_with_flags(
         cluster
             ._directory
@@ -60,8 +74,8 @@ fn retained_sql_log_id(cluster: &TestCluster, node: usize) -> LogId<SessionConse
     .expect("independent read-only log witness");
     let bytes: Vec<u8> = connection
         .query_row(
-            "SELECT entry_json FROM consensus_log ORDER BY log_index DESC LIMIT 1",
-            [],
+            "SELECT entry_json FROM consensus_log WHERE (?1 IS NULL OR log_index = ?1) ORDER BY log_index DESC LIMIT 1",
+            [index],
             |row| row.get(0),
         )
         .expect("physical retained log entry");
@@ -80,6 +94,10 @@ fn retained_sql_log_end(cluster: &TestCluster, node: usize) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix() {
+    let _election_permit = ELECTION_AND_SNAPSHOT_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("existing election qualification permit");
     let mut cluster = TestCluster::start().await;
     cluster._directory.disable_cleanup(true);
     cluster._snapshot_directory.disable_cleanup(true);
@@ -105,6 +123,7 @@ async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_s
     let before_id = retained_sql_log_id(&cluster, leader);
     let before = before_id.index;
     let mut response_counts = Vec::new();
+    let prefix_only = Arc::new(AtomicBool::new(false));
     for follower in 0..MEMBER_COUNT {
         if follower == leader {
             continue;
@@ -116,12 +135,12 @@ async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_s
             request_id: *request.request_id().as_bytes(),
             matched: before_id,
             responses: responses.clone(),
+            prefix_only: prefix_only.clone(),
         }));
         response_counts.push(responses);
     }
-    // Retain only this leader's controlled outbound streams. A follower
-    // must not elect a different committed leader in the term used by the
-    // explicit higher-vote RPC below, including during the public timeout.
+    // Retain only this leader's controlled outbound streams until the exact
+    // public timeout and its uncommitted SQL suffix have been observed.
     for ((sender, _), path) in &cluster.paths {
         if *sender != leader {
             path.set_enabled(false);
@@ -148,16 +167,70 @@ async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_s
         }
     }
 
-    let successor = (0..MEMBER_COUNT).find(|node| *node != leader).unwrap();
-    let successor_id = cluster.stores[successor].status().node_id;
+    // Elect the successor with the actual surviving majority. Retain old
+    // prefix replies but prevent unrelated old-leader traffic from resetting
+    // their election. No successor RPC reaches the former leader yet.
+    prefix_only.store(true, Ordering::SeqCst);
+    let survivors = (0..MEMBER_COUNT)
+        .filter(|index| *index != leader)
+        .collect::<Vec<_>>();
+    for ((sender, receiver), path) in &cluster.paths {
+        if *sender != leader && *receiver != leader {
+            path.set_enabled(true);
+        }
+    }
+    let (successor_id, successor_term) = tokio::time::timeout(RECOVERY_TIMEOUT, async {
+        loop {
+            let reports = futures_util::future::join_all(
+                survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
+            )
+            .await;
+            let statuses = survivors
+                .iter()
+                .map(|index| cluster.stores[*index].status())
+                .collect::<Vec<_>>();
+            if let Some(candidate) = statuses[0].leader_id {
+                let next_term = statuses[0].term;
+                if next_term > term
+                    && candidate != store.status().node_id
+                    && reports.iter().all(DurableReadinessReport::is_ready)
+                    && statuses.iter().all(|status| {
+                        status.leader_id == Some(candidate)
+                            && status.term == next_term
+                            && status.applied_index >= Some(tail)
+                    })
+                {
+                    break (candidate, next_term);
+                }
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("actual surviving majority elects and commits its higher term");
+    let successor = survivors
+        .iter()
+        .copied()
+        .find(|index| cluster.stores[*index].status().node_id == successor_id)
+        .unwrap();
+    let conflict = retained_sql_log_id_at(&cluster, successor, Some(tail));
+    assert!(survivors
+        .iter()
+        .all(|index| retained_sql_log_id_at(&cluster, *index, Some(tail)) == conflict));
+    assert_eq!(conflict.leader_id.term, successor_term);
+    assert_eq!(
+        store.status().term,
+        term,
+        "old replication readers still own the old term"
+    );
+    assert_eq!(retained_sql_log_end(&cluster, leader), tail);
+    eprintln!("sdk_stepdown_real_majority term={successor_term} leader={successor_id:?} committed_conflict={conflict:?} old_tail={tail}");
     let identity = consensus_identity(&(0..MEMBER_COUNT).map(member).collect::<Vec<_>>());
-    let higher_vote = Vote::new_committed(term + 1, successor_id);
     let rpc = ConflictingEmptyAppend {
-        vote: higher_vote,
-        prev_log_id: Some(LogId::new(
-            CommittedLeaderId::new(term + 1, successor_id),
-            tail,
-        )),
+        vote: Vote::new_committed(successor_term, successor_id),
+        prev_log_id: Some(conflict),
         entries: Vec::new(),
         leader_commit: None,
     };
