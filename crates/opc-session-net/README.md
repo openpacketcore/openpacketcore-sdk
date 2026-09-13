@@ -285,6 +285,15 @@ exactly one ALPN. `/3` accepts only its roster operation set and exact
 tenant/scope/fence authority, never shares a lane or fallback path with `/1`
 or `/2`, and is excluded from `/2` capacity accounting and idle reclaim.
 
+For a recovered mutation roster, the first provider-authenticated Applied
+observation from status or adoption becomes conclusive under the current
+authority. It does not restore prepare/execute permission. Direct compensation
+still requires a complete conclusive roster with an irreversible abort result.
+An Applied observation retained before a genuinely ambiguous compensation is
+different: subsequent status/adoption cannot authorize another inverse. That
+attempt remains recovery-only until exact compensation is proved. Neither an
+incomplete roster nor an all-Applied roster grants compensation authority.
+
 This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
 retains #696's generic, single-record atomic fenced-transition capability,
