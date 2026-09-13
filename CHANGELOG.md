@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **First Applied recovery and compensation — `opc-session-net`:** a first
+  authenticated Applied status/adoption result no longer looks like an inverse
+  that was already dispatched. A complete conclusive aborting roster can
+  compensate that member once. Actual compensation ambiguity still prevents
+  another inverse, and incomplete or all-Applied rosters remain excluded.
 - **Nested NETCONF leaf-list recovery edits — `opc-yanggen`,
   `opc-netconf-server`:** generated numeric leafref leaf-lists now compile,
   and repeated typed list keys or singleton parents cannot bypass duplicate

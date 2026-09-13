@@ -4913,6 +4913,17 @@ where
                 .get(index)
                 .cloned()
                 .ok_or(ExecutorError::InvalidMember)?;
+            // Only a previously retained Applied proof can identify an
+            // ambiguous compensation. The first authenticated Applied result
+            // after admission/effect recovery has not dispatched an inverse.
+            let recovering_compensation = prior_attempt == LocalAttempt::OutcomeUnknown
+                && matches!(
+                    first_conclusive.as_ref(),
+                    Some(ConclusiveObservation {
+                        outcome: ProviderOutcome::AppliedExecuted | ProviderOutcome::AppliedAdopted,
+                        ..
+                    })
+                );
             let compensation = local
                 .compensations
                 .get(index)
@@ -5096,8 +5107,7 @@ where
                     ..
                 })
             ) && compensation.is_none()
-                && (prior_attempt == LocalAttempt::OutcomeUnknown
-                    || task.operation == ProviderOperation::Compensate);
+                && (recovering_compensation || task.operation == ProviderOperation::Compensate);
             let has_conclusive = first_conclusive.is_some();
             let attempt = local
                 .attempts
