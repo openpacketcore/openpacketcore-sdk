@@ -5814,6 +5814,10 @@ pub(crate) struct SqliteConsensusCore {
     /// Only one unvalidated receiver may own disk space for this core.
     pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
+    /// The latest process-owned install and its completion. This is not
+    /// persisted authority and is never reconstructed from staging files.
+    pub(crate) snapshot_install_progress:
+        tokio::sync::watch::Sender<Option<Arc<crate::consensus::storage::SnapshotInstallProgress>>>,
     /// The first failed state-machine snapshot install is fatal to this core.
     /// Wake a concurrently dispatched purge with that original error; the
     /// engine cannot consume its state-machine notification while awaiting
@@ -6540,6 +6544,7 @@ impl SqliteConsensusCore {
         #[cfg(not(target_os = "linux"))]
         let _ = fresh_native_basis;
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
+        let (snapshot_install_progress, _) = tokio::sync::watch::channel(None);
         let (snapshot_install_failure, _) = tokio::sync::watch::channel(None);
 
         if let Some(diagnostics) = backend.consensus_diagnostics.as_ref() {
@@ -6582,6 +6587,7 @@ impl SqliteConsensusCore {
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             applied_progress,
+            snapshot_install_progress,
             snapshot_install_failure,
             watchers: Arc::clone(&backend.watchers),
             #[cfg(test)]
@@ -24490,6 +24496,53 @@ fn validate_exact_log_prefix_from_witnesses_sync(
     Ok(())
 }
 
+struct PortableSnapshotRetainedBoundaries {
+    last_through_target: Option<LogId<SessionConsensusNodeId>>,
+    first_through_committed: Option<LogId<SessionConsensusNodeId>>,
+    last_through_committed: Option<LogId<SessionConsensusNodeId>>,
+}
+
+fn read_portable_snapshot_retained_boundaries_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    target_end: u64,
+    committed_index: Option<u64>,
+) -> io::Result<PortableSnapshotRetainedBoundaries> {
+    let start = logical_log_start(conn, identity, start)?;
+    let mut boundaries = PortableSnapshotRetainedBoundaries {
+        last_through_target: None,
+        first_through_committed: None,
+        last_through_committed: None,
+    };
+    let mut reuse = LogRowReadReuse::new(&LOG_ROW_RETENTION_BUDGET);
+    visit_log_range_with_reuse_sync(
+        conn,
+        identity,
+        LogRangeReadOptions {
+            start,
+            end: Some(target_end),
+            limit: None,
+            append_entries_batch: false,
+            recovery_profile: LogRangeRecoveryProfile::Strict,
+        },
+        &mut reuse,
+        |entry| {
+            boundaries.last_through_target = Some(entry.log_id);
+            if committed_index.is_some_and(|committed| entry.log_id.index <= committed) {
+                boundaries
+                    .first_through_committed
+                    .get_or_insert(entry.log_id);
+                boundaries.last_through_committed = Some(entry.log_id);
+            }
+        },
+    )?;
+    // Keep every original decode and membership projection. Only the full
+    // LogId boundaries are needed after this read-only range proof; release
+    // each decoded payload as it is visited instead of retaining the history.
+    Ok(boundaries)
+}
+
 /// Validate the one compacted interval which a portable snapshot install is
 /// allowed to replace without recreating its source log rows. The snapshot
 /// builder deliberately removes the source Raft rows and markers, while a
@@ -24577,9 +24630,14 @@ fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
             .index
             .checked_add(1)
             .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
-        let retained_through_target =
-            read_log_range_sync(conn, identity, start, Some(target_end), None)?;
-        if retained_through_target.last().map(|entry| entry.log_id) == Some(*target) {
+        let retained = read_portable_snapshot_retained_boundaries_sync(
+            conn,
+            identity,
+            start,
+            target_end,
+            preinstall_committed.map(|committed| committed.index),
+        )?;
+        if retained.last_through_target == Some(*target) {
             // The complete original payload audit above already includes this
             // exact target. No source row or marker changed during the range
             // projection in this transaction; retain every ordinary prefix
@@ -24626,23 +24684,19 @@ fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
         checked_i64(retained_end)?;
         // The original P+1..S read strictly decoded and projected this entire
         // P+1..C subset from the same membership state and purge floor. Reuse
-        // its rows only within this unchanged transaction. Exact full LogId
-        // boundaries and the absent-suffix query below remain mandatory.
-        let retained = &retained_through_target
-            [..retained_through_target.partition_point(|entry| entry.log_id.index < retained_end)];
-        if retained.first().map(|entry| entry.log_id.index) != Some(start)
-            || retained.last().map(|entry| entry.log_id) != Some(committed)
-        {
+        // its exact full LogId boundaries only within this unchanged
+        // transaction. The absent-suffix query below remains mandatory.
+        let first = retained.first_through_committed.ok_or_else(|| {
+            invalid_data("session consensus portable snapshot retained tail lacks exact boundaries")
+        })?;
+        if first.index != start || retained.last_through_committed != Some(committed) {
             return Err(invalid_data(
                 "session consensus portable snapshot retained tail lacks exact boundaries",
             ));
         }
         ensure_log_id_not_after(
             &floor,
-            &retained
-                .first()
-                .expect("retained tail exact boundaries require a first row")
-                .log_id,
+            &first,
             "session consensus portable snapshot retained tail regresses purge floor",
         )?;
         let has_retained_suffix: bool = conn
@@ -50154,6 +50208,65 @@ mod tests {
             save_test_snapshot_marker(&conn, log_id(snapshot_index), "portable-prefix-audit");
         }
         backend
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_prefix_audit_does_not_retain_decoded_history() {
+        for absent_tail in [false, true] {
+            let mut peaks = Vec::new();
+            for row_count in [512, 4096] {
+                let committed = log_id(row_count - 1);
+                let target = log_id(committed.index + if absent_tail { 100 } else { 0 });
+                let backend =
+                    portable_snapshot_prefix_audit_fixture(committed.index, target.index).await;
+                let conn = backend.conn.lock().await;
+                let changes = conn.total_changes();
+                let validate = || {
+                    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+                        &conn,
+                        identity(),
+                        ConsensusAuthorityProfile::Dynamic,
+                        Some(committed),
+                        Some(log_id(row_count / 2)),
+                        &target,
+                        !absent_tail,
+                    )
+                    .expect("audit every retained row and exact snapshot boundary");
+                };
+                validate();
+                let started = Instant::now();
+                let memory = allocation_counter::measure(|| {
+                    let boundaries = read_portable_snapshot_retained_boundaries_sync(
+                        &conn,
+                        identity(),
+                        8,
+                        target.index + 1,
+                        Some(committed.index),
+                    )
+                    .expect("same-thread complete retained-range audit");
+                    assert_eq!(boundaries.first_through_committed, Some(log_id(8)));
+                    assert_eq!(boundaries.last_through_committed, Some(committed));
+                    assert_eq!(boundaries.last_through_target, Some(committed));
+                });
+                eprintln!(
+                    "portable_snapshot_prefix_range_allocation rows={row_count} absent_tail={absent_tail} peak={} retained={} total={} elapsed_us={}",
+                    memory.bytes_max, memory.bytes_current, memory.bytes_total,
+                    started.elapsed().as_micros(),
+                );
+                assert_eq!(memory.bytes_current, 0, "the range retains no allocation");
+                assert_eq!(conn.total_changes(), changes, "the audit writes nothing");
+                peaks.push(memory.bytes_max);
+            }
+            // The complete audit above includes the required independent
+            // witness map and its parallel decoder. Measure only the range
+            // phase, whose allocations and drops stay on the calling thread.
+            // Eight times as many fixed-shape rows may double transient Rust
+            // scratch; fixture construction and SQLite's C heap are excluded.
+            assert!(
+                peaks[1] <= peaks[0] * 2,
+                "portable prefix validation retains decoded history: absent_tail={absent_tail}, peaks={peaks:?}",
+            );
+        }
     }
 
     #[tokio::test]

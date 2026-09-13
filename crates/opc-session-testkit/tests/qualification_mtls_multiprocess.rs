@@ -987,9 +987,18 @@ impl RecoveryTrafficProgressTracker {
     }
 
     fn next_deadline(&self, absolute_deadline: Instant) -> Instant {
-        self.pulse_deadline()
-            .min(self.coverage_deadline())
-            .min(absolute_deadline)
+        self.progress_deadline().min(absolute_deadline)
+    }
+
+    fn progress_deadline(&self) -> Instant {
+        self.pulse_deadline().min(self.coverage_deadline())
+    }
+
+    fn observation_deadline(&self, absolute_deadline: Option<Instant>) -> Instant {
+        // A rolling observation may discover an availability interruption and
+        // use the existing recovery allowance. Capturing its initial pulse
+        // deadline as an absolute deadline would silently remove that allowance.
+        absolute_deadline.map_or_else(|| self.progress_deadline(), |at| self.next_deadline(at))
     }
 }
 
@@ -3139,6 +3148,59 @@ struct FleetReadiness {
     required_quorum: usize,
     committed_index: Option<u64>,
     applied_index: Option<u64>,
+}
+
+/// A functional catch-up witness, independent of the transport cleanup clock.
+/// Elapsed time or progress by the surviving majority cannot complete it.
+struct MemberCatchupProgress {
+    initial_committed_index: Option<u64>,
+    last_applied: Vec<Option<u64>>,
+}
+
+impl MemberCatchupProgress {
+    fn new(member_count: usize) -> Self {
+        assert!(matches!(member_count, 3 | 5));
+        Self {
+            initial_committed_index: None,
+            last_applied: vec![None; member_count],
+        }
+    }
+
+    fn observe(&mut self, reports: &[FleetReadiness]) -> bool {
+        let member_count = self.last_applied.len();
+        let required_quorum = member_count / 2 + 1;
+        assert_eq!(reports.len(), member_count);
+        if self.initial_committed_index.is_none() {
+            self.initial_committed_index = reports
+                .iter()
+                .filter_map(|report| report.committed_index)
+                .max();
+        }
+        for (node_index, (previous, report)) in
+            self.last_applied.iter_mut().zip(reports).enumerate()
+        {
+            assert_eq!(report.node_index, node_index);
+            if let Some(applied) = report.applied_index {
+                assert!(
+                    previous.is_none_or(|previous| applied >= previous),
+                    "recovering voter lost an already observed applied frontier: node={node_index}, previous={previous:?}, report={report:?}"
+                );
+                *previous = Some(applied);
+            }
+        }
+        reports.iter().all(|report| {
+            report.ready
+                && report.reason_code == QualificationReadinessCode::Ready
+                && report.configured_voters == member_count
+                && report.fresh_reachable_voters == required_quorum
+                && report.agreeing_voters == required_quorum
+                && report.required_quorum == required_quorum
+                && report
+                    .applied_index
+                    .zip(self.initial_committed_index)
+                    .is_some_and(|(applied, target)| applied >= target)
+        })
+    }
 }
 
 struct CandidateEvidenceInputs {
@@ -5621,7 +5683,7 @@ impl Fleet {
         progress: &mut RecoveryTrafficProgressTracker,
         participants: &TrafficParticipants,
         phase: &str,
-        absolute_deadline: Instant,
+        absolute_deadline: Option<Instant>,
     ) {
         assert_eq!(participants.member_count, self.member_count());
         assert!(traffic_status_snapshot_matches(
@@ -5642,15 +5704,16 @@ impl Fleet {
             participants,
         ));
         loop {
-            let observation_deadline = progress.next_deadline(absolute_deadline);
+            let observation_deadline = progress.observation_deadline(absolute_deadline);
             let observation_started = Instant::now();
             assert!(
                 observation_started < observation_deadline,
-                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, pulse_elapsed={:?}, coverage_elapsed={:?}, observation_overrun={:?}, absolute_remaining={:?}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, pulse_elapsed={:?}, coverage_elapsed={:?}, observation_overrun={:?}, absolute_remaining={:?}, availability_recovery={}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
                 observation_started.saturating_duration_since(progress.pulse_observed_at),
                 observation_started.saturating_duration_since(progress.coverage_observed_at),
                 observation_started.saturating_duration_since(observation_deadline),
-                absolute_deadline.saturating_duration_since(observation_started),
+                absolute_deadline.map(|at| at.saturating_duration_since(observation_started)),
+                progress.pulse_recovery_extended,
                 progress.pulse_checkpoint,
                 progress.coverage_checkpoint,
                 self.stderr_diagnostics()
@@ -5692,7 +5755,10 @@ impl Fleet {
             ) {
                 progress.extend_pulse_for_availability_recovery();
             }
-            let pulse_deadline = progress.pulse_deadline().min(absolute_deadline);
+            let pulse_deadline = absolute_deadline.map_or_else(
+                || progress.pulse_deadline(),
+                |at| progress.pulse_deadline().min(at),
+            );
             let coverage_deadline = progress.coverage_deadline();
             let coverage_progressed = recovery_traffic_has_all_key_coverage(
                 &progress.coverage_checkpoint,
@@ -5706,7 +5772,8 @@ impl Fleet {
             );
 
             assert!(
-                deadline_allows_completion(traffic_observed_at, absolute_deadline),
+                absolute_deadline
+                    .is_none_or(|at| deadline_allows_completion(traffic_observed_at, at)),
                 "survivor traffic observation crossed the absolute recovered-member deadline: phase={phase}, current={traffic:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
@@ -5759,17 +5826,12 @@ impl Fleet {
         progress: &mut RecoveryTrafficProgressTracker,
         participants: &TrafficParticipants,
         phase: &str,
-        absolute_deadline: Instant,
     ) -> Instant {
         loop {
             let now = Instant::now();
-            assert!(
-                deadline_admits_complete_operation(now, absolute_deadline),
-                "recovered-member readiness exhausted its absolute operation budget: phase={phase}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
-            let probe_deadline = progress.next_deadline(absolute_deadline);
-            if deadline_admits_complete_operation(now, probe_deadline) {
+            if let RecoveryTrafficCommandPlan::DispatchBy(probe_deadline) =
+                recovery_traffic_command_plan(now, progress.progress_deadline())
+            {
                 return probe_deadline;
             }
             self.wait_for_recovery_traffic_progress(
@@ -5777,7 +5839,7 @@ impl Fleet {
                 progress,
                 participants,
                 phase,
-                absolute_deadline,
+                None,
             );
         }
     }
@@ -5811,7 +5873,7 @@ impl Fleet {
                         progress,
                         participants,
                         phase,
-                        absolute_deadline,
+                        Some(absolute_deadline),
                     );
                 }
             }
@@ -5824,32 +5886,34 @@ impl Fleet {
         progress: &mut RecoveryTrafficProgressTracker,
         participants: &TrafficParticipants,
         phase: &str,
-        absolute_deadline: Instant,
     ) {
         let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        let started = Instant::now();
+        let mut catchup = MemberCatchupProgress::new(self.member_count());
+        // Snapshot catch-up depends on backlog and shared storage throughput.
+        // It does not inherit the bounded connection fault-tail deadline.
+        // Each probe and survivor continuity observation retains its original
+        // deadline. A run that never reaches real readiness never passes;
+        // the existing integration-job watchdog still bounds a hung run.
         loop {
-            let member_count = self.member_count();
-            let required_quorum = self.required_quorum();
             let probe_deadline = self.recovery_readiness_probe_deadline(
                 availability_baseline,
                 progress,
                 participants,
                 phase,
-                absolute_deadline,
             );
             let reports = self.readiness_reports_by(&node_indices, probe_deadline);
-            if reports.iter().all(|report| {
-                report.ready
-                    && report.reason_code == QualificationReadinessCode::Ready
-                    && report.configured_voters == member_count
-                    && report.fresh_reachable_voters == required_quorum
-                    && report.agreeing_voters == required_quorum
-                    && report.required_quorum == required_quorum
-            }) {
+            if catchup.observe(&reports) {
                 assert!(
                     deadline_allows_completion(Instant::now(), probe_deadline),
                     "recovered-member readiness completed after its admitted operation deadline: phase={phase}, reports={reports:?}, stderr={:?}",
                     self.stderr_diagnostics()
+                );
+                eprintln!(
+                    "MTLS_RECOVERY_CATCHUP_COMPLETE phase={phase} elapsed_millis={} initial_committed={:?} applied={:?}",
+                    started.elapsed().as_millis(),
+                    catchup.initial_committed_index,
+                    catchup.last_applied,
                 );
                 return;
             }
@@ -5871,17 +5935,18 @@ impl Fleet {
                     );
                 }
             }
-            assert!(
-                deadline_allows_completion(Instant::now(), absolute_deadline),
-                "recovered-member readiness crossed its absolute deadline: phase={phase}, reports={reports:?}, stderr={:?}",
-                self.stderr_diagnostics()
+            eprintln!(
+                "MTLS_RECOVERY_CATCHUP_PENDING phase={phase} elapsed_millis={} initial_committed={:?} applied={:?}",
+                started.elapsed().as_millis(),
+                catchup.initial_committed_index,
+                catchup.last_applied,
             );
             self.wait_for_recovery_traffic_progress(
                 availability_baseline,
                 progress,
                 participants,
                 phase,
-                absolute_deadline,
+                None,
             );
         }
     }
@@ -6843,7 +6908,7 @@ impl Fleet {
             traffic_progress,
             participants,
             "existing-generation-survivor-origin-wave",
-            absolute_deadline,
+            Some(absolute_deadline),
         );
         // Recovered-origin paths use the recovered process's one command lane
         // and remain sequential, with their existing bounded passive pulses.
@@ -6866,7 +6931,7 @@ impl Fleet {
                 traffic_progress,
                 participants,
                 "existing-generation-incident-path",
-                absolute_deadline,
+                Some(absolute_deadline),
             );
         }
         let generation_deadline = self.recovery_traffic_command_deadline(
@@ -6886,7 +6951,7 @@ impl Fleet {
             traffic_progress,
             participants,
             "existing-generation-path-generation-check",
-            absolute_deadline,
+            Some(absolute_deadline),
         );
     }
 
@@ -6960,22 +7025,35 @@ impl Fleet {
             &mut traffic_progress,
             participants,
             "replacement-all-voter-readiness",
-            recovery_deadline,
         );
         self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
             &mut traffic_progress,
             participants,
             "replacement-all-voter-readiness",
-            recovery_deadline,
+            None,
         );
-        self.verify_canary_by(traffic_progress.next_deadline(recovery_deadline));
+        self.verify_canary_by(traffic_progress.progress_deadline());
         self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
             &mut traffic_progress,
             participants,
             "replacement-canary-verification",
-            recovery_deadline,
+            None,
+        );
+        // Begin the bounded fault-outcome observation after catch-up. The
+        // full original server/connect/backoff tail is still observed, and
+        // its deadline cannot be spent by snapshot reconstruction first.
+        let settlement_started = Instant::now();
+        let settlement_deadline = settlement_started
+            + Duration::from_millis(
+                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+            );
+        eprintln!(
+            "MTLS_RECOVERY_SETTLEMENT_START phase={phase} since_publication_millis={}",
+            settlement_started
+                .duration_since(recovery_started)
+                .as_millis(),
         );
         let readiness_probe_commands_before_settlement = self.readiness_probe_commands;
         let (lifecycle_before, clean_traffic_baseline) = self
@@ -6983,8 +7061,8 @@ impl Fleet {
                 before: fault_lifecycle_before,
                 participants,
                 phase,
-                started: recovery_started,
-                deadline: recovery_deadline,
+                started: settlement_started,
+                deadline: settlement_deadline,
                 traffic_before: traffic_availability_baseline,
                 traffic_progress,
             });
@@ -19842,6 +19920,59 @@ fn member_recovery_survivor_origin_wave_has_no_cross_survivor_head_of_line_block
 }
 
 #[test]
+fn member_recovery_rolling_observation_keeps_the_existing_availability_allowance() {
+    let observed_at = Instant::now();
+    let (participants, before, mut interrupted) = subset_traffic_fixture();
+    let mut progress = RecoveryTrafficProgressTracker::new(before.clone(), observed_at);
+    let initial_deadline = progress.observation_deadline(None);
+    assert_eq!(initial_deadline, observed_at + Duration::from_secs(13));
+
+    interrupted[0].status.availability_interruption_episodes += 1;
+    interrupted[0].status.availability_interruptions += 1;
+    assert!(subset_traffic_availability_changed_since(
+        &before,
+        &interrupted,
+        &participants,
+    ));
+    progress.extend_pulse_for_availability_recovery();
+    let recovery_deadline = observed_at + Duration::from_secs(26);
+    assert_eq!(progress.observation_deadline(None), recovery_deadline);
+    assert!(deadline_allows_completion(
+        observed_at + Duration::from_millis(13_013),
+        progress.observation_deadline(None),
+    ));
+    assert!(!deadline_allows_completion(
+        recovery_deadline + Duration::from_nanos(1),
+        progress.observation_deadline(None),
+    ));
+
+    // Refreshing one key must still leave the independent all-key boundary.
+    progress.record_pulse(interrupted, observed_at + Duration::from_secs(20));
+    assert_eq!(progress.observation_deadline(None), recovery_deadline);
+}
+
+#[test]
+fn member_recovery_absolute_phase_still_bounds_an_availability_allowance() {
+    let observed_at = Instant::now();
+    let mut progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    let phase_deadline = observed_at + Duration::from_secs(20);
+    progress.extend_pulse_for_availability_recovery();
+    assert_eq!(
+        progress.observation_deadline(Some(phase_deadline)),
+        phase_deadline
+    );
+    assert!(!deadline_allows_completion(
+        phase_deadline + Duration::from_nanos(1),
+        progress.observation_deadline(Some(phase_deadline)),
+    ));
+    assert_eq!(
+        progress.observation_deadline(Some(observed_at + Duration::from_secs(86))),
+        observed_at + Duration::from_secs(26),
+        "a phase deadline never replaces the stricter rolling continuity bounds"
+    );
+}
+
+#[test]
 fn member_recovery_near_expiry_checkpoint_refreshes_before_a_wave_and_reserves_observation() {
     let observed_at = Instant::now();
     let absolute_deadline =
@@ -20454,6 +20585,127 @@ fn epoch_changing_bounds_cap_supersession_and_reject_abandonment_or_timeout() {
         assert_epoch_changing_lifecycle_delta_bounds(member_count, &before, &real_timeout, 0);
     })
     .is_err());
+}
+
+#[test]
+fn member_catchup_requires_the_recovering_voter_despite_majority_progress() {
+    for member_count in [3, 5] {
+        let mut reports = member_catchup_reports(member_count, 100);
+        reports[1].ready = false;
+        reports[1].reason_code = QualificationReadinessCode::NoQuorum;
+        reports[1].committed_index = None;
+        reports[1].applied_index = Some(10);
+        let mut progress = MemberCatchupProgress::new(member_count);
+        assert!(!progress.observe(&reports));
+        for frontier in [200, 1_000, 10_000] {
+            for report in reports.iter_mut().filter(|report| report.node_index != 1) {
+                report.committed_index = Some(frontier);
+                report.applied_index = Some(frontier);
+            }
+            assert!(
+                !progress.observe(&reports),
+                "majority progress must not complete a stalled voter's catch-up"
+            );
+        }
+        reports[1].applied_index = Some(100);
+        assert!(
+            !progress.observe(&reports),
+            "crossing the original frontier does not replace actual readiness"
+        );
+        reports[1] = member_catchup_reports(member_count, 10_000)[1];
+        assert!(progress.observe(&reports));
+    }
+}
+
+#[test]
+fn member_catchup_rejects_readiness_below_its_observed_committed_frontier() {
+    let mut reports = member_catchup_reports(3, 100);
+    reports[1].applied_index = Some(99);
+    let mut progress = MemberCatchupProgress::new(3);
+    assert!(!progress.observe(&reports));
+    reports[1].applied_index = Some(100);
+    assert!(progress.observe(&reports));
+}
+
+#[test]
+fn member_catchup_missing_observation_cannot_hide_applied_regression() {
+    let mut reports = member_catchup_reports(3, 100);
+    let mut progress = MemberCatchupProgress::new(3);
+    assert!(progress.observe(&reports));
+    reports[1].applied_index = None;
+    assert!(!progress.observe(&reports));
+    reports[1].applied_index = Some(99);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        progress.observe(&reports)
+    }))
+    .is_err());
+}
+
+#[test]
+fn member_catchup_keeps_every_quorum_readiness_witness() {
+    for member_count in [3, 5] {
+        let reports = member_catchup_reports(member_count, 100);
+        let required_quorum = member_count / 2 + 1;
+        for field in 0..5 {
+            let mut bad = reports.clone();
+            match field {
+                0 => bad[1].configured_voters -= 1,
+                1 => bad[1].fresh_reachable_voters = required_quorum - 1,
+                2 => bad[1].agreeing_voters = required_quorum - 1,
+                3 => bad[1].required_quorum = required_quorum - 1,
+                4 => bad[1].reason_code = QualificationReadinessCode::NoQuorum,
+                _ => unreachable!(),
+            }
+            assert!(!MemberCatchupProgress::new(member_count).observe(&bad));
+        }
+        assert!(MemberCatchupProgress::new(member_count).observe(&reports));
+    }
+}
+
+#[test]
+fn member_catchup_does_not_borrow_the_connection_settlement_deadline() {
+    let publication = Instant::now();
+    let old_settlement_deadline = publication
+        + Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS);
+    let observed_at = old_settlement_deadline + Duration::from_secs(1);
+    let progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    assert!(deadline_admits_complete_operation(
+        observed_at,
+        progress.progress_deadline(),
+    ));
+    assert!(
+        !deadline_admits_complete_operation(
+            observed_at,
+            progress.next_deadline(old_settlement_deadline),
+        ),
+        "the historical clock remains expired; catch-up must use its own observations"
+    );
+    let mut reports = member_catchup_reports(3, 100);
+    reports[1].ready = false;
+    let mut catchup = MemberCatchupProgress::new(3);
+    assert!(!catchup.observe(&reports));
+    reports[1].ready = true;
+    assert!(catchup.observe(&reports));
+}
+
+fn member_catchup_reports(member_count: usize, frontier: u64) -> Vec<FleetReadiness> {
+    let required_quorum = member_count / 2 + 1;
+    (0..member_count)
+        .map(|node_index| FleetReadiness {
+            node_index,
+            ready: true,
+            reason_code: QualificationReadinessCode::Ready,
+            node_id: u64::try_from(node_index + 1).expect("bounded node identifier"),
+            term: 7,
+            leader_id: Some(1),
+            configured_voters: member_count,
+            fresh_reachable_voters: required_quorum,
+            agreeing_voters: required_quorum,
+            required_quorum,
+            committed_index: Some(frontier),
+            applied_index: Some(frontier),
+        })
+        .collect()
 }
 
 #[test]

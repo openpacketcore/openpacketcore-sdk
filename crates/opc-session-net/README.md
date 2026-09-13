@@ -152,7 +152,9 @@ extend either caller's logical deadline. The reserved final third carries the
 first negotiated RPC, so an AppendEntries soft TTL cannot be exhausted by a
 successful handshake before the connection sends useful work. A cached lane
 resets shared reconnect backoff only after a complete validated reusable
-response proves the connection usable.
+response proves the connection usable. Successful cold bootstrap releases its
+setup permit without resetting that backoff, so repeated handshakes followed
+by RPC timeouts retain the existing retry escalation.
 Failure or cancellation during a negotiated call publishes one shared
 reconnect cooldown using the existing lifecycle policy. The loss retains the
 connection's admitted epoch, so a late predecessor cannot delay a newer epoch.
@@ -995,10 +997,10 @@ authenticated connection, bound to the immutable consensus/configuration
 identity, remote node, admitted TLS material epoch, and explicit
 reauthentication generation. It is monitored for evidence changes, lifecycle
 retirement, and pool shutdown. If a change races with a claim, the claimant
-revalidates and records retirement before dispatch. A connection whose
-authenticated evidence matches the current local generation/material epoch and
-is still dispatch-usable resets the gate. If reconnect cooldown extends beyond
-the admitted cold deadline, that caller returns `Timeout` without dialing or
+revalidates and records retirement before dispatch. A complete reusable RPC
+response on a connection whose authenticated evidence matches the current
+local generation/material epoch resets the consensus gate. If reconnect
+cooldown extends beyond the admitted cold deadline, that caller returns `Timeout` without dialing or
 spinning; a later RPC may retry. Publishing a newer material epoch or requesting
 explicit reauthentication supersedes old cooldowns and cancels an old-epoch
 handshake; the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope,

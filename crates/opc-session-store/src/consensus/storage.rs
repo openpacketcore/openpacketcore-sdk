@@ -72,6 +72,108 @@ const SNAPSHOT_FIXED_INSTALL_RESERVATION_ENTRIES: usize = SNAPSHOT_SQLITE_ARTIFA
 const SNAPSHOT_BUILD_RESERVATION_ENTRIES: usize = SNAPSHOT_SQLITE_ARTIFACT_MAX_ENTRIES * 2;
 const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// One real state-machine install, retained only until its successor starts.
+/// Its identity is an ordering witness, never permission to delete a log.
+pub(crate) struct SnapshotInstallProgress {
+    through: Option<LogId<SessionConsensusNodeId>>,
+    started_at: tokio::time::Instant,
+    completed_at: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+}
+
+/// Only the install future owns this guard. Observers cannot keep an install
+/// alive: dropping the future publishes cancellation before its completion.
+struct SnapshotInstallGuard {
+    progress: Arc<SnapshotInstallProgress>,
+    failure: tokio::sync::watch::Sender<Option<StorageError<SessionConsensusNodeId>>>,
+    cancellation: Option<StorageError<SessionConsensusNodeId>>,
+}
+
+fn record_snapshot_install_failure(
+    failure: &tokio::sync::watch::Sender<Option<StorageError<SessionConsensusNodeId>>>,
+    error: &StorageError<SessionConsensusNodeId>,
+) {
+    failure.send_if_modified(|first| {
+        if first.is_none() {
+            *first = Some(error.clone());
+            true
+        } else {
+            false
+        }
+    });
+}
+
+impl SnapshotInstallGuard {
+    fn begin(
+        core: &SqliteConsensusCore,
+        meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    ) -> Result<Self, Box<StorageError<SessionConsensusNodeId>>> {
+        let (completed_at, _) = tokio::sync::watch::channel(None);
+        let progress = Arc::new(SnapshotInstallProgress {
+            through: meta.last_log_id,
+            started_at: tokio::time::Instant::now(),
+            completed_at,
+        });
+        // Openraft has one state-machine worker. Do not let a second direct
+        // caller replace the completion witness of an unfinished install.
+        let admitted = core.snapshot_install_progress.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|current| current.completed_at.borrow().is_none())
+            {
+                false
+            } else {
+                *current = Some(Arc::clone(&progress));
+                true
+            }
+        });
+        if !admitted {
+            let error = storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "session consensus snapshot install is already active",
+                ),
+            );
+            record_snapshot_install_failure(&core.snapshot_install_failure, &error);
+            return Err(Box::new(error));
+        }
+        Ok(Self {
+            progress,
+            failure: core.snapshot_install_failure.clone(),
+            cancellation: Some(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "session consensus snapshot install was cancelled",
+                ),
+            )),
+        })
+    }
+
+    fn complete(mut self, result: &Result<(), StorageError<SessionConsensusNodeId>>) {
+        if let Err(error) = result {
+            record_snapshot_install_failure(&self.failure, error);
+        }
+        self.cancellation = None;
+        self.progress
+            .completed_at
+            .send_replace(Some(tokio::time::Instant::now()));
+    }
+}
+
+impl Drop for SnapshotInstallGuard {
+    fn drop(&mut self) {
+        if let Some(error) = self.cancellation.take() {
+            record_snapshot_install_failure(&self.failure, &error);
+            self.progress
+                .completed_at
+                .send_replace(Some(tokio::time::Instant::now()));
+        }
+    }
+}
+
 /// Test-only witness for the expensive live-terminal branch. The production
 /// fast probe cannot reach `reconcile_with_gate`, so a focused test can prove
 /// that clear/active calls neither select nor open a current snapshot.
@@ -5147,22 +5249,12 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
         snapshot: Box<SessionSnapshotFile>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let install = SnapshotInstallGuard::begin(&self.core, meta).map_err(|error| *error)?;
         let result = self
             .install_snapshot_inner(meta, snapshot)
             .await
             .map_err(|error| *error);
-        if let Err(error) = &result {
-            self.core
-                .snapshot_install_failure
-                .send_if_modified(|first| {
-                    if first.is_none() {
-                        *first = Some(error.clone());
-                        true
-                    } else {
-                        false
-                    }
-                });
-        }
+        install.complete(&result);
         result
     }
 
@@ -6038,24 +6130,53 @@ async fn wait_until_applied(
             "session consensus apply wait timed out",
         ))
     };
-    let deadline = tokio::time::Instant::now()
-        .checked_add(SNAPSHOT_APPLY_WAIT)
-        .ok_or_else(|| {
-            waiting_error(consensus::invalid_data(
-                "session consensus apply wait is invalid",
-            ))
-        })?;
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at.checked_add(SNAPSHOT_APPLY_WAIT).ok_or_else(|| {
+        waiting_error(consensus::invalid_data(
+            "session consensus apply wait is invalid",
+        ))
+    })?;
     let mut applied_progress = core.applied_progress.subscribe();
     let mut install_failure = core.snapshot_install_failure.subscribe();
+    let mut installs = core.snapshot_install_progress.subscribe();
+    let mut owned_install: Option<tokio::sync::watch::Receiver<Option<tokio::time::Instant>>> =
+        None;
+    let mut deadline_elapsed = false;
     loop {
         if let Some(error) = install_failure.borrow_and_update().clone() {
             return Err(Box::new(error));
         }
+        if owned_install.is_none() {
+            if let Some(install) = installs.borrow_and_update().as_ref() {
+                let completion = install.completed_at.subscribe();
+                // An old completed install, a different full LogId, or an
+                // install first started after the original guard expired
+                // cannot extend an ordinary apply wait. Completion time also
+                // retains a real owner that started and finished between polls.
+                let overlaps_wait = completion.borrow().is_none_or(|at| at >= started_at);
+                if install.through == Some(*through)
+                    && install.started_at <= deadline
+                    && overlaps_wait
+                {
+                    owned_install = Some(completion);
+                }
+            }
+        }
+        // Read completion before applied coverage: a completed install must
+        // already have published its durable floor or its original error.
+        let install_completed = owned_install
+            .as_mut()
+            .is_some_and(|install| install.borrow_and_update().is_some());
+        if install_completed {
+            if let Some(error) = install_failure.borrow_and_update().clone() {
+                return Err(Box::new(error));
+            }
+        }
         let applied = *applied_progress.borrow_and_update();
-        // A ready watch can win over an expired timeout when this task was
-        // not polled in time. Observe coverage within the original absolute
-        // deadline, including after partial progress wakes this loop again.
-        if tokio::time::Instant::now() > deadline {
+        // Ordinary apply keeps the original absolute deadline, including
+        // delayed polling and partial progress. A matching live install uses
+        // completion ordering instead of a size-independent recovery timeout.
+        if owned_install.is_none() && tokio::time::Instant::now() > deadline {
             return Err(Box::new(timed_out()));
         }
         if let Some(applied) = applied {
@@ -6068,15 +6189,41 @@ async fn wait_until_applied(
                 ))));
             }
         }
-        tokio::time::timeout_at(deadline, async {
+        if install_completed {
+            return Err(Box::new(waiting_error(consensus::invalid_data(
+                "session consensus snapshot install completed without applied coverage",
+            ))));
+        }
+        let changed = if let Some(install) = owned_install.as_mut() {
             tokio::select! {
                 changed = applied_progress.changed() => changed,
                 changed = install_failure.changed() => changed,
+                changed = install.changed() => changed,
             }
-        })
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|_| {
+        } else {
+            if deadline_elapsed {
+                return Err(Box::new(timed_out()));
+            }
+            match tokio::time::timeout_at(deadline, async {
+                tokio::select! {
+                    changed = applied_progress.changed() => changed,
+                    changed = install_failure.changed() => changed,
+                    changed = installs.changed() => changed,
+                }
+            })
+            .await
+            {
+                Ok(changed) => changed,
+                Err(_) => {
+                    // A matching install may have started at the same instant
+                    // the timer became ready. Recheck its recorded start once;
+                    // never reset or move the original deadline.
+                    deadline_elapsed = true;
+                    continue;
+                }
+            }
+        };
+        changed.map_err(|_| {
             waiting_error(consensus::invalid_data(
                 "session consensus apply progress channel closed",
             ))
@@ -16143,6 +16290,336 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(SessionConsensusStorageError::RecoveryRequired, error);
+    }
+
+    async fn owned_purge_wait_fixture() -> (
+        tempfile::TempDir,
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+    ) {
+        let directory = tempfile::tempdir().expect("owned purge fixture");
+        let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
+            .expect("owned purge backend");
+        let (log, machine) = open(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("owned purge storage");
+        (directory, log, machine)
+    }
+
+    fn owned_purge_meta(
+        through: LogId<SessionConsensusNodeId>,
+    ) -> SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode> {
+        SnapshotMeta {
+            last_log_id: Some(through),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "owned-purge-lifecycle-control".to_owned(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_owned_install_completes_between_waiter_polls() {
+        let (_directory, log, _machine) = owned_purge_wait_fixture().await;
+        let through = log_id(1);
+        let wait = wait_until_applied(&log.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        let guard = SnapshotInstallGuard::begin(&log.core, &owned_purge_meta(through))
+            .expect("exact install starts within original guard");
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        log.core.applied_progress.send_replace(Some(through));
+        guard.complete(&Ok(()));
+        wait.await
+            .expect("retain the exact completed install across delayed polling");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_owned_install_requires_exact_target_and_timely_start() {
+        for (target, late_start) in [
+            (log_id_with_term(2, 1), false),
+            (log_id(2), false),
+            (log_id(1), true),
+        ] {
+            let (_directory, log, _machine) = owned_purge_wait_fixture().await;
+            let through = log_id(1);
+            let wait = wait_until_applied(&log.core, &through);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            if late_start {
+                tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+            }
+            let guard = SnapshotInstallGuard::begin(&log.core, &owned_purge_meta(target))
+                .expect("start unrelated or late install");
+            if !late_start {
+                tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+            }
+            let error = wait
+                .await
+                .expect_err("unrelated or late owner cannot extend the guard");
+            assert!(error
+                .to_string()
+                .contains("session consensus apply wait timed out"));
+            guard.complete(&Ok(()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_owned_install_cannot_reuse_a_completed_owner() {
+        let (_directory, log, _machine) = owned_purge_wait_fixture().await;
+        let through = log_id(1);
+        let guard = SnapshotInstallGuard::begin(&log.core, &owned_purge_meta(through))
+            .expect("previous install");
+        guard.complete(&Ok(()));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        let wait = wait_until_applied(&log.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        let error = wait
+            .await
+            .expect_err("a completed predecessor is not a live owner");
+        assert!(error
+            .to_string()
+            .contains("session consensus apply wait timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_owned_install_completion_requires_durable_coverage() {
+        let (_directory, log, _machine) = owned_purge_wait_fixture().await;
+        let through = log_id(1);
+        let guard = SnapshotInstallGuard::begin(&log.core, &owned_purge_meta(through))
+            .expect("install owner");
+        let wait = wait_until_applied(&log.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        guard.complete(&Ok(()));
+        let std::task::Poll::Ready(Err(error)) = futures_util::poll!(&mut wait) else {
+            panic!("completion without durable coverage must fail immediately");
+        };
+        assert!(error
+            .to_string()
+            .contains("completed without applied coverage"));
+        assert_eq!(*log.core.applied_progress.borrow(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_owned_install_failure_precedes_late_coverage() {
+        let (_directory, log, _machine) = owned_purge_wait_fixture().await;
+        let through = log_id(1);
+        let guard = SnapshotInstallGuard::begin(&log.core, &owned_purge_meta(through))
+            .expect("install owner");
+        let wait = wait_until_applied(&log.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        let failure = storage_error(
+            ErrorSubject::StateMachine,
+            ErrorVerb::Write,
+            io::Error::other("exact owned install failure"),
+        );
+        guard.complete(&Err(failure.clone()));
+        log.core.applied_progress.send_replace(Some(through));
+        let error = wait
+            .await
+            .expect_err("original failure precedes coverage and timeout");
+        assert_eq!(error.to_string(), failure.to_string());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_owned_install_preserves_full_applied_log_id() {
+        let (_directory, log, _machine) = owned_purge_wait_fixture().await;
+        let through = log_id(1);
+        let guard = SnapshotInstallGuard::begin(&log.core, &owned_purge_meta(through))
+            .expect("install owner");
+        let wait = wait_until_applied(&log.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        log.core
+            .applied_progress
+            .send_replace(Some(log_id_with_term(2, 1)));
+        let error = wait
+            .await
+            .expect_err("ownership never weakens full-LogId coverage");
+        assert!(error
+            .to_string()
+            .contains("session consensus applied log conflicts with purge"));
+        guard.complete(&Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn covered_log_purge_owned_install_cancellation_wakes_without_another_timer() {
+        let (_directory, log, _machine) = owned_purge_wait_fixture().await;
+        let through = log_id(1);
+        let guard = SnapshotInstallGuard::begin(&log.core, &owned_purge_meta(through))
+            .expect("install owner");
+        let wait = wait_until_applied(&log.core, &through);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        drop(guard);
+        let std::task::Poll::Ready(Err(error)) = futures_util::poll!(&mut wait) else {
+            panic!("dropping the install future must wake its purge immediately");
+        };
+        assert!(error
+            .to_string()
+            .contains("session consensus snapshot install was cancelled"));
+        assert_eq!(*log.core.applied_progress.borrow(), None);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    async fn verify_owned_snapshot_install_outlives_purge_guard(native: bool, cancel: bool) {
+        let (_source_directory, mut incoming) = strict_private_install_snapshot().await;
+        let directory = FixedRawReadStoreFixture::new();
+        let token = Arc::new(if native {
+            consensus::wal::integration::PrivateWalTest::new_native(
+                directory.path().join("wal"),
+                [0xD4; 32],
+            )
+        } else {
+            consensus::wal::integration::PrivateWalTest::new(
+                directory.path().join("wal"),
+                [0xD4; 32],
+            )
+        });
+        let (backend, mut log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .expect("open delayed-install target");
+        append_commit_and_apply(
+            &mut log,
+            &mut machine,
+            [fixed_initial_membership_entry()],
+            "delayed-install predecessor",
+        )
+        .await;
+        let receiving = receive_private_install_snapshot(&mut machine, &mut incoming).await;
+        let core = machine.core.clone();
+        let mut applied_observer = machine.clone();
+        let mut log_observer = log.get_log_reader().await;
+        let gate = core.snapshot_gate.lock().await;
+        let mut install = install_private_snapshot(&mut machine, &incoming.meta, receiving);
+        assert!(futures_util::poll!(&mut install).is_pending());
+        tokio::time::pause();
+        let mut purge = Box::pin(log.purge(log_id(2)));
+        assert!(futures_util::poll!(&mut purge).is_pending());
+        tokio::time::advance(SNAPSHOT_APPLY_WAIT + Duration::from_nanos(1)).await;
+        let delayed_purge = futures_util::poll!(&mut purge);
+        tokio::time::resume();
+        let remained_pending = delayed_purge.is_pending();
+        assert_eq!(
+            applied_observer
+                .applied_state()
+                .await
+                .expect("backend applied witness")
+                .0,
+            Some(log_id(0)),
+        );
+        assert_eq!(
+            log_observer
+                .get_log_state()
+                .await
+                .expect("backend log witness")
+                .last_purged_log_id,
+            None,
+            "an unfinished install must never authorize log deletion",
+        );
+        if cancel {
+            drop(install);
+            drop(gate);
+        } else {
+            drop(gate);
+            install
+                .await
+                .expect("owned install completes after its gate is released");
+        }
+        let purge_result = match delayed_purge {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending if cancel => {
+                let std::task::Poll::Ready(result) = futures_util::poll!(&mut purge) else {
+                    panic!("cancelling the real install must immediately wake its purge");
+                };
+                result
+            }
+            std::task::Poll::Pending => purge.as_mut().await,
+        };
+        drop(purge);
+        token
+            .current()
+            .expect("target WAL")
+            .shutdown()
+            .expect("clean stop");
+        drop(machine);
+        drop(log);
+        drop(applied_observer);
+        drop(log_observer);
+        drop(core);
+        drop(backend);
+        let (backend, log, mut machine) =
+            open_private_install_store(&directory, Arc::clone(&token))
+                .await
+                .expect("cold reopen after delayed install");
+        let (applied, _) = machine
+            .applied_state()
+            .await
+            .expect("cold applied frontier");
+        assert_eq!(applied, Some(log_id(if cancel { 0 } else { 2 })));
+        assert!(machine.core.snapshot_install_progress.borrow().is_none());
+        assert!(machine.core.snapshot_install_failure.borrow().is_none());
+        let current = machine.get_current_snapshot().await.expect("cold snapshot");
+        assert_eq!(
+            current.as_ref().map(|snapshot| &snapshot.meta),
+            (!cancel).then_some(&incoming.meta)
+        );
+        drop(current);
+        token
+            .current()
+            .expect("reopened WAL")
+            .shutdown()
+            .expect("cold clean stop");
+        drop(machine);
+        drop(log);
+        drop(backend);
+        assert!(
+            remained_pending,
+            "the exact live snapshot install must own the purge wait beyond ten seconds"
+        );
+        if cancel {
+            let error = purge_result.expect_err("cancelled install cannot authorize purge");
+            assert!(error
+                .to_string()
+                .contains("session consensus snapshot install was cancelled"));
+        } else {
+            purge_result.expect("durable coverage releases the original purge");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test]
+    async fn native_snapshot_install_owner_outlives_unowned_purge_deadline() {
+        verify_owned_snapshot_install_outlives_purge_guard(true, false).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test]
+    async fn sql_snapshot_install_owner_outlives_unowned_purge_deadline() {
+        verify_owned_snapshot_install_outlives_purge_guard(false, false).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test]
+    async fn native_snapshot_install_owner_cancellation_preserves_cold_predecessor() {
+        verify_owned_snapshot_install_outlives_purge_guard(true, true).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test]
+    async fn sql_snapshot_install_owner_cancellation_preserves_cold_predecessor() {
+        verify_owned_snapshot_install_outlives_purge_guard(false, true).await;
     }
 
     #[tokio::test(start_paused = true)]

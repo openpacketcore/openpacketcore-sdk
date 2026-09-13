@@ -190,7 +190,7 @@ MemoryKeyProvider wrapper check, not remote-HKMS qualification. Openraft remains
 the only commit authority and the `EncryptingSessionBackend` remains outside it.
 
 Two additional non-ignored cases run serialized single-host three- and
-five-process fleets through bounded fault and expiry recovery. First, a
+five-process fleets through fault and expiry recovery. First, a
 test-only consensus-RPC admission gate makes one stable nonzero follower
 unavailable while node 0, a different member, atomically publishes malformed
 trust. The malformed candidate never perturbs the active controller epoch:
@@ -219,15 +219,27 @@ directions on every edge incident to that member, and restores all-voter
 readiness and canary progress without changing that process's PID. Unrelated
 survivors must not record an explicit or local-material-epoch retirement from
 this member-only recovery. A prepublication common-key survivor pulse primes
-conservative 13-second progress checkpoints. The 86-second recovery
-clock and 60-second two-stage server idle/handler tail begin only after the
-atomic projected-data rename; every publication, existing-generation incident
-path, readiness, and canary checkpoint must observe one common active key on
-every survivor observer. Requiring that pulse in every half-SLO observation
+conservative 13-second progress checkpoints. Every publication,
+existing-generation incident path, readiness, and canary checkpoint must
+observe one common active key on every survivor observer. Requiring that pulse in every half-SLO observation
 interval bounds its worst-case actual event gap to the 26-second availability
 SLO. A separate 26-second checkpoint requires every active key on every
-observer and is never reset by a faster key. The attempt/terminal
-ledger must remain unchanged for the final 2.5-second
+observer and is never reset by a faster key.
+
+Snapshot catch-up records its elapsed time and each voter's applied frontier;
+it does not inherit the 86-second connection-settlement deadline. Each voter
+must become ready with the original quorum witnesses and cover the committed
+frontier observed when catch-up began. An applied frontier must not regress,
+and survivor progress alone cannot complete recovery. RPC deadlines and the
+rolling survivor-traffic checks still apply. A run that never reaches actual
+readiness remains incomplete and is bounded by the integration job watchdog;
+it cannot pass by reporting progress. These fleets share host storage, so
+their recovery duration is not an isolated-disk or deployment recovery SLO.
+
+After actual readiness and canary verification, the connection-settlement
+phase observes the full original 60-second two-stage server idle/handler tail
+and retains its 86-second deadline. The attempt/terminal ledger must remain
+unchanged for the final 2.5-second
 cold-connect/maximum-reconnect-backoff tail. Each survivor may record at most
 one availability episode while the expired member rejoins; that episode must
 recover inside the existing 26-second SLO and be fully settled before the
@@ -248,9 +260,11 @@ at the interval baseline, with interval conservation enforced. The schedule
 binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
-The private Schedule v6 binds this procedure as
+The frozen private Schedule v6 binds the historical timed procedure as
 `member-scoped-reauth-settled-baseline/v4` with progress profile
-`common-key-pulse-all-active-key-coverage/v1`. Every epoch-changing interval
+`common-key-pulse-all-active-key-coverage/v1`; its descriptors and historical
+results remain unchanged. Passing these functional catch-up checks does not
+qualify that historical timing profile. Every epoch-changing interval
 allows `superseded` only up to the existing per-node connection-attempt bound
 `8 * (member_count - 1) + 8`; non-epoch intervals require zero. Actual timeout,
 transport, protocol, backend, reconnect failure, and `abandoned` deltas remain

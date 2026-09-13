@@ -624,6 +624,13 @@ impl ReconnectAttempt {
         self.finished = true;
     }
 
+    /// Release setup admission while retaining negotiated-call failure history.
+    /// The owner resets backoff only after a reusable response proves the
+    /// connection usable; a successful handshake alone cannot prove that.
+    pub(crate) fn established(mut self) {
+        self.finished = true;
+    }
+
     pub(crate) fn failed(mut self) {
         self.gate.finish(self.epoch, false, self.failure_jitter);
         self.finished = true;

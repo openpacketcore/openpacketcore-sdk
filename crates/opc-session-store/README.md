@@ -1140,11 +1140,15 @@ promoted snapshots, and fails closed after inspecting more than 32 directory
 entries (including unrecognized entries)
 or the current snapshot is missing, corrupt, or inconsistent. Snapshot table
 replacement remains one SQLite transaction, so retry after interruption is
-idempotent. Because Openraft schedules snapshot apply and covered-log purge on
-separate workers, purge waits at most ten seconds for the persisted applied
-floor and otherwise fails closed. Fences, lease credentials, application
-sequence, request outcomes, and logical time move together with the
-authoritative state-machine image.
+idempotent. Openraft schedules snapshot install and covered-log purge on
+separate workers. Purge waits for the process-owned install of the exact full
+log ID to publish durable applied coverage; installation duration depends on
+the state being restored and is not a fixed recovery deadline. Install failure
+or cancellation wakes the purge with an error. Without a matching install
+started within the original ten-second apply guard, purge still fails closed
+at that absolute deadline. Completion alone never permits deleting unapplied
+history. Fences, lease credentials, application sequence, request outcomes,
+and logical time move together with the authoritative state-machine image.
 
 Fixed membership is independent of the local snapshot integrity mechanism.
 Use `open_fixed_durable_quorum_with_snapshot_integrity(..., policy)` to select

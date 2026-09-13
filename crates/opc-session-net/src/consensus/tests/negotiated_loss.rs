@@ -362,3 +362,201 @@ async fn correlated_unavailable_response_preserves_reuse_without_cooldown() {
         assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 0);
     }
 }
+
+// Keep the paused runtime runnable while real loopback I/O completes. Every
+// deadline in these controls is advanced explicitly; idle-runtime auto-advance
+// must not turn a slow I/O poll into a transport timeout.
+async fn poll_without_clock_advance<F: std::future::Future>(future: F) -> F::Output {
+    let started = tokio::time::Instant::now();
+    let wall_started = std::time::Instant::now();
+    tokio::pin!(future);
+    loop {
+        assert_eq!(tokio::time::Instant::now(), started);
+        assert!(
+            wall_started.elapsed() < Duration::from_secs(5),
+            "loopback fixture stalled"
+        );
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+}
+
+async fn assert_cold_retry_edge(
+    peer: &RemoteSessionConsensusPeer,
+    resolutions: &AtomicUsize,
+    expected_resolutions: usize,
+    delay: Duration,
+    request: SessionConsensusWireRequest,
+) -> SessionConsensusWireResponse {
+    let peer = peer.clone();
+    let call = tokio::spawn(async move { peer.call(request).await });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let edge = Duration::from_millis(1);
+    tokio::time::advance(delay - edge).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        expected_resolutions,
+        "a successful bootstrap without a reusable RPC must not reset retry escalation"
+    );
+    assert!(!call.is_finished());
+    tokio::time::advance(edge).await;
+    let response = poll_without_clock_advance(call)
+        .await
+        .expect("join retry")
+        .expect("complete wire response");
+    assert_eq!(resolutions.load(Ordering::SeqCst), expected_resolutions + 1);
+    response
+}
+
+async fn verify_cold_bootstrap_preserves_negotiated_loss_backoff(
+    reusable: SessionConsensusWireResponse,
+) {
+    let _metrics = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+        .lock()
+        .await;
+    let (_, binding) = bindings();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let address = listener.local_addr().expect("loopback address");
+    let server_binding = binding.clone();
+    let server_reusable = reusable.clone();
+    let server = tokio::spawn(async move {
+        let mut calls = 0;
+        for connection in 0..4 {
+            let (mut stream, _) = listener.accept().await.expect("accept cold connection");
+            let hello: SessionConsensusBootstrapRequest =
+                read_frame(&mut stream, MAX_HANDSHAKE_FRAME_SIZE)
+                    .await
+                    .expect("bootstrap Hello");
+            let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+            write_frame(
+                &mut stream,
+                &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                    transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                    contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                    identity: hello.identity,
+                    server_node_id: server_binding.remote_consensus_node_id(),
+                    accepted_sender_node_id: hello.sender_node_id,
+                    handshake_nonce: hello.handshake_nonce,
+                    accepted_response_frame_size: hello.requested_response_frame_size,
+                    server_request_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                }),
+            )
+            .await
+            .expect("complete Accepted");
+            let responses = if connection == 2 { 2 } else { 1 };
+            for response_index in 0..responses {
+                let call: SessionConsensusTransportRequest =
+                    read_frame(&mut stream, MAX_NEGOTIATED_FRAME_SIZE)
+                        .await
+                        .expect("correlated request");
+                let SessionConsensusTransportRequest::Call { call_id, .. } = call else {
+                    panic!("ordinary request");
+                };
+                calls += 1;
+                let response = if connection == 2 && response_index == 0 {
+                    server_reusable.clone()
+                } else if connection == 3 {
+                    SessionConsensusWireResponse {
+                        result: Ok(b"recovered".to_vec()),
+                    }
+                } else {
+                    SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::Timeout),
+                    }
+                };
+                write_frame(
+                    &mut stream,
+                    &SessionConsensusTransportResponse::Call { call_id, response },
+                )
+                .await
+                .expect("complete correlated response");
+            }
+        }
+        calls
+    });
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(address) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::from_transport(
+        ConsensusTarget::resolved(&binding, resolver),
+        None,
+        binding.clone(),
+        Some(Duration::from_secs(1)),
+    );
+    let request = || {
+        SessionConsensusWireRequest::try_new(
+            binding.consensus_identity(),
+            binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::AppendEntries,
+            b"backoff-ownership".to_vec(),
+        )
+        .expect("bounded request")
+    };
+    let timeout = SessionConsensusWireResponse {
+        result: Err(SessionConsensusPeerError::Timeout),
+    };
+    assert_eq!(
+        poll_without_clock_advance(peer.call(request())).await,
+        Ok(timeout.clone())
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    let minimum = peer.lifecycle_policy.reconnect_backoff_min();
+    assert_eq!(
+        assert_cold_retry_edge(&peer, &resolutions, 1, minimum, request()).await,
+        timeout
+    );
+    assert_eq!(
+        assert_cold_retry_edge(&peer, &resolutions, 2, minimum * 2, request()).await,
+        reusable
+    );
+    // The real reusable reply resets backoff, and the next request uses that
+    // exact socket. Its subsequent failure starts at the original minimum.
+    assert_eq!(
+        poll_without_clock_advance(peer.call(request())).await,
+        Ok(timeout)
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        assert_cold_retry_edge(&peer, &resolutions, 3, minimum, request()).await,
+        SessionConsensusWireResponse {
+            result: Ok(b"recovered".to_vec())
+        }
+    );
+    assert_eq!(
+        poll_without_clock_advance(server)
+            .await
+            .expect("server join"),
+        5
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_bootstrap_cannot_reset_loss_backoff_before_correlated_success() {
+    verify_cold_bootstrap_preserves_negotiated_loss_backoff(SessionConsensusWireResponse {
+        result: Ok(b"usable".to_vec()),
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_bootstrap_cannot_reset_loss_backoff_before_correlated_unavailable() {
+    verify_cold_bootstrap_preserves_negotiated_loss_backoff(SessionConsensusWireResponse {
+        result: Err(SessionConsensusPeerError::Unavailable),
+    })
+    .await;
+}

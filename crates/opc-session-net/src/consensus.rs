@@ -1740,7 +1740,10 @@ async fn run_detached_consensus_connection_attempt(
                 .session_net_connection_successes
                 .fetch_add(1, Ordering::Relaxed);
             attempt_metrics.finish();
-            reconnect_attempt.succeeded();
+            // An accepted bootstrap can still precede a blocked or failed
+            // RPC. Preserve exponential loss backoff until the claimant's
+            // complete reusable response reaches mark_connection_usable.
+            reconnect_attempt.established();
         }
         ConsensusPublishReadyOutcome::TimedOut => {
             record_consensus_client_connection_failure(SessionConsensusPeerError::Timeout);

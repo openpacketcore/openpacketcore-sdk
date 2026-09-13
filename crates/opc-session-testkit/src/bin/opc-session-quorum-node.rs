@@ -2914,10 +2914,11 @@ impl QualificationNode {
         let report = self.store.probe_durable_readiness().await;
         let reason_code = qualification_readiness_code(report.state());
         #[cfg(feature = "test-control")]
-        if !report.is_ready() && std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some()
-        {
+        if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
             // Read the existing local metrics after the original probe. This
             // adds neither a network request nor a backend ownership wait.
+            // Include ready donors so a recovering member's snapshot can be
+            // compared with the donor's actual log-purge frontier.
             eprintln!(
                 "qualification_local_durable_progress kind=readiness_probe node_index={} reason={reason_code:?} {:?}",
                 self.node_index,
