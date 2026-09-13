@@ -35,6 +35,29 @@ use opc_types::TxId;
 
 mod ops;
 
+/// Connection storage shared with detached workers. Field order is deliberate:
+/// rusqlite must finish closing before the final retained admission is dropped.
+/// Its authorizer is removed before sqlite3_close, so the callback alone cannot
+/// own the complete connection lifetime.
+pub(crate) struct BackendConnection {
+    connection: rusqlite::Connection,
+    _retained_admission: Option<Arc<crate::retained::FileAdmission>>,
+}
+
+impl std::ops::Deref for BackendConnection {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for BackendConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
 type StoredConfigRow = (
     Vec<u8>,
     Option<Vec<u8>>,
@@ -136,7 +159,7 @@ pub struct SqliteBackend {
     min_free_bytes: u64,
     /// The shared database connection protected by an async mutex.
     /// All DB operations hold this lock for the duration of the call.
-    conn: Arc<AsyncMutex<rusqlite::Connection>>,
+    conn: Arc<AsyncMutex<BackendConnection>>,
     /// Shared admission for config-consensus blocking work, including startup
     /// before the consensus core exists.
     config_consensus_worker_gate: Arc<tokio::sync::Semaphore>,
@@ -240,7 +263,7 @@ impl SqliteBackend {
             .store(version, Ordering::Release);
     }
 
-    pub(crate) fn conn(&self) -> Arc<AsyncMutex<rusqlite::Connection>> {
+    pub(crate) fn conn(&self) -> Arc<AsyncMutex<BackendConnection>> {
         self.conn.clone()
     }
 
@@ -309,7 +332,10 @@ impl SqliteBackend {
             db_path: path,
             ephemeral,
             min_free_bytes,
-            conn: Arc::new(AsyncMutex::new(conn)),
+            conn: Arc::new(AsyncMutex::new(BackendConnection {
+                connection: conn,
+                _retained_admission: None,
+            })),
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -338,12 +364,16 @@ impl SqliteBackend {
         caps: PersistCapabilities,
         binding: crate::RetainedConfigBinding,
         repair_only: bool,
+        admission: Arc<crate::retained::FileAdmission>,
     ) -> Self {
         let backend = Self {
             db_path: path,
             ephemeral,
             min_free_bytes,
-            conn: Arc::new(AsyncMutex::new(conn)),
+            conn: Arc::new(AsyncMutex::new(BackendConnection {
+                connection: conn,
+                _retained_admission: Some(admission),
+            })),
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),

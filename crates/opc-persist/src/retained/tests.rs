@@ -36,6 +36,7 @@ fn work() -> AdmissionWork {
         mutated: AtomicBool::new(false),
         deadline: Instant::now() + Duration::from_secs(30),
         hook: None,
+        lock_hook: None,
     }
 }
 fn files(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
@@ -49,6 +50,143 @@ fn files(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
             )
         })
         .collect()
+}
+
+// dup and fork retain the same open file description. Keep a safe duplicate
+// alive to model a concurrent preflight child between fork and close-on-exec,
+// without unsafe fork calls or scheduler-dependent sleeps in the detector.
+fn capture_inherited_lock(work: &mut AdmissionWork) -> Arc<std::sync::Mutex<Option<File>>> {
+    let inherited = Arc::new(std::sync::Mutex::new(None));
+    let target = Arc::clone(&inherited);
+    work.lock_hook = Some(Arc::new(move |lock| {
+        *target.lock().expect("capture") = Some(lock.try_clone().expect("duplicate description"));
+    }));
+    inherited
+}
+
+#[test]
+fn backend_release_does_not_wait_for_an_unrelated_inherited_descriptor() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    let mut admission = work();
+    let inherited = capture_inherited_lock(&mut admission);
+    let backend = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::NewAuthority,
+        &Arc::new(admission),
+    )
+    .expect("provision");
+    let current_worker = backend.conn().try_lock_owned().expect("detached worker");
+    drop(backend);
+    assert!(
+        matches!(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work())),
+            Err(RetainedConfigError::InUse)
+        ),
+        "a live SDK owner must retain the lock"
+    );
+    drop(current_worker);
+    let successor =
+        open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+            .expect("released SDK owner must not await an unrelated inherited descriptor");
+    drop(inherited.lock().expect("capture").take());
+    assert!(
+        matches!(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work())),
+            Err(RetainedConfigError::InUse)
+        ),
+        "closing an old duplicate must not release the successor's lock"
+    );
+    drop(successor);
+}
+
+#[test]
+fn rejected_admission_releases_its_lock_despite_an_inherited_descriptor() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        )
+        .expect("provision"),
+    );
+    let before = files(dir.path());
+    let mut admission = work();
+    let inherited = capture_inherited_lock(&mut admission);
+    let mut wrong = options(&path);
+    wrong.binding.backing_identity = [0x43; 32];
+    assert!(matches!(
+        open_authority_sync(
+            wrong.clone(),
+            key(),
+            OpenIntent::Reopen,
+            &Arc::new(admission)
+        ),
+        Err(RetainedConfigError::Rejected)
+    ));
+    assert!(
+        matches!(
+            open_authority_sync(wrong, key(), OpenIntent::Reopen, &Arc::new(work())),
+            Err(RetainedConfigError::Rejected)
+        ),
+        "a completed rejection must not leave an inherited lock behind"
+    );
+    assert_eq!(before, files(dir.path()));
+    drop(inherited);
+}
+
+#[test]
+fn sqlite_close_keeps_admission_after_authorizer_removal() {
+    struct CloseProbe {
+        path: PathBuf,
+        saw_lock: Arc<AtomicBool>,
+    }
+    impl Drop for CloseProbe {
+        fn drop(&mut self) {
+            let file = open_file(&self.path, true, false).expect("lock file");
+            let result =
+                rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+            self.saw_lock.store(
+                result == Err(rustix::io::Errno::WOULDBLOCK),
+                Ordering::Release,
+            );
+        }
+    }
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    let backend = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::NewAuthority,
+        &Arc::new(work()),
+    )
+    .expect("provision");
+    let saw_lock = Arc::new(AtomicBool::new(false));
+    let probe = CloseProbe {
+        path: lock_path(&path),
+        saw_lock: Arc::clone(&saw_lock),
+    };
+    // rusqlite removes the authorizer before sqlite3_close. Observe the lock
+    // from that exact removal boundary; admission must outlive the callback.
+    backend
+        .conn()
+        .blocking_lock()
+        .authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
+            let _ = &probe;
+            rusqlite::hooks::Authorization::Allow
+        }));
+    drop(backend);
+    assert!(
+        saw_lock.load(Ordering::Acquire),
+        "SQLite close must retain admission after removing hooks"
+    );
+    assert!(
+        open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()),).is_ok()
+    );
 }
 
 // Only this private unit-test executable can select a provisioning crash.

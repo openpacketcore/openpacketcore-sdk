@@ -57,6 +57,16 @@ domain, not isolation against a malicious same-UID process, root, or a hostile
 filesystem. External actors must not rename, relink or modify a live SQLite
 database or its journals.
 
+After the final SDK connection/operation owner finishes, its guard explicitly
+unlocks the admission file. Closing only its descriptor is insufficient:
+an unrelated preflight child can inherit the same open file description until
+exec. That inherited descriptor must neither extend a completed SDK admission
+nor release a later owner's lock when it closes. A failed lock acquisition
+never constructs an unlocking guard. A shared connection wrapper retains the
+guard through SQLite close, including the earlier removal of its authorizer.
+These semantics follow the Unix
+[flock lifetime contract](https://man7.org/linux/man-pages/man2/flock.2.html).
+
 The local binding table is removed from outgoing consensus snapshots before
 compaction. Incoming snapshots containing local binding authority are rejected;
 installation copies only replicated state and preserves the receiver's own

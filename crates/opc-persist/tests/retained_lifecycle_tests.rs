@@ -203,10 +203,12 @@ async fn wrong_key_scope_epoch_and_backing_reject_without_touching_sqlite() {
         options(&path, 1, 0x43, 0x42, 16 * 1024 * 1024),
         options(&path, 1, 0x41, 0x43, 16 * 1024 * 1024),
     ] {
-        assert!(matches!(
-            SqliteBackend::reopen_config_authority(candidate, key()).await,
-            Err(RetainedConfigError::Rejected)
-        ));
+        let result = SqliteBackend::reopen_config_authority(candidate, key()).await;
+        assert!(
+            matches!(&result, Err(RetainedConfigError::Rejected)),
+            "wrong retained binding outcome: {:?}",
+            result.err()
+        );
         assert_eq!(before, files(dir.path()));
     }
     for wrong_key in [

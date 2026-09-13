@@ -279,7 +279,7 @@ const LEGACY_RAFT_TABLES: &[&str] = &[
 
 #[derive(Clone)]
 pub(crate) struct ConfigConsensusCore {
-    pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    pub(crate) conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     pub(crate) identity: ConsensusIdentity,
     pub(crate) expected_members: Arc<BTreeSet<ConsensusNodeId>>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
@@ -552,7 +552,7 @@ where
 
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
-    conn: Arc<tokio::sync::Mutex<Connection>>,
+    conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     deadline: tokio::time::Instant,
     operation: F,
 ) -> io::Result<T>

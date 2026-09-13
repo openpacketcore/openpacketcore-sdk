@@ -199,10 +199,15 @@ struct AdmissionWork {
     deadline: Instant,
     #[cfg(test)]
     hook: Option<AdmissionTestHook>,
+    #[cfg(test)]
+    lock_hook: Option<AdmissionLockTestHook>,
 }
 
 #[cfg(test)]
 type AdmissionTestHook = Arc<dyn Fn(&AdmissionWork, &str) + Send + Sync>;
+
+#[cfg(test)]
+type AdmissionLockTestHook = Arc<dyn Fn(&File) + Send + Sync>;
 
 impl AdmissionWork {
     #[cfg(test)]
@@ -235,12 +240,48 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// The guard is retained by the SQLite connection's authorizer callback, so
-/// an outstanding blocking operation cannot outlive its exclusive file lease.
-struct FileAdmission {
+/// Own the admitted lock, rather than relying on the last OS descriptor close.
+/// A concurrent preflight child can inherit this file description until exec.
+/// Only the final SDK owner releases it; failed acquisition owns no unlock.
+struct AdmissionFileLock(File);
+
+impl AdmissionFileLock {
+    #[cfg(unix)]
+    fn acquire(file: File) -> Result<Self, RetainedConfigError> {
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |error| {
+                if error == rustix::io::Errno::WOULDBLOCK {
+                    RetainedConfigError::InUse
+                } else {
+                    RetainedConfigError::Unavailable
+                }
+            },
+        )?;
+        Ok(Self(file))
+    }
+}
+
+impl std::ops::Deref for AdmissionFileLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for AdmissionFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+/// The shared connection wrapper retains this guard through SQLite close,
+/// including when an outstanding blocking operation outlives its caller.
+pub(crate) struct FileAdmission {
     path: PathBuf,
     parent: File,
-    lock: File,
+    lock: AdmissionFileLock,
     database: File,
     identity: [u64; 6],
 }
@@ -332,6 +373,8 @@ async fn open_authority(
             .ok_or(RetainedConfigError::InvalidRequest)?,
         #[cfg(test)]
         hook: None,
+        #[cfg(test)]
+        lock_hook: None,
     });
     let _cancellation = CancelOnDrop(Arc::clone(&work));
     let worker_work = Arc::clone(&work);
@@ -397,7 +440,7 @@ fn open_authority_sync(
         .ok_or(RetainedConfigError::InvalidRequest)?;
     let parent = open_file(parent_path, false, true)?;
     let before_parent = identity_for_path(parent_path, true)?;
-    let mut lock = if provision {
+    let lock = if provision {
         let result = OpenOptions::new()
             .read(true)
             .write(true)
@@ -420,8 +463,11 @@ fn open_authority_sync(
     } else {
         open_file(&lock_path(&options.path), true, false)?
     };
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| RetainedConfigError::InUse)?;
+    let lock = AdmissionFileLock::acquire(lock)?;
+    #[cfg(test)]
+    if let Some(hook) = &work.lock_hook {
+        hook(&lock);
+    }
     let mut record = [0u8; RECORD_BYTES];
     if !provision {
         if lock
@@ -432,7 +478,8 @@ fn open_authority_sync(
         {
             return Err(RetainedConfigError::RecoveryRequired);
         }
-        lock.read_exact(&mut record)
+        (&*lock)
+            .read_exact(&mut record)
             .map_err(|_| RetainedConfigError::RecoveryRequired)?;
         validate_record(&record, &options.binding, &audit_key)?;
     }
@@ -533,7 +580,7 @@ fn open_authority_sync(
         work.check()?;
         #[cfg(test)]
         work.stage("database_synced");
-        let mut record_file = &admission.lock;
+        let mut record_file = &*admission.lock;
         record_file
             .write_all(&record)
             .map_err(|_| RetainedConfigError::Unavailable)?;
@@ -578,6 +625,7 @@ fn open_authority_sync(
         caps,
         options.binding,
         record[72] == 1,
+        admission,
     ))
 }
 
