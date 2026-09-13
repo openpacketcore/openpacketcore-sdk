@@ -189,18 +189,33 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_persistence_public_background_error_preserves_results_and_reports_failed_drain() {
+    public_background_error_recovery(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_persistence_failed_writer_recovery_survives_a_snapshot_call_deadline() {
+    public_background_error_recovery(true).await;
+}
+
+async fn public_background_error_recovery(hold_recovery_generation: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = Fleet::new(3);
     let faults = (0..3)
         .map(|_| Arc::new(AtomicBool::new(false)))
         .collect::<Vec<_>>();
+    let gates = (0..3)
+        .map(|_| Arc::new(SnapshotArtifactGate::new()))
+        .collect::<Vec<_>>();
+    let release = ReleaseWriters(gates.clone());
     let result = AssertUnwindSafe(async {
         for (index, fault) in faults.iter().enumerate() {
             let fault = Arc::clone(fault);
+            let gate = Arc::clone(&gates[index]);
             let hook: GenerationHook = Arc::new(move || {
                 if fault.load(Ordering::Acquire) {
                     Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
                 } else {
+                    gate.block_if_armed_blocking();
                     Ok(())
                 }
             });
@@ -341,13 +356,53 @@ async fn async_persistence_public_background_error_preserves_results_and_reports
             "the restarted follower lost a previously acknowledged tail"
         );
         let started_repair = tokio::time::Instant::now();
-        let initialized = fleet.store(follower).initialize_cluster().await;
+        let mut initialized = if hold_recovery_generation {
+            gates[leader].arm();
+            let cold = fleet.store(follower).clone();
+            let initialization = tokio::spawn(async move { cold.initialize_cluster().await });
+            tokio::time::timeout(Duration::from_secs(3), gates[leader].wait_started())
+                .await
+                .expect("actual leader generation writer reaches the recovery hold");
+            let initialized = initialization.await.unwrap();
+            assert!(started_repair.elapsed() >= OPERATION_BOUND);
+            assert!(matches!(initialized, Err(ConsensusSessionStoreOpenError::RecoveryRequired)));
+            let health = fleet.store(follower).persistence_health();
+            assert!(health.engine_running && health.storage_failure.is_none());
+            assert_eq!(health.recovery, Some(SessionAsyncRecoveryState::CatchingUp));
+            assert!(!fleet.store(follower).status().admitted);
+            gates[leader].release();
+            initialized
+        } else {
+            fleet.store(follower).initialize_cluster().await
+        };
         for (role, store) in [("leader", fleet.store(leader)), ("cold", fleet.store(follower))] {
             let metrics = store.inner.raft.metrics();
             let metrics = metrics.borrow();
             eprintln!("async_failed_writer_rejoin role={role} elapsed_us={} result={initialized:?} health={:?} vote={:?} log={:?} applied={:?} snapshot={:?}", started_repair.elapsed().as_micros(), store.persistence_health(), metrics.vote, metrics.last_log_index, metrics.last_applied, metrics.snapshot);
         }
+        // RecoveryRequired describes one incomplete bounded attempt, not a
+        // failed engine or a lost receipt. Snapshot creation/installation can
+        // outlive that call on a shared disk. Retrying initialization is its
+        // existing public contract; every attempt still has OPERATION_BOUND.
+        // Use the existing default setup bound only as a test hang guard.
+        let setup_deadline = started_repair + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
+        let mut attempts = 1;
+        while matches!(initialized, Err(ConsensusSessionStoreOpenError::RecoveryRequired)) {
+            let cold = fleet.store(follower);
+            let health = cold.persistence_health();
+            assert!(health.engine_running && health.storage_failure.is_none());
+            assert!(health.asynchronous.unwrap().background_failure.is_none());
+            assert!(!cold.status().admitted, "an incomplete attempt grants no traffic authority");
+            assert_eq!(fleet.store(leader).inner.raft.metrics().borrow().vote, leader_vote);
+            assert_eq!(cold.inner.operation_timeout, OPERATION_BOUND);
+            initialized = tokio::time::timeout_at(setup_deadline, cold.initialize_cluster())
+                .await
+                .expect("cold recovery completes within the existing setup guard");
+            attempts += 1;
+            eprintln!("async_failed_writer_rejoin attempt={attempts} elapsed_us={} result={initialized:?} health={:?}", started_repair.elapsed().as_micros(), cold.persistence_health());
+        }
         initialized.unwrap();
+        assert!(!hold_recovery_generation || attempts >= 2);
         assert_eq!(
             fleet.store(leader).inner.raft.metrics().borrow().vote,
             leader_vote
@@ -377,6 +432,7 @@ async fn async_persistence_public_background_error_preserves_results_and_reports
     })
     .catch_unwind()
     .await;
+    drop(release);
     fleet.close_all().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

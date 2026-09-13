@@ -5696,6 +5696,12 @@ impl ConsensusSessionStore {
     /// member invokes Openraft initialization. Other pristine members wait for
     /// replicated membership, avoiding fixed-timeout split-vote lockstep.
     /// Clean first formation fails closed if the canonical member is absent.
+    ///
+    /// An existing Async voter remains quarantined until a surviving live
+    /// quorum supplies a fresh cut and the local engine proves catch-up.
+    /// `RecoveryRequired` is an incomplete recovery attempt; callers may retry
+    /// this method as recovery progresses. Each attempt retains the configured
+    /// operation deadline and grants no traffic authority before completion.
     pub async fn initialize_cluster(&self) -> Result<(), ConsensusSessionStoreOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
