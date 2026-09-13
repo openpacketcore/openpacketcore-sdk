@@ -64,13 +64,21 @@ HARNESS = ["--test-threads=4"]
 # module. It exercises raw physical adapters which must not be public merely
 # to keep an old integration target compiling. Its sensitive contracts remain
 # isolated, but use their libtest-qualified names below.
+# The composed selector request also has one literal end-to-end budget. Its
+# module serializes its own durable labs, but unrelated lib tests still compete
+# with that request unless it runs in a separate process like these contracts.
 QUIESCENT_LIB_MODULE = "stateless_quorum_consumer"
+QUIESCENT_SELECTOR_LIB_MODULE = "ebpf::tests::remote_selector_regression"
+QUIESCENT_SELECTOR_LIB_TEST = (
+    "singleton_public_protected_flow_keeps_original_request_deadline"
+)
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
     "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
+    QUIESCENT_SELECTOR_LIB_TEST,
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
     "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
@@ -261,6 +269,8 @@ def shard_ids(plan: dict) -> list[str]:
 
 
 def qualified_quiescent_lib_test(name: str) -> str:
+    if name == QUIESCENT_SELECTOR_LIB_TEST:
+        return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
 
 

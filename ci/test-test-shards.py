@@ -132,6 +132,32 @@ class ManifestTestSourceAuditTests(unittest.TestCase):
 class QuiescentShardPlanTests(unittest.TestCase):
     """The protected private-lib contracts must remain total and disjoint."""
 
+    def test_selector_contract_keeps_one_exact_ordinary_profile_run(self) -> None:
+        name = (
+            "ebpf::tests::remote_selector_regression::"
+            "singleton_public_protected_flow_keeps_original_request_deadline"
+        )
+        commands = TEST_SHARDS.commands(
+            {"heavy": {"target": "fixture", "shards": []}}, "misc", []
+        )
+        mentions = [command for command in commands if name in command]
+
+        # The broad process excludes exactly this test; the following command
+        # executes it once, with the same packages, features and test profile.
+        self.assertEqual(len(mentions), 2)
+        self.assertEqual(mentions[0], commands[0])
+        self.assertEqual(mentions[0].count(name), 1)
+        self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
+        self.assertIn("--exact", mentions[0])
+        self.assertEqual(
+            mentions[1],
+            [
+                "cargo", "test", "--locked", "--workspace", "--exclude",
+                "opc-persist", "--all-features", "--quiet", "--lib", "--",
+                "--test-threads=1", "--exact", name,
+            ],
+        )
+
     def test_optimized_contracts_have_a_dedicated_shard(self) -> None:
         ordinary = TEST_SHARDS.quiescent_lib_tests_for_shard("misc")
         optimized = TEST_SHARDS.quiescent_lib_tests_for_shard(
