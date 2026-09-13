@@ -101,6 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic. Losing the volatile quorum can lose acknowledged results; local
   persistence does not authorize recovery. No automatic mode migration is
   provided. See ADR 0022 for semantics and qualification boundaries.
+- **Retained configuration-authority lifecycle — `opc-persist`:** explicit
+  provisioning, ordinary reopen, and member-repair APIs bind local storage to
+  exact consensus, backing and key scope. Reopen rejects missing or incomplete
+  authority without creating it; repaired voters cannot bootstrap a new
+  cluster. Local bindings stay out of replicated snapshots. Ephemeral storage
+  remains an explicit choice. Whole-store rollback freshness still requires
+  external authority; see the retained lifecycle contract and issue #800.
 - **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
   workload scopes select separate bpffs roots and local writer locks. An
   explicit stopped-generation reset reclaims only the unbound current IPv4

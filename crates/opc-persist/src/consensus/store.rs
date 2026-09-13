@@ -420,6 +420,13 @@ impl ConsensusConfigStore {
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
+        if backend
+            .retained_binding
+            .as_ref()
+            .is_some_and(|binding| binding.topology() != &topology)
+        {
+            return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
+        }
         let identity = topology.identity();
         let local_node_id = topology.local_node_id();
         let members = topology.members().clone();
@@ -491,6 +498,8 @@ impl ConsensusConfigStore {
     /// members wait for that exact membership to replicate. Restarted members
     /// with durable Openraft state skip bootstrap and re-admit normally. Clean
     /// first formation fails closed if the canonical member is absent.
+    /// A retained member provisioned for repair never invokes bootstrap; it
+    /// must recover the existing membership through its authenticated peers.
     pub async fn initialize_cluster(&self) -> Result<(), ConfigConsensusOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
@@ -501,7 +510,10 @@ impl ConsensusConfigStore {
             .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
             .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
         let canonical_bootstrap = self.inner.members.first().copied();
-        if !initialized && canonical_bootstrap == Some(self.inner.local_node_id) {
+        if !initialized
+            && canonical_bootstrap == Some(self.inner.local_node_id)
+            && !self.inner.backend.retained_repair_only
+        {
             let initialize = tokio::time::timeout_at(
                 deadline,
                 self.inner.raft.initialize(self.inner.members.clone()),

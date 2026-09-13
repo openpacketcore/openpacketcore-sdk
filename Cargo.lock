@@ -3343,6 +3343,7 @@ dependencies = [
  "opc-types",
  "rand 0.10.2",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",

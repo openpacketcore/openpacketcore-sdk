@@ -12,6 +12,8 @@ mod storage;
 mod store;
 mod types;
 
+pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
+
 pub use store::{
     ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,
     ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,

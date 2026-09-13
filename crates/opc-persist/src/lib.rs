@@ -105,6 +105,7 @@ mod error;
 mod management_audit;
 mod mock;
 mod preflight;
+mod retained;
 mod schema;
 mod security_policy;
 mod types;
@@ -146,6 +147,9 @@ pub use management_audit::{
 pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};
 pub use preflight::PersistCapabilities;
+pub use retained::{
+    RetainedConfigBinding, RetainedConfigDurability, RetainedConfigError, RetainedConfigOptions,
+};
 pub use security_policy::{
     ActivePolicyMetadata, PolicyHistoryEntry, SecurityPolicyError, SecurityPolicyService,
     SerializablePolicy, SerializableRule, SerializableRuleList, SqliteSecurityPolicyService,
