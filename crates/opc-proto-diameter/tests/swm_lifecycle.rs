@@ -314,6 +314,65 @@ fn ts29273_sta_fixture_parses_correlates_and_reencodes_byte_exact() {
     );
 }
 
+// Independent six-AVP interoperability shape. All values are invented. The
+// generic extension point is TS 29.273 7.2.2.2.2; RFC 6733 6.8 requires the
+// optional Auth-Application-Id to match the already validated header.
+fn six_avp_sta() -> Vec<Vec<u8>> {
+    vec![
+        wire_avp(base::AVP_SESSION_ID.get(), 0x40, SESSION_ID.as_bytes()),
+        wire_avp(base::AVP_USER_NAME.get(), 0x40, USER_NAME.as_bytes()),
+        wire_avp(base::AVP_RESULT_CODE.get(), 0x40, &2001_u32.to_be_bytes()),
+        wire_avp(base::AVP_ORIGIN_HOST.get(), 0x40, b"aaa.private.invalid"),
+        wire_avp(base::AVP_ORIGIN_REALM.get(), 0x40, b"private.invalid"),
+        wire_avp(
+            base::AVP_AUTH_APPLICATION_ID.get(),
+            0x40,
+            &16_777_264_u32.to_be_bytes(),
+        ),
+    ]
+}
+
+fn direct_str_without_proxies() -> SwmSessionTerminationRequestEnvelope {
+    let mut avps = str_avps();
+    avps.retain(|avp| {
+        let code = u32::from_be_bytes(avp[..4].try_into().unwrap());
+        code != base::AVP_PROXY_INFO.get() && code != base::AVP_ROUTE_RECORD.get()
+    });
+    let wire = wire_message(0xc0, HOP_BY_HOP, END_TO_END, avps);
+    parsed_inbound_request_envelope(&wire)
+        .with_expected_answer_peer(SwmExpectedAnswerPeer::direct(
+            CONNECTION_A,
+            "aaa.private.invalid",
+            "private.invalid",
+        ))
+}
+
+#[test]
+fn sta_application_extension_six_avp_success_requires_exact_correlation() {
+    let request = direct_str_without_proxies();
+    let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, six_avp_sta());
+    let answer = swm::parse_swm_session_termination_answer_envelope_from_connection(
+        &decode(&wire),
+        CONNECTION_A,
+        DecodeContext::default(),
+    )
+    .expect("legal STA application extension must pass the typed parser");
+    assert_eq!(answer.answer().additional_avps.len(), 2);
+    let rebuilt = swm::build_swm_session_termination_answer(
+        &request,
+        answer.answer(),
+        EncodeContext::default(),
+    )
+    .expect("accepted extensions must also pass strict typed encoding");
+    let rebuilt_wire = encode(&rebuilt);
+    let rebuilt_answer = parsed_answer_envelope(&decode(&rebuilt_wire));
+    assert_eq!(rebuilt_answer.answer(), answer.answer());
+    let exchange = request
+        .correlate_answer(answer)
+        .expect("success requires exact session, transaction and authenticated origin");
+    assert_eq!(exchange.answer().result, SwmSessionTerminationResult::Success);
+}
+
 #[test]
 fn recognized_swm_m_bit_overrides_are_tolerated_on_receive_and_cleared_on_send() {
     let mut request_avps = str_avps();
