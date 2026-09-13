@@ -3508,3 +3508,7 @@ async fn fixed_five_voter_authenticated_placement_expiry_preserves_traffic_autho
         PlacementResilienceDisposition::IndependentPlacementWithheld,
     );
 }
+
+#[cfg(feature = "test-control")]
+#[path = "fixed_quorum_authority/consumer_reads.rs"]
+mod consumer_reads;

@@ -9306,6 +9306,66 @@ impl ConsensusSessionStore {
         key: &SessionKey,
         deadline: tokio::time::Instant,
     ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
+            let admission =
+                self.admit_consumer_scope(scope, deadline)
+                    .await
+                    .map_err(|rejection| match rejection {
+                        SessionConsumerRejection::ScopeMismatch => {
+                            StoreError::TopologyAuthorityRevoked
+                        }
+                        _ => consensus_unavailable(),
+                    })?;
+            drop(admission);
+            self.require_application_traffic_authority_before(deadline)
+                .await?;
+            // This barrier has read leases disabled: even a warm non-expiring
+            // record requires a fresh majority proof and local application of
+            // its returned index. It never allocates a sequencing authority.
+            self.linearizable_barrier_before(deadline)
+                .await
+                .map_err(|_| consensus_unavailable())?;
+            let admission =
+                self.admit_consumer_scope(scope, deadline)
+                    .await
+                    .map_err(|rejection| match rejection {
+                        SessionConsumerRejection::ScopeMismatch => {
+                            StoreError::TopologyAuthorityRevoked
+                        }
+                        _ => consensus_unavailable(),
+                    })?;
+            if let Some(logical_time) = tokio::time::timeout_at(
+                deadline,
+                self.inner
+                    .backend
+                    .consensus_logical_time(self.inner.storage_identity),
+            )
+            .await
+            .map_err(|_| consensus_unavailable())??
+            {
+                let record = tokio::time::timeout_at(
+                    deadline,
+                    self.inner.backend.consensus_get_at(key, logical_time),
+                )
+                .await
+                .map_err(|_| consensus_unavailable())??;
+                // Absence already proven at committed time and records with
+                // no expiry do not depend on advancing the replicated clock.
+                // A visible finite record still takes the original clock
+                // proposal below before deciding whether it has expired.
+                if record
+                    .as_ref()
+                    .is_none_or(|record| record.expires_at.is_none())
+                {
+                    self.require_application_traffic_authority_before(deadline)
+                        .await?;
+                    return Ok(record);
+                }
+            }
+            // Never retain this fair read lock across a proposal whose leader
+            // path must acquire the same topology gate.
+            drop(admission);
+        }
         let logical_time = self
             .logical_read_time_before(Some(scope.consensus_identity()), deadline)
             .await?;
