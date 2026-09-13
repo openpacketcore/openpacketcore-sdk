@@ -34,6 +34,8 @@ use std::os::unix::fs::OpenOptionsExt;
 const MAGIC: &[u8; 8] = b"OPCCKP01";
 const SCHEMA: &str = "CREATE TABLE consumer_checkpoint (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), generation INTEGER NOT NULL CHECK(generation > 0), envelope BLOB NOT NULL CHECK(length(envelope) > 0))";
 const ENVELOPE_OVERHEAD_LIMIT: usize = 16 * 1024;
+const SQLITE_PAGE_BYTES: u64 = 4096;
+const STORAGE_RESERVE_BYTES: u64 = 65536;
 static IO_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// Exact externally configured consumer, schema, authority epoch and backing.
@@ -116,8 +118,9 @@ impl ConsumerCheckpointOptions {
     /// Configure an absolute, exclusively owned file and bounded operations.
     ///
     /// Payload is limited to 16 MiB; the complete database and journals are
-    /// limited to 1 GiB. Storage must admit three maximum envelopes plus SQLite
-    /// overhead. No queue exists: one operation per store can be outstanding.
+    /// limited to 1 GiB. Storage must admit the page-rounded maximum envelope,
+    /// SQLite overflow pointers and root pages, plus journal and sidecar reserve.
+    /// No queue exists: one operation per store can be outstanding.
     pub fn new(
         path: impl Into<PathBuf>,
         binding: ConsumerCheckpointBinding,
@@ -130,8 +133,7 @@ impl ConsumerCheckpointOptions {
         if !path.is_absolute()
             || path.file_name().is_none()
             || !(1..=16 * 1024 * 1024).contains(&max_payload_bytes)
-            || max_storage_bytes
-                < 3 * (max_payload_bytes as u64 + ENVELOPE_OVERHEAD_LIMIT as u64) + 65536
+            || max_storage_bytes < minimum_storage_bytes(max_payload_bytes)
             || max_storage_bytes > 1024 * 1024 * 1024
             || timeout.is_zero()
             || timeout > Duration::from_secs(3600)
@@ -147,6 +149,17 @@ impl ConsumerCheckpointOptions {
             timeout,
         })
     }
+}
+
+// Called only after validating the payload range. Each overflow page spends
+// four bytes on its next-page pointer. Reserve two more pages for sqlite_schema
+// and the singleton table root; the row header fits in the root's local payload.
+// Three database images plus fixed reserve cover the database, replacement WAL
+// (including frame headers), shared memory and admission sidecar.
+fn minimum_storage_bytes(max_payload_bytes: usize) -> u64 {
+    let envelope_bytes = max_payload_bytes as u64 + ENVELOPE_OVERHEAD_LIMIT as u64;
+    let database_pages = 2 + envelope_bytes.div_ceil(SQLITE_PAGE_BYTES - 4);
+    3 * database_pages * SQLITE_PAGE_BYTES + STORAGE_RESERVE_BYTES
 }
 
 impl fmt::Debug for ConsumerCheckpointOptions {
@@ -923,7 +936,7 @@ fn configure_connection(
     let page_size: u64 = conn
         .pragma_query_value(None, "page_size", |r| r.get(0))
         .map_err(|_| ConsumerCheckpointError::Rejected)?;
-    if page_size != 4096 {
+    if page_size != SQLITE_PAGE_BYTES {
         return Err(ConsumerCheckpointError::Rejected);
     }
     // Keep room for both the database and its replacement WAL. These are hard
@@ -931,13 +944,13 @@ fn configure_connection(
     conn.pragma_update(
         None,
         "max_page_count",
-        (options.max_storage_bytes - 65536) / (3 * 4096),
+        (options.max_storage_bytes - STORAGE_RESERVE_BYTES) / (3 * SQLITE_PAGE_BYTES),
     )
     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
     let pages: u64 = conn
         .pragma_query_value(None, "max_page_count", |r| r.get(0))
         .map_err(|_| ConsumerCheckpointError::Rejected)?;
-    if pages > (options.max_storage_bytes - 65536) / (3 * 4096) {
+    if pages > (options.max_storage_bytes - STORAGE_RESERVE_BYTES) / (3 * SQLITE_PAGE_BYTES) {
         return Err(ConsumerCheckpointError::Limit);
     }
     conn.pragma_update(None, "journal_size_limit", options.max_storage_bytes / 2)

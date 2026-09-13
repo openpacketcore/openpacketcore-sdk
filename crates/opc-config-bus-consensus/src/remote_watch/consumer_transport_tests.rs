@@ -1,6 +1,7 @@
 // Included inside the existing mutual-TLS fixture module. Only synthetic SDK
 // identities and configuration values are used by these storage/transport tests.
 mod durable_consumer {
+    include!("consumer_numeric_transport_tests.rs");
     use super::*;
     use crate::remote_watch::consumer::*;
     use opc_key::{

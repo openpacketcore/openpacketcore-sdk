@@ -453,13 +453,74 @@ async fn actual_wal_process_loss_recovers_only_complete_authenticated_transactio
     }
 }
 
+fn minimum_budget_options(path: &Path, maximum_payload: usize) -> ConsumerCheckpointOptions {
+    let template = options(path);
+    let candidate = |budget| {
+        ConsumerCheckpointOptions::new(
+            path,
+            template.binding.clone(),
+            template.durability,
+            maximum_payload,
+            budget,
+            template.timeout,
+        )
+    };
+    // Find the public constructor's actual acceptance boundary. A successful
+    // options object must accommodate its declared payload, regardless of the
+    // internal storage-capacity formula.
+    let mut rejected = 0;
+    let mut accepted = 1024 * 1024 * 1024;
+    assert!(candidate(accepted).is_ok());
+    while accepted - rejected > 1 {
+        let budget = rejected + (accepted - rejected) / 2;
+        if candidate(budget).is_ok() {
+            accepted = budget;
+        } else {
+            rejected = budget;
+        }
+    }
+    candidate(accepted).unwrap()
+}
+
+#[tokio::test]
+async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.sqlite");
+    let maximum_payload = 16 * 1024 * 1024;
+    let options = minimum_budget_options(&path, maximum_payload);
+    let accepted = options.max_storage_bytes;
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x60))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    for (index, size) in [maximum_payload, maximum_payload / 2, maximum_payload]
+        .into_iter()
+        .enumerate()
+    {
+        let generation = index as u64 + 1;
+        let payload = Zeroizing::new(vec![generation as u8; size]);
+        let result = store.compare_and_set(generation, payload.clone()).await;
+        assert!(
+            result.is_ok(),
+            "accepted storage budget {accepted} cannot store maximum payload at generation {generation}: {result:?}"
+        );
+        assert_eq!(*result.unwrap().into_parts().1, *payload);
+        check_storage_size(&options).unwrap();
+    }
+    store.shutdown().await.unwrap();
+    let mut reopened = ConsumerCheckpointStore::reopen(options, keys(0x60))
+        .await
+        .unwrap();
+    let (generation, payload) = reopened.read_back().await.unwrap().into_parts();
+    assert_eq!(generation, 4);
+    assert_eq!(&**payload, vec![3; maximum_payload]);
+    reopened.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn repeated_maximum_replacements_remain_within_the_minimum_storage_budget() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = options(&dir.path().join("checkpoint.sqlite"));
-    options.max_payload_bytes = 65536;
-    options.max_storage_bytes =
-        3 * (options.max_payload_bytes as u64 + ENVELOPE_OVERHEAD_LIMIT as u64) + 65536;
+    let options = minimum_budget_options(&dir.path().join("checkpoint.sqlite"), 65536);
     let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x58))
         .await
         .unwrap();

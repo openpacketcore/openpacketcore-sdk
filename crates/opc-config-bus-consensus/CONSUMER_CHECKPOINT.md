@@ -72,7 +72,10 @@ skipped intermediate revisions are never labelled applied. An ordered tail must
 advance exactly one version. Older revisions, gaps, missing original transactions,
 wrong schema/scope and same-version conflicting transactions or canonical payloads
 are rejected. Exact duplicates are idempotent. Object-map ordering alone does not
-change the canonical payload. The accepted floor survives restart and rejects a
+change the canonical payload. Typed JSON integer values retain their exact
+precision through acceptance, application and checkpoint restart, including
+`u128`/`i128` boundaries; canonicalization never converts them through floating
+point. The accepted floor survives restart and rejects a
 lagging follower even when that follower otherwise authenticates correctly.
 
 ## SDK storage and custody
@@ -120,8 +123,11 @@ allow the complete apply intent and predecessor; insufficient aggregate space
 fails before product effects without truncating content. The existing transport
 has its separate 8 MiB response cap.
 
-The database/journal budget is explicit, at most 1 GiB, and must admit three
-maximum envelopes plus SQLite overhead. Hard page limits, bounded copies,
+The database/journal budget is explicit, at most 1 GiB. Its minimum accounts for
+the maximum encrypted envelope rounded to SQLite pages, including each overflow
+page's pointer and both schema/table root pages, then reserves three database
+images plus 64 KiB for journals and sidecars. For a 16 MiB payload limit, the
+smallest accepted storage budget is 50,532,352 bytes. Hard page limits, bounded copies,
 transactional overflow-page reuse and WAL checkpointing bound physical retention.
 No revision archive is retained. Reads and CAS authenticate the complete state;
 CAS checks the exact last-read local generation and envelope digest. Generation

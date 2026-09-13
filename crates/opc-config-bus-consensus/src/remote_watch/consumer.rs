@@ -771,16 +771,23 @@ fn canonical_config<C: Serialize>(
     limit: usize,
     deadline: tokio::time::Instant,
 ) -> Result<String, ConfigConsumerError> {
-    // Bound the first serialization before constructing a JSON tree. Sorting
-    // every object makes equal HashMaps independent of random iteration order.
+    // Bound the typed serialization before sorting objects. Preserve its number
+    // tokens: a serde_json::Value intermediate can coerce integers through f64.
     let serialized = bounded_encode(config, limit, deadline)?;
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&serialized).map_err(|_| ConfigConsumerError::InvalidState)?;
-    value.sort_all_objects();
-    let mut canonical = bounded_encode(&value, limit, deadline)?;
-    String::from_utf8(std::mem::take(&mut *canonical))
+    let mut writer = BoundedWriter {
+        bytes: Zeroizing::new(Vec::new()),
+        limit,
+        deadline,
+    };
+    canonical::write(&serialized, &mut writer)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ConfigConsumerError::Limit);
+    }
+    String::from_utf8(std::mem::take(&mut *writer.bytes))
         .map_err(|_| ConfigConsumerError::InvalidState)
 }
+
+mod canonical;
 
 #[cfg(test)]
 mod tests;

@@ -118,7 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and complete apply intent, rejects rollback/conflict/gaps, and reconciles
   interrupted application without replay. `ConsumerCheckpointStore` adds
   bounded explicit provision/reopen and atomic CAS, using purpose-separated
-  `ConfigConsumerCheckpoint` custody. This adds no voter or authoring authority
+  `ConfigConsumerCheckpoint` custody. Accepted storage bounds account for SQLite
+  overflow pages at the maximum payload, and canonical checkpoints preserve
+  typed JSON integer precision without changing shared Serde JSON features.
+  This adds no voter or authoring authority
   and no independent global-freshness claim; see SDK #799's consumer contract.
 - **Retained configuration-authority lifecycle — `opc-persist`:** explicit
   provisioning, ordinary reopen, and member-repair APIs bind local storage to
