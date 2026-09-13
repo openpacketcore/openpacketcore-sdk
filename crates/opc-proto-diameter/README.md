@@ -1460,6 +1460,13 @@ AAR/AAA, ASR/ASA, and STR/STA.
 
 ### SWm Session-Termination
 
+The ordinary STA extension surface preserves validated `User-Name` and
+`Auth-Application-Id` singletons. When present, `Auth-Application-Id` must equal
+the SWm header application on decode and encode, as required by
+[RFC 6733 section 6.8](https://www.rfc-editor.org/rfc/rfc6733.html#section-6.8).
+These extensions do not replace the envelope's exact session, transaction or
+authenticated-peer correlation checks.
+
 An ePDG creates an outbound STR by consuming one affine End-to-End identity
 from its Origin-Host authority and pairing it with the Hop-by-Hop Identifier
 reserved by the live Diameter transport:

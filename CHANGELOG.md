@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **SWm STA application extension — `opc-proto-diameter`:** ordinary Session-
+  Termination answers may carry the known `Auth-Application-Id` extension
+  alongside `User-Name`. Decode and encode require the application value to
+  match the SWm header, retain singleton and dictionary validation, and keep
+  exact session, transaction and authenticated-peer correlation. Independent
+  six-AVP fixtures cover strict framing and malformed or foreign answers.
 - **First Applied recovery and compensation — `opc-session-net`:** a first
   authenticated Applied status/adoption result no longer looks like an inverse
   that was already dispatched. A complete conclusive aborting roster can
