@@ -308,6 +308,7 @@ pub(crate) enum Point {
     BeforeNativeReceiptRead,
     BeforeNativeLogRead,
     BeforeNativeSnapshotRead,
+    BeforeNativeSnapshotWriteback,
     BeforeNativePublicRead,
     BeforeNativeGenerationAppend,
     AfterNativeGenerationAppend,

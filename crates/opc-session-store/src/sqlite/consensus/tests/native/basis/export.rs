@@ -1,6 +1,8 @@
 use super::*;
 use crate::sqlite::consensus::tests::native::ordinary::rows;
 
+mod writeback;
+
 #[test]
 fn native_snapshot_export_reuses_insert_preparations_and_preserves_exact_rows() {
     let fixture = Fixture::new();

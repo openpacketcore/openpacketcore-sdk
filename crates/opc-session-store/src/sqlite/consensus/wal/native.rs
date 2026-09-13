@@ -9,6 +9,11 @@ use crate::consensus::native::{
 };
 use crate::consensus::verified_snapshot::{PortableSnapshot, VerifiedFile};
 
+// Pace private snapshot output by file growth. This is not a dirty-memory
+// accounting limit: SQLite may retain pages or rewrite existing ones. The
+// finalizer still synchronizes and validates the complete pinned image.
+const NATIVE_SNAPSHOT_WRITEBACK_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Exact caller expectations checked against the live fixed-quorum owner.
 pub(crate) struct FixedReadExpectation<'a> {
     pub(crate) identity: SessionConsensusIdentity,
@@ -1318,6 +1323,7 @@ impl Wal {
                     export_step.set($step);
                 };
             }
+            let synced_extent = std::cell::Cell::new(0_u64);
             let check = || {
                 {
                     let state = lock_state(&self.shared)?;
@@ -1325,6 +1331,19 @@ impl Wal {
                 }
                 if cancelled() {
                     return Err(io::Error::other(SnapshotExportCancelled));
+                }
+                if let Some(destination) = destination {
+                    let extent = destination.file().metadata()?.len();
+                    if extent.saturating_sub(synced_extent.get())
+                        >= NATIVE_SNAPSHOT_WRITEBACK_BYTES
+                    {
+                        // Flush growth while exporting, outside State and the
+                        // live WAL writer. Otherwise a large final flush can
+                        // delay foreground durable writes on the same device.
+                        (self.control.hook)(Point::BeforeNativeSnapshotWriteback)?;
+                        destination.file().sync_data()?;
+                        synced_extent.set(extent);
+                    }
                 }
                 Ok(())
             };
