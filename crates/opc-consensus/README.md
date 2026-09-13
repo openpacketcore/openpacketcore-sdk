@@ -75,10 +75,13 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`3345cfdf98a151d894151a3172fbb0cb60a4eaeb` (signed commit). It retains the
+`dddfe2ee7c51394c1b5ed601c85225ce9eca680d` (signed commit). It retains the
 per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
-their ownership before retrying. The pin is by `rev`, never a branch or tag.
+their ownership before retrying. When a higher vote ends leadership, the core
+joins the former leader's replication readers before a conflicting suffix can
+be truncated. Strict storage errors and operation deadlines stay unchanged.
+The pin is by `rev`, never a branch or tag.
 The frozen HA profiles retain their original revision and evidence; they do
 not qualify this later source-build candidate.
 
