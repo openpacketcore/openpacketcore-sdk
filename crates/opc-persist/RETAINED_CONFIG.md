@@ -85,9 +85,12 @@ admitted binding, rather than transferring a sender's local storage identity.
 
 Provisioning never overwrites partial artifacts. An operator must explicitly
 recover or replace the backing resource before another provisioning operation.
-Reopening never calls schema initialization or legacy recovery. It validates
-the complete base schema, consensus schema/identity/key/history, and local
-binding before returning a usable backend.
+Reopening never initializes or migrates retained storage or invokes legacy
+recovery. It compares the complete base schema with an SDK-owned in-memory
+reference, including the exact unique replay index. A digest stored in the
+database cannot authorize changed DDL, and compatibility-digest exclusions do
+not exempt extra objects from validation. Consensus schema/identity/key/history
+and local binding are independently checked before returning a usable backend.
 
 Even a read-only SQLite open can create WAL coordination files. Admission
 therefore validates a bounded SDK-private copy of the database and recovery

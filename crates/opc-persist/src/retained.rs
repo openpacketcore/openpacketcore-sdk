@@ -910,6 +910,10 @@ fn validate_connection(
     if integrity != "ok" {
         return Err(RetainedConfigError::Rejected);
     }
+    // A digest supplied by the retained database is only a compatibility
+    // check. The independent SDK catalog includes the exact replay index.
+    crate::schema::validate_retained_base_schema(conn)
+        .map_err(|_| RetainedConfigError::Rejected)?;
     let version =
         crate::schema::get_schema_version(conn).map_err(|_| RetainedConfigError::Rejected)?;
     let digest =

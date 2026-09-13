@@ -189,6 +189,52 @@ fn sqlite_close_keeps_admission_after_authorizer_removal() {
     );
 }
 
+#[test]
+fn rewritten_schema_digest_cannot_authorize_extra_base_schema() {
+    for name in [
+        "retained_schema_probe",
+        "consensus_schema_probe",
+        "consensusXschema_probe",
+    ] {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        drop(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::NewAuthority,
+                &Arc::new(work()),
+            )
+            .expect("provision"),
+        );
+        let conn = Connection::open(&path).expect("synthetic fault access");
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER {name} BEFORE INSERT ON config_history BEGIN SELECT RAISE(IGNORE); END"
+        ))
+        .expect("inject a trigger that suppresses committed history");
+        // The persisted compatibility digest is untrusted input. Recompute it
+        // exactly as a storage substitution could; no admission HMAC changes.
+        let digest = crate::schema::current_schema_digest(&conn).expect("substituted digest");
+        conn.execute(
+            "UPDATE schema_version SET schema_digest = ?1 WHERE id = 1",
+            [digest],
+        )
+        .expect("rewrite untrusted schema metadata");
+        drop(conn);
+        let before = files(dir.path());
+        let admission = Arc::new(work());
+        assert!(
+            matches!(
+                open_authority_sync(options(&path), key(), OpenIntent::Reopen, &admission),
+                Err(RetainedConfigError::Rejected)
+            ),
+            "a rewritten compatibility digest must not authorize a changed base schema"
+        );
+        assert!(!admission.mutated.load(Ordering::Acquire));
+        assert_eq!(before, files(dir.path()));
+    }
+}
+
 // Only this private unit-test executable can select a provisioning crash.
 #[test]
 fn provisioning_crash_child() {

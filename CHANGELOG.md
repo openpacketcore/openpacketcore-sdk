@@ -105,9 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provisioning, ordinary reopen, and member-repair APIs bind local storage to
   exact consensus, backing and key scope. Reopen rejects missing or incomplete
   authority without creating it; repaired voters cannot bootstrap a new
-  cluster. Local bindings stay out of replicated snapshots. Ephemeral storage
-  remains an explicit choice. Whole-store rollback freshness still requires
-  external authority; see the retained lifecycle contract and issue #800.
+  cluster. Base-schema admission uses the SDK catalog, including the unique
+  replay index, rather than trusting a stored compatibility digest. Local
+  bindings stay out of replicated snapshots. Ephemeral storage remains an
+  explicit choice. Whole-store rollback freshness still requires external
+  authority; see the retained lifecycle contract and issue #800.
 - **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
   workload scopes select separate bpffs roots and local writer locks. An
   explicit stopped-generation reset reclaims only the unbound current IPv4

@@ -130,6 +130,32 @@ async fn missing_or_altered_authority_metadata_is_never_initialized_on_reopen() 
 }
 
 #[tokio::test]
+async fn missing_or_substituted_replay_index_rejects_without_touching_sqlite() {
+    for replacement in [
+        None,
+        Some("CREATE UNIQUE INDEX config_history_replay_lookup_idx ON config_history(version)"),
+        Some("CREATE INDEX config_history_replay_lookup_idx ON config_history(CASE WHEN json_valid(principal) THEN json_extract(principal, '$.replay_lookup_digest') ELSE NULL END)"),
+    ] {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        drop(provision(&path).await);
+        let conn = rusqlite::Connection::open(&path).expect("synthetic fault access");
+        conn.execute_batch("DROP INDEX config_history_replay_lookup_idx")
+            .expect("remove replay index");
+        if let Some(replacement) = replacement {
+            conn.execute_batch(replacement).expect("substitute replay index");
+        }
+        drop(conn);
+        let before = files(dir.path());
+        assert!(matches!(
+            SqliteBackend::reopen_config_authority(ordinary(&path), key()).await,
+            Err(RetainedConfigError::Rejected)
+        ), "reopen must reject an absent, changed, or non-unique replay index");
+        assert_eq!(before, files(dir.path()));
+    }
+}
+
+#[tokio::test]
 async fn retained_preflight_cannot_overwrite_a_legacy_probe_file() {
     let dir = tempfile::tempdir().expect("storage");
     let path = dir.path().join("retained.sqlite");
