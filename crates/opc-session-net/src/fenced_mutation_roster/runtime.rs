@@ -8884,6 +8884,103 @@ mod production_runtime_cut_matrix_tests {
         );
     }
 
+    async fn first_recovered_applied_observation_can_compensate(adopt: bool) {
+        let request = request_with_members(2);
+        let provider = Arc::new(CompensationProvider::new(
+            CompensationMode::ConclusiveThenStaleAppliedStatus,
+        ));
+        let backend = Arc::new(CutBackend::default());
+        let first = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let registration = first.register(request.clone()).await.expect("admitted");
+        drop(registration);
+        drop(first);
+
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let second = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let recovered = recovered(second.recover(recovery).await.expect("current recovery"));
+        let applied = if adopt {
+            second.adopt(&recovered, 0).await
+        } else {
+            second.status(&recovered, 0).await
+        };
+        let _applied = conclusive(applied.expect("first authenticated applied observation"));
+        assert!(matches!(
+            second.prepare(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            second.execute(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            second.compensate_member(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 0);
+
+        let not_applied = conclusive(
+            second
+                .reconcile_member(&recovered, 1)
+                .await
+                .expect("complete aborting roster"),
+        );
+        assert!(matches!(
+            second.compensate_member(&recovered, 0).await,
+            Ok(CallResult::OutcomeUnknown)
+        ));
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+
+        // Once an inverse was actually dispatched, re-observing Applied must
+        // not reauthorize it. Only exact compensation recovery can settle it.
+        let still_applied = if adopt {
+            second.adopt(&recovered, 0).await
+        } else {
+            second.status(&recovered, 0).await
+        };
+        let _still_applied = conclusive(still_applied.expect("retained applied observation"));
+        assert!(matches!(
+            second.compensate_member(&recovered, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+
+        let compensated = conclusive(
+            second
+                .reconcile_member(&recovered, 0)
+                .await
+                .expect("exact final compensation"),
+        );
+        assert_eq!(
+            second
+                .prepare_terminal(&recovered, vec![compensated, not_applied])
+                .await
+                .expect("complete aborted terminal")
+                .body
+                .phase(),
+            Phase::Aborted
+        );
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_first_applied_adoption_can_compensate_an_aborting_roster() {
+        first_recovered_applied_observation_can_compensate(true).await;
+    }
+
+    #[tokio::test]
+    async fn recovered_first_applied_status_can_compensate_an_aborting_roster() {
+        first_recovered_applied_observation_can_compensate(false).await;
+    }
+
     #[tokio::test]
     async fn successor_status_reconstructs_precrash_compensated_proof_and_aborts_without_recompensating(
     ) {
