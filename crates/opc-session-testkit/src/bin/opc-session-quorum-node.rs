@@ -1868,7 +1868,8 @@ impl QualificationNode {
                 };
             }
         };
-        let grants = match qualification_stateless_consumer_grants(identities) {
+        let grants = match qualification_stateless_consumer_grants(identities, self.isolated_scale)
+        {
             Ok(grants) => grants,
             Err(()) => {
                 return QualificationNodeReply::Error {
@@ -3023,11 +3024,27 @@ impl QualificationNode {
                 persistence: scale.persistence,
                 node_id: status.node_id.get(),
                 leader_id: status.leader_id.map(|node_id| node_id.get()),
+                term: status.term,
                 configured_voter_ids: self.configured_voter_ids.clone(),
                 committed_index: report.committed_barrier_index(),
                 applied_index: status.applied_index,
                 engine_running: health.engine_running,
                 storage_failed: health.storage_failure.is_some(),
+                storage_running: matches!(
+                    health.storage_state,
+                    opc_session_store::SessionStorageState::Running
+                ),
+                background_failed: health
+                    .asynchronous
+                    .is_some_and(|progress| progress.background_failure.is_some()),
+                saturated: health
+                    .asynchronous
+                    .is_some_and(|progress| progress.saturated),
+                async_active: matches!(
+                    health.recovery,
+                    Some(opc_session_store::SessionAsyncRecoveryState::Active)
+                ),
+                completed_snapshot_count: status.completed_snapshot_count,
                 awaiting_live_quorum: matches!(
                     health.recovery,
                     Some(opc_session_store::SessionAsyncRecoveryState::AwaitingLiveQuorum)
@@ -5313,31 +5330,40 @@ where
 
 /// Build the exact, qualification-only grants for a validated command identity.
 ///
-/// This child process is a test fixture and `QualificationNodeConfig` has no
-/// consumer scope field. The scopes are therefore the two fixed namespaces
-/// exercised by the stateless-consumer qualification workload; they are not
-/// derived from the SPIFFE text or from a request. Watches receive no separate
-/// authority from this helper.
+/// The two legacy tenant/NF scopes remain fixed. Only an explicit Original
+/// scale configuration adds that workload's one exact tenant/NF scope.
+/// Request contents and SPIFFE text never expand the grant; watches receive
+/// no separate authority from this helper.
 fn qualification_stateless_consumer_grants(
     identities: Vec<SpiffeId>,
+    scale: Option<QualificationIsolatedScaleConfig>,
 ) -> Result<Vec<SessionConsumerAuthorizationGrant>, ()> {
+    let original = scale.is_some_and(|scale| {
+        matches!(
+            scale.workload,
+            opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::Original
+        )
+    });
     identities
         .into_iter()
         .map(|identity| {
-            SessionConsumerAuthorizationGrant::try_new(
-                identity,
-                [
-                    SessionConsumerTenantNfScope::new(
-                        TenantId::new(QUALIFICATION_STATELESS_CONSUMER_TENANT).map_err(|_| ())?,
-                        NetworkFunctionKind::smf(),
-                    ),
-                    SessionConsumerTenantNfScope::new(
-                        TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
-                        NetworkFunctionKind::smf(),
-                    ),
-                ],
-            )
-            .map_err(|_| ())
+            let mut scopes = vec![
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new(QUALIFICATION_STATELESS_CONSUMER_TENANT).map_err(|_| ())?,
+                    NetworkFunctionKind::smf(),
+                ),
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
+                    NetworkFunctionKind::smf(),
+                ),
+            ];
+            if original {
+                scopes.push(SessionConsumerTenantNfScope::new(
+                    TenantId::new("sdk-702-v2-qualification").map_err(|_| ())?,
+                    NetworkFunctionKind::smf(),
+                ));
+            }
+            SessionConsumerAuthorizationGrant::try_new(identity, scopes).map_err(|_| ())
         })
         .collect()
 }

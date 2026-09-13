@@ -1,5 +1,8 @@
 //! One OS process per voter; the test process owns only clients and workload.
 
+#[path = "isolated_scale/original.rs"]
+mod original;
+
 use super::*;
 use opc_session_testkit::qualification::{
     QualificationIsolatedPersistence, QualificationIsolatedScaleConfig,
@@ -123,10 +126,16 @@ impl Fleet {
                 assert_eq!(report.configured_voter_ids, expected_ids);
                 assert!(!report.storage_failed);
             }
+            let term = reports
+                .iter()
+                .map(|report| report.term)
+                .max()
+                .expect("configured voter reports");
             if let Some(leader) = reports[0].leader_id {
                 if reports.iter().all(|report| {
                     report.ready
                         && report.engine_running
+                        && report.term == term
                         && report.leader_id == Some(leader)
                         && report.committed_index.is_some()
                         && report.applied_index >= report.committed_index

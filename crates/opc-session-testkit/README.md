@@ -995,6 +995,53 @@ independent-checker, and tamper tests with:
 - Run the historical plaintext foundation explicitly with:
   `cargo test -p opc-session-testkit --features foundation-insecure --test qualification_multiprocess`.
 
+
+The ignored `isolated_scale::original::isolated_async_original_workload` and
+`isolated_scale::original::isolated_durable_original_workload` tests use the
+original 50,000 sessions and 1,010,000 exact encrypted outcomes in separate
+voter processes. They retain the original 500 operations/s for 1,800 seconds,
+1,000 operations/s for 60 seconds, 800ms batch deadline, 25ms/100ms item
+percentile limits, eight history epochs and disk/capacity limits. Latency starts
+at each item's scheduled arrival and includes producer delay and batching.
+The paced burst is not a measurement of maximum capacity or proof of a strict
+sustained 1,000 successful DURABLE operations/s floor.
+
+Run one mode at a time inside the authorized build allocation. Supply an
+existing fs-verity directory, a short existing temporary directory, and a new
+evidence directory. No mounts or host settings are created by the runner:
+
+```bash
+OPC_FS_VERITY_QUALIFICATION=required \
+OPC_FS_VERITY_SNAPSHOT_ROOT=/path/to/existing/fs-verity/fresh-run \
+TMPDIR=/short/owned/tmp \
+python3 scripts/observe-session-store-live-memory.py \
+  --workspace-root /short/owned/tmp \
+  --evidence-directory /path/to/new/evidence \
+  -- cargo test --locked --release -p opc-session-testkit --all-features \
+     --test qualification_mtls_multiprocess \
+     isolated_scale::original::isolated_async_original_workload \
+     -- --ignored --exact --nocapture --test-threads=1
+```
+
+For Durable, replace the final test name with
+`isolated_scale::original::isolated_durable_original_workload`. The observer
+keeps actual PID/start-time identities, executable and configuration hashes,
+per-process RSS/PSS/peak estimates, sampling gaps, test output and result hashes.
+It acknowledges the final sample only after all three voters and the external
+driver have been sampled while still alive. Missing coverage fails the run;
+a successful command that ran no qualifying workload also fails. The small
+capture controls can be exercised by setting
+`OPC_SESSION_ISOLATED_FINAL_CAPTURE_CONTROL=1` and selecting `isolated_scale::`
+without `--ignored`. Parser rejection controls run with
+`python3 scripts/test-observe-session-store-live-memory.py`.
+
+These diagnostics do not establish a deployment RAM budget, a quiet-host
+performance qualification, or allocation ownership within each process.
+A process exit is not a zero-memory sample. Full live cardinality is separate
+from the small cold-reconstruction controls and the retained cold-image probe.
+All voters join their shutdown paths after the driver classifies submitted
+effects; failure evidence retains exact requests and classified results.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](../../LICENSE).

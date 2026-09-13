@@ -85,6 +85,8 @@ pub struct QualificationIsolatedScaleReadiness {
     pub node_id: u64,
     /// Current elected leader, if observed.
     pub leader_id: Option<u64>,
+    /// Term observed with the leader identity, for exact maintenance selection.
+    pub term: u64,
     /// Exact sorted voter identities admitted by this node configuration.
     pub configured_voter_ids: Vec<u64>,
     /// Committed barrier supplied by this probe.
@@ -95,6 +97,16 @@ pub struct QualificationIsolatedScaleReadiness {
     pub engine_running: bool,
     /// Whether persistence has recorded a terminal storage failure.
     pub storage_failed: bool,
+    /// Whether the native storage lifecycle is Running.
+    pub storage_running: bool,
+    /// A distinct terminal error from the asynchronous background writer.
+    pub background_failed: bool,
+    /// Whether the asynchronous persistence backlog is saturated.
+    pub saturated: bool,
+    /// Whether an Async root has completed the live-quorum recovery fence.
+    pub async_active: bool,
+    /// Completed automatic consensus snapshot publications.
+    pub completed_snapshot_count: u64,
     /// Whether an existing Async root still requires a surviving live quorum.
     pub awaiting_live_quorum: bool,
     /// Currently detached Async generation, if any.
