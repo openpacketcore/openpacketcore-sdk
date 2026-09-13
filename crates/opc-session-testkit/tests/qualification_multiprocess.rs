@@ -1523,6 +1523,7 @@ impl CanonicalConfigurationManifest {
                 snapshot_root_device: None,
                 snapshot_root_inode: None,
                 operation_timeout_millis: self.operation_timeout_millis,
+                isolated_scale: None,
                 transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
             };
             config.validate().map_err(|_| HarnessError::Evidence)?;

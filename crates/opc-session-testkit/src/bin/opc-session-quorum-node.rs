@@ -72,7 +72,8 @@ use opc_session_testkit::qualification::{
     QualificationConcurrentRecordSnapshot, QualificationConcurrentStateClass,
     QualificationConcurrentStateType, QualificationConcurrentSubscriptionId,
     QualificationConcurrentWatchEvent, QualificationConnectionLifecycleMetrics,
-    QualificationConsensusRpcAvailability, QualificationNodeCommand, QualificationNodeConfig,
+    QualificationConsensusRpcAvailability, QualificationIsolatedScaleConfig,
+    QualificationIsolatedScaleReadiness, QualificationNodeCommand, QualificationNodeConfig,
     QualificationNodeErrorCode, QualificationNodeReply, QualificationPeerRouting,
     QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialStatus,
@@ -82,8 +83,8 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS, QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES,
     QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX, QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS,
     QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
-    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
-    QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS, QUALIFICATION_MAX_CONFIG_BYTES,
+    QUALIFICATION_MAX_LEASE_HANDLES, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
@@ -413,6 +414,16 @@ struct QualificationNode {
     rpc_gate: QualificationConsensusRpcGate,
     roster_attestation_root: RosterAttestationTrustRootV1,
     fixed_consensus_identity: SessionConsensusIdentity,
+    isolated_scale: Option<QualificationIsolatedScaleConfig>,
+}
+
+#[derive(Debug)]
+struct IsolatedScaleClock(Timestamp);
+
+impl opc_session_store::Clock for IsolatedScaleClock {
+    fn now_utc(&self) -> Timestamp {
+        self.0
+    }
 }
 
 /// Test-harness-only issuer for the protected consumer ingress.  It is
@@ -1295,7 +1306,28 @@ impl QualificationNode {
 
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
-        let store = Arc::new(
+        let store = Arc::new(if let Some(scale) = config.isolated_scale {
+            let logical_time = time::OffsetDateTime::from_unix_timestamp(
+                QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
+            )
+            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?;
+            ConsensusSessionStore::open_fixed_quorum_with_clock_and_persistence(
+                topology,
+                backend,
+                &snapshot_directory,
+                peers,
+                Arc::new(IsolatedScaleClock(Timestamp::from_offset_datetime(
+                    logical_time,
+                ))),
+                Duration::from_millis(config.operation_timeout_millis),
+                config
+                    .snapshot_integrity
+                    .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
+                scale.persistence.store_mode(),
+            )
+            .await
+            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?
+        } else {
             ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                 topology,
                 backend,
@@ -1308,8 +1340,8 @@ impl QualificationNode {
                     .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
             )
             .await
-            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?,
-        );
+            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?
+        });
         let empty_vote_dispatches = Arc::new(AtomicU64::new(0));
         let counting_handler: Arc<dyn SessionConsensusRpcHandler> =
             Arc::new(QualificationProbeDispatchCountingHandler {
@@ -1368,6 +1400,7 @@ impl QualificationNode {
             config.backend_namespace.clone(),
         );
         Ok(Self {
+            isolated_scale: config.isolated_scale,
             store,
             protected,
             server: Some(server),
@@ -1758,7 +1791,44 @@ impl QualificationNode {
                 forget_lease_handle(&mut self.leases, &lease_handle);
                 QualificationNodeReply::LeaseHandleForgotten
             }
-            QualificationNodeCommand::Shutdown => QualificationNodeReply::ShuttingDown,
+            QualificationNodeCommand::Shutdown => {
+                if self.isolated_scale.is_some() {
+                    self.stop_server().await;
+                    if let Err(error) = self.store.shutdown().await {
+                        return QualificationNodeReply::Error {
+                            code: map_store_error(&error),
+                        };
+                    }
+                }
+                QualificationNodeReply::ShuttingDown
+            }
+            QualificationNodeCommand::IsolatedScaleProbe => self.isolated_scale_probe().await,
+            QualificationNodeCommand::IsolatedScaleHistoryState => {
+                if self.isolated_scale.is_none() {
+                    return invalid_request_reply();
+                }
+                match self.store.fenced_transition_v2_history_state().await {
+                    Ok(state) => QualificationNodeReply::IsolatedScaleHistory { state },
+                    Err(error) => QualificationNodeReply::Error {
+                        code: map_store_error(&error),
+                    },
+                }
+            }
+            QualificationNodeCommand::IsolatedScaleMaintainHistory { expected_state } => {
+                if self.isolated_scale.is_none() {
+                    return invalid_request_reply();
+                }
+                match self
+                    .store
+                    .maintain_fenced_transition_v2_history(expected_state)
+                    .await
+                {
+                    Ok(state) => QualificationNodeReply::IsolatedScaleHistory { state },
+                    Err(error) => QualificationNodeReply::Error {
+                        code: map_store_error(&error),
+                    },
+                }
+            }
             QualificationNodeCommand::ConsumerTlsPeerCredentialRejections => {
                 match self.consumer_server.as_ref() {
                     Some(server) => QualificationNodeReply::ConsumerTlsPeerCredentialRejections {
@@ -2937,6 +3007,39 @@ impl QualificationNode {
         QualificationNodeReply::ConcurrentRestore {
             complete: true,
             records,
+        }
+    }
+
+    async fn isolated_scale_probe(&self) -> QualificationNodeReply {
+        let Some(scale) = self.isolated_scale else {
+            return invalid_request_reply();
+        };
+        let report = self.store.probe_fixed_quorum_readiness().await;
+        let status = self.store.status();
+        let health = report.persistence_health();
+        QualificationNodeReply::IsolatedScaleReadiness {
+            status: QualificationIsolatedScaleReadiness {
+                ready: report.traffic_authority().is_granted(),
+                persistence: scale.persistence,
+                node_id: status.node_id.get(),
+                leader_id: status.leader_id.map(|node_id| node_id.get()),
+                configured_voter_ids: self.configured_voter_ids.clone(),
+                committed_index: report.committed_barrier_index(),
+                applied_index: status.applied_index,
+                engine_running: health.engine_running,
+                storage_failed: health.storage_failure.is_some(),
+                awaiting_live_quorum: matches!(
+                    health.recovery,
+                    Some(opc_session_store::SessionAsyncRecoveryState::AwaitingLiveQuorum)
+                ),
+                captured_generation: health
+                    .asynchronous
+                    .and_then(|progress| progress.captured_generation),
+                completed_generation: health
+                    .asynchronous
+                    .map(|progress| progress.completed_generation),
+                persistence_lag_millis: health.asynchronous.map(|progress| progress.lag_millis),
+            },
         }
     }
 

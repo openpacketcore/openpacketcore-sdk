@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "qualification_mtls_multiprocess/isolated_scale.rs"]
+mod isolated_scale;
+
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
@@ -3779,7 +3782,24 @@ impl Fleet {
         workload_schedule_sha256: String,
         release_provenance: Option<&ReleaseGateProvenance>,
     ) -> Self {
+        Self::start_with_settings(
+            member_count,
+            workload_schedule_sha256,
+            release_provenance,
+            None,
+        )
+    }
+
+    fn start_with_settings(
+        member_count: usize,
+        workload_schedule_sha256: String,
+        release_provenance: Option<&ReleaseGateProvenance>,
+        isolated_scale: Option<
+            opc_session_testkit::qualification::QualificationIsolatedScaleConfig,
+        >,
+    ) -> Self {
         assert!(matches!(member_count, 3 | 5));
+        assert!(isolated_scale.is_none() || release_provenance.is_none());
         let (source_revision, source_tree_status, source_worktree_sha256) =
             candidate_source_provenance().expect("capture candidate source provenance");
         let child_sha256 = candidate_sha256_file(
@@ -3790,7 +3810,10 @@ impl Fleet {
         let harness_path = env::current_exe().expect("locate candidate harness artifact");
         let harness_sha256 = candidate_sha256_file(&harness_path, MAX_CANDIDATE_ARTIFACT_BYTES)
             .expect("hash candidate harness before execution");
-        let workspace = tempfile::tempdir().expect("create mTLS qualification workspace");
+        let mut workspace = tempfile::tempdir().expect("create mTLS qualification workspace");
+        // Preserve scale-mode mutable files on failure as well as success.
+        // Their lifecycle is part of the process-memory/reconstruction evidence.
+        workspace.disable_cleanup(isolated_scale.is_some());
         let snapshot_namespace = Self::fs_verity_snapshot_campaign_namespace(release_provenance);
         if let Some(namespace) = &snapshot_namespace {
             assert_ne!(
@@ -3920,6 +3943,7 @@ impl Fleet {
                     .as_ref()
                     .map(PinnedV9SnapshotNamespace::inode),
                 operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+                isolated_scale,
                 transport: QualificationTransportConfig::ProjectedMtls(
                     QualificationProjectedMtlsConfig {
                         projected_volume_root: projected_root.clone(),
@@ -4006,6 +4030,13 @@ impl Fleet {
             candidate_public_material_manifest,
             readiness_probe_commands: 0,
         };
+        if isolated_scale.is_some() {
+            // The scale collector invokes its explicit mode-aware probe.
+            // Legacy qualification still takes the strict Durable path below.
+            fleet.assert_all_material_ready();
+            fleet.verify_snapshot_namespace();
+            return fleet;
+        }
         fleet.wait_ready();
         fleet.assert_all_material_ready();
         fleet.verify_snapshot_namespace();
