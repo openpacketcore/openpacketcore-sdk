@@ -1007,6 +1007,7 @@ impl RecoveryTrafficProgressTracker {
 
 struct RecoveryFaultSettlementContext<'a> {
     before: &'a [QualificationConnectionLifecycleMetrics],
+    catchup_before: &'a [QualificationConnectionLifecycleMetrics],
     participants: &'a TrafficParticipants,
     phase: &'a str,
     started: Instant,
@@ -2000,6 +2001,138 @@ fn recovery_fault_flush_has_no_unsafe_outcomes(
         && after.drain_overruns == before.drain_overruns
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecoveryConnectionDelta {
+    attempts: u64,
+    terminal: u64,
+    baseline_outstanding: u64,
+    reconnect_attempts: u64,
+    reconnect_failures: u64,
+}
+
+impl RecoveryConnectionDelta {
+    fn combine(self, other: Self) -> Self {
+        let sum = |left: u64, right: u64| {
+            left.checked_add(right)
+                .expect("bounded recovery connection ledger")
+        };
+        Self {
+            attempts: sum(self.attempts, other.attempts),
+            terminal: sum(self.terminal, other.terminal),
+            baseline_outstanding: sum(self.baseline_outstanding, other.baseline_outstanding),
+            reconnect_attempts: sum(self.reconnect_attempts, other.reconnect_attempts),
+            reconnect_failures: sum(self.reconnect_failures, other.reconnect_failures),
+        }
+    }
+}
+
+fn recovery_connection_delta(
+    node_index: usize,
+    before: &QualificationConnectionLifecycleMetrics,
+    after: &QualificationConnectionLifecycleMetrics,
+) -> RecoveryConnectionDelta {
+    assert_connection_attempts_accounted(before, node_index);
+    assert_connection_attempts_accounted(after, node_index);
+    assert!(
+        recovery_fault_flush_has_no_unsafe_outcomes(before, after),
+        "fault-outcome flush recorded abandoned, protocol, backend, or drain-overrun evidence: node={node_index}, before={before:?}, after={after:?}"
+    );
+    let attempts = lifecycle_counter_delta(
+        before.connection_attempts,
+        after.connection_attempts,
+        node_index,
+        "connection_attempts",
+    );
+    let terminal = [
+        (
+            "connection_successes",
+            before.connection_successes,
+            after.connection_successes,
+        ),
+        (
+            "connection_failure_transport",
+            before.connection_failure_transport,
+            after.connection_failure_transport,
+        ),
+        (
+            "connection_failure_authentication",
+            before.connection_failure_authentication,
+            after.connection_failure_authentication,
+        ),
+        (
+            "connection_failure_timeout",
+            before.connection_failure_timeout,
+            after.connection_failure_timeout,
+        ),
+        (
+            "connection_superseded",
+            before.connection_superseded,
+            after.connection_superseded,
+        ),
+        (
+            "connection_abandoned",
+            before.connection_abandoned,
+            after.connection_abandoned,
+        ),
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, (name, before, after)| {
+        total.checked_add(lifecycle_counter_delta(before, after, node_index, name))
+    })
+    .expect("bounded fault terminal ledger");
+    let reconnect_attempts = lifecycle_counter_delta(
+        before.reconnect_attempts,
+        after.reconnect_attempts,
+        node_index,
+        "reconnect_attempts",
+    );
+    let reconnect_failures = lifecycle_counter_delta(
+        before.reconnect_failures,
+        after.reconnect_failures,
+        node_index,
+        "reconnect_failures",
+    );
+    let (_, baseline_outstanding, _) =
+        connection_attempt_accounting(before).expect("accounted fault-outcome baseline");
+    assert!(
+        terminal <= attempts.saturating_add(baseline_outstanding),
+        "fault-outcome flush violated interval connection conservation: node={node_index}, attempts={attempts}, terminal_outcomes={terminal}, baseline_outstanding={baseline_outstanding}"
+    );
+    RecoveryConnectionDelta {
+        attempts,
+        terminal,
+        baseline_outstanding,
+        reconnect_attempts,
+        reconnect_failures,
+    }
+}
+
+fn assert_fixed_recovery_connection_bound(
+    member_count: usize,
+    node_index: usize,
+    delta: RecoveryConnectionDelta,
+) {
+    let bound = recovery_fault_connection_bound(member_count);
+    let terminal_bound = bound
+        .checked_add(delta.baseline_outstanding)
+        .expect("bounded terminal carry-in");
+    assert!(
+        delta.terminal <= terminal_bound,
+        "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, observed={}, bound={terminal_bound}, new_attempt_bound={bound}, delta={delta:?}",
+        delta.terminal,
+    );
+    for (counter, observed) in [
+        ("connection_attempts", delta.attempts),
+        ("reconnect_attempts", delta.reconnect_attempts),
+        ("reconnect_failures", delta.reconnect_failures),
+    ] {
+        assert!(
+            observed <= bound,
+            "fault-outcome flush exceeded the fixed per-node connection bound: node={node_index}, counter={counter}, observed={observed}, bound={bound}"
+        );
+    }
+}
+
 fn assert_recovery_fault_flush_bounds(
     member_count: usize,
     before: &[QualificationConnectionLifecycleMetrics],
@@ -2007,90 +2140,51 @@ fn assert_recovery_fault_flush_bounds(
 ) {
     assert_eq!(before.len(), member_count);
     assert_eq!(after.len(), member_count);
-    let bound = recovery_fault_connection_bound(member_count);
     for (node_index, (before, after)) in before.iter().zip(after).enumerate() {
-        assert_connection_attempts_accounted(before, node_index);
-        assert_connection_attempts_accounted(after, node_index);
-        assert!(
-            recovery_fault_flush_has_no_unsafe_outcomes(before, after),
-            "fault-outcome flush recorded abandoned, protocol, backend, or drain-overrun evidence: node={node_index}, before={before:?}, after={after:?}"
-        );
-        let attempts = lifecycle_counter_delta(
-            before.connection_attempts,
-            after.connection_attempts,
+        assert_fixed_recovery_connection_bound(
+            member_count,
             node_index,
-            "connection_attempts",
+            recovery_connection_delta(node_index, before, after),
         );
-        let terminal = [
-            (
-                "connection_successes",
-                before.connection_successes,
-                after.connection_successes,
-            ),
-            (
-                "connection_failure_transport",
-                before.connection_failure_transport,
-                after.connection_failure_transport,
-            ),
-            (
-                "connection_failure_authentication",
-                before.connection_failure_authentication,
-                after.connection_failure_authentication,
-            ),
-            (
-                "connection_failure_timeout",
-                before.connection_failure_timeout,
-                after.connection_failure_timeout,
-            ),
-            (
-                "connection_superseded",
-                before.connection_superseded,
-                after.connection_superseded,
-            ),
-            (
-                "connection_abandoned",
-                before.connection_abandoned,
-                after.connection_abandoned,
-            ),
-        ]
-        .into_iter()
-        .try_fold(0_u64, |total, (name, before, after)| {
-            total.checked_add(lifecycle_counter_delta(before, after, node_index, name))
-        })
-        .expect("bounded fault terminal ledger");
-        let reconnect_attempts = lifecycle_counter_delta(
-            before.reconnect_attempts,
-            after.reconnect_attempts,
+    }
+}
+
+fn assert_recovery_phase_connection_bounds(
+    member_count: usize,
+    fault_before: &[QualificationConnectionLifecycleMetrics],
+    catchup_before: &[QualificationConnectionLifecycleMetrics],
+    settlement_before: &[QualificationConnectionLifecycleMetrics],
+    settled: &[QualificationConnectionLifecycleMetrics],
+) {
+    for snapshot in [fault_before, catchup_before, settlement_before, settled] {
+        assert_eq!(snapshot.len(), member_count);
+    }
+    for node_index in 0..member_count {
+        // Every phase and the complete interval retain exact conservation and
+        // zero abandoned/protocol/backend/drain-overrun outcomes. Snapshot
+        // catch-up has no fixed duration, so its actual RPC timeouts cannot
+        // spend a connection allowance derived from the finite expiry schedule.
+        let fault = recovery_connection_delta(
             node_index,
-            "reconnect_attempts",
+            &fault_before[node_index],
+            &catchup_before[node_index],
         );
-        let reconnect_failures = lifecycle_counter_delta(
-            before.reconnect_failures,
-            after.reconnect_failures,
+        let catchup = recovery_connection_delta(
             node_index,
-            "reconnect_failures",
+            &catchup_before[node_index],
+            &settlement_before[node_index],
         );
-        let (_, baseline_outstanding, _) =
-            connection_attempt_accounting(before).expect("accounted fault-outcome baseline");
-        let terminal_bound = bound.saturating_add(baseline_outstanding);
-        assert!(
-            terminal <= attempts.saturating_add(baseline_outstanding),
-            "fault-outcome flush violated interval connection conservation: node={node_index}, attempts={attempts}, terminal_outcomes={terminal}, baseline_outstanding={baseline_outstanding}"
+        let settlement = recovery_connection_delta(
+            node_index,
+            &settlement_before[node_index],
+            &settled[node_index],
         );
-        assert!(
-            terminal <= terminal_bound,
-            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}, attempts={attempts}, reconnect_attempts={reconnect_attempts}, reconnect_failures={reconnect_failures}, before={before:?}, after={after:?}"
-        );
-        for (counter, observed) in [
-            ("connection_attempts", attempts),
-            ("reconnect_attempts", reconnect_attempts),
-            ("reconnect_failures", reconnect_failures),
-        ] {
-            assert!(
-                observed <= bound,
-                "fault-outcome flush exceeded the fixed per-node connection bound: node={node_index}, counter={counter}, observed={observed}, bound={bound}"
-            );
-        }
+        let complete =
+            recovery_connection_delta(node_index, &fault_before[node_index], &settled[node_index]);
+        // Share the original 85/161 allowance across both fixed phases; do not
+        // grant a second allowance when the settlement baseline is captured.
+        assert_fixed_recovery_connection_bound(member_count, node_index, fault.combine(settlement));
+        eprintln!("MTLS_RECOVERY_CONNECTION_PHASES profile=fixed-fault-and-settlement-with-catchup-conservation/v2 node_index={node_index} complete={complete:?} fault={fault:?} catchup={catchup:?} settlement={settlement:?}");
     }
 }
 
@@ -5199,6 +5293,7 @@ impl Fleet {
     ) {
         let RecoveryFaultSettlementContext {
             before,
+            catchup_before,
             participants,
             phase,
             started,
@@ -5234,6 +5329,7 @@ impl Fleet {
         let mut stable_traffic_checkpoint = traffic_progress.pulse_checkpoint.clone();
         let mut traffic_progressed_since_stable = false;
         let mut lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
+        let settlement_before = lifecycle.clone();
         let mut stable_ledger = connection_attempt_settlement_ledgers(&lifecycle);
         let observed_at = Instant::now();
         let mut stable_since = observed_at;
@@ -5390,7 +5486,13 @@ impl Fleet {
                     ),
                     self.stderr_diagnostics()
                 );
-                assert_recovery_fault_flush_bounds(self.member_count(), before, &lifecycle);
+                assert_recovery_phase_connection_bounds(
+                    self.member_count(),
+                    before,
+                    catchup_before,
+                    &settlement_before,
+                    &lifecycle,
+                );
                 return (lifecycle, traffic);
             }
             assert!(
@@ -7054,6 +7156,16 @@ impl Fleet {
             &mut traffic_progress,
             recovery_deadline,
         );
+        // Capture the end of the fixed fault/path-proof interval before
+        // backlog-dependent reconstruction. Both surrounding fixed phases
+        // share one original connection allowance when settlement completes.
+        let catchup_before =
+            self.all_lifecycle_metrics_by(traffic_progress.next_deadline(recovery_deadline));
+        assert_recovery_fault_flush_bounds(
+            self.member_count(),
+            fault_lifecycle_before,
+            &catchup_before,
+        );
         self.wait_for_recovery_readiness(
             traffic_availability_baseline,
             &mut traffic_progress,
@@ -7093,6 +7205,7 @@ impl Fleet {
         let (lifecycle_before, clean_traffic_baseline) = self
             .wait_for_recovery_fault_outcomes_to_settle(RecoveryFaultSettlementContext {
                 before: fault_lifecycle_before,
+                catchup_before: &catchup_before,
                 participants,
                 phase,
                 started: settlement_started,
@@ -20971,6 +21084,85 @@ fn recovery_fault_flush_bounds_incident_failures_and_rejects_abandonment() {
             &before,
             &unsafe_after
         ));
+    }
+}
+
+#[test]
+fn recovery_phase_accounting_shares_one_fixed_bound_across_catchup() {
+    for member_count in [3, 5] {
+        let bound = recovery_fault_connection_bound(member_count);
+        let mut before = vec![lifecycle_metrics_fixture(); member_count];
+        before[0].connection_attempts = 1;
+        before[0].active_connections = 1;
+        let mut catchup_before = before.clone();
+        catchup_before[0].connection_attempts += 20;
+        catchup_before[0].connection_successes += 20;
+        let mut settlement_before = catchup_before.clone();
+        // Longer reconstruction legitimately accumulates more calls than the
+        // entire fixed allowance. The original pending attempt stays owned.
+        settlement_before[0].connection_attempts += 2 * bound;
+        settlement_before[0].connection_successes += 2 * bound;
+        let mut settled = settlement_before.clone();
+        settled[0].connection_attempts += bound - 20;
+        settled[0].connection_successes += bound - 20 + 1;
+        settled[0].active_connections = 0;
+        assert_recovery_phase_connection_bounds(
+            member_count,
+            &before,
+            &catchup_before,
+            &settlement_before,
+            &settled,
+        );
+
+        // Exactly one additional attempt in either fixed phase fails. Each
+        // individual phase remains below its bound, so this detects granting
+        // a fresh full allowance after catch-up instead of sharing the budget.
+        for fault_phase in [false, true] {
+            let mut fault = catchup_before.clone();
+            let mut settlement = settled.clone();
+            if fault_phase {
+                fault[0].connection_attempts += 1;
+                fault[0].connection_successes += 1;
+            } else {
+                settlement[0].connection_attempts += 1;
+                settlement[0].connection_successes += 1;
+            }
+            assert!(std::panic::catch_unwind(|| {
+                assert_recovery_phase_connection_bounds(
+                    member_count,
+                    &before,
+                    &fault,
+                    &settlement_before,
+                    &settlement,
+                );
+            })
+            .is_err());
+        }
+    }
+}
+
+#[test]
+fn recovery_phase_accounting_cannot_hide_unsafe_or_unaccounted_catchup() {
+    for failure in 0..6 {
+        let before = vec![lifecycle_metrics_fixture(); 3];
+        let mut catchup = before.clone();
+        catchup[0].connection_attempts = 1;
+        match failure {
+            0 => catchup[0].connection_abandoned = 1,
+            1 => catchup[0].connection_failure_protocol = 1,
+            2 => catchup[0].connection_failure_backend = 1,
+            3 => {
+                catchup[0].connection_successes = 1;
+                catchup[0].drain_overruns = 1;
+            }
+            4 => catchup[0].connection_successes = 2,
+            5 => {} // An outstanding attempt without a live owner.
+            _ => unreachable!(),
+        }
+        assert!(std::panic::catch_unwind(|| {
+            assert_recovery_phase_connection_bounds(3, &before, &before, &catchup, &catchup);
+        })
+        .is_err());
     }
 }
 

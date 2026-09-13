@@ -250,17 +250,29 @@ cadence and independent full-key coverage clock resume immediately after
 recovery.
 Only after bounded fault-era transport/authentication/timeout/reconnect
 outcomes have settled does it capture the clean member-scoped reauthentication
-baseline. Fault-era new attempts and reconnects retain the fixed 85/161
-per-node bound: the ordinary 24/40 allowance, no more than fifteen five-second
+baseline. The fixed fault/path-proof and settlement phases share one 85/161
+per-node bound for new attempts and reconnects: the ordinary 24/40 allowance,
+no more than fifteen five-second
 refresh rounds over four/eight incident directed paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved
 node. The reverse probe fails local material preflight without dialing. Terminal
 outcomes may additionally include only the exact attempts already outstanding
-at the interval baseline, with interval conservation enforced. The schedule
-binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
+at each measured interval's baseline, with interval conservation enforced.
+A passive lifecycle snapshot after the existing-generation path proof ends
+the fixed fault interval. The first settlement snapshot ends catch-up. Both
+fixed intervals spend the same allowance; taking the second baseline does not
+grant another 85/161 attempts. Variable-duration catch-up records its actual
+attempts, terminal outcomes, and reconnects separately. Every phase and the
+complete interval must conserve attempts and live owners with monotonic
+counters. Catch-up cannot spend a total-count allowance derived from a finite
+expiry schedule: real caller deadlines can expire while snapshot installation
+holds a consensus lane, requiring a fresh connection for a later RPC.
+The functional audit reports this phase accounting as
+`fixed-fault-and-settlement-with-catchup-conservation/v2`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
-The frozen private Schedule v6 binds the historical timed procedure as
+The frozen private Schedule v6 keeps its historical accounting profile
+`new-attempts-plus-baseline-outstanding/v1` and binds the timed procedure as
 `member-scoped-reauth-settled-baseline/v4` with progress profile
 `common-key-pulse-all-active-key-coverage/v1`; its descriptors and historical
 results remain unchanged. Passing these functional catch-up checks does not
