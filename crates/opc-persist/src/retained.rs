@@ -5,7 +5,9 @@
 //! authentication does not prove freshness against coherent storage rollback.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+#[cfg(test)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,14 +16,19 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use rand::{rngs::SysRng, TryRng};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(unix)]
+use crate::local_sqlite::{
+    file_identity, identity_for_path, open_file, open_sqlite, AdmissionFileLock, FileAdmission,
+};
+use crate::local_sqlite::{lock_path, reject_symlink_components};
 use crate::{AuditKey, ConfigConsensusTopology, SqliteBackend};
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 const RECORD_MAGIC: &[u8; 8] = b"OPCRET01";
 const RECORD_DOMAIN: &[u8] = b"openpacketcore/config-retained-admission/v1\0";
@@ -238,75 +245,6 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancelled.store(true, Ordering::Release);
     }
-}
-
-/// Own the admitted lock, rather than relying on the last OS descriptor close.
-/// A concurrent preflight child can inherit this file description until exec.
-/// Only the final SDK owner releases it; failed acquisition owns no unlock.
-struct AdmissionFileLock(File);
-
-impl AdmissionFileLock {
-    #[cfg(unix)]
-    fn acquire(file: File) -> Result<Self, RetainedConfigError> {
-        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
-            |error| {
-                if error == rustix::io::Errno::WOULDBLOCK {
-                    RetainedConfigError::InUse
-                } else {
-                    RetainedConfigError::Unavailable
-                }
-            },
-        )?;
-        Ok(Self(file))
-    }
-}
-
-impl std::ops::Deref for AdmissionFileLock {
-    type Target = File;
-
-    fn deref(&self) -> &File {
-        &self.0
-    }
-}
-
-impl Drop for AdmissionFileLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
-    }
-}
-
-/// The shared connection wrapper retains this guard through SQLite close,
-/// including when an outstanding blocking operation outlives its caller.
-pub(crate) struct FileAdmission {
-    path: PathBuf,
-    parent: File,
-    lock: AdmissionFileLock,
-    database: File,
-    identity: [u64; 6],
-}
-
-impl FileAdmission {
-    #[cfg(unix)]
-    fn read_back(&self) -> Result<(), RetainedConfigError> {
-        reject_symlink_components(&self.path)?;
-        let parent = self.path.parent().ok_or(RetainedConfigError::Rejected)?;
-        let identity = file_identity(&self.parent, &self.lock, &self.database)?;
-        if identity != self.identity
-            || identity_for_path(parent, true)? != identity[0..2]
-            || identity_for_path(&lock_path(&self.path), false)? != identity[2..4]
-            || identity_for_path(&self.path, false)? != identity[4..6]
-        {
-            return Err(RetainedConfigError::Rejected);
-        }
-        Ok(())
-    }
-}
-
-fn lock_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".opc-retained");
-    PathBuf::from(name)
 }
 
 /// Returns only a denial predicate. Presence is never admission authority.
@@ -630,7 +568,7 @@ fn open_authority_sync(
 }
 
 #[cfg(unix)]
-fn retained_preflight(
+pub(crate) fn retained_preflight(
     admission: &FileAdmission,
     ephemeral: bool,
     min_free_bytes: u64,
@@ -657,117 +595,6 @@ fn retained_preflight(
         foreign_keys_on: true,
         wal_mode: true,
     }
-}
-
-#[cfg(unix)]
-fn open_file(path: &Path, writable: bool, directory: bool) -> Result<File, RetainedConfigError> {
-    let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    if directory {
-        flags |= libc::O_DIRECTORY;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(writable)
-        .custom_flags(flags)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                RetainedConfigError::RecoveryRequired
-            } else {
-                RetainedConfigError::Rejected
-            }
-        })?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-    if metadata.is_dir() != directory
-        || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err(RetainedConfigError::Rejected);
-    }
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn identity_for_path(path: &Path, directory: bool) -> Result<[u64; 2], RetainedConfigError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| RetainedConfigError::Rejected)?;
-    if metadata.file_type().is_symlink()
-        || metadata.is_dir() != directory
-        || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err(RetainedConfigError::Rejected);
-    }
-    Ok([metadata.dev(), metadata.ino()])
-}
-
-#[cfg(unix)]
-fn file_identity(
-    parent: &File,
-    lock: &File,
-    database: &File,
-) -> Result<[u64; 6], RetainedConfigError> {
-    let parent = parent
-        .metadata()
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-    let lock = lock
-        .metadata()
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-    let database = database
-        .metadata()
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-    Ok([
-        parent.dev(),
-        parent.ino(),
-        lock.dev(),
-        lock.ino(),
-        database.dev(),
-        database.ino(),
-    ])
-}
-
-fn reject_symlink_components(path: &Path) -> Result<(), RetainedConfigError> {
-    let mut prefix = PathBuf::new();
-    for component in path.components() {
-        if matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::CurDir
-        ) {
-            return Err(RetainedConfigError::InvalidRequest);
-        }
-        prefix.push(component);
-        match std::fs::symlink_metadata(&prefix) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(RetainedConfigError::Rejected)
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && prefix == path => {}
-            Err(_) => return Err(RetainedConfigError::RecoveryRequired),
-        }
-    }
-    Ok(())
-}
-
-fn open_sqlite(path: &Path) -> Result<Connection, RetainedConfigError> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|_| RetainedConfigError::Rejected)?;
-    if conn
-        .is_readonly(rusqlite::DatabaseName::Main)
-        .map_err(|_| RetainedConfigError::Rejected)?
-    {
-        return Err(RetainedConfigError::Rejected);
-    }
-    conn.busy_timeout(Duration::from_millis(u64::from(
-        SqliteBackend::SQLITE_BUSY_TIMEOUT_MS,
-    )))
-    .map_err(|_| RetainedConfigError::Unavailable)?;
-    Ok(conn)
 }
 
 fn make_record(

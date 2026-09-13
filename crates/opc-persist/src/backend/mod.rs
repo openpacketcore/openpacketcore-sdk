@@ -41,7 +41,36 @@ mod ops;
 /// own the complete connection lifetime.
 pub(crate) struct BackendConnection {
     connection: rusqlite::Connection,
-    _retained_admission: Option<Arc<crate::retained::FileAdmission>>,
+    _retained_admission: Option<Arc<crate::local_sqlite::FileAdmission>>,
+}
+
+impl BackendConnection {
+    #[cfg(unix)]
+    pub(crate) fn retained(
+        connection: rusqlite::Connection,
+        admission: Arc<crate::local_sqlite::FileAdmission>,
+    ) -> Self {
+        Self {
+            connection,
+            _retained_admission: Some(admission),
+        }
+    }
+
+    pub(crate) fn close(self) -> Result<(), rusqlite::Error> {
+        let Self {
+            connection,
+            _retained_admission,
+        } = self;
+        // Retain admission through both explicit close and the returned
+        // connection's final drop if SQLite rejects the first close attempt.
+        match connection.close() {
+            Ok(()) => Ok(()),
+            Err((connection, error)) => {
+                drop(connection);
+                Err(error)
+            }
+        }
+    }
 }
 
 impl std::ops::Deref for BackendConnection {
@@ -364,7 +393,7 @@ impl SqliteBackend {
         caps: PersistCapabilities,
         binding: crate::RetainedConfigBinding,
         repair_only: bool,
-        admission: Arc<crate::retained::FileAdmission>,
+        admission: Arc<crate::local_sqlite::FileAdmission>,
     ) -> Self {
         let backend = Self {
             db_path: path,

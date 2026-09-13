@@ -101,7 +101,13 @@
 mod backend;
 pub mod break_glass;
 mod consensus;
+mod consumer_checkpoint;
 mod error;
+mod local_sqlite;
+pub use consumer_checkpoint::{
+    ConsumerCheckpointBinding, ConsumerCheckpointError, ConsumerCheckpointOptions,
+    ConsumerCheckpointReadback, ConsumerCheckpointStore,
+};
 mod management_audit;
 mod mock;
 mod preflight;

@@ -15,7 +15,8 @@ Amended 2026-07-16 for the shared config-bus adapter and atomic named rollback
 points.
 
 Amended 2026-09-13 for explicit retained-authority provisioning, reopening and
-member repair (SDK #800).
+member repair (SDK #800), and separate non-voting consumer checkpoint/apply
+recovery (SDK #799).
 
 ## Context
 
@@ -144,6 +145,23 @@ every configured remote voter. Cluster, configuration, and positive epoch are
 persisted and validated on reopen. Reads and readiness use Openraft's
 linearizable barrier; a local SQLite read or listener bind is not quorum
 evidence.
+
+### Non-voting consumption
+
+`DurableConfigConsumer` owns authenticated remote snapshot/tail acceptance and a
+separate sealed local checkpoint. It preserves original transaction/version/payload
+without manufacturing `StoredConfig` authoring provenance or becoming a voter.
+Acceptance and complete application intent are persisted before caller visibility
+and product effects respectively. Restart and ambiguous application require
+product-owned readback; an observed or historical applied record is not current
+runtime authority. Compacted snapshot replacement preserves the old applied fact.
+
+`ConsumerCheckpointStore` shares only the retained filesystem admission substrate.
+Its sole row uses purpose-separated SDK envelope custody and a local CAS generation.
+The product owns actual apply, candidate policy and readiness. Coherent whole-store
+rollback still requires independently fresh external authority. See the
+[consumer contract](../../crates/opc-config-bus-consensus/CONSUMER_CHECKPOINT.md)
+for the bounded lifecycle and failure outcomes.
 
 ### Shared transport
 

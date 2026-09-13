@@ -91,6 +91,15 @@ marker and decrypts the locally applied head and history pages. The marker is
 not available for arbitrary `ManagedDatastore` implementations, so a Shadow
 `ConfigBus` cannot accidentally be restored from an unproven feed.
 
+## Durable non-voting consumers
+
+`DurableConfigConsumer<C>` composes the authenticated watch with an SDK-owned
+sealed checkpoint and a product-owned apply/readback port. It persists the accepted
+floor and complete apply intent, and requires actual runtime readback after restart
+or ambiguity. It does not manufacture local config commits or become a voter.
+See the [consumer checkpoint contract](CONSUMER_CHECKPOINT.md) for composition,
+limits, lifecycle evidence and the separate global-freshness obligation.
+
 ## Authenticated remote recovery and watch
 
 `ConfigWatchServer` exposes the same follower-local, publication-safe view to
@@ -138,7 +147,7 @@ still receive only the sealed representation. Decryption occurs in the local
 `EncryptingManagedDatastore` before the trusted Shadow bus serves an authorized
 consumer, just as it does for local config readers.
 
-Minimal composition:
+Transport-only composition (durable consumers use the checkpoint contract above):
 
 ```rust,ignore
 use std::sync::Arc;

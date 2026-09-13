@@ -1,5 +1,7 @@
 //! Authenticated follower-served committed-config recovery and watch transport.
 
+pub mod consumer;
+
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -1579,6 +1581,7 @@ async fn connect_client_attempt(
 
 #[cfg(test)]
 mod tests {
+    include!("remote_watch/consumer_transport_tests.rs");
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1727,6 +1730,7 @@ mod tests {
 
     #[derive(Default)]
     struct AppliedStoreProbe {
+        compacted_before: std::sync::atomic::AtomicU64,
         active_waits: AtomicUsize,
         max_active_waits: AtomicUsize,
         wait_calls: AtomicUsize,
@@ -1815,7 +1819,11 @@ mod tests {
             after: ConfigVersion,
             limit: usize,
         ) -> Result<Vec<StoredConfig<TestConfig>>, StoreError> {
-            if self.compacted {
+            if self.compacted
+                || self.probe.as_ref().is_some_and(|probe| {
+                    after.get() < probe.compacted_before.load(Ordering::SeqCst)
+                })
+            {
                 return Err(StoreError::history_compacted(
                     "test committed history was compacted",
                 ));
