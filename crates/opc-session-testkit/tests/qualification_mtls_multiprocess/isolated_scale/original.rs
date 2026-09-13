@@ -584,12 +584,36 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
             }
         }).catch_unwind());
             if let Err(panic) = phase_result {
+                let failure_observed = Instant::now();
+                eprintln!(
+                    "sdk_isolated_scale_failure_phase={}",
+                    serde_json::json!({
+                        "phase": name,
+                        "phase_elapsed_ns": failure_observed.duration_since(started).as_nanos(),
+                        "observed_unix_ns": realtime_ns(),
+                        "submitted_operations": submitted,
+                        "joined_operations": completed,
+                        "unjoined_batches": pending.len(),
+                    })
+                );
                 // The JoinSet remains owned outside the failing phase. Drain all
                 // submitted calls before shutdown; retain successes too so an
                 // unrelated failure cannot erase a sibling's exact result.
                 runtime.block_on(async {
                     while let Some(batch) = pending.join_next().await {
                         if let Ok(batch) = batch {
+                            // These are the original invocation timestamps, not
+                            // the time at which failure cleanup joined the task.
+                            eprintln!(
+                                "sdk_isolated_scale_drained_sibling_timing={}",
+                                serde_json::json!({
+                                    "phase": name,
+                                    "session_slots": batch.slots,
+                                    "started_offset_ns": batch.started.checked_duration_since(started).map(|value| value.as_nanos()),
+                                    "completed_offset_ns": batch.completed.checked_duration_since(started).map(|value| value.as_nanos()),
+                                    "scheduled_offsets_ns": batch.scheduled.iter().map(|due| due.checked_duration_since(started).map(|value| value.as_nanos())).collect::<Vec<_>>(),
+                                })
+                            );
                             let resolved = batch.outcomes.into_iter().map(Some).collect::<Vec<_>>();
                             effects.preserve_effect("drained_sibling", &batch.requests, &resolved);
                         }
@@ -674,6 +698,21 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
                 serde_json::json!(reports)
             );
         }
+        // The timed workload and its dispatched calls have already ended.
+        // Ask the existing diagnostic command for bounded WAL stage counters
+        // before shutdown; diagnostic failure must not replace the workload RED.
+        let diagnostics =
+            std::panic::catch_unwind(AssertUnwindSafe(|| fleet.all_consensus_diagnostics()));
+        if let Ok(diagnostics) = diagnostics {
+            eprintln!(
+                "sdk_isolated_scale_failure_consensus={}",
+                serde_json::json!(diagnostics)
+            );
+        }
+        eprintln!(
+            "sdk_isolated_scale_failure_node_stderr={}",
+            serde_json::json!(fleet.stderr_diagnostics())
+        );
     }
     runtime.block_on(client.shutdown());
     drop(identity_source);

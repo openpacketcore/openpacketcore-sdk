@@ -1480,20 +1480,9 @@ impl QualificationNode {
                 if let Ok(Some(costs)) =
                     opc_session_store::test_support::consensus_local_wal_costs_for_test(&self.store)
                 {
-                    eprintln!(
-                        "qualification_local_wal_costs {}",
-                        serde_json::json!({
-                            "groups": costs["groups"],
-                            "sync_calls": costs["sync_calls"],
-                            "intent_us": costs["intent_us"],
-                            "data_sync_us": costs["data_sync_us"],
-                            "publication_us": costs["publication_us"],
-                            "queue_wait_us": costs["queue_wait_us"],
-                            "submit_to_callback_us": costs["submit_to_callback_us"],
-                            "application": costs["application"],
-                            "checkpoint": costs["checkpoint"],
-                        }),
-                    );
+                    // This body-free snapshot has bounded counters and retains
+                    // the writer scope, stage maxima and slowest request too.
+                    eprintln!("qualification_local_wal_costs {costs}");
                 }
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
