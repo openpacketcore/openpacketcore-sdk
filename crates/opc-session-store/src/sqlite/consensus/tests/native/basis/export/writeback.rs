@@ -1,20 +1,66 @@
 use super::*;
 
 const LAST_WRITEBACK_BATCH: u64 = 17;
+const WRITEBACK_REQUESTS_PER_BATCH: usize = 2;
+
+fn writeback_request(row: u64, slot: usize) -> FencedTransitionV2Request {
+    let template = sdk741_component_request(Sdk741Payload::Create, row, slot, None);
+    let mut record = template.mutation().record().unwrap().clone();
+    let handle = opc_key::KeyHandle::new(
+        KeyId::new("sdk741-writeback-test-vector").unwrap(),
+        opc_key::KeyPurpose::Session,
+        record.key.tenant.clone(),
+        opc_key::Zeroizing::new([0xE7; opc_key::AES_256_GCM_SIV_KEY_LEN]),
+    );
+    let aad =
+        crate::record::build_session_envelope_aad(&record, "sdk-702-v2-qualification", &handle)
+            .unwrap();
+    // Reach the actual 8 MiB writeback threshold with a small number of
+    // authenticated rows. Thousands of tiny records otherwise spend the
+    // ownership gate's fixed five-second guard preparing its first flush.
+    let plaintext = vec![0xA7; 256 * 1024];
+    let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
+    nonce.copy_from_slice(&template.request_id().nonce().as_bytes()[4..]);
+    let encoded =
+        opc_crypto::encrypt_envelope_with_handle_and_nonce(&handle, &aad, &plaintext, nonce)
+            .unwrap();
+    assert_eq!(
+        opc_crypto::decrypt_envelope_with_handle(&handle, &aad, &encoded)
+            .unwrap()
+            .as_slice(),
+        plaintext.as_slice(),
+    );
+    record.payload = EncryptedSessionPayload::try_envelope(encoded).unwrap();
+    let request = FencedTransitionV2Request::new(
+        template.request_id().epoch(),
+        template.request_id().nonce(),
+        template.lease().clone(),
+        FencedTransitionMutation::create(record),
+    )
+    .unwrap();
+    assert_ne!(request.request_id(), template.request_id());
+    request
+}
 
 fn writeback_fixture(control: IoControl) -> Fixture {
     let fixture = Fixture::with_control(Limits::default(), control);
     let initial = fenced_transition_v2_request(0xE7, 1, "native-writeback-first");
     fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
     for index in 2..=LAST_WRITEBACK_BATCH {
-        let requests = (0..256)
-            .map(|slot| sdk741_component_request(Sdk741Payload::Create, index * 32, slot, None))
-            .collect();
+        let requests = (0..WRITEBACK_REQUESTS_PER_BATCH)
+            .map(|slot| writeback_request(index * 32, slot))
+            .collect::<Vec<_>>();
         fixture.parity(&[fenced_transition_v2_batch_entry(
             index,
-            requests,
+            requests.clone(),
             timestamp(2),
         )]);
+        for request in &requests {
+            assert!(matches!(
+                status(&fixture.wal, request),
+                FencedTransitionV2Status::Recorded(result) if result.is_ok()
+            ));
+        }
     }
     fixture
 }
@@ -104,7 +150,7 @@ fn native_snapshot_writeback_releases_live_owner_and_preserves_captured_cut() {
     assert_eq!(status(&reopened, &later), expected_later);
     assert!(matches!(
         expected_later,
-        FencedTransitionV2Status::Recorded(_)
+        FencedTransitionV2Status::Recorded(result) if result.is_ok()
     ));
     reopened.shutdown().unwrap();
 }
@@ -189,8 +235,7 @@ fn native_snapshot_writeback_io_failure_fences_wakes_and_survives_cancellation()
             .unwrap(),
         Some(log_id(LAST_WRITEBACK_BATCH))
     );
-    let request =
-        sdk741_component_request(Sdk741Payload::Create, LAST_WRITEBACK_BATCH * 32, 255, None);
+    let request = writeback_request(LAST_WRITEBACK_BATCH * 32, WRITEBACK_REQUESTS_PER_BATCH - 1);
     let expected = read_fenced_transition_v2_status_sync(
         &fixture.oracle.conn.blocking_lock(),
         identity(),
@@ -199,6 +244,9 @@ fn native_snapshot_writeback_io_failure_fences_wakes_and_survives_cancellation()
     )
     .unwrap();
     assert_eq!(status(&reopened, &request), expected);
-    assert!(matches!(expected, FencedTransitionV2Status::Recorded(_)));
+    assert!(matches!(
+        expected,
+        FencedTransitionV2Status::Recorded(result) if result.is_ok()
+    ));
     reopened.shutdown().unwrap();
 }
