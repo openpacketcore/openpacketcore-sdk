@@ -1150,6 +1150,16 @@ at that absolute deadline. Completion alone never permits deleting unapplied
 history. Fences, lease credentials, application sequence, request outcomes,
 and logical time move together with the authoritative state-machine image.
 
+The pinned Openraft implementation also retains the donor's required log
+suffix while a snapshot transfer owns it. Successful snapshot or log
+replication hands that suffix to the next transfer before a pending purge can
+remove it. Transfer failure releases the retention before retry. New and
+failed attempts respect the scheduled purge frontier, so unreachable targets
+cannot repeatedly reclaim each other's pending ranges. This allows a
+recovering voter to advance from its installed snapshot through ordinary log
+replication while writes continue. The existing retention capacity,
+quorum, voting, commitment and deadline rules remain in force.
+
 Fixed membership is independent of the local snapshot integrity mechanism.
 Use `open_fixed_durable_quorum_with_snapshot_integrity(..., policy)` to select
 one explicitly:

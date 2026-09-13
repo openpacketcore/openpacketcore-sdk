@@ -1070,6 +1070,16 @@ coverage MUST fail closed. A missing, unrelated, or late-starting install does
 not extend the existing absolute apply guard. Install ownership MUST remain
 process-local and MUST NOT be inferred from persisted staging artifacts.
 
+A donor MUST retain the log suffix needed by an active snapshot receiver and
+hand successful snapshot progress directly to retained log replication before
+executing a pending purge. This successful handoff uses the issued purge
+frontier to select the retained suffix. New and failed attempts MUST respect
+the scheduled purge frontier so unreachable targets cannot repeatedly reclaim
+each other's pending ranges. Failed data transfers release their retention
+before retry; heartbeat outcomes do not release an active data transfer's
+ownership. Existing capacity limits, quorum
+authority, committed/applied floors and operation deadlines remain unchanged.
+
 ## 12. Serialization
 
 Rust has no garbage collector, so the goal is allocation, CPU, and cache
