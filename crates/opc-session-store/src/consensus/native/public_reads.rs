@@ -138,7 +138,9 @@ impl NativeState {
         // scratch before reading. Selected decoders retain their own guards.
         let container_bytes = count
             .checked_mul(
-                std::mem::size_of::<ReplicationEntry>() + std::mem::size_of::<VerificationMemory>(),
+                std::mem::size_of::<ReplicationEntry>()
+                    + std::mem::size_of::<VerificationMemory>()
+                    + std::mem::size_of::<&NotificationRow>(),
             )
             .ok_or_else(unavailable)?;
         let _containers = VerificationMemory::reserve(
@@ -153,32 +155,44 @@ impl NativeState {
             .map_err(|_| unavailable())?;
         let mut result = Vec::new();
         result.try_reserve_exact(count).map_err(|_| unavailable())?;
+        // Select only the requested range; collecting borrowed rows avoids
+        // walking an unrelated historical prefix. Charge their container too.
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(count).map_err(|_| unavailable())?;
         for position in first..first + count {
             check().map_err(|_| unavailable())?;
             let sequence = u64::try_from(position).map_err(|_| unavailable())? + 1;
             let row = self.notifications.get(position).ok_or_else(unavailable)?;
             row.validate(sequence, &self.frontiers)
                 .map_err(|_| unavailable())?;
-            let decoded = row
-                .read(&self.frontiers, &|| check())
-                .map_err(|_| unavailable())?;
-            let entry = decoded.entry();
-            validation::validate_notification(entry, sequence, &self.frontiers)
-                .map_err(|_| unavailable())?;
+            rows.push(row);
+        }
+        let mut sequence = range.first_sequence();
+        // Reuse the bounded selected decoder already used by snapshot export.
+        // It retains authenticated input and complete fingerprints, limits each
+        // batch and worker stack through the same verification memory budget,
+        // and joins every worker before returning or refunding its reservation.
+        NativeNotification::visit_export(rows, &self.frontiers, &|| check(), &mut |entry| {
+            check()?;
+            validation::validate_notification(entry, sequence, &self.frontiers)?;
             // Counting serialization allocates no output. The closed effect
             // shape has at most two records and two batch elements; double
             // byte backing plus fixed object/allocation overhead covers the
             // independent copy, including Bytes and encrypted-payload Arcs.
-            let bytes = image::binary::encoded_len(entry, generation::MAX_ITEM)
-                .map_err(|_| unavailable())?
+            let bytes = image::binary::encoded_len(entry, generation::MAX_ITEM)?
                 .checked_mul(2)
                 .and_then(|bytes| {
                     bytes.checked_add(2 * std::mem::size_of::<ReplicationEntry>() + 32 * 64)
                 })
-                .ok_or_else(unavailable)?;
-            reservations.push(VerificationMemory::reserve(bytes).map_err(|_| unavailable())?);
-            result.push(owned::notification(entry).map_err(|_| unavailable())?);
-        }
+                .ok_or_else(|| invalid("native journal output reservation overflow"))?;
+            reservations.push(VerificationMemory::reserve(bytes)?);
+            result.push(owned::notification(entry)?);
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| invalid("native journal sequence overflow"))?;
+            Ok(())
+        })
+        .map_err(|_| unavailable())?;
         check().map_err(|_| unavailable())?;
         crate::backend::validate_replication_log_page_owned(start, limit, result)
     }

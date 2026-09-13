@@ -186,3 +186,86 @@ fn native_public_restore_filtered_progress_and_stale_revision_match_original_pag
         Err(StoreError::RestoreScanCursorStale)
     );
 }
+
+#[test]
+fn native_public_selected_journal_ranges_preserve_sql_bytes_and_cancellation() {
+    let fixture = Fixture::new();
+    let first = fenced_transition_v2_request(0xB3, 1, "native-selected-journal-pages");
+    fixture.parity(&[formation(), activation(1, first, timestamp(1))]);
+    let entries = (0..3)
+        .map(|batch| {
+            let requests = (0..64)
+                .map(|slot| {
+                    sdk741_component_request(Sdk741Payload::Create, 180 + batch, slot, None)
+                })
+                .collect();
+            fenced_transition_v2_batch_entry(2 + batch, requests, timestamp(2))
+        })
+        .collect::<Vec<_>>();
+    fixture.parity(&entries);
+    fixture.wal.checkpoint().unwrap();
+    let reopened = fixture.reopened();
+    assert!(reopened.native_cold_counts_for_test().unwrap()[1] > 0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut retained = Vec::new();
+    for (start, limit) in [
+        (0, 0),
+        (0, 1),
+        (1, 64),
+        (17, 65),
+        (63, 130),
+        (193, 2),
+        (194, 65),
+    ] {
+        let expected = runtime
+            .block_on(fixture.oracle.consensus_get_replication_log(start, limit))
+            .unwrap();
+        let actual = reopened
+            .native_public_read(&|| Ok(()), |state, check| {
+                state.replication_log(start, limit, check)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            encode_json(&actual).unwrap(),
+            encode_json(&expected).unwrap()
+        );
+        retained.push((actual, expected));
+    }
+    // Cancellation at different checked-work boundaries must discard the
+    // entire caller result, including a page with an already decoded prefix.
+    for cut in [1, 64, 256, 512] {
+        let checks = std::cell::Cell::new(0);
+        let result = reopened
+            .native_public_read(&|| Ok(()), |state, owner_check| {
+                state.replication_log(1, 193, &|| {
+                    owner_check()?;
+                    checks.set(checks.get() + 1);
+                    if checks.get() >= cut {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "cancel journal page",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+            .unwrap();
+        assert!(checks.get() >= cut);
+        assert!(matches!(result, Err(StoreError::BackendUnavailable(_))));
+    }
+    assert_eq!(reopened.native_sql_fallback_count().unwrap(), 0);
+    reopened.shutdown().unwrap();
+    // Completed public pages own their exact payloads after the native owner
+    // and all decoder workers have stopped.
+    for (actual, expected) in retained {
+        assert_eq!(
+            encode_json(&actual).unwrap(),
+            encode_json(&expected).unwrap()
+        );
+    }
+}

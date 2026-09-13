@@ -1293,6 +1293,14 @@ compatibility participants together before restoring traffic.
 
 ### Replication-watch cursor and handoff contract
 
+Native journal pages decode selected on-disk notifications through the same
+bounded decoder used by snapshot export. Each batch retains at most 64 rows
+and 4 MiB of input; at most eight workers decode it, with their stacks charged
+to the existing verification-memory budget. Every worker is joined before
+return. Pages preserve authenticated fingerprints, sequence order, independent
+output ownership, cancellation, and the existing read deadline. Portable
+SQLite snapshot export remains available.
+
 `watch(start_sequence)` uses an inclusive 1-based cursor. Zero is the
 empty-head sentinel and normalizes to one. An existing cursor first emits that
 entry; a future cursor waits and never receives a lower live entry.

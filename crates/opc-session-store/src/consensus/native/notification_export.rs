@@ -1,5 +1,5 @@
 //! Bounded complete selected notification decoding outside State. The caller
-//! retains authenticated reads, cancellation, sequence order and SQL output.
+//! retains authenticated reads, cancellation, sequence order and output ownership.
 
 use super::*;
 use crate::consensus::verified_snapshot::VerificationMemory;
