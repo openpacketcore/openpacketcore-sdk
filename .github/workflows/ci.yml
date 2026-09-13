@@ -87,6 +87,9 @@ jobs:
           python3 ci/test-sdk702-release-attest.py
           bash -n ci/setup-fsverity-tmp.sh
 
+      - name: Test live voter memory evidence validators
+        run: python3 scripts/test-observe-session-store-live-memory.py
+
       - name: Run opc-proto-diameter corpus generator self-test
         run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
 
