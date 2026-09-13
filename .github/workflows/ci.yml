@@ -298,8 +298,30 @@ jobs:
         with:
           shared-key: opc-rust-gtpu-cfg
 
+      # The composed request has the same literal one-second contract here
+      # as in the ordinary shard. Keep this cfg and feature selection, but
+      # run it after unrelated test runtimes have exited.
       - name: Run GTP-U unsupported-platform cfg tests
-        run: RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet
+        env:
+          RUSTFLAGS: "--cfg opc_linux_gtpu_sys_force_unsupported"
+        run: |
+          set -euo pipefail
+          selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_keeps_original_request_deadline
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --list --exact "$selector" > unsupported-selector-tests.txt
+          python3 - "$selector" <<'PYCODE'
+          import pathlib
+          import sys
+
+          selected = [
+              line.removesuffix(": test")
+              for line in pathlib.Path("unsupported-selector-tests.txt").read_text().splitlines()
+              if line.endswith(": test")
+          ]
+          if selected != [sys.argv[1]]:
+              sys.exit(f"unsupported selector must resolve exactly once: {selected!r}")
+          PYCODE
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet -- --exact --skip "$selector"
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --test-threads=1 --exact "$selector" --nocapture
 
   # `rust-gtpu-cfg` above forces the Linux backend unavailable; these two lanes
   # cover the orthogonal axis of host portability. `opc-gtpu-dataplane` ships a
