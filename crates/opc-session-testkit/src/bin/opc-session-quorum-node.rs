@@ -4259,6 +4259,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
     }
 
     let mut reconciled_entries = 0_u64;
+    let mut maximum_page_entries = QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES;
     'coherent_head: loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
@@ -4334,6 +4335,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                     QualificationTrafficFailureStage::Watch,
                 ));
             };
+            let limit = limit.min(maximum_page_entries);
             if diagnostic {
                 eprintln!("qualification_watch_reconciliation stage=page_start start={start} limit={limit} head={head} elapsed_us={}", recovery_started_at.elapsed().as_micros());
             }
@@ -4351,6 +4353,16 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             ));
                         }
                         Ok(Err(StoreError::BackendUnavailable(_))) => {
+                            // A valid page can exceed a reader's fixed work or
+                            // memory bound. Retrying that same page cannot make
+                            // progress. Reduce only the next requested page;
+                            // the cursor advances only after complete validation.
+                            // Keep the original total-entry and time bounds.
+                            let reduced = (limit / 2).max(1);
+                            if reduced < maximum_page_entries {
+                                eprintln!("qualification_watch_reconciliation retry=smaller_page start={start} previous_limit={limit} next_limit={reduced} head={head}");
+                                maximum_page_entries = reduced;
+                            }
                             match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
                                 TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
                                 TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
@@ -7431,6 +7443,191 @@ mod tests {
             .expect("scripted transaction ID"),
             op,
             timestamp: Timestamp::now_utc(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct PageLimitedTrafficWatchBackend {
+        maximum_page: usize,
+        corrupt_sequence: Option<u64>,
+        requests: Arc<std::sync::Mutex<Vec<(u64, usize)>>>,
+        watch_starts: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl PageLimitedTrafficWatchBackend {
+        fn new(maximum_page: usize, corrupt_sequence: Option<u64>) -> Self {
+            Self {
+                maximum_page,
+                corrupt_sequence,
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                watch_starts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrafficWatchBackend for PageLimitedTrafficWatchBackend {
+        async fn traffic_replication_head(&self) -> Result<u64, StoreError> {
+            Ok(17)
+        }
+
+        async fn traffic_replication_log(
+            &self,
+            start: u64,
+            limit: usize,
+        ) -> Result<Vec<ReplicationEntry>, StoreError> {
+            self.requests
+                .lock()
+                .expect("bounded page requests")
+                .push((start, limit));
+            if limit > self.maximum_page {
+                // Model the native reader's unchanged two-second work bound
+                // with a paused clock, independently of the recovery strategy.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return Err(StoreError::BackendUnavailable(
+                    "scripted per-page work bound".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok((start..start + limit as u64)
+                .take_while(|sequence| *sequence <= 17)
+                .map(|sequence| {
+                    let generation = if self.corrupt_sequence == Some(sequence) {
+                        sequence + 1
+                    } else {
+                        sequence
+                    };
+                    scripted_traffic_replication_entry(sequence, reconciliation_cas(0, generation))
+                })
+                .collect())
+        }
+
+        async fn open_traffic_watch(
+            &self,
+            start_sequence: u64,
+        ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+            self.watch_starts
+                .lock()
+                .expect("bounded page watch starts")
+                .push(start_sequence);
+            Ok(scripted_live_traffic_watch(Vec::new()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_watch_recovery_makes_progress_under_a_per_page_work_bound() {
+        let backend = PageLimitedTrafficWatchBackend::new(4, None);
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let keys = (0..member_count)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let (_cancel, mut cancellation) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        let deadline =
+            started + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+        let result = reconcile_traffic_watch_stream(
+            &backend,
+            &keys,
+            seed,
+            member_count,
+            0,
+            vec![0; member_count],
+            vec![0; member_count],
+            started,
+            deadline,
+            &mut cancellation,
+        )
+        .await;
+        let recovered = match result {
+            Ok(Some(recovered)) => recovered,
+            Ok(None) => panic!("live recovery was cancelled"),
+            Err(failure) => panic!(
+                "bounded pages must recover every entry: failure={failure:?} requests={:?}",
+                backend.requests.lock().expect("bounded page requests")
+            ),
+        };
+        assert!(tokio::time::Instant::now() < deadline);
+        assert_eq!(recovered.head, 17);
+        assert_eq!(recovered.watch_start, 18);
+        assert_eq!(recovered.generations, vec![17, 0, 0]);
+        assert_eq!(
+            *backend
+                .watch_starts
+                .lock()
+                .expect("bounded page watch starts"),
+            vec![18]
+        );
+        let requests = backend.requests.lock().expect("bounded page requests");
+        assert_eq!(requests[0], (1, 17), "retain the original page maximum");
+        let mut next = 1;
+        for (start, limit) in requests.iter().filter(|(_, limit)| *limit <= 4) {
+            assert_eq!(*start, next, "no skipped or duplicated successful prefix");
+            next += *limit as u64;
+        }
+        assert_eq!(next, 18, "all exact historical entries must be reconciled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_watch_smaller_pages_keep_the_deadline_and_reject_partial_corrupt_history() {
+        for (maximum_page, corrupt_sequence) in [(0, None), (4, Some(7))] {
+            let backend = PageLimitedTrafficWatchBackend::new(maximum_page, corrupt_sequence);
+            let member_count = 3;
+            let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+            let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+            let (_cancel, cancellation) = oneshot::channel();
+            let started = tokio::time::Instant::now();
+            let result = run_traffic_watch_task(
+                backend.clone(),
+                futures_util::stream::empty().boxed(),
+                1,
+                member_count,
+                seed,
+                0,
+                cancellation,
+                Arc::clone(&observation),
+            )
+            .await;
+            let failure = result.expect_err("unavailable or corrupt history must fail closed");
+            assert_eq!(observation.failure(), Some(failure));
+            assert_eq!(observation.watch_sequence.load(Ordering::Acquire), 0);
+            assert_eq!(observation.watch_reconciliations.load(Ordering::Acquire), 0);
+            assert!(observation
+                .watch_traffic_generations
+                .iter()
+                .all(|generation| generation.load(Ordering::Acquire) == 0));
+            assert!(backend
+                .watch_starts
+                .lock()
+                .expect("bounded page watch starts")
+                .is_empty());
+            let requests = backend.requests.lock().expect("bounded page requests");
+            if maximum_page == 0 {
+                assert_eq!(
+                    failure.code,
+                    QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+                );
+                assert_eq!(
+                    started.elapsed(),
+                    Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS)
+                );
+                assert_eq!(
+                    failure.recovery_elapsed_millis,
+                    Some(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS)
+                );
+                assert_eq!(requests.last(), Some(&(1, 1)));
+                assert!(requests.iter().all(|(start, _)| *start == 1));
+            } else {
+                assert_eq!(
+                    failure.code,
+                    QualificationTrafficFailureCode::InvariantViolation
+                );
+                assert!(
+                    requests.iter().any(|(start, _)| *start > 1),
+                    "reject corrupt history even after a completely validated page"
+                );
+            }
         }
     }
 

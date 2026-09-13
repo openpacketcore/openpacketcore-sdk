@@ -414,6 +414,12 @@ the last successfully proven linearizable replication head and perform no new
 backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
+Reconciliation starts with the original maximum page size. After a typed
+backend-unavailable read, it reduces the requested page size so a reader's work
+or memory bound cannot force repeated attempts at the same oversized page.
+Each returned page must still be complete and pass every sequence, generation,
+fence and record check. The original total-entry and reconciliation deadlines
+remain; no cursor or replacement watch is published from a partial recovery.
 
 `qualification/v6/session-ha-profile.json` and its schema are the published,
 byte-for-byte frozen stateless-consumer contract: consumer transport revision
