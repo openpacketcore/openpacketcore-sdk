@@ -71,6 +71,14 @@ resampling, the workspace exact-pins
 not a mutable branch or tag, and locked metadata must resolve only
 `openraft`/`openraft-macros` 0.9.24 from that revision.
 
+SDK-741 advances the current immutable pin to signed commit
+`3345cfdf98a151d894151a3172fbb0cb60a4eaeb`. This descendant preserves the
+election repair and fixes snapshot-to-log handoff and failed-target purge
+retention. The exact package versions, features, source-build closure and
+consensus authority remain unchanged. Historical HA profiles still bind the
+original revision above; current manifest/lock/metadata checks independently
+bind the new candidate. This source change does not confer qualification.
+
 Registry 0.9.24 SDK one-shot leader-loss runs happened to pass. They do not
 invalidate the deterministic scripted engine regression or the historical
 observed-leader split-vote in the multi-process qualification harness: the

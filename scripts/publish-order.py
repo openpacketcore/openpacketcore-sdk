@@ -23,9 +23,11 @@ from collections import deque
 from pathlib import Path
 
 
+OPENRAFT_REV = "3345cfdf98a151d894151a3172fbb0cb60a4eaeb"
+FROZEN_SESSION_HA_OPENRAFT_REV = "f607e636406b16bd0ad7925dbb631da1b7a4cd96"
 OPENRAFT_GIT_SOURCE = (
     "git+https://github.com/openpacketcore/openraft"
-    "?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+    f"?rev={OPENRAFT_REV}"
 )
 FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY = {
     "opc-alarm",
@@ -110,9 +112,7 @@ def main() -> int:
         errors.append(
             "opc-consensus: Openraft is not pinned to the approved version and full git rev"
         )
-    resolved_fork_source = (
-        f"{OPENRAFT_GIT_SOURCE}#f607e636406b16bd0ad7925dbb631da1b7a4cd96"
-    )
+    resolved_fork_source = f"{OPENRAFT_GIT_SOURCE}#{OPENRAFT_REV}"
     fork_packages = {
         (package["name"], package["version"])
         for package in meta["packages"]
@@ -150,8 +150,11 @@ def main() -> int:
         != FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY
     ):
         errors.append("frozen v2 session HA profile source-build crate closure drifted")
-    if source_gate.get("openraft_rev") != OPENRAFT_GIT_SOURCE.rsplit("=", 1)[-1]:
-        errors.append("session HA profile Openraft revision is not exact")
+    # The historical profile binds its original engine, not the current
+    # source-build candidate. Never rewrite that evidence when repairing the
+    # engine; current Cargo source/package checks above bind the new revision.
+    if source_gate.get("openraft_rev") != FROZEN_SESSION_HA_OPENRAFT_REV:
+        errors.append("frozen session HA profile Openraft revision is not exact")
     if source_gate.get("removal_condition") != SOURCE_BUILD_REMOVAL_CONDITION:
         errors.append("session HA profile source-build removal condition drifted")
     if source_gate.get("crates_io_check_date") != "2026-07-13":

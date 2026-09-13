@@ -1952,6 +1952,17 @@ impl QualificationNode {
                     || traffic.observation.failure().is_some()
             })
         {
+            eprintln!(
+                "qualification_watch_handoff rejected=precondition schedule_bound={} state={:?}",
+                self.traffic_schedule_bound,
+                self.traffic.as_ref().map(|traffic| (
+                    traffic.mutation_cancel.is_some(),
+                    traffic.mutation_task.is_some(),
+                    traffic.watch_cancel.is_some(),
+                    traffic.watch_task.is_some(),
+                    traffic.observation.failure(),
+                ))
+            );
             return QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
@@ -2003,7 +2014,7 @@ impl QualificationNode {
         // waits as the in-task recovery path. Retain the sender for the whole
         // call: a dropped sender is an explicit cancellation signal.
         let (_reconciliation_cancel, mut reconciliation_cancel_rx) = oneshot::channel();
-        let Some(reconciliation) = reconcile_traffic_watch_stream(
+        let reconciliation = reconcile_traffic_watch_stream(
             &self.protected,
             &traffic_keys,
             seed,
@@ -2015,12 +2026,27 @@ impl QualificationNode {
             deadline,
             &mut reconciliation_cancel_rx,
         )
-        .await
-        .ok()
-        .flatten() else {
-            return QualificationNodeReply::Error {
-                code: QualificationNodeErrorCode::TrafficUnavailable,
-            };
+        .await;
+        let reconciliation = match reconciliation {
+            Ok(Some(reconciliation)) => reconciliation,
+            Ok(None) => {
+                eprintln!("qualification_watch_handoff rejected=cancelled");
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                };
+            }
+            Err(failure) => {
+                // These are bounded classifications and counters only. Keep
+                // the actual failure when the command reply is deliberately
+                // coarse; never emit backend strings or session material.
+                eprintln!(
+                    "qualification_watch_handoff rejected=reconciliation failure={failure:?} elapsed_millis={}",
+                    recovery_started_at.elapsed().as_millis()
+                );
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                };
+            }
         };
 
         let resumed_generation = reconciliation.generations[self.node_index];
@@ -2038,6 +2064,10 @@ impl QualificationNode {
             )
             .await
         {
+            eprintln!(
+                "qualification_watch_handoff rejected=restart_record elapsed_millis={}",
+                recovery_started_at.elapsed().as_millis()
+            );
             return QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
@@ -4245,7 +4275,8 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
             result = tokio::time::timeout_at(deadline, backend.traffic_replication_head()) => {
                 match result {
                     Ok(Ok(head)) if head >= reconciled_sequence => head,
-                    Ok(Ok(_)) => {
+                    Ok(Ok(head)) => {
+                        eprintln!("qualification_watch_reconciliation rejected=head_regression sequence={reconciled_sequence} head={head}");
                         return Err(QualificationTrafficFailure::fixed(
                             QualificationTrafficFailureCode::InvariantViolation,
                             QualificationTrafficFailureStage::Watch,
@@ -4256,6 +4287,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
                             TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
                             TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                eprintln!("qualification_watch_reconciliation rejected=head_retry_deadline sequence={reconciled_sequence}");
                                 return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                     QualificationTrafficFailureStage::Watch,
                                     recovery_started_at,
@@ -4264,6 +4296,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         }
                     }
                     Ok(Err(error)) => {
+                        eprintln!("qualification_watch_reconciliation rejected=head_error sequence={reconciled_sequence} class={:?}", qualification_store_error_class(&error));
                         return Err(QualificationTrafficFailure::store(
                             QualificationTrafficFailureCode::WatchUnavailable,
                             QualificationTrafficFailureStage::Watch,
@@ -4271,6 +4304,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         ));
                     }
                     Err(_) => {
+                        eprintln!("qualification_watch_reconciliation rejected=head_deadline sequence={reconciled_sequence}");
                         return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                             QualificationTrafficFailureStage::Watch,
                             recovery_started_at,
@@ -4288,6 +4322,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
             let Some((start, limit)) =
                 traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
                     .map_err(|_| {
+                        eprintln!("qualification_watch_reconciliation rejected=page_plan sequence={reconciled_sequence} head={head} reconciled_entries={reconciled_entries}");
                         QualificationTrafficFailure::fixed(
                             QualificationTrafficFailureCode::InvariantViolation,
                             QualificationTrafficFailureStage::Watch,
@@ -4308,7 +4343,8 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                 result = tokio::time::timeout_at(deadline, backend.traffic_replication_log(start, limit)) => {
                     match result {
                         Ok(Ok(entries)) if entries.len() == limit => entries,
-                        Ok(Ok(_)) => {
+                        Ok(Ok(entries)) => {
+                            eprintln!("qualification_watch_reconciliation rejected=page_count start={start} limit={limit} count={} head={head}", entries.len());
                             return Err(QualificationTrafficFailure::fixed(
                                 QualificationTrafficFailureCode::InvariantViolation,
                                 QualificationTrafficFailureStage::Watch,
@@ -4319,6 +4355,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                                 TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
                                 TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
                                 TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                    eprintln!("qualification_watch_reconciliation rejected=page_retry_deadline start={start} limit={limit} head={head}");
                                     return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                         QualificationTrafficFailureStage::Watch,
                                         recovery_started_at,
@@ -4327,6 +4364,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             }
                         }
                         Ok(Err(error)) => {
+                            eprintln!("qualification_watch_reconciliation rejected=page_error start={start} limit={limit} head={head} class={:?}", qualification_store_error_class(&error));
                             return Err(QualificationTrafficFailure::store(
                                 QualificationTrafficFailureCode::WatchUnavailable,
                                 QualificationTrafficFailureStage::Watch,
@@ -4334,6 +4372,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             ));
                         }
                         Err(_) => {
+                            eprintln!("qualification_watch_reconciliation rejected=page_deadline start={start} limit={limit} head={head}");
                             return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                 QualificationTrafficFailureStage::Watch,
                                 recovery_started_at,
@@ -4363,6 +4402,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                     )
                     .is_err()
                 {
+                    eprintln!("qualification_watch_reconciliation rejected=entry_invariant sequence={} expected_sequence={expected_sequence} head={head} reconciled_entries={reconciled_entries}", entry.sequence);
                     return Err(QualificationTrafficFailure::fixed(
                         QualificationTrafficFailureCode::InvariantViolation,
                         QualificationTrafficFailureStage::Watch,
@@ -4399,6 +4439,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
                             TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
                             TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                eprintln!("qualification_watch_reconciliation rejected=watch_retry_deadline start={watch_start} reconciled_entries={reconciled_entries}");
                                 return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                     QualificationTrafficFailureStage::Watch,
                                     recovery_started_at,
@@ -4407,6 +4448,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         }
                     }
                     Ok(Err(error)) => {
+                        eprintln!("qualification_watch_reconciliation rejected=watch_error start={watch_start} reconciled_entries={reconciled_entries} class={:?}", qualification_store_error_class(&error));
                         return Err(QualificationTrafficFailure::store(
                             QualificationTrafficFailureCode::WatchUnavailable,
                             QualificationTrafficFailureStage::Watch,
@@ -4414,6 +4456,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         ));
                     }
                     Err(_) => {
+                        eprintln!("qualification_watch_reconciliation rejected=watch_deadline start={watch_start} reconciled_entries={reconciled_entries}");
                         return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                             QualificationTrafficFailureStage::Watch,
                             recovery_started_at,

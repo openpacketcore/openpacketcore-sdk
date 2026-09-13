@@ -75,10 +75,12 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`f607e636406b16bd0ad7925dbb631da1b7a4cd96` (signed tag
-`opc-v0.9.24-election-resampling-1`) because registry Openraft 0.9.24 does not
-resample an election timeout for each campaign. The pin is by `rev`, never a
-branch or tag.
+`3345cfdf98a151d894151a3172fbb0cb60a4eaeb` (signed commit). It retains the
+per-campaign election-timeout fix and preserves a recovering snapshot target's
+required log suffix through successful handoff, while failed targets release
+their ownership before retrying. The pin is by `rev`, never a branch or tag.
+The frozen HA profiles retain their original revision and evidence; they do
+not qualify this later source-build candidate.
 
 Crates that contain this engine or have a transitive normal dependency path to
 it are source-build only: `opc-alarm`, `opc-alarm-k8s`, `opc-alarm-testkit`,

@@ -40,7 +40,7 @@ The session and configuration adapters use one fixed runtime profile from
 `opc-consensus`; operators cannot tune either domain onto a different election
 or heartbeat regime. This workspace revision exact-pins
 `https://github.com/openpacketcore/openraft` at
-`f607e636406b16bd0ad7925dbb631da1b7a4cd96` so every election campaign samples
+`3345cfdf98a151d894151a3172fbb0cb60a4eaeb` so every election campaign samples
 a fresh timeout. Confirm the lock resolves only `openraft` and
 `openraft-macros` 0.9.24 from that full revision. Do not substitute registry
 0.9.24, a branch, a tag, or a downstream partial patch.
