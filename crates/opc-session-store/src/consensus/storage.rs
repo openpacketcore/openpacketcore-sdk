@@ -4583,6 +4583,29 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             return Ok(entries);
         }
         if entries.is_empty() {
+            // Keep the original fatal storage contract. Qualification builds
+            // record the requested and retained cuts only after it has failed,
+            // while this same connection guard still excludes log mutation.
+            #[cfg(feature = "test-control")]
+            {
+                let pointer = |value: io::Result<Option<LogId<SessionConsensusNodeId>>>| {
+                    value.map_err(|_| ())
+                };
+                let physical = conn
+                    .query_row(
+                        "SELECT MIN(log_index), MAX(log_index) FROM consensus_log",
+                        [],
+                        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    )
+                    .map_err(|_| ());
+                eprintln!(
+                    "qualification_empty_log_range start={start} end={end} physical={physical:?} last={:?} purged={:?} applied={:?} vote={:?}",
+                    pointer(consensus::last_log_sync(&conn, self.core.storage_identity)),
+                    pointer(consensus::read_purged_sync(&conn, self.core.storage_identity)),
+                    pointer(consensus::read_applied_sync(&conn, self.core.storage_identity)),
+                    consensus::read_vote_sync(&conn, self.core.storage_identity).map_err(|_| ()),
+                );
+            }
             return Err(storage_error(
                 ErrorSubject::Logs,
                 ErrorVerb::Read,
