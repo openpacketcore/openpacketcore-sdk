@@ -3107,7 +3107,10 @@ impl ChildNode {
     fn shutdown(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
             let reply = self.invoke(&QualificationNodeCommand::Shutdown);
-            assert!(matches!(reply, QualificationNodeReply::ShuttingDown));
+            assert!(
+                matches!(reply, QualificationNodeReply::ShuttingDown),
+                "qualification shutdown was not joined: {reply:?}"
+            );
             let deadline = Instant::now() + Duration::from_secs(5);
             while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));

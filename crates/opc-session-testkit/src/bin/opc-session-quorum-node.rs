@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use opc_identity::ProjectedSvidSource;
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_redaction::metrics::{SecurityMetricsReader, METRICS};
@@ -1793,8 +1793,12 @@ impl QualificationNode {
             }
             QualificationNodeCommand::Shutdown => {
                 if self.isolated_scale.is_some() {
+                    let deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(opc_session_testkit::qualification::QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
                     self.stop_server().await;
-                    if let Err(error) = self.store.shutdown().await {
+                    if let Err(error) =
+                        join_qualification_shutdown_before(deadline, || self.store.shutdown()).await
+                    {
                         return QualificationNodeReply::Error {
                             code: map_store_error(&error),
                         };
@@ -3118,6 +3122,57 @@ impl QualificationNode {
         }
         if let Some(server) = self.consumer_server.take() {
             server.abort_and_wait().await;
+        }
+    }
+}
+
+async fn join_qualification_shutdown_before<S, F>(
+    deadline: tokio::time::Instant,
+    mut shutdown: S,
+) -> Result<(), StoreError>
+where
+    S: FnMut() -> F,
+    F: std::future::Future<Output = Result<(), StoreError>>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline_error = || {
+        StoreError::BackendUnavailable("qualification shutdown control deadline elapsed".to_owned())
+    };
+    let mut previous_wait_failed = false;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        let observation = shutdown();
+        tokio::pin!(observation);
+        if previous_wait_failed {
+            // Every public call observes the same SDK-owned drain. A latched
+            // completion is immediately ready; a pending observation retains
+            // its own unchanged SDK timeout while the real drain continues.
+            // Never infer pending completion from an error string or elapsed
+            // time, and never retry an already completed storage failure.
+            if let Some(result) = observation.as_mut().now_or_never() {
+                return if tokio::time::Instant::now() < deadline {
+                    result
+                } else {
+                    Err(deadline_error())
+                };
+            }
+            eprintln!(
+                "sdk_qualification_shutdown pending_drain=true elapsed_us={}",
+                started.elapsed().as_micros()
+            );
+        }
+        let result = tokio::time::timeout_at(deadline, observation.as_mut()).await;
+        // A ready future can be polled before Tokio's elapsed timer. Retain
+        // the inclusive control cutoff even for such a late ready result.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        match result {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(_)) => previous_wait_failed = true,
+            Err(_) => return Err(deadline_error()),
         }
     }
 }
@@ -6317,6 +6372,10 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "opc-session-quorum-node/shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {

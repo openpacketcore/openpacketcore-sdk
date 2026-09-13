@@ -49589,6 +49589,34 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn probe_primary_writer_without_wait(path: &Path) -> rusqlite::Result<()> {
+        let probe = Connection::open(path)?;
+        probe.busy_timeout(Duration::ZERO)?;
+        let transaction = Transaction::new_unchecked(&probe, TransactionBehavior::Immediate)?;
+        transaction.rollback()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consensus_log_prune_writer_probe_rejects_a_retained_write_lock() {
+        let directory = tempfile::tempdir().expect("writer probe directory");
+        let path = directory.path().join("writer-probe.sqlite");
+        let writer = Connection::open(&path).expect("open retained writer");
+        apply_pragma_profile(&writer, false, true).expect("production writer profile");
+        let transaction = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)
+            .expect("retain the real SQLite writer lock");
+        let error = probe_primary_writer_without_wait(&path)
+            .expect_err("the independent probe cannot hide a retained writer by waiting");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        transaction.rollback().expect("release the retained writer");
+        probe_primary_writer_without_wait(&path)
+            .expect("the same probe admits the writer only after lock release");
+    }
+
+    #[cfg(target_os = "linux")]
     async fn assert_consensus_log_prune_turn_interruption_at_controlled_window(
         point: ConsensusLogPruneTurnGatePoint,
         cancel_primary_before_handoff: bool,
@@ -49866,6 +49894,20 @@ mod tests {
             Connection::open(pinned.path()).expect("open competing primary writer");
         apply_pragma_profile(&primary_writer, false, true)
             .expect("configure competing primary writer");
+        assert_eq!(
+            primary_writer
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))
+                .expect("observe the production primary lock-wait bound"),
+            100,
+            "the primary retains the production 100ms SQLite busy timeout"
+        );
+        assert_eq!(lane.primary_writers_for_test(), 1);
+        // The retained primary guard prevents another prune turn. An
+        // independent zero-wait BEGIN proves that rollback released SQLite's
+        // writer lock; elapsed transaction time also includes scheduling and
+        // durable I/O, which SQLite's busy timeout does not bound.
+        probe_primary_writer_without_wait(pinned.path())
+            .expect("prune preemption releases the real writer lock without a busy wait");
         let began = std::time::Instant::now();
         let primary_write =
             Transaction::new_unchecked(&primary_writer, TransactionBehavior::Immediate)
@@ -49879,9 +49921,9 @@ mod tests {
         primary_write
             .commit()
             .expect("commit primary write after prune preemption");
-        assert!(
-            began.elapsed() < Duration::from_millis(100),
-            "the primary BEGIN IMMEDIATE and write retain the production 100ms busy bound"
+        eprintln!(
+            "sdk_prune_preemption primary_commit_elapsed_us={} busy_timeout_ms=100 writer_probe_busy_timeout_ms=0",
+            began.elapsed().as_micros()
         );
 
         drop(primary_guard);

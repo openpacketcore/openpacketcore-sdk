@@ -1,6 +1,9 @@
 //! Real fixed-quorum SDK calls through the private WAL opt-in. The peer
 //! transport is in-process; this does not qualify remote TLS or snapshots.
 
+#[path = "sequential_wal_sdk_tests/scoped_reads.rs"]
+mod scoped_reads;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
