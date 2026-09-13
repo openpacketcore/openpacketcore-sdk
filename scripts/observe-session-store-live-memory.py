@@ -168,22 +168,32 @@ def matching_original_records(event, records):
 
 
 def acknowledge_final_sample(check, records, workspace_root):
-    for event in events(check, 'sdk_isolated_scale_final_sample_required='):
+    acknowledge_sample(check, records, workspace_root, 'final')
+
+
+def acknowledge_initial_sample(check, records, workspace_root):
+    acknowledge_sample(check, records, workspace_root, 'initial')
+
+
+def acknowledge_sample(check, records, workspace_root, phase):
+    if phase not in ('initial', 'final'):
+        raise ValueError('unknown memory capture phase')
+    for event in events(check, f'sdk_isolated_scale_{phase}_sample_required='):
         matched = matching_original_records(event, records)
         if not matched or any(r.get('last_sample_unix_ns', 0) < event['sample_request_unix_ns'] for r in matched):
             continue
         workspace = Path(event['workspace']).resolve(strict=True)
         if not workspace.is_relative_to(workspace_root):
             raise ValueError('acknowledgement outside owned measurement workspace')
-        path = workspace / 'isolated-memory-final.json'
+        path = workspace / f'isolated-memory-{phase}.json'
         if path.exists():
             continue
         samples = [dict(pid=r['pid'], start_ticks=r['start_ticks'], sampled_unix_ns=r['last_sample_unix_ns']) for r in matched]
         payload = dict(request=event, samples=samples)
         encoded = json.dumps(payload, sort_keys=True).encode()
         if len(encoded) > 4096:
-            raise ValueError('final memory acknowledgement exceeds its bound')
-        temporary = workspace / '.isolated-memory-final.tmp'
+            raise ValueError('memory acknowledgement exceeds its bound')
+        temporary = workspace / f'.isolated-memory-{phase}.tmp'
         with temporary.open('xb') as stream:
             stream.write(encoded)
         temporary.rename(path)
@@ -373,9 +383,10 @@ def main():
                 except FileNotFoundError:
                     pass
                 try:
+                    acknowledge_initial_sample(check, list(identities.values()), workspace_root)
                     acknowledge_final_sample(check, list(identities.values()), workspace_root)
                 except Exception as error:
-                    errors.append(dict(stage='final_capture', error=str(error)))
+                    errors.append(dict(stage='memory_capture', error=str(error)))
                 time.sleep(0.1)
     except Exception as error:
         errors.append(dict(stage='observer_loop', error=str(error)))

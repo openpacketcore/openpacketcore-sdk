@@ -1,6 +1,7 @@
 //! Exact expiry and authority boundaries for the optimized scoped read path.
 
 use super::*;
+use crate::SessionConsumerScope;
 
 #[derive(Debug)]
 struct ReadClock(std::sync::Mutex<crate::Timestamp>);
@@ -34,6 +35,14 @@ async fn expiry_and_authority(native: bool) {
         fleet.snapshot_root = Some(snapshots.path().to_path_buf());
     }
     fleet.open().await;
+    // Retain the scope from the admitted fixed configuration, as a client does.
+    // The synchronous discovery accessor is allowed to reject a busy local
+    // reader; each actual consumer_get still validates fresh authority below.
+    let scope = SessionConsumerScope::new(fleet.peers[0].identity);
+    assert!(fleet
+        .peers
+        .iter()
+        .all(|peer| peer.identity == scope.consensus_identity()));
     let result = AssertUnwindSafe(async {
         for store in &fleet.stores {
             assert_eq!(
@@ -79,13 +88,34 @@ async fn expiry_and_authority(native: bool) {
             .expect("independent generic read")
             .expect("committed finite record");
         drop(backend);
+        if !native {
+            let store = &fleet.stores[0];
+            let held = store.inner.backend.lock_connection_for_test().await;
+            assert!(
+                store.consumer_scope().is_err(),
+                "synchronous scope rediscovery cannot wait for the held test reader"
+            );
+            let read = store.consumer_get(
+                scope,
+                &key,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            );
+            tokio::pin!(read);
+            assert!(read.as_mut().now_or_never().is_none());
+            drop(held);
+            assert_eq!(
+                read.await
+                    .expect("admitted scope read after reader release"),
+                Some(encrypted.clone())
+            );
+        }
         clock.set(crate::Timestamp::from_offset_datetime(
             start + time::Duration::SECOND - time::Duration::NANOSECOND,
         ));
         for store in &fleet.stores {
             let actual = store
                 .consumer_get(
-                    store.consumer_scope().expect("scope"),
+                    scope,
                     &key,
                     tokio::time::Instant::now() + Duration::from_secs(1),
                 )
@@ -102,7 +132,7 @@ async fn expiry_and_authority(native: bool) {
             assert!(
                 store
                     .consumer_get(
-                        store.consumer_scope().expect("scope"),
+                        scope,
                         &key,
                         tokio::time::Instant::now() + Duration::from_secs(1)
                     )
@@ -117,7 +147,7 @@ async fn expiry_and_authority(native: bool) {
             assert!(
                 store
                     .consumer_get(
-                        store.consumer_scope().expect("scope"),
+                        scope,
                         &key,
                         tokio::time::Instant::now() + Duration::from_secs(1)
                     )
@@ -136,7 +166,7 @@ async fn expiry_and_authority(native: bool) {
             assert!(
                 store
                     .consumer_get(
-                        store.consumer_scope().expect("cold scope"),
+                        scope,
                         &key,
                         tokio::time::Instant::now() + Duration::from_secs(1)
                     )
@@ -150,9 +180,6 @@ async fn expiry_and_authority(native: bool) {
             *peer.handler.write().await = None;
         }
         for store in &fleet.stores {
-            let scope = store
-                .consumer_scope()
-                .expect("scope captured before majority probe");
             assert!(
                 store
                     .consumer_get(

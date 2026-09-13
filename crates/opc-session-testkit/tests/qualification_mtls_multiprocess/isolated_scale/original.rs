@@ -11,6 +11,7 @@ mod requests;
 #[path = "../../../../opc-session-store/tests/fenced_transition_v2_qualification/resources.rs"]
 mod resources;
 use opc_consensus::DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
+use opc_session_net::consumer::PersistentSessionConsumerExecuteError;
 use opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError;
 use opc_session_store::{
     FencedTransitionMutationResult, FencedTransitionOutcome,
@@ -186,6 +187,13 @@ async fn execute_batch_inner(
                 )
                 .await;
             }
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }) => {
+                panic!(
+                    "batch was not transmitted: cause={cause:?}; attempt={attempt}; remaining_ns={}; pool={:?}",
+                    deadline.saturating_duration_since(Instant::now()).as_nanos(),
+                    client.v2_diagnostics(),
+                );
+            }
             Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch { request_ids }) => {
                 assert_eq!(request_ids, ids);
                 break;
@@ -316,24 +324,37 @@ fn realtime_ns() -> u128 {
         .as_nanos()
 }
 
-fn final_memory_sample(
+enum MemorySamplePhase {
+    Initial,
+    Final,
+}
+
+fn memory_sample(
     fleet: &Fleet,
     scale: QualificationIsolatedScaleConfig,
     pids: &[u32],
+    phase: MemorySamplePhase,
 ) -> serde_json::Value {
+    let phase = match phase {
+        MemorySamplePhase::Initial => "initial",
+        MemorySamplePhase::Final => "final",
+    };
     let requested = realtime_ns();
     let request = serde_json::json!({
         "sample_request_unix_ns": requested, "driver_pid": std::process::id(),
         "voter_pids": pids, "workspace": fleet.workspace.path(),
         "configuration": scale, "schedule_sha256": scale.schedule_sha256(),
     });
-    eprintln!("sdk_isolated_scale_final_sample_required={request}");
+    eprintln!("sdk_isolated_scale_{phase}_sample_required={request}");
     // This is outside both timed workload phases. Keep every owner alive
     // until the external observer has captured each actual voter and driver.
     // The existing setup guard detects a missing observer, not an operation
     // or recovery failure, and grants no memory/performance acceptance.
     let deadline = Instant::now() + Duration::from_secs(10);
-    let path = fleet.workspace.path().join("isolated-memory-final.json");
+    let path = fleet
+        .workspace
+        .path()
+        .join(format!("isolated-memory-{phase}.json"));
     loop {
         match fs::read(&path) {
             Ok(bytes) => {
@@ -403,11 +424,15 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
         .collect::<Vec<_>>();
     assert_eq!(pids.iter().collect::<BTreeSet<_>>().len(), 3);
     assert!(pids.iter().all(|pid| *pid != std::process::id()));
+    // The external sampler must cover every owner before the workload starts.
+    // Discovery runs independently and cannot be assumed to beat this process.
+    let initial_memory = memory_sample(&fleet, scale, &pids, MemorySamplePhase::Initial);
     eprintln!(
         "sdk_isolated_scale_started={}",
         serde_json::json!({
             "configuration": scale, "schedule_sha256": scale.schedule_sha256(),
             "driver_pid": std::process::id(), "voter_pids": pids, "workspace": fleet.workspace.path(),
+            "initial_memory_sample": initial_memory,
         "started_unix_ns": realtime_ns(),
             "full_cardinality": true, "performance_acceptance": false, "quiet_host_claim": false,
         })
@@ -439,7 +464,14 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
                 let observation = client.execute(&SessionConsumerRequest::new(scope,
                     SessionConsumerRequestId::from_bytes((index as u128).to_be_bytes()),
                     SessionConsumerOperation::ObserveFencedTransition { key: key.clone() },
-                )).await.expect("public preload fence observation");
+                )).await.unwrap_or_else(|error| {
+                    let cause = match &error {
+                        PersistentSessionConsumerExecuteError::NotTransmitted { cause }
+                        | PersistentSessionConsumerExecuteError::ReadUnavailable { cause } => Some(*cause),
+                        _ => None,
+                    };
+                    panic!("public preload fence observation failed: index={index}; error={error:?}; cause={cause:?}; v2_pool={:?}", client.v2_diagnostics());
+                });
                 let SessionConsumerResponse::ObserveFencedTransition(Ok(observation)) = observation else {
                     panic!("preload requires its independent current fence");
                 };
@@ -621,7 +653,7 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
                 .all(|report| report.async_active && report.completed_generation > Some(0)));
         }
         effects.assert_clean();
-        let final_memory = final_memory_sample(&fleet, scale, &pids);
+        let final_memory = memory_sample(&fleet, scale, &pids, MemorySamplePhase::Final);
         serde_json::json!({
             "configuration": scale, "schedule_sha256": scale.schedule_sha256(), "driver_pid": std::process::id(),
             "voter_pids": pids, "workspace": fleet.workspace.path(), "reports": reports, "phases": phases,
@@ -629,8 +661,20 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
             "effect_counters": effects.json(), "full_cardinality": true,
             "performance_acceptance": false, "quiet_host_claim": false,
             "cold_restart_qualification": false, "final_memory_sample": final_memory,
+            "initial_memory_sample": initial_memory,
         })
     }));
+    if result.is_err() {
+        // Capture live progress after the failed workload has relinquished its
+        // calls, before shutdown changes the observed engine/storage state.
+        let reports = std::panic::catch_unwind(AssertUnwindSafe(|| fleet.isolated_scale_reports()));
+        if let Ok(reports) = reports {
+            eprintln!(
+                "sdk_isolated_scale_failure_reports={}",
+                serde_json::json!(reports)
+            );
+        }
+    }
     runtime.block_on(client.shutdown());
     drop(identity_source);
     fleet.shutdown_isolated_scale_joined();
@@ -781,7 +825,7 @@ fn original_wire_control(persistence: QualificationIsolatedPersistence) {
         effects.assert_clean();
         if env::var_os("OPC_SESSION_ISOLATED_FINAL_CAPTURE_CONTROL").is_some() {
             let pids = fleet.nodes.iter().map(ChildNode::process_id).collect::<Vec<_>>();
-            let capture = final_memory_sample(&fleet, scale, &pids);
+            let capture = memory_sample(&fleet, scale, &pids, MemorySamplePhase::Final);
             eprintln!("sdk_isolated_scale_capture_control={}", serde_json::json!({
                 "capture": capture, "full_cardinality": false, "performance_acceptance": false,
             }));

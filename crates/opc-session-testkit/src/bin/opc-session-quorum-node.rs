@@ -1326,7 +1326,10 @@ impl QualificationNode {
                 scale.persistence.store_mode(),
             )
             .await
-            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?
+            .map_err(|error| {
+                eprintln!("qualification node consensus open error: {error:?}");
+                node_open_failure(QualificationNodeOpenStage::Consensus)
+            })?
         } else {
             ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                 topology,
@@ -1340,7 +1343,10 @@ impl QualificationNode {
                     .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
             )
             .await
-            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?
+            .map_err(|error| {
+                eprintln!("qualification node consensus open error: {error:?}");
+                node_open_failure(QualificationNodeOpenStage::Consensus)
+            })?
         });
         let empty_vote_dispatches = Arc::new(AtomicU64::new(0));
         let counting_handler: Arc<dyn SessionConsensusRpcHandler> =

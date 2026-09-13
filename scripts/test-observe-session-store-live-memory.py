@@ -91,4 +91,53 @@ with tempfile.TemporaryDirectory() as temporary:
     m.acknowledge_final_sample(check_root, local_records, check_root)
     check('completed-acknowledgement-not-overwritten', ack_path.read_bytes() == before)
 
+# Initial discovery must acknowledge all four live owners before the driver
+# emits its workload-start marker; the strict late-start rejection above stays.
+with tempfile.TemporaryDirectory() as temporary:
+    check_root = Path(temporary)
+    workspace = check_root / 'workspace'
+    workspace.mkdir()
+    initial_request = copy.deepcopy(request)
+    initial_request['workspace'] = str(workspace)
+    initial_records = copy.deepcopy(records)
+    for row in initial_records:
+        row['configurations']['hash']['workspace'] = str(workspace)
+    line = 'sdk_isolated_scale_initial_sample_required=' + json.dumps(initial_request) + '\n'
+    log = check_root / 'output.log'
+    initial_path = workspace / 'isolated-memory-initial.json'
+    log.write_text(line[:-2])
+    m.acknowledge_initial_sample(check_root, initial_records, check_root)
+    check('partial-initial-request-cannot-acknowledge', not initial_path.exists())
+    log.write_text(line)
+    m.acknowledge_final_sample(check_root, initial_records, check_root)
+    check('initial-request-cannot-produce-final-ack',
+          not (workspace / 'isolated-memory-final.json').exists())
+    for index in range(4):
+        m.acknowledge_initial_sample(check_root, initial_records[:index] + initial_records[index+1:], check_root)
+        check('initial-missing-owner-' + str(index), not initial_path.exists())
+        stale = copy.deepcopy(initial_records)
+        stale[index]['last_sample_unix_ns'] = initial_request['sample_request_unix_ns'] - 1
+        m.acknowledge_initial_sample(check_root, stale, check_root)
+        check('initial-stale-owner-' + str(index), not initial_path.exists())
+    try:
+        m.acknowledge_initial_sample(check_root, initial_records, check_root / 'foreign')
+    except ValueError:
+        checks.append('foreign-initial-workspace-cannot-acknowledge')
+    else:
+        raise AssertionError('foreign initial workspace acknowledged')
+    m.acknowledge_initial_sample(check_root, initial_records, check_root)
+    initial_ack = json.loads(initial_path.read_text())
+    check('initial-request-echoed-exactly', initial_ack['request'] == initial_request)
+    check('initial-capture-all-four-incarnations',
+          {(r['pid'], r['start_ticks']) for r in initial_ack['samples']} ==
+          {(r['pid'], r['start_ticks']) for r in initial_records})
+    check('initial-capture-follows-request',
+          all(r['sampled_unix_ns'] >= initial_request['sample_request_unix_ns']
+              for r in initial_ack['samples']))
+    before = initial_path.read_bytes()
+    m.acknowledge_initial_sample(check_root, initial_records, check_root)
+    check('initial-acknowledgement-not-overwritten', initial_path.read_bytes() == before)
+    check('initial-acknowledgement-does-not-complete-workload',
+          not m.original_coverage(check_root, initial_records)['all_declared_processes_observed'])
+
 print(json.dumps(dict(passed=len(checks), failed=0, scope='parser controls only')))
