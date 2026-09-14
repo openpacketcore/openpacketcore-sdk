@@ -180,6 +180,43 @@ async fn checkpoint_is_sealed_cas_storage_without_voter_or_authoring_tables() {
 }
 
 #[tokio::test]
+async fn reopen_rejects_extra_schema_objects_with_sqlite_lookalike_names() {
+    // SDK #799 requires the checkpoint's exact storage schema. Ordinary user
+    // objects can resemble SQLite's reserved prefix without using that prefix.
+    for extra in [
+        "CREATE TABLE sqliteXextra (value BLOB)",
+        "CREATE INDEX sqliteXextra ON consumer_checkpoint(generation)",
+        "CREATE VIEW sqliteXextra AS SELECT generation FROM consumer_checkpoint",
+        "CREATE TRIGGER sqliteXextra BEFORE UPDATE ON consumer_checkpoint BEGIN SELECT RAISE(IGNORE); END",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.sqlite");
+        let options = options(&path);
+        let provider = keys(0x61);
+        let mut store = ConsumerCheckpointStore::provision(options.clone(), provider.clone())
+            .await
+            .unwrap();
+        let (generation, _) = store.read_back().await.unwrap().into_parts();
+        store
+            .compare_and_set(generation, Zeroizing::new(b"synthetic checkpoint".to_vec()))
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(extra).unwrap();
+        drop(conn);
+        let before = files(dir.path());
+        let result = ConsumerCheckpointStore::reopen(options, provider).await;
+        assert!(
+            matches!(result, Err(ConsumerCheckpointError::Rejected)),
+            "extra application schema must reject reopen: {extra}"
+        );
+        assert_eq!(before, files(dir.path()));
+    }
+}
+
+#[tokio::test]
 async fn wrong_scope_schema_consumer_backing_key_and_truncation_do_not_modify_original() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checkpoint.sqlite");

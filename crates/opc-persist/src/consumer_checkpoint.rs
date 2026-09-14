@@ -968,7 +968,7 @@ fn read_row(
 ) -> Result<EncodedRow, ConsumerCheckpointError> {
     let schema_ok: bool = conn
         .query_row(
-            "SELECT COUNT(*)=1 AND MIN(sql)=?1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            "SELECT COUNT(*)=1 AND MIN(sql)=?1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
             [SCHEMA],
             |r| r.get(0),
         )
