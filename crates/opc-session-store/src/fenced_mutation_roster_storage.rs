@@ -4317,6 +4317,26 @@ pub(crate) struct HydratedProductionReservationRecordV2 {
 }
 
 impl HydratedProductionReservationRecordV2 {
+    /// Complete retained allocation of a live hydrated row, including its
+    /// enclosing Box. Retained terminals and tombstones are not discounted.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_live_allocation_bytes(&self) -> Option<usize> {
+        if self.record.state != ProductionReservationStateV2::Live
+            || self.committed_terminal.is_some()
+            || self.committed_canonical.is_some()
+            || self.terminal_proof_bundle.is_some()
+            || self.terminal_evidence.is_some()
+            || self.tombstone.is_some()
+        {
+            return None;
+        }
+        std::mem::size_of::<Self>()
+            .checked_add(self.record.native_read_allocation_bytes()?)?
+            .checked_add(self.canonical.capacity())?
+            .checked_add(self.admission.as_ref()?.native_read_allocation_bytes()?)?
+            .checked_add(self.admission_provenance.native_read_allocation_bytes()?)
+    }
+
     /// Return the validated durable V2 row projection.
     pub(crate) const fn record(&self) -> &ProductionReservationRecordV2 {
         &self.record
@@ -4424,6 +4444,28 @@ pub(crate) enum HydratedProductionReservationPayload {
 }
 
 impl HydratedProductionReservationRecord {
+    /// Complete retained allocation of a live hydrated row, including its
+    /// enclosing Box. Other lifecycle states retain their original peak.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_live_allocation_bytes(&self) -> Option<usize> {
+        let HydratedProductionReservationPayload::Live {
+            admission,
+            admission_ingress: _,
+            admission_provenance,
+        } = &self.payload
+        else {
+            return None;
+        };
+        if self.record.state != ReservationState::Live {
+            return None;
+        }
+        std::mem::size_of::<Self>()
+            .checked_add(self.record.native_read_allocation_bytes()?)?
+            .checked_add(self.canonical.capacity())?
+            .checked_add(admission.native_read_allocation_bytes()?)?
+            .checked_add(admission_provenance.native_read_allocation_bytes()?)
+    }
+
     /// Return the validated durable row projection.
     pub(crate) const fn record(&self) -> &ProductionReservationRecord {
         &self.record
@@ -4503,6 +4545,28 @@ impl<'de> Deserialize<'de> for ProductionReservationRecord {
 }
 
 impl ProductionReservationRecord {
+    #[cfg(target_os = "linux")]
+    fn native_read_allocation_bytes(&self) -> Option<usize> {
+        let mut bytes = self
+            .admission
+            .capacity()
+            .checked_add(self.admission_ingress.capacity())?
+            .checked_add(self.admission_provenance.capacity())?;
+        for field in [
+            &self.terminal,
+            &self.terminal_proof_bundle,
+            &self.terminal_ingress,
+            &self.terminal_evidence,
+            &self.tombstone,
+        ] {
+            bytes = bytes.checked_add(field.as_ref().map_or(0, Vec::capacity))?;
+        }
+        if let Some(reservation) = &self.business_reservation {
+            bytes = bytes.checked_add(reservation.expected.native_read_allocation_bytes()?)?;
+        }
+        Some(bytes)
+    }
+
     /// Build the dedicated V2 live-admission row for an exact absent
     /// predecessor. This never creates a V1 business reservation or a
     /// synthetic authoritative-row value.
@@ -5168,6 +5232,29 @@ impl ProductionReservationRecord {
 }
 
 impl ProductionReservationRecordV2 {
+    #[cfg(target_os = "linux")]
+    fn native_read_allocation_bytes(&self) -> Option<usize> {
+        let mut bytes = self
+            .admission
+            .capacity()
+            .checked_add(self.admission_ingress.capacity())?
+            .checked_add(self.admission_provenance.capacity())?;
+        for field in [
+            &self.terminal,
+            &self.terminal_proof_bundle,
+            &self.terminal_evidence,
+            &self.tombstone,
+        ] {
+            bytes = bytes.checked_add(field.as_ref().map_or(0, Vec::capacity))?;
+        }
+        if let Some(reservation) = &self.absence_reservation {
+            bytes = bytes
+                .checked_add(reservation.predicate.key.log_row_reuse_allocation_bytes()?)?
+                .checked_add(reservation.successor.native_read_allocation_bytes()?)?;
+        }
+        Some(bytes)
+    }
+
     fn live_with_provenance_and_ingress(
         admission: &Admission,
         admission_ingress: &RosterIngressAttestationV2,
@@ -8526,6 +8613,13 @@ pub(crate) struct ProductionBusinessState {
 }
 
 impl ProductionBusinessState {
+    #[cfg(target_os = "linux")]
+    fn native_read_allocation_bytes(&self) -> Option<usize> {
+        self.key
+            .log_row_reuse_allocation_bytes()?
+            .checked_add(self.canonical.capacity())
+    }
+
     /// Wrap one exact authoritative row observed at the admission barrier.
     pub(crate) fn present(
         key: crate::model::SessionKey,

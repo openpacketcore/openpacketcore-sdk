@@ -1202,6 +1202,15 @@ whole-snapshot memory copy, chmod guarantee, or hash-then-reopen sequence.
 Dynamic authority retains its existing bounded corruption detection and does
 not claim either fixed snapshot protection.
 
+Native protected-roster reads reserve their complete validation allowance
+before decoding and authenticating a canonical carrier. Once a live V1 or V2
+row has completed validation, its reservation shrinks to cover the retained
+row, enclosing allocation, projection owner, and every nested buffer capacity.
+The reservation travels with the hydrated body until its owner drops it;
+completed validation scratch no longer occupies that allowance. Retained
+terminal and tombstone rows keep their original validation reservation.
+Neither the initial validation allowance nor the process cap is reduced.
+
 Explicit portable selection can read existing sealed images, but an old strict
 reader cannot reopen newly written unsealed snapshots. A rollout or rollback
 must retain compatible readers or use a separately reviewed offline conversion

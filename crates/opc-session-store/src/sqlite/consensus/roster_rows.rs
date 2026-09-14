@@ -457,7 +457,7 @@ fn hydrate_original_with_reservation(
         .checked_mul(12)
         .and_then(|bytes| bytes.checked_add(64 * 1024))
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
-    let memory = reserve(bytes).map_err(|_| ProtectedRosterApplyError::Corrupt)?;
+    let mut memory = reserve(bytes).map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     original.validate(profile)?;
     let (body, facts, slots) = match profile {
         Profile::V1 => {
@@ -596,6 +596,23 @@ fn hydrate_original_with_reservation(
             (Body::V2(Box::new(row)), facts, slots)
         }
     };
+    if facts.state == State::Live {
+        // Authentication and canonicalization above have returned: their
+        // temporary carriers and proof buffers are destroyed. Keep all live
+        // row capacities, its Box, projection owner, and scalar container
+        // charged; only completed validation scratch is refunded. Terminal
+        // and tombstone hydrations retain the original reservation unchanged.
+        let retained = match &body {
+            Body::V1(row) => row.native_live_allocation_bytes(),
+            Body::V2(row) => row.native_live_allocation_bytes(),
+        }
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Hydration>()))
+        .and_then(|bytes| bytes.checked_add(original.owner.allocation_capacity()))
+        .ok_or(ProtectedRosterApplyError::Corrupt)?;
+        memory
+            .shrink_to(retained)
+            .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
+    }
     let projection = Projection {
         profile,
         stable_slot: slots.0,

@@ -549,7 +549,7 @@ fn native_roster_v1_admission_authenticates_the_exact_reserved_business_row() {
 fn native_live_roster_hydrations_release_completed_validation_scratch() {
     use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
     use crate::fenced_mutation_roster::{MAX_CHECKPOINT_BYTES, MAX_PLAN_BYTES, MAX_RESULT_BYTES};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let (_directory, backend, signed) = fixture(ProtectedRosterV2RecoveryFixtureState::Established);
     let conn = backend.conn.blocking_lock();
@@ -622,10 +622,133 @@ fn native_live_roster_hydrations_release_completed_validation_scratch() {
         "moving a hydration must preserve its body reservation"
     );
     for (body, memory) in parts {
-        drop(body);
+        let charged_before = used.load(Ordering::Acquire);
+        let released = allocation_counter::measure(|| drop(body));
+        assert_eq!(used.load(Ordering::Acquire), charged_before);
         drop(memory);
+        let charged = charged_before - used.load(Ordering::Acquire);
+        assert!(
+            charged >= usize::try_from(-released.bytes_current).unwrap(),
+            "the retained reservation must cover the actual destroyed heap"
+        );
     }
     let reclaimed = reserve(PROCESS_VERIFICATION_BYTES)
         .expect("all destroyed hydration owners refund their reservations");
     drop(reclaimed);
+}
+
+#[test]
+fn native_roster_v2_hydration_charges_retained_heap_and_preserves_other_lifecycle_peaks() {
+    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for state in [
+        ProtectedRosterV2RecoveryFixtureState::Live,
+        ProtectedRosterV2RecoveryFixtureState::Established,
+        ProtectedRosterV2RecoveryFixtureState::Aborted,
+    ] {
+        let steps = if matches!(&state, ProtectedRosterV2RecoveryFixtureState::Live) {
+            1
+        } else {
+            2
+        };
+        let (_directory, backend, signed) = fixture(state);
+        let conn = backend.conn.blocking_lock();
+        let projection = projection(&signed);
+        let scope = read_membership_scope_sync(&conn, signed.identity).unwrap();
+        let binding = signed.admission.binding_key(1).unwrap();
+        for step in 0..steps {
+            if step == 1 {
+                let now = read_machine_sync(&conn, signed.identity)
+                    .unwrap()
+                    .2
+                    .unwrap();
+                reclaim_protected_rosters_sync(
+                    &conn,
+                    signed.identity,
+                    now.add_seconds(24 * 60 * 60).unwrap(),
+                )
+                .unwrap();
+            }
+            let mut bytes = canonical(&conn, &signed, &projection);
+            // Spare carrier capacity is still owned even though it is absent
+            // from the canonical wire length and authentication input.
+            bytes.reserve_exact(4096);
+            let peak = 12 * bytes.len() + 64 * 1024;
+            let used = Box::leak(Box::new(AtomicUsize::new(0)));
+            let row = hydrate_original_with_reservation(
+                projection.profile,
+                projection.original.clone(),
+                binding,
+                bytes,
+                &signed.root,
+                &scope,
+                &|bytes| {
+                    VerificationMemory::reserve_for_test(used, bytes, PROCESS_VERIFICATION_BYTES)
+                },
+            )
+            .unwrap_or_else(|_| panic!("signed V2 carrier must hydrate"));
+            let charged = used.load(Ordering::Acquire);
+            if row.facts.state == State::Live {
+                assert!(charged < peak, "completed live validation releases scratch");
+            } else {
+                assert_eq!(charged, peak, "other lifecycle reservations stay unchanged");
+            }
+            // Measure the allocations freed by the real row, independently
+            // of the production accounting helpers and serialized lengths.
+            let released = allocation_counter::measure(|| drop(row));
+            assert!(
+                charged >= usize::try_from(-released.bytes_current).unwrap(),
+                "the retained reservation must cover the actual destroyed heap"
+            );
+            assert_eq!(used.load(Ordering::Acquire), 0);
+        }
+    }
+}
+
+#[test]
+fn native_live_roster_hydration_keeps_initial_peak_and_refunds_failed_validation() {
+    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (_directory, backend, signed) = fixture(ProtectedRosterV2RecoveryFixtureState::Live);
+    let conn = backend.conn.blocking_lock();
+    let projection = projection(&signed);
+    let scope = read_membership_scope_sync(&conn, signed.identity).unwrap();
+    let binding = signed.admission.binding_key(1).unwrap();
+    let bytes = canonical(&conn, &signed, &projection);
+    let peak = 12 * bytes.len() + 64 * 1024;
+    let used = Box::leak(Box::new(AtomicUsize::new(0)));
+    let reserve =
+        |bytes| VerificationMemory::reserve_for_test(used, bytes, PROCESS_VERIFICATION_BYTES);
+    let occupied = reserve(PROCESS_VERIFICATION_BYTES - peak + 1).unwrap();
+    assert!(hydrate_original_with_reservation(
+        projection.profile,
+        projection.original.clone(),
+        binding,
+        bytes.clone(),
+        &signed.root,
+        &scope,
+        &reserve,
+    )
+    .is_err());
+    assert_eq!(
+        used.load(Ordering::Acquire),
+        PROCESS_VERIFICATION_BYTES - peak + 1
+    );
+    drop(occupied);
+    let mut foreign = binding.to_bytes();
+    foreign[0] ^= 1;
+    assert!(hydrate_original_with_reservation(
+        projection.profile,
+        projection.original,
+        RequestBindingKey::from_bytes(foreign).unwrap(),
+        bytes,
+        &signed.root,
+        &scope,
+        &reserve,
+    )
+    .is_err());
+    assert_eq!(used.load(Ordering::Acquire), 0);
+    drop(reserve(PROCESS_VERIFICATION_BYTES).unwrap());
 }
