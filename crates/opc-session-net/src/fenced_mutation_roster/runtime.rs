@@ -962,7 +962,7 @@ impl LocalAuthorityRegistry {
     pub(crate) fn permit_for_publication(
         &self,
         call: &EstablishedPublicationCall<'_>,
-    ) -> Result<LocalAuthorityPermit, ()> {
+    ) -> Result<LocalAuthorityPermit, PublicationAuthorityCheckError> {
         let publication = call.authority();
         let current = publication.current_authority();
         let key = LocalAuthorityKey {
@@ -971,9 +971,16 @@ impl LocalAuthorityRegistry {
             roster_id: publication.roster_id(),
             admission_commitment: publication.admission_commitment(),
         };
-        let mut entries = self.lock_entries(&key).map_err(|_| ())?;
+        let mut entries = self.inner.entries[self.shard_index(&key)]
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => PublicationAuthorityCheckError::Unavailable,
+                std::sync::TryLockError::Poisoned(_) => PublicationAuthorityCheckError::Rejected,
+            })?;
         self.prune_expired_locked(&mut entries);
-        let entry = entries.get(&key).ok_or(())?;
+        let entry = entries
+            .get(&key)
+            .ok_or(PublicationAuthorityCheckError::Rejected)?;
         if entry.registration != Some(publication.current_registration())
             || entry.authority != *current
             || call.roster_id() != publication.roster_id()
@@ -983,7 +990,7 @@ impl LocalAuthorityRegistry {
             || call.current_fence() != current.fence()
             || !self.current_at(&entry.authority)
         {
-            return Err(());
+            return Err(PublicationAuthorityCheckError::Rejected);
         }
         Ok(LocalAuthorityPermit {
             key,
@@ -991,6 +998,18 @@ impl LocalAuthorityRegistry {
             authority: entry.authority.clone(),
             generation: entry.generation,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn lock_publication_shard_for_test<'a>(
+        &'a self,
+        call: &EstablishedPublicationCall<'_>,
+    ) -> impl Sized + 'a {
+        let permit = self
+            .permit_for_publication(call)
+            .expect("test publication authority is current before contention");
+        self.lock_entries(&permit.key)
+            .expect("test publication shard is initially free")
     }
 
     /// Hold the exact publication authority shard while accepting provider
@@ -3223,14 +3242,22 @@ impl fmt::Debug for CurrentPublicationAuthorityRead<'_> {
 /// command or otherwise mutate consensus state.
 #[async_trait]
 pub(crate) trait PublicationAuthorityReader: Send + Sync {
-    /// Backend-local error whose details never cross the publication adapter.
-    type Error: Send + Sync + 'static;
-
     /// Read and authenticate one exact current publication authority.
     async fn read_current_publication_authority(
         &self,
         request: CurrentPublicationAuthorityRead<'_>,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), PublicationAuthorityCheckError>;
+}
+
+/// Fixed classification of a local or backend publication precheck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationAuthorityCheckError {
+    /// The check rejected the exact capability; it must not be retried as a
+    /// temporary availability failure.
+    Rejected,
+    /// The check could not currently establish authority. No authority or
+    /// provider non-transmission evidence is granted by this result.
+    Unavailable,
 }
 
 fn validate_terminal_request_shape(
