@@ -27,6 +27,7 @@ use crate::{SessionAsyncRecoveryState, SnapshotIntegrityPolicy};
 
 mod admission;
 mod bootstrap;
+mod initialization;
 mod races;
 mod snapshots;
 mod writer;

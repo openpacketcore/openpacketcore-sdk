@@ -187,6 +187,9 @@ const PROTECTED_ROSTER_PROFILE_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
 const PROTECTED_ROSTER_PROFILE_V2_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/protected-roster-profile-activation-request/v2\0";
 
+#[cfg(all(test, target_os = "linux"))]
+mod initialization_evidence;
+
 #[cfg(test)]
 static CONSUMER_CONSENSUS_PROPOSAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -5708,6 +5711,9 @@ impl ConsensusSessionStore {
     /// `RecoveryRequired` is an incomplete recovery attempt; callers may retry
     /// this method as recovery progresses. Each attempt retains the configured
     /// operation deadline and grants no traffic authority before completion.
+    /// After recovery activates, ordinary initialization/admission may still
+    /// return `ClusterFormationRejected`, including for non-convergence at
+    /// that same deadline. This error is not an unconditional retry signal.
     pub async fn initialize_cluster(&self) -> Result<(), ConsensusSessionStoreOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
@@ -5716,9 +5722,19 @@ impl ConsensusSessionStore {
         if !self.inner.persistence_protocol.is_active() {
             self.recover_async_before(deadline).await?;
         }
-        let initialized = tokio::time::timeout_at(deadline, self.inner.raft.is_initialized())
+        let initialized_probe = self.inner.raft.is_initialized();
+        #[cfg(all(test, target_os = "linux"))]
+        let initialized_probe =
+            initialization_evidence::hold_initialized_probe(self, deadline, initialized_probe);
+        let initialized = tokio::time::timeout_at(deadline, initialized_probe)
             .await
-            .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?
+            .map_err(|_| {
+                #[cfg(all(test, target_os = "linux"))]
+                initialization_evidence::record_deadline(
+                    initialization_evidence::DeadlineStage::InitializedProbe,
+                );
+                ConsensusSessionStoreOpenError::ClusterFormationRejected
+            })?
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
         let canonical_bootstrap = self.inner.bootstrap_members.first().copied();
         if !initialized && canonical_bootstrap == Some(self.inner.local_node_id) {
@@ -5729,7 +5745,13 @@ impl ConsensusSessionStore {
                     .initialize(self.inner.bootstrap_members.clone()),
             )
             .await
-            .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
+            .map_err(|_| {
+                #[cfg(all(test, target_os = "linux"))]
+                initialization_evidence::record_deadline(
+                    initialization_evidence::DeadlineStage::CanonicalInitialize,
+                );
+                ConsensusSessionStoreOpenError::ClusterFormationRejected
+            })?;
             match initialize {
                 Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
                 Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
@@ -5975,6 +5997,10 @@ impl ConsensusSessionStore {
                 }
                 () = tokio::time::sleep(Duration::from_millis(25)) => {}
                 () = tokio::time::sleep_until(deadline) => {
+                    #[cfg(all(test, target_os = "linux"))]
+                    initialization_evidence::record_deadline(
+                        initialization_evidence::DeadlineStage::ExactMembership,
+                    );
                     return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
                 }
             }

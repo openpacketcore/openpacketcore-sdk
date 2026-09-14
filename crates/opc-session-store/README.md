@@ -438,11 +438,16 @@ No automatic conversion or cross-mode recovery is provided.
 Install `rpc_handler()` before calling `initialize_cluster()` on every startup.
 For an existing Async root, this call obtains a genuinely new committed entry
 from the other live voters, admits repair only from its certified leader, and
-waits for exact local application before allowing votes and traffic. A timeout
-or missing live majority returns `RecoveryRequired`. A later call may continue
-validated catch-up or obtain a fresh attempt. An all-cold quorum stays closed;
-local disk progress, cached responses, and recreating storage do not supply a
-supported recovery authority.
+waits for exact local application before allowing votes. An incomplete cold
+recovery attempt or missing live majority returns `RecoveryRequired`; a later
+call may continue validated catch-up or obtain a fresh attempt. Once recovery
+becomes active, the remaining ordinary initialization and membership admission
+checks still share that call's original operation deadline. Their timeout can
+return `ClusterFormationRejected`, which also covers genuine scope rejection
+and is not a general retry signal. Active recovery health does not establish
+successful initialization or traffic authority. An all-cold quorum stays
+closed; local disk progress, cached responses, and recreating storage do not
+supply a supported recovery authority.
 
 If a restarted voter lost a previously acknowledged volatile tail, its
 certified live leader restores that prefix through ordinary snapshot

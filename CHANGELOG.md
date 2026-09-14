@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation releases unused admission. Late result delivery fails without
   fencing an owner validated on time. Ordinary SQL cancellation and native
   persistence are unchanged.
+- `opc-session-store`: distinguish a proven post-activation initialization-probe
+  timeout from genuine admission rejection in the bounded Async recovery test.
+  Per-call test evidence, deterministic deadline and native-scope controls, and
+  clarified recovery documentation preserve production errors and deadlines
+  (Refs #814).
 - **Native journal read admission — `opc-session-store`:** preflight complete
   journal output before copying and bound concurrent construction to 32 MiB
   within the existing 128 MiB verifier budget. Oversized requests return
