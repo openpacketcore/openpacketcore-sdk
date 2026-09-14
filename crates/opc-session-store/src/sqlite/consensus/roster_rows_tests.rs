@@ -28,15 +28,23 @@ pub(crate) fn signed_v1_command_with_mutation(
     signed: &crate::consensus::types::RosterV2PersistenceFixture,
     mutation: EstablishedMutation,
 ) -> ConsensusRosterAdmissionCommand {
+    signed_v1_command_with_payloads(signed, mutation, [vec![0xB2], vec![0xB3], vec![0xB4]])
+}
+
+fn signed_v1_command_with_payloads(
+    signed: &crate::consensus::types::RosterV2PersistenceFixture,
+    mutation: EstablishedMutation,
+    [plan, checkpoint, result]: [Vec<u8>; 3],
+) -> ConsensusRosterAdmissionCommand {
     let admission = Admission::authenticate(
         AdmissionProposal::new(
             crate::fenced_mutation_roster::Profile::v1(),
             RosterId::from_bytes([0xB1; 16]).unwrap(),
             signed.admission.members().to_vec(),
             mutation,
-            vec![0xB2],
-            vec![0xB3],
-            vec![0xB4],
+            plan,
+            checkpoint,
+            result,
         )
         .unwrap(),
         signed.admission.key().clone(),
@@ -535,4 +543,89 @@ fn native_roster_v1_admission_authenticates_the_exact_reserved_business_row() {
         &read_membership_scope_sync(&conn, signed.identity).unwrap()
     )
     .is_err());
+}
+
+#[test]
+fn native_live_roster_hydrations_release_completed_validation_scratch() {
+    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+    use crate::fenced_mutation_roster::{MAX_CHECKPOINT_BYTES, MAX_PLAN_BYTES, MAX_RESULT_BYTES};
+    use std::sync::atomic::AtomicUsize;
+
+    let (_directory, backend, signed) = fixture(ProtectedRosterV2RecoveryFixtureState::Established);
+    let conn = backend.conn.blocking_lock();
+    let current = ops::get_raw_sync(&conn, signed.admission.key())
+        .unwrap()
+        .unwrap();
+    let scope = read_membership_scope_sync(&conn, signed.identity).unwrap();
+    let command = signed_v1_command_with_payloads(
+        &signed,
+        EstablishedMutation::no_op(),
+        [
+            vec![0xB2; MAX_PLAN_BYTES],
+            vec![0xB3; MAX_CHECKPOINT_BYTES],
+            vec![0xB4; MAX_RESULT_BYTES],
+        ],
+    );
+    let binding = command.admission().binding_key(3).unwrap();
+    let projection =
+        Projection::from_admission(binding, &command).unwrap_or_else(|_| panic!("V1 projection"));
+    let reservation = ProductionAdmissionBusinessReservation::new(
+        command.admission(),
+        ProductionBusinessState::from_authoritative_record(&current).unwrap(),
+    )
+    .unwrap();
+    let record = ProductionReservationRecord::live_with_provenance_and_ingress(
+        command.admission(),
+        &command.ingress_attestation().unwrap(),
+        &command.admission_provenance().unwrap(),
+        binding.history_epoch(),
+        reservation,
+        ChargeProfile::v1(),
+    )
+    .unwrap();
+    let bytes = record.to_canonical_bytes().unwrap();
+    let used = Box::leak(Box::new(AtomicUsize::new(0)));
+    let reserve =
+        |bytes| VerificationMemory::reserve_for_test(used, bytes, PROCESS_VERIFICATION_BYTES);
+    let mut rows = Vec::new();
+    // Two complete read owners per voter fit as retained data. Each new
+    // authentication must still reserve its unchanged original scratch peak.
+    for _ in 0..6 {
+        let hydrated = hydrate_original_with_reservation(
+            projection.profile,
+            projection.original.clone(),
+            binding,
+            bytes.clone(),
+            &signed.root,
+            &scope,
+            &reserve,
+        )
+        .unwrap_or_else(|_| {
+            panic!("completed validation scratch must not exclude retained live rows")
+        });
+        assert!(hydrated.facts.state == State::Live);
+        assert_eq!(hydrated.canonical(), bytes);
+        assert!(hydrated.validate_business(Some(&current)).is_ok());
+        rows.push(hydrated);
+    }
+    // The decoded admission, durable admission bytes, and complete canonical
+    // carrier each retain the maximum protected plan/checkpoint/result.
+    // This independent lower bound must remain charged after into_parts too.
+    let minimum_owned = 6 * 3 * (MAX_PLAN_BYTES + MAX_CHECKPOINT_BYTES + MAX_RESULT_BYTES);
+    assert!(
+        reserve(PROCESS_VERIFICATION_BYTES - minimum_owned + 1).is_err(),
+        "live row bytes cannot be refunded while their bodies remain owned"
+    );
+    let parts: Vec<_> = rows.into_iter().map(Hydration::into_parts).collect();
+    assert!(
+        reserve(PROCESS_VERIFICATION_BYTES - minimum_owned + 1).is_err(),
+        "moving a hydration must preserve its body reservation"
+    );
+    for (body, memory) in parts {
+        drop(body);
+        drop(memory);
+    }
+    let reclaimed = reserve(PROCESS_VERIFICATION_BYTES)
+        .expect("all destroyed hydration owners refund their reservations");
+    drop(reclaimed);
 }

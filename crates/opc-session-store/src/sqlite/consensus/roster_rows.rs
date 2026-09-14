@@ -429,6 +429,26 @@ pub(super) fn hydrate_original(
     root: &RosterAttestationTrustRootV1,
     scope: &MembershipValidationScope,
 ) -> Result<Hydration, ProtectedRosterApplyError> {
+    hydrate_original_with_reservation(
+        profile,
+        original,
+        binding,
+        canonical,
+        root,
+        scope,
+        &crate::consensus::verified_snapshot::VerificationMemory::reserve,
+    )
+}
+
+fn hydrate_original_with_reservation(
+    profile: Profile,
+    original: OriginalAuthority,
+    binding: RequestBindingKey,
+    canonical: Vec<u8>,
+    root: &RosterAttestationTrustRootV1,
+    scope: &MembershipValidationScope,
+    reserve: &impl Fn(usize) -> std::io::Result<crate::consensus::verified_snapshot::VerificationMemory>,
+) -> Result<Hydration, ProtectedRosterApplyError> {
     if canonical.is_empty() || canonical.len() > PROTECTED_ROSTER_MAX_CANONICAL_RECORD_BYTES {
         return Err(ProtectedRosterApplyError::Corrupt);
     }
@@ -437,8 +457,7 @@ pub(super) fn hydrate_original(
         .checked_mul(12)
         .and_then(|bytes| bytes.checked_add(64 * 1024))
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
-    let memory = crate::consensus::verified_snapshot::VerificationMemory::reserve(bytes)
-        .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
+    let memory = reserve(bytes).map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     original.validate(profile)?;
     let (body, facts, slots) = match profile {
         Profile::V1 => {
