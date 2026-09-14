@@ -1456,6 +1456,15 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   conservative maximum-payload round trips, fixed redaction-safe fallbacks,
   slow-reader deadline reaping, connection-slot recovery, and deterministic
   shutdown while a write is blocked.
+- The three-voter fixtures in `tests/stateless_quorum_consumer.rs` await
+  listener and engine quiescence on normal return, keeping their original
+  fixture binding alive until later service/transport clones drop. Restart
+  transfers the same isolation guards without a release/reacquire gap.
+  Detectors check real clone-wide engine shutdown and a queued restart waiter;
+  normal Drop rejects an unjoined fixture. The panic fallback only aborts
+  listeners, and intentional OS process-loss exits still bypass destructors.
+  This test isolation does not reserve production apply headroom or guarantee
+  progress under arbitrary verifier pressure (Refs #815).
 - Run with: `cargo test -p opc-session-net --all-features`.
 
 ## License

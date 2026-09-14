@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `opc-session-net`: join three-voter fixture engines on normal test exits and
+  retain isolation until later service/transport owners retire. Restart keeps
+  the original fixture binding and transfers its guards without reacquiring;
+  production verifier limits and operation deadlines are unchanged (Refs #815).
 - **Cancelled legacy cache verification — `opc-session-store`:** the explicit
   Linux `PrivateWalTest` route retains an already-started read's connection,
   permit and WAL guard through cache validation after caller cancellation.

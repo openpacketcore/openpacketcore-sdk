@@ -755,6 +755,15 @@ impl Drop for ThreeVoterConsumerFleet {
                 server.abort();
             }
         }
+        // Normal test completion must join the engines before fixture
+        // isolation is released. On an earlier panic, retain the existing
+        // non-blocking listener abort without introducing a second panic.
+        if !std::thread::panicking() {
+            assert!(
+                self.stores.is_empty(),
+                "three-voter fixture must await quiescence before releasing isolation"
+            );
+        }
     }
 }
 
@@ -1463,6 +1472,10 @@ impl ThreeVoterConsumerFleet {
         self.servers[node] = Some(server);
     }
 
+    /// Join listeners and engines while retaining fixture isolation. Keep the
+    /// original, earlier fleet binding alive until later service/transport
+    /// handles have dropped; a consuming close or shadowed restart releases
+    /// these guards too early. Intentional OS process-loss exits bypass Drop.
     async fn quiesce(&mut self) {
         for enabled in self.path_enabled.values() {
             enabled.store(false, Ordering::Release);
@@ -1496,10 +1509,6 @@ impl ThreeVoterConsumerFleet {
         }
         self.stores.clear();
         self.backends.clear();
-    }
-
-    async fn shutdown(mut self) {
-        self.quiesce().await;
     }
 
     /// Stop every listener, consensus engine, and backing handle, retaining
@@ -1612,6 +1621,79 @@ impl ThreeVoterConsumerFleet {
             panic!("survivors elect a new leader; final statuses: {statuses:?}")
         })
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_voter_fixture_quiescence_retains_isolation_through_store_clones() {
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::new(TestPki::new())).await;
+    let stores = fleet.stores.clone();
+    let service = Arc::new(stores[0].consumer_service());
+    let service_lifetime = Arc::downgrade(&service);
+    assert!(stores.iter().all(|store| {
+        consensus_local_durable_progress_for_test(store).engine_state
+            == ConsensusEngineStateForTest::Running
+    }));
+
+    fleet.quiesce().await;
+    assert!(
+        stores.iter().all(|store| {
+            consensus_local_durable_progress_for_test(store).engine_state
+                == ConsensusEngineStateForTest::Stopped
+        }),
+        "fixture quiescence must await real clone-wide engine shutdown"
+    );
+    assert!(service_lifetime.upgrade().is_some());
+    assert!(
+        THREE_VOTER_FLEET_TEST_GATE.try_acquire().is_err(),
+        "a closed store-owning service still precedes fixture isolation release"
+    );
+    assert!(crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+        .try_lock()
+        .is_err());
+
+    drop(service);
+    assert!(service_lifetime.upgrade().is_none());
+    drop(stores);
+    // Keep the outer metric guard while checking the inner gate. Every fleet
+    // constructor takes the metric guard first, so another harness thread
+    // cannot steal this exact admission observation.
+    let metrics_guard = fleet.metrics_test_guard.take().expect("metric isolation");
+    drop(fleet);
+    let next = THREE_VOTER_FLEET_TEST_GATE
+        .try_acquire()
+        .expect("next fixture admission follows joined engines and owner retirement");
+    drop(next);
+    drop(metrics_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_voter_fixture_restart_keeps_one_continuous_isolation_owner() {
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::new(TestPki::new())).await;
+    // Queue a real next-fixture waiter before restart. Releasing and then
+    // reacquiring the gate would hand its permit to this waiter and prevent
+    // the replacement constructor from completing within the existing bound.
+    let mut next = Box::pin(THREE_VOTER_FLEET_TEST_GATE.acquire());
+    assert!(futures_util::poll!(next.as_mut()).is_pending());
+    fleet = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, fleet.restart_all())
+        .await
+        .expect("restart transfers its original isolation without reacquiring");
+    assert!(futures_util::poll!(next.as_mut()).is_pending());
+    drop(next);
+    assert!(THREE_VOTER_FLEET_TEST_GATE.try_acquire().is_err());
+    assert!(crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+        .try_lock()
+        .is_err());
+    let stores = fleet.stores.clone();
+    assert!(stores.iter().all(|store| {
+        consensus_local_durable_progress_for_test(store).engine_state
+            == ConsensusEngineStateForTest::Running
+    }));
+    fleet.quiesce().await;
+    assert!(stores.iter().all(|store| {
+        consensus_local_durable_progress_for_test(store).engine_state
+            == ConsensusEngineStateForTest::Stopped
+    }));
+    drop(stores);
 }
 
 fn three_voter_replica_id(index: usize) -> ReplicaId {
@@ -5098,7 +5180,7 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     // spent eight seconds on a discarded local barrier+unanimity proof and
     // the same operation then timed out before the leader's activation proof.
     let pki = Arc::new(TestPki::new());
-    let fleet =
+    let mut fleet =
         ThreeVoterConsumerFleet::start(Arc::clone(&pki), Some(Duration::from_secs(4))).await;
     let (leader, _, _) = fleet.observed_leader();
     let follower = (leader + 1) % THREE_VOTER_COUNT;
@@ -5196,7 +5278,7 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     );
     persistent.shutdown().await;
     server.abort_and_wait().await;
-    fleet.shutdown().await;
+    fleet.quiesce().await;
 }
 
 #[cfg(feature = "test-control")]
@@ -5209,7 +5291,7 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
     // that exact binding durable before measuring the one actual lease write.
     let operation_budget = Duration::from_millis(250);
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start(
+    let mut fleet = ThreeVoterConsumerFleet::start(
         Arc::clone(&pki),
         Some(operation_budget + Duration::from_millis(50)),
     )
@@ -5340,12 +5422,13 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
 
     persistent.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test]
 async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_calls() {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let (leader, _, _) = fleet.observed_leader();
     let follower = (leader + 1) % THREE_VOTER_COUNT;
 
@@ -5688,6 +5771,7 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
     for server in servers {
         server.abort_and_wait().await;
     }
+    fleet.quiesce().await;
 }
 
 #[cfg(feature = "test-control")]
@@ -5706,7 +5790,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
     physical_attempt_timeout: Duration,
 ) {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let client_spiffe = spiffe("prepared-cas-three-voter-client");
     let a_spiffe = three_voter_spiffe(0);
     let c_spiffe = three_voter_spiffe(2);
@@ -5960,6 +6044,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
     client_c.shutdown().await;
     a_server.abort_and_wait().await;
     c_server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[derive(Debug)]
@@ -6010,7 +6095,7 @@ async fn warm_prepared_cas_response_loss_sample(
     warm_connections: bool,
 ) -> WarmPreparedCasLatencySample {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let client_spiffe = spiffe("prepared-cas-warm-matrix-client");
     let manifest = fleet.stores[0]
         .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
@@ -6209,6 +6294,7 @@ async fn warm_prepared_cas_response_loss_sample(
         client_c.shutdown().await;
         a_server.abort_and_wait().await;
         c_server.abort_and_wait().await;
+        fleet.quiesce().await;
         return WarmPreparedCasLatencySample {
             payload_bytes,
             attempt_budget,
@@ -6296,6 +6382,7 @@ async fn warm_prepared_cas_response_loss_sample(
     client_c.shutdown().await;
     a_server.abort_and_wait().await;
     c_server.abort_and_wait().await;
+    fleet.quiesce().await;
     WarmPreparedCasLatencySample {
         payload_bytes,
         attempt_budget,
@@ -6425,7 +6512,7 @@ async fn prepared_cas_cold_response_loss_latency_comparison() {
 #[tokio::test]
 async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_restart() {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let client_spiffe = spiffe("three-voter-public-fenced-client");
 
     // Every endpoint is the real OpenRaft-backed consumer service. The test
@@ -6576,7 +6663,7 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
     // connection or a modeled receipt map. Rebuild the public facade from the
     // retained journal without retaining a prepared execution handle; recovery
     // therefore observes the authoritative committed head through the facade.
-    let fleet = fleet.restart_all().await;
+    fleet = fleet.restart_all().await;
     fleet.wait_all_ready().await;
     let mut recovery_servers = Vec::with_capacity(THREE_VOTER_COUNT);
     let mut recovery_addresses = Vec::with_capacity(THREE_VOTER_COUNT);
@@ -6721,7 +6808,7 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
     for server in recovery_servers {
         server.abort_and_wait().await;
     }
-    fleet.shutdown().await;
+    fleet.quiesce().await;
 }
 
 #[cfg(feature = "test-control")]
@@ -7187,7 +7274,7 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     for server in recovery_servers {
         server.abort_and_wait().await;
     }
-    fleet.shutdown().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test]
@@ -7386,7 +7473,7 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
 async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal(
 ) {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -7943,6 +8030,7 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
 
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 // The real consensus service runs all three authenticated voter transports at
@@ -7952,7 +8040,7 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal() {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -8610,13 +8698,14 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
 
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_v2_absent_roster_rejects_authoritative_incumbent_before_provider_work(
 ) {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -8849,12 +8938,13 @@ async fn persistent_three_voter_v2_absent_roster_rejects_authoritative_incumbent
 
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_v2_absent_roster_not_found_is_adoption_only() {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -9071,13 +9161,14 @@ async fn persistent_three_voter_v2_absent_roster_not_found_is_adoption_only() {
 
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absence_and_exact_recovery(
 ) {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -9471,13 +9562,14 @@ async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absenc
 
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_v2_absent_roster_tenant_scope_isolation_preserves_exact_authority()
 {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -9851,12 +9943,13 @@ async fn persistent_three_voter_v2_absent_roster_tenant_scope_isolation_preserve
     shutdown_a.shutdown().await;
     shutdown_b.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_v1_ingress_rejects_v2_absent_roster_before_provider_work() {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -9998,12 +10091,13 @@ async fn persistent_three_voter_v1_ingress_rejects_v2_absent_roster_before_provi
 
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_v2_absent_roster_replays_exact_bytes_and_rejects_conflict() {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -10248,13 +10342,14 @@ async fn persistent_three_voter_v2_absent_roster_replays_exact_bytes_and_rejects
     replay_shutdown.shutdown().await;
     conflict_shutdown.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_three_voter_protected_roster_not_found_after_outcome_unknown_requires_adoption()
 {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -10501,6 +10596,7 @@ async fn persistent_three_voter_protected_roster_not_found_after_outcome_unknown
 
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
+    fleet.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -10543,7 +10639,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         "the snapshot/restart evidence compacts the retained PollAdmitted body before any member effect"
     );
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -11165,7 +11261,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     drop(initial_adapter);
     initial_shutdown.shutdown().await;
     initial_server.abort_and_wait().await;
-    let fleet = if matches!(
+    fleet = if matches!(
         cut,
         DurableRosterCrashCut::EstablishedBeforePublication
             | DurableRosterCrashCut::PublicationFirstSendNotTransmitted
@@ -11530,7 +11626,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         recovery_shutdown.shutdown().await;
         recovery_server.abort_and_wait().await;
         lease_server.abort_and_wait().await;
-        fleet.shutdown().await;
+        fleet.quiesce().await;
         return;
     }
     let mut recovered = if matches!(cut, DurableRosterCrashCut::BeforeAdmission) {
@@ -11706,7 +11802,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     recovery_shutdown.shutdown().await;
     recovery_server.abort_and_wait().await;
     lease_server.abort_and_wait().await;
-    fleet.shutdown().await;
+    fleet.quiesce().await;
 }
 
 #[cfg(feature = "test-control")]
@@ -11818,7 +11914,7 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
     const TAIL_BATCH_SIZE: usize = 32;
 
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -11992,7 +12088,7 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
         panic_with_durable_progress!(fleet);
     }
 
-    let fleet = fleet.restart_all().await;
+    fleet = fleet.restart_all().await;
     let (restart_leader, _, _) = fleet.wait_for_observed_leader().await;
     let restarted_replication_sequence = fleet.stores[restart_leader]
         .max_replication_sequence()
@@ -12001,7 +12097,7 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
     if restarted_replication_sequence != stable_replication_sequence {
         panic_with_durable_progress!(fleet);
     }
-    fleet.shutdown().await;
+    fleet.quiesce().await;
 }
 
 #[cfg(feature = "test-control")]
@@ -12015,7 +12111,7 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
     const SNAPSHOT_COMMANDS: usize = 4_300;
 
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -12600,7 +12696,7 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
     drop(initial_transport);
     drop(recovery_transport);
     drop(lease_transport);
-    let fleet = fleet.restart_all().await;
+    fleet = fleet.restart_all().await;
 
     let (restart_leader, _, restart_term) =
         fleet.wait_for_admitted_quorum_leader(&[0, 1, 2], 0).await;
@@ -12693,7 +12789,7 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
 
     restart_shutdown.shutdown().await;
     restart_server.abort_and_wait().await;
-    fleet.shutdown().await;
+    fleet.quiesce().await;
 }
 
 // Durable provider-only evidence shared by the protected-roster integration matrix.
@@ -15589,7 +15685,7 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     wait_for_protected_roster_process_loss_lease_expiry(&phase_two_guard, "phase three").await;
 
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_with_topology_in_directory(
+    let mut fleet = ThreeVoterConsumerFleet::start_with_topology_in_directory(
         Arc::clone(&pki),
         None,
         true,
@@ -15886,7 +15982,7 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     drop(adapter);
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
-    fleet.shutdown().await;
+    fleet.quiesce().await;
     std::fs::remove_dir_all(&durable_snapshot_directory)
         .expect("remove completed process-loss snapshot fixture directory");
     write_protected_roster_process_loss_state(&state.join("phase-three-complete"), b"complete");
