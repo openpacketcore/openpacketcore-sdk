@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::consensus::snapshot::SnapshotArtifactGate;
+use crate::consensus::store::initialization_evidence::{self, DeadlineStage, ProbeControl};
 
 struct ReleaseWriters(Vec<Arc<SnapshotArtifactGate>>);
 
@@ -192,15 +193,28 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_persistence_public_background_error_preserves_results_and_reports_failed_drain() {
-    public_background_error_recovery(false).await;
+    public_background_error_recovery(RecoveryHold::None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_persistence_failed_writer_recovery_survives_a_snapshot_call_deadline() {
-    public_background_error_recovery(true).await;
+    public_background_error_recovery(RecoveryHold::SnapshotPublication).await;
 }
 
-async fn public_background_error_recovery(hold_recovery_generation: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_persistence_recovery_survives_post_activation_admission_deadlines() {
+    public_background_error_recovery(RecoveryHold::InitializedProbe).await;
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RecoveryHold {
+    None,
+    SnapshotPublication,
+    InitializedProbe,
+}
+
+async fn public_background_error_recovery(hold: RecoveryHold) {
+    let hold_recovery_generation = hold == RecoveryHold::SnapshotPublication;
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = Fleet::new(3);
     let faults = (0..3)
@@ -359,16 +373,20 @@ async fn public_background_error_recovery(hold_recovery_generation: bool) {
             "the restarted follower lost a previously acknowledged tail"
         );
         let started_repair = tokio::time::Instant::now();
+        let mut forced_probe_deadlines = if hold == RecoveryHold::InitializedProbe { 2 } else { 0 };
+        let mut probe_deadlines_seen = 0;
         let mut initialized = if hold_recovery_generation {
             gates[leader].arm();
             let cold = fleet.store(follower).clone();
-            let initialization = tokio::spawn(async move { cold.initialize_cluster().await });
+            let initialization = tokio::spawn(async move {
+                initialization_evidence::observe(&cold, ProbeControl::Run).await
+            });
             tokio::time::timeout(Duration::from_secs(3), gates[leader].wait_started())
                 .await
                 .expect("actual leader generation writer reaches the recovery hold");
             let initialized = initialization.await.unwrap();
             assert!(started_repair.elapsed() >= OPERATION_BOUND);
-            assert!(matches!(initialized, Err(ConsensusSessionStoreOpenError::RecoveryRequired)));
+            assert!(matches!(initialized.result, Err(ConsensusSessionStoreOpenError::RecoveryRequired)));
             let health = fleet.store(follower).persistence_health();
             assert!(health.engine_running && health.storage_failure.is_none());
             assert_eq!(health.recovery, Some(SessionAsyncRecoveryState::CatchingUp));
@@ -376,21 +394,39 @@ async fn public_background_error_recovery(hold_recovery_generation: bool) {
             gates[leader].release();
             initialized
         } else {
-            fleet.store(follower).initialize_cluster().await
+            initialization_evidence::observe(
+                fleet.store(follower),
+                if forced_probe_deadlines > 0 { ProbeControl::UntilDeadline } else { ProbeControl::Run },
+            ).await
         };
         for (role, store) in [("leader", fleet.store(leader)), ("cold", fleet.store(follower))] {
             let metrics = store.inner.raft.metrics();
             let metrics = metrics.borrow();
             eprintln!("async_failed_writer_rejoin role={role} elapsed_us={} result={initialized:?} health={:?} vote={:?} log={:?} applied={:?} snapshot={:?}", started_repair.elapsed().as_micros(), store.persistence_health(), metrics.vote, metrics.last_log_index, metrics.last_applied, metrics.snapshot);
         }
-        // RecoveryRequired describes one incomplete bounded attempt, not a
-        // failed engine or a lost receipt. Snapshot creation/installation can
-        // outlive that call on a shared disk. Retrying initialization is its
-        // existing public contract; every attempt still has OPERATION_BOUND.
-        // Use the existing default setup bound only as a test hang guard.
+        // RecoveryRequired describes one incomplete bounded cold attempt.
+        // After activation, the remaining initialized probe can expire at
+        // the same deadline. Retry that case only when this exact call's
+        // evidence proves the elapsed branch; an opaque rejection or a real
+        // scope/storage/engine failure cannot borrow an earlier timeout.
+        // Every attempt retains OPERATION_BOUND. The existing setup bound
+        // remains the outer test hang guard, never a production extension.
         let setup_deadline = started_repair + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
         let mut attempts = 1;
-        while matches!(initialized, Err(ConsensusSessionStoreOpenError::RecoveryRequired)) {
+        loop {
+            if forced_probe_deadlines > 0 && initialized.expired_stage() == Some(DeadlineStage::InitializedProbe) {
+                assert!(matches!(initialized.result, Err(ConsensusSessionStoreOpenError::ClusterFormationRejected)));
+                assert!(initialized.probe_was_active_and_unadmitted());
+                if probe_deadlines_seen > 0 {
+                    assert!(!initialized.cold_on_entry, "the next bounded call starts already active");
+                }
+                assert!(started_repair.elapsed() >= OPERATION_BOUND);
+                forced_probe_deadlines -= 1;
+                probe_deadlines_seen += 1;
+            }
+            if !initialized.retryable_recovery_attempt() {
+                break;
+            }
             let cold = fleet.store(follower);
             let health = cold.persistence_health();
             assert!(health.engine_running && health.storage_failure.is_none());
@@ -398,13 +434,18 @@ async fn public_background_error_recovery(hold_recovery_generation: bool) {
             assert!(!cold.status().admitted, "an incomplete attempt grants no traffic authority");
             assert_eq!(fleet.store(leader).inner.raft.metrics().borrow().vote, leader_vote);
             assert_eq!(cold.inner.operation_timeout, OPERATION_BOUND);
-            initialized = tokio::time::timeout_at(setup_deadline, cold.initialize_cluster())
-                .await
-                .expect("cold recovery completes within the existing setup guard");
+            initialized = tokio::time::timeout_at(
+                setup_deadline,
+                initialization_evidence::observe(
+                    cold,
+                    if forced_probe_deadlines > 0 { ProbeControl::UntilDeadline } else { ProbeControl::Run },
+                ),
+            ).await.expect("cold recovery completes within the existing setup guard");
             attempts += 1;
             eprintln!("async_failed_writer_rejoin attempt={attempts} elapsed_us={} result={initialized:?} health={:?}", started_repair.elapsed().as_micros(), cold.persistence_health());
         }
-        initialized.unwrap();
+        initialized.result.expect("bounded recovery retries must survive a proven post-activation admission deadline");
+        assert_eq!(probe_deadlines_seen, if hold == RecoveryHold::InitializedProbe { 2 } else { 0 });
         assert!(!hold_recovery_generation || attempts >= 2);
         assert_eq!(
             fleet.store(leader).inner.raft.metrics().borrow().vote,

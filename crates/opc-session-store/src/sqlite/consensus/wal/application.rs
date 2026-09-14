@@ -100,6 +100,16 @@ impl AppliedPrefix {
     }
 }
 
+fn check_application_read_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "private WAL application read deadline exceeded",
+        ));
+    }
+    Ok(())
+}
+
 fn projection_schema_version(conn: &Connection) -> io::Result<i64> {
     conn.pragma_query_value(
         Some(rusqlite::DatabaseName::Main),
@@ -210,6 +220,28 @@ impl Wal {
         conn: &Connection,
         read: impl FnOnce() -> T,
     ) -> io::Result<T> {
+        self.with_application_read_until(conn, None, read)
+    }
+
+    /// A started legacy read retains validation ownership after caller drop.
+    /// Its original pre-admission deadline is never refreshed. Checking under
+    /// the State lock orders expiry/fencing before a waiting callback.
+    #[cfg(test)]
+    pub(crate) fn with_retained_application_read<T>(
+        &self,
+        conn: &Connection,
+        deadline: Instant,
+        read: impl FnOnce() -> T,
+    ) -> io::Result<T> {
+        self.with_application_read_until(conn, Some(deadline), read)
+    }
+
+    fn with_application_read_until<T>(
+        &self,
+        conn: &Connection,
+        deadline: Option<Instant>,
+        read: impl FnOnce() -> T,
+    ) -> io::Result<T> {
         if self.is_native() {
             return self.reject_native_sql_fallback();
         }
@@ -222,6 +254,7 @@ impl Wal {
         #[cfg(test)]
         let validation_phase = std::cell::Cell::new("entry");
         let result = (|| {
+            check_application_read_deadline(deadline)?;
             if !conn.is_autocommit() {
                 return Err(invalid_data(
                     "private WAL read entered with an active transaction",
@@ -233,6 +266,7 @@ impl Wal {
             let validated = validate_live_cache(conn, &state, self.binding);
             validation += validation_started.elapsed();
             validated?;
+            check_application_read_deadline(deadline)?;
             let read_started = Instant::now();
             let value = read();
             read_duration = read_started.elapsed();
@@ -247,6 +281,7 @@ impl Wal {
             let validated = validate_live_cache(conn, &state, self.binding);
             validation += validation_started.elapsed();
             validated?;
+            check_application_read_deadline(deadline)?;
             Ok(value)
         })();
         #[cfg(test)]

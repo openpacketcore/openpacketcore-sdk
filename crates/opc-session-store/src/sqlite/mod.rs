@@ -680,7 +680,7 @@ impl Drop for RestoreScanCancellation {
 
 struct SqliteOperationCancellation {
     cancellation: Arc<AtomicBool>,
-    interrupt: InterruptHandle,
+    interrupt: Option<InterruptHandle>,
     abort: tokio::task::AbortHandle,
     cancel_queued: Option<Box<dyn FnOnce() + Send>>,
     armed: bool,
@@ -697,12 +697,14 @@ impl Drop for SqliteOperationCancellation {
     fn drop(&mut self) {
         if self.armed {
             self.cancellation.store(true, Ordering::Release);
-            self.interrupt.interrupt();
+            if let Some(interrupt) = &self.interrupt {
+                interrupt.interrupt();
+            }
             if let Some(cancel_queued) = self.cancel_queued.take() {
                 cancel_queued();
             }
-            // A running blocking job ignores abort and remains bounded by its
-            // SQLite interrupt/progress handler.
+            // Abort removes queued work. A running job retains its connection
+            // and permit through cleanup, with the original SQLite deadline.
             self.abort.abort();
         }
     }
@@ -886,6 +888,29 @@ enum SqliteStoreWorkKind {
 }
 
 #[derive(Clone, Copy)]
+enum SqliteTaskCompletion {
+    Interruptible,
+    // The explicit legacy SQL qualification route owes post-read validation
+    // under its WAL lock even when its async caller has gone away.
+    #[cfg(all(test, target_os = "linux"))]
+    RetainGuardedRead,
+}
+
+impl SqliteTaskCompletion {
+    fn interrupt_on_caller_drop(self) -> bool {
+        match self {
+            Self::Interruptible => true,
+            #[cfg(all(test, target_os = "linux"))]
+            Self::RetainGuardedRead => false,
+        }
+    }
+
+    fn result_deadline_expired(self, deadline: std::time::Instant) -> bool {
+        !self.interrupt_on_caller_drop() && std::time::Instant::now() >= deadline
+    }
+}
+
+#[derive(Clone, Copy)]
 enum SqliteWorkerFailure {
     Admission,
     OutcomeUnavailable,
@@ -893,12 +918,17 @@ enum SqliteWorkerFailure {
 
 fn install_sqlite_operation_progress_handler(
     conn: &Connection,
-    cancellation: Arc<AtomicBool>,
+    cancellation: Option<Arc<AtomicBool>>,
     deadline: std::time::Instant,
 ) -> SqliteOperationProgressGuard<'_> {
     conn.progress_handler(
         SQLITE_OPERATION_PROGRESS_INTERVAL,
-        Some(move || cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= deadline),
+        Some(move || {
+            cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+                || std::time::Instant::now() >= deadline
+        }),
     );
     SqliteOperationProgressGuard(conn)
 }
@@ -1415,7 +1445,8 @@ impl SqliteSessionBackend {
         self.run_sqlite_task_on(
             Arc::clone(&self.conn),
             Arc::clone(&self.operation_workers),
-            operation,
+            SqliteTaskCompletion::Interruptible,
+            move |conn, _deadline| operation(conn),
         )
         .await
     }
@@ -1424,12 +1455,13 @@ impl SqliteSessionBackend {
         &self,
         conn: Arc<tokio::sync::Mutex<Connection>>,
         workers: Arc<tokio::sync::Semaphore>,
+        completion: SqliteTaskCompletion,
         operation: F,
     ) -> Result<Result<T, E>, SqliteWorkerFailure>
     where
         T: Send + 'static,
         E: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+        F: FnOnce(&Connection, std::time::Instant) -> Result<T, E> + Send + 'static,
     {
         let deadline = tokio::time::Instant::now()
             .checked_add(SQLITE_OPERATION_MAX_WORK)
@@ -1456,7 +1488,9 @@ impl SqliteSessionBackend {
                 SqliteWorkerFailure::Admission
             })?;
         let cancellation = Arc::new(AtomicBool::new(false));
-        let interrupt = conn.get_interrupt_handle();
+        let interrupt = completion
+            .interrupt_on_caller_drop()
+            .then(|| conn.get_interrupt_handle());
         let operation_deadline = deadline.into_std();
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, operation))));
@@ -1471,13 +1505,15 @@ impl SqliteSessionBackend {
             let result = {
                 let _progress = install_sqlite_operation_progress_handler(
                     &conn,
-                    Arc::clone(&task_cancellation),
+                    completion
+                        .interrupt_on_caller_drop()
+                        .then(|| Arc::clone(&task_cancellation)),
                     operation_deadline,
                 );
                 if task_cancellation.load(Ordering::Acquire) {
                     Err(SqliteWorkerFailure::OutcomeUnavailable)
                 } else {
-                    Ok(operation(&conn))
+                    Ok(operation(&conn, operation_deadline))
                 }
             };
             #[cfg(test)]
@@ -1534,7 +1570,14 @@ impl SqliteSessionBackend {
                 cancel_on_drop.disarm();
                 drop(conn);
                 drop(worker_permit);
-                result
+                // Tokio polls a ready result before its timer. A retained
+                // owner may have validated on time while this receiver was
+                // delayed: reject the late response without fencing it.
+                if completion.result_deadline_expired(operation_deadline) {
+                    Err(SqliteWorkerFailure::OutcomeUnavailable)
+                } else {
+                    result
+                }
             }
             Ok(Ok(None)) => {
                 cancel_on_drop.disarm();
@@ -1569,22 +1612,35 @@ impl SqliteSessionBackend {
         F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
     {
         #[cfg(all(test, target_os = "linux"))]
-        let operation = {
-            let private_test = self.private_wal_test.clone();
-            move |conn: &Connection| {
-                if let Some(private_test) = private_test {
-                    if !matches!(kind, SqliteStoreWorkKind::Read) {
-                        return Err(sqlite_store_outcome_unavailable(kind));
-                    }
-                    return private_test
-                        .current()
-                        .and_then(|wal| wal.with_application_read(conn, || operation(conn)))
-                        .map_err(|_| sqlite_store_outcome_unavailable(kind))?;
-                }
-                operation(conn)
+        let result = if let Some(private_test) = self
+            .private_wal_test
+            .as_ref()
+            .filter(|private_test| !private_test.is_native())
+            .cloned()
+        {
+            if !matches!(kind, SqliteStoreWorkKind::Read) {
+                return Err(sqlite_store_outcome_unavailable(kind));
             }
+            self.run_sqlite_task_on(
+                Arc::clone(&self.conn),
+                Arc::clone(&self.operation_workers),
+                SqliteTaskCompletion::RetainGuardedRead,
+                move |conn, deadline| {
+                    private_test
+                        .current()
+                        .and_then(|wal| {
+                            wal.with_retained_application_read(conn, deadline, || operation(conn))
+                        })
+                        .map_err(|_| sqlite_store_outcome_unavailable(kind))?
+                },
+            )
+            .await
+        } else {
+            self.run_sqlite_task(operation).await
         };
-        match self.run_sqlite_task(operation).await {
+        #[cfg(not(all(test, target_os = "linux")))]
+        let result = self.run_sqlite_task(operation).await;
+        match result {
             Ok(Ok(value)) => Ok(value),
             Err(SqliteWorkerFailure::OutcomeUnavailable) => {
                 Err(sqlite_store_outcome_unavailable(kind))
@@ -1626,7 +1682,7 @@ impl SqliteSessionBackend {
                 .map_err(|_| SqliteWorkerFailure::Admission)?;
         let conn = pool.checkout(deadline).await?;
         let cancellation = Arc::new(AtomicBool::new(false));
-        let interrupt = conn.get_interrupt_handle();
+        let interrupt = Some(conn.get_interrupt_handle());
         let operation_deadline = deadline.into_std();
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((
@@ -1643,7 +1699,7 @@ impl SqliteSessionBackend {
                 if let Some(conn) = lease.connection() {
                     let _progress = install_sqlite_operation_progress_handler(
                         conn,
-                        Arc::clone(&task_cancellation),
+                        Some(Arc::clone(&task_cancellation)),
                         operation_deadline,
                     );
                     if task_cancellation.load(Ordering::Acquire) || !conn.is_autocommit() {
