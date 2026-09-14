@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Cancelled legacy cache verification — `opc-session-store`:** the explicit
+  Linux `PrivateWalTest` route retains an already-started read's connection,
+  permit and WAL guard through cache validation after caller cancellation.
+  The original deadline and foreign-write fence remain enforced; queued
+  cancellation releases unused admission. Late result delivery fails without
+  fencing an owner validated on time. Ordinary SQL cancellation and native
+  persistence are unchanged.
 - **Native journal read admission — `opc-session-store`:** preflight complete
   journal output before copying and bound concurrent construction to 32 MiB
   within the existing 128 MiB verifier budget. Oversized requests return

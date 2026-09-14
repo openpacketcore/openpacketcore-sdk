@@ -328,6 +328,16 @@ independent HA placement.
   `BackendOperationOutcomeUnavailable`, or
   `LeaseError::OperationOutcomeUnavailable`, respectively. Reads remain
   retryable. Consensus-gated SQLite reads use the same supervised worker path.
+  In the explicit Linux unit-test `PrivateWalTest` legacy SQL route, an
+  already-started guarded read completes its before/after cache validation
+  under the WAL lock after caller cancellation. The original pre-admission
+  deadline still governs SQLite progress and guard admission/completion;
+  expiry fences before a waiting durability callback can succeed. Queued
+  cancellation still releases unused admission. A late result receiver gets
+  an error without fencing a cache validated on time. Non-SQL waits and
+  cleanup retirement are not a hard two-second wall-clock guarantee.
+  Ordinary SQLite and acceptance-pool cancellation remain interruptible;
+  native persistence does not use this legacy guarded-read route.
 - The exact `opc-session-net/5` ALPN, version, and contract profile have no
   fallback or downgrade negotiation. Public session-net `Request`/`Response`
   remain, but `Hello`/`HelloAck` gain an optional `contract_profile`, so

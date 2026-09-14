@@ -54,7 +54,16 @@ share one lifecycle-owned storage authority. Selected native reads and apply
 use that authority rather than a second mutable SQLite application projection.
 SQLite remains the public file-backed construction type and the verified
 snapshot interchange format. Standalone SQLite and the historical private WAL
-fixtures retain their existing contracts.
+fixtures remain separate from native persistence. The explicit legacy SQL
+qualification fixture retains an already-started read's WAL guard through
+post-read validation when its caller disappears. It keeps the original
+pre-admission deadline, checks expiry while holding the WAL lock before
+success, and fences failed or expired validation before releasing a waiting
+durability callback. Cancellation before worker start still reclaims queued
+admission. Delayed async result delivery fails without fencing an owner that
+validated on time. Non-SQL waiting/cleanup is not preemptible at that deadline.
+This fixture rule adds no production persistence mode and does not change
+ordinary SQL cancellation, native storage or snapshot policy.
 
 Durable mode retains the segmented WAL's intent/data/publication ordering,
 single completion owner, exact committed/application cuts, bounded admission,

@@ -9,6 +9,9 @@ use super::super::wal::application::ApplyControl;
 use super::super::wal::{Binding, IoControl, Limits, Operation, Point, Wal};
 use super::*;
 
+#[path = "sequential_wal/cancelled_reads.rs"]
+mod cancelled_reads;
+
 struct Pause {
     point: Point,
     state: Mutex<(bool, bool)>,
