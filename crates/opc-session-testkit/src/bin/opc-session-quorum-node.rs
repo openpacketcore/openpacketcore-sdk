@@ -3432,6 +3432,7 @@ async fn run_traffic_mutation_task(
                 }
                 match reconcile_traffic_mutation_checkpoint(
                     &protected,
+                    &store,
                     &key,
                     &owner,
                     &mut lease,
@@ -3555,6 +3556,7 @@ async fn run_traffic_mutation_task(
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_traffic_mutation_checkpoint(
     protected: &ProtectedStore,
+    store: &ConsensusSessionStore,
     key: &SessionKey,
     owner: &OwnerId,
     lease: &mut Option<LeaseGuard>,
@@ -3570,6 +3572,7 @@ async fn reconcile_traffic_mutation_checkpoint(
     if traffic_failure_retains_known_authority(initial_failure) {
         return reconcile_traffic_known_authority(
             protected,
+            store,
             key,
             owner,
             lease.as_ref(),
@@ -3604,6 +3607,7 @@ async fn reconcile_traffic_mutation_checkpoint(
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_traffic_known_authority(
     protected: &ProtectedStore,
+    store: &ConsensusSessionStore,
     key: &SessionKey,
     owner: &OwnerId,
     lease: Option<&LeaseGuard>,
@@ -3717,7 +3721,67 @@ async fn reconcile_traffic_known_authority(
             QualificationTrafficFailureStage::Get,
         ));
     }
+    if initial_failure.stage == QualificationTrafficFailureStage::ReadinessProbe {
+        // An exact get proves the retained record through a logical-time
+        // proposal. It does not prove the separate quorum read-index path that
+        // failed. Keep this same interruption episode open until that path is
+        // ready, charging every failed proof against the original budget.
+        prove_traffic_readiness_recovery(
+            || async { store.probe_durable_readiness().await.is_ready() },
+            recovery_started_at,
+            deadline,
+            consecutive_availability_interruptions,
+            observation,
+        )
+        .await?;
+    }
     Ok(())
+}
+
+async fn prove_traffic_readiness_recovery<P, F>(
+    mut probe: P,
+    recovery_started_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure>
+where
+    P: FnMut() -> F,
+    F: std::future::Future<Output = bool>,
+{
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::ReadinessProbe,
+                recovery_started_at,
+            ));
+        }
+        // This is a read-only proof, so its observer can be cancelled without
+        // abandoning a mutation or replacing retained lease authority.
+        let readiness = tokio::time::timeout_at(deadline, probe()).await;
+        if matches!(readiness, Ok(true)) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                    QualificationTrafficFailureStage::ReadinessProbe,
+                    recovery_started_at,
+                ));
+            }
+            return Ok(());
+        }
+        let failure = QualificationTrafficFailure::backend_unavailable(
+            QualificationTrafficFailureCode::ReadinessUnavailable,
+            QualificationTrafficFailureStage::ReadinessProbe,
+        );
+        if !observation.record_availability_interruption(consecutive_availability_interruptions) {
+            return Err(failure);
+        }
+        if readiness.is_err() || !wait_for_traffic_recovery_retry(deadline).await {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::ReadinessProbe,
+                recovery_started_at,
+            ));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6371,6 +6435,10 @@ fn main() -> ExitCode {
 #[cfg(test)]
 #[path = "opc-session-quorum-node/shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "opc-session-quorum-node/readiness_recovery_tests.rs"]
+mod readiness_recovery_tests;
 
 #[cfg(test)]
 mod tests {

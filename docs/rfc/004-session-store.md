@@ -38,9 +38,17 @@ recovery. Mutation or lease outcomes that can make authority ambiguous discard
 the prior guard, reacquire same-owner authority at a strictly higher fence, and
 validate the exact scheduled record. Read-only get, restore-scan, and readiness
 outcomes retain the already-proven guard and validate that same exact record
-without minting unnecessary fencing authority. Evidence binds this routing as
-`stage-aware-known-authority/v1`. The fixed
-schedule drops one successful release response per mutator, allows eight
+without minting unnecessary fencing authority. Historical traffic-resource/v6
+evidence binds that routing as `stage-aware-known-authority/v1`. The current
+traffic-resource/v8 schedule binds
+`stage-aware-known-authority-readiness-reproof/v1`: a readiness-origin recovery
+also proves durable readiness again after the exact record check, using the
+same guard and original episode deadline. Failed and timed-out proofs count
+against the unchanged interruption allowance; an exact record read alone does
+not complete readiness recovery. The distinct traffic-resource/v7 retained-
+acquisition profile keeps its historical meaning; v8 does not consume that
+algorithm. See the [qualification contract](../../crates/opc-session-testkit/README.md).
+The fixed schedule drops one successful release response per mutator, allows eight
 outcomes per node, uses the fixed 26-second two-election-plus-operation
 transition envelope per recovery episode, and applies a 50 ms retry delay;
 phase completion requires every interruption to be reconciled. Lease loss,

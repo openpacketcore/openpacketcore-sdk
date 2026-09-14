@@ -965,7 +965,7 @@ pub const QUALIFICATION_TRAFFIC_RECOVERY_DEADLINE_DIAGNOSTIC_PROFILE: &str =
     "terminal-stage-elapsed-millis/v1";
 /// Versioned authority reconciliation algorithm bound into the schedule.
 pub const QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE: &str =
-    "stage-aware-known-authority/v1";
+    "stage-aware-known-authority-readiness-reproof/v1";
 /// Maximum wall-clock budget for one stopped watch's journal reconciliation.
 pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS: u64 = 25_000;
 /// Maximum journal entries one stopped watch may reconcile.
@@ -4859,7 +4859,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v6\n",
+            "opc-session-ha/traffic-resource/v8\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -8871,7 +8871,7 @@ mod tests {
         assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS, 50);
         assert_eq!(
             QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
-            "stage-aware-known-authority/v1"
+            "stage-aware-known-authority-readiness-reproof/v1"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
@@ -8985,8 +8985,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:f4fdbdc7ef765362d2bc6c0a99a6970711ed78bce0030238982696d9d3df7af2",
-                "sha256:bfd95da81973536ecaa47340e8b2a8dcef130e6464cef58f0940ab914e8aaef0",
+                "sha256:29efafbd2732a80d360565512dc5537a7bc1518c0e3db66a6ff9c3384af9da4c",
+                "sha256:5db818eff11926f74b57d6a1656aa01a664b227b5001d91ef02584bb360cb4ba",
             )
         );
         assert!(is_exact_sha256(&three));
@@ -9549,32 +9549,32 @@ mod tests {
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 3,
-                "sha256:42ee8f3df8b619ca5352e97771688f60c27cc46edda1d040cd2f05f1db47c28c",
+                "sha256:a76ed68dfd8971911562c752942059087e10f2be0b2587a0af3f27a37d649ee0",
             ),
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 5,
-                "sha256:41660b8d18f75b4d54f0027fdae15ecc6def17cef76a92204cd68d44aec7e7ad",
+                "sha256:c9bce310ff3e0c83f5c5dfb951614850e3d6364ccb8b3493d2306b587146626c",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 3,
-                "sha256:9426b250e64e9a2e1a13e603fb751e5fa7d97040baa0fc37004d163477785357",
+                "sha256:0f11171c86644a7d66b7daf423a862194f682f1f0c488097b76ef262dc0d0410",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 5,
-                "sha256:113be3f9f8bdac145abc8e86644a0278363431ff2b777c658c326b04614f5fe6",
+                "sha256:300493153261feafe0bce4b618fe58c5ce1525a00c5de3bece88470c8967d454",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 3,
-                "sha256:bb9cf323a28a94ae8935c83441e42a1124cec46c2254f56615c8e5b0f1a16c4f",
+                "sha256:88c29b8a0befde90ce4ab188652f1c88cd20376557744ac7d417e2185a7da556",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 5,
-                "sha256:5eeef1a6ce271c67d48fc860b3e0cd3c23fb8d11e7552cc1879cac88734f0307",
+                "sha256:a5a811dd25a871d02cc6a8e639dcb3c750d7e8d8598f7638d873329b100cc366",
             ),
         ];
         for (campaign, member_count, expected) in vectors {

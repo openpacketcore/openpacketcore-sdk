@@ -15,7 +15,7 @@ pub mod qualification_sequential;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,9 +29,9 @@ use opc_session_store::{
     QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity, ReplicaEndpoint,
     ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreBlockReason,
     RestoreBlockReasonCode, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SqliteSessionBackend, SystemClock, TokioVirtualClock,
-    ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SqliteSessionBackend, SystemClock,
+    TokioVirtualClock, ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::Timestamp;
 
@@ -147,6 +147,8 @@ struct InProcessConsensusPeer {
     scope: Option<SessionConsensusIdentity>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     online: Arc<AtomicBool>,
+    ordinary_read_barrier_online: Arc<AtomicBool>,
+    rejected_ordinary_read_barriers: Arc<AtomicUsize>,
 }
 
 impl InProcessConsensusPeer {
@@ -156,6 +158,8 @@ impl InProcessConsensusPeer {
             scope: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             online: Arc::new(AtomicBool::new(true)),
+            ordinary_read_barrier_online: Arc::new(AtomicBool::new(true)),
+            rejected_ordinary_read_barriers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -193,6 +197,16 @@ impl SessionConsensusPeer for InProcessConsensusPeer {
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         if !self.online.load(Ordering::SeqCst) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        // The unit read-index request has an empty payload. Capability and
+        // profile probes share this family and must still reach the handler.
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && request.payload.is_empty()
+            && !self.ordinary_read_barrier_online.load(Ordering::SeqCst)
+        {
+            self.rejected_ordinary_read_barriers
+                .fetch_add(1, Ordering::SeqCst);
             return Err(SessionConsensusPeerError::Unavailable);
         }
         let handler = self
@@ -412,6 +426,37 @@ impl ConsensusTestCluster {
             if *source == index || *target == index {
                 path.set_online(online);
             }
+        }
+    }
+
+    /// Gate only ordinary read-index calls on one directed fixture path.
+    ///
+    /// Mutations, replication, and the nonempty capability/profile probes
+    /// carried by the same RPC family continue through the real handler.
+    pub fn set_ordinary_read_barrier_online(&self, source: usize, target: usize, online: bool) {
+        self.paths
+            .get(&(source, target))
+            .expect("consensus test path")
+            .ordinary_read_barrier_online
+            .store(online, Ordering::SeqCst);
+    }
+
+    /// Number of actual ordinary read-index calls rejected on a fixture path.
+    pub fn rejected_ordinary_read_barriers(&self, source: usize, target: usize) -> usize {
+        self.paths
+            .get(&(source, target))
+            .expect("consensus test path")
+            .rejected_ordinary_read_barriers
+            .load(Ordering::SeqCst)
+    }
+
+    /// Drain the real stores and break the fixture's handler ownership cycles.
+    pub async fn shutdown(self) {
+        for result in join_all(self.stores.iter().map(ConsensusSessionStore::shutdown)).await {
+            result.expect("shut down consensus test member");
+        }
+        for path in self.paths.values() {
+            path.handler.write().await.take();
         }
     }
 
