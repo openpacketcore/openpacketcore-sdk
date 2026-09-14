@@ -436,3 +436,174 @@ async fn public_background_error_recovery(hold_recovery_generation: bool) {
     fleet.close_all().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let gate = Arc::new(SnapshotArtifactGate::new());
+    let release = ReleaseWriters(vec![Arc::clone(&gate)]);
+    let mut rescue = None;
+    let result = AssertUnwindSafe(async {
+        let writer_gate = Arc::clone(&gate);
+        let hook: GenerationHook = Arc::new(move || {
+            writer_gate.block_if_armed_blocking();
+            Ok(())
+        });
+        fleet
+            .open_with_hook(0, SessionPersistenceMode::Async, Some(hook))
+            .await
+            .unwrap();
+        for index in 1..3 {
+            fleet
+                .open(index, SessionPersistenceMode::Async)
+                .await
+                .unwrap();
+        }
+        fleet.form().await;
+        let leader = fleet.store(fleet.leader()).clone();
+        leader
+            .activate_fenced_transition_capability()
+            .await
+            .unwrap();
+        let request = create_request(&leader, 1, &provider()).await;
+        for voter in fleet.stores.iter().flatten() {
+            voter.drain_async_persistence().await.unwrap();
+        }
+        gate.arm();
+        let outcome = create(&leader, &request).await;
+        tokio::time::timeout(Duration::from_secs(3), gate.wait_started())
+            .await
+            .expect("real native generation writer reached the I/O hold");
+        let store = fleet.store(0).clone();
+        assert!(!store
+            .inner
+            .private_wal
+            .as_ref()
+            .unwrap()
+            .native_snapshot_publication_pending_for_test()
+            .unwrap());
+        *fleet.peers[0].handler.write().await = None;
+
+        // A Tokio-only watchdog cannot release a writer when the runtime is
+        // blocked in its join. This external rescue bounds the failing case;
+        // a passing run must signal it only after both public deadlines fire.
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let writer_gate = Arc::clone(&gate);
+        rescue = Some((
+            release_sender,
+            std::thread::spawn(move || {
+                let signalled = release_receiver.recv_timeout(OPERATION_BOUND * 4).is_ok();
+                writer_gate.release();
+                signalled
+            }),
+        ));
+        assert!(
+            store.shutdown().now_or_never().is_none(),
+            "cancel one caller after starting the clone-wide background drain"
+        );
+        tokio::time::timeout(OPERATION_BOUND, async {
+            while store.persistence_health().storage_state != SessionStorageState::Draining {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the runtime must observe the held native drain before its deadline");
+        let lock =
+            std::fs::File::open(fleet.directory.path().join("node-0.sqlite.native-wal/LOCK"))
+                .expect("independent native owner lock descriptor");
+        assert_eq!(
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK),
+            "a timed-out caller must not release the root"
+        );
+        let first = store.clone();
+        let second = store.clone();
+        let (first_result, second_result, ()) = tokio::join!(
+            first.shutdown(),
+            second.shutdown(),
+            tokio::time::sleep(Duration::from_millis(1)),
+        );
+        assert_eq!(first_result, Err(consensus_unavailable()));
+        assert_eq!(second_result, Err(consensus_unavailable()));
+        assert_eq!(
+            store.persistence_health().storage_state,
+            SessionStorageState::Draining
+        );
+        assert_eq!(
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK)
+        );
+        rescue
+            .as_ref()
+            .unwrap()
+            .0
+            .send(())
+            .expect("release after both original deadlines");
+        store
+            .shutdown()
+            .await
+            .expect("retry observes the same completed physical drain");
+        assert_eq!(
+            store.persistence_health().storage_state,
+            SessionStorageState::Closed
+        );
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("physical writer completion releases its native owner lock");
+        drop(lock);
+        drop(first);
+        drop(second);
+        drop(leader);
+        drop(store);
+        fleet.close(0).await;
+        fleet
+            .open(0, SessionPersistenceMode::Async)
+            .await
+            .expect("ordinary reopen after every old owner is dropped");
+        let cold = fleet.store(0);
+        assert_eq!(
+            cold.persistence_health().recovery,
+            Some(SessionAsyncRecoveryState::AwaitingLiveQuorum)
+        );
+        assert!(!cold.status().admitted);
+        // A clean drain still reopens cold. Passive readiness cannot grant
+        // authority; use the existing public live-quorum admission sequence.
+        let setup_deadline =
+            tokio::time::Instant::now() + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
+        loop {
+            let initialized = tokio::time::timeout_at(setup_deadline, cold.initialize_cluster())
+                .await
+                .expect("cold admission stays within the existing setup guard");
+            if initialized != Err(ConsensusSessionStoreOpenError::RecoveryRequired) {
+                initialized.expect("ordinary live-quorum reconstruction");
+                break;
+            }
+            let health = cold.persistence_health();
+            assert!(health.engine_running);
+            assert_eq!(health.storage_state, SessionStorageState::Running);
+            assert!(health.storage_failure.is_none());
+            assert!(!cold.status().admitted);
+            assert_eq!(cold.inner.operation_timeout, OPERATION_BOUND);
+        }
+        fleet.ready().await;
+        assert_recorded(fleet.store(0), &request, &outcome).await;
+    })
+    .catch_unwind()
+    .await;
+    drop(release);
+    let released_by_caller = if let Some((sender, thread)) = rescue {
+        let _ = sender.send(());
+        tokio::task::spawn_blocking(move || thread.join())
+            .await
+            .unwrap()
+            .unwrap()
+    } else {
+        false
+    };
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert!(
+        released_by_caller,
+        "the external watchdog must not rescue a passing runtime"
+    );
+}

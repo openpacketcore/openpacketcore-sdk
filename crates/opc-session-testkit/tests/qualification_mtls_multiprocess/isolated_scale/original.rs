@@ -12,7 +12,9 @@ mod requests;
 mod resources;
 use opc_consensus::DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
 use opc_session_net::consumer::PersistentSessionConsumerExecuteError;
-use opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError;
+use opc_session_store::consumer::{
+    SessionConsumerV2FencedTransitionBatchError, SessionConsumerV2FencedTransitionBatchResult,
+};
 use opc_session_store::{
     FencedTransitionMutationResult, FencedTransitionOutcome,
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
@@ -50,11 +52,12 @@ impl Effects {
         kind: &str,
         requests: &[FencedTransitionV2Request],
         resolved: &[Option<FencedTransitionOutcome>],
+        returned: &[SessionConsumerV2FencedTransitionBatchResult],
     ) {
         let index = self.failure_records.fetch_add(1, Ordering::Relaxed);
         let path = self.evidence_root.join(format!("effect-{index}.json"));
         let evidence = serde_json::json!({
-            "kind": kind, "requests": requests, "resolved": resolved,
+            "kind": kind, "requests": requests, "resolved": resolved, "returned": returned,
             "counters": self.json(), "performance_acceptance": false,
         });
         fs::write(
@@ -116,6 +119,7 @@ async fn execute_batch(
     deadline: Instant,
 ) -> Vec<FencedTransitionOutcome> {
     let mut resolved = vec![None; requests.len()];
+    let mut returned = Vec::new();
     let result = AssertUnwindSafe(execute_batch_inner(
         client,
         scope,
@@ -123,11 +127,12 @@ async fn execute_batch(
         effects,
         deadline,
         &mut resolved,
+        &mut returned,
     ))
     .catch_unwind()
     .await;
     if let Err(panic) = result {
-        effects.preserve_effect("failed_batch", requests, &resolved);
+        effects.preserve_effect("failed_batch", requests, &resolved, &returned);
         std::panic::resume_unwind(panic);
     }
     resolved
@@ -143,6 +148,7 @@ async fn execute_batch_inner(
     effects: &Effects,
     deadline: Instant,
     resolved: &mut [Option<FencedTransitionOutcome>],
+    returned: &mut Vec<SessionConsumerV2FencedTransitionBatchResult>,
 ) {
     assert!(!requests.is_empty() && requests.len() <= 256);
     let ids = requests
@@ -162,8 +168,12 @@ async fn execute_batch_inner(
         // turn a possibly transmitted mutation into a retry-safe operation.
         match client.execute_v2(&operation).await {
             Ok(SessionConsumerV2Response::FencedTransitionV2Batch(Ok(outcomes))) => {
-                assert_eq!(outcomes.len(), requests.len());
-                for (index, outcome) in outcomes.into_iter().enumerate() {
+                // Retain the whole typed reply before any validation can
+                // fail, including errors distinct from unresolved effects.
+                *returned = outcomes;
+                assert_eq!(returned.len(), requests.len());
+                let mut rejection = None;
+                for (index, outcome) in returned.iter().enumerate() {
                     assert_eq!(outcome.request_id(), ids[index]);
                     match outcome.result().clone() {
                         Ok(outcome) => {
@@ -171,8 +181,13 @@ async fn execute_batch_inner(
                             resolved[index] = Some(outcome);
                         }
                         Err(SessionConsumerV2FencedTransitionError::OutcomeUnknown) => {}
-                        error => panic!("exact batch item rejected: {error:?}"),
+                        Err(error) => {
+                            rejection.get_or_insert(error);
+                        }
                     }
+                }
+                if let Some(error) = rejection {
+                    panic!("exact batch item rejected: {error:?}");
                 }
                 break;
             }
@@ -615,7 +630,7 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
                                 })
                             );
                             let resolved = batch.outcomes.into_iter().map(Some).collect::<Vec<_>>();
-                            effects.preserve_effect("drained_sibling", &batch.requests, &resolved);
+                            effects.preserve_effect("drained_sibling", &batch.requests, &resolved, &[]);
                         }
                     }
                 });
@@ -794,7 +809,10 @@ fn isolated_durable_original_workload() {
 
 // Exercise the full workload's actual encryption and public batch protocol
 // without claiming its cardinality, duration or memory acceptance.
-fn original_wire_control(persistence: QualificationIsolatedPersistence) {
+fn original_wire_control(
+    persistence: QualificationIsolatedPersistence,
+    check_mixed_batch_failure: bool,
+) {
     let scale = QualificationIsolatedScaleConfig {
         persistence,
         workload: QualificationIsolatedScaleWorkload::Original,
@@ -862,6 +880,43 @@ fn original_wire_control(persistence: QualificationIsolatedPersistence) {
         )).await.expect("real rejected public request");
         assert!(matches!(rejection, SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)));
         effects.assert_clean();
+        if check_mixed_batch_failure {
+            let mut mixed = requests.clone();
+            mixed[0] = request_with_changed_body(&mixed[0]);
+            let evidence_root = fleet.workspace.path().join("mixed-item-failure");
+            fs::create_dir(&evidence_root).expect("separate mixed-response evidence");
+            let rejected_effects = Effects {
+                evidence_root: evidence_root.clone(),
+                ..Effects::default()
+            };
+            let failure = AssertUnwindSafe(execute_batch(
+                &client, scope, &mixed, &rejected_effects, Instant::now() + BATCH_BOUND,
+            )).catch_unwind().await;
+            assert!(failure.is_err(), "a typed rejection must keep qualification RED");
+            assert_eq!(rejected_effects.dispatched_batches.load(Ordering::Relaxed), 1);
+            assert_eq!(rejected_effects.failure_records.load(Ordering::Relaxed), 1);
+            assert_eq!(rejected_effects.not_transmitted_retries.load(Ordering::Relaxed), 0);
+            assert_eq!(rejected_effects.ambiguous_batches.load(Ordering::Relaxed), 0);
+            assert_eq!(rejected_effects.status_reads.load(Ordering::Relaxed), 0);
+            let evidence: serde_json::Value = serde_json::from_slice(
+                &fs::read(evidence_root.join("effect-0.json")).expect("failed batch ledger"),
+            ).expect("typed failure ledger JSON");
+            assert_eq!(evidence["kind"], "failed_batch");
+            assert_eq!(evidence["resolved"][0], serde_json::Value::Null);
+            for (index, outcome) in created.iter().enumerate().skip(1) {
+                assert_eq!(evidence["resolved"][index], serde_json::to_value(outcome).unwrap(),
+                    "an early rejection must retain every later exact sibling");
+            }
+            let returned: Vec<opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchResult> =
+                serde_json::from_value(evidence["returned"].clone()).expect("complete typed batch reply");
+            assert_eq!(returned.len(), mixed.len());
+            assert_eq!(returned[0].request_id(), mixed[0].request_id());
+            assert_eq!(returned[0].result(), &Err(SessionConsumerV2FencedTransitionError::RequestConflict));
+            for ((request, outcome), result) in mixed.iter().zip(&created).zip(&returned).skip(1) {
+                assert_eq!(result.request_id(), request.request_id());
+                assert_eq!(result.result(), &Ok(outcome.clone()));
+            }
+        }
         if env::var_os("OPC_SESSION_ISOLATED_FINAL_CAPTURE_CONTROL").is_some() {
             let pids = fleet.nodes.iter().map(ChildNode::process_id).collect::<Vec<_>>();
             let capture = memory_sample(&fleet, scale, &pids, MemorySamplePhase::Final);
@@ -878,10 +933,15 @@ fn original_wire_control(persistence: QualificationIsolatedPersistence) {
 
 #[test]
 fn original_encrypted_async_batches_preserve_receipts_and_scope() {
-    original_wire_control(QualificationIsolatedPersistence::Async);
+    original_wire_control(QualificationIsolatedPersistence::Async, false);
 }
 
 #[test]
 fn original_encrypted_durable_batches_preserve_receipts_and_scope() {
-    original_wire_control(QualificationIsolatedPersistence::Durable);
+    original_wire_control(QualificationIsolatedPersistence::Durable, false);
+}
+
+#[test]
+fn original_mixed_batch_failure_retains_typed_rejection_and_exact_successes() {
+    original_wire_control(QualificationIsolatedPersistence::Durable, true);
 }

@@ -1938,7 +1938,13 @@ async fn shutdown_consensus_session_store(
             .map_err(|_| consensus_unavailable());
         inner.storage_shutdown.stop_native_snapshot_exports();
         inner.storage_shutdown.wait().await;
-        wal.shutdown().map_err(|_| consensus_unavailable())?;
+        let wal = Arc::clone(wal);
+        // Joining a disk writer must leave the runtime free to enforce each
+        // caller's deadline while this shared coordinator retains the drain.
+        tokio::task::spawn_blocking(move || wal.shutdown())
+            .await
+            .map_err(|_| consensus_unavailable())?
+            .map_err(|_| consensus_unavailable())?;
         return raft_result;
     }
     inner
