@@ -1874,6 +1874,15 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_pair_shares_authenticated_authority_and_reopens_without_v1_lowering() {
+        assert_paired_fixture_authority_and_reopen(false).await;
+    }
+
+    #[tokio::test]
+    async fn fixture_pair_recovers_a_lost_response_before_shared_read_and_reopen() {
+        assert_paired_fixture_authority_and_reopen(true).await;
+    }
+
+    async fn assert_paired_fixture_authority_and_reopen(lose_response: bool) {
         let tenant = fixture_tenant();
         let provider = fixture_provider(tenant.clone());
         let fixture =
@@ -1897,10 +1906,48 @@ mod tests {
             )
             .await
             .expect("prepare through the initial opaque facade");
-        prepared
-            .execute_once()
-            .await
-            .expect("the opaque facade commits through the shared authority");
+        if lose_response {
+            fixture.lose_next_fenced_transition_response();
+        }
+        let execution = prepared.execute_once().await;
+        if lose_response {
+            assert!(
+                matches!(&execution, Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: observed }) if *observed == request_id),
+                "the real committed response loss must expose the exact unknown outcome"
+            );
+        }
+        match execution {
+            Ok(_) => {}
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: observed,
+            }) => {
+                assert!(
+                    observed == request_id,
+                    "only the exact retained request may recover"
+                );
+                // One physical attempt may lose its response. Recover only its
+                // receipt under the original outer deadline before shared reads.
+                let receipt = prepared.status_until_terminal(deadline).await.expect(
+                    "the exact ambiguous transition must reconcile before its original deadline",
+                );
+                assert!(
+                    matches!(receipt, FencedTransitionStatus::Recorded(result) if result.is_ok()),
+                    "only a successful authoritative receipt permits shared readback"
+                );
+            }
+            Err(error) => panic!("paired fixture dispatch failed before exact recovery: {error:?}"),
+        }
+        if lose_response {
+            assert!(
+                fixture.diagnostics().fenced_transition_status_calls() > 0,
+                "unknown completion must be proved with authoritative receipt reads"
+            );
+        }
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_calls(),
+            1,
+            "shared readback follows exactly one physical mutation"
+        );
 
         let record = general
             .get(&fixture_key(tenant))

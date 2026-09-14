@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conservative call-start timing, fresh backend authorizations, exact store
   credential checks, and the original request deadlines. Ambiguous or late
   renewals fence the worker (Refs #821).
+- `opc-session-testkit`: reconcile an exact ambiguous paired-fixture transition
+  through its authoritative receipt before shared readback and facade reopening.
+  Real response-loss and no-replay controls retain the original request deadlines
+  and general-backend capability boundary (Refs #824).
 - `opc-session-testkit`: retain each synthetic traffic acquisition's exact
   consumer request and fixed deadline before polling. Reconcile uncertain
   outcomes before admitting a successor, preserve custody across restart, and
