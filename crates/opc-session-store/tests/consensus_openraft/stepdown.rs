@@ -109,6 +109,7 @@ async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_s
     let (leader, _, term) = cluster.observed_leader();
     let store = &cluster.stores[leader];
     store.activate_fenced_transition_capability().await.unwrap();
+    let setup_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
     cluster.wait_all_ready(RECOVERY_TIMEOUT).await.unwrap();
     let key = session_key(b"stepdown-uncommitted-suffix");
     let observation = store.observe_fenced_transition(&key).await.unwrap();
@@ -121,6 +122,23 @@ async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_s
         b"sealed-stepdown-suffix",
     );
     let before_id = retained_sql_log_id(&cluster, leader);
+    // The observation commits a logical-time entry on a majority. Establish
+    // the exact persisted prefix on every voter before installing the fault;
+    // readiness before that observation does not prove its final entry arrived.
+    tokio::time::timeout_at(setup_deadline, async {
+        loop {
+            if (0..MEMBER_COUNT).all(|node| retained_sql_log_id(&cluster, node) == before_id) {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("all voters persist the exact setup prefix before the fault");
+    assert!(
+        tokio::time::Instant::now() <= setup_deadline,
+        "exact setup prefix must be observed within the original setup deadline"
+    );
     let before = before_id.index;
     let mut response_counts = Vec::new();
     let prefix_only = Arc::new(AtomicBool::new(false));
