@@ -5530,13 +5530,48 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         "prepare relies on exact token construction, journal health, and pre-Ready readiness"
     );
 
-    tokio::time::timeout(
-        Duration::from_millis(100),
-        outer.fenced_transition(&prepared),
-    )
-    .await
-    .expect("prewarmed follower route reaches the elected voter inside the caller budget")
-    .expect("one real protected physical transition");
+    let caller_budget = Duration::from_millis(100);
+    let started = std::time::Instant::now();
+    let executed = tokio::time::timeout(caller_budget, outer.fenced_transition(&prepared)).await;
+    let elapsed = started.elapsed();
+    // Capture the observed boundary before an assertion unwinds the fleet.
+    // These counters do not infer an outcome for a cancelled physical call.
+    let physical_calls = counted_services
+        .iter()
+        .map(|service| service.transition_calls.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let capability_calls = counted_services
+        .iter()
+        .map(|service| service.capability_calls.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let progress = fleet
+        .stores
+        .iter()
+        .map(|store| {
+            let status = store.status();
+            (
+                status.term,
+                status.leader_id,
+                status.last_log_index,
+                status.applied_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "protected_prepared_execution elapsed_us={} timeout={} physical_calls={physical_calls:?} \
+         capability_calls={capability_calls:?} read_barriers={} before_proposal={before_proposal} \
+         voter_progress={progress:?}",
+        elapsed.as_micros(),
+        executed.is_err(),
+        fleet.read_barrier_calls(),
+    );
+    executed
+        .expect("prewarmed follower route reaches the elected voter inside the caller budget")
+        .expect("one real protected physical transition");
+    assert!(
+        elapsed <= caller_budget,
+        "a ready future must not bypass the original 100 ms caller budget: {elapsed:?}"
+    );
     assert_eq!(
         1,
         counted_services[follower]

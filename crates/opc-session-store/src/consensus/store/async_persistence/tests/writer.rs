@@ -48,6 +48,20 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
             assert_recorded(voter, &requests[0], &first).await;
             voter.drain_async_persistence().await.unwrap();
         }
+        for gate in &gates {
+            gate.arm();
+        }
+        let mut retained = vec![(requests[0].clone(), first)];
+        retained.push((requests[1].clone(), create(&store, &requests[1]).await));
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            join_all(gates.iter().map(|gate| gate.wait_started())),
+        )
+        .await
+        .expect("all ordinary native generation writers reached the I/O hold");
+        // A generation already past an unarmed hook may still finish while
+        // the hold is being installed. Compare persistence only after every
+        // writer has entered the actual hold, before any snapshot is requested.
         let selected = (0..3)
             .map(|index| fleet.selector(index))
             .collect::<Vec<_>>();
@@ -63,17 +77,6 @@ async fn async_persistence_public_v2_and_snapshot_work_continue_during_writer_st
                     .completed_generation
             })
             .collect::<Vec<_>>();
-        for gate in &gates {
-            gate.arm();
-        }
-        let mut retained = vec![(requests[0].clone(), first)];
-        retained.push((requests[1].clone(), create(&store, &requests[1]).await));
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            join_all(gates.iter().map(|gate| gate.wait_started())),
-        )
-        .await
-        .expect("all ordinary native generation writers reached the I/O hold");
         let snapshots = fleet
             .stores
             .iter()
