@@ -380,6 +380,8 @@ pub(super) struct AdmissionObservation {
 
 #[derive(Clone, Debug)]
 pub(super) struct FlushObservation {
+    #[cfg(feature = "test-control")]
+    io_timing: integration::FlushIoTiming,
     #[cfg(test)]
     pub(super) first: u64,
     #[cfg(test)]
@@ -1749,6 +1751,11 @@ fn write_loop_body(
         let mut data_sync = Duration::ZERO;
         let mut write = Duration::ZERO;
         let mut dirty = false;
+        #[cfg(feature = "test-control")]
+        let mut io_timing = integration::FlushIoTiming {
+            started_unix_ns: integration::wall_timestamp_ns(),
+            ..integration::FlushIoTiming::default()
+        };
         let intent_started = Instant::now();
         (control.hook)(Point::BeforeIntent)?;
         let planned = GroupIntent::plan(disk, &group.requests, limits)?;
@@ -1760,7 +1767,13 @@ fn write_loop_body(
         let next_cut = disk.cut + 1;
         let preparing = disk.directory.join(format!("cut-{next_cut:020}.preparing"));
         let pending = disk.directory.join(format!("cut-{next_cut:020}.pending"));
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         let mut publication_file = file_create(&preparing)?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.intent_create = io_started.elapsed();
+        }
         (control.hook)(Point::AfterIntentCreate)?;
         let intent_bytes = planned.encode();
         let intent_control = IoControl {
@@ -1775,11 +1788,29 @@ fn write_loop_body(
             &mut intent_written,
         )?;
         (control.hook)(Point::BeforeIntentSync)?;
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         publication_file.sync_all()?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.intent_file_sync = io_started.elapsed();
+        }
         (control.hook)(Point::AfterIntentSync)?;
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         fs::rename(&preparing, &pending)?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.intent_rename = io_started.elapsed();
+        }
         (control.hook)(Point::AfterIntentRename)?;
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         File::open(&disk.directory)?.sync_all()?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.intent_directory_sync = io_started.elapsed();
+        }
         (control.hook)(Point::AfterIntentPublish)?;
         let intent = intent_started.elapsed();
         (control.hook)(Point::BeforeWrite)?;
@@ -1866,14 +1897,32 @@ fn write_loop_body(
         };
         let mut cut_written = 0;
         write_controlled(&mut publication_file, &cut, &cut_control, &mut cut_written)?;
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         publication_file.sync_all()?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.publication_file_sync = io_started.elapsed();
+        }
         (control.hook)(Point::BeforeCutPublish)?;
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         fs::rename(
             &pending,
             disk.directory.join(format!("cut-{next_cut:020}.cut")),
         )?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.publication_rename = io_started.elapsed();
+        }
         (control.hook)(Point::AfterCutRename)?;
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         File::open(&disk.directory)?.sync_all()?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.publication_directory_sync = io_started.elapsed();
+        }
         disk.cut = next_cut;
         let mut cut_hash = Sha256::new();
         cut_hash.update(&intent_bytes);
@@ -1883,7 +1932,13 @@ fn write_loop_body(
         (control.hook)(Point::AfterCutPublish)?;
         // Application failure fences this same mutex. Keep success
         // completions inside it so no callback can cross that fence.
+        #[cfg(feature = "test-control")]
+        let io_started = Instant::now();
         let mut state = lock_state(&shared)?;
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.callback_lock_wait = io_started.elapsed();
+        }
         ensure_readable(&state)?;
         let committed = group
             .requests
@@ -1926,7 +1981,13 @@ fn write_loop_body(
         if state.volatile_experiment.is_some() {
             shared.ready.notify_all();
         }
+        #[cfg(feature = "test-control")]
+        {
+            io_timing.completed_unix_ns = integration::wall_timestamp_ns();
+        }
         let observation = FlushObservation {
+            #[cfg(feature = "test-control")]
+            io_timing,
             #[cfg(test)]
             first,
             #[cfg(test)]

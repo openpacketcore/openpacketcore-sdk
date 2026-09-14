@@ -1466,6 +1466,8 @@ impl SqliteSessionBackend {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()?;
+            #[cfg(test)]
+            let operation_started = std::time::Instant::now();
             let result = {
                 let _progress = install_sqlite_operation_progress_handler(
                     &conn,
@@ -1478,6 +1480,23 @@ impl SqliteSessionBackend {
                     Ok(operation(&conn))
                 }
             };
+            #[cfg(test)]
+            if task_cancellation.load(Ordering::Acquire)
+                || result.is_err()
+                || result.as_ref().is_ok_and(|result| result.is_err())
+            {
+                eprintln!(
+                    "sqlite_operation_cancellation_boundary={}",
+                    serde_json::json!({
+                        "thread": format!("{:?}", std::thread::current().id()),
+                        "cancelled": task_cancellation.load(Ordering::Acquire),
+                        "own_deadline_expired": std::time::Instant::now() >= operation_deadline,
+                        "elapsed_us": operation_started.elapsed().as_micros(),
+                        "autocommit": conn.is_autocommit(),
+                        "database_file": conn.path().and_then(|path| std::path::Path::new(path).file_name()).and_then(|name| name.to_str()),
+                    })
+                );
+            }
             // Return both guards with the result. The async wrapper disarms
             // its interrupt before dropping them, so completion cannot issue
             // a stale interrupt against a successor operation. If the wrapper

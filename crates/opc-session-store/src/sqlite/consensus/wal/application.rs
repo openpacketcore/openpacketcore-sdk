@@ -219,12 +219,16 @@ impl Wal {
         ensure_readable(&state)?;
         let mut validation = Duration::ZERO;
         let mut read_duration = Duration::ZERO;
+        #[cfg(test)]
+        let validation_phase = std::cell::Cell::new("entry");
         let result = (|| {
             if !conn.is_autocommit() {
                 return Err(invalid_data(
                     "private WAL read entered with an active transaction",
                 ));
             }
+            #[cfg(test)]
+            validation_phase.set("before_read");
             let validation_started = Instant::now();
             let validated = validate_live_cache(conn, &state, self.binding);
             validation += validation_started.elapsed();
@@ -237,12 +241,30 @@ impl Wal {
                     "private WAL read retained an active transaction",
                 ));
             }
+            #[cfg(test)]
+            validation_phase.set("after_read");
             let validation_started = Instant::now();
             let validated = validate_live_cache(conn, &state, self.binding);
             validation += validation_started.elapsed();
             validated?;
             Ok(value)
         })();
+        #[cfg(test)]
+        if let Err(error) = &result {
+            eprintln!(
+                "private_wal_application_read_guard_failure={}",
+                serde_json::json!({
+                    "phase": validation_phase.get(),
+                    "thread": format!("{:?}", std::thread::current().id()),
+                    "kind": format!("{:?}", error.kind()),
+                    "sqlite_extended_code": super::super::sqlite_error_code(error),
+                    "autocommit": conn.is_autocommit(),
+                    "elapsed_us": started.elapsed().as_micros(),
+                    "validation_us": validation.as_micros(),
+                    "read_body_us": read_duration.as_micros(),
+                })
+            );
+        }
         if result.is_err() {
             fence(&mut state);
             self.shared.ready.notify_all();

@@ -3,6 +3,57 @@ use super::*;
 const LAST_WRITEBACK_BATCH: u64 = 17;
 const WRITEBACK_REQUESTS_PER_BATCH: usize = 2;
 
+// The first real writeback is reached only after validating and materializing
+// the captured snapshot. That work is fixture setup, not the live-owner
+// handoff being tested. Start both unchanged five-second Gate checks only
+// after this exact production boundary exists. Completion (including panic)
+// is also signalled so an export which omits writeback cannot pass or strand
+// the fixture waiting for a boundary it never visits.
+#[derive(Debug, PartialEq, Eq)]
+enum WritebackSetupEvent {
+    Reached,
+    Finished,
+}
+
+struct WritebackSetup {
+    announced: AtomicBool,
+    progress: mpsc::SyncSender<WritebackSetupEvent>,
+}
+
+impl WritebackSetup {
+    fn new() -> (Arc<Self>, mpsc::Receiver<WritebackSetupEvent>) {
+        let (progress, receiver) = mpsc::sync_channel(2);
+        (
+            Arc::new(Self {
+                announced: AtomicBool::new(false),
+                progress,
+            }),
+            receiver,
+        )
+    }
+
+    fn hook(&self, point: Point) -> io::Result<()> {
+        if point == Point::BeforeNativeSnapshotWriteback
+            && !self.announced.swap(true, Ordering::AcqRel)
+        {
+            self.progress
+                .send(WritebackSetupEvent::Reached)
+                .map_err(|_| io::Error::other("snapshot writeback witness disconnected"))?;
+        }
+        Ok(())
+    }
+}
+
+struct WritebackSetupFinished(Arc<WritebackSetup>);
+
+impl Drop for WritebackSetupFinished {
+    fn drop(&mut self) {
+        // At most one Reached and one Finished event are sent to the two-slot
+        // channel. This drop cannot wait for the witness to drain its event.
+        let _ = self.0.progress.send(WritebackSetupEvent::Finished);
+    }
+}
+
 fn writeback_request(row: u64, slot: usize) -> FencedTransitionV2Request {
     let template = sdk741_component_request(Sdk741Payload::Create, row, slot, None);
     let mut record = template.mutation().record().unwrap().clone();
@@ -68,7 +119,15 @@ fn writeback_fixture(control: IoControl) -> Fixture {
 #[test]
 fn native_snapshot_writeback_releases_live_owner_and_preserves_captured_cut() {
     let gate = Gate::new(Point::BeforeNativeSnapshotWriteback, 1);
-    let fixture = writeback_fixture(gate.control());
+    let (setup, progress) = WritebackSetup::new();
+    let hooks = (Arc::clone(&setup), Arc::clone(&gate));
+    let fixture = writeback_fixture(IoControl {
+        hook: Arc::new(move |point| {
+            hooks.0.hook(point)?;
+            hooks.1.hook(point)
+        }),
+        ..IoControl::default()
+    });
     let members = fixed_members();
     let bindings = test_member_bindings(&members);
     let authority = || SnapshotBuildAuthority {
@@ -89,24 +148,94 @@ fn native_snapshot_writeback_releases_live_owner_and_preserves_captured_cut() {
     let path = fixture.directory.path().join("writeback.sqlite");
     let pin = create_pinned_snapshot_database(&path).unwrap();
     let later = sdk741_component_request(Sdk741Payload::Create, 1024, 0, None);
+    let later_entries = [fenced_transition_v2_batch_entry(
+        LAST_WRITEBACK_BATCH + 1,
+        vec![later.clone()],
+        timestamp(3),
+    )];
+    // Advance only the independent SQL oracle during setup. Its captured
+    // reference above remains at the old cut. Replaying/validating SQL history
+    // must not consume the native-owner handoff's five-second gate either.
+    let (expected_application, expected_applied, expected_logical_time) = {
+        let conn = fixture.oracle.conn.blocking_lock();
+        append_logs_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &later_entries,
+        )
+        .unwrap();
+        save_committed_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(log_id(LAST_WRITEBACK_BATCH + 1)),
+        )
+        .unwrap();
+        let applied = apply_entries_with_authority_sync(
+            &conn,
+            identity(),
+            &fixture.oracle.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            later_entries.to_vec(),
+        )
+        .unwrap();
+        (
+            applied,
+            read_applied_sync(&conn, identity()).unwrap(),
+            read_machine_sync(&conn, identity()).unwrap().2,
+        )
+    };
     let ((exported, cut), paused_extent) = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
+            let _setup_finished = WritebackSetupFinished(Arc::clone(&setup));
             fixture
                 .wal
                 .native_export_portable_snapshot_into(&pin, &|| false)
                 .unwrap()
                 .unwrap()
         });
+        assert_eq!(progress.recv().unwrap(), WritebackSetupEvent::Reached);
         gate.entered();
         let paused_extent = pin.file().metadata().unwrap().len();
         assert!(paused_extent >= 8 * 1024 * 1024);
         // The real output flush is paused. A new durable mutation must still
         // append, commit and apply through the live owner before it resumes.
-        fixture.parity(&[fenced_transition_v2_batch_entry(
-            LAST_WRITEBACK_BATCH + 1,
-            vec![later.clone()],
-            timestamp(3),
-        )]);
+        fixture.append_commit(&later_entries);
+        let applied = fixture.wal.native_apply_committed(&later_entries).unwrap();
+        assert_eq!(
+            encode_json(&applied.responses).unwrap(),
+            encode_json(&expected_application.responses).unwrap(),
+            "complete response parity"
+        );
+        assert_eq!(
+            encode_json(&applied.notifications).unwrap(),
+            encode_json(&expected_application.notifications).unwrap(),
+            "exact notification parity"
+        );
+        assert_eq!(
+            fixture
+                .wal
+                .with_native_read(|state| Ok(state.applied()))
+                .unwrap(),
+            expected_applied
+        );
+        assert_eq!(
+            fixture
+                .wal
+                .with_native_read(|state| Ok(state.logical_time()))
+                .unwrap(),
+            expected_logical_time
+        );
         fixture
             .wal
             .submit(Operation::Barrier)
@@ -158,11 +287,14 @@ fn native_snapshot_writeback_releases_live_owner_and_preserves_captured_cut() {
 #[test]
 fn native_snapshot_writeback_io_failure_fences_wakes_and_survives_cancellation() {
     let writeback = Gate::new(Point::BeforeNativeSnapshotWriteback, 1);
+    let (setup, progress) = WritebackSetup::new();
+    let setup_hook = Arc::clone(&setup);
     let cut = Gate::new(Point::BeforeCutPublish, 1);
     let armed = Arc::new(AtomicBool::new(false));
     let hooks = (Arc::clone(&writeback), Arc::clone(&cut), Arc::clone(&armed));
     let fixture = writeback_fixture(IoControl {
         hook: Arc::new(move |point| {
+            setup_hook.hook(point)?;
             if hooks.2.load(Ordering::Acquire) {
                 hooks.1.hook(point)?;
             }
@@ -182,10 +314,12 @@ fn native_snapshot_writeback_io_failure_fences_wakes_and_survives_cancellation()
     let cancelled = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
+            let _setup_finished = WritebackSetupFinished(Arc::clone(&setup));
             fixture
                 .wal
                 .native_export_portable_snapshot_into(&pin, &|| cancelled.load(Ordering::Acquire))
         });
+        assert_eq!(progress.recv().unwrap(), WritebackSetupEvent::Reached);
         writeback.entered();
         assert!(pin.file().metadata().unwrap().len() >= 8 * 1024 * 1024);
         armed.store(true, Ordering::Release);

@@ -19,6 +19,50 @@ use super::{invalid_data, Binding, IoControl, Limits};
 #[cfg(test)]
 use crate::sqlite::consensus;
 
+// Diagnostic correlation only. Wall time never controls a deadline or a
+// callback. These fields live in the existing request-count-bounded history;
+// no extra queue, file I/O, observer query, or State lock is added to flushing.
+#[cfg(feature = "test-control")]
+#[derive(Clone, Debug, Default)]
+pub(super) struct FlushIoTiming {
+    pub(super) started_unix_ns: Option<u128>,
+    pub(super) completed_unix_ns: Option<u128>,
+    pub(super) intent_create: Duration,
+    pub(super) intent_file_sync: Duration,
+    pub(super) intent_rename: Duration,
+    pub(super) intent_directory_sync: Duration,
+    pub(super) publication_file_sync: Duration,
+    pub(super) publication_rename: Duration,
+    pub(super) publication_directory_sync: Duration,
+    pub(super) callback_lock_wait: Duration,
+}
+
+#[cfg(feature = "test-control")]
+pub(super) fn wall_timestamp_ns() -> Option<u128> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+#[cfg(feature = "test-control")]
+impl FlushIoTiming {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "started_unix_ns": self.started_unix_ns,
+            "completed_unix_ns": self.completed_unix_ns,
+            "intent_create_ns": self.intent_create.as_nanos(),
+            "intent_file_sync_ns": self.intent_file_sync.as_nanos(),
+            "intent_rename_ns": self.intent_rename.as_nanos(),
+            "intent_directory_sync_ns": self.intent_directory_sync.as_nanos(),
+            "publication_file_sync_ns": self.publication_file_sync.as_nanos(),
+            "publication_rename_ns": self.publication_rename.as_nanos(),
+            "publication_directory_sync_ns": self.publication_directory_sync.as_nanos(),
+            "callback_lock_wait_ns": self.callback_lock_wait.as_nanos(),
+        })
+    }
+}
+
 /// Constant-space totals for this writer incarnation. Detailed samples below
 /// are recent groups bounded by retained request count; totals never reset at
 /// a checkpoint or pretend those samples cover the owner's whole lifetime.
@@ -48,6 +92,8 @@ pub(super) struct FlushCosts {
 
 #[derive(Default)]
 struct SlowestFlushRequest {
+    #[cfg(feature = "test-control")]
+    io_timing: FlushIoTiming,
     operation: &'static str,
     queue_wait_us: u128,
     submit_to_callback_us: u128,
@@ -60,7 +106,7 @@ struct SlowestFlushRequest {
 
 impl SlowestFlushRequest {
     fn json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let observation = serde_json::json!({
             "operation": self.operation,
             "queue_wait_us": self.queue_wait_us,
             "submit_to_callback_us": self.submit_to_callback_us,
@@ -69,7 +115,14 @@ impl SlowestFlushRequest {
             "intent_us": self.intent_us,
             "data_sync_us": self.data_sync_us,
             "publication_us": self.publication_us,
-        })
+        });
+        #[cfg(feature = "test-control")]
+        let observation = {
+            let mut observation = observation;
+            observation["io_timing"] = self.io_timing.json();
+            observation
+        };
+        observation
     }
 }
 
@@ -122,6 +175,8 @@ impl FlushCosts {
             self.submit_to_callback_us += submit_to_callback_us;
             if submit_to_callback_us > self.slowest_request.submit_to_callback_us {
                 self.slowest_request = SlowestFlushRequest {
+                    #[cfg(feature = "test-control")]
+                    io_timing: group.io_timing.clone(),
                     operation: admission.operation,
                     queue_wait_us,
                     submit_to_callback_us,
@@ -540,7 +595,25 @@ impl Wal {
             "application": state.application_costs.json(),
         });
         #[cfg(feature = "test-control")]
-        let observation = super::volatile_experiment::observe(state, observation);
+        let observation = {
+            let mut observation = observation;
+            observation["recent_flushes"] = serde_json::json!(state.observations.iter().map(|group| {
+                serde_json::json!({
+                    "io_timing": group.io_timing.json(),
+                    "sync_calls": group.sync_calls,
+                    "queue_wait_ns": group.queue_wait.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
+                    "operation": group.admission.iter().map(|value| value.operation).collect::<Vec<_>>(),
+                    "entries": group.admission.iter().map(|value| value.entries).collect::<Vec<_>>(),
+                    "submit_to_callback_ns": group.submit_to_callback.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
+                    "intent_ns": group.intent.as_nanos(),
+                    "write_ns": group.write.as_nanos(),
+                    "data_sync_ns": group.data_sync.as_nanos(),
+                    "publication_ns": group.publication.as_nanos(),
+                    "rollover_ns": group.rollover.as_nanos(),
+                })
+            }).collect::<Vec<_>>());
+            super::volatile_experiment::observe(state, observation)
+        };
         observation
     }
 

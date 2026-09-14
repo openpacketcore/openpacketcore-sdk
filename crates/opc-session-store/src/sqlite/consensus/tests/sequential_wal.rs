@@ -3292,6 +3292,39 @@ fn moving_basis_bounds_count_only_retained_suffix() {
     assert_eq!(costs["retained_request_limit"], 4);
     assert_eq!(costs["discarded_groups"], 20);
     assert_eq!(costs["discarded_requests"], 20);
+    #[cfg(feature = "test-control")]
+    {
+        let recent = costs["recent_flushes"].as_array().unwrap();
+        assert_eq!(
+            recent.len(),
+            4,
+            "diagnostics share the original retention bound"
+        );
+        for group in recent {
+            let timing = &group["io_timing"];
+            let intent_parts = [
+                "intent_create_ns",
+                "intent_file_sync_ns",
+                "intent_rename_ns",
+                "intent_directory_sync_ns",
+            ]
+            .iter()
+            .map(|name| timing[*name].as_u64().unwrap())
+            .sum::<u64>();
+            let publication_parts = [
+                "publication_file_sync_ns",
+                "publication_rename_ns",
+                "publication_directory_sync_ns",
+            ]
+            .iter()
+            .map(|name| timing[*name].as_u64().unwrap())
+            .sum::<u64>();
+            assert!(intent_parts <= group["intent_ns"].as_u64().unwrap());
+            assert!(publication_parts <= group["publication_ns"].as_u64().unwrap());
+            assert_eq!(group["operation"].as_array().unwrap().len(), 1);
+            assert_eq!(group["submit_to_callback_ns"].as_array().unwrap().len(), 1);
+        }
+    }
     assert_eq!(costs["sync_calls"], total_sync_calls);
     assert_eq!(costs["data_sync_us"], serde_json::json!(total_data_sync_us));
     assert_eq!(observation["groups"].as_array().unwrap().len(), 4);
