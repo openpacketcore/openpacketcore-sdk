@@ -133,6 +133,17 @@ impl NativeNotification {
         }
     }
 
+    /// Size the immutable canonical row without hydrating selected bytes.
+    /// A selected extent was admitted with its full fingerprint. Its length
+    /// is only allocation input: successful reads still authenticate/decode
+    /// that exact extent and validate every field and the full fingerprint.
+    pub(super) fn canonical_length(&self) -> io::Result<usize> {
+        match &self.body {
+            Body::Resident(row) => image::binary::encoded_len(&**row, generation::MAX_ITEM),
+            Body::Selected(row) => Ok(row.range.length()),
+        }
+    }
+
     pub(super) fn from_admitted_range(
         row: generation::facts::Row<generation::facts::Notification>,
         source: Arc<prefix::VerifiedPrefix>,

@@ -92,6 +92,27 @@ builder, integrity metadata, and the separate native generations. The existing
 extent and namespace limits remain enforced. Retention limits and process RSS
 qualification are independent of this workspace reduction.
 
+Native journal-page construction has a separate process-wide 32 MiB admission
+pool inside the unchanged 128 MiB verification budget. Before any output
+allocation, a read counts the complete requested interval's canonical copy
+charge, containers, and validator allowance, then acquires both reservations.
+Selected extent lengths supply allocation bounds only; authenticated decoding,
+full fingerprint validation, and exact canonical-size checks remain required.
+An inadmissible request returns the existing `BackendUnavailable` result and
+may be retried as a smaller complete page under the caller's original deadline.
+It cannot silently shorten a successful page or advance its cursor.
+
+This is optional-read resource policy, independent of persistence mode and wire
+cardinality. It prevents journal output from taking more than one quarter of
+the verifier while snapshot/application work is active; it does not guarantee
+that every other verifier can run under arbitrary concurrent pressure. Selected
+input, decoding, encoding, retained images, and worker stacks keep their
+existing separate charges. Both construction reservations end after temporary
+output is destroyed or at the existing successful caller handoff. Returned
+caller-owned values are outside that construction pool, so it is not a process
+RSS or end-to-end output-memory guarantee. Integrity errors and storage failure
+fencing retain their existing behavior.
+
 Ordinary construction selects a fresh native root or reopens its exact selected
 state. The backing retains native-selection knowledge independently of the
 native directory, so missing selected state is an error. Existing populated

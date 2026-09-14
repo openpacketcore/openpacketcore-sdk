@@ -1356,3 +1356,77 @@ fn native_catalog_cold_header_preflight_bounds_owned_membership_and_snapshot_met
         );
     }
 }
+
+#[test]
+fn native_journal_page_admission_preserves_selected_ranges_cancellation_and_integrity() {
+    use std::cell::Cell;
+    use std::os::unix::fs::FileExt;
+    let (mut storage, _, mut outcome) = fixture();
+    for ordinal in 2..=65 {
+        let next = request(ordinal, Some(&outcome));
+        let applied = apply(&mut storage, &[command(ordinal, &next, time(2), false)]);
+        let Ok(SessionMutationOutcome::FencedTransition(next)) = &applied.responses[0].result
+        else {
+            panic!("successful fixture transition");
+        };
+        outcome = next.clone();
+    }
+    let (files, catalog) = Files::new(&storage);
+    let corrupt_offset = catalog.rows.notifications[32].range.offset;
+    let cold = catalog.into_storage(&|| Ok(())).unwrap();
+    for (start, limit) in [(0, 0), (0, 1), (0, 65), (17, 19), (64, 10), (65, 10)] {
+        let hot = storage
+            .business
+            .replication_log(start, limit, &|| Ok(()))
+            .unwrap();
+        let selected = cold
+            .business
+            .replication_log(start, limit, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            postcard::to_allocvec(&hot).unwrap(),
+            postcard::to_allocvec(&selected).unwrap()
+        );
+    }
+    for stop in [1, 40, 100, 170] {
+        let calls = Cell::new(0);
+        assert!(cold
+            .business
+            .replication_log(0, 65, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() >= stop {
+                    Err(io::Error::other("injected read cancellation"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        // Cancellation stays set while already-started verification retires;
+        // the number of cleanup checks is not a public read contract.
+        assert!(calls.get() >= stop);
+        let retry = cold.business.replication_log(0, 8, &|| Ok(())).unwrap();
+        assert_eq!(retry.len(), 8);
+    }
+    let writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&files.path)
+        .unwrap();
+    let mut byte = [0];
+    writer.read_exact_at(&mut byte, corrupt_offset).unwrap();
+    byte[0] ^= 1;
+    writer.write_all_at(&byte, corrupt_offset).unwrap();
+    writer.sync_all().unwrap();
+    assert!(
+        cold.business.replication_log(0, 65, &|| Ok(())).is_err(),
+        "admitted extent length must never replace authenticated content verification"
+    );
+    assert_eq!(
+        storage
+            .business
+            .replication_log(0, 65, &|| Ok(()))
+            .unwrap()
+            .len(),
+        65
+    );
+}
