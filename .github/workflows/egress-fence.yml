@@ -147,6 +147,7 @@ jobs:
             "${optimized_sqlite_contracts[@]}"
             lagging_replica_installs_compacted_snapshot_without_losing_committed_state
             fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+            compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart
           )
           broad_skip_arguments=()
           for contract in "${broad_test_skips[@]}"; do
@@ -186,6 +187,19 @@ jobs:
             --test-threads=1 \
             --exact \
             fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+          # Predecessor compaction commits the production snapshot threshold
+          # before catch-up. Keep that 5-minute command batch off the shared
+          # four-thread binary so host scheduling cannot turn an existing
+          # bound into a teardown-queue timeout.
+          cargo test --locked \
+            -p opc-session-store \
+            --all-features \
+            --quiet \
+            --test consensus_openraft \
+            -- \
+            --test-threads=1 \
+            --exact \
+            compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart
           # This proof owns a scoped snapshot-promotion gate while it verifies
           # an unrelated concurrent install. Give that process-global test
           # control a fresh process without changing its one-second bound.
