@@ -42,6 +42,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod isolated_scale;
+pub use isolated_scale::{
+    QualificationIsolatedPersistence, QualificationIsolatedScaleConfig,
+    QualificationIsolatedScaleReadiness, QualificationIsolatedScaleWorkload,
+    QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
+};
+
 const FROZEN_SESSION_HA_PROFILE_V2_JSON: &str =
     include_str!("../qualification/v2/session-ha-profile.json");
 
@@ -4418,6 +4425,10 @@ pub struct QualificationNodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_root_inode: Option<u64>,
     pub operation_timeout_millis: u64,
+    /// Explicit separate-process measurement mode and fixed application clock.
+    /// Legacy configuration bytes omit this field and remain Durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolated_scale: Option<QualificationIsolatedScaleConfig>,
     #[serde(default)]
     pub transport: QualificationTransportConfig,
 }
@@ -4434,6 +4445,13 @@ impl QualificationNodeConfig {
             return Err(QualificationConfigError::Topology);
         }
         if self.node_index >= self.members.len()
+            || self.isolated_scale.is_some_and(|scale| {
+                self.members.len() != 3
+                    || self.workload_schedule_sha256 != scale.schedule_sha256()
+                    || !matches!(self.transport, QualificationTransportConfig::ProjectedMtls(_))
+                    || (scale.workload == QualificationIsolatedScaleWorkload::Original
+                        && !has_external_snapshot_namespace)
+            })
             || self.operation_timeout_millis != QUALIFICATION_OPERATION_TIMEOUT_MILLIS
             || self.configuration_epoch == 0
             || !is_bounded_label(&self.backend_namespace, 128)
@@ -4597,6 +4615,7 @@ impl fmt::Debug for QualificationNodeConfig {
             .field("snapshot_root_device", &self.snapshot_root_device)
             .field("snapshot_root_inode", &self.snapshot_root_inode)
             .field("operation_timeout_millis", &self.operation_timeout_millis)
+            .field("isolated_scale", &self.isolated_scale)
             .field("transport", &self.transport)
             .finish()
     }
@@ -5321,6 +5340,12 @@ pub enum QualificationNodeCommandKind {
     ConsumerTlsPeerCredentialRejections,
     /// Read process-local dedicated listener admission counters.
     StatelessConsumerAdmissionStatus,
+    /// Probe explicit scale-mode traffic authority without a durability claim for Async.
+    IsolatedScaleProbe,
+    /// Read the public bounded receipt-history state in an explicit scale fleet.
+    IsolatedScaleHistoryState,
+    /// Invoke public local-operator maintenance in an explicit scale fleet.
+    IsolatedScaleMaintainHistory,
 }
 
 impl QualificationNodeCommandKind {
@@ -5367,6 +5392,9 @@ impl QualificationNodeCommandKind {
         Self::Shutdown,
         Self::ConsumerTlsPeerCredentialRejections,
         Self::StatelessConsumerAdmissionStatus,
+        Self::IsolatedScaleProbe,
+        Self::IsolatedScaleHistoryState,
+        Self::IsolatedScaleMaintainHistory,
     ];
 }
 
@@ -5512,6 +5540,15 @@ pub enum QualificationNodeCommand {
     /// consumer listener. Callers must reject an unavailable listener or
     /// incoherent active/high-water values rather than infer them from clients.
     StatelessConsumerAdmissionStatus,
+    /// Opt-in scale proof; the legacy `Probe` remains strictly Durable.
+    IsolatedScaleProbe,
+    /// Read receipt-history state; only explicit scale configurations admit this command.
+    IsolatedScaleHistoryState,
+    /// Local operator control, never exposed through the consumer endpoint.
+    /// The public store verifies leadership and the exact expected state.
+    IsolatedScaleMaintainHistory {
+        expected_state: opc_session_store::FencedTransitionV2HistoryState,
+    },
 }
 
 impl fmt::Debug for QualificationNodeCommand {
@@ -5643,6 +5680,15 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::StatelessConsumerAdmissionStatus => {
                 formatter.write_str("QualificationNodeCommand::StatelessConsumerAdmissionStatus")
             }
+            Self::IsolatedScaleProbe => {
+                formatter.write_str("QualificationNodeCommand::IsolatedScaleProbe")
+            }
+            Self::IsolatedScaleHistoryState => {
+                formatter.write_str("QualificationNodeCommand::IsolatedScaleHistoryState")
+            }
+            Self::IsolatedScaleMaintainHistory { .. } => {
+                formatter.write_str("QualificationNodeCommand::IsolatedScaleMaintainHistory")
+            }
         }
     }
 }
@@ -5720,6 +5766,13 @@ impl QualificationNodeCommand {
             Self::StatelessConsumerAdmissionStatus => {
                 QualificationNodeCommandKind::StatelessConsumerAdmissionStatus
             }
+            Self::IsolatedScaleProbe => QualificationNodeCommandKind::IsolatedScaleProbe,
+            Self::IsolatedScaleHistoryState => {
+                QualificationNodeCommandKind::IsolatedScaleHistoryState
+            }
+            Self::IsolatedScaleMaintainHistory { .. } => {
+                QualificationNodeCommandKind::IsolatedScaleMaintainHistory
+            }
         }
     }
 
@@ -5755,6 +5808,9 @@ impl QualificationNodeCommand {
             | Self::TrafficStatusSnapshot
             | Self::Shutdown
             | Self::ConsumerTlsPeerCredentialRejections
+            | Self::IsolatedScaleProbe
+            | Self::IsolatedScaleHistoryState
+            | Self::IsolatedScaleMaintainHistory { .. }
             | Self::StatelessConsumerAdmissionStatus => Ok(()),
             Self::StartStatelessConsumer {
                 consumer_identities,
@@ -6075,6 +6131,14 @@ pub struct QualificationConcurrentWatchEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QualificationNodeReply {
+    /// Explicit scale-mode proof and passive persistence progress.
+    IsolatedScaleReadiness {
+        status: QualificationIsolatedScaleReadiness,
+    },
+    /// Exact public history-state read or local maintenance result.
+    IsolatedScaleHistory {
+        state: opc_session_store::FencedTransitionV2HistoryState,
+    },
     Bound {
         node_index: usize,
         bind_addr: SocketAddr,
@@ -8446,6 +8510,14 @@ mod tests {
             QualificationNodeCommand::Shutdown,
             QualificationNodeCommand::ConsumerTlsPeerCredentialRejections,
             QualificationNodeCommand::StatelessConsumerAdmissionStatus,
+            QualificationNodeCommand::IsolatedScaleProbe,
+            QualificationNodeCommand::IsolatedScaleHistoryState,
+            QualificationNodeCommand::IsolatedScaleMaintainHistory {
+                expected_state: opc_session_store::FencedTransitionV2HistoryState::new(
+                    Some(opc_session_store::FencedTransitionV2HistoryEpoch::new(1).expect("epoch")),
+                    None, None, 0, 0, 1, 0,
+                ).expect("bounded expected history"),
+            },
         ];
         let kinds = commands
             .iter()
@@ -9000,6 +9072,7 @@ mod tests {
             snapshot_root_device: None,
             snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+            isolated_scale: None,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         };
         assert_eq!(config.validate(), Err(QualificationConfigError::Member));
@@ -9041,6 +9114,7 @@ mod tests {
             snapshot_root_device: None,
             snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+            isolated_scale: None,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         }
     }
@@ -9050,9 +9124,11 @@ mod tests {
         let legacy = valid_config();
         let encoded = serde_json::to_value(&legacy).expect("encode legacy configuration");
         assert!(encoded.get("snapshot_integrity").is_none());
+        assert!(encoded.get("isolated_scale").is_none());
         let decoded: QualificationNodeConfig =
             serde_json::from_value(encoded.clone()).expect("decode legacy configuration");
         assert_eq!(decoded.snapshot_integrity, None);
+        assert_eq!(decoded.isolated_scale, None);
         assert_eq!(
             decoded
                 .snapshot_integrity
@@ -9076,6 +9152,67 @@ mod tests {
         );
         encoded["snapshot_integrity"] = serde_json::json!("automatic");
         assert!(serde_json::from_value::<QualificationNodeConfig>(encoded).is_err());
+    }
+
+    #[test]
+    fn isolated_scale_configuration_binds_mode_clock_and_workload_without_legacy_fallback() {
+        let mut config = valid_config();
+        let scale = QualificationIsolatedScaleConfig {
+            persistence: QualificationIsolatedPersistence::Async,
+            workload: QualificationIsolatedScaleWorkload::BoundaryControl,
+        };
+        config.isolated_scale = Some(scale);
+        config.workload_schedule_sha256 = scale.schedule_sha256();
+        assert_eq!(
+            config.validate(),
+            Err(QualificationConfigError::Configuration),
+            "isolated scale requires authenticated process transport"
+        );
+        config.transport =
+            QualificationTransportConfig::ProjectedMtls(QualificationProjectedMtlsConfig {
+                projected_volume_root: PathBuf::from("/qualification/projected"),
+                certificate_file: PathBuf::from("tls.crt"),
+                private_key_file: PathBuf::from("tls.key"),
+                trust_bundle_files: vec![PathBuf::from("ca.crt")],
+                poll_interval_millis: 100,
+                lifecycle: QualificationConnectionLifecycleConfig {
+                    maximum_authentication_age_millis: 60_000,
+                    rotation_drain_window_millis: 5_000,
+                    reconnect_backoff_min_millis: 25,
+                    reconnect_backoff_max_millis: 250,
+                    rotation_jitter_millis: 1_000,
+                },
+                peer_routing: QualificationPeerRouting::PinnedLoopbackTestOnly,
+            });
+        assert_eq!(config.validate(), Ok(()));
+        let encoded = serde_json::to_value(&config).expect("explicit scale config");
+        assert_eq!(encoded["isolated_scale"]["persistence"], "async");
+        assert_eq!(
+            serde_json::from_value::<QualificationNodeConfig>(encoded.clone())
+                .expect("round trip scale config"),
+            config
+        );
+        let mut unknown_mode = encoded;
+        unknown_mode["isolated_scale"]["persistence"] = serde_json::json!("volatile");
+        assert!(serde_json::from_value::<QualificationNodeConfig>(unknown_mode).is_err());
+        for changed in [
+            QualificationIsolatedScaleConfig {
+                persistence: QualificationIsolatedPersistence::Durable,
+                ..scale
+            },
+            QualificationIsolatedScaleConfig {
+                workload: QualificationIsolatedScaleWorkload::Original,
+                ..scale
+            },
+        ] {
+            config.isolated_scale = Some(changed);
+            assert_ne!(changed.schedule_sha256(), scale.schedule_sha256());
+            assert_eq!(
+                config.validate(),
+                Err(QualificationConfigError::Configuration)
+            );
+        }
+        assert_eq!(QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS, 1_900_000_000);
     }
 
     #[test]

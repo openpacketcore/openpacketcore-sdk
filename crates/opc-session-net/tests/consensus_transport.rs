@@ -2360,36 +2360,82 @@ async fn append_timeout_boundary_drops_one_lane_per_slow_attempt() {
         )
     };
 
-    assert!(call(b"warm", Duration::from_secs(2)).await.is_ok());
+    assert_eq!(
+        call(b"warm", Duration::from_secs(2)).await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"warm".to_vec()),
+        })
+    );
     assert_eq!(resolutions.load(Ordering::SeqCst), 1);
 
     handler.delay_millis.store(100, Ordering::SeqCst);
-    assert!(call(b"below-250", Duration::from_millis(250)).await.is_ok());
+    assert_eq!(
+        call(b"below-250", Duration::from_millis(250)).await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"below-250".to_vec()),
+        })
+    );
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
         1,
         "a response below 250 ms must preserve the cached lane"
     );
 
-    handler.delay_millis.store(300, Ordering::SeqCst);
-    let started = Instant::now();
     for payload in [b"slow-1".as_slice(), b"slow-2", b"slow-3", b"slow-4"] {
+        let calls_before = handler.calls.load(Ordering::SeqCst);
+        let resolutions_before = resolutions.load(Ordering::SeqCst);
+        handler.delay_millis.store(300, Ordering::SeqCst);
         assert_eq!(
             call(payload, Duration::from_millis(250)).await,
             Err(SessionConsensusPeerError::Timeout)
         );
-    }
-    let elapsed = started.elapsed();
-    assert!(elapsed >= Duration::from_secs(1));
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            calls_before + 1,
+            "the slow request must reach the handler on the established lane"
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            resolutions_before,
+            "a slow request starts on the preceding healthy lane"
+        );
 
-    handler.delay_millis.store(0, Ordering::SeqCst);
-    assert!(call(b"recover", Duration::from_millis(250)).await.is_ok());
+        // Consecutive cold failures can exhaust a call's admission budget
+        // during reconnect backoff without opening another socket. Prove a
+        // correlated recovery before the next slow request so every timeout
+        // here actually discards an authenticated lane. The paused-clock
+        // negotiated-loss controls separately cover exponential backoff.
+        handler.delay_millis.store(0, Ordering::SeqCst);
+        assert_eq!(
+            call(b"recover", Duration::from_millis(250)).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"recover".to_vec()),
+            })
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            resolutions_before + 1,
+            "the timed-out lane must be replaced exactly once"
+        );
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            calls_before + 2,
+            "the replacement lane must deliver the exact recovery response"
+        );
+    }
+
+    assert_eq!(
+        call(b"reuse", Duration::from_millis(250)).await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"reuse".to_vec()),
+        })
+    );
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
         5,
         "each timed-out call must consume one authenticated lane and force one replacement"
     );
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 7);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 11);
 
     server.abort_and_wait().await;
 }

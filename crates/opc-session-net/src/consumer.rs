@@ -84,6 +84,7 @@ use crate::fenced_mutation_roster::{
 use crate::lifecycle::{
     CertificateExpiryEvidence, ConnectionLifecycle, ConnectionLifecyclePolicy, ReconnectAdmission,
     ReconnectAttempt, ReconnectGate, RetirementReason, SessionReauthenticationControl,
+    TlsCompletionTime,
 };
 #[cfg(test)]
 use crate::protocol::read_frame_payload;
@@ -7292,7 +7293,8 @@ impl StatelessSessionConsumerClient {
         .await?
         .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
         .map_err(|error| consumer_tls_setup_error(error, pre_request_budget_active))?;
-        let established_at = tokio::time::Instant::now();
+        let tls_completion = TlsCompletionTime::now();
+        let established_at = tls_completion.instant();
         if tls.get_ref().1.alpn_protocol() != Some(self.transport_capability.alpn()) {
             return Err(ConsumerSetupError::Client(
                 SessionConsumerClientError::Protocol,
@@ -7312,12 +7314,12 @@ impl StatelessSessionConsumerClient {
             Some(CertificateExpiryEvidence::capture(
                 handshake.leaf_expires_at(),
                 handshake.certificate_chain_expires_at(),
-                established_at,
+                tls_completion,
             )),
             Some(CertificateExpiryEvidence::capture(
                 peer.leaf_expires_at(),
                 peer.certificate_chain_expires_at(),
-                established_at,
+                tls_completion,
             )),
             generation,
             Some(handshake.epoch()),
@@ -7973,7 +7975,8 @@ impl StatelessSessionConsumerClient {
                 cause: SessionConsumerClientError::Authentication,
             });
         }
-        let established_at = tokio::time::Instant::now();
+        let tls_completion = TlsCompletionTime::now();
+        let established_at = tls_completion.instant();
         let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
         let mut lifecycle = ConnectionLifecycle::new(
             self.lifecycle_policy,
@@ -7981,12 +7984,12 @@ impl StatelessSessionConsumerClient {
             Some(CertificateExpiryEvidence::capture(
                 handshake.leaf_expires_at(),
                 handshake.certificate_chain_expires_at(),
-                established_at,
+                tls_completion,
             )),
             Some(CertificateExpiryEvidence::capture(
                 peer.leaf_expires_at(),
                 peer.certificate_chain_expires_at(),
-                established_at,
+                tls_completion,
             )),
             generation,
             Some(handshake.epoch()),
@@ -11260,7 +11263,8 @@ impl PersistentSessionConsumerV2Pool {
         if peer.spiffe_id().as_str() != self.client.voter.tls_identity() {
             return Err(SessionConsumerClientError::Authentication);
         }
-        let established_at = tokio::time::Instant::now();
+        let tls_completion = TlsCompletionTime::now();
+        let established_at = tls_completion.instant();
         let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
         let lifecycle = ConnectionLifecycle::new(
             self.client.lifecycle_policy,
@@ -11268,12 +11272,12 @@ impl PersistentSessionConsumerV2Pool {
             Some(CertificateExpiryEvidence::capture(
                 handshake.leaf_expires_at(),
                 handshake.certificate_chain_expires_at(),
-                established_at,
+                tls_completion,
             )),
             Some(CertificateExpiryEvidence::capture(
                 peer.leaf_expires_at(),
                 peer.certificate_chain_expires_at(),
-                established_at,
+                tls_completion,
             )),
             generation,
             Some(handshake.epoch()),
@@ -19523,7 +19527,8 @@ async fn handle_server_connection(
             _ = hooks.continue_after_tls.notified() => {}
         }
     }
-    let established_at = tokio::time::Instant::now();
+    let tls_completion = TlsCompletionTime::now();
+    let established_at = tls_completion.instant();
     let peer = opc_tls::peer_tls_identity_from_server_connection(tls.get_ref().1)
         .map_err(|_| ProtocolError::Authentication)?;
     let authorization = authorizer
@@ -19536,12 +19541,12 @@ async fn handle_server_connection(
         Some(CertificateExpiryEvidence::capture(
             handshake.leaf_expires_at(),
             handshake.certificate_chain_expires_at(),
-            established_at,
+            tls_completion,
         )),
         Some(CertificateExpiryEvidence::capture(
             peer.leaf_expires_at(),
             peer.certificate_chain_expires_at(),
-            established_at,
+            tls_completion,
         )),
         generation,
         Some(handshake.epoch()),

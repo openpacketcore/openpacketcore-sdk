@@ -46,6 +46,9 @@ rustix = { version = "1", features = ["fs", "process", "system", "thread", "time
 nix = { workspace = true, features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
+# SDK-owned encrypted mTLS/fixed-voter regression fixture with passive storage
+# timing so deadline failures retain their actual local persistence costs.
+opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0", features = ["consumer-fixture", "test-control"] }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

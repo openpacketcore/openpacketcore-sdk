@@ -1402,6 +1402,7 @@ impl ConsensusSessionStore {
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        storage_shutdown.enable_runtime_write_handoff();
         let raft_handler =
             SessionRaftRpcHandler::new(raft.clone(), peer_directory.clone(), local_node_id);
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
@@ -1440,7 +1441,11 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            persistence: SessionPersistenceMode::Durable,
+            persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
+            #[cfg(target_os = "linux")]
+            private_wal: None,
             terminal_recovery_handoff_consumer,
             #[cfg(test)]
             terminal_recovery_gate_checks: AtomicU64::new(0),

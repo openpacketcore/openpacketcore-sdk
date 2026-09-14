@@ -44,6 +44,8 @@ use crate::{
 
 pub mod audit;
 pub(crate) mod consensus;
+#[cfg(target_os = "linux")]
+mod native;
 
 /// Non-production consensus timing hooks for deterministic integration tests.
 #[cfg(feature = "test-control")]
@@ -599,6 +601,10 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 #[allow(clippy::type_complexity)]
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) native_owner: Option<Arc<consensus::wal::owner::NativeOwner>>,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) private_wal_test: Option<Arc<consensus::wal::integration::PrivateWalTest>>,
     // A recovered terminal snapshot stays pinned from the connection-aware
     // latch classifier through the first consensus-core initialization.  That
     // core alone consumes the pending terminal record after using this exact
@@ -674,7 +680,7 @@ impl Drop for RestoreScanCancellation {
 
 struct SqliteOperationCancellation {
     cancellation: Arc<AtomicBool>,
-    interrupt: InterruptHandle,
+    interrupt: Option<InterruptHandle>,
     abort: tokio::task::AbortHandle,
     cancel_queued: Option<Box<dyn FnOnce() + Send>>,
     armed: bool,
@@ -691,12 +697,14 @@ impl Drop for SqliteOperationCancellation {
     fn drop(&mut self) {
         if self.armed {
             self.cancellation.store(true, Ordering::Release);
-            self.interrupt.interrupt();
+            if let Some(interrupt) = &self.interrupt {
+                interrupt.interrupt();
+            }
             if let Some(cancel_queued) = self.cancel_queued.take() {
                 cancel_queued();
             }
-            // A running blocking job ignores abort and remains bounded by its
-            // SQLite interrupt/progress handler.
+            // Abort removes queued work. A running job retains its connection
+            // and permit through cleanup, with the original SQLite deadline.
             self.abort.abort();
         }
     }
@@ -880,6 +888,29 @@ enum SqliteStoreWorkKind {
 }
 
 #[derive(Clone, Copy)]
+enum SqliteTaskCompletion {
+    Interruptible,
+    // The explicit legacy SQL qualification route owes post-read validation
+    // under its WAL lock even when its async caller has gone away.
+    #[cfg(all(test, target_os = "linux"))]
+    RetainGuardedRead,
+}
+
+impl SqliteTaskCompletion {
+    fn interrupt_on_caller_drop(self) -> bool {
+        match self {
+            Self::Interruptible => true,
+            #[cfg(all(test, target_os = "linux"))]
+            Self::RetainGuardedRead => false,
+        }
+    }
+
+    fn result_deadline_expired(self, deadline: std::time::Instant) -> bool {
+        !self.interrupt_on_caller_drop() && std::time::Instant::now() >= deadline
+    }
+}
+
+#[derive(Clone, Copy)]
 enum SqliteWorkerFailure {
     Admission,
     OutcomeUnavailable,
@@ -887,12 +918,17 @@ enum SqliteWorkerFailure {
 
 fn install_sqlite_operation_progress_handler(
     conn: &Connection,
-    cancellation: Arc<AtomicBool>,
+    cancellation: Option<Arc<AtomicBool>>,
     deadline: std::time::Instant,
 ) -> SqliteOperationProgressGuard<'_> {
     conn.progress_handler(
         SQLITE_OPERATION_PROGRESS_INTERVAL,
-        Some(move || cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= deadline),
+        Some(move || {
+            cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+                || std::time::Instant::now() >= deadline
+        }),
     );
     SqliteOperationProgressGuard(conn)
 }
@@ -979,9 +1015,10 @@ impl SqliteSessionBackend {
     /// Open a test database through an explicitly selected SQLite test VFS.
     ///
     /// This exists only for the `test-vfs` feature's real-file durability
-    /// qualification. Apart from selecting the VFS for `Connection::open`, it
-    /// takes the identical file-open path as [`Self::open`], including the
-    /// recovery latch check and the primary writer pragma profile.
+    /// qualification. It retains the SQLite backend and selects the VFS for
+    /// both primary and checkpoint connections. The recovery latch check and
+    /// primary writer pragma profile follow the same file-open path as
+    /// [`Self::open`].
     #[cfg(feature = "test-vfs")]
     #[doc(hidden)]
     pub fn open_with_vfs_for_test(
@@ -993,6 +1030,13 @@ impl SqliteSessionBackend {
             Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs_name)
                 .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
         let mut backend = Self::finish_file_open(path, conn)?;
+        // This fixture selects SQLite's actual primary/checkpoint writers.
+        // Native persistence bypasses the SQLite VFS and has no SQL checkpoint
+        // worker, so keeping that owner would miss the intended fault seam.
+        #[cfg(target_os = "linux")]
+        {
+            backend.native_owner = None;
+        }
         backend.checkpoint_vfs_name = Some(Arc::from(vfs_name));
         Ok(backend)
     }
@@ -1251,8 +1295,19 @@ impl SqliteSessionBackend {
             .map(|path| ConsensusAcceptanceReaderPool::new(Arc::new(path.clone())))
             .transpose()?;
 
+        #[cfg(target_os = "linux")]
+        let native_owner = database_path
+            .as_ref()
+            .map(|path| consensus::wal::owner::NativeOwner::discover(path, &conn).map(Arc::new))
+            .transpose()
+            .map_err(|_| native::unavailable())?;
+
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            #[cfg(target_os = "linux")]
+            native_owner,
+            #[cfg(all(test, target_os = "linux"))]
+            private_wal_test: None,
             terminal_recovery_handoff: Arc::new(StdMutex::new(None)),
             consensus_acceptance_reader_pool,
             database_path: database_path.map(Arc::new),
@@ -1313,6 +1368,42 @@ impl SqliteSessionBackend {
             })
     }
 
+    /// Validate the selected native root before comparing caller scope. Only
+    /// a root that also verifies against its original SQLite identity can
+    /// distinguish a different requested identity from corrupt recovery input.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn native_persistence_preflight(
+        &self,
+        expected: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<
+        Option<crate::consensus::SessionPersistenceMode>,
+        crate::consensus::storage::SessionConsensusStorageError,
+    > {
+        use crate::consensus::storage::SessionConsensusStorageError;
+
+        let Some(owner) = &self.native_owner else {
+            return Ok(None);
+        };
+        match owner.persistence_mode(expected) {
+            Ok(mode) => Ok(mode),
+            Err(_) => {
+                let conn = self.conn.lock().await;
+                let persisted = consensus::read_storage_identity_sync(&conn)
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+                if persisted != expected
+                    && owner
+                        .persistence_mode(persisted)
+                        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                        .is_some()
+                {
+                    Err(SessionConsensusStorageError::IdentityMismatch)
+                } else {
+                    Err(SessionConsensusStorageError::CorruptState)
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn lock_connection_for_test(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
@@ -1346,10 +1437,16 @@ impl SqliteSessionBackend {
         E: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
     {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| wal.reject_native_sql_fallback::<()>()) {
+            let _ = result;
+            return Err(SqliteWorkerFailure::OutcomeUnavailable);
+        }
         self.run_sqlite_task_on(
             Arc::clone(&self.conn),
             Arc::clone(&self.operation_workers),
-            operation,
+            SqliteTaskCompletion::Interruptible,
+            move |conn, _deadline| operation(conn),
         )
         .await
     }
@@ -1358,12 +1455,13 @@ impl SqliteSessionBackend {
         &self,
         conn: Arc<tokio::sync::Mutex<Connection>>,
         workers: Arc<tokio::sync::Semaphore>,
+        completion: SqliteTaskCompletion,
         operation: F,
     ) -> Result<Result<T, E>, SqliteWorkerFailure>
     where
         T: Send + 'static,
         E: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+        F: FnOnce(&Connection, std::time::Instant) -> Result<T, E> + Send + 'static,
     {
         let deadline = tokio::time::Instant::now()
             .checked_add(SQLITE_OPERATION_MAX_WORK)
@@ -1390,7 +1488,9 @@ impl SqliteSessionBackend {
                 SqliteWorkerFailure::Admission
             })?;
         let cancellation = Arc::new(AtomicBool::new(false));
-        let interrupt = conn.get_interrupt_handle();
+        let interrupt = completion
+            .interrupt_on_caller_drop()
+            .then(|| conn.get_interrupt_handle());
         let operation_deadline = deadline.into_std();
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, operation))));
@@ -1400,18 +1500,39 @@ impl SqliteSessionBackend {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()?;
+            #[cfg(test)]
+            let operation_started = std::time::Instant::now();
             let result = {
                 let _progress = install_sqlite_operation_progress_handler(
                     &conn,
-                    Arc::clone(&task_cancellation),
+                    completion
+                        .interrupt_on_caller_drop()
+                        .then(|| Arc::clone(&task_cancellation)),
                     operation_deadline,
                 );
                 if task_cancellation.load(Ordering::Acquire) {
                     Err(SqliteWorkerFailure::OutcomeUnavailable)
                 } else {
-                    Ok(operation(&conn))
+                    Ok(operation(&conn, operation_deadline))
                 }
             };
+            #[cfg(test)]
+            if task_cancellation.load(Ordering::Acquire)
+                || result.is_err()
+                || result.as_ref().is_ok_and(|result| result.is_err())
+            {
+                eprintln!(
+                    "sqlite_operation_cancellation_boundary={}",
+                    serde_json::json!({
+                        "thread": format!("{:?}", std::thread::current().id()),
+                        "cancelled": task_cancellation.load(Ordering::Acquire),
+                        "own_deadline_expired": std::time::Instant::now() >= operation_deadline,
+                        "elapsed_us": operation_started.elapsed().as_micros(),
+                        "autocommit": conn.is_autocommit(),
+                        "database_file": conn.path().and_then(|path| std::path::Path::new(path).file_name()).and_then(|name| name.to_str()),
+                    })
+                );
+            }
             // Return both guards with the result. The async wrapper disarms
             // its interrupt before dropping them, so completion cannot issue
             // a stale interrupt against a successor operation. If the wrapper
@@ -1449,13 +1570,36 @@ impl SqliteSessionBackend {
                 cancel_on_drop.disarm();
                 drop(conn);
                 drop(worker_permit);
-                result
+                // Tokio polls a ready result before its timer. A retained
+                // owner may have validated on time while this receiver was
+                // delayed: reject the late response without fencing it.
+                if completion.result_deadline_expired(operation_deadline) {
+                    Err(SqliteWorkerFailure::OutcomeUnavailable)
+                } else {
+                    result
+                }
             }
             Ok(Ok(None)) => {
                 cancel_on_drop.disarm();
                 Err(SqliteWorkerFailure::OutcomeUnavailable)
             }
         }
+    }
+
+    pub(super) fn with_application_cache_read<T>(
+        &self,
+        _conn: &Connection,
+        read: impl FnOnce() -> T,
+    ) -> std::io::Result<T> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| wal.reject_native_sql_fallback()) {
+            return result;
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(private_test) = self.private_wal_test.as_ref() {
+            return private_test.current()?.with_application_read(_conn, read);
+        }
+        Ok(read())
     }
 
     async fn run_store_sqlite_task<T, F>(
@@ -1467,7 +1611,36 @@ impl SqliteSessionBackend {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
     {
-        match self.run_sqlite_task(operation).await {
+        #[cfg(all(test, target_os = "linux"))]
+        let result = if let Some(private_test) = self
+            .private_wal_test
+            .as_ref()
+            .filter(|private_test| !private_test.is_native())
+            .cloned()
+        {
+            if !matches!(kind, SqliteStoreWorkKind::Read) {
+                return Err(sqlite_store_outcome_unavailable(kind));
+            }
+            self.run_sqlite_task_on(
+                Arc::clone(&self.conn),
+                Arc::clone(&self.operation_workers),
+                SqliteTaskCompletion::RetainGuardedRead,
+                move |conn, deadline| {
+                    private_test
+                        .current()
+                        .and_then(|wal| {
+                            wal.with_retained_application_read(conn, deadline, || operation(conn))
+                        })
+                        .map_err(|_| sqlite_store_outcome_unavailable(kind))?
+                },
+            )
+            .await
+        } else {
+            self.run_sqlite_task(operation).await
+        };
+        #[cfg(not(all(test, target_os = "linux")))]
+        let result = self.run_sqlite_task(operation).await;
+        match result {
             Ok(Ok(value)) => Ok(value),
             Err(SqliteWorkerFailure::OutcomeUnavailable) => {
                 Err(sqlite_store_outcome_unavailable(kind))
@@ -1489,6 +1662,11 @@ impl SqliteSessionBackend {
         E: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
     {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| wal.reject_native_sql_fallback::<()>()) {
+            let _ = result;
+            return Err(SqliteWorkerFailure::OutcomeUnavailable);
+        }
         let deadline = tokio::time::Instant::now()
             .checked_add(SQLITE_OPERATION_MAX_WORK)
             .ok_or(SqliteWorkerFailure::Admission)?;
@@ -1504,7 +1682,7 @@ impl SqliteSessionBackend {
                 .map_err(|_| SqliteWorkerFailure::Admission)?;
         let conn = pool.checkout(deadline).await?;
         let cancellation = Arc::new(AtomicBool::new(false));
-        let interrupt = conn.get_interrupt_handle();
+        let interrupt = Some(conn.get_interrupt_handle());
         let operation_deadline = deadline.into_std();
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((
@@ -1521,7 +1699,7 @@ impl SqliteSessionBackend {
                 if let Some(conn) = lease.connection() {
                     let _progress = install_sqlite_operation_progress_handler(
                         conn,
-                        Arc::clone(&task_cancellation),
+                        Some(Arc::clone(&task_cancellation)),
                         operation_deadline,
                     );
                     if task_cancellation.load(Ordering::Acquire) || !conn.is_autocommit() {
@@ -1584,6 +1762,15 @@ impl SqliteSessionBackend {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
     {
+        // The private cache currently has one guarded owner connection.
+        // Secondary generation-bound readers need their own contract before
+        // this experimental route can retain the ordinary reader pool.
+        #[cfg(all(test, target_os = "linux"))]
+        if self.private_wal_test.is_some() {
+            return self
+                .run_store_sqlite_task(SqliteStoreWorkKind::Read, operation)
+                .await;
+        }
         let result = match &self.consensus_acceptance_reader_pool {
             Some(pool) => {
                 self.run_sqlite_task_on_consensus_acceptance_reader(Arc::clone(pool), operation)
@@ -1603,9 +1790,9 @@ impl SqliteSessionBackend {
         }
     }
 
-    /// Read one exact test-control padding receipt through a fresh WAL
-    /// acceptance-reader snapshot. This path never enters proposal admission
-    /// and cannot replay the command whose caller observed ambiguity.
+    /// Read one exact test-control padding receipt from the selected owner:
+    /// an immutable native capture or a fresh SQL acceptance-reader snapshot.
+    /// This never proposes or replays the command being observed.
     #[cfg(feature = "test-control")]
     pub(crate) async fn consensus_padding_receipt_status_for_test(
         &self,
@@ -1613,6 +1800,20 @@ impl SqliteSessionBackend {
         authority_identity: crate::consensus::SessionConsensusIdentity,
         request_id: crate::consensus::SessionConsensusRequestId,
     ) -> Result<consensus::ConsensusPaddingReceiptStatus, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, _check| {
+                    state
+                        .padding_receipt_for_test(storage_identity, authority_identity, request_id)
+                        .map_err(|_| {
+                            StoreError::Serialization(
+                                "session consensus padding receipt state is invalid".into(),
+                            )
+                        })
+                })
+                .await;
+        }
         self.run_consensus_acceptance_read_task(move |conn| {
             let tx = conn.unchecked_transaction().map_err(|_| {
                 StoreError::BackendUnavailable(
@@ -1812,6 +2013,39 @@ impl SqliteSessionBackend {
         >,
         expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
     ) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_fixed_try_read(
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity,
+                    members: expected_members,
+                    bindings: expected_bindings,
+                    placement: expected_placement_policy,
+                    pristine: false,
+                    database_path: None,
+                },
+                |_, exact| Ok(exact),
+            )
+        }) {
+            return matches!(result, Ok(Some(true)));
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if self.private_wal_test.is_some() {
+            return self.conn.try_lock().is_ok_and(|conn| {
+                self.with_application_cache_read(&conn, || {
+                    consensus::fixed_quorum_authority_is_exact_sync(
+                        &conn,
+                        identity,
+                        expected_members,
+                        expected_bindings,
+                        expected_placement_policy,
+                        false,
+                    )
+                })
+                .and_then(|read| read)
+                .unwrap_or(false)
+            });
+        }
         if let Some(pool) = &self.consensus_acceptance_reader_pool {
             let Some(lease) = pool.try_checkout() else {
                 return false;
@@ -1865,15 +2099,38 @@ impl SqliteSessionBackend {
         #[cfg(test)]
         self.fixed_quorum_durable_check_count
             .fetch_add(1, Ordering::SeqCst);
+        #[cfg(target_os = "linux")]
+        while let Some(result) = self.native_read(|wal| {
+            wal.native_fixed_try_read(
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity,
+                    members: expected_members,
+                    bindings: expected_bindings,
+                    placement: expected_placement_policy,
+                    pristine: allow_pristine_membership,
+                    database_path: None,
+                },
+                |_, exact| Ok(exact),
+            )
+        }) {
+            match result {
+                Ok(Some(exact)) => return exact,
+                Err(_) => return false,
+                Ok(None) => tokio::time::sleep(Duration::from_millis(1)).await,
+            }
+        }
         let conn = self.conn.lock().await;
-        consensus::fixed_quorum_authority_is_exact_sync(
-            &conn,
-            identity,
-            expected_members,
-            expected_bindings,
-            expected_placement_policy,
-            allow_pristine_membership,
-        )
+        self.with_application_cache_read(&conn, || {
+            consensus::fixed_quorum_authority_is_exact_sync(
+                &conn,
+                identity,
+                expected_members,
+                expected_bindings,
+                expected_placement_policy,
+                allow_pristine_membership,
+            )
+        })
+        .and_then(|read| read)
         .unwrap_or(false)
     }
 
@@ -1894,6 +2151,29 @@ impl SqliteSessionBackend {
         >,
         expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            #[cfg(test)]
+            if self
+                .consensus_operator_recovery_failure
+                .load(Ordering::Acquire)
+            {
+                return Err(std::io::Error::other("native injected recovery failure"));
+            }
+            wal.native_fixed_read(
+                crate::sqlite::consensus::wal::native::FixedReadExpectation {
+                    identity,
+                    members: &expected_members,
+                    bindings: &expected_bindings,
+                    placement: expected_placement_policy,
+                    pristine: false,
+                    database_path: self.database_path.as_deref().map(PathBuf::as_path),
+                },
+                |_, exact| Ok(exact),
+            )
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         #[cfg(test)]
         if self
             .consensus_operator_recovery_failure
@@ -1930,6 +2210,10 @@ impl SqliteSessionBackend {
         &self,
         acceptance: FixedQuorumActivatedV2MutationSnapshotRequest,
     ) -> Result<FixedQuorumActivatedV2MutationSnapshot, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_v2_mutation_snapshot(&acceptance) {
+            return result;
+        }
         let FixedQuorumActivatedV2MutationSnapshotRequest {
             storage_identity,
             scope_identity,
@@ -2103,6 +2387,10 @@ impl SqliteSessionBackend {
         acceptance: FixedQuorumFencedTransitionV2StatusReadRequest,
         requests: Vec<crate::FencedTransitionV2Request>,
     ) -> Result<FixedQuorumFencedTransitionV2StatusBatchRead, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_v2_status_batch(&acceptance, &requests) {
+            return result;
+        }
         if requests.is_empty() {
             return Err(StoreError::BackendUnavailable(
                 "session status cohort was empty".into(),
@@ -2243,6 +2531,17 @@ impl SqliteSessionBackend {
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<Option<opc_types::Timestamp>, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != identity {
+                    return Err(std::io::Error::other("native clock identity differs"));
+                }
+                Ok(state.logical_time())
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             consensus::logical_time_sync(conn, identity).map_err(|_| {
                 StoreError::BackendUnavailable(
@@ -2265,6 +2564,24 @@ impl SqliteSessionBackend {
         current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, check| {
+                    state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                        let read =
+                            consensus::roster_reads::read_protected_roster_admission_status_sync(
+                                store,
+                                identity,
+                                &admission,
+                                &current_authority,
+                                now,
+                            )?;
+                        Ok((read, now))
+                    })
+                })
+                .await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2295,6 +2612,19 @@ impl SqliteSessionBackend {
         recovery: crate::fenced_mutation_roster_executor::RecoveryRequest,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, check| {
+                    state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                        let read = consensus::roster_reads::read_protected_roster_recovery_sync(
+                            store, identity, &recovery, now,
+                        )?;
+                        Ok((read, now))
+                    })
+                })
+                .await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2328,6 +2658,29 @@ impl SqliteSessionBackend {
         terminal_evidence: crate::fenced_mutation_roster::RosterCompactTerminalEvidenceV2,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, check| {
+                    state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                        let read =
+                            consensus::roster_reads::read_protected_roster_terminal_status_sync(
+                                store,
+                                identity,
+                                binding,
+                                consensus::ProtectedRosterTerminalStatusRequest {
+                                    registration_parts,
+                                    current_authority: &current_authority,
+                                    terminal_body_commitment,
+                                    terminal_evidence: &terminal_evidence,
+                                    logical_time: now,
+                                },
+                            )?;
+                        Ok((read, now))
+                    })
+                })
+                .await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2363,6 +2716,15 @@ impl SqliteSessionBackend {
         request: crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<opc_types::Timestamp, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self.native_read_task(move |state, check| {
+                state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                    consensus::roster_reads::read_protected_roster_current_publication_authority_sync(store, identity, &request, now)?;
+                    Ok(now)
+                })
+            }).await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2392,6 +2754,15 @@ impl SqliteSessionBackend {
         current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterV2ReadResult, opc_types::Timestamp), StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self.native_read_task(move |state, check| {
+                state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                    let read = consensus::roster_reads::read_protected_roster_v2_admission_status_sync(store, identity, &admission, &current_authority, now)?;
+                    Ok((read, now))
+                })
+            }).await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2421,6 +2792,19 @@ impl SqliteSessionBackend {
         recovery: crate::fenced_mutation_roster_executor::RecoveryRequest,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterV2ReadResult, opc_types::Timestamp), StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, check| {
+                    state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                        let read = consensus::roster_reads::read_protected_roster_v2_recovery_sync(
+                            store, identity, &recovery, now,
+                        )?;
+                        Ok((read, now))
+                    })
+                })
+                .await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2453,6 +2837,29 @@ impl SqliteSessionBackend {
         terminal_evidence: crate::fenced_mutation_roster::RosterProfileV2CompactTerminalEvidenceV1,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterV2ReadResult, opc_types::Timestamp), StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, check| {
+                    state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                        let read =
+                            consensus::roster_reads::read_protected_roster_v2_terminal_status_sync(
+                                store,
+                                identity,
+                                binding,
+                                consensus::ProtectedRosterV2TerminalStatusRequest {
+                                    registration_parts,
+                                    current_authority: &current_authority,
+                                    terminal_body_commitment,
+                                    terminal_evidence: &terminal_evidence,
+                                    logical_time: now,
+                                },
+                            )?;
+                        Ok((read, now))
+                    })
+                })
+                .await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2486,6 +2893,15 @@ impl SqliteSessionBackend {
         request: crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<opc_types::Timestamp, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self.native_read_task(move |state, check| {
+                state.with_roster_read(identity, wall_time_floor, check, |store, now| {
+                    consensus::roster_reads::read_protected_roster_v2_current_publication_authority_sync(store, identity, &request, now)?;
+                    Ok(now)
+                })
+            }).await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let logical_time = consensus::logical_time_sync(conn, identity)
                 .map_err(|_| {
@@ -2514,6 +2930,17 @@ impl SqliteSessionBackend {
         scope_identity: crate::consensus::SessionConsensusIdentity,
         voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(std::io::Error::other("native V1 identity differs"));
+                }
+                Ok(state.v1_activation_matches(scope_identity, &voters))
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             consensus::fenced_transition_activation_matches_scope_sync(
                 conn,
@@ -2537,6 +2964,19 @@ impl SqliteSessionBackend {
         scope_identity: crate::consensus::SessionConsensusIdentity,
         voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(std::io::Error::other(
+                        "native roster activation identity differs",
+                    ));
+                }
+                Ok(state.protected_roster_activation_matches(scope_identity, &voters))
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             consensus::protected_roster_profile_activation_matches_scope_sync(
                 conn,
@@ -2563,6 +3003,17 @@ impl SqliteSessionBackend {
         voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
         profile_digest: [u8; 32],
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(std::io::Error::other("native V2 identity differs"));
+                }
+                Ok(state.v2_activation_matches(scope_identity, &voters, profile_digest))
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             consensus::fenced_transition_v2_activation_matches_scope_sync(
                 conn,
@@ -2588,6 +3039,13 @@ impl SqliteSessionBackend {
         key: &SessionKey,
         logical_time: opc_types::Timestamp,
     ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            let key = key.clone();
+            return self
+                .native_read_task(move |state, _check| state.get_at(&key, logical_time))
+                .await;
+        }
         let key = key.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let tx = conn
@@ -2613,6 +3071,18 @@ impl SqliteSessionBackend {
         key: &SessionKey,
         logical_time: opc_types::Timestamp,
     ) -> Result<crate::FencedTransitionObservation, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            let key = key.clone();
+            return self
+                .native_read_task(move |state, _check| state.observe_at(&key, logical_time))
+                .await
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "fenced transition observation is unavailable".into(),
+                    )
+                });
+        }
         let key = key.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let tx = conn
@@ -2653,6 +3123,18 @@ impl SqliteSessionBackend {
         _authority_identity: crate::consensus::SessionConsensusIdentity,
         request: &crate::FencedTransitionRequest,
     ) -> Result<crate::FencedTransitionStatus, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            let request = request.clone();
+            return self
+                .native_read_task(move |state, _| {
+                    if state.identity() != storage_identity {
+                        return Err(native::unavailable());
+                    }
+                    state.status_v1(&request)
+                })
+                .await;
+        }
         let request = request.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let tx = conn
@@ -2683,6 +3165,23 @@ impl SqliteSessionBackend {
         operation_request_id: crate::consensus::SessionConsensusRequestId,
         request: &crate::consumer::SessionConsumerRequest,
     ) -> Result<crate::consumer::SessionConsumerLeaseMutationStatus, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            let request = request.clone();
+            return self
+                .native_read_task(move |state, _| {
+                    let receipts = state.consumer_receipts()?;
+                    consensus::consumer_receipts::read_consumer_lease_mutation_status_sync(
+                        &receipts,
+                        storage_identity,
+                        authority_identity,
+                        binding_request_id,
+                        operation_request_id,
+                        &request,
+                    )
+                })
+                .await;
+        }
         let request = request.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let tx = conn
@@ -2712,6 +3211,19 @@ impl SqliteSessionBackend {
         storage_identity: crate::consensus::SessionConsensusIdentity,
         lookup: consensus::ConsumerCompareAndSetReceiptLookup,
     ) -> Result<crate::consumer::SessionConsumerCompareAndSetStatus, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, _| {
+                    let receipts = state.consumer_receipts()?;
+                    consensus::consumer_receipts::read_consumer_compare_and_set_status_sync(
+                        &receipts,
+                        storage_identity,
+                        lookup,
+                    )
+                })
+                .await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let tx = conn
                 .unchecked_transaction()
@@ -2738,6 +3250,21 @@ impl SqliteSessionBackend {
         binding_request_id: crate::consensus::SessionConsensusRequestId,
         request_commitment: [u8; 32],
     ) -> Result<consensus::ConsumerRequestBindingLookup, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, _| {
+                    let receipts = state.consumer_receipts()?;
+                    consensus::consumer_receipts::read_consumer_request_binding_sync(
+                        &receipts,
+                        storage_identity,
+                        authority_identity,
+                        binding_request_id,
+                        request_commitment,
+                    )
+                })
+                .await;
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let tx = conn
                 .unchecked_transaction()
@@ -2763,6 +3290,20 @@ impl SqliteSessionBackend {
         authority_identity: crate::consensus::SessionConsensusIdentity,
         request: &crate::FencedTransitionV2Request,
     ) -> Result<crate::FencedTransitionV2Status, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.with_native_public_receipt_read(std::slice::from_ref(request), |state, receipts| {
+                if state.identity() != storage_identity {
+                    return Err(std::io::Error::other("native status identity differs"));
+                }
+                Ok(match receipts {
+                    Some(receipts) => state.status_with_receipts(request, receipts),
+                    None => state.status(request),
+                })
+            })
+        }) {
+            return result.map_err(|_| native::unavailable())?;
+        }
         let request = request.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let tx = conn
@@ -2790,6 +3331,17 @@ impl SqliteSessionBackend {
         &self,
         storage_identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(std::io::Error::other("native history identity differs"));
+                }
+                Ok(state.history().is_some())
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let persisted_identity = consensus::read_storage_identity_sync(conn).map_err(|_| {
                 StoreError::BackendUnavailable("fenced transition V2 history is unavailable".into())
@@ -2819,6 +3371,19 @@ impl SqliteSessionBackend {
         &self,
         storage_identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(std::io::Error::other(
+                        "native roster history identity differs",
+                    ));
+                }
+                Ok(state.roster_v2_history_is_activated())
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             consensus::protected_roster_v2_history_is_activated_sync(conn, storage_identity)
                 .map_err(|_| {
@@ -2836,6 +3401,17 @@ impl SqliteSessionBackend {
         storage_identity: crate::consensus::SessionConsensusIdentity,
         _authority_identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<crate::FencedTransitionV2HistoryState, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(std::io::Error::other("native history identity differs"));
+                }
+                state.history_state()
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             consensus::read_fenced_transition_v2_history_state_sync(conn, storage_identity).map_err(
                 |_| {
@@ -2855,6 +3431,22 @@ impl SqliteSessionBackend {
         logical_time: opc_types::Timestamp,
         deadline: tokio::time::Instant,
     ) -> Result<RestoreScanPage, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            request.validate()?;
+            let result = self
+                .native_read_task_at(
+                    deadline,
+                    Arc::clone(&self.restore_scan_workers),
+                    move |state, check| state.scan_restore_records(request, logical_time, check),
+                )
+                .await;
+            return if tokio::time::Instant::now() >= deadline {
+                Err(StoreError::RestoreScanWorkBudgetExceeded)
+            } else {
+                result
+            };
+        }
         self.run_restore_scan(
             request,
             logical_time,
@@ -2893,6 +3485,8 @@ impl SqliteSessionBackend {
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, request))));
         let task_job = Arc::clone(&queued_job);
+        #[cfg(all(test, target_os = "linux"))]
+        let private_test = self.private_wal_test.clone();
         let task = tokio::task::spawn_blocking(move || {
             let (conn, worker_permit, request) = task_job
                 .lock()
@@ -2902,40 +3496,54 @@ impl SqliteSessionBackend {
             if task_cancellation.load(Ordering::Acquire) {
                 return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
             }
-            let tx = if profile.is_standalone() {
-                match standalone_transaction(&conn) {
-                    Ok(tx) => tx,
+            let read = || {
+                let tx = if profile.is_standalone() {
+                    match standalone_transaction(&conn) {
+                        Ok(tx) => tx,
+                        Err(error) => return Some(Err(error)),
+                    }
+                } else {
+                    match conn.unchecked_transaction().map_err(|_| {
+                        StoreError::BackendUnavailable("session store scan failed".into())
+                    }) {
+                        Ok(tx) => tx,
+                        Err(error) => return Some(Err(error)),
+                    }
+                };
+                let result = match ops::scan_restore_records_sync(
+                    &tx,
+                    request,
+                    logical_time,
+                    Arc::clone(&task_cancellation),
+                    operation_deadline,
+                    profile,
+                ) {
+                    Ok(result) => result,
                     Err(error) => return Some(Err(error)),
+                };
+                if task_cancellation.load(Ordering::Acquire) {
+                    return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
                 }
-            } else {
-                match conn
-                    .unchecked_transaction()
-                    .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))
+                if tx.commit().is_err() {
+                    return Some(Err(StoreError::BackendUnavailable(
+                        "session store scan failed".into(),
+                    )));
+                }
+                Some(Ok(result))
+            };
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(private_test) = private_test {
+                return match private_test
+                    .current()
+                    .and_then(|wal| wal.with_application_read(&conn, read))
                 {
-                    Ok(tx) => tx,
-                    Err(error) => return Some(Err(error)),
-                }
-            };
-            let result = match ops::scan_restore_records_sync(
-                &tx,
-                request,
-                logical_time,
-                Arc::clone(&task_cancellation),
-                operation_deadline,
-                profile,
-            ) {
-                Ok(result) => result,
-                Err(error) => return Some(Err(error)),
-            };
-            if task_cancellation.load(Ordering::Acquire) {
-                return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
+                    Ok(result) => result,
+                    Err(_) => Some(Err(StoreError::BackendUnavailable(
+                        "session store scan failed".into(),
+                    ))),
+                };
             }
-            if tx.commit().is_err() {
-                return Some(Err(StoreError::BackendUnavailable(
-                    "session store scan failed".into(),
-                )));
-            }
-            Some(Ok(result))
+            read()
         });
         let cancel_job = Arc::clone(&queued_job);
         let mut cancel_on_drop = RestoreScanCancellation {
@@ -2973,6 +3581,12 @@ impl SqliteSessionBackend {
     /// Read the committed application-journal head after the caller has
     /// completed its Openraft linearizable barrier and local apply wait.
     pub(crate) async fn consensus_max_replication_sequence(&self) -> Result<u64, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self
+            .native_read(|wal| wal.native_public_scalar_read(|state| Ok(state.watch_sequence())))
+        {
+            return result.map_err(|_| native::unavailable());
+        }
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let seq: i64 = conn
                 .query_row(
@@ -2998,6 +3612,34 @@ impl SqliteSessionBackend {
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<bool, StoreError> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != identity
+                    || self
+                        .consensus_operator_recovery_failure
+                        .load(Ordering::Acquire)
+                {
+                    return Err(std::io::Error::other(
+                        "native recovery identity differs or injected failure",
+                    ));
+                }
+                let latch = self
+                    .database_path
+                    .as_deref()
+                    .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                    .transpose()?
+                    .flatten();
+                if latch.is_some_and(|latch| latch.identity != identity) {
+                    return Err(std::io::Error::other(
+                        "native recovery latch identity differs",
+                    ));
+                }
+                Ok(latch.is_some())
+            })
+        }) {
+            return result.map_err(|_| native::unavailable());
+        }
         #[cfg(test)]
         if self
             .consensus_operator_recovery_failure
@@ -3095,6 +3737,12 @@ impl SqliteSessionBackend {
         let range = ReplicationLogRange::try_new(start, limit)?;
         if range.is_empty() {
             return Ok(Vec::new());
+        }
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return self
+                .native_read_task(move |state, check| state.replication_log(start, limit, check))
+                .await;
         }
         let Ok(sqlite_start) = i64::try_from(range.first_sequence()) else {
             return Ok(Vec::new());
@@ -3764,6 +4412,12 @@ impl SessionBackend for SqliteSessionBackend {
         &self,
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return Err(StoreError::CapabilityNotSupported(
+                CONSENSUS_AUTHORITY_REQUIRED.into(),
+            ));
+        }
         let now = self.clock.now_utc();
         let deadline = tokio::time::Instant::now()
             .checked_add(Duration::from_millis(
@@ -3917,6 +4571,12 @@ impl SessionBackend for SqliteSessionBackend {
         futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
         StoreError,
     > {
+        #[cfg(target_os = "linux")]
+        if self.native_enabled() {
+            return Err(StoreError::CapabilityNotSupported(
+                CONSENSUS_AUTHORITY_REQUIRED.into(),
+            ));
+        }
         let cursor = ReplicationWatchCursor::new(start_sequence);
         let mut watchers = self.watchers.lock().await;
         let existing = self

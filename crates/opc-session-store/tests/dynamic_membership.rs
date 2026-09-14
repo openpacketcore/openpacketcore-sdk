@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,7 +22,7 @@ use opc_key::{
 use opc_session_store::test_support::{
     assert_mixed_compacted_roster_status_and_terminal_conflict_for_test,
     assert_stale_predecessor_signed_fresh_roster_admission_rejected_for_test,
-    recover_signed_roster_terminal_authority_for_test,
+    consensus_local_durable_progress_for_test, recover_signed_roster_terminal_authority_for_test,
     release_signed_fresh_roster_admission_for_test, roster_attestation_trust_root_for_test,
     submit_signed_fresh_roster_admission_for_test, submit_signed_fresh_roster_cycle_for_test,
     terminalize_signed_fresh_roster_admission_for_test,
@@ -1565,6 +1565,11 @@ async fn finalizing_transition_blocks_successor_staging_until_exact_resume() {
     // while the leader is isolated forces the exact resumable window: local
     // routes have cut over, while durable terminal evidence is Finalizing.
     let incumbent = fleet.wait_transition_caller(&[0, 1, 2]).await;
+    eprintln!(
+        "finalizing_exact_resume stage=role_selected role=incumbent slot={incumbent} fixture_node_id={:?} observed_monotonic={:?}",
+        fleet.network.node_ids[incumbent],
+        Instant::now()
+    );
     let incumbent_transport = Arc::clone(&fleet.transports[incumbent]);
     incumbent_transport.block_next_finalization();
     let commit_store = fleet.stores[incumbent].clone();
@@ -1601,6 +1606,11 @@ async fn finalizing_transition_blocks_successor_staging_until_exact_resume() {
         .filter(|index| *index != incumbent)
         .collect::<Vec<_>>();
     let successor = fleet.wait_transition_caller(&retained).await;
+    eprintln!(
+        "finalizing_exact_resume stage=role_selected role=successor slot={successor} fixture_node_id={:?} observed_monotonic={:?}",
+        fleet.network.node_ids[successor],
+        Instant::now()
+    );
     assert_ne!(
         successor, incumbent,
         "isolated incumbent remained the transition caller"
@@ -1621,6 +1631,11 @@ async fn finalizing_transition_blocks_successor_staging_until_exact_resume() {
         .copied()
         .find(|candidate| *candidate != successor)
         .expect("non-leader retained member to restart");
+    eprintln!(
+        "finalizing_exact_resume stage=role_selected role=restarted slot={restarted} fixture_node_id={:?} observed_monotonic={:?}",
+        fleet.network.node_ids[restarted],
+        Instant::now()
+    );
     fleet
         .restart_member_in_scope(restarted, &expanded, first.desired_identity(), &first)
         .await;
@@ -1651,10 +1666,19 @@ async fn finalizing_transition_blocks_successor_staging_until_exact_resume() {
         .expect("successor resumes the exact first transition");
     assert_eq!(completed.phase(), SessionTopologyTransitionPhase::Completed);
     fleet.network.heal(incumbent);
-    let _ = tokio::time::timeout(TEST_DEADLINE, incumbent_commit)
+    let incumbent_result = tokio::time::timeout(TEST_DEADLINE, incumbent_commit)
         .await
         .expect("incumbent commit task terminates after exact resume")
         .expect("incumbent commit task remains live");
+    let incumbent_observed_at = Instant::now();
+    // The caller result does not establish drain of separately owned work.
+    let (outcome, phase, reason) = match &incumbent_result {
+        Ok(status) => ("ok", Some(status.phase()), status.reason_code()),
+        Err(error) => ("error", None, error.reason_code()),
+    };
+    eprintln!(
+        "finalizing_exact_resume stage=incumbent_joined slot={incumbent} observed_monotonic={incumbent_observed_at:?} outcome={outcome} phase={phase:?} reason={reason}"
+    );
     wait_completed_and_admitted(&fleet.stores, &first, &expanded, &[]).await;
 
     fleet.stores[successor]
@@ -1971,6 +1995,27 @@ async fn wait_completed_and_admitted(
     })
     .await;
     if converged.is_err() {
+        #[cfg(feature = "test-control")]
+        {
+            let failure_observed_at = Instant::now();
+            // Openraft metrics only. Collect all passive samples before the
+            // later awaited durable-status diagnostics; they are not atomic
+            // with those reads or with the public consensus snapshots.
+            let observations = stores
+                .iter()
+                .enumerate()
+                .map(|(index, store)| {
+                    let started = Instant::now();
+                    let progress = consensus_local_durable_progress_for_test(store);
+                    (index, started, Instant::now(), progress)
+                })
+                .collect::<Vec<_>>();
+            for (index, started, finished, progress) in observations {
+                eprintln!(
+                    "dynamic_membership stage=uniform_completion_timeout slot={index} failure_observed_monotonic={failure_observed_at:?} sample_started_monotonic={started:?} sample_finished_monotonic={finished:?} openraft_metrics={progress:?}"
+                );
+            }
+        }
         for (index, store) in stores.iter().enumerate() {
             eprintln!(
                 "node {index}: transition={:?}, consensus={:?}",

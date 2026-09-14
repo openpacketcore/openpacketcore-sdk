@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use opc_identity::ProjectedSvidSource;
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_redaction::metrics::{SecurityMetricsReader, METRICS};
@@ -72,7 +72,8 @@ use opc_session_testkit::qualification::{
     QualificationConcurrentRecordSnapshot, QualificationConcurrentStateClass,
     QualificationConcurrentStateType, QualificationConcurrentSubscriptionId,
     QualificationConcurrentWatchEvent, QualificationConnectionLifecycleMetrics,
-    QualificationConsensusRpcAvailability, QualificationNodeCommand, QualificationNodeConfig,
+    QualificationConsensusRpcAvailability, QualificationIsolatedScaleConfig,
+    QualificationIsolatedScaleReadiness, QualificationNodeCommand, QualificationNodeConfig,
     QualificationNodeErrorCode, QualificationNodeReply, QualificationPeerRouting,
     QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialStatus,
@@ -82,8 +83,8 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS, QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES,
     QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX, QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS,
     QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
-    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
-    QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS, QUALIFICATION_MAX_CONFIG_BYTES,
+    QUALIFICATION_MAX_LEASE_HANDLES, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
@@ -413,6 +414,16 @@ struct QualificationNode {
     rpc_gate: QualificationConsensusRpcGate,
     roster_attestation_root: RosterAttestationTrustRootV1,
     fixed_consensus_identity: SessionConsensusIdentity,
+    isolated_scale: Option<QualificationIsolatedScaleConfig>,
+}
+
+#[derive(Debug)]
+struct IsolatedScaleClock(Timestamp);
+
+impl opc_session_store::Clock for IsolatedScaleClock {
+    fn now_utc(&self) -> Timestamp {
+        self.0
+    }
 }
 
 /// Test-harness-only issuer for the protected consumer ingress.  It is
@@ -1295,7 +1306,31 @@ impl QualificationNode {
 
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
-        let store = Arc::new(
+        let store = Arc::new(if let Some(scale) = config.isolated_scale {
+            let logical_time = time::OffsetDateTime::from_unix_timestamp(
+                QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
+            )
+            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?;
+            ConsensusSessionStore::open_fixed_quorum_with_clock_and_persistence(
+                topology,
+                backend,
+                &snapshot_directory,
+                peers,
+                Arc::new(IsolatedScaleClock(Timestamp::from_offset_datetime(
+                    logical_time,
+                ))),
+                Duration::from_millis(config.operation_timeout_millis),
+                config
+                    .snapshot_integrity
+                    .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
+                scale.persistence.store_mode(),
+            )
+            .await
+            .map_err(|error| {
+                eprintln!("qualification node consensus open error: {error:?}");
+                node_open_failure(QualificationNodeOpenStage::Consensus)
+            })?
+        } else {
             ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                 topology,
                 backend,
@@ -1308,8 +1343,11 @@ impl QualificationNode {
                     .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
             )
             .await
-            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?,
-        );
+            .map_err(|error| {
+                eprintln!("qualification node consensus open error: {error:?}");
+                node_open_failure(QualificationNodeOpenStage::Consensus)
+            })?
+        });
         let empty_vote_dispatches = Arc::new(AtomicU64::new(0));
         let counting_handler: Arc<dyn SessionConsensusRpcHandler> =
             Arc::new(QualificationProbeDispatchCountingHandler {
@@ -1368,6 +1406,7 @@ impl QualificationNode {
             config.backend_namespace.clone(),
         );
         Ok(Self {
+            isolated_scale: config.isolated_scale,
             store,
             protected,
             server: Some(server),
@@ -1425,6 +1464,26 @@ impl QualificationNode {
                 }
             }
             QualificationNodeCommand::ConsensusDiagnostics => {
+                let health = self.store.persistence_health();
+                eprintln!(
+                    "qualification_persistence_health mode={:?} engine_running={} storage_state={:?} storage_failure={:?}",
+                    health.mode, health.engine_running, health.storage_state, health.storage_failure,
+                );
+                #[cfg(feature = "test-control")]
+                eprintln!(
+                    "qualification_local_durable_progress {:?}",
+                    opc_session_store::test_support::consensus_local_durable_progress_for_test(
+                        &self.store
+                    ),
+                );
+                #[cfg(all(target_os = "linux", feature = "test-control"))]
+                if let Ok(Some(costs)) =
+                    opc_session_store::test_support::consensus_local_wal_costs_for_test(&self.store)
+                {
+                    // This body-free snapshot has bounded counters and retains
+                    // the writer scope, stage maxima and slowest request too.
+                    eprintln!("qualification_local_wal_costs {costs}");
+                }
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
                 }
@@ -1727,7 +1786,48 @@ impl QualificationNode {
                 forget_lease_handle(&mut self.leases, &lease_handle);
                 QualificationNodeReply::LeaseHandleForgotten
             }
-            QualificationNodeCommand::Shutdown => QualificationNodeReply::ShuttingDown,
+            QualificationNodeCommand::Shutdown => {
+                if self.isolated_scale.is_some() {
+                    let deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(opc_session_testkit::qualification::QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
+                    self.stop_server().await;
+                    if let Err(error) =
+                        join_qualification_shutdown_before(deadline, || self.store.shutdown()).await
+                    {
+                        return QualificationNodeReply::Error {
+                            code: map_store_error(&error),
+                        };
+                    }
+                }
+                QualificationNodeReply::ShuttingDown
+            }
+            QualificationNodeCommand::IsolatedScaleProbe => self.isolated_scale_probe().await,
+            QualificationNodeCommand::IsolatedScaleHistoryState => {
+                if self.isolated_scale.is_none() {
+                    return invalid_request_reply();
+                }
+                match self.store.fenced_transition_v2_history_state().await {
+                    Ok(state) => QualificationNodeReply::IsolatedScaleHistory { state },
+                    Err(error) => QualificationNodeReply::Error {
+                        code: map_store_error(&error),
+                    },
+                }
+            }
+            QualificationNodeCommand::IsolatedScaleMaintainHistory { expected_state } => {
+                if self.isolated_scale.is_none() {
+                    return invalid_request_reply();
+                }
+                match self
+                    .store
+                    .maintain_fenced_transition_v2_history(expected_state)
+                    .await
+                {
+                    Ok(state) => QualificationNodeReply::IsolatedScaleHistory { state },
+                    Err(error) => QualificationNodeReply::Error {
+                        code: map_store_error(&error),
+                    },
+                }
+            }
             QualificationNodeCommand::ConsumerTlsPeerCredentialRejections => {
                 match self.consumer_server.as_ref() {
                     Some(server) => QualificationNodeReply::ConsumerTlsPeerCredentialRejections {
@@ -1767,7 +1867,8 @@ impl QualificationNode {
                 };
             }
         };
-        let grants = match qualification_stateless_consumer_grants(identities) {
+        let grants = match qualification_stateless_consumer_grants(identities, self.isolated_scale)
+        {
             Ok(grants) => grants,
             Err(()) => {
                 return QualificationNodeReply::Error {
@@ -1921,6 +2022,17 @@ impl QualificationNode {
                     || traffic.observation.failure().is_some()
             })
         {
+            eprintln!(
+                "qualification_watch_handoff rejected=precondition schedule_bound={} state={:?}",
+                self.traffic_schedule_bound,
+                self.traffic.as_ref().map(|traffic| (
+                    traffic.mutation_cancel.is_some(),
+                    traffic.mutation_task.is_some(),
+                    traffic.watch_cancel.is_some(),
+                    traffic.watch_task.is_some(),
+                    traffic.observation.failure(),
+                ))
+            );
             return QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
@@ -1972,7 +2084,7 @@ impl QualificationNode {
         // waits as the in-task recovery path. Retain the sender for the whole
         // call: a dropped sender is an explicit cancellation signal.
         let (_reconciliation_cancel, mut reconciliation_cancel_rx) = oneshot::channel();
-        let Some(reconciliation) = reconcile_traffic_watch_stream(
+        let reconciliation = reconcile_traffic_watch_stream(
             &self.protected,
             &traffic_keys,
             seed,
@@ -1984,12 +2096,27 @@ impl QualificationNode {
             deadline,
             &mut reconciliation_cancel_rx,
         )
-        .await
-        .ok()
-        .flatten() else {
-            return QualificationNodeReply::Error {
-                code: QualificationNodeErrorCode::TrafficUnavailable,
-            };
+        .await;
+        let reconciliation = match reconciliation {
+            Ok(Some(reconciliation)) => reconciliation,
+            Ok(None) => {
+                eprintln!("qualification_watch_handoff rejected=cancelled");
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                };
+            }
+            Err(failure) => {
+                // These are bounded classifications and counters only. Keep
+                // the actual failure when the command reply is deliberately
+                // coarse; never emit backend strings or session material.
+                eprintln!(
+                    "qualification_watch_handoff rejected=reconciliation failure={failure:?} elapsed_millis={}",
+                    recovery_started_at.elapsed().as_millis()
+                );
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                };
+            }
         };
 
         let resumed_generation = reconciliation.generations[self.node_index];
@@ -2007,6 +2134,10 @@ impl QualificationNode {
             )
             .await
         {
+            eprintln!(
+                "qualification_watch_handoff rejected=restart_record elapsed_millis={}",
+                recovery_started_at.elapsed().as_millis()
+            );
             return QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
@@ -2879,9 +3010,72 @@ impl QualificationNode {
         }
     }
 
+    async fn isolated_scale_probe(&self) -> QualificationNodeReply {
+        let Some(scale) = self.isolated_scale else {
+            return invalid_request_reply();
+        };
+        let report = self.store.probe_fixed_quorum_readiness().await;
+        let status = self.store.status();
+        let health = report.persistence_health();
+        QualificationNodeReply::IsolatedScaleReadiness {
+            status: QualificationIsolatedScaleReadiness {
+                ready: report.traffic_authority().is_granted(),
+                persistence: scale.persistence,
+                node_id: status.node_id.get(),
+                leader_id: status.leader_id.map(|node_id| node_id.get()),
+                term: status.term,
+                configured_voter_ids: self.configured_voter_ids.clone(),
+                committed_index: report.committed_barrier_index(),
+                applied_index: status.applied_index,
+                engine_running: health.engine_running,
+                storage_failed: health.storage_failure.is_some(),
+                storage_running: matches!(
+                    health.storage_state,
+                    opc_session_store::SessionStorageState::Running
+                ),
+                background_failed: health
+                    .asynchronous
+                    .is_some_and(|progress| progress.background_failure.is_some()),
+                saturated: health
+                    .asynchronous
+                    .is_some_and(|progress| progress.saturated),
+                async_active: matches!(
+                    health.recovery,
+                    Some(opc_session_store::SessionAsyncRecoveryState::Active)
+                ),
+                completed_snapshot_count: status.completed_snapshot_count,
+                awaiting_live_quorum: matches!(
+                    health.recovery,
+                    Some(opc_session_store::SessionAsyncRecoveryState::AwaitingLiveQuorum)
+                ),
+                captured_generation: health
+                    .asynchronous
+                    .and_then(|progress| progress.captured_generation),
+                completed_generation: health
+                    .asynchronous
+                    .map(|progress| progress.completed_generation),
+                persistence_lag_millis: health.asynchronous.map(|progress| progress.lag_millis),
+            },
+        }
+    }
+
     async fn probe(&self) -> QualificationNodeReply {
         let report = self.store.probe_durable_readiness().await;
         let reason_code = qualification_readiness_code(report.state());
+        #[cfg(feature = "test-control")]
+        if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
+            // Read the existing local metrics after the original probe. This
+            // adds neither a network request nor a backend ownership wait.
+            // Include ready donors so a recovering member's snapshot can be
+            // compared with the donor's actual log-purge frontier.
+            eprintln!(
+                "qualification_local_durable_progress kind=readiness_probe node_index={} reason={reason_code:?} {:?}",
+                self.node_index,
+                opc_session_store::test_support::consensus_local_durable_progress_for_test(
+                    &self.store
+                ),
+            );
+        }
         let progress = report.recovery_progress();
         let status = self.store.status();
         QualificationNodeReply::Readiness {
@@ -2923,6 +3117,57 @@ impl QualificationNode {
         }
         if let Some(server) = self.consumer_server.take() {
             server.abort_and_wait().await;
+        }
+    }
+}
+
+async fn join_qualification_shutdown_before<S, F>(
+    deadline: tokio::time::Instant,
+    mut shutdown: S,
+) -> Result<(), StoreError>
+where
+    S: FnMut() -> F,
+    F: std::future::Future<Output = Result<(), StoreError>>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline_error = || {
+        StoreError::BackendUnavailable("qualification shutdown control deadline elapsed".to_owned())
+    };
+    let mut previous_wait_failed = false;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        let observation = shutdown();
+        tokio::pin!(observation);
+        if previous_wait_failed {
+            // Every public call observes the same SDK-owned drain. A latched
+            // completion is immediately ready; a pending observation retains
+            // its own unchanged SDK timeout while the real drain continues.
+            // Never infer pending completion from an error string or elapsed
+            // time, and never retry an already completed storage failure.
+            if let Some(result) = observation.as_mut().now_or_never() {
+                return if tokio::time::Instant::now() < deadline {
+                    result
+                } else {
+                    Err(deadline_error())
+                };
+            }
+            eprintln!(
+                "sdk_qualification_shutdown pending_drain=true elapsed_us={}",
+                started.elapsed().as_micros()
+            );
+        }
+        let result = tokio::time::timeout_at(deadline, observation.as_mut()).await;
+        // A ready future can be polled before Tokio's elapsed timer. Retain
+        // the inclusive control cutoff even for such a late ready result.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        match result {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(_)) => previous_wait_failed = true,
+            Err(_) => return Err(deadline_error()),
         }
     }
 }
@@ -3142,6 +3387,7 @@ async fn run_traffic_mutation_task(
     let mut lease = Some(lease);
     let mut consecutive_availability_interruptions = 0_u64;
     let mut shutdown_deadline = None;
+    let diagnostic_started_at = tokio::time::Instant::now();
     let terminal_failure = loop {
         match run_traffic_mutation_task_inner(
             &protected,
@@ -3167,6 +3413,23 @@ async fn run_traffic_mutation_task(
                 }
                 let recovery_started_at = tokio::time::Instant::now();
                 let deadline = traffic_recovery_deadline(recovery_started_at, shutdown_deadline);
+                if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
+                    // Fixed enums and atomic counters only, after the failed
+                    // public call and inside the original recovery budget.
+                    // No backend lock, payload, credential or error string.
+                    eprintln!(
+                        "qualification_local_durable_progress kind=traffic_interruption elapsed_millis={} node_index={node_index} failure={failure:?} diagnostics={:?}",
+                        diagnostic_started_at.elapsed().as_millis(),
+                        store.diagnostic_snapshot(),
+                    );
+                    #[cfg(feature = "test-control")]
+                    eprintln!(
+                        "qualification_local_durable_progress kind=traffic_engine node_index={node_index} {:?}",
+                        opc_session_store::test_support::consensus_local_durable_progress_for_test(
+                            &store
+                        ),
+                    );
+                }
                 match reconcile_traffic_mutation_checkpoint(
                     &protected,
                     &key,
@@ -4154,6 +4417,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
     deadline: tokio::time::Instant,
     cancellation: &mut oneshot::Receiver<()>,
 ) -> Result<Option<ReconciledTrafficWatch>, QualificationTrafficFailure> {
+    let diagnostic = std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some();
     if traffic_keys.len() != member_count
         || reconciled_generations.len() != member_count
         || reconciled_record_fences.len() != member_count
@@ -4165,6 +4429,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
     }
 
     let mut reconciled_entries = 0_u64;
+    let mut maximum_page_entries = QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES;
     'coherent_head: loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
@@ -4172,13 +4437,17 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                 recovery_started_at,
             ));
         }
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=head_start sequence={reconciled_sequence} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+        }
         let head = tokio::select! {
             biased;
             _ = &mut *cancellation => return Ok(None),
             result = tokio::time::timeout_at(deadline, backend.traffic_replication_head()) => {
                 match result {
                     Ok(Ok(head)) if head >= reconciled_sequence => head,
-                    Ok(Ok(_)) => {
+                    Ok(Ok(head)) => {
+                        eprintln!("qualification_watch_reconciliation rejected=head_regression sequence={reconciled_sequence} head={head}");
                         return Err(QualificationTrafficFailure::fixed(
                             QualificationTrafficFailureCode::InvariantViolation,
                             QualificationTrafficFailureStage::Watch,
@@ -4189,6 +4458,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
                             TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
                             TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                eprintln!("qualification_watch_reconciliation rejected=head_retry_deadline sequence={reconciled_sequence}");
                                 return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                     QualificationTrafficFailureStage::Watch,
                                     recovery_started_at,
@@ -4197,6 +4467,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         }
                     }
                     Ok(Err(error)) => {
+                        eprintln!("qualification_watch_reconciliation rejected=head_error sequence={reconciled_sequence} class={:?}", qualification_store_error_class(&error));
                         return Err(QualificationTrafficFailure::store(
                             QualificationTrafficFailureCode::WatchUnavailable,
                             QualificationTrafficFailureStage::Watch,
@@ -4204,6 +4475,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         ));
                     }
                     Err(_) => {
+                        eprintln!("qualification_watch_reconciliation rejected=head_deadline sequence={reconciled_sequence}");
                         return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                             QualificationTrafficFailureStage::Watch,
                             recovery_started_at,
@@ -4213,10 +4485,15 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
             }
         };
 
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=head_complete sequence={reconciled_sequence} head={head} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+        }
+
         while reconciled_sequence < head {
             let Some((start, limit)) =
                 traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
                     .map_err(|_| {
+                        eprintln!("qualification_watch_reconciliation rejected=page_plan sequence={reconciled_sequence} head={head} reconciled_entries={reconciled_entries}");
                         QualificationTrafficFailure::fixed(
                             QualificationTrafficFailureCode::InvariantViolation,
                             QualificationTrafficFailureStage::Watch,
@@ -4228,23 +4505,39 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                     QualificationTrafficFailureStage::Watch,
                 ));
             };
+            let limit = limit.min(maximum_page_entries);
+            if diagnostic {
+                eprintln!("qualification_watch_reconciliation stage=page_start start={start} limit={limit} head={head} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+            }
             let entries = tokio::select! {
                 biased;
                 _ = &mut *cancellation => return Ok(None),
                 result = tokio::time::timeout_at(deadline, backend.traffic_replication_log(start, limit)) => {
                     match result {
                         Ok(Ok(entries)) if entries.len() == limit => entries,
-                        Ok(Ok(_)) => {
+                        Ok(Ok(entries)) => {
+                            eprintln!("qualification_watch_reconciliation rejected=page_count start={start} limit={limit} count={} head={head}", entries.len());
                             return Err(QualificationTrafficFailure::fixed(
                                 QualificationTrafficFailureCode::InvariantViolation,
                                 QualificationTrafficFailureStage::Watch,
                             ));
                         }
                         Ok(Err(StoreError::BackendUnavailable(_))) => {
+                            // A valid page can exceed a reader's fixed work or
+                            // memory bound. Retrying that same page cannot make
+                            // progress. Reduce only the next requested page;
+                            // the cursor advances only after complete validation.
+                            // Keep the original total-entry and time bounds.
+                            let reduced = (limit / 2).max(1);
+                            if reduced < maximum_page_entries {
+                                eprintln!("qualification_watch_reconciliation retry=smaller_page start={start} previous_limit={limit} next_limit={reduced} head={head}");
+                                maximum_page_entries = reduced;
+                            }
                             match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
                                 TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
                                 TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
                                 TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                    eprintln!("qualification_watch_reconciliation rejected=page_retry_deadline start={start} limit={limit} head={head}");
                                     return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                         QualificationTrafficFailureStage::Watch,
                                         recovery_started_at,
@@ -4253,6 +4546,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             }
                         }
                         Ok(Err(error)) => {
+                            eprintln!("qualification_watch_reconciliation rejected=page_error start={start} limit={limit} head={head} class={:?}", qualification_store_error_class(&error));
                             return Err(QualificationTrafficFailure::store(
                                 QualificationTrafficFailureCode::WatchUnavailable,
                                 QualificationTrafficFailureStage::Watch,
@@ -4260,6 +4554,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             ));
                         }
                         Err(_) => {
+                            eprintln!("qualification_watch_reconciliation rejected=page_deadline start={start} limit={limit} head={head}");
                             return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                 QualificationTrafficFailureStage::Watch,
                                 recovery_started_at,
@@ -4268,6 +4563,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                     }
                 }
             };
+            if diagnostic {
+                eprintln!("qualification_watch_reconciliation stage=page_complete start={start} count={} head={head} elapsed_us={}", entries.len(), recovery_started_at.elapsed().as_micros());
+            }
             for entry in entries {
                 let Some(expected_sequence) = reconciled_sequence.checked_add(1) else {
                     return Err(QualificationTrafficFailure::fixed(
@@ -4286,6 +4584,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                     )
                     .is_err()
                 {
+                    eprintln!("qualification_watch_reconciliation rejected=entry_invariant sequence={} expected_sequence={expected_sequence} head={head} reconciled_entries={reconciled_entries}", entry.sequence);
                     return Err(QualificationTrafficFailure::fixed(
                         QualificationTrafficFailureCode::InvariantViolation,
                         QualificationTrafficFailureStage::Watch,
@@ -4307,6 +4606,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                 QualificationTrafficFailureStage::Watch,
             ));
         };
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=watch_start start={watch_start} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+        }
         let stream = tokio::select! {
             biased;
             _ = &mut *cancellation => return Ok(None),
@@ -4319,6 +4621,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                             TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
                             TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
                             TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                eprintln!("qualification_watch_reconciliation rejected=watch_retry_deadline start={watch_start} reconciled_entries={reconciled_entries}");
                                 return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                                     QualificationTrafficFailureStage::Watch,
                                     recovery_started_at,
@@ -4327,6 +4630,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         }
                     }
                     Ok(Err(error)) => {
+                        eprintln!("qualification_watch_reconciliation rejected=watch_error start={watch_start} reconciled_entries={reconciled_entries} class={:?}", qualification_store_error_class(&error));
                         return Err(QualificationTrafficFailure::store(
                             QualificationTrafficFailureCode::WatchUnavailable,
                             QualificationTrafficFailureStage::Watch,
@@ -4334,6 +4638,7 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         ));
                     }
                     Err(_) => {
+                        eprintln!("qualification_watch_reconciliation rejected=watch_deadline start={watch_start} reconciled_entries={reconciled_entries}");
                         return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                             QualificationTrafficFailureStage::Watch,
                             recovery_started_at,
@@ -4342,6 +4647,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                 }
             }
         };
+        if diagnostic {
+            eprintln!("qualification_watch_reconciliation stage=watch_complete start={watch_start} elapsed_us={}", recovery_started_at.elapsed().as_micros());
+        }
         return Ok(Some(ReconciledTrafficWatch {
             stream,
             watch_start,
@@ -5072,31 +5380,40 @@ where
 
 /// Build the exact, qualification-only grants for a validated command identity.
 ///
-/// This child process is a test fixture and `QualificationNodeConfig` has no
-/// consumer scope field. The scopes are therefore the two fixed namespaces
-/// exercised by the stateless-consumer qualification workload; they are not
-/// derived from the SPIFFE text or from a request. Watches receive no separate
-/// authority from this helper.
+/// The two legacy tenant/NF scopes remain fixed. Only an explicit Original
+/// scale configuration adds that workload's one exact tenant/NF scope.
+/// Request contents and SPIFFE text never expand the grant; watches receive
+/// no separate authority from this helper.
 fn qualification_stateless_consumer_grants(
     identities: Vec<SpiffeId>,
+    scale: Option<QualificationIsolatedScaleConfig>,
 ) -> Result<Vec<SessionConsumerAuthorizationGrant>, ()> {
+    let original = scale.is_some_and(|scale| {
+        matches!(
+            scale.workload,
+            opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::Original
+        )
+    });
     identities
         .into_iter()
         .map(|identity| {
-            SessionConsumerAuthorizationGrant::try_new(
-                identity,
-                [
-                    SessionConsumerTenantNfScope::new(
-                        TenantId::new(QUALIFICATION_STATELESS_CONSUMER_TENANT).map_err(|_| ())?,
-                        NetworkFunctionKind::smf(),
-                    ),
-                    SessionConsumerTenantNfScope::new(
-                        TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
-                        NetworkFunctionKind::smf(),
-                    ),
-                ],
-            )
-            .map_err(|_| ())
+            let mut scopes = vec![
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new(QUALIFICATION_STATELESS_CONSUMER_TENANT).map_err(|_| ())?,
+                    NetworkFunctionKind::smf(),
+                ),
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
+                    NetworkFunctionKind::smf(),
+                ),
+            ];
+            if original {
+                scopes.push(SessionConsumerTenantNfScope::new(
+                    TenantId::new("sdk-702-v2-qualification").map_err(|_| ())?,
+                    NetworkFunctionKind::smf(),
+                ));
+            }
+            SessionConsumerAuthorizationGrant::try_new(identity, scopes).map_err(|_| ())
         })
         .collect()
 }
@@ -6050,6 +6367,10 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "opc-session-quorum-node/shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7305,6 +7626,191 @@ mod tests {
             .expect("scripted transaction ID"),
             op,
             timestamp: Timestamp::now_utc(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct PageLimitedTrafficWatchBackend {
+        maximum_page: usize,
+        corrupt_sequence: Option<u64>,
+        requests: Arc<std::sync::Mutex<Vec<(u64, usize)>>>,
+        watch_starts: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl PageLimitedTrafficWatchBackend {
+        fn new(maximum_page: usize, corrupt_sequence: Option<u64>) -> Self {
+            Self {
+                maximum_page,
+                corrupt_sequence,
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                watch_starts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrafficWatchBackend for PageLimitedTrafficWatchBackend {
+        async fn traffic_replication_head(&self) -> Result<u64, StoreError> {
+            Ok(17)
+        }
+
+        async fn traffic_replication_log(
+            &self,
+            start: u64,
+            limit: usize,
+        ) -> Result<Vec<ReplicationEntry>, StoreError> {
+            self.requests
+                .lock()
+                .expect("bounded page requests")
+                .push((start, limit));
+            if limit > self.maximum_page {
+                // Model the native reader's unchanged two-second work bound
+                // with a paused clock, independently of the recovery strategy.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return Err(StoreError::BackendUnavailable(
+                    "scripted per-page work bound".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok((start..start + limit as u64)
+                .take_while(|sequence| *sequence <= 17)
+                .map(|sequence| {
+                    let generation = if self.corrupt_sequence == Some(sequence) {
+                        sequence + 1
+                    } else {
+                        sequence
+                    };
+                    scripted_traffic_replication_entry(sequence, reconciliation_cas(0, generation))
+                })
+                .collect())
+        }
+
+        async fn open_traffic_watch(
+            &self,
+            start_sequence: u64,
+        ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+            self.watch_starts
+                .lock()
+                .expect("bounded page watch starts")
+                .push(start_sequence);
+            Ok(scripted_live_traffic_watch(Vec::new()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_watch_recovery_makes_progress_under_a_per_page_work_bound() {
+        let backend = PageLimitedTrafficWatchBackend::new(4, None);
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let keys = (0..member_count)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let (_cancel, mut cancellation) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        let deadline =
+            started + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+        let result = reconcile_traffic_watch_stream(
+            &backend,
+            &keys,
+            seed,
+            member_count,
+            0,
+            vec![0; member_count],
+            vec![0; member_count],
+            started,
+            deadline,
+            &mut cancellation,
+        )
+        .await;
+        let recovered = match result {
+            Ok(Some(recovered)) => recovered,
+            Ok(None) => panic!("live recovery was cancelled"),
+            Err(failure) => panic!(
+                "bounded pages must recover every entry: failure={failure:?} requests={:?}",
+                backend.requests.lock().expect("bounded page requests")
+            ),
+        };
+        assert!(tokio::time::Instant::now() < deadline);
+        assert_eq!(recovered.head, 17);
+        assert_eq!(recovered.watch_start, 18);
+        assert_eq!(recovered.generations, vec![17, 0, 0]);
+        assert_eq!(
+            *backend
+                .watch_starts
+                .lock()
+                .expect("bounded page watch starts"),
+            vec![18]
+        );
+        let requests = backend.requests.lock().expect("bounded page requests");
+        assert_eq!(requests[0], (1, 17), "retain the original page maximum");
+        let mut next = 1;
+        for (start, limit) in requests.iter().filter(|(_, limit)| *limit <= 4) {
+            assert_eq!(*start, next, "no skipped or duplicated successful prefix");
+            next += *limit as u64;
+        }
+        assert_eq!(next, 18, "all exact historical entries must be reconciled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_watch_smaller_pages_keep_the_deadline_and_reject_partial_corrupt_history() {
+        for (maximum_page, corrupt_sequence) in [(0, None), (4, Some(7))] {
+            let backend = PageLimitedTrafficWatchBackend::new(maximum_page, corrupt_sequence);
+            let member_count = 3;
+            let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+            let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+            let (_cancel, cancellation) = oneshot::channel();
+            let started = tokio::time::Instant::now();
+            let result = run_traffic_watch_task(
+                backend.clone(),
+                futures_util::stream::empty().boxed(),
+                1,
+                member_count,
+                seed,
+                0,
+                cancellation,
+                Arc::clone(&observation),
+            )
+            .await;
+            let failure = result.expect_err("unavailable or corrupt history must fail closed");
+            assert_eq!(observation.failure(), Some(failure));
+            assert_eq!(observation.watch_sequence.load(Ordering::Acquire), 0);
+            assert_eq!(observation.watch_reconciliations.load(Ordering::Acquire), 0);
+            assert!(observation
+                .watch_traffic_generations
+                .iter()
+                .all(|generation| generation.load(Ordering::Acquire) == 0));
+            assert!(backend
+                .watch_starts
+                .lock()
+                .expect("bounded page watch starts")
+                .is_empty());
+            let requests = backend.requests.lock().expect("bounded page requests");
+            if maximum_page == 0 {
+                assert_eq!(
+                    failure.code,
+                    QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+                );
+                assert_eq!(
+                    started.elapsed(),
+                    Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS)
+                );
+                assert_eq!(
+                    failure.recovery_elapsed_millis,
+                    Some(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS)
+                );
+                assert_eq!(requests.last(), Some(&(1, 1)));
+                assert!(requests.iter().all(|(start, _)| *start == 1));
+            } else {
+                assert_eq!(
+                    failure.code,
+                    QualificationTrafficFailureCode::InvariantViolation
+                );
+                assert!(
+                    requests.iter().any(|(start, _)| *start > 1),
+                    "reject corrupt history even after a completely validated page"
+                );
+            }
         }
     }
 

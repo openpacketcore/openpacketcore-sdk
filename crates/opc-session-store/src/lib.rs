@@ -6,6 +6,19 @@
 //! stale-owner protections are intended for 5G CNF session-state boundaries;
 //! production suitability remains specific to the selected backend profile.
 //!
+//! # Fixed-quorum persistence
+//!
+//! [`SessionPersistenceMode`] selects durable or asynchronous storage through
+//! [`ConsensusSessionStore::open_fixed_quorum_with_persistence`] or its explicit
+//! clock/deadline variant. Existing constructors retain durable acknowledgement.
+//! Async mutations still require real quorum replication and committed apply;
+//! disk persistence may lag success. Every existing Async root must rejoin a
+//! surviving live quorum through [`ConsensusSessionStore::initialize_cluster`].
+//! An all-cold quorum cannot recover authority from local generations alone.
+//! Use [`ConsensusSessionStore::probe_fixed_quorum_readiness`] to gate traffic;
+//! [`SessionPersistenceHealth`] and an explicit local persistence drain are
+//! observations of local storage, not quorum-durability proofs.
+//!
 //! # Protected checkpoint consumption
 //!
 //! Prepared CAS and lease checkpoint requests are obtained only from an
@@ -153,19 +166,22 @@ pub use consensus::types::{
 pub use consensus::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
     ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
-    ProtectedRosterConsensusDiagnosticSnapshot, SessionConsensusClusterId, SessionConsensusCommand,
+    ProtectedRosterConsensusDiagnosticSnapshot, SessionAsyncPersistenceProgress,
+    SessionAsyncRecoveryState, SessionConsensusClusterId, SessionConsensusCommand,
     SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
     SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
     SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
-    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, SnapshotIntegrityPolicy,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,
-    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionMutationIntent, SessionMutationOutcome, SessionPersistenceDrainError,
+    SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,
+    SessionStorageFailureKind, SessionStorageFailureStage, SessionStorageState,
+    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
+    SnapshotIntegrityPolicy, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
@@ -346,6 +362,7 @@ pub use readiness::{
     DurableRecoveryState, FixedQuorumReadinessReport, FixedQuorumTrafficAuthority,
     PlacementResilienceDisposition, PlacementResiliencePolicy, PlacementResilienceReport,
     ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
+    SessionQuorumReadinessReport,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use recovery::{

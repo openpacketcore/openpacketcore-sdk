@@ -144,6 +144,7 @@ fn maximum_utc() -> time::OffsetDateTime {
 #[derive(Clone)]
 struct InProcessConsensusPeer {
     node_id: SessionConsensusNodeId,
+    scope: Option<SessionConsensusIdentity>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     online: Arc<AtomicBool>,
 }
@@ -152,6 +153,7 @@ impl InProcessConsensusPeer {
     fn new(node_id: SessionConsensusNodeId) -> Self {
         Self {
             node_id,
+            scope: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             online: Arc::new(AtomicBool::new(true)),
         }
@@ -178,6 +180,10 @@ impl fmt::Debug for InProcessConsensusPeer {
 
 #[async_trait]
 impl SessionConsensusPeer for InProcessConsensusPeer {
+    fn scope_identity(&self) -> Option<SessionConsensusIdentity> {
+        self.scope
+    }
+
     fn node_id(&self) -> SessionConsensusNodeId {
         self.node_id
     }
@@ -220,6 +226,15 @@ impl ConsensusTestCluster {
     /// call sites retain the original failure rather than silently falling
     /// back to a fake coordinator.
     pub async fn start(member_count: usize) -> Self {
+        Self::start_with_authority(member_count, false).await
+    }
+
+    #[cfg(feature = "consumer-fixture")]
+    pub(crate) async fn start_fixed_durable() -> Self {
+        Self::start_with_authority(3, true).await
+    }
+
+    async fn start_with_authority(member_count: usize, fixed: bool) -> Self {
         assert!(
             member_count == 1 || member_count >= 3,
             "consensus test fleets require one or at least three members"
@@ -244,10 +259,29 @@ impl ConsensusTestCluster {
             .collect::<Vec<_>>();
         let configuration_id =
             opc_consensus::derive_configuration_id(cluster_id, epoch, &fingerprints);
-        let identity = opc_consensus::ConsensusIdentity::new(cluster_id, configuration_id, epoch);
+        let placement = opc_session_store::PlacementResiliencePolicy::AllowReducedResilience;
+        let identity = if fixed {
+            opc_session_store::derive_fixed_durable_quorum_consensus_identity(
+                cluster_id,
+                epoch,
+                &fingerprints,
+                placement,
+            )
+        } else {
+            opc_consensus::ConsensusIdentity::new(cluster_id, configuration_id, epoch)
+        };
         let topologies = (0..member_count)
             .map(|index| {
-                if member_count == 1 {
+                if fixed {
+                    ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+                        QuorumTopologyConfig::new_consensus(
+                            test_replica_id(index).expect("valid fixed fixture replica ID"),
+                            members.clone(),
+                            identity,
+                        ),
+                        placement,
+                    )
+                } else if member_count == 1 {
                     ValidatedQuorumTopology::try_new_consensus_lab_singleton(
                         test_replica_id(index).expect("valid consensus test replica ID"),
                         members.clone(),
@@ -282,7 +316,10 @@ impl ConsensusTestCluster {
                 if source != target {
                     paths.insert(
                         (source, target),
-                        Arc::new(InProcessConsensusPeer::new(node_id)),
+                        Arc::new(InProcessConsensusPeer {
+                            scope: fixed.then_some(identity),
+                            ..InProcessConsensusPeer::new(node_id)
+                        }),
                     );
                 }
             }
@@ -300,7 +337,18 @@ impl ConsensusTestCluster {
                     (node_ids[target], peer)
                 })
                 .collect();
-            stores.push(
+            let store = if fixed {
+                // This fixture exercises fixed authority, not strict snapshot or
+                // independent physical failure-domain qualification.
+                ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                    opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
+                )
+                .await
+            } else {
                 ConsensusSessionStore::open_with_clock(
                     topologies[index].clone(),
                     backends[index].clone(),
@@ -310,8 +358,8 @@ impl ConsensusTestCluster {
                     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
-                .expect("open consensus test node"),
-            );
+            };
+            stores.push(store.expect("open consensus test node"));
         }
 
         for ((_, target), path) in &paths {
@@ -329,7 +377,7 @@ impl ConsensusTestCluster {
             #[cfg(feature = "consumer-fixture")]
             consumer_roster,
         };
-        cluster.wait_ready().await;
+        cluster.wait_ready(fixed).await;
         cluster
     }
 
@@ -389,21 +437,24 @@ impl ConsensusTestCluster {
         }
     }
 
-    async fn wait_ready(&self) {
+    async fn wait_ready(&self, fixed: bool) {
         // Cluster formation can require one resampled election after a split
         // vote and then one complete profiled readiness operation.
         let deadline = tokio::time::Instant::now() + CONSENSUS_TEST_TRANSITION_TIMEOUT;
         loop {
-            let reports = join_all(
-                self.stores
-                    .iter()
-                    .map(ConsensusSessionStore::probe_durable_readiness),
-            )
+            let reports = join_all(self.stores.iter().map(|store| async move {
+                if fixed {
+                    store
+                        .probe_fixed_durable_quorum_readiness()
+                        .await
+                        .traffic_authority()
+                        == opc_session_store::FixedQuorumTrafficAuthority::Granted
+                } else {
+                    store.probe_durable_readiness().await.state() == DurableReadinessState::Ready
+                }
+            }))
             .await;
-            if reports
-                .iter()
-                .all(|report| report.state() == DurableReadinessState::Ready)
-            {
+            if reports.iter().all(|ready| *ready) {
                 return;
             }
             assert!(

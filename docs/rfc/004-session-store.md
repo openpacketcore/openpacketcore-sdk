@@ -1060,6 +1060,26 @@ Every deployment profile MUST publish:
 - Which state classes are replicated.
 - Which state classes are rebuildable.
 
+Snapshot installation and covered-log purge run on separate Openraft workers.
+Purge MUST retain unapplied history until the exact process-owned install has
+published durable applied coverage. The install's completion dependency is
+not a fixed deployment recovery-time limit: a larger authenticated snapshot
+may take longer while the surviving quorum remains available. Failure or
+cancellation MUST wake the purge with an error, and completion without durable
+coverage MUST fail closed. A missing, unrelated, or late-starting install does
+not extend the existing absolute apply guard. Install ownership MUST remain
+process-local and MUST NOT be inferred from persisted staging artifacts.
+
+A donor MUST retain the log suffix needed by an active snapshot receiver and
+hand successful snapshot progress directly to retained log replication before
+executing a pending purge. This successful handoff uses the issued purge
+frontier to select the retained suffix. New and failed attempts MUST respect
+the scheduled purge frontier so unreachable targets cannot repeatedly reclaim
+each other's pending ranges. Failed data transfers release their retention
+before retry; heartbeat outcomes do not release an active data transfer's
+ownership. Existing capacity limits, quorum
+authority, committed/applied floors and operation deadlines remain unchanged.
+
 ## 12. Serialization
 
 Rust has no garbage collector, so the goal is allocation, CPU, and cache
@@ -2493,11 +2513,17 @@ fencing.
   fresh bidirectional mTLS/bootstrap paths on every incident edge, leaves
   unrelated survivor explicit/material-epoch retirement counters unchanged,
   and settles all lifecycle drains plus survivor availability episodes before
-  the next traffic baseline. The schedule-bound
-  `member-scoped-reauth-settled-baseline/v4` checkpoint starts its 86-second
-  absolute bound and 60-second two-stage server tail at the atomic
-  projected-data rename, then requires a final 2.5-second outbound-ledger quiet
-  tail. A prepublication common-key pulse and conservative 13-second
+  the next traffic baseline. Functional snapshot catch-up records elapsed time
+  and monotonic applied frontiers without inheriting a fixed connection-cleanup
+  deadline. Every voter must become ready with the exact quorum witnesses and
+  cover the first observed committed frontier; majority progress alone never
+  completes recovery. After readiness and canary verification, connection
+  settlement retains its own 86-second bound, full 60-second two-stage server
+  tail and final 2.5-second outbound-ledger quiet tail. The frozen schedule-bound
+  `member-scoped-reauth-settled-baseline/v4` descriptor and historical results
+  retain their publication-based clock; these corrected functional checks do
+  not qualify that historical timing profile or a deployment recovery SLO on
+  shared storage. A prepublication common-key pulse and conservative 13-second
   observations require one active key to advance on every survivor observer
   and bound that pulse's worst-case actual event gap to 26 seconds. An
   independent 26-second checkpoint requires every active key on every observer

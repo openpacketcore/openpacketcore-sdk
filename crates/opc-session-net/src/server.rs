@@ -33,7 +33,7 @@ use crate::identity::{LocalReplicaBinding, SessionClusterId};
 use crate::lifecycle::{
     directed_connection_key, material_status_matches_admission, CertificateExpiryEvidence,
     ConnectionAttemptMetricGuard, ConnectionLifecycle, ConnectionLifecyclePolicy, RetirementReason,
-    SessionReauthenticationControl,
+    SessionReauthenticationControl, TlsCompletionTime,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -2236,7 +2236,8 @@ async fn handle_connection(
                 ))
             })?
             .map_err(classify_tls_io_error)?;
-        let established_at = tokio::time::Instant::now();
+        let tls_completion = TlsCompletionTime::now();
+        let established_at = tls_completion.instant();
         if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
             return Err(ProtocolError::UnexpectedResponse);
         }
@@ -2245,12 +2246,12 @@ async fn handle_connection(
         let local_certificate_expiry = CertificateExpiryEvidence::capture(
             handshake.leaf_expires_at(),
             handshake.certificate_chain_expires_at(),
-            established_at,
+            tls_completion,
         );
         let peer_certificate_expiry = CertificateExpiryEvidence::capture(
             peer.leaf_expires_at(),
             peer.certificate_chain_expires_at(),
-            established_at,
+            tls_completion,
         );
         let (mut r, mut w) = tokio::io::split(tls_stream);
         dispatch(

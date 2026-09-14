@@ -1,0 +1,386 @@
+use super::*;
+
+const LAST_WRITEBACK_BATCH: u64 = 17;
+const WRITEBACK_REQUESTS_PER_BATCH: usize = 2;
+
+// The first real writeback is reached only after validating and materializing
+// the captured snapshot. That work is fixture setup, not the live-owner
+// handoff being tested. Start both unchanged five-second Gate checks only
+// after this exact production boundary exists. Completion (including panic)
+// is also signalled so an export which omits writeback cannot pass or strand
+// the fixture waiting for a boundary it never visits.
+#[derive(Debug, PartialEq, Eq)]
+enum WritebackSetupEvent {
+    Reached,
+    Finished,
+}
+
+struct WritebackSetup {
+    announced: AtomicBool,
+    progress: mpsc::SyncSender<WritebackSetupEvent>,
+}
+
+impl WritebackSetup {
+    fn new() -> (Arc<Self>, mpsc::Receiver<WritebackSetupEvent>) {
+        let (progress, receiver) = mpsc::sync_channel(2);
+        (
+            Arc::new(Self {
+                announced: AtomicBool::new(false),
+                progress,
+            }),
+            receiver,
+        )
+    }
+
+    fn hook(&self, point: Point) -> io::Result<()> {
+        if point == Point::BeforeNativeSnapshotWriteback
+            && !self.announced.swap(true, Ordering::AcqRel)
+        {
+            self.progress
+                .send(WritebackSetupEvent::Reached)
+                .map_err(|_| io::Error::other("snapshot writeback witness disconnected"))?;
+        }
+        Ok(())
+    }
+}
+
+struct WritebackSetupFinished(Arc<WritebackSetup>);
+
+impl Drop for WritebackSetupFinished {
+    fn drop(&mut self) {
+        // At most one Reached and one Finished event are sent to the two-slot
+        // channel. This drop cannot wait for the witness to drain its event.
+        let _ = self.0.progress.send(WritebackSetupEvent::Finished);
+    }
+}
+
+fn writeback_request(row: u64, slot: usize) -> FencedTransitionV2Request {
+    let template = sdk741_component_request(Sdk741Payload::Create, row, slot, None);
+    let mut record = template.mutation().record().unwrap().clone();
+    let handle = opc_key::KeyHandle::new(
+        KeyId::new("sdk741-writeback-test-vector").unwrap(),
+        opc_key::KeyPurpose::Session,
+        record.key.tenant.clone(),
+        opc_key::Zeroizing::new([0xE7; opc_key::AES_256_GCM_SIV_KEY_LEN]),
+    );
+    let aad =
+        crate::record::build_session_envelope_aad(&record, "sdk-702-v2-qualification", &handle)
+            .unwrap();
+    // Reach the actual 8 MiB writeback threshold with a small number of
+    // authenticated rows. Thousands of tiny records otherwise spend the
+    // ownership gate's fixed five-second guard preparing its first flush.
+    let plaintext = vec![0xA7; 256 * 1024];
+    let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
+    nonce.copy_from_slice(&template.request_id().nonce().as_bytes()[4..]);
+    let encoded =
+        opc_crypto::encrypt_envelope_with_handle_and_nonce(&handle, &aad, &plaintext, nonce)
+            .unwrap();
+    assert_eq!(
+        opc_crypto::decrypt_envelope_with_handle(&handle, &aad, &encoded)
+            .unwrap()
+            .as_slice(),
+        plaintext.as_slice(),
+    );
+    record.payload = EncryptedSessionPayload::try_envelope(encoded).unwrap();
+    let request = FencedTransitionV2Request::new(
+        template.request_id().epoch(),
+        template.request_id().nonce(),
+        template.lease().clone(),
+        FencedTransitionMutation::create(record),
+    )
+    .unwrap();
+    assert_ne!(request.request_id(), template.request_id());
+    request
+}
+
+fn writeback_fixture(control: IoControl) -> Fixture {
+    let fixture = Fixture::with_control(Limits::default(), control);
+    let initial = fenced_transition_v2_request(0xE7, 1, "native-writeback-first");
+    fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
+    for index in 2..=LAST_WRITEBACK_BATCH {
+        let requests = (0..WRITEBACK_REQUESTS_PER_BATCH)
+            .map(|slot| writeback_request(index * 32, slot))
+            .collect::<Vec<_>>();
+        fixture.parity(&[fenced_transition_v2_batch_entry(
+            index,
+            requests.clone(),
+            timestamp(2),
+        )]);
+        for request in &requests {
+            assert!(matches!(
+                status(&fixture.wal, request),
+                FencedTransitionV2Status::Recorded(result) if result.is_ok()
+            ));
+        }
+    }
+    fixture
+}
+
+#[test]
+fn native_snapshot_writeback_releases_live_owner_and_preserves_captured_cut() {
+    let gate = Gate::new(Point::BeforeNativeSnapshotWriteback, 1);
+    let (setup, progress) = WritebackSetup::new();
+    let hooks = (Arc::clone(&setup), Arc::clone(&gate));
+    let fixture = writeback_fixture(IoControl {
+        hook: Arc::new(move |point| {
+            hooks.0.hook(point)?;
+            hooks.1.hook(point)
+        }),
+        ..IoControl::default()
+    });
+    let members = fixed_members();
+    let bindings = test_member_bindings(&members);
+    let authority = || SnapshotBuildAuthority {
+        identity: identity(),
+        profile: ConsensusAuthorityProfile::FixedImmutable,
+        expected_members: &members,
+        expected_bindings: &bindings,
+        fixed_placement_policy: FIXED_TEST_PLACEMENT_POLICY,
+    };
+    let (expected_cut, reference) = build_snapshot_database_pinned_with_authority_sync(
+        &fixture.oracle.conn.blocking_lock(),
+        authority(),
+        &fixture.directory.path().join("reference-writeback.sqlite"),
+    )
+    .unwrap();
+    assert!(reference.file().metadata().unwrap().len() > 8 * 1024 * 1024);
+    assert_eq!(expected_cut.0, Some(log_id(LAST_WRITEBACK_BATCH)));
+    let path = fixture.directory.path().join("writeback.sqlite");
+    let pin = create_pinned_snapshot_database(&path).unwrap();
+    let later = sdk741_component_request(Sdk741Payload::Create, 1024, 0, None);
+    let later_entries = [fenced_transition_v2_batch_entry(
+        LAST_WRITEBACK_BATCH + 1,
+        vec![later.clone()],
+        timestamp(3),
+    )];
+    // Advance only the independent SQL oracle during setup. Its captured
+    // reference above remains at the old cut. Replaying/validating SQL history
+    // must not consume the native-owner handoff's five-second gate either.
+    let (expected_application, expected_applied, expected_logical_time) = {
+        let conn = fixture.oracle.conn.blocking_lock();
+        append_logs_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &later_entries,
+        )
+        .unwrap();
+        save_committed_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(log_id(LAST_WRITEBACK_BATCH + 1)),
+        )
+        .unwrap();
+        let applied = apply_entries_with_authority_sync(
+            &conn,
+            identity(),
+            &fixture.oracle.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            later_entries.to_vec(),
+        )
+        .unwrap();
+        (
+            applied,
+            read_applied_sync(&conn, identity()).unwrap(),
+            read_machine_sync(&conn, identity()).unwrap().2,
+        )
+    };
+    let ((exported, cut), paused_extent) = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let _setup_finished = WritebackSetupFinished(Arc::clone(&setup));
+            fixture
+                .wal
+                .native_export_portable_snapshot_into(&pin, &|| false)
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(progress.recv().unwrap(), WritebackSetupEvent::Reached);
+        gate.entered();
+        let paused_extent = pin.file().metadata().unwrap().len();
+        assert!(paused_extent >= 8 * 1024 * 1024);
+        // The real output flush is paused. A new durable mutation must still
+        // append, commit and apply through the live owner before it resumes.
+        fixture.append_commit(&later_entries);
+        let applied = fixture.wal.native_apply_committed(&later_entries).unwrap();
+        assert_eq!(
+            encode_json(&applied.responses).unwrap(),
+            encode_json(&expected_application.responses).unwrap(),
+            "complete response parity"
+        );
+        assert_eq!(
+            encode_json(&applied.notifications).unwrap(),
+            encode_json(&expected_application.notifications).unwrap(),
+            "exact notification parity"
+        );
+        assert_eq!(
+            fixture
+                .wal
+                .with_native_read(|state| Ok(state.applied()))
+                .unwrap(),
+            expected_applied
+        );
+        assert_eq!(
+            fixture
+                .wal
+                .with_native_read(|state| Ok(state.logical_time()))
+                .unwrap(),
+            expected_logical_time
+        );
+        fixture
+            .wal
+            .submit(Operation::Barrier)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!worker.is_finished());
+        gate.release();
+        (worker.join().unwrap(), paused_extent)
+    });
+    assert_eq!(
+        cut, expected_cut,
+        "export retains its original immutable cut"
+    );
+    let finalized =
+        finalize_native_snapshot_database_sync(exported, pin, authority(), &cut).unwrap();
+    assert!(finalized.file().metadata().unwrap().len() > paused_extent);
+    let conn = open_pinned_snapshot_database(&finalized).unwrap();
+    assert_portable_tables_equal(&conn, &open_pinned_snapshot_database(&reference).unwrap());
+    validate_native_snapshot_export_sync(&conn, &finalized, authority(), &cut).unwrap();
+    drop(conn);
+    drop(finalized);
+    assert!(
+        !path.exists(),
+        "unpublished output is reclaimed after finalization"
+    );
+    let expected_later = read_fenced_transition_v2_status_sync(
+        &fixture.oracle.conn.blocking_lock(),
+        identity(),
+        identity(),
+        &later,
+    )
+    .unwrap();
+    let reopened = fixture.reopened();
+    assert_eq!(
+        reopened
+            .with_native_read(|state| Ok(state.applied()))
+            .unwrap(),
+        Some(log_id(LAST_WRITEBACK_BATCH + 1))
+    );
+    assert_eq!(status(&reopened, &later), expected_later);
+    assert!(matches!(
+        expected_later,
+        FencedTransitionV2Status::Recorded(result) if result.is_ok()
+    ));
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn native_snapshot_writeback_io_failure_fences_wakes_and_survives_cancellation() {
+    let writeback = Gate::new(Point::BeforeNativeSnapshotWriteback, 1);
+    let (setup, progress) = WritebackSetup::new();
+    let setup_hook = Arc::clone(&setup);
+    let cut = Gate::new(Point::BeforeCutPublish, 1);
+    let armed = Arc::new(AtomicBool::new(false));
+    let hooks = (Arc::clone(&writeback), Arc::clone(&cut), Arc::clone(&armed));
+    let fixture = writeback_fixture(IoControl {
+        hook: Arc::new(move |point| {
+            setup_hook.hook(point)?;
+            if hooks.2.load(Ordering::Acquire) {
+                hooks.1.hook(point)?;
+            }
+            hooks.0.hook(point)?;
+            if point == Point::BeforeNativeSnapshotWriteback {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected native snapshot writeback failure",
+                ));
+            }
+            Ok(())
+        }),
+        ..IoControl::default()
+    });
+    let path = fixture.directory.path().join("failed-writeback.sqlite");
+    let pin = create_pinned_snapshot_database(&path).unwrap();
+    let cancelled = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let _setup_finished = WritebackSetupFinished(Arc::clone(&setup));
+            fixture
+                .wal
+                .native_export_portable_snapshot_into(&pin, &|| cancelled.load(Ordering::Acquire))
+        });
+        assert_eq!(progress.recv().unwrap(), WritebackSetupEvent::Reached);
+        writeback.entered();
+        assert!(pin.file().metadata().unwrap().len() >= 8 * 1024 * 1024);
+        armed.store(true, Ordering::Release);
+        let inflight = fixture
+            .wal
+            .submit(append(&[Entry {
+                log_id: log_id(LAST_WRITEBACK_BATCH + 1),
+                payload: EntryPayload::Blank,
+            }]))
+            .unwrap();
+        cut.entered();
+        let queued = fixture.wal.submit(Operation::Barrier).unwrap();
+        cancelled.store(true, Ordering::Release);
+        writeback.release();
+        let error = worker.join().unwrap().err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            error.to_string(),
+            "injected native snapshot writeback failure"
+        );
+        assert!(fixture.wal.submit(Operation::Barrier).is_err());
+        assert!(queued.try_recv().unwrap().is_err());
+        assert!(matches!(
+            queued.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            inflight.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        cut.release();
+        assert!(inflight.wait().is_err());
+    });
+    assert!(fixture.wal.shutdown().is_err());
+    drop(pin);
+    assert!(!path.exists(), "failed unpublished staging is reclaimed");
+    let reopened = Wal::open(
+        &fixture.directory.path().join("wal"),
+        fixture.wal.binding(),
+        Limits::default(),
+        IoControl::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .with_native_read(|state| Ok(state.applied()))
+            .unwrap(),
+        Some(log_id(LAST_WRITEBACK_BATCH))
+    );
+    let request = writeback_request(LAST_WRITEBACK_BATCH * 32, WRITEBACK_REQUESTS_PER_BATCH - 1);
+    let expected = read_fenced_transition_v2_status_sync(
+        &fixture.oracle.conn.blocking_lock(),
+        identity(),
+        identity(),
+        &request,
+    )
+    .unwrap();
+    assert_eq!(status(&reopened, &request), expected);
+    assert!(matches!(
+        expected,
+        FencedTransitionV2Status::Recorded(result) if result.is_ok()
+    ));
+    reopened.shutdown().unwrap();
+}

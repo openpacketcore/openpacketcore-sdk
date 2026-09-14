@@ -190,7 +190,7 @@ MemoryKeyProvider wrapper check, not remote-HKMS qualification. Openraft remains
 the only commit authority and the `EncryptingSessionBackend` remains outside it.
 
 Two additional non-ignored cases run serialized single-host three- and
-five-process fleets through bounded fault and expiry recovery. First, a
+five-process fleets through fault and expiry recovery. First, a
 test-only consensus-RPC admission gate makes one stable nonzero follower
 unavailable while node 0, a different member, atomically publishes malformed
 trust. The malformed candidate never perturbs the active controller epoch:
@@ -219,15 +219,27 @@ directions on every edge incident to that member, and restores all-voter
 readiness and canary progress without changing that process's PID. Unrelated
 survivors must not record an explicit or local-material-epoch retirement from
 this member-only recovery. A prepublication common-key survivor pulse primes
-conservative 13-second progress checkpoints. The 86-second recovery
-clock and 60-second two-stage server idle/handler tail begin only after the
-atomic projected-data rename; every publication, existing-generation incident
-path, readiness, and canary checkpoint must observe one common active key on
-every survivor observer. Requiring that pulse in every half-SLO observation
+conservative 13-second progress checkpoints. Every publication,
+existing-generation incident path, readiness, and canary checkpoint must
+observe one common active key on every survivor observer. Requiring that pulse in every half-SLO observation
 interval bounds its worst-case actual event gap to the 26-second availability
 SLO. A separate 26-second checkpoint requires every active key on every
-observer and is never reset by a faster key. The attempt/terminal
-ledger must remain unchanged for the final 2.5-second
+observer and is never reset by a faster key.
+
+Snapshot catch-up records its elapsed time and each voter's applied frontier;
+it does not inherit the 86-second connection-settlement deadline. Each voter
+must become ready with the original quorum witnesses and cover the committed
+frontier observed when catch-up began. An applied frontier must not regress,
+and survivor progress alone cannot complete recovery. RPC deadlines and the
+rolling survivor-traffic checks still apply. A run that never reaches actual
+readiness remains incomplete and is bounded by the integration job watchdog;
+it cannot pass by reporting progress. These fleets share host storage, so
+their recovery duration is not an isolated-disk or deployment recovery SLO.
+
+After actual readiness and canary verification, the connection-settlement
+phase observes the full original 60-second two-stage server idle/handler tail
+and retains its 86-second deadline. The attempt/terminal ledger must remain
+unchanged for the final 2.5-second
 cold-connect/maximum-reconnect-backoff tail. Each survivor may record at most
 one availability episode while the expired member rejoins; that episode must
 recover inside the existing 26-second SLO and be fully settled before the
@@ -238,19 +250,33 @@ cadence and independent full-key coverage clock resume immediately after
 recovery.
 Only after bounded fault-era transport/authentication/timeout/reconnect
 outcomes have settled does it capture the clean member-scoped reauthentication
-baseline. Fault-era new attempts and reconnects retain the fixed 85/161
-per-node bound: the ordinary 24/40 allowance, no more than fifteen five-second
+baseline. The fixed fault/path-proof and settlement phases share one 85/161
+per-node bound for new attempts and reconnects: the ordinary 24/40 allowance,
+no more than fifteen five-second
 refresh rounds over four/eight incident directed paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved
 node. The reverse probe fails local material preflight without dialing. Terminal
 outcomes may additionally include only the exact attempts already outstanding
-at the interval baseline, with interval conservation enforced. The schedule
-binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
+at each measured interval's baseline, with interval conservation enforced.
+A passive lifecycle snapshot after the existing-generation path proof ends
+the fixed fault interval. The first settlement snapshot ends catch-up. Both
+fixed intervals spend the same allowance; taking the second baseline does not
+grant another 85/161 attempts. Variable-duration catch-up records its actual
+attempts, terminal outcomes, and reconnects separately. Every phase and the
+complete interval must conserve attempts and live owners with monotonic
+counters. Catch-up cannot spend a total-count allowance derived from a finite
+expiry schedule: real caller deadlines can expire while snapshot installation
+holds a consensus lane, requiring a fresh connection for a later RPC.
+The functional audit reports this phase accounting as
+`fixed-fault-and-settlement-with-catchup-conservation/v2`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
-The private Schedule v6 binds this procedure as
+The frozen private Schedule v6 keeps its historical accounting profile
+`new-attempts-plus-baseline-outstanding/v1` and binds the timed procedure as
 `member-scoped-reauth-settled-baseline/v4` with progress profile
-`common-key-pulse-all-active-key-coverage/v1`. Every epoch-changing interval
+`common-key-pulse-all-active-key-coverage/v1`; its descriptors and historical
+results remain unchanged. Passing these functional catch-up checks does not
+qualify that historical timing profile. Every epoch-changing interval
 allows `superseded` only up to the existing per-node connection-attempt bound
 `8 * (member_count - 1) + 8`; non-epoch intervals require zero. Actual timeout,
 transport, protocol, backend, reconnect failure, and `abandoned` deltas remain
@@ -400,6 +426,12 @@ the last successfully proven linearizable replication head and perform no new
 backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
+Reconciliation starts with the original maximum page size. After a typed
+backend-unavailable read, it reduces the requested page size so a reader's work
+or memory bound cannot force repeated attempts at the same oversized page.
+Each returned page must still be complete and pass every sequence, generation,
+fence and record check. The original total-entry and reconciliation deadlines
+remain; no cursor or replacement watch is published from a partial recovery.
 
 `qualification/v6/session-ha-profile.json` and its schema are the published,
 byte-for-byte frozen stateless-consumer contract: consumer transport revision
@@ -951,6 +983,15 @@ independent-checker, and tamper tests with:
 
 ## Verification
 
+- The `isolated_scale::` controls in `qualification_mtls_multiprocess` run
+  three separate voter processes and an external mTLS client for each explicit
+  Async/Durable mode. They check a public exact receipt, joined shutdown of
+  every live voter, and reconstruction from the same storage in three fresh
+  processes. Durable reconstruction must return the recorded receipt and an
+  identical replay; an all-cold Async quorum must remain quarantined under the
+  original negative guard. These small boundary controls do not establish
+  full-cardinality memory or throughput qualification. Legacy configurations
+  omit `isolated_scale` and retain their existing behavior.
 - Source checked: `Cargo.toml`, `src/lib.rs`, and dependent session tests.
 - Run production-mTLS qualification with:
   `cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features -- --test-threads=1`.
@@ -965,6 +1006,53 @@ independent-checker, and tamper tests with:
   `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1`.
 - Run the historical plaintext foundation explicitly with:
   `cargo test -p opc-session-testkit --features foundation-insecure --test qualification_multiprocess`.
+
+
+The ignored `isolated_scale::original::isolated_async_original_workload` and
+`isolated_scale::original::isolated_durable_original_workload` tests use the
+original 50,000 sessions and 1,010,000 exact encrypted outcomes in separate
+voter processes. They retain the original 500 operations/s for 1,800 seconds,
+1,000 operations/s for 60 seconds, 800ms batch deadline, 25ms/100ms item
+percentile limits, eight history epochs and disk/capacity limits. Latency starts
+at each item's scheduled arrival and includes producer delay and batching.
+The paced burst is not a measurement of maximum capacity or proof of a strict
+sustained 1,000 successful DURABLE operations/s floor.
+
+Run one mode at a time inside the authorized build allocation. Supply an
+existing fs-verity directory, a short existing temporary directory, and a new
+evidence directory. No mounts or host settings are created by the runner:
+
+```bash
+OPC_FS_VERITY_QUALIFICATION=required \
+OPC_FS_VERITY_SNAPSHOT_ROOT=/path/to/existing/fs-verity/fresh-run \
+TMPDIR=/short/owned/tmp \
+python3 scripts/observe-session-store-live-memory.py \
+  --workspace-root /short/owned/tmp \
+  --evidence-directory /path/to/new/evidence \
+  -- cargo test --locked --release -p opc-session-testkit --all-features \
+     --test qualification_mtls_multiprocess \
+     isolated_scale::original::isolated_async_original_workload \
+     -- --ignored --exact --nocapture --test-threads=1
+```
+
+For Durable, replace the final test name with
+`isolated_scale::original::isolated_durable_original_workload`. The observer
+keeps actual PID/start-time identities, executable and configuration hashes,
+per-process RSS/PSS/peak estimates, sampling gaps, test output and result hashes.
+It acknowledges the final sample only after all three voters and the external
+driver have been sampled while still alive. Missing coverage fails the run;
+a successful command that ran no qualifying workload also fails. The small
+capture controls can be exercised by setting
+`OPC_SESSION_ISOLATED_FINAL_CAPTURE_CONTROL=1` and selecting `isolated_scale::`
+without `--ignored`. Parser rejection controls run with
+`python3 scripts/test-observe-session-store-live-memory.py`.
+
+These diagnostics do not establish a deployment RAM budget, a quiet-host
+performance qualification, or allocation ownership within each process.
+A process exit is not a zero-memory sample. Full live cardinality is separate
+from the small cold-reconstruction controls and the retained cold-image probe.
+All voters join their shutdown paths after the driver classifies submitted
+effects; failure evidence retains exact requests and classified results.
 
 ## License
 

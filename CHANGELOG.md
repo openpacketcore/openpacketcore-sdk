@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **TLS dependency security:** require Rustls 0.23.45 for
+  RUSTSEC-2026-0285, preserving the existing provider and TLS feature policy.
+  Refresh the workspace and standalone reference lockfiles, including the
+  required WebPKI patch and the reference's previously yanked ChaCha20 patch
+  (Refs #817).
+- `opc-session-net`: join three-voter fixture engines on normal test exits and
+  retain isolation until later service/transport owners retire. Restart keeps
+  the original fixture binding and transfers its guards without reacquiring;
+  production verifier limits and operation deadlines are unchanged (Refs #815).
+- **Cancelled legacy cache verification — `opc-session-store`:** the explicit
+  Linux `PrivateWalTest` route retains an already-started read's connection,
+  permit and WAL guard through cache validation after caller cancellation.
+  The original deadline and foreign-write fence remain enforced; queued
+  cancellation releases unused admission. Late result delivery fails without
+  fencing an owner validated on time. Ordinary SQL cancellation and native
+  persistence are unchanged.
+- `opc-session-store`: distinguish a proven post-activation initialization-probe
+  timeout from genuine admission rejection in the bounded Async recovery test.
+  Per-call test evidence, deterministic deadline and native-scope controls, and
+  clarified recovery documentation preserve production errors and deadlines
+  (Refs #814).
+- **Native journal read admission — `opc-session-store`:** preflight complete
+  journal output before copying and bound concurrent construction to 32 MiB
+  within the existing 128 MiB verifier budget. Oversized requests return
+  `BackendUnavailable` and permit a smaller complete retry without changing
+  cursor, integrity, ownership, persistence, or deadline rules.
 - **SWm STA application extension — `opc-proto-diameter`:** ordinary Session-
   Termination answers may carry the known `Auth-Application-Id` extension
   alongside `User-Name`. Decode and encode require the application value to
@@ -39,6 +65,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Selectable fixed-quorum persistence — `opc-session-store`:** supported
+  `SessionPersistenceMode::Async` acknowledges validated resident storage,
+  real quorum replication, and committed application while one coalescing
+  writer persists local generations. Existing constructors retain `Durable`.
+  Additive openers accept persistence independently of snapshot integrity,
+  including the existing explicit clock and complete-operation deadline shape.
+  Mode-aware readiness, typed passive health, and an explicit local drain
+  report the selected contract. Every existing Async root rejoins through a
+  fresh surviving-quorum commit and exact local catch-up; an all-cold set stays
+  `RecoveryRequired`. Mode mismatches fail closed on disk and consensus/control
+  traffic. Losing the volatile quorum can lose acknowledged results; local
+  persistence does not authorize recovery. No automatic mode migration is
+  provided. See ADR 0022 for semantics and qualification boundaries.
 - **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
   workload scopes select separate bpffs roots and local writer locks. An
   explicit stopped-generation reset reclaims only the unbound current IPv4
