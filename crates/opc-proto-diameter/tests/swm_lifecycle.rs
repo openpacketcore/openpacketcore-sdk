@@ -314,6 +314,290 @@ fn ts29273_sta_fixture_parses_correlates_and_reencodes_byte_exact() {
     );
 }
 
+fn sta_extension_decode_context() -> DecodeContext {
+    DecodeContext {
+        validation_level: opc_protocol::ValidationLevel::Strict,
+        ..DecodeContext::default()
+    }
+}
+
+fn sta_extension_decode(wire: &[u8]) -> Message<'_> {
+    let (tail, message) = Message::decode(wire, sta_extension_decode_context())
+        .expect("synthetic extension fixture must frame under strict validation");
+    assert!(tail.is_empty());
+    message
+}
+
+fn parsed_sta_extension_envelope(message: &Message<'_>) -> SwmSessionTerminationAnswerEnvelope {
+    swm::parse_swm_session_termination_answer_envelope_from_connection(
+        message,
+        CONNECTION_A,
+        sta_extension_decode_context(),
+    )
+    .expect("valid synthetic STA extension must parse strictly")
+}
+
+// Independent six-AVP interoperability shape. All values are invented. The
+// generic extension point is TS 29.273 7.2.2.2.2; RFC 6733 6.8 requires the
+// optional Auth-Application-Id to match the already validated header.
+fn six_avp_sta() -> Vec<Vec<u8>> {
+    vec![
+        wire_avp(base::AVP_SESSION_ID.get(), 0x40, SESSION_ID.as_bytes()),
+        wire_avp(base::AVP_USER_NAME.get(), 0x40, USER_NAME.as_bytes()),
+        wire_avp(base::AVP_RESULT_CODE.get(), 0x40, &2001_u32.to_be_bytes()),
+        wire_avp(base::AVP_ORIGIN_HOST.get(), 0x40, b"aaa.private.invalid"),
+        wire_avp(base::AVP_ORIGIN_REALM.get(), 0x40, b"private.invalid"),
+        wire_avp(
+            base::AVP_AUTH_APPLICATION_ID.get(),
+            0x40,
+            &16_777_264_u32.to_be_bytes(),
+        ),
+    ]
+}
+
+fn direct_str_without_proxies() -> SwmSessionTerminationRequestEnvelope {
+    let mut avps = str_avps();
+    avps.retain(|avp| {
+        let code = u32::from_be_bytes(avp[..4].try_into().unwrap());
+        code != base::AVP_PROXY_INFO.get() && code != base::AVP_ROUTE_RECORD.get()
+    });
+    let wire = wire_message(0xc0, HOP_BY_HOP, END_TO_END, avps);
+    parsed_inbound_request_envelope(&wire).with_expected_answer_peer(SwmExpectedAnswerPeer::direct(
+        CONNECTION_A,
+        "aaa.private.invalid",
+        "private.invalid",
+    ))
+}
+
+#[test]
+fn sta_application_extension_six_avp_success_requires_exact_correlation() {
+    let request = direct_str_without_proxies();
+    let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, six_avp_sta());
+    let answer = swm::parse_swm_session_termination_answer_envelope_from_connection(
+        &sta_extension_decode(&wire),
+        CONNECTION_A,
+        sta_extension_decode_context(),
+    )
+    .expect("legal STA application extension must pass the typed parser");
+    assert_eq!(answer.answer().additional_avps.len(), 2);
+    let rebuilt = swm::build_swm_session_termination_answer(
+        &request,
+        answer.answer(),
+        EncodeContext::default(),
+    )
+    .expect("accepted extensions must also pass strict typed encoding");
+    let rebuilt_wire = encode(&rebuilt);
+    let rebuilt_answer = parsed_sta_extension_envelope(&sta_extension_decode(&rebuilt_wire));
+    assert_eq!(rebuilt_answer.answer(), answer.answer());
+    let exchange = request
+        .correlate_answer(answer)
+        .expect("success requires exact session, transaction and authenticated origin");
+    assert_eq!(
+        exchange.answer().result,
+        SwmSessionTerminationResult::Success
+    );
+}
+
+#[test]
+fn sta_application_extension_optional_presence_and_order_preserve_known_values() {
+    for include_user in [false, true] {
+        for include_application in [false, true] {
+            for reverse_extensions in [false, true] {
+                let mut avps = six_avp_sta();
+                avps.retain(|avp| {
+                    let code = u32::from_be_bytes(avp[..4].try_into().unwrap());
+                    (include_user || code != base::AVP_USER_NAME.get())
+                        && (include_application || code != base::AVP_AUTH_APPLICATION_ID.get())
+                });
+                if reverse_extensions {
+                    avps[1..].reverse();
+                }
+                let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, avps);
+                let answer = parsed_sta_extension_envelope(&sta_extension_decode(&wire));
+                assert_eq!(
+                    answer.answer().additional_avps.len(),
+                    usize::from(include_user) + usize::from(include_application)
+                );
+                let request = direct_str_without_proxies();
+                let rebuilt = swm::build_swm_session_termination_answer(
+                    &request,
+                    answer.answer(),
+                    EncodeContext::default(),
+                )
+                .expect("legal optional extensions reencode");
+                let rebuilt_wire = encode(&rebuilt);
+                assert_eq!(
+                    parsed_sta_extension_envelope(&sta_extension_decode(&rebuilt_wire)).answer(),
+                    answer.answer()
+                );
+                request
+                    .correlate_answer(answer)
+                    .expect("exact answer correlates");
+            }
+        }
+    }
+}
+
+#[test]
+fn sta_application_extension_decode_and_encode_reject_mismatch_and_duplicates() {
+    let request = direct_str_without_proxies();
+    let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, six_avp_sta());
+    let legal_answer = parsed_sta_extension_envelope(&sta_extension_decode(&wire));
+    for value in [0_u32, 16_777_265, u32::MAX] {
+        let mut avps = six_avp_sta();
+        avps[5] = wire_avp(
+            base::AVP_AUTH_APPLICATION_ID.get(),
+            0x40,
+            &value.to_be_bytes(),
+        );
+        let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, avps);
+        let error = swm::parse_swm_session_termination_answer(
+            &sta_extension_decode(&wire),
+            sta_extension_decode_context(),
+        )
+        .expect_err("an extension cannot contradict the validated header");
+        assert!(matches!(
+            error.code(),
+            DecodeErrorCode::Structural {
+                reason: "SWm STA Auth-Application-Id differs from the header application"
+            }
+        ));
+        let mut answer = legal_answer.answer().clone();
+        answer.additional_avps[1] = SwmAdditionalAvp::new(
+            AvpHeader::ietf(base::AVP_AUTH_APPLICATION_ID, true),
+            value.to_be_bytes().to_vec(),
+            EncodeContext::default(),
+        )
+        .unwrap();
+        assert!(swm::build_swm_session_termination_answer(
+            &request,
+            &answer,
+            EncodeContext::default()
+        )
+        .is_err());
+    }
+    for index in [0, 1, 2, 3, 4, 5] {
+        let mut avps = six_avp_sta();
+        avps.push(avps[index].clone());
+        let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, avps);
+        let error = swm::parse_swm_session_termination_answer(
+            &sta_extension_decode(&wire),
+            sta_extension_decode_context(),
+        )
+        .expect_err("all six singleton AVPs reject duplication");
+        assert_eq!(error.code(), &DecodeErrorCode::DuplicateIe);
+    }
+    for index in [0, 1] {
+        let mut answer = legal_answer.answer().clone();
+        answer
+            .additional_avps
+            .push(answer.additional_avps[index].clone());
+        assert!(swm::build_swm_session_termination_answer(
+            &request,
+            &answer,
+            EncodeContext::default()
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn sta_application_extension_full_chain_and_header_validation_remain_strict() {
+    let mut cases = Vec::new();
+    for malformed in [
+        wire_avp(base::AVP_AUTH_APPLICATION_ID.get(), 0x40, &[0, 1, 2]),
+        wire_avp(base::AVP_AUTH_APPLICATION_ID.get(), 0x40, &[0; 8]),
+        wire_avp(
+            base::AVP_AUTH_APPLICATION_ID.get(),
+            0x00,
+            &16_777_264_u32.to_be_bytes(),
+        ),
+    ] {
+        let mut avps = six_avp_sta();
+        avps[5] = malformed;
+        cases.push(wire_message(0x40, HOP_BY_HOP, END_TO_END, avps));
+    }
+    for forbidden in [
+        wire_avp(base::AVP_DESTINATION_HOST.get(), 0x40, b"forbidden.invalid"),
+        wire_avp(
+            base::AVP_DESTINATION_REALM.get(),
+            0x40,
+            b"forbidden.invalid",
+        ),
+        wire_avp(
+            base::AVP_TERMINATION_CAUSE.get(),
+            0x40,
+            &4_u32.to_be_bytes(),
+        ),
+        wire_avp(base::AVP_ROUTE_RECORD.get(), 0x40, b"forbidden.invalid"),
+        wire_avp(UNKNOWN_OPTIONAL_AVP, 0x40, b"unknown-mandatory"),
+        vec![0, 0, 0, 1, 0x40, 0, 0, 7],
+    ] {
+        let mut avps = six_avp_sta();
+        avps.push(forbidden);
+        cases.push(wire_message(0x40, HOP_BY_HOP, END_TO_END, avps));
+    }
+    let mut bad_padding = six_avp_sta();
+    let padded = &mut bad_padding[3];
+    assert_ne!(padded.len(), 8 + b"aaa.private.invalid".len());
+    *padded.last_mut().unwrap() = 1;
+    cases.push(wire_message(0x40, HOP_BY_HOP, END_TO_END, bad_padding));
+    for (offset, value) in [(5_usize, 274_u32), (8, 16_777_265)] {
+        let mut wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, six_avp_sta());
+        if offset == 5 {
+            wire[5..8].copy_from_slice(&value.to_be_bytes()[1..]);
+        } else {
+            wire[8..12].copy_from_slice(&value.to_be_bytes());
+        }
+        cases.push(wire);
+    }
+    for flags in [0xc0, 0x00] {
+        cases.push(wire_message(flags, HOP_BY_HOP, END_TO_END, six_avp_sta()));
+    }
+    for (case, wire) in cases.into_iter().enumerate() {
+        let parsed = Message::decode(&wire, sta_extension_decode_context());
+        if let Ok((tail, message)) = parsed {
+            assert!(tail.is_empty());
+            assert!(
+                swm::parse_swm_session_termination_answer(&message, sta_extension_decode_context())
+                    .is_err(),
+                "malformed synthetic answer case {case} must remain rejected"
+            );
+        }
+    }
+}
+
+#[test]
+fn sta_application_extension_never_bypasses_exact_answer_authority() {
+    let request = direct_str_without_proxies();
+    for index in [0_usize, 3, 4] {
+        let mut avps = six_avp_sta();
+        let code = u32::from_be_bytes(avps[index][..4].try_into().unwrap());
+        avps[index] = wire_avp(code, 0x40, b"replacement.private.invalid");
+        let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, avps);
+        let answer = parsed_sta_extension_envelope(&sta_extension_decode(&wire));
+        assert!(request.clone().correlate_answer(answer).is_err());
+    }
+    for (hop, end, connection) in [
+        (HOP_BY_HOP + 1, END_TO_END, CONNECTION_A),
+        (HOP_BY_HOP, END_TO_END + 1, CONNECTION_A),
+        (HOP_BY_HOP, END_TO_END, CONNECTION_B),
+    ] {
+        let wire = wire_message(0x40, hop, end, six_avp_sta());
+        let answer = swm::parse_swm_session_termination_answer_envelope_from_connection(
+            &sta_extension_decode(&wire),
+            connection,
+            sta_extension_decode_context(),
+        )
+        .expect("well formed foreign answer is parsed before correlation");
+        assert!(request.clone().correlate_answer(answer).is_err());
+    }
+    let wire = wire_message(0x40, HOP_BY_HOP, END_TO_END, six_avp_sta());
+    request
+        .correlate_answer(parsed_sta_extension_envelope(&sta_extension_decode(&wire)))
+        .expect("rejected foreign answers do not prevent the owner's valid completion");
+}
+
 #[test]
 fn recognized_swm_m_bit_overrides_are_tolerated_on_receive_and_cleared_on_send() {
     let mut request_avps = str_avps();
