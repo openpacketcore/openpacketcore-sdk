@@ -6373,6 +6373,10 @@ fn main() -> ExitCode {
 mod shutdown_tests;
 
 #[cfg(test)]
+#[path = "opc-session-quorum-node/readiness_recovery_tests.rs"]
+mod readiness_recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
