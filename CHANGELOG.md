@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **TLS dependency security:** require Rustls 0.23.45 for
+  RUSTSEC-2026-0285, preserving the existing provider and TLS feature policy.
+  Refresh the workspace and standalone reference lockfiles, including the
+  required WebPKI patch and the reference's previously yanked ChaCha20 patch
+  (Refs #817).
 - `opc-session-net`: join three-voter fixture engines on normal test exits and
   retain isolation until later service/transport owners retire. Restart keeps
   the original fixture binding and transfers its guards without reacquiring;
