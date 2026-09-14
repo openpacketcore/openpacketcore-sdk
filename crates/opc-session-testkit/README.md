@@ -299,7 +299,21 @@ same-owner authority at a strictly higher fence, and validate the exact
 scheduled record. Read-only get, restore-scan, and readiness outcomes retain
 the already-proven guard and validate that same exact record without minting
 unnecessary fencing authority. Evidence binds this routing as
-`stage-aware-known-authority/v1`. The private schedule drops one successful
+`stage-aware-known-authority-readiness-reproof/v1`. After a readiness failure,
+the retained-authority checkpoint also requires a fresh durable-readiness
+proof. An exact get uses a logical-time proposal and cannot certify that the
+separate read-index path recovered. Every completed not-ready proof and proof
+timeout consumes the existing interruption budget, and the read-only proof is
+bounded by the remaining original episode deadline. Recovery counters close
+the episode only after both the exact record and readiness are proven.
+
+This changed algorithm has a fresh `opc-session-ha/traffic-resource/v8`
+schedule identity. All numeric bounds, the workload's existing acquisition
+path, and the historical v6 descriptors remain unchanged. The retained-acquire
+v7 schedule introduced in [PR #801](https://github.com/openpacketcore/openpacketcore-sdk/pull/801)
+is a separate source change; this readiness correction does not claim that
+behavior or reinterpret its evidence. The current 3/5-voter traffic and mTLS
+candidate digests bind the readiness-proof algorithm. The private schedule drops one successful
 release response
 per mutator to exercise that path, and is bound to eight outcomes per node, a
 fixed 26-second two-election-plus-operation transition envelope per episode,
