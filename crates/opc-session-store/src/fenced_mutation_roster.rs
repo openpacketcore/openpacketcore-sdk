@@ -1232,6 +1232,52 @@ pub(crate) struct Admission {
     body_commitment: [u8; 32],
 }
 impl Admission {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_for_native_read(&self) -> std::io::Result<Self> {
+        // Proposal, member descriptors and all opaque fields own their Vec
+        // storage. StableId is the sole shared byte backing in this model.
+        // Preserve the already-decoded immutable commitment without a second
+        // serialization or authentication pass during the ownership copy.
+        Ok(Self {
+            proposal: self.proposal.clone(),
+            key: crate::consensus::native::owned::key(&self.key)?,
+            scope: self.scope,
+            logical_owner: self.logical_owner.clone(),
+            admission_fence: self.admission_fence,
+            expected_generation: self.expected_generation,
+            body_commitment: self.body_commitment,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_read_allocation_bytes(&self) -> Option<usize> {
+        let proposal = &self.proposal;
+        let mut bytes = self
+            .key
+            .log_row_reuse_allocation_bytes()?
+            .checked_add(self.logical_owner.allocation_capacity())?
+            .checked_add(
+                proposal
+                    .members
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Member>())?,
+            )?
+            .checked_add(proposal.protected_plan.capacity())?
+            .checked_add(proposal.terminal_checkpoint.capacity())?
+            .checked_add(proposal.terminal_result.capacity())?
+            .checked_add(
+                proposal
+                    .established_mutation
+                    .state_type
+                    .as_ref()
+                    .map_or(0, StateType::allocation_capacity),
+            )?;
+        for member in &proposal.members {
+            bytes = bytes.checked_add(member.descriptor.capacity())?;
+        }
+        Some(bytes)
+    }
+
     pub(crate) fn authenticate(
         proposal: AdmissionProposal,
         key: SessionKey,

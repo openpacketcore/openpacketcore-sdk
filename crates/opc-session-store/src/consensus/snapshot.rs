@@ -758,6 +758,10 @@ pub(crate) struct PinnedSqliteFile {
 struct ImmutableFileGeneration {
     length: u64,
     digest: [u8; 32],
+    /// Whole-file checksum checked after this generation was sealed. Only
+    /// the complete payload verifier can populate it; any new generation
+    /// starts without it, including independent opens and envelope rebinding.
+    verified_payload_checksum: Option<[u8; 32]>,
     /// Linux `ctime` is owned by the kernel and changes when the inode is
     /// modified. It closes the post-scan/pre-publication window without a
     /// second content scan.
@@ -1833,6 +1837,7 @@ impl PinnedSqliteFile {
         self.immutable_generation = Some(ImmutableFileGeneration {
             length: metadata.len(),
             digest,
+            verified_payload_checksum: None,
             change_time: linux_file_change_time(&metadata),
         });
         self.verify_immutable_generation()
@@ -1864,6 +1869,7 @@ impl PinnedSqliteFile {
         self.immutable_generation = Some(ImmutableFileGeneration {
             length: portable.source.length(),
             digest: portable.source.digest(),
+            verified_payload_checksum: None,
             change_time: linux_file_change_time(&metadata),
         });
         self.portable = Some(portable);
@@ -1906,6 +1912,18 @@ impl PinnedSqliteFile {
     /// written between extraction and admission.
     pub(crate) fn verify_payload_checksum(&self, expected: [u8; 32]) -> io::Result<()> {
         self.verify_immutable_generation()?;
+        if let Some(checksum) = self
+            .immutable_generation
+            .and_then(|generation| generation.verified_payload_checksum)
+        {
+            return if checksum == expected {
+                Ok(())
+            } else {
+                Err(invalid_data(
+                    "extracted snapshot checksum differs from its envelope",
+                ))
+            };
+        }
         #[cfg(target_os = "linux")]
         if let Some(portable) = &self.portable {
             return if portable.source.digest() == expected {
@@ -1934,6 +1952,22 @@ impl PinnedSqliteFile {
                 "extracted snapshot checksum differs from its envelope",
             ));
         }
+        Ok(())
+    }
+
+    /// Retain a completed whole-file checksum check with its exact immutable
+    /// generation. Subsequent handoffs still verify the descriptor, links,
+    /// extent, change time and integrity measurement before using this check.
+    pub(crate) fn verify_and_bind_payload_checksum(
+        &mut self,
+        expected: [u8; 32],
+    ) -> io::Result<()> {
+        self.verify_payload_checksum(expected)?;
+        let generation = self
+            .immutable_generation
+            .as_mut()
+            .ok_or_else(|| invalid_data("pinned SQLite file immutable generation is absent"))?;
+        generation.verified_payload_checksum = Some(expected);
         Ok(())
     }
 
@@ -1994,6 +2028,7 @@ impl PinnedSqliteFile {
         pinned.immutable_generation = Some(ImmutableFileGeneration {
             length: metadata.len(),
             digest,
+            verified_payload_checksum: None,
             change_time: linux_file_change_time(&metadata),
         });
         pinned.verify_immutable_generation()?;
@@ -2017,6 +2052,7 @@ impl PinnedSqliteFile {
         pinned.immutable_generation = Some(ImmutableFileGeneration {
             length: metadata.len(),
             digest,
+            verified_payload_checksum: None,
             change_time: linux_file_change_time(&metadata),
         });
         pinned.verify_immutable_generation()?;
@@ -2043,6 +2079,7 @@ impl PinnedSqliteFile {
         pinned.immutable_generation = Some(ImmutableFileGeneration {
             length: metadata.len(),
             digest,
+            verified_payload_checksum: None,
             change_time: linux_file_change_time(&metadata),
         });
         pinned.verify_immutable_generation()?;
@@ -2355,6 +2392,7 @@ impl PinnedSqliteFile {
             self.immutable_generation = Some(ImmutableFileGeneration {
                 length: total_length,
                 digest: rebound_digest,
+                verified_payload_checksum: None,
                 #[cfg(target_os = "linux")]
                 change_time: bound_change_time,
             });

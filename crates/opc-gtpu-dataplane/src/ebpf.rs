@@ -53677,6 +53677,11 @@ mod load_capability_tests {
 
 #[cfg(test)]
 mod tests {
+    // This fixture constructs real durable consensus, whose public platform
+    // contract is Linux-only. The portable fake-runtime tests remain below.
+    #[cfg(target_os = "linux")]
+    mod remote_selector_regression;
+
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::hash::Hash;
     use std::net::Ipv6Addr;
@@ -54172,6 +54177,8 @@ mod tests {
     }
 
     struct FakeRuntime {
+        #[cfg(target_os = "linux")]
+        selector_readback_gate: Mutex<Option<Arc<remote_selector_regression::ReadbackGate>>>,
         ifindexes: HashMap<String, u32>,
         state: Arc<Mutex<FakeState>>,
         environment: EbpfEnvironment,
@@ -54871,6 +54878,8 @@ mod tests {
                     net_admin_capable: true,
                     bpf_capable: true,
                 },
+                #[cfg(target_os = "linux")]
+                selector_readback_gate: Mutex::new(None),
                 cleanup_only_adoption_pause: Mutex::new(None),
                 historical_recovery_effect_pause: Mutex::new(None),
                 cleanup_only_adoption_entries: AtomicUsize::new(0),
@@ -60945,6 +60954,29 @@ mod tests {
             ifindex: u32,
             key: [u8; GTPU_SESSION_GROUP_ID_LEN],
         ) -> Result<Option<[u8; GTPU_SESSION_GROUP_VALUE_LEN]>, GtpuError> {
+            #[cfg(target_os = "linux")]
+            {
+                // Pause only after a real active map mutation, before its exact
+                // readback can authorize the protected coordinator's final claim.
+                let active = self
+                    .state()
+                    .session_groups
+                    .get(&(ifindex, key))
+                    .is_some_and(|raw| {
+                        GtpuSessionGroupRecord::decode(raw)
+                            .is_some_and(|record| record.phase() == GtpuSessionGroupPhase::Active)
+                    });
+                if active {
+                    let gate = self
+                        .selector_readback_gate
+                        .lock()
+                        .expect("readback gate lock")
+                        .take();
+                    if let Some(gate) = gate {
+                        gate.wait()?;
+                    }
+                }
+            }
             let mut state = self.state();
             Self::fail_if_requested(&mut state, "session_group_get")?;
             if !state.grouped_map_ready.contains(&ifindex) {

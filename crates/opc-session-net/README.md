@@ -118,6 +118,10 @@ position but grants no success or authority. Cancellation, timeout, EOF,
 framing, `Protocol`, `Authentication`, `ScopeMismatch`, `Rejected`, evidence
 mismatch, lifecycle retirement, or any uncertain stream position drops it, so
 a late or partial response cannot be consumed by another Openraft RPC. The
+discarded socket shares the existing per-peer reconnect cooldown, including
+when a complete correlated response carries a typed error that forbids reuse.
+This preserves the original returned error and uses the connection's admitted
+epoch, so a late predecessor cannot delay newly published credentials. The
 client applies one absolute logical deadline to lane acquisition, waiting for a
 usable connection, bounded encoding, request write, and response read. Cold
 DNS/TCP/TLS/identity/bootstrap work admitted while that caller is waiting may
@@ -148,7 +152,13 @@ extend either caller's logical deadline. The reserved final third carries the
 first negotiated RPC, so an AppendEntries soft TTL cannot be exhausted by a
 successful handshake before the connection sends useful work. A cached lane
 resets shared reconnect backoff only after a complete validated reusable
-response proves the connection usable.
+response proves the connection usable. Successful cold bootstrap releases its
+setup permit without resetting that backoff, so repeated handshakes followed
+by RPC timeouts retain the existing retry escalation.
+Failure or cancellation during a negotiated call publishes one shared
+reconnect cooldown using the existing lifecycle policy. The loss retains the
+connection's admitted epoch, so a late predecessor cannot delay a newer epoch.
+A complete correlated semantic response does not count as transport loss.
 At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
 outbound lanes. During one bounded retirement step, at most one retiring
 generation per lane may overlap its replacement, for up to 120 server-side
@@ -996,10 +1006,10 @@ authenticated connection, bound to the immutable consensus/configuration
 identity, remote node, admitted TLS material epoch, and explicit
 reauthentication generation. It is monitored for evidence changes, lifecycle
 retirement, and pool shutdown. If a change races with a claim, the claimant
-revalidates and records retirement before dispatch. A connection whose
-authenticated evidence matches the current local generation/material epoch and
-is still dispatch-usable resets the gate. If reconnect cooldown extends beyond
-the admitted cold deadline, that caller returns `Timeout` without dialing or
+revalidates and records retirement before dispatch. A complete reusable RPC
+response on a connection whose authenticated evidence matches the current
+local generation/material epoch resets the consensus gate. If reconnect
+cooldown extends beyond the admitted cold deadline, that caller returns `Timeout` without dialing or
 spinning; a later RPC may retry. Publishing a newer material epoch or requesting
 explicit reauthentication supersedes old cooldowns and cancels an old-epoch
 handshake; the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope,

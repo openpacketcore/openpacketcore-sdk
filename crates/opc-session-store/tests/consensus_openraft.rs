@@ -1,3 +1,6 @@
+#[path = "consensus_openraft/stepdown.rs"]
+mod stepdown;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};

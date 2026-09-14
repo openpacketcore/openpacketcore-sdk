@@ -38,6 +38,7 @@ use crate::identity::RemoteReplicaBinding;
 use crate::lifecycle::{
     directed_connection_key, CertificateExpiryEvidence, ConnectionAttemptMetricGuard,
     ConnectionLifecycle, ConnectionLifecyclePolicy, ReconnectGate, SessionReauthenticationControl,
+    TlsCompletionTime,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -707,16 +708,17 @@ async fn open_connection_attempt(
                     if peer.spiffe_id().as_str() != binding.remote_spiffe_id().as_str() {
                         return Err(ProtocolError::Authentication.into());
                     }
-                    let tls_completed_at = tokio::time::Instant::now();
+                    let tls_completion = TlsCompletionTime::now();
+                    let tls_completed_at = tls_completion.instant();
                     let local_expiry = CertificateExpiryEvidence::capture(
                         attempt.leaf_expires_at(),
                         attempt.certificate_chain_expires_at(),
-                        tls_completed_at,
+                        tls_completion,
                     );
                     let peer_expiry = CertificateExpiryEvidence::capture(
                         peer.leaf_expires_at(),
                         peer.certificate_chain_expires_at(),
-                        tls_completed_at,
+                        tls_completion,
                     );
 
                     let (mut reader, mut writer) = tokio::io::split(tls_stream);

@@ -1637,7 +1637,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
     assert!(workspace.contains("rust-version = \"1.88\""));
     assert!(workspace.contains(
-        "openraft = { version = \"=0.9.24\", git = \"https://github.com/openpacketcore/openraft\", rev = \"f607e636406b16bd0ad7925dbb631da1b7a4cd96\""
+        "openraft = { version = \"=0.9.24\", git = \"https://github.com/openpacketcore/openraft\", rev = \"dddfe2ee7c51394c1b5ed601c85225ce9eca680d\""
     ));
     for manifest in [
         include_str!("../../opc-alarm/Cargo.toml"),
@@ -1654,7 +1654,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let lockfile = include_str!("../../../Cargo.lock");
     assert!(lockfile.contains("name = \"openraft\"\nversion = \"0.9.24\""));
     assert!(lockfile.contains(
-        "source = \"git+https://github.com/openpacketcore/openraft?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96#f607e636406b16bd0ad7925dbb631da1b7a4cd96\""
+        "source = \"git+https://github.com/openpacketcore/openraft?rev=dddfe2ee7c51394c1b5ed601c85225ce9eca680d#dddfe2ee7c51394c1b5ed601c85225ce9eca680d\""
     ));
 }
 
@@ -1691,7 +1691,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     assert_eq!(openraft["req"], "=0.9.24");
     assert_eq!(
         openraft["source"],
-        "git+https://github.com/openpacketcore/openraft?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+        "git+https://github.com/openpacketcore/openraft?rev=dddfe2ee7c51394c1b5ed601c85225ce9eca680d"
     );
     assert_eq!(
         openraft["features"],
@@ -1702,7 +1702,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     assert_eq!(resolved_openraft["version"], "0.9.24");
     assert_eq!(
         resolved_openraft["source"],
-        "git+https://github.com/openpacketcore/openraft?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96#f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+        "git+https://github.com/openpacketcore/openraft?rev=dddfe2ee7c51394c1b5ed601c85225ce9eca680d#dddfe2ee7c51394c1b5ed601c85225ce9eca680d"
     );
     let fork_source = resolved_openraft["source"]
         .as_str()
@@ -1791,7 +1791,8 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         serde_json::json!({
             "consumer-fixture": ["dep:rcgen", "dep:rustls-pki-types"],
             "default": [],
-            "foundation-insecure": ["opc-session-net/insecure-test"]
+            "foundation-insecure": ["opc-session-net/insecure-test"],
+            "test-control": ["opc-session-store/test-control"]
         })
     );
     let foundation_network = testkit["dependencies"]

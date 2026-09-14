@@ -35,6 +35,13 @@ impl NfKind {
         &self.0
     }
 
+    /// Return the allocated capacity of the underlying string, in bytes.
+    ///
+    /// This includes unused capacity and does not allocate or change the NF kind.
+    pub fn allocation_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Check if this NF kind is in the known 3GPP set.
     pub fn is_known(&self) -> bool {
         Self::KNOWN_VALUES.contains(&self.as_str())
@@ -138,3 +145,18 @@ pub type NfType = NfKind;
 
 /// Compatibility alias used by SBI RFC examples.
 pub type NfInstanceId = InstanceId;
+
+#[cfg(test)]
+mod capacity_tests {
+    #[test]
+    fn log_row_reuse_preparation_nf_capacity_includes_slack() {
+        let mut backing = String::with_capacity(4096);
+        backing.push_str("smf");
+        let expected = backing.capacity();
+        let kind = super::NfKind(backing);
+        let before = serde_json::to_vec(&kind).unwrap();
+        assert!(expected > kind.as_str().len());
+        assert_eq!(kind.allocation_capacity(), expected);
+        assert!(serde_json::to_vec(&kind).unwrap() == before);
+    }
+}

@@ -39,6 +39,11 @@ use serde::{
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt};
 
+mod maintenance;
+pub(crate) use maintenance::{
+    ProductionMixedReclaimStream, ProductionMixedTerminalRetirementStream,
+};
+
 /// The sole ledger-global protected-roster charge-witness version accepted.
 ///
 /// This is derived from the roster profile, rather than being an independently
@@ -105,7 +110,7 @@ const PRODUCTION_SNAPSHOT_DOMAIN: &[u8] =
     b"opc/session-store/protected-roster/production-snapshot/v3\0";
 const SNAPSHOT_FLOOR_FRAME_HEADER_BYTES: usize = 14;
 const SNAPSHOT_FLOOR_PARTITION_BYTES: usize = 64;
-const MAX_RETIREMENT_CURSOR_CODEC_BYTES: usize = 256;
+pub(crate) const MAX_RETIREMENT_CURSOR_CODEC_BYTES: usize = 256;
 const TERMINAL_RETENTION_NANOS: i128 = 24 * 60 * 60 * 1_000_000_000;
 #[cfg(test)]
 const SNAPSHOT_CHUNK_HEADER_BYTES: u64 = 5;
@@ -4424,6 +4429,12 @@ impl HydratedProductionReservationRecord {
         &self.record
     }
 
+    /// Return the exact canonical bytes retained by this complete hydration.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+
     /// Return the decoded payload that was validated with this row.
     pub(crate) const fn payload(&self) -> &HydratedProductionReservationPayload {
         &self.payload
@@ -6121,75 +6132,31 @@ pub(crate) fn prepare_production_mixed_reclaim(
     budget: GlobalChargeBudget,
     profile: ChargeProfile,
 ) -> Result<PreparedProductionMixedReclaim, ReservationError> {
-    witness.admits(budget)?;
+    let mut stream = ProductionMixedReclaimStream::new(maintenance_time, witness, budget, profile)?;
     if selected.is_empty() || selected.len() > RECLAIM_BATCH {
         return Err(ReservationError::SnapshotMismatch);
     }
-    let mut previous_order = None;
     let mut rows = Vec::with_capacity(selected.len());
-    let mut guard_rows = Vec::with_capacity(selected.len());
-    let mut counters = witness.roster;
     for selection in selected {
-        match selection {
+        rows.push(stream.push(match selection {
             ProductionMixedReclaimSelection::V1(record) => {
-                record.validate(profile)?;
-                if record.state != ReservationState::Retained {
-                    return Err(ReservationError::InvalidState);
-                }
-                let at = record.terminalized_at.ok_or(ReservationError::StateShape)?;
-                if at.checked_add_retention()? > maintenance_time {
-                    return Err(ReservationError::NotEligible);
-                }
-                let order = (at, record.binding(), ProductionRosterProfileTag::V1);
-                if previous_order.is_some_and(|previous| previous >= order) {
-                    return Err(ReservationError::SnapshotMismatch);
-                }
-                previous_order = Some(order);
-                let mut replacement = (*record).clone();
-                replacement.reclaim_at(maintenance_time, profile)?;
-                counters = counters_without_production_record(counters, record, profile)?;
-                counters = counters_with_production_record(counters, &replacement, profile)?;
-                rows.push(ProductionMixedReclaimRow::V1 {
-                    expected: Box::new((*record).clone()),
-                    replacement: Box::new(replacement),
-                });
-                guard_rows.push(order);
+                ProductionMixedReclaimSelection::V1(record)
             }
             ProductionMixedReclaimSelection::V2(record) => {
-                record.validate(profile)?;
-                if record.state != ProductionReservationStateV2::Retained {
-                    return Err(ReservationError::InvalidState);
-                }
-                let at = record.terminalized_at.ok_or(ReservationError::StateShape)?;
-                if at.checked_add_retention()? > maintenance_time {
-                    return Err(ReservationError::NotEligible);
-                }
-                let order = (at, record.binding(), ProductionRosterProfileTag::V2);
-                if previous_order.is_some_and(|previous| previous >= order) {
-                    return Err(ReservationError::SnapshotMismatch);
-                }
-                previous_order = Some(order);
-                let mut replacement = (*record).clone();
-                replacement.reclaim_at(maintenance_time, profile)?;
-                counters = counters_without_production_record_v2(counters, record, profile)?;
-                counters = counters_with_production_record_v2(counters, &replacement, profile)?;
-                rows.push(ProductionMixedReclaimRow::V2 {
-                    expected: Box::new((*record).clone()),
-                    replacement: Box::new(replacement),
-                });
-                guard_rows.push(order);
+                ProductionMixedReclaimSelection::V2(record)
             }
-        }
+        })?);
     }
-    let next = witness.with_roster(counters);
-    next.admits(budget)?;
+    let maintenance::ReclaimClosure {
+        previous,
+        next,
+        guard,
+    } = stream.finish()?;
     Ok(PreparedProductionMixedReclaim {
         rows,
-        previous: witness,
+        previous,
         next,
-        guard: ProductionMixedReclaimOldestGuard {
-            selected: guard_rows,
-        },
+        guard,
     })
 }
 
@@ -6340,165 +6307,33 @@ pub(crate) fn prepare_production_mixed_terminal_retirement(
     budget: GlobalChargeBudget,
     profile: ChargeProfile,
 ) -> Result<PreparedProductionMixedTerminalRetirement, ReservationError> {
-    witness.admits(budget)?;
+    let mut stream = ProductionMixedTerminalRetirementStream::new(witness, budget, profile)?;
     if selected.is_empty() || selected.len() > RECLAIM_BATCH {
         return Err(ReservationError::SnapshotMismatch);
     }
-    let mut previous_sequence = witness.retired_terminal_sequence();
-    let mut counters = witness.roster;
     let mut rows = Vec::with_capacity(selected.len());
-    let mut guard_rows = Vec::with_capacity(selected.len());
-    let mut seen_bindings = BTreeMap::new();
     for selection in selected {
-        match selection {
+        rows.push(stream.push(match selection {
             ProductionMixedTerminalRetirementSelection::V1(record) => {
-                record.validate(profile)?;
-                let sequence = record
-                    .terminal_sequence()
-                    .ok_or(ReservationError::StateShape)?;
-                if record.state != ReservationState::Tombstone || sequence <= previous_sequence {
-                    return Err(ReservationError::SnapshotMismatch);
-                }
-                if seen_bindings.insert(record.binding(), ()).is_some() {
-                    return Err(ReservationError::Duplicate);
-                }
-                counters = counters_without_production_record(counters, record, profile)?;
-                rows.push(ProductionMixedReclaimRow::DeleteV1(Box::new(
-                    (*record).clone(),
-                )));
-                guard_rows.push((sequence, record.binding(), ProductionRosterProfileTag::V1));
+                ProductionMixedTerminalRetirementSelection::V1(record)
             }
             ProductionMixedTerminalRetirementSelection::V2(record) => {
-                record.validate(profile)?;
-                let sequence = record
-                    .terminal_sequence()
-                    .ok_or(ReservationError::StateShape)?;
-                if record.state != ProductionReservationStateV2::Tombstone
-                    || sequence <= previous_sequence
-                {
-                    return Err(ReservationError::SnapshotMismatch);
-                }
-                if seen_bindings.insert(record.binding(), ()).is_some() {
-                    return Err(ReservationError::Duplicate);
-                }
-                counters = counters_without_production_record_v2(counters, record, profile)?;
-                rows.push(ProductionMixedReclaimRow::DeleteV2(Box::new(
-                    (*record).clone(),
-                )));
-                guard_rows.push((sequence, record.binding(), ProductionRosterProfileTag::V2));
+                ProductionMixedTerminalRetirementSelection::V2(record)
             }
-        }
-        previous_sequence = match guard_rows.last() {
-            Some((sequence, _, _)) => *sequence,
-            None => return Err(ReservationError::SnapshotMismatch),
-        };
+        })?);
     }
-    let mut floor_actions: Vec<ProductionMixedTerminalRetirementFloorAction> =
-        Vec::with_capacity(partitions.len());
-    let mut partition_guards = Vec::with_capacity(partitions.len());
-    let mut covered = BTreeMap::new();
-    for partition in partitions {
-        let key = ProductionFloorKey::from_floor(partition.floor)?;
-        if covered.insert((key, partition.target_epoch), ()).is_some() {
-            return Err(ReservationError::Duplicate);
-        }
-        let mut bindings = selected
-            .iter()
-            .filter_map(|selection| {
-                let binding = match selection {
-                    ProductionMixedTerminalRetirementSelection::V1(record) => record.binding(),
-                    ProductionMixedTerminalRetirementSelection::V2(record) => record.binding(),
-                };
-                (ProductionFloorKey::from_binding(binding).ok() == Some(key)
-                    && binding.history_epoch() == partition.target_epoch)
-                    .then_some(binding)
-            })
-            .collect::<Vec<_>>();
-        bindings.sort_unstable();
-        if bindings.is_empty() || bindings.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(ReservationError::FloorAdvance);
-        }
-        if let Some(cursor) = partition.cursor.as_ref() {
-            cursor.validate_for_floor(partition.floor)?;
-            if cursor.target_epoch() != partition.target_epoch {
-                return Err(ReservationError::FloorAdvance);
-            }
-        }
-        for binding in &bindings {
-            partition
-                .floor
-                .validate_new_binding(*binding)
-                .map_err(|_| ReservationError::FloorAdvance)?;
-        }
-        let (floor, cursor) = if partition.final_batch {
-            let replacement = partition
-                .floor
-                .advance_to(partition.target_epoch)
-                .map_err(|_| ReservationError::FloorAdvance)?;
-            counters = counters_without_production_floor(counters, partition.floor)?;
-            if !partition.partition_empty_after {
-                counters = counters_with_production_floor(counters, replacement)?;
-            }
-            if let Some(cursor) = partition.cursor.as_ref() {
-                counters = counters_without_retirement_cursor(counters, cursor)?;
-            }
-            (
-                ProductionFloorCas {
-                    key,
-                    expected: Some(partition.floor),
-                    replacement: (!partition.partition_empty_after).then_some(replacement),
-                },
-                ProductionRetirementCursorCas {
-                    key,
-                    expected: partition.cursor.clone(),
-                    replacement: None,
-                },
-            )
-        } else {
-            // A global terminal-sequence prefix does not establish that its
-            // bindings are the next contiguous range in this partition's
-            // binding order. It therefore cannot create or advance a
-            // partition-local cursor. An already durable cursor is preserved
-            // until a final page consumes it.
-            (
-                ProductionFloorCas {
-                    key,
-                    expected: Some(partition.floor),
-                    replacement: Some(partition.floor),
-                },
-                ProductionRetirementCursorCas {
-                    key,
-                    expected: partition.cursor.clone(),
-                    replacement: partition.cursor.clone(),
-                },
-            )
-        };
-        partition_guards.push(ProductionMixedTerminalRetirementPartitionGuard);
-        floor_actions.push(ProductionMixedTerminalRetirementFloorAction { floor, cursor });
-    }
-    for selection in selected {
-        let binding = match selection {
-            ProductionMixedTerminalRetirementSelection::V1(record) => record.binding(),
-            ProductionMixedTerminalRetirementSelection::V2(record) => record.binding(),
-        };
-        let key = ProductionFloorKey::from_binding(binding)?;
-        if !covered.contains_key(&(key, binding.history_epoch())) {
-            return Err(ReservationError::FloorAdvance);
-        }
-    }
-    let next = witness
-        .with_roster(counters)
-        .retire_through_terminal_sequence(previous_sequence)?;
-    next.admits(budget)?;
+    let maintenance::RetirementClosure {
+        floor_actions,
+        previous,
+        next,
+        guard,
+    } = stream.finish(partitions)?;
     Ok(PreparedProductionMixedTerminalRetirement {
         rows,
         floor_actions,
-        previous: witness,
+        previous,
         next,
-        guard: ProductionMixedTerminalRetirementGuard {
-            selected: guard_rows,
-            partitions: partition_guards,
-        },
+        guard,
     })
 }
 
@@ -7221,6 +7056,152 @@ pub(crate) struct ProductionSnapshotStreamValidator {
     terminal_sequences: BTreeMap<u64, RequestBindingKey>,
 }
 
+/// Scalar charge contributions derived by the original complete row validator.
+/// This cannot be deserialized and grants no row, signature or uniqueness
+/// admission. Native generation recovery keeps it beside its prospective
+/// indexes so each checkpoint can compare the same witness without retaining
+/// decoded historical carriers or rescanning all earlier rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProductionSnapshotAccounting {
+    counters: AggregateCounters,
+    record_count: usize,
+    floor_count: usize,
+    cursor_count: usize,
+}
+
+impl ProductionSnapshotAccounting {
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            counters: zero_counters(),
+            record_count: 0,
+            floor_count: 0,
+            cursor_count: 0,
+        }
+    }
+
+    /// Replace only previously derived contributions. Intermediate counts may
+    /// cross a final cardinality bound while a checkpoint swaps disjoint rows;
+    /// all arithmetic is checked and finish enforces the original limits.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn replace(
+        &mut self,
+        before: Option<Self>,
+        after: Option<Self>,
+    ) -> Result<(), ReservationError> {
+        let before = before.unwrap_or_else(Self::empty);
+        let after = after.unwrap_or_else(Self::empty);
+        macro_rules! replace {
+            ($value:expr,$old:expr,$new:expr) => {
+                $value
+                    .checked_sub($old)
+                    .ok_or(ReservationError::WitnessMismatch)?
+                    .checked_add($new)
+                    .ok_or(ReservationError::Arithmetic)?
+            };
+        }
+        let counters = AggregateCounters {
+            materialized_charge_bytes: replace!(
+                self.counters.materialized_charge_bytes,
+                before.counters.materialized_charge_bytes,
+                after.counters.materialized_charge_bytes
+            ),
+            reserved_future_charge_bytes: replace!(
+                self.counters.reserved_future_charge_bytes,
+                before.counters.reserved_future_charge_bytes,
+                after.counters.reserved_future_charge_bytes
+            ),
+            live_reservations: replace!(
+                self.counters.live_reservations,
+                before.counters.live_reservations,
+                after.counters.live_reservations
+            ),
+            retained_and_live_bindings: replace!(
+                self.counters.retained_and_live_bindings,
+                before.counters.retained_and_live_bindings,
+                after.counters.retained_and_live_bindings
+            ),
+            durable_epoch_bindings: replace!(
+                self.counters.durable_epoch_bindings,
+                before.counters.durable_epoch_bindings,
+                after.counters.durable_epoch_bindings
+            ),
+            floor_count: replace!(
+                self.counters.floor_count,
+                before.counters.floor_count,
+                after.counters.floor_count
+            ),
+            floor_charge_bytes: replace!(
+                self.counters.floor_charge_bytes,
+                before.counters.floor_charge_bytes,
+                after.counters.floor_charge_bytes
+            ),
+            retirement_cursor_count: replace!(
+                self.counters.retirement_cursor_count,
+                before.counters.retirement_cursor_count,
+                after.counters.retirement_cursor_count
+            ),
+            retirement_cursor_charge_bytes: replace!(
+                self.counters.retirement_cursor_charge_bytes,
+                before.counters.retirement_cursor_charge_bytes,
+                after.counters.retirement_cursor_charge_bytes
+            ),
+        };
+        let next = Self {
+            counters,
+            record_count: replace!(self.record_count, before.record_count, after.record_count),
+            floor_count: replace!(self.floor_count, before.floor_count, after.floor_count),
+            cursor_count: replace!(self.cursor_count, before.cursor_count, after.cursor_count),
+        };
+        *self = next;
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        self,
+        application_sequence: u64,
+        witness: Option<GlobalChargeWitness>,
+        budget: GlobalChargeBudget,
+    ) -> Result<(), ReservationError> {
+        if self.record_count != self.counters.durable_epoch_bindings
+            || self.floor_count != self.counters.floor_count
+            || self.cursor_count != self.counters.retirement_cursor_count
+        {
+            return Err(ReservationError::WitnessMismatch);
+        }
+        if self.counters.live_reservations > MAX_LIVE_ROSTERS {
+            return Err(ReservationError::LiveLimit);
+        }
+        if self.counters.retained_and_live_bindings > MAX_RESERVED_AND_RETAINED {
+            return Err(ReservationError::BindingLimit);
+        }
+        if self.record_count > MAX_RESERVED_AND_RETAINED {
+            return Err(ReservationError::DurableBindingLimit);
+        }
+        if self.floor_count > MAX_RESERVED_AND_RETAINED
+            || self.cursor_count > MAX_RESERVED_AND_RETAINED
+        {
+            return Err(ReservationError::FloorLimit);
+        }
+        match witness {
+            None if self.record_count == 0 && self.floor_count == 0 && self.cursor_count == 0 => {
+                Ok(())
+            }
+            None => Err(ReservationError::SnapshotMismatch),
+            Some(witness) => {
+                if witness.retired_terminal_sequence() > application_sequence {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                witness.admits(budget)?;
+                if witness.roster != self.counters {
+                    return Err(ReservationError::WitnessMismatch);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl ProductionSnapshotStreamValidator {
     /// Start an empty SQL-stream validation pass.
     pub(crate) const fn new(
@@ -7425,21 +7406,20 @@ impl ProductionSnapshotStreamValidator {
         witness: Option<GlobalChargeWitness>,
         budget: GlobalChargeBudget,
     ) -> Result<(), ReservationError> {
-        match witness {
-            None if self.record_count == 0 && self.floor_count == 0 && self.cursor_count == 0 => {
-                Ok(())
-            }
-            None => Err(ReservationError::SnapshotMismatch),
-            Some(witness) => {
-                if witness.retired_terminal_sequence() > self.application_sequence {
-                    return Err(ReservationError::SnapshotMismatch);
-                }
-                witness.admits(budget)?;
-                if witness.roster != self.counters {
-                    return Err(ReservationError::WitnessMismatch);
-                }
-                Ok(())
-            }
+        let application_sequence = self.application_sequence;
+        self.into_accounting()
+            .finish(application_sequence, witness, budget)
+    }
+
+    /// Destroy the stream's temporary uniqueness maps before returning only
+    /// its derived scalar charge. A caller combining such fragments must
+    /// independently enforce their shared binding and terminal-sequence keys.
+    pub(crate) fn into_accounting(self) -> ProductionSnapshotAccounting {
+        ProductionSnapshotAccounting {
+            counters: self.counters,
+            record_count: self.record_count,
+            floor_count: self.floor_count,
+            cursor_count: self.cursor_count,
         }
     }
 }
@@ -8127,7 +8107,7 @@ impl fmt::Debug for ProductionRowCas {
 /// partition commitment.  The retired epoch follows those two commitments,
 /// so this key remains stable across monotonic floor advances without exposing
 /// a tenant identity.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ProductionFloorKey([u8; SNAPSHOT_FLOOR_PARTITION_BYTES]);
 
 impl Serialize for ProductionFloorKey {

@@ -19,8 +19,8 @@ categories = ["network-programming", "data-structures"]
 default = []
 # Process-local lab state only; never supplies persistence or cross-process HA.
 lab-memory = []
-# Enables non-production consensus election controls used only by integration
-# tests that must deterministically exercise a real authenticated campaign.
+# Enables non-production consensus election and live-owner fault controls for
+# integration tests, including independent native/SQL authority witnesses.
 test-control = []
 # Test-only VFS hooks used to qualify SQLite durability boundaries with the
 # bundled SQLite build. This feature is never enabled by production crates.
@@ -38,8 +38,14 @@ opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 postcard = { workspace = true }
+# Native snapshot captures retain immutable container roots. Ordinary writes
+# copy only the changed paths; they never clone the retained history index.
+imbl = { version = "=7.0.2", features = ["serde"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync", "io-util", "fs", "rt"] }
+# The bounded SQLite scheduler handoff relies on the validated blocking-pool
+# FIFO retirement order. Enforce it for SDK consumers, whose lockfile is their
+# own; upgrades require the handoff queue/lifetime matrix to be revalidated.
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "io-util", "fs", "rt"] }
 tracing = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
@@ -65,12 +71,19 @@ rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks", "limits
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
+# Measure native owner allocations in focused, single-threaded unit tests.
+# This workspace dependency is never linked into the production store.
+allocation-counter = { workspace = true }
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["test-vfs"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }
 tempfile = "3"
 proptest = "1.9"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The allocation counter is thread-local; pin only its model-measurement thread.
+nix = { workspace = true, features = ["sched"] }
 
 [[test]]
 name = "sqlite_checkpoint_hotpath"

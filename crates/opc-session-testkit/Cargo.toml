@@ -9,6 +9,8 @@ description = "Chaos and failure testing testkit for OpenPacketCore session repl
 default = []
 foundation-insecure = ["opc-session-net/insecure-test"]
 consumer-fixture = ["dep:rcgen", "dep:rustls-pki-types"]
+# Passive, redacted engine/storage observations for qualification diagnostics.
+test-control = ["opc-session-store/test-control"]
 
 [dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }

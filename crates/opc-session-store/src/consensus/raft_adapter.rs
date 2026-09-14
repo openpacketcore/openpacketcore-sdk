@@ -26,6 +26,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
 
+use super::persistence_protocol::{self, PersistenceProtocol};
+
 use super::{
     SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
@@ -844,6 +846,7 @@ fn validate_peer_transition_scope(
 pub(crate) struct SessionRaftNetworkFactory {
     local_node_id: SessionConsensusNodeId,
     peer_directory: SessionRaftPeerDirectory,
+    persistence: PersistenceProtocol,
 }
 
 impl SessionRaftNetworkFactory {
@@ -857,6 +860,7 @@ impl SessionRaftNetworkFactory {
     ) -> Result<Self, SessionRaftAdapterError> {
         Ok(Self {
             local_node_id,
+            persistence: PersistenceProtocol::default(),
             peer_directory: SessionRaftPeerDirectory::try_new(
                 identity,
                 local_node_id,
@@ -875,6 +879,7 @@ impl SessionRaftNetworkFactory {
     ) -> Result<Self, SessionRaftAdapterError> {
         Ok(Self {
             local_node_id,
+            persistence: PersistenceProtocol::default(),
             peer_directory: SessionRaftPeerDirectory::try_new_candidate(
                 current_identity,
                 local_node_id,
@@ -886,6 +891,11 @@ impl SessionRaftNetworkFactory {
     /// Shared dynamic directory used by the membership transition driver.
     pub(crate) fn peer_directory(&self) -> SessionRaftPeerDirectory {
         self.peer_directory.clone()
+    }
+
+    pub(crate) fn with_persistence(mut self, persistence: PersistenceProtocol) -> Self {
+        self.persistence = persistence;
+        self
     }
 }
 
@@ -910,6 +920,7 @@ impl RaftNetworkFactory<SessionRaftTypeConfig> for SessionRaftNetworkFactory {
             local_node_id: self.local_node_id,
             target,
             peer_directory: self.peer_directory.clone(),
+            persistence: self.persistence.clone(),
         }
     }
 }
@@ -919,6 +930,7 @@ pub(crate) struct SessionRaftNetwork {
     local_node_id: SessionConsensusNodeId,
     target: SessionConsensusNodeId,
     peer_directory: SessionRaftPeerDirectory,
+    persistence: PersistenceProtocol,
 }
 
 impl fmt::Debug for SessionRaftNetwork {
@@ -954,6 +966,11 @@ impl SessionRaftNetwork {
         Resp: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
     {
+        if !self.persistence.is_active() {
+            return Err(EngineRpcError::Unreachable(Unreachable::new(
+                &SessionConsensusPeerError::Rejected,
+            )));
+        }
         // Keep the route-generation permit for the complete peer call. A
         // uniform apply waits for all predecessor-scoped calls already in
         // flight before publishing successor routes.
@@ -970,6 +987,12 @@ impl SessionRaftNetwork {
             )));
         }
 
+        let payload = persistence_protocol::wrap_payload(
+            self.persistence.mode(),
+            payload,
+            family.max_request_payload_bytes(),
+        )
+        .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
         let wire = SessionConsensusWireRequest::try_new(
             route.identity,
             self.local_node_id,
@@ -990,10 +1013,12 @@ impl SessionRaftNetwork {
         let payload = response
             .result
             .map_err(|error| map_peer_error(error, action, self, hard_ttl))?;
-        let result: Result<Resp, RaftError<SessionConsensusNodeId, E>> = decode_bounded(&payload)
+        let payload = persistence_protocol::unwrap_payload(self.persistence.mode(), &payload)
+            .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
+        let result: Result<Resp, RaftError<SessionConsensusNodeId, E>> = decode_bounded(payload)
             .map_err(|error| {
-            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
-        })?;
+                EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+            })?;
         result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
     }
 
@@ -1006,12 +1031,37 @@ impl SessionRaftNetwork {
     ) -> Result<AppendEntriesResponse<SessionConsensusNodeId>, EngineRpcError> {
         let entry_count = request.entries.len();
         let roster_append = is_singleton_roster_append(request);
+        let family = if roster_append {
+            SessionConsensusRpcFamily::AppendEntriesRoster
+        } else {
+            SessionConsensusRpcFamily::AppendEntries
+        };
         let payload = match if roster_append {
             encode_roster_bounded(request)
         } else {
             encode_bounded(request)
         } {
-            Ok(payload) => payload,
+            Ok(payload)
+                if persistence_protocol::payload_fits(
+                    self.persistence.mode(),
+                    family,
+                    payload.len(),
+                ) =>
+            {
+                payload
+            }
+            Ok(_) => {
+                if !roster_append {
+                    if let Some(entries_hint) = append_entries_split_hint(entry_count) {
+                        return Err(EngineRpcError::PayloadTooLarge(
+                            PayloadTooLarge::new_entries_hint(entries_hint),
+                        ));
+                    }
+                }
+                return Err(EngineRpcError::Unreachable(Unreachable::new(
+                    &CodecTransportError(ConsensusCodecError::TooLarge),
+                )));
+            }
             Err(ConsensusCodecError::TooLarge) => {
                 if !roster_append {
                     if let Some(entries_hint) = append_entries_split_hint(entry_count) {
@@ -1031,11 +1081,7 @@ impl SessionRaftNetwork {
             }
         };
         self.call(
-            if roster_append {
-                SessionConsensusRpcFamily::AppendEntriesRoster
-            } else {
-                SessionConsensusRpcFamily::AppendEntries
-            },
+            family,
             opc_consensus::engine::RPCTypes::AppendEntries,
             payload,
             option,
@@ -1148,6 +1194,7 @@ pub(crate) struct SessionRaftRpcHandler {
     peer_directory: SessionRaftPeerDirectory,
     local_node_id: SessionConsensusNodeId,
     fixed_quorum_admission: Option<FixedQuorumEngineAdmission>,
+    persistence: PersistenceProtocol,
 }
 
 impl SessionRaftRpcHandler {
@@ -1161,6 +1208,7 @@ impl SessionRaftRpcHandler {
             peer_directory,
             local_node_id,
             fixed_quorum_admission: None,
+            persistence: PersistenceProtocol::default(),
         }
     }
 
@@ -1175,7 +1223,13 @@ impl SessionRaftRpcHandler {
             peer_directory,
             local_node_id,
             fixed_quorum_admission: Some(fixed_quorum_admission),
+            persistence: PersistenceProtocol::default(),
         }
+    }
+
+    pub(crate) fn with_persistence(mut self, persistence: PersistenceProtocol) -> Self {
+        self.persistence = persistence;
+        self
     }
 
     /// Handle a raw engine RPC using the complete inbound operation deadline.
@@ -1186,12 +1240,64 @@ impl SessionRaftRpcHandler {
     pub(crate) async fn handle_before(
         &self,
         authenticated_sender: SessionConsensusNodeId,
-        request: SessionConsensusWireRequest,
+        mut request: SessionConsensusWireRequest,
         deadline: tokio::time::Instant,
     ) -> SessionConsensusWireResponse {
         if let Err(error) = validate_envelope(authenticated_sender, &request) {
             return rejected_response(error);
         }
+        request.payload = match persistence_protocol::unwrap_owned_payload(
+            self.persistence.mode(),
+            request.payload,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => return rejected_response(error),
+        };
+        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async
+            && !self.persistence.is_active()
+        {
+            let permit = match tokio::time::timeout_at(
+                deadline,
+                Arc::clone(&self.persistence.cold_rpc_admission).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => return rejected_response(SessionConsensusPeerError::Timeout),
+            };
+            let handler = self.clone();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            // A cancelled transport must not drop the attempt's read guard
+            // while Raft still owns an accepted append or snapshot install.
+            // The finite permit is retained until its real engine completion.
+            tokio::spawn(async move {
+                let response = handler
+                    .handle_payload_before(authenticated_sender, request, deadline)
+                    .await;
+                let _ = send.send(response);
+                drop(permit);
+            });
+            match tokio::time::timeout_at(deadline, receive).await {
+                Ok(Ok(response)) => response,
+                _ => return rejected_response(SessionConsensusPeerError::Timeout),
+            }
+        } else {
+            self.handle_payload_before(authenticated_sender, request, deadline)
+                .await
+        };
+        persistence_protocol::wrap_response(self.persistence.mode(), response)
+    }
+
+    async fn handle_payload_before(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+        deadline: tokio::time::Instant,
+    ) -> SessionConsensusWireResponse {
+        let persistence = match self.persistence.engine_before(deadline).await {
+            Ok(admission) => admission,
+            Err(error) => return rejected_response(error),
+        };
         if let Some(authority) = &self.fixed_quorum_admission {
             // Initial formation permits only the pristine durable membership;
             // every other raw engine entry requires the exact durable fixed
@@ -1240,7 +1346,24 @@ impl SessionRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.append_entries(rpc).await)
+                if !persistence.permits_append(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                let matched = rpc
+                    .entries
+                    .last()
+                    .map(|entry| entry.log_id)
+                    .or(rpc.prev_log_id);
+                let result = self.raft.append_entries(rpc).await;
+                if matches!(result, Ok(AppendEntriesResponse::Conflict))
+                    && persistence.request_cold_repair()
+                {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                if matches!(result, Ok(AppendEntriesResponse::Success)) {
+                    persistence.confirm_append(matched);
+                }
+                encode_engine_result(&result)
             }
             SessionConsensusRpcFamily::AppendEntriesRoster => {
                 let rpc = match decode_roster_and_bind_sender::<
@@ -1251,9 +1374,29 @@ impl SessionRaftRpcHandler {
                     Ok(_) => return rejected_response(SessionConsensusPeerError::Protocol),
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.append_entries(rpc).await)
+                if !persistence.permits_append(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                let matched = rpc
+                    .entries
+                    .last()
+                    .map(|entry| entry.log_id)
+                    .or(rpc.prev_log_id);
+                let result = self.raft.append_entries(rpc).await;
+                if matches!(result, Ok(AppendEntriesResponse::Conflict))
+                    && persistence.request_cold_repair()
+                {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                if matches!(result, Ok(AppendEntriesResponse::Success)) {
+                    persistence.confirm_append(matched);
+                }
+                encode_engine_result(&result)
             }
             SessionConsensusRpcFamily::Vote => {
+                if !persistence.permits_vote() {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
                 let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
                     &request.payload,
                     request.sender,
@@ -1271,6 +1414,9 @@ impl SessionRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
+                if !persistence.permits_snapshot(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
                 if rpc.done
                     && self
                         .peer_directory
@@ -2313,13 +2459,33 @@ mod tests {
         leader: SessionConsensusNodeId,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum FixedAuthorityBackend {
+        Sqlite,
+        #[cfg(target_os = "linux")]
+        Native,
+    }
+
     async fn fixed_follower_fixture(
         operation_timeout: Duration,
         admitted: bool,
+        selected: FixedAuthorityBackend,
     ) -> FixedFollowerFixture {
         let temp = tempfile::tempdir().expect("follower tempdir");
         let backend = SqliteSessionBackend::open(temp.path().join("sessions.sqlite"))
             .expect("follower backend");
+        #[cfg(target_os = "linux")]
+        let backend = {
+            let mut backend = backend;
+            if matches!(selected, FixedAuthorityBackend::Sqlite) {
+                // Retain the original SQL authority controls on an explicitly
+                // selected legacy fixture, alongside the native controls.
+                backend.native_owner = None;
+            }
+            backend
+        };
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(selected, FixedAuthorityBackend::Sqlite));
         let scope = identity(0x81);
         let leader = node_id(1);
         let local = node_id(2);
@@ -2349,6 +2515,15 @@ mod tests {
             )
             .await
             .expect("fixed follower storage");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            backend
+                .native_owner
+                .as_ref()
+                .is_some_and(|owner| owner.selected()),
+            matches!(selected, FixedAuthorityBackend::Native),
+            "the raw handler fixture must exercise its named authority owner"
+        );
         if admitted {
             let membership = membership_entry(leader, 0, vec![members.clone()], members.clone());
             log_store
@@ -2403,7 +2578,17 @@ mod tests {
 
     #[tokio::test]
     async fn raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family() {
-        let fixture = fixed_follower_fixture(Duration::from_secs(1), true).await;
+        for selected in [
+            FixedAuthorityBackend::Sqlite,
+            #[cfg(target_os = "linux")]
+            FixedAuthorityBackend::Native,
+        ] {
+            assert_one_raw_authority_check_per_family(selected).await;
+        }
+    }
+
+    async fn assert_one_raw_authority_check_per_family(selected: FixedAuthorityBackend) {
+        let fixture = fixed_follower_fixture(Duration::from_secs(1), true, selected).await;
         fixture
             .backend
             .fixed_quorum_durable_check_count
@@ -2436,7 +2621,7 @@ mod tests {
                     .fixed_quorum_durable_check_count
                     .load(Ordering::SeqCst),
                 before + 1,
-                "each admitted {family:?} has exactly one durable SQLite authority check"
+                "each admitted {family:?} has exactly one {selected:?} authority check"
             );
         }
         fixture
@@ -2449,7 +2634,9 @@ mod tests {
     #[tokio::test]
     async fn raw_fixed_handler_rejects_vote_before_admission_after_durable_placement_policy_drift()
     {
-        let fixture = fixed_follower_fixture(Duration::from_secs(1), false).await;
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), false, FixedAuthorityBackend::Sqlite)
+                .await;
         let conn = rusqlite::Connection::open(fixture._temp.path().join("sessions.sqlite"))
             .expect("open fixed voter database");
         conn.execute(
@@ -2490,7 +2677,8 @@ mod tests {
     #[tokio::test]
     async fn raw_fixed_handler_authority_check_honors_the_complete_operation_deadline() {
         let operation_timeout = Duration::from_millis(40);
-        let fixture = fixed_follower_fixture(operation_timeout, true).await;
+        let fixture =
+            fixed_follower_fixture(operation_timeout, true, FixedAuthorityBackend::Sqlite).await;
         let held_sqlite_lock = fixture.backend.lock_connection_for_test().await;
         let request = SessionConsensusWireRequest::try_new(
             fixture.scope,
@@ -2521,6 +2709,290 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown fixed test Raft");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_authority_check_honors_the_complete_operation_deadline() {
+        let fixture = fixed_follower_fixture(
+            Duration::from_millis(40),
+            true,
+            FixedAuthorityBackend::Native,
+        )
+        .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native owner selected")
+            .current()
+            .expect("live native owner");
+        let before = wal
+            .native_activation_facts_for_test()
+            .expect("raw owner before");
+        let held_wal = Arc::clone(&wal);
+        let (entered, holding) = tokio::sync::oneshot::channel();
+        let holder = std::thread::spawn(move || {
+            held_wal.with_native_owner_held_for_test(|| {
+                entered.send(()).expect("test awaits real lock acquisition");
+                // Release the fault independently of the Tokio executor, so
+                // even a blocking production regression can finish cleanup.
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        });
+        holding.await.expect("real native owner held");
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let started = Instant::now();
+        let response = fixture.handler.handle(fixture.leader, request).await;
+        let elapsed = started.elapsed();
+        holder
+            .join()
+            .expect("join finite fault")
+            .expect("held native owner");
+        let after = wal
+            .native_activation_facts_for_test()
+            .expect("raw owner after");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        eprintln!("native raw authority elapsed_us={}", elapsed.as_micros());
+        assert_eq!(
+            response.result,
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "a held native authority lock fails closed before engine admission"
+        );
+        assert!(elapsed >= Duration::from_millis(20));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "native authority consumes the unchanged 40 ms operation deadline"
+        );
+        assert_eq!(
+            after, before,
+            "timed-out authority cannot mutate vote/log/application"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_rejects_vote_before_admission_after_native_placement_policy_drift() {
+        use crate::readiness::PlacementResiliencePolicy::{
+            AllowReducedResilience, RequireIndependentFailureDomains,
+        };
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), false, FixedAuthorityBackend::Native)
+                .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native selection")
+            .current()
+            .expect("native owner");
+        let before = wal
+            .native_activation_facts_for_test()
+            .expect("raw pristine owner");
+        assert_eq!(before["placement"], 1);
+        wal.replace_native_placement_for_test(
+            RequireIndependentFailureDomains,
+            AllowReducedResilience,
+        )
+        .expect("inject only live placement fault");
+        let faulted = wal
+            .native_activation_facts_for_test()
+            .expect("independent fault readback");
+        let mut expected = before.clone();
+        expected["placement"] = serde_json::json!(2);
+        assert_eq!(
+            faulted, expected,
+            "only the selected live authority field changed"
+        );
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let response = fixture.handler.handle(fixture.leader, request).await;
+        let after = wal
+            .native_activation_facts_for_test()
+            .expect("raw rejected owner");
+        wal.replace_native_placement_for_test(
+            AllowReducedResilience,
+            RequireIndependentFailureDomains,
+        )
+        .expect("restore only this live placement field");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        assert_eq!(
+            response.result,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        assert_eq!(
+            after, faulted,
+            "rejected vote changes no native engine/application fact"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .fixed_quorum_durable_check_count
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_applied_membership_requires_the_exact_uniform_voters() {
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), true, FixedAuthorityBackend::Native)
+                .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native selection")
+            .current()
+            .expect("native owner");
+        let before = wal
+            .native_activation_facts_for_test()
+            .expect("raw admitted owner");
+        let restore = wal
+            .native_fixed_authority_fault_for_test(6)
+            .expect("alter only the live applied membership");
+        let faulted = wal
+            .native_activation_facts_for_test()
+            .expect("raw fault readback");
+        let members = BTreeSet::from([node_id(1), node_id(2), node_id(3)]);
+        let bindings = member_bindings(&members);
+        let policy = crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains;
+        let immediate = fixture.backend.fixed_quorum_authority_is_exact_now(
+            fixture.scope,
+            &members,
+            &bindings,
+            policy,
+        );
+        let raw = fixture
+            .backend
+            .fixed_quorum_authority_record_is_exact(
+                fixture.scope,
+                &members,
+                &bindings,
+                policy,
+                false,
+            )
+            .await;
+        let after = wal
+            .native_activation_facts_for_test()
+            .expect("raw post-check owner");
+        restore().expect("restore only applied membership");
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        assert_eq!(
+            faulted["business"]["membership_log_id"],
+            before["business"]["membership_log_id"]
+        );
+        assert_eq!(
+            faulted["business"]["membership_configs"][0]
+                .as_array()
+                .expect("raw voters")
+                .len(),
+            2
+        );
+        assert_eq!(faulted["scope_members"], before["scope_members"]);
+        assert_eq!(faulted["authority_members"], before["authority_members"]);
+        assert_eq!(after, faulted, "authority probes mutate no owner facts");
+        assert!(
+            !immediate,
+            "a log ID alone cannot establish the exact applied voter set"
+        );
+        assert!(
+            !raw,
+            "raw engine admission requires the exact uniform applied membership"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_immediate_authority_never_waits_for_a_held_owner() {
+        let fixture = fixed_follower_fixture(
+            Duration::from_millis(40),
+            true,
+            FixedAuthorityBackend::Native,
+        )
+        .await;
+        let wal = fixture
+            .backend
+            .native_owner
+            .as_ref()
+            .expect("native selection")
+            .current()
+            .expect("native owner");
+        let held_wal = Arc::clone(&wal);
+        let (entered, holding) = tokio::sync::oneshot::channel();
+        let holder = std::thread::spawn(move || {
+            held_wal.with_native_owner_held_for_test(|| {
+                entered.send(()).expect("test awaits real lock acquisition");
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        });
+        holding.await.expect("real owner held");
+        let members = BTreeSet::from([node_id(1), node_id(2), node_id(3)]);
+        let bindings = member_bindings(&members);
+        let policy = crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains;
+        let started = Instant::now();
+        let admitted = fixture.backend.fixed_quorum_authority_is_exact_now(
+            fixture.scope,
+            &members,
+            &bindings,
+            policy,
+        );
+        let elapsed = started.elapsed();
+        holder
+            .join()
+            .expect("join finite fault")
+            .expect("held real owner");
+        let restored = fixture.backend.fixed_quorum_authority_is_exact_now(
+            fixture.scope,
+            &members,
+            &bindings,
+            policy,
+        );
+        fixture
+            .raft
+            .shutdown()
+            .await
+            .expect("shutdown fixed test Raft");
+        eprintln!(
+            "native immediate authority elapsed_us={}",
+            elapsed.as_micros()
+        );
+        assert!(
+            !admitted,
+            "immediate status fails closed while its authority owner is busy"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "immediate authority must not block the executor"
+        );
+        assert!(
+            restored,
+            "contention does not revoke or corrupt the restored authority"
+        );
     }
 
     fn rejecting_peer_map(
@@ -2593,6 +3065,7 @@ mod tests {
             local_node_id: node_id(1),
             target,
             peer_directory: directory.clone(),
+            persistence: PersistenceProtocol::default(),
         };
         let hard_ttl = Duration::from_secs(4);
         let option = RPCOption::new(hard_ttl);
@@ -2683,6 +3156,7 @@ mod tests {
             local_node_id: node_id(1),
             target,
             peer_directory: directory,
+            persistence: PersistenceProtocol::default(),
         };
         assert!(matches!(
             call_test_network(&retired).await,

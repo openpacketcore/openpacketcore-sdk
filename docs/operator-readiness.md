@@ -134,7 +134,7 @@ removed. Each domain retains its own state machine and production evidence
 gates.
 
 The current exact pin is the immutable `openpacketcore/openraft` revision
-`f607e636406b16bd0ad7925dbb631da1b7a4cd96`, not registry 0.9.24. Both domains
+`dddfe2ee7c51394c1b5ed601c85225ce9eca680d`, not registry 0.9.24. Both domains
 consume one fixed runtime profile from `opc-consensus`, including fresh
 per-campaign `[5,000 ms, 8,000 ms)` election-timeout sampling, a 2,000 ms
 heartbeat/AppendEntries ceiling, and the shared 10,000 ms operation default.
@@ -667,9 +667,16 @@ The adapter removes bounded SDK-named interrupted staging files on restart but
 does not delete unknown operator files. A missing/corrupt referenced snapshot,
 directory above 8,192 entries, cross-identity image, or snapshot behind the
 committed/applied floor fails closed before service admission. Covered-log
-purge waits at most ten seconds for asynchronous snapshot apply to advance the
-durable floor; timeout stops the Openraft node rather than deleting unapplied
-history.
+purge waits for the process-owned snapshot install of the exact full log ID to
+advance the durable applied floor. A long-running install keeps the recovering
+member unavailable while the surviving quorum can continue serving; elapsed
+install time alone does not stop the member. Install failure or cancellation
+still stops it, and a purge without a matching install started within the
+ten-second apply guard still fails closed. No path deletes unapplied history
+or reports a completed purge before durable coverage exists. Investigate a
+stalled install through storage and recovery progress; a live task is not a
+claim of readiness. Deployment recovery objectives and request deadlines are
+separate from this internal ordering dependency.
 
 ### Replication-log range cursor operations
 
@@ -986,10 +993,18 @@ other survivors' explicit and local-material-epoch retirement counters must
 remain unchanged. All lifecycle drains and every still-live survivor
 availability episode must be settled before the next traffic baseline, then
 all-voter readiness and canary progress complete without restarting that
-process. Schedule profile `member-scoped-reauth-settled-baseline/v4` makes that
-boundary explicit: the atomic projected-data rename starts the 86-second
-fail-safe and 60-second two-stage server tail, while a final 2.5-second quiet
-interval covers cold connect plus maximum reconnect backoff. A prepublication
+process. The functional checks observe snapshot catch-up without a fixed total
+recovery deadline: every voter must become ready with the exact quorum
+witnesses, cover the first observed committed frontier, and retain monotonic
+applied progress. Elapsed time or progress by the surviving majority cannot
+complete this proof. These processes share storage; their catch-up duration
+does not establish a deployment recovery SLO. After readiness and canary
+verification, a separate connection-settlement phase retains its 86-second
+fail-safe, full 60-second two-stage server tail, and final 2.5-second quiet
+interval for cold connect plus maximum reconnect backoff. The frozen schedule
+profile `member-scoped-reauth-settled-baseline/v4` and its historical results
+retain their original publication-based timing semantics; passing the corrected
+functional checks does not qualify that historical timing profile. A prepublication
 common-key pulse and 13-second observation checkpoints require one active key
 to advance on every survivor observer and conservatively bound that pulse's
 worst-case actual event gap to 26 seconds. An independent 26-second checkpoint

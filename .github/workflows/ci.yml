@@ -87,6 +87,9 @@ jobs:
           python3 ci/test-sdk702-release-attest.py
           bash -n ci/setup-fsverity-tmp.sh
 
+      - name: Test live voter memory evidence validators
+        run: python3 scripts/test-observe-session-store-live-memory.py
+
       - name: Run opc-proto-diameter corpus generator self-test
         run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
 
@@ -295,8 +298,30 @@ jobs:
         with:
           shared-key: opc-rust-gtpu-cfg
 
+      # The composed request has the same literal one-second contract here
+      # as in the ordinary shard. Keep this cfg and feature selection, but
+      # run it after unrelated test runtimes have exited.
       - name: Run GTP-U unsupported-platform cfg tests
-        run: RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet
+        env:
+          RUSTFLAGS: "--cfg opc_linux_gtpu_sys_force_unsupported"
+        run: |
+          set -euo pipefail
+          selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_keeps_original_request_deadline
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --list --exact "$selector" > unsupported-selector-tests.txt
+          python3 - "$selector" <<'PYCODE'
+          import pathlib
+          import sys
+
+          selected = [
+              line.removesuffix(": test")
+              for line in pathlib.Path("unsupported-selector-tests.txt").read_text().splitlines()
+              if line.endswith(": test")
+          ]
+          if selected != [sys.argv[1]]:
+              sys.exit(f"unsupported selector must resolve exactly once: {selected!r}")
+          PYCODE
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet -- --exact --skip "$selector"
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --test-threads=1 --exact "$selector" --nocapture
 
   # `rust-gtpu-cfg` above forces the Linux backend unavailable; these two lanes
   # cover the orthogonal axis of host portability. `opc-gtpu-dataplane` ships a
@@ -617,11 +642,13 @@ jobs:
           set -euo pipefail
           ordinary_timing_contracts=(
             persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
-            persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
             persistent_three_voter_first_transition_has_one_leader_activation_proof
             protected_consumer_chain_after_activation_elides_outer_capability_wire_calls
           )
+          # Keep the original bounds while optimizing snapshot log generation
+          # and the large protected-plan fixtures. Each still runs exactly once.
           optimized_roster_contracts=(
+            persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
             persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal
             persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart
             persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
