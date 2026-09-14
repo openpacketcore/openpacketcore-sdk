@@ -526,18 +526,19 @@ impl RetainedSnapshotDirectory {
             let metadata = (**self.directory).metadata()?;
             let identity = (metadata.dev(), metadata.ino());
             let mut hooks = registry.lock().expect("retained namespace sync hooks");
-            let Some(hooks) = hooks.get_mut(self.cleanup_latch_identity()) else {
-                return sync_directory();
-            };
-            if let Some(observer) = &mut hooks.observer {
-                observer.observed.push(identity);
-            }
-            if std::mem::take(&mut hooks.fail) {
-                return Err(io::Error::other(
-                    "injected retained snapshot namespace sync failure",
-                ));
+            if let Some(hooks) = hooks.get_mut(self.cleanup_latch_identity()) {
+                if let Some(observer) = &mut hooks.observer {
+                    observer.observed.push(identity);
+                }
+                if std::mem::take(&mut hooks.fail) {
+                    return Err(io::Error::other(
+                        "injected retained snapshot namespace sync failure",
+                    ));
+                }
             }
         }
+        // Directory I/O must not serialize unrelated fixture namespaces
+        // behind the process-wide test-hook registry, including no-hook calls.
         sync_directory()
     }
 
