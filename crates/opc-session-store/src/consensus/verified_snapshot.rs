@@ -22,6 +22,44 @@ const MAX_BLOCKS: usize = MAX_INDEX_BYTES / DIGEST_BYTES;
 pub(crate) const PROCESS_VERIFICATION_BYTES: usize = 128 * 1024 * 1024;
 static VERIFICATION_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+// Optional journal-page construction must not consume the whole verifier.
+// This is a local admission policy, not a wire/page-cardinality limit. The
+// other three quarters remain outside this output pool; selected decoders,
+// snapshots, retained images and application still share the original cap.
+const JOURNAL_PAGE_BYTES: usize = PROCESS_VERIFICATION_BYTES / 4;
+static JOURNAL_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Complete output/container admission for one native journal read. Both
+/// guards are acquired before allocation. The caller destroys all temporary
+/// output before returning either allowance; successful caller-owned results
+/// leave this construction budget at the existing public handoff boundary.
+pub(crate) struct JournalPageMemory {
+    // Refund process bytes before allowing another optional page to enter.
+    _process: VerificationMemory,
+    _admission: VerificationMemory,
+}
+
+impl JournalPageMemory {
+    pub(crate) fn reserve(bytes: usize) -> io::Result<Self> {
+        Self::reserve_with(&JOURNAL_PAGES, bytes, VerificationMemory::reserve)
+    }
+
+    fn reserve_with(
+        pages: &'static AtomicUsize,
+        bytes: usize,
+        reserve: impl FnOnce(usize) -> io::Result<VerificationMemory>,
+    ) -> io::Result<Self> {
+        let admission = VerificationMemory::reserve_from(pages, bytes, JOURNAL_PAGE_BYTES)?;
+        // Failure here refunds optional admission too. There is no wait while
+        // retaining a partial output, and no uncharged or enlarged allocation.
+        let process = reserve(bytes)?;
+        Ok(Self {
+            _process: process,
+            _admission: admission,
+        })
+    }
+}
+
 /// Reservation shared across all retained images, their cache replacement
 /// buffers, and asynchronous transport reads. Exhaustion fails closed before
 /// allocating or spawning work; dropping the owner returns the reservation.
@@ -404,6 +442,10 @@ impl Seek for VerifiedReader {
         Ok(self.position)
     }
 }
+
+#[cfg(test)]
+#[path = "journal_page_memory_tests.rs"]
+mod journal_page_memory_tests;
 
 #[cfg(test)]
 mod tests {

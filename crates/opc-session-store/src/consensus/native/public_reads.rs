@@ -3,7 +3,7 @@
 //! from the WAL mutex. The adapter retains admission until this work retires.
 
 use super::*;
-use crate::consensus::verified_snapshot::VerificationMemory;
+use crate::consensus::verified_snapshot::{JournalPageMemory, VerificationMemory};
 use crate::sqlite::consensus::consumer_receipts::ConsumerReceiptStore;
 use crate::sqlite::consensus::roster_engine::RosterCommandStore;
 
@@ -134,35 +134,43 @@ impl NativeState {
             .checked_sub(first)
             .ok_or_else(unavailable)?
             .min(limit);
-        // Reserve both exact output containers and one full validator's
-        // scratch before reading. Selected decoders retain their own guards.
-        let container_bytes = count
-            .checked_mul(
-                std::mem::size_of::<ReplicationEntry>()
-                    + std::mem::size_of::<VerificationMemory>()
-                    + std::mem::size_of::<&NotificationRow>(),
-            )
-            .ok_or_else(unavailable)?;
-        let _containers = VerificationMemory::reserve(
-            container_bytes
-                .checked_add(8 * crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 64 * 1024)
-                .ok_or_else(unavailable)?,
-        )
-        .map_err(|_| unavailable())?;
-        let mut reservations = Vec::new();
-        reservations
-            .try_reserve_exact(count)
-            .map_err(|_| unavailable())?;
-        let mut result = Vec::new();
-        result.try_reserve_exact(count).map_err(|_| unavailable())?;
-        // Select only the requested range; collecting borrowed rows avoids
-        // walking an unrelated historical prefix. Charge their container too.
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(count).map_err(|_| unavailable())?;
+        // Preflight the entire requested range before hydrating or copying a
+        // single row. A failed page never accumulates most of the shared
+        // verifier budget while snapshot/application work is already active.
+        let mut output_bytes = 0_usize;
         for position in first..first + count {
             check().map_err(|_| unavailable())?;
             let sequence = u64::try_from(position).map_err(|_| unavailable())? + 1;
             let row = self.notifications.get(position).ok_or_else(unavailable)?;
+            if row.sequence() != sequence {
+                return Err(unavailable());
+            }
+            let bytes = journal_output_bytes(row.canonical_length().map_err(|_| unavailable())?)
+                .map_err(|_| unavailable())?;
+            output_bytes = output_bytes.checked_add(bytes).ok_or_else(unavailable)?;
+        }
+        let container_bytes = count
+            .checked_mul(
+                std::mem::size_of::<ReplicationEntry>() + std::mem::size_of::<&NotificationRow>(),
+            )
+            .ok_or_else(unavailable)?;
+        // Keep the original validator allowance. Selected input, decode,
+        // encoding and scoped worker stacks retain their own process guards.
+        let bytes = output_bytes
+            .checked_add(container_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(8 * crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 64 * 1024)
+            })
+            .ok_or_else(unavailable)?;
+        let _memory = JournalPageMemory::reserve(bytes).map_err(|_| unavailable())?;
+        let mut result = Vec::new();
+        result.try_reserve_exact(count).map_err(|_| unavailable())?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(count).map_err(|_| unavailable())?;
+        for position in first..first + count {
+            check().map_err(|_| unavailable())?;
+            let row = self.notifications.get(position).ok_or_else(unavailable)?;
+            let sequence = u64::try_from(position).map_err(|_| unavailable())? + 1;
             row.validate(sequence, &self.frontiers)
                 .map_err(|_| unavailable())?;
             rows.push(row);
@@ -175,17 +183,13 @@ impl NativeState {
         NativeNotification::visit_export(rows, &self.frontiers, &|| check(), &mut |entry| {
             check()?;
             validation::validate_notification(entry, sequence, &self.frontiers)?;
-            // Counting serialization allocates no output. The closed effect
-            // shape has at most two records and two batch elements; double
-            // byte backing plus fixed object/allocation overhead covers the
-            // independent copy, including Bytes and encrypted-payload Arcs.
-            let bytes = image::binary::encoded_len(entry, generation::MAX_ITEM)?
-                .checked_mul(2)
-                .and_then(|bytes| {
-                    bytes.checked_add(2 * std::mem::size_of::<ReplicationEntry>() + 32 * 64)
-                })
-                .ok_or_else(|| invalid("native journal output reservation overflow"))?;
-            reservations.push(VerificationMemory::reserve(bytes)?);
+            // Authenticate/decode first, then verify that the actual canonical
+            // copy fits its preflight charge before creating independent data.
+            let bytes =
+                journal_output_bytes(image::binary::encoded_len(entry, generation::MAX_ITEM)?)?;
+            output_bytes = output_bytes
+                .checked_sub(bytes)
+                .ok_or_else(|| invalid("native journal output exceeds preflight"))?;
             result.push(owned::notification(entry)?);
             sequence = sequence
                 .checked_add(1)
@@ -194,6 +198,9 @@ impl NativeState {
         })
         .map_err(|_| unavailable())?;
         check().map_err(|_| unavailable())?;
+        if output_bytes != 0 {
+            return Err(unavailable());
+        }
         crate::backend::validate_replication_log_page_owned(start, limit, result)
     }
 
@@ -246,3 +253,16 @@ impl NativeState {
         self.frontiers.watch_sequence
     }
 }
+
+// The native effect has at most two records/two batch elements. Preserve the
+// original independent-copy backing and fixed object/allocation allowance.
+fn journal_output_bytes(encoded: usize) -> io::Result<usize> {
+    encoded
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<ReplicationEntry>() + 32 * 64))
+        .ok_or_else(|| invalid("native journal output reservation overflow"))
+}
+
+#[cfg(test)]
+#[path = "public_reads_tests.rs"]
+mod tests;

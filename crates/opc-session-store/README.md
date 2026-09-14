@@ -1301,6 +1301,19 @@ return. Pages preserve authenticated fingerprints, sequence order, independent
 output ownership, cancellation, and the existing read deadline. Portable
 SQLite snapshot export remains available.
 
+Native journal reads preflight the complete requested range before allocating
+output. Their independent copies, containers, and validator allowance share a
+process-wide 32 MiB construction pool within the existing 128 MiB verification
+budget. This internal admission policy prevents bulk output construction from
+occupying more than one quarter of that budget; selected input, decoding,
+encoding, retained images, and worker stacks still have their own charges.
+An inadmissible page returns `BackendUnavailable` before copying, so a caller
+may retry a smaller complete page within its original deadline. It never
+returns a partial success or advances a cursor. Cancellation and failure
+release both reservations after temporary output is destroyed. Successful
+caller-owned results leave this construction pool at the existing handoff;
+the pool is neither an end-to-end result-memory nor a process RSS limit.
+
 `watch(start_sequence)` uses an inclusive 1-based cursor. Zero is the
 empty-head sentinel and normalizes to one. An existing cursor first emits that
 entry; a future cursor waits and never receives a lower live entry.
