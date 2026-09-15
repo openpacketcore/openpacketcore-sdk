@@ -35,6 +35,58 @@ use opc_types::TxId;
 
 mod ops;
 
+/// Connection storage shared with detached workers. Field order is deliberate:
+/// rusqlite must finish closing before the final retained admission is dropped.
+/// Its authorizer is removed before sqlite3_close, so the callback alone cannot
+/// own the complete connection lifetime.
+pub(crate) struct BackendConnection {
+    connection: rusqlite::Connection,
+    _retained_admission: Option<Arc<crate::local_sqlite::FileAdmission>>,
+}
+
+impl BackendConnection {
+    #[cfg(unix)]
+    pub(crate) fn retained(
+        connection: rusqlite::Connection,
+        admission: Arc<crate::local_sqlite::FileAdmission>,
+    ) -> Self {
+        Self {
+            connection,
+            _retained_admission: Some(admission),
+        }
+    }
+
+    pub(crate) fn close(self) -> Result<(), rusqlite::Error> {
+        let Self {
+            connection,
+            _retained_admission,
+        } = self;
+        // Retain admission through both explicit close and the returned
+        // connection's final drop if SQLite rejects the first close attempt.
+        match connection.close() {
+            Ok(()) => Ok(()),
+            Err((connection, error)) => {
+                drop(connection);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for BackendConnection {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for BackendConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
 type StoredConfigRow = (
     Vec<u8>,
     Option<Vec<u8>>,
@@ -126,7 +178,7 @@ pub(crate) fn deserialize_audit_op_type(s: &str) -> Result<AuditOpType, PersistE
 ///     let _ = backend.audit_key();
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SqliteBackend {
     /// Path to the database (for preflight reporting).
     db_path: PathBuf,
@@ -136,7 +188,7 @@ pub struct SqliteBackend {
     min_free_bytes: u64,
     /// The shared database connection protected by an async mutex.
     /// All DB operations hold this lock for the duration of the call.
-    conn: Arc<AsyncMutex<rusqlite::Connection>>,
+    conn: Arc<AsyncMutex<BackendConnection>>,
     /// Shared admission for config-consensus blocking work, including startup
     /// before the consensus core exists.
     config_consensus_worker_gate: Arc<tokio::sync::Semaphore>,
@@ -149,10 +201,23 @@ pub struct SqliteBackend {
     management_audit_data_version: Arc<AtomicU64>,
     /// Cached preflight result (populated after first successful preflight).
     cached_caps: std::sync::OnceLock<PersistCapabilities>,
+    /// Exact retained scope, absent only on the existing create-or-open API.
+    pub(crate) retained_binding: Option<crate::RetainedConfigBinding>,
+    pub(crate) retained_repair_only: bool,
     /// Narrow fault injection for the alarm-audit adapter. This deliberately
     /// cannot execute SQL or mutate config/consensus authority.
     #[cfg(feature = "dangerous-test-hooks")]
     alarm_audit_write_fault: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for SqliteBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqliteBackend")
+            .field("ephemeral", &self.ephemeral)
+            .field("retained", &self.retained_binding.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqliteBackend {
@@ -227,7 +292,7 @@ impl SqliteBackend {
             .store(version, Ordering::Release);
     }
 
-    pub(crate) fn conn(&self) -> Arc<AsyncMutex<rusqlite::Connection>> {
+    pub(crate) fn conn(&self) -> Arc<AsyncMutex<BackendConnection>> {
         self.conn.clone()
     }
 
@@ -266,6 +331,11 @@ impl SqliteBackend {
         min_free_bytes: u64,
         audit_key: AuditKey,
     ) -> Result<Self, PersistError> {
+        if crate::retained::requires_retained_lifecycle(&path) {
+            return Err(PersistError::preflight_failed(
+                "retained configuration storage requires the explicit lifecycle API",
+            ));
+        }
         // Reject contradictory combination: :memory: is always ephemeral, so
         // passing ephemeral=false with :memory: would create a backend with a
         // self.ephemeral field that contradicts its reported capabilities.
@@ -291,13 +361,18 @@ impl SqliteBackend {
             db_path: path,
             ephemeral,
             min_free_bytes,
-            conn: Arc::new(AsyncMutex::new(conn)),
+            conn: Arc::new(AsyncMutex::new(BackendConnection {
+                connection: conn,
+                _retained_admission: None,
+            })),
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
             cached_caps: std::sync::OnceLock::new(),
+            retained_binding: None,
+            retained_repair_only: false,
             #[cfg(feature = "dangerous-test-hooks")]
             alarm_audit_write_fault: Arc::new(AtomicBool::new(false)),
         };
@@ -306,6 +381,41 @@ impl SqliteBackend {
         let _ = backend.cached_caps.set(caps);
 
         Ok(backend)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_retained_connection(
+        path: PathBuf,
+        ephemeral: bool,
+        min_free_bytes: u64,
+        audit_key: AuditKey,
+        conn: rusqlite::Connection,
+        caps: PersistCapabilities,
+        binding: crate::RetainedConfigBinding,
+        repair_only: bool,
+        admission: Arc<crate::local_sqlite::FileAdmission>,
+    ) -> Self {
+        let backend = Self {
+            db_path: path,
+            ephemeral,
+            min_free_bytes,
+            conn: Arc::new(AsyncMutex::new(BackendConnection {
+                connection: conn,
+                _retained_admission: Some(admission),
+            })),
+            config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            audit_key: Arc::new(audit_key),
+            management_audit_data_version: Arc::new(AtomicU64::new(0)),
+            cached_caps: std::sync::OnceLock::new(),
+            retained_binding: Some(binding),
+            retained_repair_only: repair_only,
+            #[cfg(feature = "dangerous-test-hooks")]
+            alarm_audit_write_fault: Arc::new(AtomicBool::new(false)),
+        };
+        let _ = backend.cached_caps.set(caps);
+        backend
     }
 
     /// Create an in-memory database for testing (non-durable).

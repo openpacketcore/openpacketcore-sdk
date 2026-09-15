@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod consumer_checkpoint;
 pub mod custody;
 pub mod errors;
 pub mod kms;
@@ -30,6 +31,7 @@ pub mod scope;
 #[cfg(test)]
 mod tests;
 
+pub use consumer_checkpoint::ConsumerCheckpointAad;
 pub use custody::{
     admitted_key_custody, install_key_custody_module, key_custody_required_capabilities,
     AdmittedKeyCustody, KeyCustodyInstallError, KeyCustodyModule, MAX_KEY_CUSTODY_BOUND_AAD_BYTES,

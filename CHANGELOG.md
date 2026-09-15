@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conservative call-start timing, fresh backend authorizations, exact store
   credential checks, and the original request deadlines. Ambiguous or late
   renewals fence the worker (Refs #821).
+- `opc-session-testkit`: reconcile an exact ambiguous paired-fixture transition
+  through its authoritative receipt before shared readback and facade reopening.
+  Real response-loss and no-replay controls retain the original request deadlines
+  and general-backend capability boundary (Refs #824).
+- `opc-session-testkit`: retain each synthetic traffic acquisition's exact
+  consumer request and fixed deadline before polling. Reconcile uncertain
+  outcomes before admitting a successor, preserve custody across restart, and
+  retire recorded old acquisitions before fresh restart authority. The v10
+  qualification schedule combines this recovery profile with readiness and scan
+  reproof from v9; ordinary lease APIs, stale-fence checks and existing recovery
+  bounds are unchanged (Refs #819).
 - `opc-session-store`: separate a pinned snapshot directory's original configured
   namespace name from its owned I/O capability. Independent processes no longer
   share a lease key merely because their inherited descriptor numbers match.
@@ -101,6 +112,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic. Losing the volatile quorum can lose acknowledged results; local
   persistence does not authorize recovery. No automatic mode migration is
   provided. See ADR 0022 for semantics and qualification boundaries.
+- **Durable non-voting configuration consumers:** `DurableConfigConsumer` composes
+  authenticated snapshot/tail recovery with a sealed SDK checkpoint and a
+  product-owned apply/readback port. It persists original committed revisions
+  and complete apply intent, rejects rollback/conflict/gaps, and reconciles
+  interrupted application without replay. `ConsumerCheckpointStore` adds
+  bounded explicit provision/reopen and atomic CAS, using purpose-separated
+  `ConfigConsumerCheckpoint` custody. Accepted storage bounds account for SQLite
+  overflow pages at the maximum payload, and canonical checkpoints preserve
+  typed JSON integer precision without changing shared Serde JSON features.
+  This adds no voter or authoring authority
+  and no independent global-freshness claim; see SDK #799's consumer contract.
+- **Retained configuration-authority lifecycle — `opc-persist`:** explicit
+  provisioning, ordinary reopen, and member-repair APIs bind local storage to
+  exact consensus, backing and key scope. Reopen rejects missing or incomplete
+  authority without creating it; repaired voters cannot bootstrap a new
+  cluster. Base-schema admission uses the SDK catalog, including the unique
+  replay index, rather than trusting a stored compatibility digest. Local
+  bindings stay out of replicated snapshots. Ephemeral storage remains an
+  explicit choice. Whole-store rollback freshness still requires external
+  authority; see the retained lifecycle contract and issue #800.
 - **Isolated eBPF workload lifecycle — `opc-gtpu-dataplane`:** stable opaque
   workload scopes select separate bpffs roots and local writer locks. An
   explicit stopped-generation reset reclaims only the unbound current IPv4

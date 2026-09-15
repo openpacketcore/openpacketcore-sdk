@@ -17,6 +17,12 @@
 
 pub mod remote_watch;
 
+pub use remote_watch::consumer::{
+    ConfigAcceptanceOutcome, ConfigApplyIntent, ConfigApplyOutcome, ConfigConsumerApplyPort,
+    ConfigConsumerApplyResult, ConfigConsumerError, ConfigConsumerPhase, ConfigConsumerStatus,
+    ConfigRuntimeReadback, ConfigRuntimeReadbackOutcome, ConsumerRevision, DurableConfigConsumer,
+};
+
 pub use remote_watch::{
     fixed_config_watch_endpoint, ConfigWatchAddrResolver, ConfigWatchBindingError,
     ConfigWatchClientBinding, ConfigWatchContractProfile, ConfigWatchError, ConfigWatchServer,

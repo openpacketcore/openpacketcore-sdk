@@ -36,7 +36,9 @@ provider that declares non-exportable custody.
   process; the controller is not a cross-pod coordinator, watcher, or durable
   epoch source.
 - `KeyPurpose` separates lanes such as `Config`, `Session`,
-  `ShadowSecurity`, `IpsecSa`, `Audit`, and `Backup`.
+  `ConfigConsumerCheckpoint`, `ShadowSecurity`, `IpsecSa`, `Audit`, and `Backup`.
+- `ConsumerCheckpointAad` binds consumer-local checkpoint envelopes to exact
+  consumer and storage digests; its local generation is not a configuration revision.
 - `EnvelopeAad`, `ConfigAad`, `SessionAad`, and `ShadowSecurityAad` build
   structured authenticated data.
 - `AeadAlgorithm` exposes local `Aes256GcmSiv` and server-side `RemoteSeal`

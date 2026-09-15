@@ -1,5 +1,8 @@
 //! Private child-process node for experimental session-HA qualification.
 
+#[path = "opc-session-quorum-node/traffic_acquire.rs"]
+mod traffic_acquire;
+
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File};
@@ -408,6 +411,7 @@ struct QualificationNode {
     configured_voter_ids: Vec<u64>,
     traffic_schedule_bound: bool,
     traffic: Option<QualificationTrafficRuntime>,
+    traffic_acquire_journal: Option<traffic_acquire::Journal>,
     concurrent_watches:
         HashMap<QualificationConcurrentSubscriptionId, QualificationConcurrentWatchRuntime>,
     empty_vote_dispatches: Arc<AtomicU64>,
@@ -1304,6 +1308,27 @@ impl QualificationNode {
         .await
         .map_err(|_| node_open_failure(QualificationNodeOpenStage::Transport))?;
 
+        let traffic_schedule_bound = qualification_traffic_schedule_sha256(config.members.len())
+            .is_some_and(|digest| digest == config.workload_schedule_sha256);
+        let traffic_acquire_journal = if traffic_schedule_bound {
+            Some(
+                traffic_acquire::Journal::open(
+                    &config.database_path,
+                    traffic_acquire::Binding::new(
+                        SessionConsumerScope::new(fixed_consensus_identity),
+                        config.node_index,
+                        qualification_traffic_key(config.node_index).map_err(|_| NodeFailure)?,
+                        OwnerId::new(format!("rotation-traffic-owner-{}", config.node_index))
+                            .map_err(|_| NodeFailure)?,
+                        QUALIFICATION_TRAFFIC_TTL,
+                    ),
+                    QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
+                )
+                .map_err(|_| NodeFailure)?,
+            )
+        } else {
+            None
+        };
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
         let store = Arc::new(if let Some(scale) = config.isolated_scale {
@@ -1424,9 +1449,9 @@ impl QualificationNode {
             node_index: config.node_index,
             member_count: config.members.len(),
             configured_voter_ids,
-            traffic_schedule_bound: qualification_traffic_schedule_sha256(config.members.len())
-                .is_some_and(|digest| digest == config.workload_schedule_sha256),
+            traffic_schedule_bound,
             traffic: None,
+            traffic_acquire_journal,
             concurrent_watches: HashMap::new(),
             empty_vote_dispatches,
             rpc_gate,
@@ -2256,9 +2281,21 @@ impl QualificationNode {
                 };
             }
         };
-        let lease = match self
-            .protected
-            .acquire(&key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
+        let Some(journal) = self.traffic_acquire_journal.take() else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let mut acquirer = match traffic_acquire::Acquirer::from_store(journal, &self.store).await {
+            Ok(acquirer) => acquirer,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                }
+            }
+        };
+        let lease = match acquirer
+            .acquire_after_start(traffic_recovery_deadline(tokio::time::Instant::now(), None))
             .await
         {
             Ok(lease) => lease,
@@ -2309,6 +2346,7 @@ impl QualificationNode {
             key,
             owner,
             lease,
+            acquirer,
             traffic.seed,
             self.member_count,
             self.node_index,
@@ -3375,6 +3413,7 @@ async fn run_traffic_mutation_task(
     key: SessionKey,
     owner: OwnerId,
     lease: LeaseGuard,
+    mut acquirer: traffic_acquire::Acquirer,
     seed: u64,
     member_count: usize,
     node_index: usize,
@@ -3396,6 +3435,7 @@ async fn run_traffic_mutation_task(
             &key,
             &owner,
             &mut lease,
+            &mut acquirer,
             seed,
             member_count,
             node_index,
@@ -3437,6 +3477,7 @@ async fn run_traffic_mutation_task(
                     &key,
                     &owner,
                     &mut lease,
+                    &mut acquirer,
                     seed,
                     member_count,
                     node_index,
@@ -3524,6 +3565,7 @@ async fn run_traffic_mutation_task(
                     &key,
                     &owner,
                     &mut lease,
+                    &mut acquirer,
                     seed,
                     member_count,
                     node_index,
@@ -3561,6 +3603,7 @@ async fn reconcile_traffic_mutation_checkpoint(
     key: &SessionKey,
     owner: &OwnerId,
     lease: &mut Option<LeaseGuard>,
+    acquirer: &mut traffic_acquire::Acquirer,
     seed: u64,
     member_count: usize,
     node_index: usize,
@@ -3593,6 +3636,7 @@ async fn reconcile_traffic_mutation_checkpoint(
         key,
         owner,
         lease,
+        acquirer,
         seed,
         member_count,
         node_index,
@@ -3881,6 +3925,7 @@ async fn reconcile_traffic_mutation_authority(
     key: &SessionKey,
     owner: &OwnerId,
     lease: &mut Option<LeaseGuard>,
+    acquirer: &mut traffic_acquire::Acquirer,
     seed: u64,
     member_count: usize,
     node_index: usize,
@@ -3897,8 +3942,9 @@ async fn reconcile_traffic_mutation_authority(
         .unwrap_or(observed_record_fence)
         .max(observed_record_fence);
     // The prior guard is no longer usable after a typed ambiguous mutation
-    // outcome. Same-owner acquire is the only operation that establishes a
-    // fresh, strictly higher fencing authority for deterministic recovery.
+    // outcome. Resolve any earlier acquire through its durable exact request
+    // before accepting a strictly higher same-owner authority. An unrelated
+    // fresh acquire alone cannot retire an older request still in flight.
     *lease = None;
 
     let recovered_lease = loop {
@@ -3908,10 +3954,7 @@ async fn reconcile_traffic_mutation_authority(
                 recovery_started_at,
             ));
         }
-        match protected
-            .acquire(key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
-            .await
-        {
+        match acquirer.acquire(deadline).await {
             Ok(recovered) => break recovered,
             Err(error) => {
                 let failure = QualificationTrafficFailure::lease(
@@ -4163,6 +4206,7 @@ async fn run_traffic_mutation_task_inner(
     key: &SessionKey,
     owner: &OwnerId,
     lease: &mut Option<LeaseGuard>,
+    acquirer: &mut traffic_acquire::Acquirer,
     seed: u64,
     member_count: usize,
     node_index: usize,
@@ -4385,8 +4429,11 @@ async fn run_traffic_mutation_task_inner(
         if traffic_cancellation_requested(cancellation, shutdown_deadline) {
             return Ok(());
         }
-        let reacquired = protected
-            .acquire(key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
+        let reacquired = acquirer
+            .acquire(traffic_recovery_deadline(
+                tokio::time::Instant::now(),
+                *shutdown_deadline,
+            ))
             .await
             .map_err(|error| {
                 QualificationTrafficFailure::lease(

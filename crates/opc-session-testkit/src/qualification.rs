@@ -936,8 +936,9 @@ pub const QUALIFICATION_TRAFFIC_TTL_MILLIS: u64 = 60 * 60 * 1_000;
 /// before the qualification run fails closed.
 pub const QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE: u64 = 8;
 /// Maximum wall-clock interval for one authority-and-record reconciliation.
-/// Ambiguous mutation outcomes advance same-owner fencing authority; read-only
-/// checkpoints retain the already-proven guard and validate its exact record.
+/// Ambiguous mutation outcomes resolve every retained acquisition before
+/// advancing same-owner fencing authority; read-only checkpoints retain the
+/// already-proven guard and validate its exact record.
 /// The bound covers the fixed two-election cluster transition plus one complete
 /// consensus operation and remains large enough for the reconciliation's
 /// sequential acquire and linearizable get plus one retry delay. An accepted
@@ -965,7 +966,14 @@ pub const QUALIFICATION_TRAFFIC_RECOVERY_DEADLINE_DIAGNOSTIC_PROFILE: &str =
     "terminal-stage-elapsed-millis/v1";
 /// Versioned authority reconciliation algorithm bound into the schedule.
 pub const QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE: &str =
-    "stage-aware-known-authority-readiness-and-scan-reproof/v1";
+    "stage-aware-known-authority-readiness-and-scan-reproof/v2";
+/// Exact-request acquisition recovery used only by the synthetic traffic caller.
+pub const QUALIFICATION_TRAFFIC_ACQUIRE_RECOVERY_PROFILE: &str =
+    "retained-consumer-id-receipt-before-successor/v1";
+/// Version of the private, single-writer traffic acquisition journal.
+pub const QUALIFICATION_TRAFFIC_ACQUIRE_JOURNAL_VERSION: u8 = 1;
+/// Maximum complete traffic acquisition journal image, including its binding.
+pub const QUALIFICATION_TRAFFIC_ACQUIRE_JOURNAL_MAX_BYTES: u64 = 4096;
 /// Maximum wall-clock budget for one stopped watch's journal reconciliation.
 pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS: u64 = 25_000;
 /// Maximum journal entries one stopped watch may reconcile.
@@ -4859,7 +4867,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v9\n",
+            "opc-session-ha/traffic-resource/v10\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -4892,6 +4900,9 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "availability_recovery_millis={}\n",
             "availability_retry_millis={}\n",
             "authority_reconciliation_profile={}\n",
+            "acquire_recovery_profile={}\n",
+            "acquire_journal_version={}\n",
+            "acquire_journal_max_bytes={}\n",
             "synthetic_interruption_profile={}\n",
             "synthetic_interruption_restart_profile={}\n",
             "recovery_deadline_diagnostic_profile={}\n",
@@ -4961,6 +4972,9 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
         QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
         QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
+        QUALIFICATION_TRAFFIC_ACQUIRE_RECOVERY_PROFILE,
+        QUALIFICATION_TRAFFIC_ACQUIRE_JOURNAL_VERSION,
+        QUALIFICATION_TRAFFIC_ACQUIRE_JOURNAL_MAX_BYTES,
         QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
         QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
         QUALIFICATION_TRAFFIC_RECOVERY_DEADLINE_DIAGNOSTIC_PROFILE,
@@ -8871,8 +8885,14 @@ mod tests {
         assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS, 50);
         assert_eq!(
             QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
-            "stage-aware-known-authority-readiness-and-scan-reproof/v1"
+            "stage-aware-known-authority-readiness-and-scan-reproof/v2"
         );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_ACQUIRE_RECOVERY_PROFILE,
+            "retained-consumer-id-receipt-before-successor/v1"
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_ACQUIRE_JOURNAL_VERSION, 1);
+        assert_eq!(QUALIFICATION_TRAFFIC_ACQUIRE_JOURNAL_MAX_BYTES, 4096);
         assert_eq!(
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
             "post-release-response-loss/v1"
@@ -8985,8 +9005,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:3a9c32ec56bb2d5a897f28c0d4f46354eb90014876f9b9600568e2e7d33587c6",
-                "sha256:7b0b420d87091a2c0b76dba1723bf2ea3c1ea176437002e30f5d30a4e5d0f250",
+                "sha256:21f7fbce7ed5b064646b39e6c955c6c11ae4aa0a4f62b072126a6a5f0fc31184",
+                "sha256:66f5978e2089dd2db048498be70407b0145e651ba84035b40490c5f2dbef658d",
             )
         );
         assert!(is_exact_sha256(&three));
@@ -9549,32 +9569,32 @@ mod tests {
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 3,
-                "sha256:993c12b660d997987657c7d5def0f73cbb42353b432944ce43b6e60da45df6e1",
+                "sha256:f64560ee88d5e58be6d192129d6075eefa7dab6e62015d77c0ce297857d6616e",
             ),
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 5,
-                "sha256:a478b0b51a33b2b2f90ec37fa48ac3287dae4366eeee6d937382d8ffe0eb9705",
+                "sha256:e02aefe01ad11d3705eb357dfc4c698306a039f243d972d0caa0484ed00ab4e4",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 3,
-                "sha256:5fe89a5d8f56e2cc036db7c5d835daf7a66aa6b0212151af7b88282a17f5bdfd",
+                "sha256:d874c2695c4000cddfea31debea47c406ae8df62d70c1037fb05a13d79a5bd22",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 5,
-                "sha256:013f569f123f69632b8a65388fc0c6e4ee1922ed57375dfc5161188b9264871f",
+                "sha256:c7b7ffd9ee19d9ffc544554fbfbf0e85f4d0b1e96715dc0071994071483e7413",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 3,
-                "sha256:6190c9c6ada99160497643cd3ddfcca582c0ebc639222a1197ebdcadaf8846d0",
+                "sha256:48186b0cb31ee56672894091be1f029745be0564b88315bb64c4f591f83db8e6",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 5,
-                "sha256:cae16b3c0c53325708e37d5b7e3a853e183ac9a79c889b665c5bc2b664b3fb93",
+                "sha256:d75496f2a40d7c91ab42472339efb895478dae34abf3410d81791b94a90adbbe",
             ),
         ];
         for (campaign, member_count, expected) in vectors {

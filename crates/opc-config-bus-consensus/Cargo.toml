@@ -24,6 +24,7 @@ opc-types = { path = "../opc-types", version = "0.2.0" }
 rustls-pki-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+zeroize = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 tokio-rustls = { workspace = true }

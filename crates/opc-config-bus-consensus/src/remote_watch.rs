@@ -1,5 +1,7 @@
 //! Authenticated follower-served committed-config recovery and watch transport.
 
+pub mod consumer;
+
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -1579,6 +1581,7 @@ async fn connect_client_attempt(
 
 #[cfg(test)]
 mod tests {
+    include!("remote_watch/consumer_transport_tests.rs");
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1719,14 +1722,15 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct AppliedStore {
-        inner: Arc<MockManagedDatastore<TestConfig>>,
+    struct AppliedStore<C: OpcConfig = TestConfig> {
+        inner: Arc<MockManagedDatastore<C>>,
         compacted: bool,
         probe: Option<Arc<AppliedStoreProbe>>,
     }
 
     #[derive(Default)]
     struct AppliedStoreProbe {
+        compacted_before: std::sync::atomic::AtomicU64,
         active_waits: AtomicUsize,
         max_active_waits: AtomicUsize,
         wait_calls: AtomicUsize,
@@ -1799,14 +1803,12 @@ mod tests {
     }
 
     #[async_trait]
-    impl ManagedDatastore<TestConfig> for AppliedStore {
-        async fn load_latest(&self) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+    impl<C: OpcConfig> ManagedDatastore<C> for AppliedStore<C> {
+        async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
             self.inner.load_latest().await
         }
 
-        async fn load_committed_latest(
-            &self,
-        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+        async fn load_committed_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
             self.inner.load_committed_latest().await
         }
 
@@ -1814,8 +1816,12 @@ mod tests {
             &self,
             after: ConfigVersion,
             limit: usize,
-        ) -> Result<Vec<StoredConfig<TestConfig>>, StoreError> {
-            if self.compacted {
+        ) -> Result<Vec<StoredConfig<C>>, StoreError> {
+            if self.compacted
+                || self.probe.as_ref().is_some_and(|probe| {
+                    after.get() < probe.compacted_before.load(Ordering::SeqCst)
+                })
+            {
                 return Err(StoreError::history_compacted(
                     "test committed history was compacted",
                 ));
@@ -1831,28 +1837,25 @@ mod tests {
         async fn load_rollback(
             &self,
             target: RollbackTarget,
-        ) -> Result<StoredConfig<TestConfig>, StoreError> {
+        ) -> Result<StoredConfig<C>, StoreError> {
             self.inner.load_rollback(target).await
         }
 
         async fn load_by_idempotency_key(
             &self,
             key: &IdempotencyKey,
-        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+        ) -> Result<Option<StoredConfig<C>>, StoreError> {
             self.inner.load_by_idempotency_key(key).await
         }
 
         async fn load_by_request_id(
             &self,
             request_id: RequestId,
-        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+        ) -> Result<Option<StoredConfig<C>>, StoreError> {
             self.inner.load_by_request_id(request_id).await
         }
 
-        async fn append_commit_write(
-            &self,
-            write: CommitWrite<TestConfig>,
-        ) -> Result<(), StoreError> {
+        async fn append_commit_write(&self, write: CommitWrite<C>) -> Result<(), StoreError> {
             self.inner.append_commit_write(write).await
         }
 
@@ -1865,7 +1868,7 @@ mod tests {
         }
     }
 
-    impl CommittedRevisionSource<TestConfig> for AppliedStore {}
+    impl<C: OpcConfig> CommittedRevisionSource<C> for AppliedStore<C> {}
 
     fn scope(seed: u8) -> ConfigConsensusIdentity {
         let cluster = ConfigConsensusClusterId::new(format!("config-watch-tests-{seed}"))
@@ -2087,8 +2090,8 @@ mod tests {
         }
     }
 
-    async fn start_server(
-        bus: Arc<ConfigBus<TestConfig>>,
+    async fn start_server<C: OpcConfig + Serialize + DeserializeOwned>(
+        bus: Arc<ConfigBus<C>>,
         tls: &TestTls,
         scope: ConfigConsensusIdentity,
     ) -> (ConfigWatchServerHandle, SocketAddr) {

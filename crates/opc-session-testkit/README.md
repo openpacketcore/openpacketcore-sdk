@@ -299,27 +299,39 @@ same-owner authority at a strictly higher fence, and validate the exact
 scheduled record. Read-only get, restore-scan, and readiness outcomes retain
 the already-proven guard and validate that same exact record without minting
 unnecessary fencing authority. Evidence binds this routing as
-`stage-aware-known-authority-readiness-and-scan-reproof/v1`. After a readiness failure,
-the retained-authority checkpoint also requires a fresh durable-readiness
-proof. An exact get uses a logical-time proposal and cannot certify that the
-separate read-index path recovered. Every completed not-ready proof and proof
-timeout consumes the existing interruption budget, and the read-only proof is
-bounded by the remaining original episode deadline. Recovery counters close
-the episode only after both the exact record and readiness are proven. After a
-restore-scan failure, the checkpoint instead repeats the actual complete scan
-and requires the same exact record, durable cursor profile, count, and page
-bounds. A successful exact get cannot certify scan availability. Scan reproofs
-use that same original deadline and interruption allowance; malformed pages
-and terminal scan errors remain terminal.
+`stage-aware-known-authority-readiness-and-scan-reproof/v2`.
+After a readiness failure, the retained-authority checkpoint also requires a
+fresh durable-readiness proof. An exact get uses a logical-time proposal and
+cannot certify the separate read-index path. Every completed not-ready proof
+and proof timeout consumes the existing interruption budget, bounded by the
+remaining original episode deadline. Recovery closes only after both the
+exact record and readiness are proven. After a restore-scan failure, recovery
+repeats the complete scan and requires the same exact record, durable cursor
+profile, count and page bounds. An exact get cannot certify scan availability.
+The scan uses that same original deadline and interruption allowance;
+malformed pages and terminal scan errors remain terminal.
 
-This changed algorithm has a fresh `opc-session-ha/traffic-resource/v9`
-schedule identity. All numeric bounds, the workload's existing acquisition
-path, and the historical v6 descriptors remain unchanged. Historical v8
-retains its readiness-only reproof meaning. The retained-acquire
-v7 schedule introduced in [PR #801](https://github.com/openpacketcore/openpacketcore-sdk/pull/801)
-is a separate source change; this recovery correction does not claim that
-behavior or reinterpret its evidence. The current 3/5-voter traffic and mTLS
-candidate digests bind the readiness-and-scan-proof algorithm. The private schedule drops one successful
+Before every acquisition, the synthetic caller syncs its exact consumer request
+ID, body, scope, identity and original absolute deadline into a private,
+single-writer journal beside its database. The complete image is bounded to
+4096 bytes. Uncertainty is reconciled through the existing consumer receipt
+API; `NotFound` permits only an explicit retry of that identical live request,
+never a distinct successor. At restart, a recorded terminal acquisition is
+retired before fresh authority. Expired unknown requests stay fenced, and
+retries never extend their deadlines. Missing or mismatched journal custody
+beside an existing database fails closed. This trusted local qualification
+caller adds no consumer-mTLS or production persistence claim and changes no
+ordinary lease API. Its acquisition profile is
+`retained-consumer-id-receipt-before-successor/v1`.
+
+The current `opc-session-ha/traffic-resource/v10` schedule binds both behaviors.
+Historical v6, v7, v8 and v9 retain their original meanings: v7 added retained
+acquisitions, v8 added readiness reproof, and v9 added complete scan reproof.
+The combined schedule changes no numeric workload, timeout, interruption or
+resource bound. Current 3/5-voter traffic and mTLS candidate digests bind the
+combined algorithm.
+
+The private schedule drops one successful
 release response
 per mutator to exercise that path, and is bound to eight outcomes per node, a
 fixed 26-second two-election-plus-operation transition envelope per episode,
@@ -344,7 +356,8 @@ readiness round: 10 seconds for the backend operation and 1 second for bounded
 local result delivery), 25 seconds for journal reconciliation, and 26 seconds
 for higher-fence mutation resume. Those sequential stages compose to a
 164-second crash-to-resume ceiling; each stage still fails at its own bound and
-cannot borrow from the total. Schedule v6 binds the count, profile, recovery
+cannot borrow from the total. The current schedule binds exact-request acquisition
+recovery and its journal version/size, alongside the count, profile, recovery
 envelope, delivery allowance, final observation reserve, six bounds, and total
 so old results cannot masquerade as this evidence. This retains the v1
 deadline-composition fix and corrects v2's free-running readiness loop, which
@@ -474,7 +487,7 @@ revision. It records the compiled revision and bounded generic harness counters
 without claiming conformance to the frozen v7 revision-2 profile or any
 downstream production SLO.
 
-Schedule v6 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
+The current schedule also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains
 failed and reports only the closed deadline code, the terminal operation stage,
 and elapsed milliseconds. It does not replace the failure with the earlier
