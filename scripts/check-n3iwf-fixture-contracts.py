@@ -104,6 +104,7 @@ def main() -> int:
             "check-n3iwf-fixtures",
         )
         run(sys.executable, "scripts/n3iwf_fixture_oracles.py")
+        run(sys.executable, "scripts/n3iwf_key_reference.py")
         run(
             "cargo",
             "test",
@@ -115,6 +116,8 @@ def main() -> int:
             "wire_codecs",
             "--test",
             "ngap_messages",
+            "--test",
+            "protocol_key_known_answers",
         )
         if not publication_matches_content():
             print("n3iwf_fixture_publication_mismatch", file=sys.stderr)

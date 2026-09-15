@@ -10,6 +10,7 @@ inventories. See its [README](../crates/opc-n3iwf-fixtures/README.md) and
 crates/opc-n3iwf-fixtures/
   oracles/ngap-rel18.json
   oracles/ngap-rel18-messages.json
+  oracles/ike-auth-sha256.json
   fixtures/
     PUBLIC_SDK.json
     <subset>/
@@ -133,6 +134,48 @@ the semantic expectation against the pinned standards before publishing it.
 not encode NGAP. Run the independent gate as well as the catalog gate before
 committing the content and publication stamp.
 
+## Protocol-key cryptographic evidence
+
+`oracles/ike-auth-sha256.json` records independent answers for the existing
+RFC 7296 IKE key schedule and final shared-key AUTH calculation in both
+directions. The declared profile is PRF-HMAC-SHA256, AES-GCM-16 with a 256-bit
+key, and ECP-256. Every derived key is compared, including the four-byte GCM
+salts and empty separate integrity keys. Complete synthetic SA_INIT messages
+are independently assembled and decoded through the SDK's existing codec.
+
+The source uses public test scalars 1 and 2, fixed incrementing test nonces,
+synthetic SPIs, an initiator ID_KEY_ID as required by TS 33.501 clause 7.2.1,
+and the reserved responder name `n3iwf.example`. OpenSSL independently
+reproduces both public points and both directions of agreement. Python's
+standard-library HMAC-SHA256 and the RFC 7296 PRF+ equations reproduce every
+answer; RFC 4231 section 4.2 checks the HMAC primitive itself. The fixture
+writer publishes recorded answers without importing either implementation.
+
+The all-zero 256-bit SecurityKey from the complete NGAP Initial Context Setup
+Request supplies the synthetic K_N3IWF input. The SDK test decodes that message
+and passes the placeholder to its existing AUTH calculation. This proves the
+octet-level connection for this vector. It does not implement typed key
+import, consume-once custody, operation/generation binding, or K_AMF derivation.
+Legacy wrong-generation, reuse, cancellation and drop cases remain reference
+state models pending #791's implementation and zeroization evidence.
+
+Thirty published cases cover positive AUTH, altered MIC/key/transcript/SPI/
+nonce/identity/direction/DH input, empty key, short data and unsupported method.
+Changed reserved ID bytes invalidate AUTH because the exact ID body is signed.
+Changed reserved AUTH bytes remain receivable under RFC 7296. Both the
+independent gate and SDK additionally reject 1,549 bit/octet/prefix mutations,
+without using a digest comparison to decide authentication.
+
+```bash
+python3 scripts/n3iwf_key_reference.py --report /tmp/ike-auth-reference-report.json
+cargo test --locked -p opc-n3iwf-fixtures --test protocol_key_known_answers
+```
+
+The reference needs Python's standard library and OpenSSL 3; it uses no network
+or live peer. Hosted CI archives its report. AUTH bodies and SA_INIT inputs do
+not prove certificate validation, EAP success, a protected IKE_AUTH exchange,
+SCTP/DTLS interoperability or kernel installation. These remain in #784.
+
 ## Maintenance and publication
 
 Both `--check` and `--self-test` generate into temporary directories. They
@@ -161,5 +204,6 @@ excluding only the root publication stamp. Any later fixture change requires
 a new content commit and stamp. Preserve the content commit when merging;
 squashing/rebasing requires restamping before the final gate.
 
-Round trips alone do not prove external interoperability. These gates do not
-prove live dataplane, authenticated transport, cryptography, or kernel state.
+Round trips alone do not prove external interoperability. The independent
+known answers prove only the declared cryptographic calculations. These gates
+do not prove live dataplane, authenticated transport or kernel state.

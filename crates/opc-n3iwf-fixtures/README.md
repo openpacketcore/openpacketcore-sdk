@@ -20,14 +20,17 @@ independently with `FixtureCatalog::load_subset_from(root, subset)`.
 | `n2-sctp` | PPID 60/port 38412 metadata and a DATA chunk with opaque user data |
 | `gre-qfi` | GRE header, QFI/RQI fields, opaque trailing payload, QFI constructor bound |
 | `n3-gtpu` | Existing SDK GTP-U codecs: Echo, Recovery, PSC, End Marker |
-| `protocol-key` | Synthetic labels and consume/cancel/drop reference state transitions |
+| `protocol-key` | Independent synthetic IKE AUTH known answers; separate consume/cancel/drop reference scenarios |
 | `nas-tcp` | Two-octet length, caller bounds, partial reads/EOF, opaque inner NAS |
 | `xfrm-roster` | Synthetic SPI roster records and explicit provenance/relocation preconditions |
 | `n2-dtls` | PPID 66, isolated DTLS record/DATA framing, lifecycle preconditions |
 
-Key and transport scenario labels contain no key material. They are not
-cryptographic known-answer tests. A reference state called `zeroized` is an
-obligation for a future implementation; it does not prove memory erasure.
+Key and transport scenario labels remain separate from cryptographic evidence.
+The `ike-auth-known-answer` cases exercise the existing SDK's key schedule,
+AUTH construction and verification with public test inputs and the zero NGAP
+SecurityKey placeholder. They do not exercise a consume-once custody API.
+A reference state called `zeroized` is an obligation for a future implementation;
+it does not prove memory erasure.
 
 ## Validation layers
 
@@ -51,6 +54,11 @@ ETSI publication with Pycrate, a separate implementation from the SDK's
 `rasn` codec. It compares every SDK-decoded IE's identifier, criticality and
 open-type bytes with the reference. Semantic rejection remains an external
 reference check; the SDK's opaque-field boundary is recorded separately.
+The key gate independently reproduces SHA-256/PRF+ answers using Python's
+standard library, checks the HMAC primitive against RFC 4231, and reproduces
+the synthetic P-256 agreement with OpenSSL. Both it and the SDK reject changes
+to the MIC, key, message, nonce and exact identity body, including reserved ID
+octets. AUTH reserved octets are receiver-ignored and have positive controls.
 
 ```bash
 python3 scripts/check-n3iwf-fixture-contracts.py --self-test

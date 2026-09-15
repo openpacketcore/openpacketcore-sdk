@@ -5,11 +5,14 @@ These checks do not import the writer. Protocol parsers stop at the published
 envelope boundary. Scenario checks model caller preconditions, not cryptography,
 kernel state, authenticated identity, or a completed exchange. NGAP and GTP-U
 are exercised with the existing SDK codecs by tests/wire_codecs.rs instead.
+Cryptographic known answers delegate to the separate independent key reference.
 """
 
 import json
 import sys
 from pathlib import Path
+
+import n3iwf_key_reference as key_reference
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -336,6 +339,8 @@ REJECTIONS = {
 
 def observe(manifest, data):
     subset, context = manifest["subset"], manifest["context"]
+    if subset == "protocol-key" and manifest["validation_scope"] == key_reference.SCOPE:
+        return key_reference.observe(data, context)
     try:
         if subset == "gre-qfi":
             outcome = gre(data, context, manifest["encoding"])
@@ -359,6 +364,15 @@ def observe(manifest, data):
 
 
 def validate(manifest, data):
+    if (
+        manifest["subset"] == "protocol-key"
+        and manifest["validation_scope"] == key_reference.SCOPE
+    ):
+        try:
+            key_reference.validate(manifest, data)
+        except key_reference.Invalid as error:
+            raise Invalid(str(error)) from None
+        return
     name = manifest["sdk_fixture_id"].split(".v1.")[1]
     outcome, reason = observe(manifest, data)
     expected = manifest["expected_outcome"]
@@ -454,7 +468,7 @@ def main():
     except (Invalid, OSError, ValueError, KeyError, TypeError, IndexError):
         print("n3iwf_fixture_semantic_mismatch", file=sys.stderr)
         return 1
-    print(f"n3iwf_fixture_oracles_valid: {count} envelopes and scenarios")
+    print(f"n3iwf_fixture_oracles_valid: {count} envelopes, scenarios and known answers")
     return 0
 
 

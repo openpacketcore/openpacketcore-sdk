@@ -24,17 +24,50 @@
     "opc.n3iwf.protocol-key.v1.ordering-bind-then-consume",
     "opc.n3iwf.protocol-key.v1.malformed-label",
     "opc.n3iwf.protocol-key.v1.truncated-label",
-    "opc.n3iwf.protocol-key.v1.bounded-label-overflow"
+    "opc.n3iwf.protocol-key.v1.bounded-label-overflow",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-known-answer",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-wrong-key",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-empty-key",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-changed-transcript",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-changed-spi",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-wrong-peer-nonce",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-changed-identity",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-changed-id-reserved",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-wrong-direction-key",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-changed-dh-input",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-changed-mic",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-short-mic",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-short-header",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-unsupported-method",
+    "opc.n3iwf.protocol-key.v1.auth-initiator-auth-reserved",
+    "opc.n3iwf.protocol-key.v1.auth-responder-known-answer",
+    "opc.n3iwf.protocol-key.v1.auth-responder-wrong-key",
+    "opc.n3iwf.protocol-key.v1.auth-responder-empty-key",
+    "opc.n3iwf.protocol-key.v1.auth-responder-changed-transcript",
+    "opc.n3iwf.protocol-key.v1.auth-responder-changed-spi",
+    "opc.n3iwf.protocol-key.v1.auth-responder-wrong-peer-nonce",
+    "opc.n3iwf.protocol-key.v1.auth-responder-changed-identity",
+    "opc.n3iwf.protocol-key.v1.auth-responder-changed-id-reserved",
+    "opc.n3iwf.protocol-key.v1.auth-responder-wrong-direction-key",
+    "opc.n3iwf.protocol-key.v1.auth-responder-changed-dh-input",
+    "opc.n3iwf.protocol-key.v1.auth-responder-changed-mic",
+    "opc.n3iwf.protocol-key.v1.auth-responder-short-mic",
+    "opc.n3iwf.protocol-key.v1.auth-responder-short-header",
+    "opc.n3iwf.protocol-key.v1.auth-responder-unsupported-method",
+    "opc.n3iwf.protocol-key.v1.auth-responder-auth-reserved"
   ],
   "constructed": [
-    "generation-1 consume-once label"
+    "generation-1 consume-once label",
+    "independent synthetic initiator/responder AUTH bodies"
   ],
   "receive": [
-    "drop zeroize"
+    "drop zeroize reference state",
+    "synthetic AUTH known-answer verification"
   ],
   "unsupported": [
     "byte export",
     "hierarchy derivation",
-    "authentication decision"
+    "authentication decision",
+    "actual consume-once custody and zeroization"
   ]
 }
