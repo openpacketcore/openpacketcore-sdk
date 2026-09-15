@@ -174,7 +174,8 @@ where
 }
 
 // The tables below are transcribed from the repository generator's pinned
-// TS 38.413 Release-18 `NGAP-PDU-Contents.asn` object sets. Every top-level IE
+// TS 38.413 V19.2.0 `NGAP-PDU-Contents.asn` object sets. The independently
+// validated N3IWF V18.10.0 fixture matrix is a subset of these rows. Every top-level IE
 // in the currently typed subset is singleton. List-valued IEs carry their
 // standardized repetition inside the open-type value, not by repeating the
 // top-level protocol-IE identifier.

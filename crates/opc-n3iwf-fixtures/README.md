@@ -16,7 +16,7 @@ independently with `FixtureCatalog::load_subset_from(root, subset)`.
 | --- | --- |
 | `eap5g` | EAP Expanded envelope, AN TLVs, opaque inner NAS |
 | `nwu-ike` | Notify/Delete payload chains; create/modify labels identify intended use |
-| `ngap` | Structural APER dispatch and exact TS 38.413 V18.10.0 IE matrices |
+| `ngap` | Independent complete Release 18.10 messages, IE matrices, nested transfers and SDK structural decode |
 | `n2-sctp` | PPID 60/port 38412 metadata and a DATA chunk with opaque user data |
 | `gre-qfi` | GRE header, QFI/RQI fields, opaque trailing payload, QFI constructor bound |
 | `n3-gtpu` | Existing SDK GTP-U codecs: Echo, Recovery, PSC, End Marker |
@@ -46,6 +46,11 @@ checkout; this API does not sandbox a concurrently hostile filesystem.
 The repository gate adds read-only regeneration, independent envelope/scenario
 oracles, existing SDK codec tests, and verification of Git publication history.
 The Python reference oracles never import the fixture writer.
+The complete NGAP gate compiles all six ASN.1 modules from the hash-pinned
+ETSI publication with Pycrate, a separate implementation from the SDK's
+`rasn` codec. It compares every SDK-decoded IE's identifier, criticality and
+open-type bytes with the reference. Semantic rejection remains an external
+reference check; the SDK's opaque-field boundary is recorded separately.
 
 ```bash
 python3 scripts/check-n3iwf-fixture-contracts.py --self-test

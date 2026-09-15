@@ -9,6 +9,7 @@ inventories. See its [README](../crates/opc-n3iwf-fixtures/README.md) and
 ```
 crates/opc-n3iwf-fixtures/
   oracles/ngap-rel18.json
+  oracles/ngap-rel18-messages.json
   fixtures/
     PUBLIC_SDK.json
     <subset>/
@@ -53,7 +54,7 @@ unknown critical network IE. No wire encoding is attempted for QFI input 64.
 ## NGAP evidence
 
 `oracles/ngap-rel18.json` pins the ETSI PDF URL, document SHA-256, and ASN.1
-clause 9.4.3 for TS 38.413 V18.10.0. It records each IE's identifier,
+clause 9.4.4 for TS 38.413 V18.10.0. It records each IE's identifier,
 criticality, singleton cardinality, and mandatory/optional/conditional
 presence. These rows were extracted from that release, independently of the
 SDK's current policy tables, which also admit later extensions.
@@ -65,11 +66,72 @@ operator PLMNs, the RAN name becomes synthetic, and outer procedure criticality
 is corrected to reject. This is not independent Release-18 N3IWF message
 conformance evidence.
 
-Empty IE wrappers exercise dispatch only. Mandatory presence, inner IE values,
-TS 29.413 clause 5.3 content exceptions, complete N3IWF messages, and canonical
-typed encoding remain unproven/unsupported. Paging is unsupported by the
-N3IWF application under clause 5.4 even though its APER wrapper can be parsed.
-Issue 784 remains the tracker for evidence beyond these published boundaries.
+`oracles/ngap-rel18-messages.json` adds complete messages for all 15 admitted
+outcomes, independently encoded with Pycrate 0.8.1. The reference gate extracts
+and compiles all six ASN.1 modules from the exact PDF. Counted layout repairs
+restore wrapped comments and split identifiers; six SHA-256 hashes verify the
+resulting complete schema. No SDK source or encoder supplies reference bytes.
+The checked-in recipes use explicit `hex`, `bits`/`length`, and `type`/`value`
+notation for ASN.1 octets, bit strings, choices and open types.
+
+The 52 cases include complete N3IWF node/location information, IPv4 and IPv6,
+nested session setup/release transfers, partial resource results, absent
+mandatory/conditional fields, duplicates, unknown criticality, reordered IEs,
+malformed nested transfers and caller bounds. Independent mutation tests
+remove every mandatory IE, duplicate every present IE, change each criticality
+and truncate every prefix of the 15 base messages. Re-encoded mutations bypass
+the digest check and must still fail semantic validation. The report records
+source/tool hashes and actual case counts; hosted CI archives it.
+
+The reviewed QoS profile is standardized non-GBR 5QI 9. Its session setup
+transfer must include Session AMBR (TS 38.413 clause 8.2.1.4); an initial
+context request carrying session resources also requires UE AMBR (clause
+9.2.2.1). Separate negative cases omit each conditional field, omit the nested
+tunnel, or duplicate a QFI. Other QoS profiles need their own reviewed
+conditional evidence. A reference rejection means the message cannot be
+admitted as a successful corpus case; it does not execute the network's
+failure procedure.
+
+The SDK test compares each decoded IE's identifier, criticality and opaque
+value bytes with the independent encoder's results. It also verifies all
+procedure/outcome variants and raw-preserving output. Each manifest records
+`sdk_structural_outcome` separately: absence of a mandatory field or a malformed
+nested transfer can still pass the SDK's structural decoder. This is an
+explicit runtime gap tracked by #787. The corpus exposed and fixed the SDK's
+acceptance of incorrect procedure criticality.
+
+NAS remains opaque; the mandatory SecurityKey field uses an all-zero synthetic
+placeholder. Neither establishes a NAS procedure, key derivation, authentication
+or a complete AMF exchange. Canonical SDK encoding and full clause 5.3 content
+handling remain unsupported. Paging is inapplicable under clause 5.4.
+Issue 784 continues tracking evidence beyond these boundaries.
+
+### Running the independent NGAP gate
+
+Use an isolated environment with the hash-pinned tools:
+
+```bash
+python3 -m venv /tmp/ngap-reference
+/tmp/ngap-reference/bin/pip install --require-hashes --only-binary=:all: \
+  -r scripts/n3iwf-ngap-reference-requirements.txt
+/tmp/ngap-reference/bin/python scripts/check-n3iwf-ngap-reference.py \
+  --report /tmp/ngap-reference-report.json
+```
+
+The command downloads only the pinned public specification over HTTPS. Supply
+`--spec /path/to/ts_138413v181000p.pdf` to use a local copy; its digest must
+match. The gate never updates fixtures, weakens compiler constraints or imports
+the manifest writer. Pycrate (LGPL-2.1-or-later) and pypdf (BSD-3-Clause) are
+external test tools; no tool code or generated reference schema is linked into
+or distributed with the SDK. The SDK gains no runtime dependency.
+
+To author a new reference case, edit the explicit recipe, independently encode
+its complete PDU and each IE value using `Reference.encode` and
+`Reference.encoded_fields`, and record the resulting hex and SHA-256. Review
+the semantic expectation against the pinned standards before publishing it.
+`generate-n3iwf-fixtures.py --write` publishes these recorded results; it does
+not encode NGAP. Run the independent gate as well as the catalog gate before
+committing the content and publication stamp.
 
 ## Maintenance and publication
 

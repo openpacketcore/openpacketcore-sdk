@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import n3iwf_fixture_oracles as oracle
 
@@ -22,6 +23,34 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_reference_download_identifies_the_client_and_bounds_the_read(self):
+        spec = importlib.util.spec_from_file_location(
+            "reference_gate", ROOT / "scripts/check-n3iwf-ngap-reference.py"
+        )
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.url = gate.SPEC_URL
+        response.read.return_value = b"synthetic-publication"
+        with mock.patch.object(
+            gate.urllib.request, "urlopen", return_value=response
+        ) as fetch:
+            self.assertEqual(gate.read_spec(None), b"synthetic-publication")
+            request = fetch.call_args.args[0]
+            self.assertIsInstance(request, gate.urllib.request.Request)
+            self.assertEqual(request.full_url, gate.SPEC_URL)
+            self.assertEqual(
+                request.get_header("User-agent"), "OpenPacketCore-SDK-reference/1.0"
+            )
+            self.assertEqual(fetch.call_args.kwargs, {"timeout": 30})
+            response.read.assert_called_once_with(gate.MAX_SPEC_BYTES + 1)
+            response.url = "http://example.invalid/spec.pdf"
+            response.read.reset_mock()
+            with self.assertRaisesRegex(gate.Invalid, "^spec-transport$"):
+                gate.read_spec(None)
+            response.read.assert_not_called()
+
     def test_ngap_release18_presence_and_ie_set(self):
         matrix = json.loads(
             (FIXTURES / "ngap/matrices/ng-setup-request.json").read_text()
@@ -313,6 +342,40 @@ class PublicationRegressions(unittest.TestCase):
 
 
 class GeneratorRegressions(unittest.TestCase):
+
+    def test_ngap_reference_cannot_escape_or_overwrite_an_output(self):
+        spec = importlib.util.spec_from_file_location(
+            "writer", ROOT / "scripts/generate-n3iwf-fixtures.py"
+        )
+        writer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(writer)
+        reference_path = Path(
+            "crates/opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json"
+        )
+        original = (ROOT / reference_path).read_text()
+        for mutation in ("escape", "duplicate", "digest"):
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reference = json.loads(original)
+                if mutation == "escape":
+                    reference["cases"][0]["name"] = "../../escaped"
+                elif mutation == "duplicate":
+                    reference["cases"][1]["name"] = reference["cases"][0]["name"]
+                else:
+                    reference["cases"][0]["wire_sha256"] = "0" * 64
+                (root / reference_path).parent.mkdir(parents=True)
+                (root / reference_path).write_text(json.dumps(reference))
+                writer.ROOT = root
+                destination = root / "output/ngap"
+                destination.mkdir(parents=True)
+                # Keep the test safe even when the path guard is removed.
+                with mock.patch.object(writer, "dump_manifest") as publish:
+                    with self.assertRaises(ValueError):
+                        writer.ngap_complete_messages(destination)
+                    publish.assert_not_called()
+
     def test_check_is_read_only_and_rejects_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

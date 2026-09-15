@@ -1,30 +1,27 @@
 # opc-proto-ngap conformance — v1 subset
 
-3GPP release: TS 38.413 R18. ASN.1 types generated offline from the 3GPP
+Fixture profile: TS 38.413 V18.10.0. ASN.1 types generated offline from the V19.2.0
 modules mirrored by Wireshark at pinned commit
 `d296f939b42891994714939384adc3deaef3f180` (see
-`scripts/generate-ngap.py`); APER via `rasn`.
+`scripts/generate-ngap.py`); APER via `rasn`. The generated object set includes
+later extensions. It is not the source of the independent Release 18 corpus.
 
 ## Coverage
 
-✅ = proven by a conformance fixture per ADR 0015 (externally sourced or
-hand-authored from the specification with octet comments). 🧪 = structural
-typed dispatch is tested with explicit APER wrapper/body fixtures and fuzzed,
-but no external field-level fixture proves the IE mapping yet.
+✅ = proven at the stated boundary by a conformance fixture per ADR 0015.
+🧪 = structural dispatch only. An IE mapping check proves its identifier,
+criticality and opaque open-type bytes; it does not validate the field's
+internal semantics in the SDK.
 
 | Layer | Item | Status | Evidence |
 |---|---|---|---|
-| NGAP-PDU framing | InitiatingMessage | ✅ | External NGSetupRequest fixture round-trip |
-| NGAP-PDU framing | SuccessfulOutcome | ✅ | Hand-authored wrapper fixture (octet comments, X.691 CHOICE index 1); body kept raw |
-| NGAP-PDU framing | UnsuccessfulOutcome | ✅ | Hand-authored wrapper fixture (CHOICE index 2); body kept raw |
-| Typed decode | NGSetupRequest | ✅ | 78-byte external fixture; IE ids, RANNodeName content, and DefaultPagingDRX value asserted |
-| Typed decode | NGSetupResponse / NGSetupFailure | 🧪 | Successful/unsuccessful outcome dispatch with hand-authored empty-IE APER fixtures; malformed recognized bodies fail closed |
-| Typed decode | InitialUEMessage | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture; external field fixture pending |
-| Typed decode | DownlinkNASTransport / UplinkNASTransport | 🧪 | First-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | InitialContextSetup Request/Response/Failure | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | PDUSessionResourceSetup Request/Response | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | PDUSessionResourceRelease Command/Response | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
-| Typed decode | UEContextRelease Command/Complete | 🧪 | Outcome-aware first-CNF N2 dispatch with hand-authored empty-IE APER fixtures |
+| NGAP-PDU framing | All three outcomes | ✅ | Complete messages independently encoded from the Release 18.10 schema |
+| Typed IE mapping | NGSetup Request/Response/Failure | ✅ | Every IE compared with independent reference bytes |
+| Typed IE mapping | InitialUEMessage; Downlink/UplinkNASTransport | ✅ | Complete N3IWF messages, including IPv4/IPv6 location |
+| Typed IE mapping | InitialContextSetup Request/Response/Failure | ✅ | Complete context and nested resource fields |
+| Typed IE mapping | PDUSessionResourceSetup Request/Response | ✅ | Nested setup transfers and partial resource results |
+| Typed IE mapping | PDUSessionResourceRelease Command/Response | ✅ | Nested release transfers |
+| Typed IE mapping | UEContextRelease Command/Complete | ✅ | UE identifier pair and N3IWF location |
 | Typed decode | Paging | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture |
 
 Dispatch is outcome-aware: procedure code 21 decodes as NGSetupRequest only
@@ -35,11 +32,12 @@ applied to the first-CNF N2 subset above.
 ## Protocol-IE policy and cardinality
 
 The wrapper carries procedure/outcome-specific metadata transcribed from the
-pinned TS 38.413 Release-18 ASN.1 object sets for every typed row above:
+pinned generated ASN.1 object sets for every typed row above:
 recognized top-level IE identifiers, expected criticality, and
 singleton/repeatable cardinality.
 
-- Known identifiers are accepted only with their specified criticality.
+- Known procedures and IE identifiers are accepted only with their specified
+  criticality. The procedure check runs before typed-body materialization.
 - `UnknownIePolicy::Preserve` retains the generated entry and opaque open-type
   value; `Drop` removes it from the typed container; and `Reject` returns a
   stable value-free decode error.
@@ -78,10 +76,17 @@ render `Pdu::raw`, opaque IE values, or NAS payload bytes.
 
 ## Fixtures
 
-- `NGSetupRequest`: 78-byte APER PDU captured from an independent
-  `asn1c`-based implementation (libngap): GlobalRANNodeID, RANNodeName
-  ("My little gNB"), SupportedTAList, DefaultPagingDRX(v64). Field-level
-  content is asserted, not just the decoded type.
+- [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):
+  complete messages for all 15 admitted outcomes, encoded by Pycrate 0.8.1
+  compiled directly from the exact ETSI Release 18.10 publication. The
+  [SDK field comparison](../opc-n3iwf-fixtures/tests/ngap_messages.rs) verifies
+  every decoded IE and raw-preserving output. The separate reference gate
+  validates mandatory fields and nested ASN.1 values; it does not give the
+  SDK semantic admission or canonical typed encoding.
+- Legacy `NGSetupRequest`: 78-byte structural derivative of the libngap
+  literal. Its erroneous outer criticality is corrected from ignore to reject;
+  the original literal remains as provenance. It is not a complete N3IWF peer
+  exchange. Existing field-level assertions are retained.
 - Successful/unsuccessful outcome wrappers and empty-IE message bodies:
   hand-authored from TS 38.413 §9.2 and X.691 aligned-PER rules with
   octet-level comments. These prove routing and raw-preserving behavior, not
@@ -107,7 +112,8 @@ entries before `SequenceOf` materialization. Three additional layers guard it:
 ## Codec Boundary (v1 subset)
 
 - Canonical (typed) encoding of any message.
-- External field-level fixtures for the structural typed-dispatch subset above.
+- External field-level fixtures for Paging and procedures outside the admitted
+  N3IWF corpus.
 - Typed decode of procedures outside the first-CNF N2 subset above; preserved
   raw as `Message::Unknown`.
 - UPER encoding.

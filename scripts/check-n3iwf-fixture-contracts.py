@@ -113,6 +113,8 @@ def main() -> int:
             "opc-n3iwf-fixtures",
             "--test",
             "wire_codecs",
+            "--test",
+            "ngap_messages",
         )
         if not publication_matches_content():
             print("n3iwf_fixture_publication_mismatch", file=sys.stderr)

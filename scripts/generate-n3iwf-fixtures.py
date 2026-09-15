@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = ROOT / "crates" / "opc-n3iwf-fixtures" / "fixtures"
-PUBLIC_BASE = "82027e46d8706bc11f226fbfaf95da7858be7e4c"
+PUBLIC_BASE = "987246c8be773b19304f059231c39baa8d54d123"
 ISSUE = 784
 
 # Existing public SDK vectors reused by digest (issues 341/493).
@@ -1290,9 +1291,129 @@ def ngap_matrix_record(spec: dict) -> dict:
             "rows are TS 38.413 identifier/criticality/cardinality"
         ),
         "admission_scope": "issue-493-first-cnf-typed-subset",
-        "wire_fixture_id": spec["wire_fixture_id"],
+        "wire_fixture_id": (
+            f"opc.n3iwf.ngap.v1.complete-{spec['slug']}"
+            if spec["admitted_disposition"] == "receive"
+            else spec["wire_fixture_id"]
+        ),
         "ies": spec["ies"],
     }
+
+
+def ngap_complete_messages(subset_dir: Path) -> list[dict]:
+    """Publish independent reference results without importing its encoder."""
+    reference_path = "crates/opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json"
+    path = ROOT / reference_path
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("n3iwf_ngap_reference_file")
+    with path.open("rb") as source:
+        content = source.read(256 * 1024 + 1)
+    if len(content) > 256 * 1024:
+        raise ValueError("n3iwf_ngap_reference_size")
+    reference = json.loads(content)
+    # Reference names become paths. Validate the entire inventory before its
+    # first write, including duplicate names and stale wire digests. The
+    # independent gate separately validates the ASN.1 recipes and semantics.
+    names = set()
+    for case in reference["cases"]:
+        name = case["name"]
+        if (
+            not isinstance(name, str)
+            or len(name) > 96
+            or re.fullmatch(r"(?:complete|missing-mandatory)-[a-z0-9-]+", name) is None
+            or name in names
+        ):
+            raise ValueError("n3iwf_ngap_reference_name")
+        names.add(name)
+        wire = bytes.fromhex(case["wire_hex"])
+        if (
+            not 0 < len(wire) <= 65535
+            or hashlib.sha256(wire).hexdigest() != case["wire_sha256"]
+        ):
+            raise ValueError("n3iwf_ngap_reference_wire")
+    fixtures = []
+    for case in reference["cases"]:
+        spec = next(
+            item for item in NGAP_IE_MATRICES if item["message"] == case["message"]
+        )
+        wire_hex = bytes.fromhex(case["wire_hex"]).hex(" ")
+        record = manifest(
+            subset="ngap",
+            name=case["name"],
+            case_class=case["case_class"],
+            document="3GPP TS 38.413",
+            release="V18.10.0",
+            clauses=spec["clauses_38413"] + ["9.4.4", "9.4.5", "TS 29.413 5.3"],
+            direction=spec["direction"],
+            role="n3iwf" if spec["direction"].startswith("n3iwf") else "amf",
+            prerequisite=(
+                "Independent Pycrate 0.8.1 compiled from the hash-pinned ETSI Release 18.10 "
+                "publication. Existing SDK tests exercise structural decode separately. "
+                "Session outcomes use synthetic requested resources; inner NAS is opaque."
+            ),
+            provenance_class=(
+                "spec-authored"
+                if case["reference_error"] is None
+                else "synthetic-negative"
+            ),
+            notes=(
+                "Independently encoded ASN.1 recipe; no SDK encoder, capture, or real peer. "
+                f"Source SHA-256 {reference['source_sha256']}. "
+                "The reference gate recompiles all six modules and checks the complete "
+                "wire, nested transfers, mandatory fields and enumerated N3IWF conditions."
+            ),
+            referenced=reference_path,
+            sanitized=SYN_ID
+            + [
+                {
+                    "name": "SecurityKey",
+                    "treatment": "all-zero-256-bit-test-placeholder-if-present",
+                    "value_class": "synthetic-not-peer-key",
+                },
+                {
+                    "name": "NAS-PDU",
+                    "treatment": "opaque-synthetic-four-octet-container",
+                    "value_class": "non-subscriber",
+                },
+                {
+                    "name": "addresses",
+                    "treatment": "RFC5737-and-RFC3849-documentation-ranges",
+                    "value_class": "synthetic",
+                },
+                {
+                    "name": "PLMN",
+                    "treatment": "reserved-test-001-01",
+                    "value_class": "synthetic",
+                },
+            ],
+            wire_name=case["name"],
+            wire_hex=wire_hex,
+            assertions=[
+                f"message={case['message']}",
+                "reference=pycrate-0.8.1-ts38413-v18.10.0",
+                f"reference_result={case['reference_error'] or 'accept'}",
+                f"sdk_structural_result={case['sdk_structural_outcome']}",
+                "inner_nas=opaque",
+                "constructed_sdk_encode=unsupported",
+                "runtime_claim=false",
+            ],
+            outcome="reject" if case["reference_error"] else "receive",
+        )
+        record["validation_scope"] = "ngap-release18-message"
+        record["context"] = {
+            "message": case["message"],
+            "independent_asn1_validation": True,
+            "reference_error": case["reference_error"],
+            "max_ies": case["max_ies"],
+            "duplicate_ie_policy": "reject",
+            "unknown_ie_policy": "preserve",
+            "validation_level": "strict",
+            "sdk_structural_outcome": case["sdk_structural_outcome"],
+            "sdk_semantic_validation": False,
+        }
+        dump_manifest(subset_dir, record, wire_hex)
+        fixtures.append(record)
+    return fixtures
 
 
 def ngap(subset_dir: Path) -> list[dict]:
@@ -1554,21 +1675,35 @@ def ngap(subset_dir: Path) -> list[dict]:
             fixtures.append(extra)
             if spec["admitted_disposition"] == "receive":
                 receive_labels.append(f"{spec['message']} empty wrapper")
+    complete = ngap_complete_messages(subset_dir)
+    fixtures.extend(complete)
+    receive_labels.extend(
+        item["context"]["message"] + " independently validated complete message"
+        for item in complete
+        if item["case_class"] == "positive"
+    )
     write_readme(
         subset_dir,
         "NGAP N3IWF fixture subset",
-        """Reuses the issue 493 DecodeContext / IE cardinality contract and the
-sanitized 78-byte derivative of the legacy libngap structural vector. It is
-not an independent Release-18 N3IWF message oracle. IE tables are extracted
-separately from TS 38.413 V18.10.0 ASN.1, including presence rules. TS 29.413
-V18.5.0 clauses 5.2–5.4 decide which first-CNF messages are admitted for
-N3IWF. Canonical typed encode remains unsupported.
+        """Complete messages for all 15 admitted outcomes are independently
+encoded and decoded with Pycrate 0.8.1 compiled directly from the hash-pinned
+TS 38.413 V18.10.0 publication. They contain N3IWF identifiers, location and
+nested PDU-session transfers. Negative cases separate reference admission
+from the current SDK's structural decoder. The legacy empty wrappers remain
+at `aper-structural-dispatch`; the new scope is `ngap-release18-message`.
+
+The reference gate validates ASN.1 constraints, mandatory fields, criticality,
+cardinality, nested transfers and enumerated TS 29.413 N3IWF conditions.
+NAS remains opaque. SecurityKey, where present, is an all-zero synthetic
+placeholder; these vectors do not prove key derivation or authentication.
 
 `matrices/` publishes identifier/criticality/cardinality for every admitted
-first-CNF sent/received outcome plus Paging (5.4 discard). TS 29.413 5.2
+first-CNF sent/received outcome plus Paging (5.4 discard). Each admitted matrix
+links to a complete independently validated positive vector. TS 29.413 5.2
 messages outside the issue 493 typed subset stay unpublished. Clause 5.3
-RAN-specific ignore is not encoded in the rows. Constructed N3IWF send is
-unsupported. This crate does not select an AMF or apply subscriber policy.
+RAN-specific ignore is not encoded in the rows. Canonical SDK encoding and
+SDK semantic admission remain unsupported (#787). No real AMF exchange,
+AMF selection or subscriber policy is claimed.
 """,
     )
     write_completion(

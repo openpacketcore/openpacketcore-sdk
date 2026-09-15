@@ -3,7 +3,8 @@
 ## Claim
 
 Synthetic fixture inventories, catalog validation, bounded envelope checks,
-and local reference scenarios. `runtime_claim=false` throughout. The crate
+independently compiled complete NGAP messages, and local reference scenarios.
+`runtime_claim=false` throughout. The crate
 has no runtime protocol dependencies; test-only dependencies exercise the
 existing NGAP and GTP-U codecs against the published bytes.
 
@@ -17,7 +18,7 @@ or that all acceptance evidence for issue 784 has been supplied.
 | --- | --- | --- |
 | 3GPP TS 24.502 | V18.8.0 | EAP-5G, IKE payloads, GRE/QFI, NAS-over-TCP envelopes |
 | 3GPP TS 29.413 | V18.5.0 | N3IWF application scope, clauses 5.2–5.4 |
-| 3GPP TS 38.413 | V18.10.0 | Exact ASN.1 message IE rows, clause 9.4.3 |
+| 3GPP TS 38.413 | V18.10.0 | Six independently compiled ASN.1 modules, complete messages, IE rows and nested transfers |
 | 3GPP TS 38.412 | V18.1.0 | PPID 60/66 and port 38412, clause 7 |
 | 3GPP TS 29.281 | V18.4.0 | GTP-U Echo, Recovery, extension chains |
 | 3GPP TS 38.415 | V18.2.0 | Direction-specific PSC, clause 5.5.3 |
@@ -32,21 +33,35 @@ or that all acceptance evidence for issue 784 has been supplied.
 Allowed provenance classes are `spec-authored`, `referenced-public-vector`,
 `synthetic-negative`, and `synthetic-kat`. The last is a legacy schema name
 for scenario labels here; it does not claim a cryptographic known-answer test.
-No subscriber captures or key material are published. Documentation addresses,
-reserved test PLMN, and synthetic identifiers are used.
+No subscriber captures or real key material are published. Complete NGAP
+InitialContextSetupRequest vectors include the mandatory SecurityKey field
+with an all-zero 256-bit placeholder. It is neither a peer key nor a key
+derivation known answer. Documentation addresses, reserved test PLMN, and
+synthetic identifiers are used.
 
 The NGAP legacy vector is transformed before publication. Its full original
 literal is SHA-256 pinned and its precise sanitization is tested. The source
 is not evidence of Release-18 N3IWF message conformance. Exact Release-18
 matrices instead come from the independently pinned ETSI ASN.1 extraction.
+The complete-message corpus uses Pycrate 0.8.1 compiled from that exact PDF;
+the bundled Pycrate NGAP schema and the SDK generator are not used. The gate
+checks mandatory presence, criticality, singleton cardinality, nested ASN.1
+transfers, N3IWF node/location choice, conditional resource results, UE AMBR
+when initial context setup includes session resources, and Session AMBR for
+the reviewed non-GBR 5QI 9 profile. It exercises all 15 admitted outcomes.
+The current SDK checks framing and opaque IE bytes against those independent
+results, and rejects incorrect procedure criticality before typed decoding.
 The complete existing Echo Request/Response and downlink PSC literals are
 compared to the published GTP-U bytes. Codec execution adds semantic checks;
 round trips alone do not prove external interoperability.
 
 ## Unsupported evidence
 
-- NGAP mandatory presence/inner IE validation, clause 5.3 content exceptions,
-  independently validated complete N3IWF messages, and canonical typed encode.
+- SDK NGAP mandatory/conditional presence, typed inner IE validation and
+  canonical typed encode (#787). Reference validation does not implement
+  those runtime functions. Full clause 5.3 content handling, procedures outside
+  the admitted 15 outcomes, other QoS profiles and live AMF interoperability
+  remain unproven.
 - Complete IKE exchanges, subscriber authentication, key derivation/export,
   and actual memory zeroization.
 - Established DTLS sessions, verified peer certificates, actual exporter

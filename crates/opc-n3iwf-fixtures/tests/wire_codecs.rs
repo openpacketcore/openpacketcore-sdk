@@ -69,7 +69,10 @@ fn every_gtpu_wire_obeys_its_codec_contract() {
 #[test]
 fn ngap_dispatch_is_structural_and_rejects_malformed_containers() {
     let catalog = FixtureCatalog::load().expect("catalog");
-    for (manifest, wire) in catalog.manifests().filter(|(m, _)| m.subset == "ngap") {
+    for (manifest, wire) in catalog
+        .manifests()
+        .filter(|(m, _)| m.subset == "ngap" && m.validation_scope == "aper-structural-dispatch")
+    {
         assert_eq!(manifest.validation_scope, "aper-structural-dispatch");
         assert_eq!(manifest.context["mandatory_presence_validation"], false);
         assert_eq!(manifest.context["inner_ie_validation"], false);

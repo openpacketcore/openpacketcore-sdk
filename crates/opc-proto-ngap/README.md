@@ -4,9 +4,10 @@ Experimental NGAP APER codec subset for OpenPacketCore.
 
 ## Purpose
 
-`opc-proto-ngap` provides a Release 18 NGAP-PDU framing and typed-dispatch
-surface built on `rasn`. The current scope is the v1 subset documented in
-`CONFORMANCE.md`.
+`opc-proto-ngap` provides an NGAP-PDU framing and typed-dispatch surface built
+on `rasn`, with independent TS 38.413 V18.10.0 fixture evidence. The generated
+schema is V19.2.0 and admits later extensions. The current scope is the v1
+subset documented in [CONFORMANCE.md](CONFORMANCE.md).
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
 or gNB procedure state, NAS handling, or semantic validation of NGAP IE
@@ -29,7 +30,7 @@ cardinality, and configured decode policies.
 
 ## Typed IE policy boundary
 
-Each currently typed procedure/outcome has Release-18 metadata for its known
+Each currently typed procedure/outcome has pinned ASN.1 metadata for its known
 top-level protocol-IE identifiers, required wire criticality, and
 singleton/repeatable cardinality. Before `rasn` materializes a typed
 `ProtocolIE-Container`, the decoder reads its exact aligned-PER 16-bit count,
@@ -52,8 +53,8 @@ The remaining `DecodeContext` policies apply as follows:
   Repeatable identifiers retain every occurrence. All top-level IEs in the
   current typed subset are singleton; list-valued IEs carry repetition inside
   their value.
-- Known identifiers must carry their TS 38.413 criticality. A mismatch fails
-  with a stable, value-free structural error.
+- Known procedures and IE identifiers must carry their TS 38.413 criticality.
+  A mismatch fails with a stable, value-free structural error.
 
 Filtering changes only the typed view. `Pdu::raw` is never rewritten, and the
 only supported encoder is raw-preserving. Consequently, encoding a PDU decoded
@@ -95,10 +96,11 @@ pdu.encode(
 
 ## Status And Limits
 
-The crate is experimental and `publish = false`. Fixture-proven coverage exists
-for NGAP-PDU framing and `NGSetupRequest`. Several first-CNF AMF N2 messages
-have structural typed dispatch with hand-authored APER fixtures, but not yet
-external field-level fixtures.
+The crate is experimental and `publish = false`. The independent N3IWF corpus
+proves framing and each decoded IE's identifier, criticality and opaque bytes
+for 15 admitted message outcomes. Its reference gate validates nested ASN.1
+values and enumerated N3IWF conditions; the SDK does not yet perform those
+semantic checks. See the [evidence guide](../../docs/n3iwf-fixture-contracts.md).
 
 Canonical typed encode is intentionally unsupported. `rasn` 0.28 decodes the
 covered APER fixtures, but its encoder does not reproduce the byte alignment
@@ -117,17 +119,19 @@ make generate-ngap
 
 The generator requires Python 3.9+, `rasn-compiler` 0.16, and network access.
 Inputs are fetched from Wireshark ASN.1 files at pinned commit
-`d296f939b42891994714939384adc3deaef3f180`; output is deterministic for that
-commit.
+`d296f939b42891994714939384adc3deaef3f180` (TS 38.413 V19.2.0); output is
+deterministic for that commit.
 
 ## Roadmap
 
 - Resolve or work around the APER encoder alignment issue before enabling
   constructed typed NGAP messages.
-- Add external field-level fixtures for the structural typed-dispatch subset.
+- Add external field-level fixtures for Paging and further procedures.
 - Expand procedure coverage only with fixture evidence and raw-preserving
   regression tests.
-- Add semantic validation in consuming AMF/N2 code, not in this framing crate.
+- Add typed inner IE and presence validation with canonical construction
+  under [#787](https://github.com/openpacketcore/openpacketcore-sdk/issues/787).
+  Procedure state and subscriber policy remain consumer responsibilities.
 
 ## Verification
 
