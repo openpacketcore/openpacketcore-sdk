@@ -1,0 +1,44 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 41,
+    "max_spi_bytes": 4
+  },
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.duplicate-nas-ip4",
+  "subset": "nwu-ike",
+  "case_class": "duplicate",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.1.2"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "Caller duplicate-notify policy",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Two NAS_IP4_ADDRESS notifies; singleton policy is caller-owned"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-nas-ip4.hex",
+    "digest_sha256": "fd0164726418960aabe10435d23934b5bd654a338fcafe26726d003dd036070c"
+  },
+  "semantic_assertions": [
+    "duplicate_notify=55502"
+  ],
+  "expected_outcome": "caller-policy",
+  "runtime_claim": false
+}

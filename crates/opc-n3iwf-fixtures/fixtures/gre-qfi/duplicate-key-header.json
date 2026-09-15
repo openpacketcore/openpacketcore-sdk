@@ -1,0 +1,44 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gre-header",
+  "context": {
+    "max_qfi": 63
+  },
+  "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.duplicate-key-header",
+  "subset": "gre-qfi",
+  "case_class": "duplicate",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.3"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "One GRE header per packet",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Two concatenated GRE headers"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-key-header.hex",
+    "digest_sha256": "c2a6c6516f912367bb8a51d61cf18bb7a090cf3c655da215ce8638d6a1a550eb"
+  },
+  "semantic_assertions": [
+    "gre_header_count=1",
+    "trailing_bytes=opaque-payload"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

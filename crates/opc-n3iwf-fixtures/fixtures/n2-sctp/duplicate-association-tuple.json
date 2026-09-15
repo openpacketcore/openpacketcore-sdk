@@ -1,0 +1,45 @@
+{
+  "encoding": "metadata-record",
+  "validation_scope": "association-metadata",
+  "context": {
+    "layout": "ppid-port",
+    "ppid": 60,
+    "max_port": 65534
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.duplicate-association-tuple",
+  "subset": "n2-sctp",
+  "case_class": "duplicate",
+  "source": {
+    "document": "3GPP TS 38.412",
+    "release": "V18.1.0",
+    "clauses": [
+      "7"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Caller association-generation uniqueness",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Repeated PPID/port tuple; generation collision is caller policy"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-association-tuple.hex",
+    "digest_sha256": "5c9ffba17e76e1b7ff2d748ef4a5727ebd8945614e3f3cb00dd95492845c23e7"
+  },
+  "semantic_assertions": [
+    "duplicate_tuple=true"
+  ],
+  "expected_outcome": "caller-policy",
+  "runtime_claim": false
+}

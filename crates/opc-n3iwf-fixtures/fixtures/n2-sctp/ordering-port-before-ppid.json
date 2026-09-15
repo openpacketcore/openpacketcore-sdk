@@ -1,0 +1,45 @@
+{
+  "encoding": "metadata-record",
+  "validation_scope": "association-metadata",
+  "context": {
+    "layout": "port-ppid",
+    "ppid": 60,
+    "max_port": 65534
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.ordering-port-before-ppid",
+  "subset": "n2-sctp",
+  "case_class": "ordering",
+  "source": {
+    "document": "3GPP TS 38.412",
+    "release": "V18.1.0",
+    "clauses": [
+      "7"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Metadata encoding order is not on-wire SCTP",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Port then PPID documents that metadata order is not a chunk order claim"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-port-before-ppid.hex",
+    "digest_sha256": "0a42d6c2b4b84b66980e22ac435a9c5d2a0e7e3e27d8a7d5fa66225f3c0f1a89"
+  },
+  "semantic_assertions": [
+    "metadata_order=port-then-ppid"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

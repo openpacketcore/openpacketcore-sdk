@@ -1,0 +1,47 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.malformed-version",
+  "subset": "xfrm-roster",
+  "case_class": "malformed",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Version 0 is not the synthetic roster record version"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-version.hex",
+    "digest_sha256": "88f05c3a6476978ba649eb5b731b3542730c55c9f9efa34620ef7710032b4230"
+  },
+  "semantic_assertions": [
+    "version=0"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

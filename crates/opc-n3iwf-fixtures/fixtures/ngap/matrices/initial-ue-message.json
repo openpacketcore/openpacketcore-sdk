@@ -1,0 +1,182 @@
+{
+  "message": "InitialUEMessage",
+  "procedure_code": 15,
+  "outcome": "initiating",
+  "direction": "n3iwf-to-amf",
+  "ts29413_clause": "5.2",
+  "admitted_disposition": "receive",
+  "constructed_send": false,
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.5.1"
+    ]
+  },
+  "application": {
+    "document": "3GPP TS 29.413",
+    "release": "V18.5.0",
+    "clauses": [
+      "5.2"
+    ]
+  },
+  "n3iwf_content_exceptions": "TS 29.413 5.3 RAN-specific ignore is not encoded; rows are TS 38.413 identifier/criticality/cardinality",
+  "admission_scope": "issue-493-first-cnf-typed-subset",
+  "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-ue-message",
+  "ies": [
+    {
+      "id": 85,
+      "name": "id-RAN-UE-NGAP-ID",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 38,
+      "name": "id-NAS-PDU",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 121,
+      "name": "id-UserLocationInformation",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 90,
+      "name": "id-RRCEstablishmentCause",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 26,
+      "name": "id-FiveG-S-TMSI",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 3,
+      "name": "id-AMFSetID",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 112,
+      "name": "id-UEContextRequest",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 0,
+      "name": "id-AllowedNSSAI",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 171,
+      "name": "id-SourceToTarget-AMFInformationReroute",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 174,
+      "name": "id-SelectedPLMNIdentity",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 201,
+      "name": "id-IABNodeIndication",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 224,
+      "name": "id-CEmodeBSupport-Indicator",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 225,
+      "name": "id-LTEM-Indication",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 227,
+      "name": "id-EDT-Session",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 245,
+      "name": "id-AuthenticatedIndication",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 259,
+      "name": "id-NPN-AccessInformation",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 333,
+      "name": "id-RedCapIndication",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 371,
+      "name": "id-SelectedNID",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 402,
+      "name": "id-MobileIABNodeIndication",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 414,
+      "name": "id-Partially-Allowed-NSSAI",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 427,
+      "name": "id-ERedCapIndication",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 440,
+      "name": "id-AUN3DeviceAccessInfo",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    }
+  ]
+}

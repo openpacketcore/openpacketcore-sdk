@@ -1,0 +1,46 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "nas-tcp-envelope",
+  "context": {
+    "max_payload_len": 256,
+    "min_payload_len": 1,
+    "stream_open": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.unknown-epd",
+  "subset": "nas-tcp",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 24.501",
+    "release": "R18",
+    "clauses": [
+      "9.1.1"
+    ]
+  },
+  "direction": "either",
+  "role": "nas-tcp-endpoint",
+  "prerequisite": "Envelope is complete; inner NAS EPD is opaque to the framer",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-nas/CONFORMANCE.md",
+    "notes": "EPD 0x7f is unknown to NAS; the TCP envelope itself is complete"
+  },
+  "sanitized_fields": [
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-epd.hex",
+    "digest_sha256": "b67d3f05ff78cc41830520f6aca7d01b1e5cfbae647ad442d9102e33f9005820"
+  },
+  "semantic_assertions": [
+    "envelope_complete=true",
+    "inner_nas=opaque-or-reject-by-nas-codec"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

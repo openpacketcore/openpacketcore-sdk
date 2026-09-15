@@ -1,0 +1,45 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 65535,
+    "unknown_ie_policy": "reject"
+  },
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.receive-recovery-ignored",
+  "subset": "n3-gtpu",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 29.281",
+    "release": "V18.4.0",
+    "clauses": [
+      "8.2"
+    ]
+  },
+  "direction": "peer-to-local",
+  "role": "gtpu-endpoint",
+  "prerequisite": "Received Recovery is ignored and canonicalized to zero",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-gtpu/tests/control_messages.rs",
+    "notes": "Echo Response Recovery 0xa5 is ignored on receive"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/receive-recovery-ignored.hex",
+    "digest_sha256": "bb72319b3449056dfbb88911d55f7078546140adc800700e7095838f31c7c5f1"
+  },
+  "semantic_assertions": [
+    "received_recovery_ignored=true",
+    "canonical_recovery=0"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

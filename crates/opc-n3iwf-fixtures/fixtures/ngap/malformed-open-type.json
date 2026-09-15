@@ -1,0 +1,47 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "aper-structural-dispatch",
+  "context": {
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "reject",
+    "mandatory_presence_validation": false,
+    "inner_ie_validation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.malformed-open-type",
+  "subset": "ngap",
+  "case_class": "malformed",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Open-type length 1 cannot hold a ProtocolIE-Container prefix"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-open-type.hex",
+    "digest_sha256": "68737f9dd46ff754a2398456e3e1589816b8f08a9cf3d895f76d909cf1786569"
+  },
+  "semantic_assertions": [
+    "open_type_length=1"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

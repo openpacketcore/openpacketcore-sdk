@@ -1,0 +1,51 @@
+{
+  "encoding": "scenario-label",
+  "validation_scope": "handle-lifecycle-contract",
+  "context": {
+    "bound_generation": 1,
+    "requested_generation": 1,
+    "purpose": "unknown",
+    "max_label_bytes": 64,
+    "actions": [
+      "bind",
+      "consume"
+    ],
+    "expected_state": "consumed"
+  },
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.unknown-purpose",
+  "subset": "protocol-key",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "amf-to-n3iwf-handoff",
+  "role": "n3iwf",
+  "prerequisite": "Purpose must be K_N3IWF",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Unknown purpose label is rejected"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-purpose.hex",
+    "digest_sha256": "44b747f7b75c85d61a4be62caf358176252a578786d95364ca8fc46f94b59fad"
+  },
+  "semantic_assertions": [
+    "purpose=unknown"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

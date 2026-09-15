@@ -1,0 +1,52 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "dtls-record",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.malformed-tls-version",
+  "subset": "n2-dtls",
+  "case_class": "malformed",
+  "source": {
+    "document": "IETF RFC 6347",
+    "release": "RFC 6347",
+    "clauses": [
+      "4.1"
+    ]
+  },
+  "direction": "peer-to-local",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "TLS 1.2 record version is not DTLS"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-tls-version.hex",
+    "digest_sha256": "f17d6ef8147e88e6fc1349fe3188a984cc12be7f70c5f8008c49a14b60a1589b"
+  },
+  "semantic_assertions": [
+    "version=tls-1.2"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

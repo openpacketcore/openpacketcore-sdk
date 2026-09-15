@@ -1,0 +1,41 @@
+{
+  "subset": "nas-tcp",
+  "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.nas-tcp.v1.positive-envelope",
+    "opc.n3iwf.nas-tcp.v1.partial-need-more-data",
+    "opc.n3iwf.nas-tcp.v1.duplicate-complete-frames",
+    "opc.n3iwf.nas-tcp.v1.ordering-two-message-types",
+    "opc.n3iwf.nas-tcp.v1.malformed-zero-length",
+    "opc.n3iwf.nas-tcp.v1.truncated-length-octet",
+    "opc.n3iwf.nas-tcp.v1.bounded-length-overflow",
+    "opc.n3iwf.nas-tcp.v1.unknown-epd",
+    "opc.n3iwf.nas-tcp.v1.eof-loss-incomplete-frame"
+  ],
+  "constructed": [
+    "complete two-octet envelope"
+  ],
+  "receive": [
+    "two-frame stream",
+    "unknown inner EPD left opaque"
+  ],
+  "unsupported": [
+    "TCP listen",
+    "reconnect",
+    "security termination",
+    "UE lifecycle"
+  ]
+}

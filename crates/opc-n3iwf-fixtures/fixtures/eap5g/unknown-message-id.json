@@ -1,0 +1,44 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "eap-envelope",
+  "context": {
+    "max_an_bytes": 1024
+  },
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.unknown-message-id",
+  "subset": "eap5g",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.2.2.1"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Message-Id 0x7F is not a defined EAP-5G message"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-message-id.hex",
+    "digest_sha256": "810c9434c5c1f62b12b40d0adef12f3fff8e429730b36c8bc694e7ffc3cc60ca"
+  },
+  "semantic_assertions": [
+    "message_id=0x7f",
+    "unknown_critical=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

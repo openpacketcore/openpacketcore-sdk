@@ -1,0 +1,43 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gre-header",
+  "context": {
+    "max_qfi": 63
+  },
+  "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.malformed-missing-key",
+  "subset": "gre-qfi",
+  "case_class": "malformed",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.3"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "NWu profile requires K=1",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "K=0 so the QFI key field is absent"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-missing-key.hex",
+    "digest_sha256": "d8e0873e07dc7ad50a18300157d1aa293f9c3f70d2271ba00489647275af9c2f"
+  },
+  "semantic_assertions": [
+    "k=0"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

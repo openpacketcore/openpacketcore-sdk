@@ -1,0 +1,46 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "nas-tcp-envelope",
+  "context": {
+    "max_payload_len": 256,
+    "min_payload_len": 1,
+    "stream_open": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.duplicate-complete-frames",
+  "subset": "nas-tcp",
+  "case_class": "duplicate",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.4"
+    ]
+  },
+  "direction": "either",
+  "role": "nas-tcp-endpoint",
+  "prerequisite": "Stream may carry more than one envelope",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Two complete frames; first is valid and the second remains buffered"
+  },
+  "sanitized_fields": [
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-complete-frames.hex",
+    "digest_sha256": "0b25e5e5d2595b8bcd787d65d2386447fbdb25b223d965ab9645b93661c536ba"
+  },
+  "semantic_assertions": [
+    "first_frame_complete=true",
+    "trailing_frame_buffered=true"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

@@ -1,0 +1,57 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "sctp-data-chunk",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.reliable-delivery-data",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4",
+      "IETF RFC 4960 3.3.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Reliable ordered delivery is a caller precondition; B/E flags identify an unfragmented DATA message",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Unfragmented DATA chunk (B=1 E=1) carrying PPID 66 and an isolated ServerHelloDone; flags do not prove reliability or authentication"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/reliable-delivery-data.hex",
+    "digest_sha256": "29e58e11f07756d8987911b8570a1d1e7ffe347c9221d25a52f229c391cedc71"
+  },
+  "semantic_assertions": [
+    "chunk=DATA",
+    "flags=B+E",
+    "ppid=66",
+    "reliable_delivery=true",
+    "reliability=caller-precondition"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

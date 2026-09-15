@@ -1,0 +1,44 @@
+{
+  "subset": "eap5g",
+  "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.eap5g.v1.positive-start",
+    "opc.n3iwf.eap5g.v1.positive-nas-response",
+    "opc.n3iwf.eap5g.v1.unknown-parameter-ignored",
+    "opc.n3iwf.eap5g.v1.ordering-an-parameters",
+    "opc.n3iwf.eap5g.v1.duplicate-selected-plmn",
+    "opc.n3iwf.eap5g.v1.malformed-length",
+    "opc.n3iwf.eap5g.v1.unknown-message-id",
+    "opc.n3iwf.eap5g.v1.truncated-start",
+    "opc.n3iwf.eap5g.v1.bounded-an-parameter-overflow",
+    "opc.n3iwf.eap5g.v1.positive-notification",
+    "opc.n3iwf.eap5g.v1.positive-stop"
+  ],
+  "constructed": [
+    "EAP-Request/5G-Start envelope",
+    "EAP-Request/5G-Notification Message-Id 3"
+  ],
+  "receive": [
+    "EAP-Response/5G-NAS with selected PLMN and opaque NAS",
+    "EAP-Response/5G-Stop Message-Id 4",
+    "AN-parameter reorder"
+  ],
+  "unsupported": [
+    "subscriber authentication decision",
+    "SUCI deconcealment",
+    "EAP method key derivation"
+  ]
+}

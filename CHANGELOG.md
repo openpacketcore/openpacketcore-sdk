@@ -65,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Synthetic N3IWF fixture contracts — `opc-n3iwf-fixtures`:** ten independently
+  consumable inventories with explicit encoding, validation scope, caller
+  context, provenance, and byte digests. Catalog loading validates bounded
+  regular files, redacted diagnostics, unique JSON fields, and pinned
+  TS 38.413 V18.10.0 IE presence/criticality/cardinality matrices. Read-only
+  generation, independent envelope/scenario oracles, existing NGAP/GTP-U codec
+  tests, and Git content stamps guard the inventory. The reused legacy NGAP
+  vector is sanitized structural evidence; complete Release-18 N3IWF messages,
+  typed encoding, cryptography, transports, and kernel state remain unproven.
+  All records keep `runtime_claim=false`. This establishes the documented
+  fixture boundaries and leaves broader evidence tracked in #784; issue 795
+  remains outside this change.
 - **Selectable fixed-quorum persistence — `opc-session-store`:** supported
   `SessionPersistenceMode::Async` acknowledges validated resident storage,
   real quorum replication, and committed application while one coalescing

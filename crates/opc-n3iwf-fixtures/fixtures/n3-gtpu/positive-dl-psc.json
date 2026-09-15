@@ -1,0 +1,47 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 65535,
+    "unknown_ie_policy": "reject"
+  },
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.positive-dl-psc",
+  "subset": "n3-gtpu",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 29.281",
+    "release": "V18.4.0",
+    "clauses": [
+      "5.2.2.7"
+    ]
+  },
+  "direction": "n3-downlink",
+  "role": "upf-to-n3iwf",
+  "prerequisite": "Issue 341/existing PduSessionContainer downlink subset",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-gtpu/tests/gtpu_tests.rs",
+    "notes": "DL PDU Session Container QFI 9 without PPI/RQI"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-dl-psc.hex",
+    "digest_sha256": "5b6709b222ef7d332ef7d77419bc683db8d6424c9b92deca791f3bb3ca14d3ee"
+  },
+  "semantic_assertions": [
+    "direction=downlink",
+    "pdu_type=0",
+    "qfi=9",
+    "rqi=0"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

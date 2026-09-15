@@ -1,0 +1,40 @@
+{
+  "subset": "protocol-key",
+  "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.protocol-key.v1.positive-generation-1",
+    "opc.n3iwf.protocol-key.v1.wrong-generation",
+    "opc.n3iwf.protocol-key.v1.reuse-after-consume",
+    "opc.n3iwf.protocol-key.v1.drop-zeroize",
+    "opc.n3iwf.protocol-key.v1.cancellation",
+    "opc.n3iwf.protocol-key.v1.unknown-purpose",
+    "opc.n3iwf.protocol-key.v1.ordering-bind-then-consume",
+    "opc.n3iwf.protocol-key.v1.malformed-label",
+    "opc.n3iwf.protocol-key.v1.truncated-label",
+    "opc.n3iwf.protocol-key.v1.bounded-label-overflow"
+  ],
+  "constructed": [
+    "generation-1 consume-once label"
+  ],
+  "receive": [
+    "drop zeroize"
+  ],
+  "unsupported": [
+    "byte export",
+    "hierarchy derivation",
+    "authentication decision"
+  ]
+}

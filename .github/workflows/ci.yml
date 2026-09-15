@@ -82,6 +82,11 @@ jobs:
           python3 scripts/check-management-plane-policy.py --self-test
           python3 scripts/check-management-plane-policy.py --check
 
+      - name: Run N3IWF fixture-contract gates
+        run: |
+          python3 scripts/check-n3iwf-fixture-contracts.py --self-test
+          python3 scripts/check-n3iwf-fixture-contracts.py --check
+
       - name: Test SDK-702 release-attestation wrapper environment
         run: |
           python3 ci/test-sdk702-release-attest.py

@@ -1,0 +1,77 @@
+{
+  "message": "NGSetupRequest",
+  "procedure_code": 21,
+  "outcome": "initiating",
+  "direction": "n3iwf-to-amf",
+  "ts29413_clause": "5.2",
+  "admitted_disposition": "receive",
+  "constructed_send": false,
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.6.1"
+    ]
+  },
+  "application": {
+    "document": "3GPP TS 29.413",
+    "release": "V18.5.0",
+    "clauses": [
+      "5.2"
+    ]
+  },
+  "n3iwf_content_exceptions": "TS 29.413 5.3 RAN-specific ignore is not encoded; rows are TS 38.413 identifier/criticality/cardinality",
+  "admission_scope": "issue-493-first-cnf-typed-subset",
+  "wire_fixture_id": "opc.n3iwf.ngap.v1.positive-ngsetup-external",
+  "ies": [
+    {
+      "id": 27,
+      "name": "id-GlobalRANNodeID",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 82,
+      "name": "id-RANNodeName",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 102,
+      "name": "id-SupportedTAList",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 21,
+      "name": "id-DefaultPagingDRX",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 147,
+      "name": "id-UERetentionInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 204,
+      "name": "id-NB-IoT-DefaultPagingDRX",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 273,
+      "name": "id-Extended-RANNodeName",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    }
+  ]
+}

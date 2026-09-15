@@ -1,0 +1,47 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 42,
+    "max_spi_bytes": 4
+  },
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.delete-esp",
+  "subset": "nwu-ike",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "1.4.1",
+      "3.11"
+    ]
+  },
+  "direction": "either",
+  "role": "ike-endpoint",
+  "prerequisite": "Child SA exists; roster relocation is a separate subset",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Delete payload names synthetic ESP SPI only"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/delete-esp.hex",
+    "digest_sha256": "05c84b5034024801c7866aaa06892be3c247e8b3fb251b5f2bf4b4780b264bdc"
+  },
+  "semantic_assertions": [
+    "protocol=ESP",
+    "spi_count=1",
+    "backend_roster=out-of-scope"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

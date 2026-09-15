@@ -1,0 +1,54 @@
+{
+  "subset": "nwu-ike",
+  "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.nwu-ike.v1.positive-nas-ip4",
+    "opc.n3iwf.nwu-ike.v1.positive-nas-tcp-port",
+    "opc.n3iwf.nwu-ike.v1.positive-5g-qos-info",
+    "opc.n3iwf.nwu-ike.v1.positive-up-ip4",
+    "opc.n3iwf.nwu-ike.v1.positive-up-sa-info",
+    "opc.n3iwf.nwu-ike.v1.delete-esp",
+    "opc.n3iwf.nwu-ike.v1.mobility-additional-addresses",
+    "opc.n3iwf.nwu-ike.v1.create-child-sa",
+    "opc.n3iwf.nwu-ike.v1.modify-child-sa",
+    "opc.n3iwf.nwu-ike.v1.unknown-critical-payload",
+    "opc.n3iwf.nwu-ike.v1.duplicate-nas-ip4",
+    "opc.n3iwf.nwu-ike.v1.ordering-tcp-before-ip4",
+    "opc.n3iwf.nwu-ike.v1.malformed-spi-size",
+    "opc.n3iwf.nwu-ike.v1.truncated-nas-ip4",
+    "opc.n3iwf.nwu-ike.v1.bounded-spi-size-overflow"
+  ],
+  "constructed": [
+    "NAS_IP4_ADDRESS",
+    "NAS_TCP_PORT",
+    "5G_QOS_INFO",
+    "UP_IP4_ADDRESS",
+    "UP_SA_INFO",
+    "CREATE_CHILD_SA notify chain",
+    "MODIFY_CHILD_SA INFORMATIONAL pair",
+    "Delete ESP"
+  ],
+  "receive": [
+    "MOBIKE additional-address notify",
+    "notify reordering"
+  ],
+  "unsupported": [
+    "XFRM install",
+    "SPI allocation",
+    "authentication decision",
+    "suite allowlist"
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 127,
+    "max_spi_bytes": 4
+  },
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.unknown-critical-payload",
+  "subset": "nwu-ike",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.5"
+    ]
+  },
+  "direction": "peer-to-local",
+  "role": "ike-endpoint",
+  "prerequisite": "Generic IKEv2 payload-chain decoder from opc-proto-ikev2",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ikev2/tests/unknown_critical_rejection.rs",
+    "notes": "Critical bit set on unknown payload type 127"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-critical-payload.hex",
+    "digest_sha256": "bc9a53d1b948e23a10f39b1bbb93287763858ed4a2f670b0a6ec47554a7af8b6"
+  },
+  "semantic_assertions": [
+    "critical=true",
+    "unknown_payload_type=127",
+    "initial_payload_type=127"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

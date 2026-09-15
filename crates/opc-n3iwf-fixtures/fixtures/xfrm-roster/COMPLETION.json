@@ -1,0 +1,43 @@
+{
+  "subset": "xfrm-roster",
+  "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.xfrm-roster.v1.positive-single-pair",
+    "opc.n3iwf.xfrm-roster.v1.overlap-rekey",
+    "opc.n3iwf.xfrm-roster.v1.rekey-new-pair",
+    "opc.n3iwf.xfrm-roster.v1.relocation",
+    "opc.n3iwf.xfrm-roster.v1.unknown-inbound-spi",
+    "opc.n3iwf.xfrm-roster.v1.duplicate-spi",
+    "opc.n3iwf.xfrm-roster.v1.ordering-old-then-new",
+    "opc.n3iwf.xfrm-roster.v1.malformed-version",
+    "opc.n3iwf.xfrm-roster.v1.truncated-record",
+    "opc.n3iwf.xfrm-roster.v1.bounded-generation-overflow"
+  ],
+  "constructed": [
+    "single pair",
+    "overlap",
+    "rekey"
+  ],
+  "receive": [
+    "relocation",
+    "old-then-new order"
+  ],
+  "unsupported": [
+    "PDU/QFI policy",
+    "IKE notify parsing",
+    "key material"
+  ]
+}

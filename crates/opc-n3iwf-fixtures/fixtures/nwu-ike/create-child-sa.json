@@ -1,0 +1,52 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 41,
+    "max_spi_bytes": 4
+  },
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.create-child-sa",
+  "subset": "nwu-ike",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "7.5",
+      "8.3",
+      "9.3.1.1",
+      "9.3.1.8"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "CREATE_CHILD_SA selected; XFRM roster is a separate subset",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Clause 7.5 CREATE_CHILD_SA notify chain: 5G_QOS_INFO (DCSI) then UP_IP4_ADDRESS 55504"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/create-child-sa.hex",
+    "digest_sha256": "b4bbac8d9c06838a1148a0f1d7a294e9b7213d5ab3e8499b7caa1f31e920c4f9"
+  },
+  "semantic_assertions": [
+    "procedure=create-child-sa",
+    "payload_chain_only=true",
+    "complete_ike_exchange=unsupported",
+    "notify_types=55501,55504",
+    "dcsi=1",
+    "backend_roster=out-of-scope"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

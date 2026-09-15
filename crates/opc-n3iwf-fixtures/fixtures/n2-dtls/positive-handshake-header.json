@@ -1,0 +1,61 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "dtls-record",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.positive-handshake-header",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 6347",
+    "release": "RFC 6347",
+    "clauses": [
+      "4.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Server endpoint after its preceding handshake flight; this isolated ServerHelloDone is not a completed handshake",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "DTLS 1.2 ServerHelloDone with an empty body, as RFC 6347 4.2.2 and RFC 5246 7.4.5 permit; no ClientHello, random, certificate, or key material"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-handshake-header.hex",
+    "digest_sha256": "4a711ac988b7612a3329e991815afbe6accd749994ccafd10c27b44ac9b13651"
+  },
+  "semantic_assertions": [
+    "content_type=handshake",
+    "version=dtls-1.2",
+    "record_length=12",
+    "handshake_type=server_hello_done",
+    "fragment_length=0"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

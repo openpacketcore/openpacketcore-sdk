@@ -1,0 +1,47 @@
+{
+  "encoding": "metadata-record",
+  "validation_scope": "association-metadata",
+  "context": {
+    "layout": "ppid-port",
+    "ppid": 60,
+    "max_port": 65534
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.positive-ppid60-port",
+  "subset": "n2-sctp",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.412",
+    "release": "V18.1.0",
+    "clauses": [
+      "7"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Reuse opc-sctp SctpAssociation and NGAP_PPID=60",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-sctp/src/lib.rs::NGAP_PPID",
+    "notes": "PPID 60 and default service port 38412; not a security claim"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-ppid60-port.hex",
+    "digest_sha256": "055d3a888065cd6c75a9b6ebb0bf8e0c6f1300e8e703d3029756fb1531c2c686"
+  },
+  "semantic_assertions": [
+    "ppid=60",
+    "port=38412",
+    "protection=unprotected"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

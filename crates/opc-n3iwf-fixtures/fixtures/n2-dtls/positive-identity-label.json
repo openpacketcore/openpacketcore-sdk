@@ -1,0 +1,58 @@
+{
+  "encoding": "scenario-label",
+  "validation_scope": "dtls-lifecycle-contract",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.positive-identity-label",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Identity is a typed expected-peer label, not a certificate dump",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Expected-peer identity label only; no certificate or exporter secret"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-identity-label.hex",
+    "digest_sha256": "10ab6e5ef90f8250860d1f74756fc0b5984df98dddbda4475659623c6cbbb14a"
+  },
+  "semantic_assertions": [
+    "identity=expected-peer-label",
+    "material_published=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

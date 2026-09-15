@@ -1,0 +1,49 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "nas-tcp-envelope",
+  "context": {
+    "max_payload_len": 256,
+    "min_payload_len": 1,
+    "stream_open": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.eof-loss-incomplete-frame",
+  "subset": "nas-tcp",
+  "case_class": "truncation",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.2.4",
+      "9.4"
+    ]
+  },
+  "direction": "either",
+  "role": "nas-tcp-endpoint",
+  "prerequisite": "TCP FIN, abort, or loss after these octets; not an open-stream partial",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Same prefix as partial-need-more-data finalizes as reject on EOF/loss"
+  },
+  "sanitized_fields": [
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/eof-loss-incomplete-frame.hex",
+    "digest_sha256": "a6ceb9cc64de2ca8b98ee4090d5915413d6e71d730d5e56376a6f586c6a1b9ad"
+  },
+  "semantic_assertions": [
+    "eof_or_loss=true",
+    "incomplete_frame=true",
+    "finalization=reject",
+    "not_need_more_data"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

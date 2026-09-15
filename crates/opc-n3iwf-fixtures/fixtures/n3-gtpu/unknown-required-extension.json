@@ -1,0 +1,45 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 65535,
+    "unknown_ie_policy": "reject"
+  },
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.unknown-required-extension",
+  "subset": "n3-gtpu",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 29.281",
+    "release": "V18.4.0",
+    "clauses": [
+      "5.2.1"
+    ]
+  },
+  "direction": "n3-downlink",
+  "role": "n3iwf",
+  "prerequisite": "UnknownIePolicy::Reject",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-gtpu/tests/gtpu_tests.rs",
+    "notes": "Comprehension-required unknown extension 0x84"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-required-extension.hex",
+    "digest_sha256": "15f7e18ba252afa8c176770340ba0881d475356d1c8b9845cdd6f616becb2d11"
+  },
+  "semantic_assertions": [
+    "ext_type=0x84",
+    "code=UnknownCriticalIe"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

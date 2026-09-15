@@ -1,0 +1,46 @@
+{
+  "encoding": "metadata-record",
+  "validation_scope": "association-metadata",
+  "context": {
+    "layout": "ppid-port",
+    "ppid": 60,
+    "max_port": 65534
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.bounded-port-overflow",
+  "subset": "n2-sctp",
+  "case_class": "bounded-overflow",
+  "source": {
+    "document": "3GPP TS 38.412",
+    "release": "V18.1.0",
+    "clauses": [
+      "7"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Caller port-width bound",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Port field encoded as 0xffff after PPID; still a 16-bit value, used as overflow sentinel for a 15-bit caller bound"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/bounded-port-overflow.hex",
+    "digest_sha256": "6a862104148480c12345ce60d1c0c3dedfc928d967a989a6a5d8303eb258e09c"
+  },
+  "semantic_assertions": [
+    "port=65535",
+    "caller_bound_exceeded=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

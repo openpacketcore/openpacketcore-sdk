@@ -1,0 +1,47 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": false,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.unknown-inbound-spi",
+  "subset": "xfrm-roster",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Exact inbound SA provenance required",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Inbound SPI 0xff000000 is not in the roster"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-inbound-spi.hex",
+    "digest_sha256": "816d0a5a02df5816bc8ec449424c2dbb48c02a104c15baf0384b044c2fa13db5"
+  },
+  "semantic_assertions": [
+    "inbound_spi_unknown=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

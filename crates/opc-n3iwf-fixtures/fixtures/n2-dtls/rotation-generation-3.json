@@ -1,0 +1,55 @@
+{
+  "encoding": "scenario-label",
+  "validation_scope": "dtls-lifecycle-contract",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 2,
+    "new_auth_key_id": 3,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.rotation-generation-3",
+  "subset": "n2-dtls",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4.8",
+      "5"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Key-id rotation after rekey-generation-2; exporter secret unpublished",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Rotation generation-3 label; distinct from rekey-generation-2"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/rotation-generation-3.hex",
+    "digest_sha256": "a42d1d8ee3745b0a3315b8bfdecb22e37a3b8a73c63b2926dde6f02214e158a4"
+  },
+  "semantic_assertions": [
+    "rotation=true",
+    "generation=3",
+    "material_published=false"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

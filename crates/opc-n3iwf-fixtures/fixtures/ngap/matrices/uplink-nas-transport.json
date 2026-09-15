@@ -1,0 +1,77 @@
+{
+  "message": "UplinkNASTransport",
+  "procedure_code": 46,
+  "outcome": "initiating",
+  "direction": "n3iwf-to-amf",
+  "ts29413_clause": "5.2",
+  "admitted_disposition": "receive",
+  "constructed_send": false,
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.5.3"
+    ]
+  },
+  "application": {
+    "document": "3GPP TS 29.413",
+    "release": "V18.5.0",
+    "clauses": [
+      "5.2"
+    ]
+  },
+  "n3iwf_content_exceptions": "TS 29.413 5.3 RAN-specific ignore is not encoded; rows are TS 38.413 identifier/criticality/cardinality",
+  "admission_scope": "issue-493-first-cnf-typed-subset",
+  "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-uplink-nas-transport",
+  "ies": [
+    {
+      "id": 10,
+      "name": "id-AMF-UE-NGAP-ID",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 85,
+      "name": "id-RAN-UE-NGAP-ID",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 38,
+      "name": "id-NAS-PDU",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 121,
+      "name": "id-UserLocationInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 239,
+      "name": "id-W-AGFIdentityInformation",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 246,
+      "name": "id-TNGFIdentityInformation",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 247,
+      "name": "id-TWIFIdentityInformation",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "optional"
+    }
+  ]
+}

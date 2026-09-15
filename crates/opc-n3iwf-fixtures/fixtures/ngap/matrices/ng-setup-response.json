@@ -1,0 +1,91 @@
+{
+  "message": "NGSetupResponse",
+  "procedure_code": 21,
+  "outcome": "successful",
+  "direction": "amf-to-n3iwf",
+  "ts29413_clause": "5.2",
+  "admitted_disposition": "receive",
+  "constructed_send": false,
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.6.2"
+    ]
+  },
+  "application": {
+    "document": "3GPP TS 29.413",
+    "release": "V18.5.0",
+    "clauses": [
+      "5.2"
+    ]
+  },
+  "n3iwf_content_exceptions": "TS 29.413 5.3 RAN-specific ignore is not encoded; rows are TS 38.413 identifier/criticality/cardinality",
+  "admission_scope": "issue-493-first-cnf-typed-subset",
+  "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ng-setup-response",
+  "ies": [
+    {
+      "id": 1,
+      "name": "id-AMFName",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 96,
+      "name": "id-ServedGUAMIList",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 86,
+      "name": "id-RelativeAMFCapacity",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 80,
+      "name": "id-PLMNSupportList",
+      "criticality": "reject",
+      "cardinality": "singleton",
+      "presence": "mandatory"
+    },
+    {
+      "id": 19,
+      "name": "id-CriticalityDiagnostics",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 147,
+      "name": "id-UERetentionInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 200,
+      "name": "id-IAB-Supported",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 274,
+      "name": "id-Extended-AMFName",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 404,
+      "name": "id-MobileIAB-Supported",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    }
+  ]
+}

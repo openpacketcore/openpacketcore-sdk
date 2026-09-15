@@ -1,0 +1,53 @@
+{
+  "encoding": "metadata-record",
+  "validation_scope": "dtls-association-metadata",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.unknown-ppid60",
+  "subset": "n2-dtls",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Protected profile cannot be built from ordinary SctpAssociation",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "PPID 60 is the unprotected N2 profile and cannot satisfy DTLS"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-ppid60.hex",
+    "digest_sha256": "4082763076bdaee3a85e52eb5893169d45d057397616251e0e699e6403238e66"
+  },
+  "semantic_assertions": [
+    "ppid=60",
+    "dtls_profile=unsupported"
+  ],
+  "expected_outcome": "unsupported",
+  "runtime_claim": false
+}
