@@ -724,6 +724,21 @@ logical basenames rather than treating a mutable parent pathname as authority.
 The supported writer model is cooperative SDK processes running under one
 dedicated service UID and serialized by the namespace/database leases.
 
+A supervisor that hands over a pinned snapshot directory must also supply its
+original configured filesystem name. Use
+`SnapshotDirectory::from_pinned(configured_name, directory_file)` with
+`ConsensusSessionStore::open_fixed_quorum_with_snapshot_directory`. Construction
+checks that the name and descriptor identify the same admissible directory,
+then retains an independent open-file description for its flock. Store opening
+rechecks permissions and performs the existing complete lease admission. The
+configured name is made absolute once and remains the socket and cleanup key;
+the retained descriptor supplies I/O even after a pathname replacement. Never
+use `/proc/self/fd/N/` as the configured name: descriptor numbers can identify
+unrelated directories in different processes. Pending cleanup keeps exclusion
+until its exact-directory durability check and final owner retirement. Existing
+pathname openers keep their behavior; the explicit handoff changes neither
+persistence mode nor snapshot integrity, deadlines or capacity bounds.
+
 This is deliberately not a privileged-attacker boundary. It excludes `root`,
 `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, non-cooperating processes with the same
 effective UID, and writable aliases of the retained directory from the trust

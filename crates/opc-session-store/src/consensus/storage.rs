@@ -42,6 +42,7 @@ use super::snapshot::{
 use super::snapshot::{
     pending_snapshot_namespace_recovery_authority, PendingSnapshotNamespaceRecoveryAuthority,
 };
+use super::snapshot_directory::{SnapshotDirectory, SnapshotDirectorySource};
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionPersistenceMode,
     SessionRaftTypeConfig, SessionTopologyMemberBinding, SnapshotIntegrityPolicy,
@@ -51,6 +52,9 @@ use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::readiness::PlacementResiliencePolicy;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 use crate::sqlite::SqliteSessionBackend;
+
+#[cfg(all(test, target_os = "linux"))]
+mod pinned_directory_tests;
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
 const SNAPSHOT_FOOTER_BYTES: u64 = SNAPSHOT_ENVELOPE_FOOTER_BYTES;
@@ -581,12 +585,46 @@ fn bind_snapshot_directory_socket(
     ))
 }
 
+#[cfg(unix)]
+fn open_snapshot_directory(path: &Path) -> io::Result<std::fs::File> {
+    nix::fcntl::open(
+        path,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC
+            | nix::fcntl::OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(io::Error::from)
+}
+
 async fn acquire_snapshot_directory_lease(
     backend: &SqliteSessionBackend,
     path: &Path,
 ) -> io::Result<Arc<SnapshotDirectoryLease>> {
-    let configured_path = absolute(path)?;
-    let directory_preexisted = path.exists();
+    acquire_snapshot_directory(backend, SnapshotDirectory::from_path(path)).await
+}
+
+async fn acquire_snapshot_directory(
+    backend: &SqliteSessionBackend,
+    source: SnapshotDirectory,
+) -> io::Result<Arc<SnapshotDirectoryLease>> {
+    #[cfg(target_os = "linux")]
+    let mut pinned = None;
+    let (configured_path, directory_preexisted) = match source.0 {
+        SnapshotDirectorySource::Path(path) => (absolute(&path)?, path.exists()),
+        #[cfg(target_os = "linux")]
+        SnapshotDirectorySource::Pinned {
+            configured_path,
+            canonical_directory,
+            directory,
+        } => {
+            pinned = Some((directory, canonical_directory));
+            (configured_path, true)
+        }
+    };
     if !directory_preexisted {
         #[cfg(unix)]
         {
@@ -594,10 +632,10 @@ async fn acquire_snapshot_directory_lease(
 
             let mut builder = std::fs::DirBuilder::new();
             builder.recursive(true).mode(0o700);
-            builder.create(path)?;
+            builder.create(&configured_path)?;
         }
         #[cfg(not(unix))]
-        std::fs::create_dir_all(path)?;
+        std::fs::create_dir_all(&configured_path)?;
     }
     // Capture the durable owner before creating a directory flock.  A queued
     // cleanup retains the exact old directory flock until it is durably
@@ -630,17 +668,14 @@ async fn acquire_snapshot_directory_lease(
         // The retained FD is opened before any identity policy is evaluated.
         // Never turn the configured path into a capability after this point:
         // its parent may be renamed by an operator while the lease survives.
-        let directory = nix::fcntl::open(
-            &configured_path,
-            nix::fcntl::OFlag::O_RDONLY
-                | nix::fcntl::OFlag::O_DIRECTORY
-                | nix::fcntl::OFlag::O_NOFOLLOW
-                | nix::fcntl::OFlag::O_CLOEXEC
-                | nix::fcntl::OFlag::O_NONBLOCK,
-            nix::sys::stat::Mode::empty(),
-        )
-        .map(std::fs::File::from)
-        .map_err(io::Error::from)?;
+        #[cfg(target_os = "linux")]
+        let (directory, pinned_canonical) = match pinned {
+            Some((directory, canonical_directory)) => (directory, Some(canonical_directory)),
+            None => (open_snapshot_directory(&configured_path)?, None),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (directory, pinned_canonical): (_, Option<PathBuf>) =
+            (open_snapshot_directory(&configured_path)?, None);
         let metadata = directory.metadata()?;
         let owner = metadata.uid();
         let mode = metadata.mode();
@@ -656,17 +691,27 @@ async fn acquire_snapshot_directory_lease(
         if !directory_preexisted && mode & 0o777 != 0o700 {
             directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         }
-        // Canonical spelling is a logical/latch key only. Verify it still
-        // names the exact retained descriptor before recording it; otherwise
-        // a parent rename raced admission and we fail closed.
-        let canonical_directory = std::fs::canonicalize(&configured_path)?;
-        let canonical_metadata = std::fs::metadata(&canonical_directory)?;
-        if canonical_metadata.dev() != metadata.dev() || canonical_metadata.ino() != metadata.ino()
-        {
-            return Err(io::Error::other(
-                "snapshot directory changed while establishing retained descriptor",
-            ));
-        }
+        // Canonical spelling serves logical child names and the local
+        // directory registry. The configured name alone owns socket/cleanup
+        // exclusion. Establish correspondence once, before retaining it.
+        let canonical_directory = match pinned_canonical {
+            // The constructor checked the original name against this exact
+            // capability. Never resolve it again after the handoff: a later
+            // replacement cannot redirect I/O or replace the configured key.
+            Some(canonical_directory) => canonical_directory,
+            None => {
+                let canonical_directory = std::fs::canonicalize(&configured_path)?;
+                let canonical_metadata = std::fs::metadata(&canonical_directory)?;
+                if canonical_metadata.dev() != metadata.dev()
+                    || canonical_metadata.ino() != metadata.ino()
+                {
+                    return Err(io::Error::other(
+                        "snapshot directory changed while establishing retained descriptor",
+                    ));
+                }
+                canonical_directory
+            }
+        };
         #[cfg(target_os = "linux")]
         let (namespace_socket, namespace) = match pending_snapshot_namespace_recovery_authority(
             &configured_path,
@@ -674,10 +719,9 @@ async fn acquire_snapshot_directory_lease(
             (database_identity.device, database_identity.inode),
         )? {
             PendingSnapshotNamespaceRecoveryAuthority::Exact(namespace) => {
-                // The new descriptor served only to prove this configured
-                // path still names D1. The queued namespace already owns
-                // D1's flock; reuse that exact capability so same-owner
-                // restart can drain it.
+                // The handoff proved the configured name's binding to D1.
+                // The queued namespace already owns D1's flock; reuse that
+                // exact capability so same-owner restart can drain it.
                 drop(directory);
                 let namespace_socket = namespace
                     .trusted_namespace_socket_for_identity((
@@ -3216,7 +3260,7 @@ pub(crate) async fn open_with_member_bindings(
 > {
     open_with_member_bindings_for_profile(
         backend,
-        snapshot_dir,
+        SnapshotDirectory::from_path(snapshot_dir),
         identity,
         expected_members,
         expected_bindings,
@@ -3252,7 +3296,7 @@ pub(crate) async fn open_with_member_bindings_and_roster_attestation_root(
 > {
     open_with_member_bindings_for_profile(
         backend,
-        snapshot_dir,
+        SnapshotDirectory::from_path(snapshot_dir),
         identity,
         expected_members,
         expected_bindings,
@@ -3289,7 +3333,7 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
 > {
     open_fixed_with_persistence_and_roster_attestation_root(
         backend,
-        snapshot_dir,
+        SnapshotDirectory::from_path(snapshot_dir),
         identity,
         expected_members,
         expected_bindings,
@@ -3305,7 +3349,7 @@ pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_fixed_with_persistence_and_roster_attestation_root(
     backend: &SqliteSessionBackend,
-    snapshot_dir: impl Into<PathBuf>,
+    snapshot_dir: SnapshotDirectory,
     identity: SessionConsensusIdentity,
     expected_members: BTreeSet<SessionConsensusNodeId>,
     expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
@@ -3374,7 +3418,7 @@ async fn preflight_fs_verity(
 #[allow(clippy::too_many_arguments)]
 async fn open_with_member_bindings_for_profile(
     backend: &SqliteSessionBackend,
-    snapshot_dir: impl Into<PathBuf>,
+    snapshot_dir: SnapshotDirectory,
     identity: SessionConsensusIdentity,
     expected_members: BTreeSet<SessionConsensusNodeId>,
     expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
@@ -3405,8 +3449,7 @@ async fn open_with_member_bindings_for_profile(
             return Err(SessionConsensusStorageError::PersistenceModeMismatch);
         }
     }
-    let snapshot_dir = snapshot_dir.into();
-    let snapshot_directory_lease = acquire_snapshot_directory_lease(backend, &snapshot_dir)
+    let snapshot_directory_lease = acquire_snapshot_directory(backend, snapshot_dir)
         .await
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable
@@ -19997,12 +20040,15 @@ mod tests {
             nix::sys::stat::Mode::empty(),
         )
         .expect("open pinned procfd snapshot leaf");
-        let procfd_path = PathBuf::from(format!("/proc/self/fd/{}/", snapshot_fd.as_raw_fd()));
+        let locator = PathBuf::from(format!("/proc/self/fd/{}/", snapshot_fd.as_raw_fd()));
+        let descriptor = std::fs::File::open(locator).expect("reopen inherited capability");
+        let pinned = SnapshotDirectory::from_pinned(&snapshots, descriptor)
+            .expect("bind the configured name to the pinned directory");
         let backend = SqliteSessionBackend::open(workspace.path().join("sessions.sqlite"))
             .expect("open procfd snapshot backend");
-        acquire_snapshot_directory_lease(&backend, &procfd_path)
+        acquire_snapshot_directory(&backend, pinned)
             .await
-            .expect("admit inherited procfd snapshot leaf through the complete lease path");
+            .expect("admit inherited snapshot capability through the complete lease path");
     }
 
     #[cfg(target_os = "linux")]

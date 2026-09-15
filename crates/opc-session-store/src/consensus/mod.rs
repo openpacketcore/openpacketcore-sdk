@@ -11,6 +11,7 @@ mod persistence;
 mod persistence_protocol;
 pub(crate) mod raft_adapter;
 pub(crate) mod snapshot;
+mod snapshot_directory;
 mod snapshot_integrity;
 pub(crate) mod storage;
 pub(crate) mod store;
@@ -23,6 +24,7 @@ pub use persistence::{
     SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,
     SessionStorageFailureKind, SessionStorageFailureStage, SessionStorageState,
 };
+pub use snapshot_directory::SnapshotDirectory;
 pub use snapshot_integrity::SnapshotIntegrityPolicy;
 
 #[cfg(feature = "test-control")]

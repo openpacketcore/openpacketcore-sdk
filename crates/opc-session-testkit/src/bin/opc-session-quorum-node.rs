@@ -58,8 +58,8 @@ use opc_session_store::{
     SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerV2Operation,
     SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
     SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
-    SessionQuorumRosterIngress, SnapshotIntegrityPolicy, SqliteSessionBackend, StateClass,
-    StateType, StoreError, StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
+    SessionQuorumRosterIngress, SnapshotDirectory, SnapshotIntegrityPolicy, SqliteSessionBackend,
+    StateClass, StateType, StoreError, StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256,
@@ -1311,10 +1311,10 @@ impl QualificationNode {
                 QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
             )
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?;
-            ConsensusSessionStore::open_fixed_quorum_with_clock_and_persistence(
+            ConsensusSessionStore::open_fixed_quorum_with_snapshot_directory(
                 topology,
                 backend,
-                &snapshot_directory,
+                snapshot_directory,
                 peers,
                 Arc::new(IsolatedScaleClock(Timestamp::from_offset_datetime(
                     logical_time,
@@ -1331,16 +1331,17 @@ impl QualificationNode {
                 node_open_failure(QualificationNodeOpenStage::Consensus)
             })?
         } else {
-            ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
+            ConsensusSessionStore::open_fixed_quorum_with_snapshot_directory(
                 topology,
                 backend,
-                &snapshot_directory,
+                snapshot_directory,
                 peers,
                 Arc::new(SystemClock),
                 Duration::from_millis(config.operation_timeout_millis),
                 config
                     .snapshot_integrity
                     .unwrap_or(SnapshotIntegrityPolicy::FsVerity),
+                opc_session_store::SessionPersistenceMode::Durable,
             )
             .await
             .map_err(|error| {
@@ -5666,17 +5667,16 @@ fn canonical_private_directory_with_identity(
 fn pinned_v9_snapshot_leaf_directory(
     snapshot_directory: &Path,
     snapshot_root: &Path,
-) -> Result<PathBuf, NodeFailure> {
+) -> Result<SnapshotDirectory, NodeFailure> {
     let raw_fd = env::var_os(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV)
         .and_then(|raw| raw.into_string().ok())
         .and_then(|raw| raw.parse::<i32>().ok())
         .filter(|fd| *fd >= 0)
         .ok_or(NodeFailure)?;
     let descriptor_path = PathBuf::from(format!("/proc/self/fd/{raw_fd}"));
-    // Opening our own procfs descriptor duplicates the inherited capability;
-    // it does not resolve the configured V9 pathname. The original inherited
-    // descriptor remains open for the process lifetime and pins this object
-    // through store initialization.
+    // Reopen the inherited capability without using its process-relative
+    // locator as the logical namespace. The explicit store handoff below
+    // checks and retains the original configured name separately.
     let descriptor = File::open(&descriptor_path).map_err(|_| NodeFailure)?;
     let descriptor_metadata = fstat(&descriptor).map_err(|_| NodeFailure)?;
     if !FileType::from_raw_mode(descriptor_metadata.st_mode).is_dir()
@@ -5698,21 +5698,14 @@ fn pinned_v9_snapshot_leaf_directory(
     {
         return Err(NodeFailure);
     }
-    // Store admission keeps O_NOFOLLOW. On Linux that rejects the procfs
-    // magic link when it is final, so retain a trailing separator: it makes
-    // the descriptor magic link an intermediate component while preserving
-    // the exact inherited directory object. Unlike a terminal `/.`, this
-    // spelling survives `std::path::absolute` inside full store admission.
-    // Its retained namespace descriptor then remains the sole authority for
-    // every snapshot child operation.
-    Ok(PathBuf::from(format!("/proc/self/fd/{raw_fd}/")))
+    SnapshotDirectory::from_pinned(snapshot_directory, descriptor).map_err(|_| NodeFailure)
 }
 
 #[cfg(not(unix))]
 fn pinned_v9_snapshot_leaf_directory(
     _snapshot_directory: &Path,
     _snapshot_root: &Path,
-) -> Result<PathBuf, NodeFailure> {
+) -> Result<SnapshotDirectory, NodeFailure> {
     Err(NodeFailure)
 }
 
@@ -5744,7 +5737,9 @@ fn configured_fs_verity_snapshot_root() -> Result<PathBuf, NodeFailure> {
     Ok(canonical)
 }
 
-fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<PathBuf, NodeFailure> {
+fn secure_qualification_paths(
+    config: &QualificationNodeConfig,
+) -> Result<SnapshotDirectory, NodeFailure> {
     let workspace = fs::canonicalize(&config.workspace_directory).map_err(|_| NodeFailure)?;
     if workspace.parent().is_none() {
         return Err(NodeFailure);
@@ -5808,7 +5803,7 @@ fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<PathBu
         if !snapshots.starts_with(&snapshot_root) || snapshots == snapshot_root {
             return Err(NodeFailure);
         }
-        snapshots
+        SnapshotDirectory::from_path(snapshots)
     };
     if let QualificationTransportConfig::ProjectedMtls(projected) = &config.transport {
         let metadata =
@@ -6608,11 +6603,8 @@ mod tests {
             V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV,
             leaf_fd.as_raw_fd().to_string(),
         );
-        assert_eq!(
-            pinned_v9_snapshot_leaf_directory(&leaf, &root)
-                .expect("accept descriptor-pinned private direct child"),
-            PathBuf::from(format!("/proc/self/fd/{}/", leaf_fd.as_raw_fd()))
-        );
+        let _handoff = pinned_v9_snapshot_leaf_directory(&leaf, &root)
+            .expect("accept configured-name and descriptor-pinned private direct child");
 
         // The old descriptor remains live across this same-UID pathname swap;
         // a restarted child that receives it can only reopen the original
@@ -6631,7 +6623,7 @@ mod tests {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .expect("store-style no-follow admission reopens the inherited original leaf descriptor");
+        .expect("no-follow access reopens the inherited original leaf descriptor");
         let restarted_metadata = fstat(&restarted).expect("fstat restarted snapshot leaf");
         assert_eq!(
             (restarted_metadata.st_dev, restarted_metadata.st_ino),
