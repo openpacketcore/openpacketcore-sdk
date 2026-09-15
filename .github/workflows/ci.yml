@@ -982,3 +982,80 @@ jobs:
         run: |
           helm template sdk-ref operators/helm/sdk-reference-operator/ --set webhook.certMode=manual --set webhook.secretName=my-secret > /tmp/rendered-manual.yaml
           python3 -c 'import yaml; list(yaml.safe_load_all(open("/tmp/rendered-manual.yaml")))' 
+
+  # Manual observation only. Ordinary gates above remain unchanged. This
+  # comparison never replaces a failed selector invocation with a later pass.
+  selector-filesystem-observation:
+    name: Selector filesystem observation (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUSTFLAGS: "--cfg opc_linux_gtpu_sys_force_unsupported"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-gtpu-cfg
+      - name: Compare unchanged selector on distinct file-backed filesystems
+        run: |
+          set -euo pipefail
+          selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_keeps_original_request_deadline
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --list --exact "$selector" > selector-observation-tests.txt
+          python3 - "$selector" <<'PYCODE'
+          import pathlib
+          import sys
+          selected = [line.removesuffix(": test") for line in pathlib.Path("selector-observation-tests.txt").read_text().splitlines() if line.endswith(": test")]
+          if selected != [sys.argv[1]]:
+              sys.exit("selector observation must resolve exactly once")
+          PYCODE
+          default_parent="${TMPDIR:-/tmp}"
+          alternate_parent=/mnt
+          default_device="$(findmnt --noheadings --output MAJ:MIN --target "$default_parent")"
+          alternate_device="$(findmnt --noheadings --output MAJ:MIN --target "$alternate_parent")"
+          for profile in default alternate; do
+            if [[ "$profile" == default ]]; then parent="$default_parent"; else parent="$alternate_parent"; fi
+            printf 'selector_filesystem profile=%s ' "$profile"
+            findmnt --noheadings --output MAJ:MIN,FSTYPE --target "$parent"
+            filesystem="$(findmnt --noheadings --output FSTYPE --target "$parent")"
+            case "$filesystem" in
+              ext4|xfs|btrfs) ;;
+              *) printf 'selector_comparison unavailable=non_disk_filesystem\n'; exit 2 ;;
+            esac
+          done
+          if [[ "$default_device" == "$alternate_device" ]]; then
+            printf 'selector_comparison unavailable=same_filesystem\n'
+            exit 2
+          fi
+          default_directory="$(mktemp -d "$default_parent/selector-ci-default.XXXXXX")"
+          alternate_directory="$(sudo mktemp -d "$alternate_parent/selector-ci-alternate.XXXXXX")"
+          sudo chown "$(id -u):$(id -g)" "$alternate_directory"
+          selector_resources() {
+            date -u +selector_resources_utc=%Y-%m-%dT%H:%M:%S.%NZ || printf 'selector_clock unavailable=true\n'
+            for resource in cpu io memory; do
+              printf 'selector_pressure_%s\n' "$resource"
+              cat "/proc/pressure/$resource" 2>/dev/null || printf 'unavailable\n'
+            done
+            sed -n '1p' /proc/stat 2>/dev/null || printf 'selector_cpu unavailable=true\n'
+            sed -n '/^Dirty:/p;/^Writeback:/p;/^WritebackTmp:/p' /proc/meminfo 2>/dev/null || printf 'selector_writeback unavailable=true\n'
+          }
+          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet -- --exact --skip "$selector"
+          comparison_exit=0
+          for profile in default_first alternate default_repeat; do
+            if [[ "$profile" == alternate ]]; then directory="$alternate_directory"; else directory="$default_directory"; fi
+            printf 'selector_comparison begin=%s\n' "$profile"
+            selector_resources || :
+            selector_exit=0
+            /usr/bin/time -v env TMPDIR="$directory" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --test-threads=1 --exact "$selector" --nocapture || selector_exit=$?
+            selector_resources || :
+            printf 'selector_comparison end=%s exit_status=%s\n' "$profile" "$selector_exit"
+            if [[ "$selector_exit" -ne 0 && "$comparison_exit" -eq 0 ]]; then comparison_exit="$selector_exit"; fi
+          done
+          exit "$comparison_exit"
