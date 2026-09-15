@@ -12,21 +12,29 @@ interoperability.
 
 `runtime_claim=false` on every manifest and completion record.
 
+## Scope
+
+Reusable SDK fixture contracts only. This crate does not encode application
+policy, subscriber authentication decisions, AMF selection, deployment
+topology, readiness, or product claims. Tracking issue 795 is tracking-only
+and is not implemented here.
+
 ## Specification baseline
 
-| Document | Release | Subsets |
-| --- | --- | --- |
-| 3GPP TS 24.502 | V18.8.0 | eap5g, nwu-ike, gre-qfi, nas-tcp |
-| 3GPP TS 38.413 | R18 | ngap |
-| 3GPP TS 38.412 | V18.1.0 | n2-sctp |
-| 3GPP TS 29.281 | V18.4.0 | n3-gtpu |
-| 3GPP TS 38.415 | V18.2.0 | n3-gtpu uplink PSC |
-| 3GPP TS 33.501 | V18.12.0 | protocol-key |
-| IETF RFC 7296 | RFC 7296 | nwu-ike |
-| IETF RFC 4555 | RFC 4555 | nwu-ike mobility notify |
-| IETF RFC 4960 | RFC 4960 | n2-sctp DATA chunk |
-| IETF RFC 6083 | RFC 6083 | n2-dtls PPID 66 |
-| IETF RFC 6347 | RFC 6347 | n2-dtls record labels |
+| Document | Release | Clauses | Subsets |
+| --- | --- | --- | --- |
+| 3GPP TS 24.502 | V18.8.0 | 7.3–7.7, 8.2–8.3, 9.3–9.4 | eap5g, nwu-ike, gre-qfi, nas-tcp |
+| 3GPP TS 29.413 | V18.5.0 | 5.2–5.4 | ngap N3IWF application |
+| 3GPP TS 38.413 | V18.10.0 | message/IE definitions | ngap |
+| 3GPP TS 38.412 | V18.1.0 | 7 | n2-sctp |
+| 3GPP TS 29.281 | V18.4.0 | 4.4, 5.2.2.7, 7.2–7.3, 8.2 | n3-gtpu |
+| 3GPP TS 38.415 | V18.2.0 | 5.5.3 | n3-gtpu uplink PSC |
+| 3GPP TS 33.501 | V18.12.0 | 7.2.1 | protocol-key |
+| IETF RFC 7296 | RFC 7296 | IKEv2 notify/create/modify/delete | nwu-ike |
+| IETF RFC 4555 | RFC 4555 | MOBIKE additional-address | nwu-ike |
+| IETF RFC 4960 | RFC 4960 | DATA chunk; path failure | n2-sctp, n2-dtls |
+| IETF RFC 6083 | RFC 6083 | DTLS/SCTP PPID 66, AUTH, reliable delivery | n2-dtls |
+| IETF RFC 6347 | RFC 6347 | DTLS 1.2 record labels | n2-dtls |
 
 ## Coverage
 
@@ -35,16 +43,16 @@ subset alone. 🚫 = explicitly unsupported in this crate.
 
 | Subset | Status | Constructed | Receive | Unsupported |
 | --- | --- | --- | --- | --- |
-| eap5g | ✅ | EAP-Request/5G-Start | EAP-Response/5G-NAS; spare AN-parameter ignore | subscriber authentication, SUCI, EAP key derivation |
-| nwu-ike | ✅ | NAS_IP4_ADDRESS, NAS_TCP_PORT, 5G_QOS_INFO, UP_IP4_ADDRESS, Delete ESP | MOBIKE ADDITIONAL_IP4_ADDRESS | XFRM install, SPI allocation, authentication |
-| ngap | ✅ | none (typed encode unsupported) | 78-byte NGSetupRequest; empty wrapper | canonical typed encode; constructed N3IWF send |
+| eap5g | ✅ | Start; Notification (Message-Id 3) | NAS; Stop (Message-Id 4); spare ignore; permitted reorder | subscriber authentication, SUCI, EAP key derivation |
+| nwu-ike | ✅ | notifies; CREATE_CHILD_SA 7.5; MODIFY_CHILD_SA 7.6; Delete ESP | MOBIKE ADDITIONAL_IP4_ADDRESS | XFRM install, SPI allocation, authentication |
+| ngap | ✅ | none (typed encode unsupported) | Rel-18 NGSetupRequest; 5.2 empty wrappers + IE matrices | constructed send; Paging (29.413 5.4); AMF selection |
 | n2-sctp | ✅ | PPID 60 / port 38412 | metadata order variants | PPID 66 on this profile; DTLS |
 | gre-qfi | ✅ | downlink QFI+RQI | uplink QFI; nonzero Protocol Type ignore | XFRM install; QFI allocation |
 | n3-gtpu | ✅ | Echo Request/Response Recovery 0; uplink PSC | downlink PSC; ignored Recovery; End Marker order | backend control port; eBPF offload (issue 644) |
-| protocol-key | ✅ | generation-1 consume-once label | drop zeroize | byte export; hierarchy derivation |
+| protocol-key | ✅ | generation-1 consume-once label | drop zeroize | byte export; hierarchy derivation; key material |
 | nas-tcp | ✅ | complete two-octet envelope | two-frame stream; unknown inner EPD left opaque | TCP listen; reconnect; security termination |
 | xfrm-roster | ✅ | inbound/outbound SPI pair label | overlap/rekey/relocate labels | IKE notify parsing |
-| n2-dtls | ✅ | PPID 66; handshake header; expected-peer identity label; SCTP-AUTH length | rekey; path failure | PPID 60 as protection; certificates |
+| n2-dtls | ✅ | PPID 66; handshake/identity; SCTP-AUTH; DATA B/E | rekey; rotation; path failure | PPID 60 as protection; certificates |
 
 Every subset includes the required case classes: positive, malformed,
 duplicate, unknown-critical, ordering, truncation, and bounded-overflow.

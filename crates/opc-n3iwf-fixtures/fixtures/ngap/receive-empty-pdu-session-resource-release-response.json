@@ -1,0 +1,43 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-release-response",
+  "subset": "ngap",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.1.4",
+      "TS 29.413 5.2"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Issue 493 empty-IE wrapper helper; IE values remain unsupported",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ngap/src/lib.rs::empty_ie_pdu",
+    "notes": "PDUSessionResourceReleaseResponse empty ProtocolIE-Container. TS 29.413 V18.5.0 clause 5.2. Constructed N3IWF send is unsupported."
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/receive-empty-pdu-session-resource-release-response.hex",
+    "digest_sha256": "164dc23fd8df4f3c60cfb3b2a393918057e525a57dd2807da7e8cdb4d82afd00"
+  },
+  "semantic_assertions": [
+    "procedure=28",
+    "outcome=successful",
+    "ts29413=5.2",
+    "matrix=pdu-session-resource-release-response",
+    "constructed_typed_encode=unsupported"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

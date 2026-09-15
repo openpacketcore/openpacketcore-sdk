@@ -12,6 +12,7 @@
 //! @spec 3GPP TS29281 V18.4.0
 //! @spec 3GPP TS38415 V18.2.0
 //! @spec 3GPP TS33501 V18.12.0
+//! @spec IETF RFC4555
 //! @spec IETF RFC6083
 //! @spec IETF RFC7296
 //! @req REQ-3GPP-N3IWF-FIXTURE-CONTRACT-001
@@ -129,6 +130,8 @@ pub enum ContractErrorCode {
     MissingWire,
     /// Publication metadata is incomplete.
     MissingPublication,
+    /// An admitted NGAP outcome is missing its IE matrix.
+    MissingMatrix,
 }
 
 impl fmt::Display for ContractErrorCode {
@@ -144,6 +147,7 @@ impl fmt::Display for ContractErrorCode {
             Self::CompletionMismatch => "n3iwf_fixture_completion_mismatch",
             Self::MissingWire => "n3iwf_fixture_missing_wire",
             Self::MissingPublication => "n3iwf_fixture_missing_publication",
+            Self::MissingMatrix => "n3iwf_fixture_missing_matrix",
         })
     }
 }
@@ -249,6 +253,53 @@ pub struct SubsetCompletion {
     pub receive: Vec<String>,
     /// Explicitly unsupported outcomes.
     pub unsupported: Vec<String>,
+    /// Admitted sent/received message names that publish a matrix.
+    #[serde(default)]
+    pub admitted_outcomes: Vec<String>,
+    /// Relative matrix paths owned by this subset.
+    #[serde(default)]
+    pub matrices: Vec<String>,
+}
+
+/// One IE identifier/criticality/cardinality row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IeCardinality {
+    /// NGAP ProtocolIE-ID.
+    pub id: u16,
+    /// Standardized IE name.
+    pub name: String,
+    /// `reject`, `ignore`, or `notify`.
+    pub criticality: String,
+    /// Top-level cardinality; first-CNF IEs are singleton.
+    pub cardinality: String,
+}
+
+/// Message/IE matrix for one admitted or explicitly unsupported NGAP outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageIeMatrix {
+    /// Message name.
+    pub message: String,
+    /// Procedure code.
+    pub procedure_code: u8,
+    /// `initiating`, `successful`, or `unsuccessful`.
+    pub outcome: String,
+    /// N3IWF/AMF direction.
+    pub direction: String,
+    /// TS 29.413 clause that admits or discards the message.
+    pub ts29413_clause: String,
+    /// `receive`, `constructed`, or `unsupported`.
+    pub admitted_disposition: String,
+    /// Constructed N3IWF send remains unsupported.
+    pub constructed_send: bool,
+    /// TS 38.413 message/IE definition.
+    pub source: SourceRef,
+    /// TS 29.413 application to non-3GPP access.
+    pub application: SourceRef,
+    /// Manifest that carries the admitted wire octets.
+    #[serde(default)]
+    pub wire_fixture_id: Option<String>,
+    /// Identifier/criticality/cardinality rows.
+    pub ies: Vec<IeCardinality>,
 }
 
 /// Public SDK revision publication for these contracts.
@@ -275,6 +326,7 @@ pub struct FixtureCatalog {
     publication: PublicSdkPublication,
     completions: BTreeMap<String, SubsetCompletion>,
     manifests: Vec<(PathBuf, FixtureManifest, Vec<u8>)>,
+    ngap_matrices: Vec<MessageIeMatrix>,
 }
 
 impl FixtureCatalog {
@@ -304,6 +356,7 @@ impl FixtureCatalog {
         let mut completions = BTreeMap::new();
         let mut manifests = Vec::new();
         let mut seen_ids = BTreeSet::new();
+        let ngap_matrices = read_ngap_matrices(&root.join("ngap").join("matrices"))?;
 
         for subset in SUBSETS {
             let subset_dir = root.join(subset);
@@ -347,6 +400,7 @@ impl FixtureCatalog {
             publication,
             completions,
             manifests,
+            ngap_matrices,
         })
     }
 
@@ -367,6 +421,12 @@ impl FixtureCatalog {
         self.manifests
             .iter()
             .map(|(_, manifest, wire)| (manifest, wire.as_slice()))
+    }
+
+    /// NGAP message/IE matrices for every admitted or 5.4-unsupported outcome.
+    #[must_use]
+    pub fn ngap_matrices(&self) -> &[MessageIeMatrix] {
+        &self.ngap_matrices
     }
 
     /// Run every catalog detector.
@@ -402,6 +462,11 @@ impl FixtureCatalog {
                 }
             }
         }
+        detect_ngap_matrices(
+            self.completions.get("ngap"),
+            &self.ngap_matrices,
+            &self.manifests,
+        )?;
         Ok(())
     }
 }
@@ -424,6 +489,49 @@ fn read_manifest(path: &Path) -> Result<FixtureManifest, ContractError> {
     let raw = fs::read_to_string(path)
         .map_err(|_| ContractError::new(ContractErrorCode::MissingField))?;
     serde_json::from_str(&raw).map_err(|_| ContractError::new(ContractErrorCode::MissingField))
+}
+
+fn read_ngap_matrices(dir: &Path) -> Result<Vec<MessageIeMatrix>, ContractError> {
+    if !dir.is_dir() {
+        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+    }
+    let entries =
+        fs::read_dir(dir).map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+    }
+    let mut matrices = Vec::new();
+    for path in paths {
+        let raw = fs::read_to_string(&path)
+            .map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
+        detect_text(&raw)?;
+        let matrix: MessageIeMatrix = serde_json::from_str(&raw)
+            .map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
+        if matrix.message.is_empty()
+            || matrix.ies.is_empty()
+            || matrix.ts29413_clause.is_empty()
+            || matrix.admitted_disposition.is_empty()
+            || matrix.source.release != "V18.10.0"
+            || matrix.application.release != "V18.5.0"
+        {
+            return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+        }
+        for ie in &matrix.ies {
+            if ie.name.is_empty()
+                || !matches!(ie.criticality.as_str(), "reject" | "ignore" | "notify")
+                || ie.cardinality != "singleton"
+            {
+                return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+            }
+        }
+        matrices.push(matrix);
+    }
+    Ok(matrices)
 }
 
 fn read_wire(path: &Path) -> Result<Vec<u8>, ContractError> {
@@ -509,6 +617,61 @@ fn detect_completion(
     }
     if completion.receive.is_empty() || completion.unsupported.is_empty() {
         return Err(ContractError::new(ContractErrorCode::CompletionMismatch));
+    }
+    if subset == "ngap"
+        && (completion.admitted_outcomes.is_empty() || completion.matrices.is_empty())
+    {
+        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+    }
+    Ok(())
+}
+
+fn detect_ngap_matrices(
+    completion: Option<&SubsetCompletion>,
+    matrices: &[MessageIeMatrix],
+    manifests: &[(PathBuf, FixtureManifest, Vec<u8>)],
+) -> Result<(), ContractError> {
+    let Some(completion) = completion else {
+        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+    };
+    let matrix_messages: BTreeSet<&str> = matrices
+        .iter()
+        .map(|matrix| matrix.message.as_str())
+        .collect();
+    for admitted in &completion.admitted_outcomes {
+        if !matrix_messages.contains(admitted.as_str()) {
+            return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+        }
+    }
+    let fixture_ids: BTreeSet<&str> = manifests
+        .iter()
+        .filter(|(_, manifest, _)| manifest.subset == "ngap")
+        .map(|(_, manifest, _)| manifest.sdk_fixture_id.as_str())
+        .collect();
+    let mut saw_paging = false;
+    for matrix in matrices {
+        match matrix.ts29413_clause.as_str() {
+            "5.2" => {
+                if matrix.admitted_disposition != "receive" || matrix.constructed_send {
+                    return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+                }
+            }
+            "5.4" => {
+                if matrix.message != "Paging" || matrix.admitted_disposition != "unsupported" {
+                    return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+                }
+                saw_paging = true;
+            }
+            _ => return Err(ContractError::new(ContractErrorCode::MissingMatrix)),
+        }
+        if let Some(fixture_id) = &matrix.wire_fixture_id {
+            if !fixture_ids.contains(fixture_id.as_str()) {
+                return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+            }
+        }
+    }
+    if !saw_paging || matrices.len() < completion.admitted_outcomes.len() {
+        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
     }
     Ok(())
 }

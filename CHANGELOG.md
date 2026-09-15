@@ -70,10 +70,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gre-qfi, n3-gtpu, protocol-key, nas-tcp, xfrm-roster, and n2-dtls. Each
   subset publishes required case classes, sanitized-field inventory, SHA-256
   digests, constructed/receive/unsupported outcomes, and
-  `runtime_claim=false`. Reuses the issue 493 NGAP DecodeContext vector and
-  issue 341 GTP-U Echo/PSC bytes by digest. Crate and rust-gates detectors
-  fail closed on missing classes, digest mutation, and forbidden content.
-  No codec, adapter, or key-handle runtime is activated (Fixes #784).
+  `runtime_claim=false`. Oracles are TS 24.502 V18.8.0 7.3–7.7 / 8.2–8.3 /
+  9.3–9.4, TS 29.413 V18.5.0 5.2–5.4, TS 38.413 V18.10.0, TS 38.412 V18.1.0
+  clause 7, RFC 6083, TS 29.281 V18.4.0 4.4 / 5.2.2.7 / 7.2–7.3 / 8.2,
+  TS 38.415 V18.2.0 5.5.3, TS 33.501 V18.12.0 7.2.1, RFC 7296, and RFC 4555.
+  Reuses the issue 493 NGAP DecodeContext vector and issue 341 GTP-U
+  Echo/PSC bytes by digest. NGAP publishes Rel-18 bytes plus IE
+  cardinality/criticality matrices for every admitted 5.2 outcome; Paging is
+  5.4 unsupported. Crate and rust-gates detectors fail closed on missing
+  classes, digest mutation, and forbidden content. No codec, adapter, or
+  key-handle runtime is activated. Application policy, subscriber
+  authentication decisions, AMF selection, deployment, readiness, and
+  product claims stay out of scope. Tracking issue 795 is not implemented
+  (Fixes #784).
 - **Selectable fixed-quorum persistence — `opc-session-store`:** supported
   `SessionPersistenceMode::Async` acknowledges validated resident storage,
   real quorum replication, and committed application while one coalescing

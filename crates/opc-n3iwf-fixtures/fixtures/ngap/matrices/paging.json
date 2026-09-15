@@ -1,0 +1,135 @@
+{
+  "message": "Paging",
+  "procedure_code": 24,
+  "outcome": "initiating",
+  "direction": "amf-to-n3iwf",
+  "ts29413_clause": "5.4",
+  "admitted_disposition": "unsupported",
+  "constructed_send": false,
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.4.1"
+    ]
+  },
+  "application": {
+    "document": "3GPP TS 29.413",
+    "release": "V18.5.0",
+    "clauses": [
+      "5.4",
+      "5.3"
+    ]
+  },
+  "wire_fixture_id": "opc.n3iwf.ngap.v1.unsupported-paging-5-4",
+  "ies": [
+    {
+      "id": 115,
+      "name": "id-UEPagingIdentity",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 50,
+      "name": "id-PagingDRX",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 103,
+      "name": "id-TAIListForPaging",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 52,
+      "name": "id-PagingPriority",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 118,
+      "name": "id-UERadioCapabilityForPaging",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 51,
+      "name": "id-PagingOrigin",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 11,
+      "name": "id-AssistanceDataForPaging",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 203,
+      "name": "id-NB-IoT-Paging-eDRXInfo",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 202,
+      "name": "id-NB-IoT-PagingDRX",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 205,
+      "name": "id-Enhanced-CoverageRestriction",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 208,
+      "name": "id-WUS-Assistance-Information",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 223,
+      "name": "id-EUTRA-PagingeDRXInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 222,
+      "name": "id-CEmodeBrestricted",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 332,
+      "name": "id-NR-PagingeDRXInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 342,
+      "name": "id-PagingCause",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 344,
+      "name": "id-PEIPSassistanceInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 477,
+      "name": "id-LPWUSPSAssistanceInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 495,
+      "name": "id-LPWUSDisableIndication",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    }
+  ]
+}

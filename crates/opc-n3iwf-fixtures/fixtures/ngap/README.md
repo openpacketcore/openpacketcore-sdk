@@ -1,12 +1,11 @@
 # NGAP N3IWF fixture subset
 
 Reuses the issue 493 DecodeContext / IE cardinality contract and the
-public 78-byte NGSetupRequest vector. Canonical typed encode remains
-unsupported. Release 18 identifier/criticality/cardinality matrices for the
-typed procedures live in `crates/opc-proto-ngap/src/policy.rs` and are
-cited by path. The 78-byte vector is copied by digest and locked to that
-source file by `tests/contracts.rs`.
+public 78-byte Rel-18 NGSetupRequest vector (TS 38.413 V18.10.0). TS 29.413
+V18.5.0 clauses 5.2–5.4 decide which first-CNF messages are admitted for
+N3IWF. Canonical typed encode remains unsupported.
 
-Admitted send/receive outcomes in this subset: receive NGSetupRequest and
-empty wrappers. Constructed N3IWF encode is unsupported until issue 787.
+`matrices/` publishes identifier/criticality/cardinality for every admitted
+sent/received outcome plus Paging (5.4 discard). Constructed N3IWF send is
+unsupported. This crate does not select an AMF or apply subscriber policy.
 

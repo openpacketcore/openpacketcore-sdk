@@ -6,6 +6,11 @@ Synthetic wire and transport contracts for N3IWF primitives. Owned by
 These contracts do not activate a codec, adapter, key handle, or transport
 runtime. `runtime_claim` is false.
 
+Scope is reusable SDK contracts only. They do not encode application policy,
+subscriber authentication decisions, AMF selection, deployment topology,
+readiness, or product claims. Tracking issue 795 is tracking-only and is not
+implemented here.
+
 ## Why a dedicated crate
 
 Several N3IWF primitives (NWu GRE, NAS-over-TCP, protocol-key KATs, XFRM
@@ -58,19 +63,29 @@ Every subset publishes at least one fixture in each class:
 
 ## Semantic distinctions the catalog locks
 
-- EAP-5G spare AN-parameters are ignored; duplicate selected-PLMN is a caller
-  duplicate-singleton policy, not the spare-parameter ignore rule.
-- NAS-over-TCP partial prefixes remain `need-more-data` until a complete
-  frame, EOF/loss, or bounded finalization.
-- NGAP reuses the issue 493 Release 18 DecodeContext vector. Canonical typed
-  encode remains unsupported.
+- EAP-5G spare AN-parameters and AN-parameter reordering are permitted on
+  receive. Duplicate selected-PLMN is a caller duplicate-singleton policy,
+  not the spare-parameter ignore rule. Notification is Message-Id 3; Stop is
+  Message-Id 4.
+- NAS-over-TCP partial prefixes remain `need-more-data` while the stream is
+  open. EOF/loss of an incomplete frame or bounded-length overflow finalizes
+  as reject.
+- NGAP reuses the issue 493 Rel-18 DecodeContext vector (TS 38.413 V18.10.0).
+  TS 29.413 V18.5.0 5.2–5.4 decide admission. Every admitted sent/received
+  outcome publishes an IE cardinality/criticality matrix. Paging is 5.4
+  unsupported. Canonical typed encode remains unsupported.
 - NWu GRE received nonzero Protocol Type is ignored.
 - N3 GTP-U downlink PSC is type 0; uplink PSC is type 1 QFI-only. Received
   Recovery is ignored and canonicalized to zero.
-- IKE notify wire and XFRM backend roster are separate subsets.
-- Protocol-key fixtures are labels only. No key, MSK, or K_N3IWF bytes.
-- N2 DTLS requires PPID 66. Ordinary PPID 60 associations cannot satisfy that
-  subset. Errors are redacted labels.
+- IKE wire notifies/create/modify/delete/mobility stay in `nwu-ike`. Backend
+  overlap, SPI provenance, rekey, and roster relocation stay in `xfrm-roster`.
+- Protocol-key fixtures are synthetic known-answer labels only. Wrong
+  generation, reuse, drop, and cancellation are published. No key, MSK, or
+  K_N3IWF bytes.
+- N2 DTLS requires handshake/identity labels, PPID 66, SCTP-AUTH, reliable
+  DATA B/E delivery, rekey/rotation, and restart/path-failure labels.
+  Ordinary PPID 60 associations cannot satisfy that subset. Errors are
+  bounded redacted labels.
 
 ## Gates
 

@@ -4,7 +4,7 @@
   "case_class": "ordering",
   "source": {
     "document": "3GPP TS 38.413",
-    "release": "R18",
+    "release": "V18.10.0",
     "clauses": [
       "9.2"
     ]

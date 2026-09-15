@@ -115,6 +115,44 @@ def check_catalog() -> list[str]:
                 errors.append(f"{path.name}: digest mismatch")
         if REQUIRED - classes:
             errors.append(f"{subset}: missing {sorted(REQUIRED - classes)}")
+
+    ngap_completion = load_json(FIXTURE_ROOT / "ngap" / "COMPLETION.json")
+    if not ngap_completion.get("admitted_outcomes") or not ngap_completion.get("matrices"):
+        errors.append("ngap: missing admitted_outcomes or matrices")
+    for rel in ngap_completion.get("matrices", []):
+        matrix_path = FIXTURE_ROOT / "ngap" / rel
+        if not matrix_path.is_file():
+            errors.append(f"ngap: missing matrix {rel}")
+            continue
+        matrix = load_json(matrix_path)
+        if not matrix.get("ies") or not matrix.get("message"):
+            errors.append(f"{rel}: incomplete matrix")
+        if matrix.get("source", {}).get("release") != "V18.10.0":
+            errors.append(f"{rel}: TS 38.413 release must be V18.10.0")
+        if matrix.get("application", {}).get("release") != "V18.5.0":
+            errors.append(f"{rel}: TS 29.413 release must be V18.5.0")
+        if matrix.get("constructed_send") is True:
+            errors.append(f"{rel}: constructed send must stay unsupported")
+
+    def has_id_fragment(subset: str, fragment: str) -> bool:
+        return any(
+            fragment in path.name
+            for path in (FIXTURE_ROOT / subset).glob("*.json")
+            if path.name != "COMPLETION.json"
+        )
+
+    for subset, fragment in (
+        ("eap5g", "positive-notification"),
+        ("eap5g", "positive-stop"),
+        ("nwu-ike", "create-child-sa"),
+        ("nwu-ike", "modify-child-sa"),
+        ("nas-tcp", "eof-loss-incomplete-frame"),
+        ("n2-dtls", "reliable-delivery-data"),
+        ("n2-dtls", "rotation-generation-3"),
+        ("ngap", "unsupported-paging-5-4"),
+    ):
+        if not has_id_fragment(subset, fragment):
+            errors.append(f"{subset}: missing {fragment}")
     return errors
 
 

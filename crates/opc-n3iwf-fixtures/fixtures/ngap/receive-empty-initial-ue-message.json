@@ -1,0 +1,43 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-ue-message",
+  "subset": "ngap",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.5.1",
+      "TS 29.413 5.2"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Issue 493 empty-IE wrapper helper; IE values remain unsupported",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ngap/src/lib.rs::empty_ie_pdu",
+    "notes": "InitialUEMessage empty ProtocolIE-Container. TS 29.413 V18.5.0 clause 5.2. Constructed N3IWF send is unsupported."
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/receive-empty-initial-ue-message.hex",
+    "digest_sha256": "d1aeea62e3031ec1e1859d590d09dedfa4bbff542c6282336e747c1fe567537c"
+  },
+  "semantic_assertions": [
+    "procedure=15",
+    "outcome=initiating",
+    "ts29413=5.2",
+    "matrix=initial-ue-message",
+    "constructed_typed_encode=unsupported"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

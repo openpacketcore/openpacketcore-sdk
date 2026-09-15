@@ -110,9 +110,10 @@ def completion(
     constructed: list[str],
     receive: list[str],
     unsupported: list[str],
+    extra: dict | None = None,
 ) -> dict:
     classes = sorted({item["case_class"] for item in fixtures})
-    return {
+    record = {
         "subset": subset,
         "status": "complete",
         "issue": ISSUE,
@@ -124,6 +125,464 @@ def completion(
         "receive": receive,
         "unsupported": unsupported,
     }
+    if extra:
+        record.update(extra)
+    return record
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def empty_ie_pdu(choice: int, procedure: int, criticality: int) -> str:
+    """Issue 493 empty ProtocolIE-Container wrapper: choice + procedure + crit + 03 00 00 00."""
+    return f"{choice:02x} {procedure:02x} {criticality:02x} 03 00 00 00"
+
+
+# TS 38.413 V18.10.0 IE identifier/criticality/cardinality transcribed from
+# crates/opc-proto-ngap/src/policy.rs (issue 493 first-CNF profiles).
+# TS 29.413 V18.5.0 clause 5.2 admits these N3IWF–AMF messages; clause 5.4
+# discards Paging. Constructed N3IWF send remains unsupported.
+NGAP_CRITICALITY = {"reject": 0x00, "ignore": 0x40, "notify": 0x80}
+NGAP_CHOICE = {"initiating": 0x00, "successful": 0x20, "unsuccessful": 0x40}
+
+NGAP_IE_MATRICES: list[dict] = [
+    {
+        "slug": "ng-setup-request",
+        "message": "NGSetupRequest",
+        "procedure_code": 21,
+        "outcome": "initiating",
+        "outer_criticality": "reject",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.6.1"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.positive-ngsetup-external",
+        "emit_empty_wrapper": False,
+        "ies": [
+            (27, "id-GlobalRANNodeID", "reject"),
+            (82, "id-RANNodeName", "ignore"),
+            (102, "id-SupportedTAList", "reject"),
+            (21, "id-DefaultPagingDRX", "ignore"),
+            (147, "id-UERetentionInformation", "ignore"),
+            (204, "id-NB-IoT-DefaultPagingDRX", "ignore"),
+            (273, "id-Extended-RANNodeName", "ignore"),
+            (475, "id-AIoT-Support", "reject"),
+            (483, "id-AdditionalULI", "ignore"),
+        ],
+    },
+    {
+        "slug": "ng-setup-response",
+        "message": "NGSetupResponse",
+        "procedure_code": 21,
+        "outcome": "successful",
+        "outer_criticality": "reject",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.6.2"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ng-setup-response",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (1, "id-AMFName", "reject"),
+            (96, "id-ServedGUAMIList", "reject"),
+            (86, "id-RelativeAMFCapacity", "ignore"),
+            (80, "id-PLMNSupportList", "reject"),
+            (19, "id-CriticalityDiagnostics", "ignore"),
+            (147, "id-UERetentionInformation", "ignore"),
+            (200, "id-IAB-Supported", "ignore"),
+            (274, "id-Extended-AMFName", "ignore"),
+            (404, "id-MobileIAB-Supported", "ignore"),
+            (467, "id-AIOTFIdentifier", "reject"),
+            (476, "id-AIOTFName", "reject"),
+        ],
+    },
+    {
+        "slug": "ng-setup-failure",
+        "message": "NGSetupFailure",
+        "procedure_code": 21,
+        "outcome": "unsuccessful",
+        "outer_criticality": "reject",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.6.3"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ng-setup-failure",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (15, "id-Cause", "ignore"),
+            (107, "id-TimeToWait", "ignore"),
+            (19, "id-CriticalityDiagnostics", "ignore"),
+        ],
+    },
+    {
+        "slug": "initial-ue-message",
+        "message": "InitialUEMessage",
+        "procedure_code": 15,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.5.1"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-ue-message",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (85, "id-RAN-UE-NGAP-ID", "reject"),
+            (38, "id-NAS-PDU", "reject"),
+            (121, "id-UserLocationInformation", "reject"),
+            (90, "id-RRCEstablishmentCause", "ignore"),
+            (26, "id-FiveG-S-TMSI", "reject"),
+            (3, "id-AMFSetID", "ignore"),
+            (112, "id-UEContextRequest", "ignore"),
+            (0, "id-AllowedNSSAI", "reject"),
+            (171, "id-SourceToTarget-AMFInformationReroute", "ignore"),
+            (174, "id-SelectedPLMNIdentity", "ignore"),
+            (201, "id-IABNodeIndication", "reject"),
+            (224, "id-CEmodeBSupport-Indicator", "reject"),
+            (225, "id-LTEM-Indication", "ignore"),
+            (227, "id-EDT-Session", "ignore"),
+            (245, "id-AuthenticatedIndication", "ignore"),
+            (259, "id-NPN-AccessInformation", "reject"),
+            (333, "id-RedCapIndication", "ignore"),
+            (371, "id-SelectedNID", "ignore"),
+            (402, "id-MobileIABNodeIndication", "reject"),
+            (414, "id-Partially-Allowed-NSSAI", "ignore"),
+            (427, "id-ERedCapIndication", "ignore"),
+            (440, "id-AUN3DeviceAccessInfo", "ignore"),
+            (28, "id-GUAMI", "ignore"),
+            (176, "id-GUAMIType", "ignore"),
+            (454, "id-RequestedNSSAI", "ignore"),
+        ],
+    },
+    {
+        "slug": "downlink-nas-transport",
+        "message": "DownlinkNASTransport",
+        "procedure_code": 4,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.5.2"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-downlink-nas-transport",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "reject"),
+            (85, "id-RAN-UE-NGAP-ID", "reject"),
+            (48, "id-OldAMF", "reject"),
+            (83, "id-RANPagingPriority", "ignore"),
+            (38, "id-NAS-PDU", "reject"),
+            (36, "id-MobilityRestrictionList", "ignore"),
+            (31, "id-IndexToRFSP", "ignore"),
+            (110, "id-UEAggregateMaximumBitRate", "ignore"),
+            (0, "id-AllowedNSSAI", "reject"),
+            (177, "id-SRVCCOperationPossible", "ignore"),
+            (205, "id-Enhanced-CoverageRestriction", "ignore"),
+            (206, "id-Extended-ConnectedTime", "ignore"),
+            (209, "id-UE-DifferentiationInfo", "ignore"),
+            (222, "id-CEmodeBrestricted", "ignore"),
+            (117, "id-UERadioCapability", "ignore"),
+            (228, "id-UECapabilityInfoRequest", "ignore"),
+            (226, "id-EndIndication", "ignore"),
+            (264, "id-UERadioCapabilityID", "reject"),
+            (334, "id-TargetNSSAIInformation", "ignore"),
+            (34, "id-MaskedIMEISV", "ignore"),
+            (414, "id-Partially-Allowed-NSSAI", "ignore"),
+            (400, "id-MobileIAB-Authorized", "ignore"),
+            (443, "id-ExtendedOldAMF", "ignore"),
+        ],
+    },
+    {
+        "slug": "uplink-nas-transport",
+        "message": "UplinkNASTransport",
+        "procedure_code": 46,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.5.3"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-uplink-nas-transport",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "reject"),
+            (85, "id-RAN-UE-NGAP-ID", "reject"),
+            (38, "id-NAS-PDU", "reject"),
+            (121, "id-UserLocationInformation", "ignore"),
+            (239, "id-W-AGFIdentityInformation", "reject"),
+            (246, "id-TNGFIdentityInformation", "reject"),
+            (247, "id-TWIFIdentityInformation", "reject"),
+        ],
+    },
+    {
+        "slug": "initial-context-setup-request",
+        "message": "InitialContextSetupRequest",
+        "procedure_code": 14,
+        "outcome": "initiating",
+        "outer_criticality": "reject",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.2.1"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-context-setup-request",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "reject"),
+            (85, "id-RAN-UE-NGAP-ID", "reject"),
+            (48, "id-OldAMF", "reject"),
+            (110, "id-UEAggregateMaximumBitRate", "reject"),
+            (18, "id-CoreNetworkAssistanceInformationForInactive", "ignore"),
+            (28, "id-GUAMI", "reject"),
+            (71, "id-PDUSessionResourceSetupListCxtReq", "reject"),
+            (0, "id-AllowedNSSAI", "reject"),
+            (119, "id-UESecurityCapabilities", "reject"),
+            (94, "id-SecurityKey", "reject"),
+            (108, "id-TraceActivation", "ignore"),
+            (36, "id-MobilityRestrictionList", "ignore"),
+            (117, "id-UERadioCapability", "ignore"),
+            (31, "id-IndexToRFSP", "ignore"),
+            (34, "id-MaskedIMEISV", "ignore"),
+            (38, "id-NAS-PDU", "ignore"),
+            (24, "id-EmergencyFallbackIndicator", "reject"),
+            (91, "id-RRCInactiveTransitionReportRequest", "ignore"),
+            (118, "id-UERadioCapabilityForPaging", "ignore"),
+            (146, "id-RedirectionVoiceFallback", "ignore"),
+            (33, "id-LocationReportingRequestType", "ignore"),
+            (165, "id-CNAssistedRANTuning", "ignore"),
+            (177, "id-SRVCCOperationPossible", "ignore"),
+            (199, "id-IAB-Authorized", "ignore"),
+            (205, "id-Enhanced-CoverageRestriction", "ignore"),
+            (206, "id-Extended-ConnectedTime", "ignore"),
+            (209, "id-UE-DifferentiationInfo", "ignore"),
+            (216, "id-NRV2XServicesAuthorized", "ignore"),
+            (215, "id-LTEV2XServicesAuthorized", "ignore"),
+            (218, "id-NRUESidelinkAggregateMaximumBitrate", "ignore"),
+            (217, "id-LTEUESidelinkAggregateMaximumBitrate", "ignore"),
+            (219, "id-PC5QoSParameters", "ignore"),
+            (222, "id-CEmodeBrestricted", "ignore"),
+            (234, "id-UE-UP-CIoT-Support", "ignore"),
+            (238, "id-RGLevelWirelineAccessCharacteristics", "ignore"),
+            (254, "id-ManagementBasedMDTPLMNList", "ignore"),
+            (264, "id-UERadioCapabilityID", "reject"),
+            (326, "id-TimeSyncAssistanceInfo", "ignore"),
+            (328, "id-QMCConfigInfo", "ignore"),
+            (334, "id-TargetNSSAIInformation", "ignore"),
+            (335, "id-UESliceMaximumBitRateList", "ignore"),
+            (345, "id-FiveG-ProSeAuthorized", "ignore"),
+            (346, "id-FiveG-ProSeUEPC5AggregateMaximumBitRate", "ignore"),
+            (347, "id-FiveG-ProSePC5QoSParameters", "ignore"),
+            (367, "id-NetworkControlledRepeaterAuthorized", "ignore"),
+            (373, "id-AerialUEsubscriptionInformation", "ignore"),
+            (374, "id-NR-A2X-ServicesAuthorized", "ignore"),
+            (375, "id-LTE-A2X-ServicesAuthorized", "ignore"),
+            (376, "id-NR-A2X-UE-PC5-AggregateMaximumBitRate", "ignore"),
+            (377, "id-LTE-A2X-UE-PC5-AggregateMaximumBitRate", "ignore"),
+            (378, "id-A2X-PC5-QoS-Parameters", "ignore"),
+            (400, "id-MobileIAB-Authorized", "ignore"),
+            (414, "id-Partially-Allowed-NSSAI", "ignore"),
+            (430, "id-SLPositioningRangingServiceInfo", "ignore"),
+            (443, "id-ExtendedOldAMF", "ignore"),
+            (450, "id-AMF-UE-NGAP-ID2", "ignore"),
+        ],
+    },
+    {
+        "slug": "initial-context-setup-response",
+        "message": "InitialContextSetupResponse",
+        "procedure_code": 14,
+        "outcome": "successful",
+        "outer_criticality": "reject",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.2.2"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-context-setup-response",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "ignore"),
+            (85, "id-RAN-UE-NGAP-ID", "ignore"),
+            (72, "id-PDUSessionResourceSetupListCxtRes", "ignore"),
+            (55, "id-PDUSessionResourceFailedToSetupListCxtRes", "ignore"),
+            (19, "id-CriticalityDiagnostics", "ignore"),
+        ],
+    },
+    {
+        "slug": "initial-context-setup-failure",
+        "message": "InitialContextSetupFailure",
+        "procedure_code": 14,
+        "outcome": "unsuccessful",
+        "outer_criticality": "reject",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.2.3"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-context-setup-failure",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "ignore"),
+            (85, "id-RAN-UE-NGAP-ID", "ignore"),
+            (132, "id-PDUSessionResourceFailedToSetupListCxtFail", "ignore"),
+            (15, "id-Cause", "ignore"),
+            (19, "id-CriticalityDiagnostics", "ignore"),
+        ],
+    },
+    {
+        "slug": "pdu-session-resource-setup-request",
+        "message": "PDUSessionResourceSetupRequest",
+        "procedure_code": 29,
+        "outcome": "initiating",
+        "outer_criticality": "reject",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.1.1"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-setup-request",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "reject"),
+            (85, "id-RAN-UE-NGAP-ID", "reject"),
+            (83, "id-RANPagingPriority", "ignore"),
+            (38, "id-NAS-PDU", "reject"),
+            (74, "id-PDUSessionResourceSetupListSUReq", "reject"),
+            (110, "id-UEAggregateMaximumBitRate", "ignore"),
+            (335, "id-UESliceMaximumBitRateList", "ignore"),
+        ],
+    },
+    {
+        "slug": "pdu-session-resource-setup-response",
+        "message": "PDUSessionResourceSetupResponse",
+        "procedure_code": 29,
+        "outcome": "successful",
+        "outer_criticality": "reject",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.1.2"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-setup-response",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "ignore"),
+            (85, "id-RAN-UE-NGAP-ID", "ignore"),
+            (75, "id-PDUSessionResourceSetupListSURes", "ignore"),
+            (58, "id-PDUSessionResourceFailedToSetupListSURes", "ignore"),
+            (19, "id-CriticalityDiagnostics", "ignore"),
+            (121, "id-UserLocationInformation", "ignore"),
+        ],
+    },
+    {
+        "slug": "pdu-session-resource-release-command",
+        "message": "PDUSessionResourceReleaseCommand",
+        "procedure_code": 28,
+        "outcome": "initiating",
+        "outer_criticality": "reject",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.1.3"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-release-command",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "reject"),
+            (85, "id-RAN-UE-NGAP-ID", "reject"),
+            (83, "id-RANPagingPriority", "ignore"),
+            (38, "id-NAS-PDU", "ignore"),
+            (79, "id-PDUSessionResourceToReleaseListRelCmd", "reject"),
+        ],
+    },
+    {
+        "slug": "pdu-session-resource-release-response",
+        "message": "PDUSessionResourceReleaseResponse",
+        "procedure_code": 28,
+        "outcome": "successful",
+        "outer_criticality": "reject",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.1.4"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-release-response",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "ignore"),
+            (85, "id-RAN-UE-NGAP-ID", "ignore"),
+            (70, "id-PDUSessionResourceReleasedListRelRes", "ignore"),
+            (121, "id-UserLocationInformation", "ignore"),
+            (19, "id-CriticalityDiagnostics", "ignore"),
+        ],
+    },
+    {
+        "slug": "ue-context-release-command",
+        "message": "UEContextReleaseCommand",
+        "procedure_code": 41,
+        "outcome": "initiating",
+        "outer_criticality": "reject",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.2.4"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ue-context-release-command",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (114, "id-UE-NGAP-IDs", "reject"),
+            (15, "id-Cause", "ignore"),
+        ],
+    },
+    {
+        "slug": "ue-context-release-complete",
+        "message": "UEContextReleaseComplete",
+        "procedure_code": 41,
+        "outcome": "successful",
+        "outer_criticality": "reject",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["9.2.2.5"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ue-context-release-complete",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (10, "id-AMF-UE-NGAP-ID", "ignore"),
+            (85, "id-RAN-UE-NGAP-ID", "ignore"),
+            (121, "id-UserLocationInformation", "ignore"),
+            (32, "id-InfoOnRecommendedCellsAndRANNodesForPaging", "ignore"),
+            (60, "id-PDUSessionResourceListCxtRelCpl", "reject"),
+            (19, "id-CriticalityDiagnostics", "ignore"),
+            (207, "id-PagingAssisDataforCEcapabUE", "ignore"),
+        ],
+    },
+    {
+        "slug": "paging",
+        "message": "Paging",
+        "procedure_code": 24,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.4",
+        "admitted_disposition": "unsupported",
+        "clauses_38413": ["9.2.4.1"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.unsupported-paging-5-4",
+        "emit_empty_wrapper": True,
+        "ies": [
+            (115, "id-UEPagingIdentity", "ignore"),
+            (50, "id-PagingDRX", "ignore"),
+            (103, "id-TAIListForPaging", "ignore"),
+            (52, "id-PagingPriority", "ignore"),
+            (118, "id-UERadioCapabilityForPaging", "ignore"),
+            (51, "id-PagingOrigin", "ignore"),
+            (11, "id-AssistanceDataForPaging", "ignore"),
+            (203, "id-NB-IoT-Paging-eDRXInfo", "ignore"),
+            (202, "id-NB-IoT-PagingDRX", "ignore"),
+            (205, "id-Enhanced-CoverageRestriction", "ignore"),
+            (208, "id-WUS-Assistance-Information", "ignore"),
+            (223, "id-EUTRA-PagingeDRXInformation", "ignore"),
+            (222, "id-CEmodeBrestricted", "ignore"),
+            (332, "id-NR-PagingeDRXInformation", "ignore"),
+            (342, "id-PagingCause", "ignore"),
+            (344, "id-PEIPSassistanceInformation", "ignore"),
+            (477, "id-LPWUSPSAssistanceInformation", "ignore"),
+            (495, "id-LPWUSDisableIndication", "ignore"),
+        ],
+    },
+]
 
 
 def write_completion(subset_dir: Path, record: dict) -> None:
@@ -183,6 +642,8 @@ def eap5g(subset_dir: Path) -> list[dict]:
     overflow = (
         "02 02 00 12 fe 00 28 af 00 00 00 03 02 00 00 08 02 ff 00"
     )
+    notification = "01 03 00 10 fe 00 28 af 00 00 00 03 03 00 00 00"
+    stop = "02 04 00 0e fe 00 28 af 00 00 00 03 04 00"
     fixtures = [
         manifest(
             subset="eap5g",
@@ -373,17 +834,67 @@ def eap5g(subset_dir: Path) -> list[dict]:
             assertions=["an_parameter_length_overflow=true"],
             outcome="reject",
         ),
+        manifest(
+            subset="eap5g",
+            name="positive-notification",
+            case_class="positive",
+            document="3GPP TS 24.502",
+            release="V18.8.0",
+            clauses=["7.3", "9.3.2.2.5"],
+            direction="n3iwf-to-ue",
+            role="n3iwf",
+            prerequisite="EAP-5G session started; AN-parameters empty for N3IWF",
+            provenance_class="spec-authored",
+            notes="EAP-Request/5G-Notification Message-Id 3 with empty AN-parameters",
+            referenced=None,
+            sanitized=SYN_ID,
+            wire_name="positive-notification",
+            wire_hex=notification,
+            assertions=["eap_code=request", "message_id=3", "an_parameters_len=0"],
+            outcome="constructed",
+        ),
+        manifest(
+            subset="eap5g",
+            name="positive-stop",
+            case_class="positive",
+            document="3GPP TS 24.502",
+            release="V18.8.0",
+            clauses=["7.3", "9.3.2.2.4"],
+            direction="ue-to-n3iwf",
+            role="ue",
+            prerequisite="EAP-5G session ending; subscriber auth remains unsupported",
+            provenance_class="spec-authored",
+            notes="EAP-Response/5G-Stop Message-Id 4 plus spare octet",
+            referenced=None,
+            sanitized=SYN_ID,
+            wire_name="positive-stop",
+            wire_hex=stop,
+            assertions=["eap_code=response", "message_id=4"],
+            outcome="receive",
+        ),
     ]
     for item, wire in zip(
         fixtures,
-        [start, nas, unknown, ordered, duplicate, malformed, unknown_critical, truncated, overflow],
+        [
+            start,
+            nas,
+            unknown,
+            ordered,
+            duplicate,
+            malformed,
+            unknown_critical,
+            truncated,
+            overflow,
+            notification,
+            stop,
+        ],
         strict=True,
     ):
         dump_manifest(subset_dir, item, wire)
     write_readme(
         subset_dir,
         "EAP-5G fixture subset",
-        """Hand-authored from TS 24.502 V18.8.0 clauses 7.3 and 9.3.2.
+        """Hand-authored from TS 24.502 V18.8.0 clauses 7.3–7.7 and 9.3.2.
 
 | Offset | Octets | Field |
 | --- | --- | --- |
@@ -396,9 +907,10 @@ def eap5g(subset_dir: Path) -> list[dict]:
 | 12 | `01` | 5G-Start-Id |
 | 13 | `00` | Spare |
 
-Unknown spare AN-parameters are ignored. Duplicate selected-PLMN is a caller
-duplicate-singleton policy, not the spare-parameter ignore rule. NAS remains
-opaque. `runtime_claim=false`.
+Unknown spare AN-parameters and AN-parameter reordering are permitted on
+receive. Duplicate selected-PLMN is a caller duplicate-singleton policy, not
+the spare-parameter ignore rule. Notification (Message-Id 3) and Stop
+(Message-Id 4) are published. NAS remains opaque. `runtime_claim=false`.
 """,
     )
     write_completion(
@@ -406,8 +918,15 @@ opaque. `runtime_claim=false`.
         completion(
             "eap5g",
             fixtures,
-            constructed=["EAP-Request/5G-Start envelope"],
-            receive=["EAP-Response/5G-NAS with selected PLMN and opaque NAS"],
+            constructed=[
+                "EAP-Request/5G-Start envelope",
+                "EAP-Request/5G-Notification Message-Id 3",
+            ],
+            receive=[
+                "EAP-Response/5G-NAS with selected PLMN and opaque NAS",
+                "EAP-Response/5G-Stop Message-Id 4",
+                "AN-parameter reorder",
+            ],
             unsupported=[
                 "subscriber authentication decision",
                 "SUCI deconcealment",
@@ -431,6 +950,11 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
     malformed = "00 00 00 0c 00 04 d8 ce c0 00 02"
     truncated = "00 00 00 0c 00 00 d8 ce c0"
     overflow = "00 00 00 08 ff 00 d8 ce"
+    create_child = (
+        "29 00 00 0d 00 00 d8 cd 04 05 01 09 00 "
+        "00 00 00 0c 00 00 d8 d4 c0 00 02 0b"
+    )
+    modify_child = "00 00 00 0d 00 00 d8 cd 04 05 01 0a 00"
     wires = [
         nas_ip4,
         nas_tcp,
@@ -438,6 +962,8 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
         up_ip4,
         delete,
         mobike,
+        create_child,
+        modify_child,
         unknown_crit,
         duplicate,
         ordered,
@@ -562,6 +1088,53 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
         ),
         manifest(
             subset="nwu-ike",
+            name="create-child-sa",
+            case_class="positive",
+            document="3GPP TS 24.502",
+            release="V18.8.0",
+            clauses=["7.5", "8.3", "9.3.1.1", "9.3.1.8"],
+            direction="n3iwf-to-ue",
+            role="n3iwf",
+            prerequisite="CREATE_CHILD_SA selected; XFRM roster is a separate subset",
+            provenance_class="spec-authored",
+            notes="Clause 7.5 CREATE_CHILD_SA notify chain: 5G_QOS_INFO then UP_IP4_ADDRESS",
+            referenced=None,
+            sanitized=SYN_ID,
+            wire_name="create-child-sa",
+            wire_hex=create_child,
+            assertions=[
+                "procedure=create-child-sa",
+                "notify_types=55501,55508",
+                "backend_roster=out-of-scope",
+            ],
+            outcome="constructed",
+        ),
+        manifest(
+            subset="nwu-ike",
+            name="modify-child-sa",
+            case_class="positive",
+            document="3GPP TS 24.502",
+            release="V18.8.0",
+            clauses=["7.6", "8.3", "9.3.1.1"],
+            direction="n3iwf-to-ue",
+            role="n3iwf",
+            prerequisite="Existing Child SA; INFORMATIONAL modify; roster stays out of scope",
+            provenance_class="spec-authored",
+            notes="Clause 7.6 modify-child-sa 5G_QOS_INFO with updated QFI 10",
+            referenced=None,
+            sanitized=SYN_ID,
+            wire_name="modify-child-sa",
+            wire_hex=modify_child,
+            assertions=[
+                "procedure=modify-child-sa",
+                "notify_type=55501",
+                "qfi=10",
+                "backend_roster=out-of-scope",
+            ],
+            outcome="constructed",
+        ),
+        manifest(
+            subset="nwu-ike",
             name="unknown-critical-payload",
             case_class="unknown-critical",
             document="IETF RFC 7296",
@@ -680,16 +1253,18 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
     write_readme(
         subset_dir,
         "NWu IKE fixture subset",
-        """Wire notifies and Delete/MOBIKE payloads only. Backend overlap, SPI
-provenance, rekey, and roster relocation belong to `xfrm-roster`.
+        """Wire notifies plus create/modify/delete/mobility payloads only. Backend
+overlap, SPI provenance, rekey, and roster relocation belong to `xfrm-roster`.
 
 | Notify | Type | Synthetic value |
 | --- | --- | --- |
 | NAS_IP4_ADDRESS | 55502 | 192.0.2.10 |
 | NAS_TCP_PORT | 55506 | 20000 |
-| 5G_QOS_INFO | 55501 | PDU session 5, QFI 9 |
+| 5G_QOS_INFO | 55501 | PDU session 5, QFI 9 or 10 |
 | UP_IP4_ADDRESS | 55508 | 192.0.2.11 |
 | ADDITIONAL_IP4_ADDRESS | 16397 | 192.0.2.10 |
+| CREATE_CHILD_SA chain | TS 24.502 7.5 | 55501 then 55508 |
+| MODIFY_CHILD_SA | TS 24.502 7.6 | 55501 QFI 10 |
 | Delete ESP | RFC 7296 §3.11 | one synthetic SPI |
 """,
     )
@@ -698,7 +1273,15 @@ provenance, rekey, and roster relocation belong to `xfrm-roster`.
         completion(
             "nwu-ike",
             fixtures,
-            constructed=["NAS_IP4_ADDRESS", "NAS_TCP_PORT", "5G_QOS_INFO", "UP_IP4_ADDRESS", "Delete ESP"],
+            constructed=[
+                "NAS_IP4_ADDRESS",
+                "NAS_TCP_PORT",
+                "5G_QOS_INFO",
+                "UP_IP4_ADDRESS",
+                "CREATE_CHILD_SA notify chain",
+                "MODIFY_CHILD_SA 5G_QOS_INFO",
+                "Delete ESP",
+            ],
             receive=["MOBIKE additional-address notify", "notify reordering"],
             unsupported=[
                 "XFRM install",
@@ -711,8 +1294,40 @@ provenance, rekey, and roster relocation belong to `xfrm-roster`.
     return fixtures
 
 
+def ngap_matrix_record(spec: dict) -> dict:
+    return {
+        "message": spec["message"],
+        "procedure_code": spec["procedure_code"],
+        "outcome": spec["outcome"],
+        "direction": spec["direction"],
+        "ts29413_clause": spec["ts29413_clause"],
+        "admitted_disposition": spec["admitted_disposition"],
+        "constructed_send": False,
+        "source": {
+            "document": "3GPP TS 38.413",
+            "release": "V18.10.0",
+            "clauses": spec["clauses_38413"],
+        },
+        "application": {
+            "document": "3GPP TS 29.413",
+            "release": "V18.5.0",
+            "clauses": [spec["ts29413_clause"], "5.3"],
+        },
+        "wire_fixture_id": spec["wire_fixture_id"],
+        "ies": [
+            {
+                "id": ie_id,
+                "name": name,
+                "criticality": crit,
+                "cardinality": "singleton",
+            }
+            for ie_id, name, crit in spec["ies"]
+        ],
+    }
+
+
 def ngap(subset_dir: Path) -> list[dict]:
-    empty_setup = "00 15 00 03 00 00 00"
+    empty_setup = empty_ie_pdu(0x00, 21, 0x00)
     unknown_crit = (
         "00 15 40 4a 00 00 04 00 ff 00 08 40 02 f8 98 00 00 00 00 00 52 40 0f "
         "06 00 4d 79 20 6c 69 74 74 6c 65 20 67 4e 42 00 66 00 1f 01 00 00 00 "
@@ -742,13 +1357,13 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="positive-ngsetup-external",
             case_class="positive",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2.6.1"],
             direction="n3iwf-to-amf",
             role="n3iwf",
             prerequisite="Existing opc-proto-ngap DecodeContext policy from issue 493",
             provenance_class="referenced-public-vector",
-            notes="78-byte independent libngap NGSetupRequest already proven in opc-proto-ngap",
+            notes="78-byte independent Rel-18 libngap NGSetupRequest already proven in opc-proto-ngap; TS 29.413 V18.5.0 5.2 admits NG Setup",
             referenced="crates/opc-proto-ngap/src/lib.rs::ngsetup_request_fixture",
             sanitized=SYN_ID,
             wire_name="positive-ngsetup-external",
@@ -757,6 +1372,8 @@ def ngap(subset_dir: Path) -> list[dict]:
                 "procedure=21",
                 "outcome=initiating",
                 "ie_ids=27,82,102,21",
+                "ts29413=5.2",
+                "matrix=ng-setup-request",
                 "canonical_typed_encode=unsupported",
             ],
             outcome="receive",
@@ -766,7 +1383,7 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="positive-empty-setup-wrapper",
             case_class="positive",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2", "X.691"],
             direction="n3iwf-to-amf",
             role="n3iwf",
@@ -785,7 +1402,7 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="unknown-critical-ie",
             case_class="unknown-critical",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2.6.1"],
             direction="n3iwf-to-amf",
             role="n3iwf",
@@ -804,7 +1421,7 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="duplicate-global-ran-node-id",
             case_class="duplicate",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2.6.1"],
             direction="n3iwf-to-amf",
             role="n3iwf",
@@ -823,7 +1440,7 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="ordering-empty-container",
             case_class="ordering",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2"],
             direction="n3iwf-to-amf",
             role="n3iwf",
@@ -842,7 +1459,7 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="malformed-open-type",
             case_class="malformed",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2"],
             direction="n3iwf-to-amf",
             role="n3iwf",
@@ -861,7 +1478,7 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="truncated-wrapper",
             case_class="truncation",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2"],
             direction="n3iwf-to-amf",
             role="n3iwf",
@@ -880,7 +1497,7 @@ def ngap(subset_dir: Path) -> list[dict]:
             name="bounded-ie-count-overflow",
             case_class="bounded-overflow",
             document="3GPP TS 38.413",
-            release="R18",
+            release="V18.10.0",
             clauses=["9.2"],
             direction="n3iwf-to-amf",
             role="n3iwf",
@@ -897,18 +1514,82 @@ def ngap(subset_dir: Path) -> list[dict]:
     ]
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
+
+    matrix_paths: list[str] = []
+    admitted: list[str] = []
+    receive_labels = [
+        "NGSetupRequest external Rel-18 vector",
+        "empty initiating NG Setup wrapper",
+    ]
+    unsupported_labels = [
+        "canonical typed encode",
+        "constructed N3IWF send",
+        "semantic IE-value validation",
+        "AMF selection",
+        "Paging (TS 29.413 5.4)",
+    ]
+    for spec in NGAP_IE_MATRICES:
+        record = ngap_matrix_record(spec)
+        rel = f"matrices/{spec['slug']}.json"
+        write_json(subset_dir / rel, record)
+        matrix_paths.append(rel)
+        if spec["admitted_disposition"] == "receive":
+            admitted.append(spec["message"])
+        if spec["emit_empty_wrapper"]:
+            wire_hex = empty_ie_pdu(
+                NGAP_CHOICE[spec["outcome"]],
+                spec["procedure_code"],
+                NGAP_CRITICALITY[spec["outer_criticality"]],
+            )
+            name = (
+                f"unsupported-{spec['slug']}-5-4"
+                if spec["admitted_disposition"] == "unsupported"
+                else f"receive-empty-{spec['slug']}"
+            )
+            extra = manifest(
+                subset="ngap",
+                name=name,
+                case_class="positive",
+                document="3GPP TS 38.413",
+                release="V18.10.0",
+                clauses=spec["clauses_38413"] + [f"TS 29.413 {spec['ts29413_clause']}"],
+                direction=spec["direction"],
+                role="n3iwf" if spec["direction"].startswith("n3iwf") else "amf",
+                prerequisite="Issue 493 empty-IE wrapper helper; IE values remain unsupported",
+                provenance_class="spec-authored",
+                notes=(
+                    f"{spec['message']} empty ProtocolIE-Container. "
+                    f"TS 29.413 V18.5.0 clause {spec['ts29413_clause']}. "
+                    "Constructed N3IWF send is unsupported."
+                ),
+                referenced="crates/opc-proto-ngap/src/lib.rs::empty_ie_pdu",
+                sanitized=SYN_ID,
+                wire_name=name,
+                wire_hex=wire_hex,
+                assertions=[
+                    f"procedure={spec['procedure_code']}",
+                    f"outcome={spec['outcome']}",
+                    f"ts29413={spec['ts29413_clause']}",
+                    f"matrix={spec['slug']}",
+                    "constructed_typed_encode=unsupported",
+                ],
+                outcome=spec["admitted_disposition"],
+            )
+            dump_manifest(subset_dir, extra, wire_hex)
+            fixtures.append(extra)
+            if spec["admitted_disposition"] == "receive":
+                receive_labels.append(f"{spec['message']} empty wrapper")
     write_readme(
         subset_dir,
         "NGAP N3IWF fixture subset",
         """Reuses the issue 493 DecodeContext / IE cardinality contract and the
-public 78-byte NGSetupRequest vector. Canonical typed encode remains
-unsupported. Release 18 identifier/criticality/cardinality matrices for the
-typed procedures live in `crates/opc-proto-ngap/src/policy.rs` and are
-cited by path. The 78-byte vector is copied by digest and locked to that
-source file by `tests/contracts.rs`.
+public 78-byte Rel-18 NGSetupRequest vector (TS 38.413 V18.10.0). TS 29.413
+V18.5.0 clauses 5.2–5.4 decide which first-CNF messages are admitted for
+N3IWF. Canonical typed encode remains unsupported.
 
-Admitted send/receive outcomes in this subset: receive NGSetupRequest and
-empty wrappers. Constructed N3IWF encode is unsupported until issue 787.
+`matrices/` publishes identifier/criticality/cardinality for every admitted
+sent/received outcome plus Paging (5.4 discard). Constructed N3IWF send is
+unsupported. This crate does not select an AMF or apply subscriber policy.
 """,
     )
     write_completion(
@@ -917,12 +1598,12 @@ empty wrappers. Constructed N3IWF encode is unsupported until issue 787.
             "ngap",
             fixtures,
             constructed=[],
-            receive=["NGSetupRequest external vector", "empty initiating wrapper"],
-            unsupported=[
-                "canonical typed encode",
-                "constructed N3IWF send",
-                "semantic IE-value validation",
-            ],
+            receive=receive_labels,
+            unsupported=unsupported_labels,
+            extra={
+                "admitted_outcomes": admitted,
+                "matrices": matrix_paths,
+            },
         ),
     )
     return fixtures
@@ -1813,7 +2494,18 @@ def nas_tcp(subset_dir: Path) -> list[dict]:
     truncated = "00"
     overflow = "01 00" + " 00" * 16
     unknown = "00 03 7f 00 00"
-    wires = [positive, need_more, duplicate, ordered, malformed, truncated, overflow, unknown]
+    eof_loss = "00 05 7e 00"
+    wires = [
+        positive,
+        need_more,
+        duplicate,
+        ordered,
+        malformed,
+        truncated,
+        overflow,
+        unknown,
+        eof_loss,
+    ]
     fixtures = [
         manifest(
             subset="nas-tcp",
@@ -1967,6 +2659,30 @@ def nas_tcp(subset_dir: Path) -> list[dict]:
             assertions=["envelope_complete=true", "inner_nas=opaque-or-reject-by-nas-codec"],
             outcome="receive",
         ),
+        manifest(
+            subset="nas-tcp",
+            name="eof-loss-incomplete-frame",
+            case_class="truncation",
+            document="3GPP TS 24.502",
+            release="V18.8.0",
+            clauses=["8.2.4", "9.4"],
+            direction="either",
+            role="nas-tcp-endpoint",
+            prerequisite="TCP FIN, abort, or loss after these octets; not an open-stream partial",
+            provenance_class="synthetic-negative",
+            notes="Same prefix as partial-need-more-data finalizes as reject on EOF/loss",
+            referenced=None,
+            sanitized=NAS_OPAQUE,
+            wire_name="eof-loss-incomplete-frame",
+            wire_hex=eof_loss,
+            assertions=[
+                "eof_or_loss=true",
+                "incomplete_frame=true",
+                "finalization=reject",
+                "not_need_more_data",
+            ],
+            outcome="reject",
+        ),
     ]
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
@@ -1974,9 +2690,9 @@ def nas_tcp(subset_dir: Path) -> list[dict]:
         subset_dir,
         "NAS-over-TCP fixture subset",
         """Two-octet length precedes an opaque NAS PDU. A partial prefix remains
-need-more-data until a complete frame, EOF/loss, or bounded finalization.
-A complete first frame plus a trailing partial or complete frame is valid
-buffered input.
+need-more-data while the stream is open. EOF/loss of an incomplete frame or
+a bounded-length overflow finalizes as reject. A complete first frame plus
+a trailing partial or complete frame is valid buffered input.
 """,
     )
     write_completion(
@@ -2247,6 +2963,8 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
     truncated = "16 fe fd"
     overflow = "16 fe fd ff ff"
     redacted = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-error-redacted")
+    reliable = "00 03 00 10 00 00 00 01 00 00 00 00 00 00 00 42"
+    rotation = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-rotation-generation-3")
     wires = [
         positive,
         hello,
@@ -2261,6 +2979,8 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
         truncated,
         overflow,
         redacted,
+        reliable,
+        rotation,
     ]
     fixtures = [
         manifest(
@@ -2516,15 +3236,54 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             assertions=["error_redacted=true", "no_peer_or_cert_bytes=true"],
             outcome="reject",
         ),
+        manifest(
+            subset="n2-dtls",
+            name="reliable-delivery-data",
+            case_class="positive",
+            document="IETF RFC 6083",
+            release="RFC 6083",
+            clauses=["4", "IETF RFC 4960 3.3.1"],
+            direction="n3iwf-to-amf",
+            role="n3iwf",
+            prerequisite="SCTP DATA B/E bits set; PPID 66; user data out of band",
+            provenance_class="spec-authored",
+            notes="Unfragmented DATA chunk (B=1 E=1) carrying PPID 66",
+            referenced=None,
+            sanitized=SYN_ID,
+            wire_name="reliable-delivery-data",
+            wire_hex=reliable,
+            assertions=["chunk=DATA", "flags=B+E", "ppid=66", "reliable_delivery=true"],
+            outcome="constructed",
+        ),
+        manifest(
+            subset="n2-dtls",
+            name="rotation-generation-3",
+            case_class="ordering",
+            document="IETF RFC 6083",
+            release="RFC 6083",
+            clauses=["4.4"],
+            direction="local",
+            role="n3iwf",
+            prerequisite="Key-id rotation after rekey-generation-2; exporter secret unpublished",
+            provenance_class="synthetic-kat",
+            notes="Rotation generation-3 label; distinct from rekey-generation-2",
+            referenced=None,
+            sanitized=NO_KEY,
+            wire_name="rotation-generation-3",
+            wire_hex=rotation,
+            assertions=["rotation=true", "generation=3", "material_published=false"],
+            outcome="receive",
+        ),
     ]
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
     write_readme(
         subset_dir,
         "N2 DTLS fixture subset",
-        """PPID 66, handshake/identity labels, SCTP-AUTH length, rekey, restart,
-and redacted errors. Ordinary PPID 60 associations cannot satisfy this
-subset. No certificates or exporter secrets are published.
+        """PPID 66, handshake/identity labels, SCTP-AUTH length, reliable DATA
+B/E delivery, rekey, rotation, restart/path failure, and bounded redacted
+errors. Ordinary PPID 60 associations cannot satisfy this subset. No
+certificates or exporter secrets are published.
 """,
     )
     write_completion(
@@ -2532,8 +3291,14 @@ subset. No certificates or exporter secrets are published.
         completion(
             "n2-dtls",
             fixtures,
-            constructed=["PPID 66", "handshake header", "expected-peer identity label", "SCTP-AUTH length label"],
-            receive=["rekey", "path failure"],
+            constructed=[
+                "PPID 66",
+                "handshake header",
+                "expected-peer identity label",
+                "SCTP-AUTH length label",
+                "SCTP DATA B/E PPID 66",
+            ],
+            receive=["rekey", "rotation generation 3", "path failure"],
             unsupported=["PPID 60 as protection", "NGAP procedure state", "certificate dumps"],
         ),
     )

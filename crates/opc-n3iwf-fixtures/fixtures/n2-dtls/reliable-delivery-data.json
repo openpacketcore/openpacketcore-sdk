@@ -1,0 +1,42 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.reliable-delivery-data",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4",
+      "IETF RFC 4960 3.3.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "SCTP DATA B/E bits set; PPID 66; user data out of band",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Unfragmented DATA chunk (B=1 E=1) carrying PPID 66"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/reliable-delivery-data.hex",
+    "digest_sha256": "c128110e92848d9a49508327e87b60b1cab54aeda78f6db4f6a07fd9fb5e8e3c"
+  },
+  "semantic_assertions": [
+    "chunk=DATA",
+    "flags=B+E",
+    "ppid=66",
+    "reliable_delivery=true"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

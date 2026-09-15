@@ -1,6 +1,6 @@
 # EAP-5G fixture subset
 
-Hand-authored from TS 24.502 V18.8.0 clauses 7.3 and 9.3.2.
+Hand-authored from TS 24.502 V18.8.0 clauses 7.3–7.7 and 9.3.2.
 
 | Offset | Octets | Field |
 | --- | --- | --- |
@@ -13,7 +13,8 @@ Hand-authored from TS 24.502 V18.8.0 clauses 7.3 and 9.3.2.
 | 12 | `01` | 5G-Start-Id |
 | 13 | `00` | Spare |
 
-Unknown spare AN-parameters are ignored. Duplicate selected-PLMN is a caller
-duplicate-singleton policy, not the spare-parameter ignore rule. NAS remains
-opaque. `runtime_claim=false`.
+Unknown spare AN-parameters and AN-parameter reordering are permitted on
+receive. Duplicate selected-PLMN is a caller duplicate-singleton policy, not
+the spare-parameter ignore rule. Notification (Message-Id 3) and Stop
+(Message-Id 4) are published. NAS remains opaque. `runtime_claim=false`.
 

@@ -20,6 +20,8 @@
     "opc.n3iwf.nwu-ike.v1.positive-up-ip4",
     "opc.n3iwf.nwu-ike.v1.delete-esp",
     "opc.n3iwf.nwu-ike.v1.mobility-additional-addresses",
+    "opc.n3iwf.nwu-ike.v1.create-child-sa",
+    "opc.n3iwf.nwu-ike.v1.modify-child-sa",
     "opc.n3iwf.nwu-ike.v1.unknown-critical-payload",
     "opc.n3iwf.nwu-ike.v1.duplicate-nas-ip4",
     "opc.n3iwf.nwu-ike.v1.ordering-tcp-before-ip4",
@@ -32,6 +34,8 @@
     "NAS_TCP_PORT",
     "5G_QOS_INFO",
     "UP_IP4_ADDRESS",
+    "CREATE_CHILD_SA notify chain",
+    "MODIFY_CHILD_SA 5G_QOS_INFO",
     "Delete ESP"
   ],
   "receive": [

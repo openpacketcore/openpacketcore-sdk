@@ -4,7 +4,7 @@
   "case_class": "positive",
   "source": {
     "document": "3GPP TS 38.413",
-    "release": "R18",
+    "release": "V18.10.0",
     "clauses": [
       "9.2.6.1"
     ]
@@ -17,7 +17,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": "crates/opc-proto-ngap/src/lib.rs::ngsetup_request_fixture",
-    "notes": "78-byte independent libngap NGSetupRequest already proven in opc-proto-ngap"
+    "notes": "78-byte independent Rel-18 libngap NGSetupRequest already proven in opc-proto-ngap; TS 29.413 V18.5.0 5.2 admits NG Setup"
   },
   "sanitized_fields": [
     {
@@ -34,6 +34,8 @@
     "procedure=21",
     "outcome=initiating",
     "ie_ids=27,82,102,21",
+    "ts29413=5.2",
+    "matrix=ng-setup-request",
     "canonical_typed_encode=unsupported"
   ],
   "expected_outcome": "receive",

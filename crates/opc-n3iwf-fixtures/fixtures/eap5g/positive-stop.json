@@ -1,0 +1,40 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.positive-stop",
+  "subset": "eap5g",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "7.3",
+      "9.3.2.2.4"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "EAP-5G session ending; subscriber auth remains unsupported",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "EAP-Response/5G-Stop Message-Id 4 plus spare octet"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-stop.hex",
+    "digest_sha256": "e81e8775544d6403deae68bb57f3f5fc866285dc41fa80f760685bae63ae26f7"
+  },
+  "semantic_assertions": [
+    "eap_code=response",
+    "message_id=4"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

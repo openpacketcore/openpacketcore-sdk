@@ -21,7 +21,8 @@
     "opc.n3iwf.nas-tcp.v1.malformed-zero-length",
     "opc.n3iwf.nas-tcp.v1.truncated-length-octet",
     "opc.n3iwf.nas-tcp.v1.bounded-length-overflow",
-    "opc.n3iwf.nas-tcp.v1.unknown-epd"
+    "opc.n3iwf.nas-tcp.v1.unknown-epd",
+    "opc.n3iwf.nas-tcp.v1.eof-loss-incomplete-frame"
   ],
   "constructed": [
     "complete two-octet envelope"

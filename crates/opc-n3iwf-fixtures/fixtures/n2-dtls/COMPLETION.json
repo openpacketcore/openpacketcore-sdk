@@ -26,16 +26,20 @@
     "opc.n3iwf.n2-dtls.v1.malformed-tls-version",
     "opc.n3iwf.n2-dtls.v1.truncated-record",
     "opc.n3iwf.n2-dtls.v1.bounded-record-overflow",
-    "opc.n3iwf.n2-dtls.v1.redacted-error"
+    "opc.n3iwf.n2-dtls.v1.redacted-error",
+    "opc.n3iwf.n2-dtls.v1.reliable-delivery-data",
+    "opc.n3iwf.n2-dtls.v1.rotation-generation-3"
   ],
   "constructed": [
     "PPID 66",
     "handshake header",
     "expected-peer identity label",
-    "SCTP-AUTH length label"
+    "SCTP-AUTH length label",
+    "SCTP DATA B/E PPID 66"
   ],
   "receive": [
     "rekey",
+    "rotation generation 3",
     "path failure"
   ],
   "unsupported": [

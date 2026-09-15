@@ -1,0 +1,165 @@
+{
+  "message": "DownlinkNASTransport",
+  "procedure_code": 4,
+  "outcome": "initiating",
+  "direction": "amf-to-n3iwf",
+  "ts29413_clause": "5.2",
+  "admitted_disposition": "receive",
+  "constructed_send": false,
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.5.2"
+    ]
+  },
+  "application": {
+    "document": "3GPP TS 29.413",
+    "release": "V18.5.0",
+    "clauses": [
+      "5.2",
+      "5.3"
+    ]
+  },
+  "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-downlink-nas-transport",
+  "ies": [
+    {
+      "id": 10,
+      "name": "id-AMF-UE-NGAP-ID",
+      "criticality": "reject",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 85,
+      "name": "id-RAN-UE-NGAP-ID",
+      "criticality": "reject",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 48,
+      "name": "id-OldAMF",
+      "criticality": "reject",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 83,
+      "name": "id-RANPagingPriority",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 38,
+      "name": "id-NAS-PDU",
+      "criticality": "reject",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 36,
+      "name": "id-MobilityRestrictionList",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 31,
+      "name": "id-IndexToRFSP",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 110,
+      "name": "id-UEAggregateMaximumBitRate",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 0,
+      "name": "id-AllowedNSSAI",
+      "criticality": "reject",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 177,
+      "name": "id-SRVCCOperationPossible",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 205,
+      "name": "id-Enhanced-CoverageRestriction",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 206,
+      "name": "id-Extended-ConnectedTime",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 209,
+      "name": "id-UE-DifferentiationInfo",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 222,
+      "name": "id-CEmodeBrestricted",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 117,
+      "name": "id-UERadioCapability",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 228,
+      "name": "id-UECapabilityInfoRequest",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 226,
+      "name": "id-EndIndication",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 264,
+      "name": "id-UERadioCapabilityID",
+      "criticality": "reject",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 334,
+      "name": "id-TargetNSSAIInformation",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 34,
+      "name": "id-MaskedIMEISV",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 414,
+      "name": "id-Partially-Allowed-NSSAI",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 400,
+      "name": "id-MobileIAB-Authorized",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    },
+    {
+      "id": 443,
+      "name": "id-ExtendedOldAMF",
+      "criticality": "ignore",
+      "cardinality": "singleton"
+    }
+  ]
+}
