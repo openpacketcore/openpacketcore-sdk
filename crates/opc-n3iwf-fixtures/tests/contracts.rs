@@ -350,16 +350,42 @@ fn ngap_matrices_use_pinned_release18_rows_supported_by_policy_rs() {
 }
 
 #[test]
-fn protocol_key_never_publishes_key_material() {
+fn protocol_key_publication_contains_only_labels_and_public_test_inputs() {
     let catalog = FixtureCatalog::load().expect("catalog must load");
     let mut saw_wrong = false;
     let mut saw_reuse = false;
     let mut saw_drop = false;
     let mut saw_cancel = false;
+    let mut labels = 0;
+    let mut known_answers = 0;
     for (manifest, wire) in catalog.manifests() {
         if manifest.subset != "protocol-key" {
             continue;
         }
+        if manifest.validation_scope == "ike-auth-known-answer" {
+            known_answers += 1;
+            assert!(manifest.provenance.synthetic && !manifest.provenance.independent_capture);
+            assert!(!manifest.runtime_claim);
+            assert_eq!(manifest.context["sdk_custody_validation"], false);
+            assert!(manifest
+                .sanitized_fields
+                .iter()
+                .any(|field| field.name == "key-inputs"
+                    && field.treatment == "public-test-scalars-1-and-2-and-zero-NGAP-placeholder"
+                    && field.value_class == "synthetic-not-peer-key"));
+            let key = manifest.context["inputs"]["auth_keying_material"]
+                .as_str()
+                .expect("test input");
+            assert!(
+                key.is_empty() || key == "00".repeat(32) || key == format!("01{}", "00".repeat(31))
+            );
+            assert!((3..=36).contains(&wire.len()));
+            // The independent recipe gate pins every remaining input and
+            // negative mutation to public scalar/nonce/identity recipes.
+            continue;
+        }
+        assert_eq!(manifest.validation_scope, "handle-lifecycle-contract");
+        labels += 1;
         assert!(manifest
             .sanitized_fields
             .iter()
@@ -373,6 +399,8 @@ fn protocol_key_never_publishes_key_material() {
         saw_cancel |= manifest.sdk_fixture_id.contains("cancellation");
     }
     assert!(saw_wrong && saw_reuse && saw_drop && saw_cancel);
+    assert_eq!(labels, 10);
+    assert_eq!(known_answers, 30);
 }
 
 #[test]

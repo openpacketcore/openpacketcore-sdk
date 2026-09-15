@@ -157,6 +157,16 @@ OpenSSL 3 AES-256-CBC and HMAC-SHA512; its literal final IKE and `SK` lengths
 make incorrect MAC coverage fail. None of these values came from the handset
 capture or from a second call into the SDK implementation.
 
+The independently consumable `opc-n3iwf-fixtures` protocol-key subset adds
+SHA-256/AES-GCM-256/P-256 IKE key-schedule and final shared-key AUTH answers
+for both peers. Its separate Python/OpenSSL reference and SDK test compare
+all derived keys and exact AUTH bodies, with altered key/transcript/identity/
+nonce/direction inputs and 1,549 mutations. Inputs are public synthetic test
+values; the K_N3IWF input is the zero SecurityKey placeholder from a complete
+independent NGAP fixture. See [the evidence boundary](../opc-n3iwf-fixtures/CONFORMANCE.md).
+This does not establish peer interoperability, a protected IKE_AUTH exchange,
+or a consume-once protocol-key custody implementation.
+
 `tests/sa_init_negotiation.rs` contains a literal, synthetic, redaction-safe
 SA_INIT message with the observed protocol shape. Its addresses, SPIs, nonce,
 DH public value, and notifications are authored test values. The test never

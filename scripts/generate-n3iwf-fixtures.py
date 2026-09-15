@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = ROOT / "crates" / "opc-n3iwf-fixtures" / "fixtures"
-PUBLIC_BASE = "987246c8be773b19304f059231c39baa8d54d123"
+PUBLIC_BASE = "2a110ecfa5445c927b6be14b0937e0c09dc5841e"
 ISSUE = 784
 
 # Existing public SDK vectors reused by digest (issues 341/493).
@@ -2397,6 +2397,95 @@ dataplane runtime and is not duplicated here.
     return fixtures
 
 
+def protocol_key_known_answers(subset_dir: Path) -> list[dict]:
+    """Publish recorded answers; never import or execute the reference crypto."""
+    reference_path = "crates/opc-n3iwf-fixtures/oracles/ike-auth-sha256.json"
+    path = ROOT / reference_path
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("n3iwf_key_reference_file")
+    with path.open("rb") as source:
+        content = source.read(256 * 1024 + 1)
+    if len(content) > 256 * 1024:
+        raise ValueError("n3iwf_key_reference_size")
+    reference = json.loads(content)
+    names = set()
+    for case in reference["cases"]:
+        name = case["name"]
+        if (
+            not isinstance(name, str)
+            or name in names
+            or re.fullmatch(r"auth-(?:initiator|responder)-[a-z0-9-]{1,60}", name)
+            is None
+        ):
+            raise ValueError("n3iwf_key_reference_name")
+        names.add(name)
+        wire = bytes.fromhex(case["wire_hex"])
+        if (
+            not 0 < len(wire) <= 4096
+            or hashlib.sha256(wire).hexdigest() != case["wire_sha256"]
+        ):
+            raise ValueError("n3iwf_key_reference_wire")
+    fixtures = []
+    for case in reference["cases"]:
+        wire_hex = bytes.fromhex(case["wire_hex"]).hex(" ")
+        record = manifest(
+            subset="protocol-key",
+            name=case["name"],
+            case_class=case["case_class"],
+            document="RFC 7296",
+            release="Published RFC (2014)",
+            clauses=["2.13", "2.14", "2.15", "2.16", "3.9", "TS 33.501 V18.12.0 7.2.1"],
+            direction=(
+                "ue-to-n3iwf" if case["auth_peer"] == "initiator" else "n3iwf-to-ue"
+            ),
+            role="ue" if case["auth_peer"] == "initiator" else "n3iwf",
+            prerequisite="Synthetic SA_INIT transcript and externally supplied test K_N3IWF; EAP success and peer certificate verification remain caller preconditions.",
+            provenance_class=(
+                "spec-authored"
+                if case["reference_error"] is None
+                else "synthetic-negative"
+            ),
+            notes="Independent standard-library HMAC-SHA256/PRF+ answers and OpenSSL public test scalar agreement. No SDK encoder, real peer, key custody or memory-erasure claim.",
+            referenced=reference_path,
+            sanitized=[
+                {
+                    "name": "key-inputs",
+                    "treatment": "public-test-scalars-1-and-2-and-zero-NGAP-placeholder",
+                    "value_class": "synthetic-not-peer-key",
+                },
+                {
+                    "name": "nonces-and-SPIs",
+                    "treatment": "fixed-incrementing-test-octets",
+                    "value_class": "synthetic",
+                },
+                {
+                    "name": "identities",
+                    "treatment": "fixed-test-ID-KEY-ID-and-reserved-example-domain",
+                    "value_class": "non-subscriber",
+                },
+            ],
+            wire_name=case["name"],
+            wire_hex=wire_hex,
+            assertions=[
+                f"AUTH_method={int(case['wire_hex'][:2], 16)}",
+                "PRF=HMAC-SHA256", "custody_validation=false",
+            ],
+            outcome="receive" if case["reference_error"] is None else "reject",
+        )
+        record["encoding"] = "protocol-wire"
+        record["validation_scope"] = "ike-auth-known-answer"
+        record["context"] = dict(
+            inputs=case["inputs"],
+            auth_peer=case["auth_peer"],
+            reference_error=case["reference_error"],
+            crypto_profile=reference["profile"],
+            sdk_custody_validation=False,
+        )
+        dump_manifest(subset_dir, record, wire_hex)
+        fixtures.append(record)
+    return fixtures
+
+
 def protocol_key(subset_dir: Path) -> list[dict]:
     # Label bytes only. Never a key.
     positive = " ".join(
@@ -2625,13 +2714,20 @@ def protocol_key(subset_dir: Path) -> list[dict]:
     ]
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
+    fixtures.extend(protocol_key_known_answers(subset_dir))
     write_readme(
         subset_dir,
         "Protocol-key fixture subset",
-        """Synthetic scenario labels and caller state transitions only; no cryptographic
-known-answer or zeroization evidence. No key, MSK, or K_N3IWF bytes are
-published. Wrong-generation, reuse, drop, and cancellation are semantic
-outcomes for issue 791.
+        """Independent RFC 7296 IKE AUTH known answers for both peers use complete
+synthetic SA_INIT messages, public test P-256 scalars, and the zero NGAP
+SecurityKey placeholder. Published negative cases and bit/prefix mutations
+check transcript, identity, nonce, direction, key and MIC binding through the
+existing SDK crypto API. AUTH payload bodies are not complete protected IKE
+exchanges, peer authentication, or K_AMF hierarchy derivation evidence.
+
+Legacy scenario labels still model wrong-generation, reuse, drop and
+cancellation obligations for issue 791. They do not exercise a custody API
+or prove actual memory zeroization. No real peer key or nonce is published.
 """,
     )
     write_completion(
@@ -2639,12 +2735,19 @@ outcomes for issue 791.
         completion(
             "protocol-key",
             fixtures,
-            constructed=["generation-1 consume-once label"],
-            receive=["drop zeroize"],
+            constructed=[
+                "generation-1 consume-once label",
+                "independent synthetic initiator/responder AUTH bodies",
+            ],
+            receive=[
+                "drop zeroize reference state",
+                "synthetic AUTH known-answer verification",
+            ],
             unsupported=[
                 "byte export",
                 "hierarchy derivation",
                 "authentication decision",
+                "actual consume-once custody and zeroization",
             ],
         ),
     )

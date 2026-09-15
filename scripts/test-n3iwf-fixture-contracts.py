@@ -3,6 +3,7 @@
 
 import hashlib
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import n3iwf_fixture_oracles as oracle
+import n3iwf_key_reference as key_reference
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -23,6 +25,76 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_key_reference_rejects_non_octet_known_answers(self):
+        reference = key_reference.read_json(key_reference.REFERENCE)
+        for value in (False, 0.0, "0", -1, 256):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                changed = json.loads(json.dumps(reference))
+                # False and 0.0 compare equal to the expected zero, but neither
+                # is a JSON integer octet. Reject before converting or comparing.
+                changed["expected_octets"]["auth_initiator"][1] = value
+                source = Path(directory) / "reference.json"
+                source.write_text(json.dumps(changed))
+                with mock.patch.object(
+                    key_reference, "REFERENCE", source
+                ), mock.patch.object(sys, "argv", ["reference"]), mock.patch(
+                    "sys.stderr", new=io.StringIO()
+                ) as errors:
+                    self.assertEqual(key_reference.main(), 1)
+                    self.assertIn("answer-octet", errors.getvalue())
+
+    def test_key_reference_rejects_undeclared_negative_input_recipes(self):
+        reference = key_reference.read_json(key_reference.REFERENCE)
+        for field in ("dh_shared", "initiator_nonce", "identity_payload_body"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                changed = json.loads(json.dumps(reference))
+                # A negative AUTH result alone cannot establish synthetic provenance.
+                changed["cases"][1]["inputs"][field] = "77" * 32
+                source = root / "reference.json"
+                source.write_text(json.dumps(changed))
+                fixture_root = root / "fixtures"
+                shutil.copytree(
+                    FIXTURES / "protocol-key", fixture_root / "protocol-key"
+                )
+                manifest_path = (
+                    fixture_root
+                    / "protocol-key"
+                    / (changed["cases"][1]["name"] + ".json")
+                )
+                manifest = json.loads(manifest_path.read_text())
+                manifest["context"]["inputs"] = changed["cases"][1]["inputs"]
+                manifest_path.write_text(json.dumps(manifest))
+                with mock.patch.object(
+                    key_reference, "REFERENCE", source
+                ), mock.patch.object(
+                    key_reference, "FIXTURES", fixture_root
+                ), mock.patch.object(
+                    sys, "argv", ["reference"]
+                ), mock.patch(
+                    "sys.stderr", new=io.StringIO()
+                ) as errors:
+                    self.assertEqual(key_reference.main(), 1)
+                    self.assertIn("synthetic-case-recipe", errors.getvalue())
+
+    def test_key_known_answer_rejects_stale_claims_and_custody_promotion(self):
+        path = FIXTURES / "protocol-key/auth-initiator-known-answer.json"
+        original = json.loads(path.read_text())
+        data = wire("protocol-key", "auth-initiator-known-answer")
+        for field in ("assertions", "custody", "encoding", "outcome"):
+            with self.subTest(field=field):
+                manifest = json.loads(json.dumps(original))
+                if field == "assertions":
+                    manifest["semantic_assertions"][0] = "AUTH_method=3"
+                elif field == "custody":
+                    manifest["context"]["sdk_custody_validation"] = True
+                elif field == "encoding":
+                    manifest["encoding"] = "scenario-label"
+                else:
+                    manifest["expected_outcome"] = "constructed"
+                with self.assertRaises(key_reference.Invalid):
+                    key_reference.validate(manifest, data)
+
     def test_reference_download_identifies_the_client_and_bounds_the_read(self):
         spec = importlib.util.spec_from_file_location(
             "reference_gate", ROOT / "scripts/check-n3iwf-ngap-reference.py"
@@ -342,6 +414,39 @@ class PublicationRegressions(unittest.TestCase):
 
 
 class GeneratorRegressions(unittest.TestCase):
+    def test_key_reference_rejects_unsafe_paths_duplicates_and_stale_digests(self):
+        spec = importlib.util.spec_from_file_location(
+            "writer", ROOT / "scripts/generate-n3iwf-fixtures.py"
+        )
+        writer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(writer)
+        reference_path = Path("crates/opc-n3iwf-fixtures/oracles/ike-auth-sha256.json")
+        original = (ROOT / reference_path).read_text()
+        for mutation in ("escape", "duplicate", "digest", "oversize", "symlink"):
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reference = json.loads(original)
+                if mutation == "escape":
+                    reference["cases"][0]["name"] = "../../escaped"
+                elif mutation == "duplicate":
+                    reference["cases"][1]["name"] = reference["cases"][0]["name"]
+                elif mutation == "digest":
+                    reference["cases"][0]["wire_sha256"] = "0" * 64
+                source = root / reference_path
+                source.parent.mkdir(parents=True)
+                source.write_text(json.dumps(reference))
+                if mutation == "oversize":
+                    source.write_bytes(b" " * (256 * 1024 + 1))
+                elif mutation == "symlink":
+                    source.unlink()
+                    source.symlink_to(ROOT / reference_path)
+                writer.ROOT = root
+                with mock.patch.object(writer, "dump_manifest") as publish:
+                    with self.assertRaises(ValueError):
+                        writer.protocol_key_known_answers(root / "output")
+                    publish.assert_not_called()
 
     def test_ngap_reference_cannot_escape_or_overwrite_an_output(self):
         spec = importlib.util.spec_from_file_location(

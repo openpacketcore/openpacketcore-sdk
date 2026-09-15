@@ -102,6 +102,18 @@ jobs:
           path: ${{ runner.temp }}/ngap-reference-report.json
           if-no-files-found: error
 
+      - name: Verify independent synthetic IKE AUTH known answers
+        run: |
+          python3 scripts/n3iwf_key_reference.py \
+            --report "${RUNNER_TEMP}/ike-auth-reference-report.json"
+
+      - name: Archive independent IKE AUTH validation report
+        uses: actions/upload-artifact@v7
+        with:
+          name: n3iwf-independent-ike-auth-reference
+          path: ${{ runner.temp }}/ike-auth-reference-report.json
+          if-no-files-found: error
+
       - name: Test SDK-702 release-attestation wrapper environment
         run: |
           python3 ci/test-sdk702-release-attest.py

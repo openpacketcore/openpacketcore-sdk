@@ -3229,7 +3229,9 @@ dependencies = [
 name = "opc-n3iwf-fixtures"
 version = "0.2.0"
 dependencies = [
+ "opc-crypto-provider",
  "opc-proto-gtpu",
+ "opc-proto-ikev2",
  "opc-proto-ngap",
  "opc-protocol",
  "serde",
