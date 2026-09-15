@@ -211,6 +211,11 @@ jobs:
       - name: Run test shard
         run: |
           set -euo pipefail
+          if [[ '${{ matrix.shard }}' == 'heavy-0' ]]; then
+            # Preserve the existing fixed-stage recovery observations when a
+            # hosted continuity assertion fails; no extra RPC is issued.
+            export OPC_SESSION_QUALIFICATION_DIAGNOSTICS=1
+          fi
           python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' > shard-commands.txt
           test -s shard-commands.txt
           # The command list is read on fd 3, and each command gets its own
