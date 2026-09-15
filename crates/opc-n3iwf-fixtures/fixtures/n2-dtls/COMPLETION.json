@@ -1,0 +1,44 @@
+{
+  "subset": "n2-dtls",
+  "status": "complete",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.n2-dtls.v1.positive-ppid66",
+    "opc.n3iwf.n2-dtls.v1.positive-handshake-header",
+    "opc.n3iwf.n2-dtls.v1.sctp-auth-length",
+    "opc.n3iwf.n2-dtls.v1.rekey-generation-2",
+    "opc.n3iwf.n2-dtls.v1.restart-path-failure",
+    "opc.n3iwf.n2-dtls.v1.unknown-ppid60",
+    "opc.n3iwf.n2-dtls.v1.duplicate-ppid66",
+    "opc.n3iwf.n2-dtls.v1.ordering-ppid-then-handshake",
+    "opc.n3iwf.n2-dtls.v1.malformed-tls-version",
+    "opc.n3iwf.n2-dtls.v1.truncated-record",
+    "opc.n3iwf.n2-dtls.v1.bounded-record-overflow",
+    "opc.n3iwf.n2-dtls.v1.redacted-error"
+  ],
+  "constructed": [
+    "PPID 66",
+    "handshake header",
+    "SCTP-AUTH length label"
+  ],
+  "receive": [
+    "rekey",
+    "path failure"
+  ],
+  "unsupported": [
+    "PPID 60 as protection",
+    "NGAP procedure state",
+    "certificate dumps"
+  ]
+}

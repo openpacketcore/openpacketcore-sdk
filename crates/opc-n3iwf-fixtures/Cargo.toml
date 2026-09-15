@@ -1,0 +1,19 @@
+[package]
+name = "opc-n3iwf-fixtures"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Synthetic N3IWF wire and transport fixture contracts (ADR 0015, issue 784)"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

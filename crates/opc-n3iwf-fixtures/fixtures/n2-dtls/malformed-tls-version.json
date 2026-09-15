@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.malformed-tls-version",
+  "subset": "n2-dtls",
+  "case_class": "malformed",
+  "source": {
+    "document": "IETF RFC 6347",
+    "release": "RFC 6347",
+    "clauses": [
+      "4.1"
+    ]
+  },
+  "direction": "peer-to-local",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "TLS 1.2 record version is not DTLS"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-tls-version.hex",
+    "digest_sha256": "1d4a7cb76d38591ca1d062056e6bb4e409097663d2bf4866e91094e4e317a7a3"
+  },
+  "semantic_assertions": [
+    "version=tls-1.2"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

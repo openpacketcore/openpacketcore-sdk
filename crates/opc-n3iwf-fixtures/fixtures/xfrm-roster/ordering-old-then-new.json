@@ -1,0 +1,43 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.ordering-old-then-new",
+  "subset": "xfrm-roster",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "One generation admits both pairs during overlap",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Generation 1 pair followed by generation 2 pair"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-old-then-new.hex",
+    "digest_sha256": "fb75e993126a5749077679466f8a0d50093fe8d3c7eceb103a728c5e6e59b5c7"
+  },
+  "semantic_assertions": [
+    "order=old-then-new"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

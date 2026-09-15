@@ -1,0 +1,36 @@
+{
+  "subset": "ngap",
+  "status": "complete",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.ngap.v1.positive-ngsetup-external",
+    "opc.n3iwf.ngap.v1.positive-empty-setup-wrapper",
+    "opc.n3iwf.ngap.v1.unknown-critical-ie",
+    "opc.n3iwf.ngap.v1.duplicate-global-ran-node-id",
+    "opc.n3iwf.ngap.v1.ordering-empty-container",
+    "opc.n3iwf.ngap.v1.malformed-open-type",
+    "opc.n3iwf.ngap.v1.truncated-wrapper",
+    "opc.n3iwf.ngap.v1.bounded-ie-count-overflow"
+  ],
+  "constructed": [],
+  "receive": [
+    "NGSetupRequest external vector",
+    "empty initiating wrapper"
+  ],
+  "unsupported": [
+    "canonical typed encode",
+    "constructed N3IWF send",
+    "semantic IE-value validation"
+  ]
+}

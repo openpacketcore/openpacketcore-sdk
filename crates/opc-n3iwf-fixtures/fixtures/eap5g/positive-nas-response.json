@@ -1,0 +1,47 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.positive-nas-response",
+  "subset": "eap5g",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "7.3",
+      "9.3.2.2.2"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "EAP-Request/5G-Start already sent",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Selected PLMN 001/01 and mo-Signalling cause; NAS body opaque"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-nas-response.hex",
+    "digest_sha256": "1deceaf5b926932eced510dab90f371d6200f0894124fb6d95d6408fac23ef79"
+  },
+  "semantic_assertions": [
+    "message_id=2",
+    "an_parameter.selected_plmn=001-01",
+    "an_parameter.establishment_cause=mo-Signalling",
+    "nas_pdu_opaque=true"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

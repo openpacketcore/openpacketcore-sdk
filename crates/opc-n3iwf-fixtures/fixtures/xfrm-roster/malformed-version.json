@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.malformed-version",
+  "subset": "xfrm-roster",
+  "case_class": "malformed",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Version 0 is not the synthetic roster record version"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-version.hex",
+    "digest_sha256": "7c1beb089e5d06c9f470e06ac994ae1c2464dafbf66d866036134aaeb4214c99"
+  },
+  "semantic_assertions": [
+    "version=0"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

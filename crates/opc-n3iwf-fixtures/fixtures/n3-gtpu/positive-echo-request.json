@@ -1,0 +1,41 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.positive-echo-request",
+  "subset": "n3-gtpu",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 29.281",
+    "release": "V18.4.0",
+    "clauses": [
+      "4.4",
+      "7.2.1"
+    ]
+  },
+  "direction": "either",
+  "role": "gtpu-endpoint",
+  "prerequisite": "Reuse opc-proto-gtpu typed control codec from issue 341",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-gtpu/tests/control_messages.rs::ECHO_REQUEST",
+    "notes": "Canonical Echo Request already proven in opc-proto-gtpu"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-echo-request.hex",
+    "digest_sha256": "5bbf0da59f87048287d0354dafbe4dcd09148cbf54643cb58244a35c692deb36"
+  },
+  "semantic_assertions": [
+    "message=echo-request",
+    "teid=0",
+    "sequence=0x1234"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

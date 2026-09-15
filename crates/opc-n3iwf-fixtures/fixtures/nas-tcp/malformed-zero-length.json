@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.malformed-zero-length",
+  "subset": "nas-tcp",
+  "case_class": "malformed",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.4"
+    ]
+  },
+  "direction": "either",
+  "role": "nas-tcp-endpoint",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Length zero is not a NAS message"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-zero-length.hex",
+    "digest_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+  },
+  "semantic_assertions": [
+    "length=0"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

@@ -1,0 +1,40 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.positive-nas-tcp-port",
+  "subset": "nwu-ike",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.2",
+      "9.3.1.6"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "NAS_IP4_ADDRESS already selected",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "NAS_TCP_PORT 55506 value 20000 is a synthetic test port"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-nas-tcp-port.hex",
+    "digest_sha256": "58136f4a9f5b3376cf76cba658d713ae0d94aeb730e63ff272097d6bc342bdca"
+  },
+  "semantic_assertions": [
+    "notify_type=55506",
+    "port=20000"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

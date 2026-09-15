@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.drop-zeroize",
+  "subset": "protocol-key",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Handle dropped without consume",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Drop revokes custody; label only"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/drop-zeroize.hex",
+    "digest_sha256": "5d7bf25c82d3589c8f7db7f9adb9a52e6623149aea51147b2a669620c97008e5"
+  },
+  "semantic_assertions": [
+    "drop=zeroize"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

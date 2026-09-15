@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.redacted-error",
+  "subset": "n2-dtls",
+  "case_class": "malformed",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Errors expose only stable labels",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Bounded redacted-error label; no peer, cert, or packet bytes"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/redacted-error.hex",
+    "digest_sha256": "1dd3232f6f95773df4ffa9f1f6aae6265234f86c44a8dd17a70d1665f33bedf7"
+  },
+  "semantic_assertions": [
+    "error_redacted=true",
+    "no_peer_or_cert_bytes=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

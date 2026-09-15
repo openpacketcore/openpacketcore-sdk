@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.bounded-record-overflow",
+  "subset": "n2-dtls",
+  "case_class": "bounded-overflow",
+  "source": {
+    "document": "IETF RFC 6347",
+    "release": "RFC 6347",
+    "clauses": [
+      "4.1"
+    ]
+  },
+  "direction": "peer-to-local",
+  "role": "n3iwf",
+  "prerequisite": "Caller record-size bound",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "DTLS length 0xffff over a five-octet header"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/bounded-record-overflow.hex",
+    "digest_sha256": "b5b9e5f419f86cff4e1dec34e6a709858b966e046a21afe0ab84a99503d5364a"
+  },
+  "semantic_assertions": [
+    "declared_length=65535"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

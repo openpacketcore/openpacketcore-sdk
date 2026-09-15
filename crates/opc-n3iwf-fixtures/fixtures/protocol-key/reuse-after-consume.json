@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.reuse-after-consume",
+  "subset": "protocol-key",
+  "case_class": "duplicate",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Handle already consumed once",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Second consume is reuse and must fail closed"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/reuse-after-consume.hex",
+    "digest_sha256": "918eec8b3c0ee58620e9f745f6cd53e56353fdaa2d8708c469652ad2665d2d0d"
+  },
+  "semantic_assertions": [
+    "reuse=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

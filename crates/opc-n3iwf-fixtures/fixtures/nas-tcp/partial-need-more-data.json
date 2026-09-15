@@ -1,0 +1,40 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.partial-need-more-data",
+  "subset": "nas-tcp",
+  "case_class": "truncation",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.2.4",
+      "9.4"
+    ]
+  },
+  "direction": "either",
+  "role": "nas-tcp-endpoint",
+  "prerequisite": "Incremental decode with caller max",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Length 5 with only two body octets remains need-more-data"
+  },
+  "sanitized_fields": [
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/partial-need-more-data.hex",
+    "digest_sha256": "a6ceb9cc64de2ca8b98ee4090d5915413d6e71d730d5e56376a6f586c6a1b9ad"
+  },
+  "semantic_assertions": [
+    "need_more_data=true",
+    "not_eof=true"
+  ],
+  "expected_outcome": "need-more-data",
+  "runtime_claim": false
+}

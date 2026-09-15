@@ -1,0 +1,38 @@
+{
+  "subset": "n2-sctp",
+  "status": "complete",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.n2-sctp.v1.positive-ppid60-port",
+    "opc.n3iwf.n2-sctp.v1.positive-data-chunk",
+    "opc.n3iwf.n2-sctp.v1.unknown-ppid66",
+    "opc.n3iwf.n2-sctp.v1.duplicate-association-tuple",
+    "opc.n3iwf.n2-sctp.v1.ordering-port-before-ppid",
+    "opc.n3iwf.n2-sctp.v1.malformed-missing-port",
+    "opc.n3iwf.n2-sctp.v1.truncated-ppid",
+    "opc.n3iwf.n2-sctp.v1.bounded-port-overflow"
+  ],
+  "constructed": [
+    "PPID 60 / port 38412 association metadata",
+    "DATA chunk header"
+  ],
+  "receive": [
+    "metadata order variants"
+  ],
+  "unsupported": [
+    "PPID 66 on this profile",
+    "DTLS",
+    "NGAP procedure state"
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.mobility-additional-addresses",
+  "subset": "nwu-ike",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 4555",
+    "release": "RFC 4555",
+    "clauses": [
+      "3.2"
+    ]
+  },
+  "direction": "either",
+  "role": "ike-endpoint",
+  "prerequisite": "MOBIKE enabled by caller policy",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "ADDITIONAL_IP4_ADDRESSES notify type 16384 with empty list body"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/mobility-additional-addresses.hex",
+    "digest_sha256": "ecc6ff169022807756d513a7f478375aac8ff7f565013ac01fdbdb973a51dbdf"
+  },
+  "semantic_assertions": [
+    "notify_type=16384",
+    "mobility_wire_only=true"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

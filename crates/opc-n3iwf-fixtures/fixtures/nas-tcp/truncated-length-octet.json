@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.truncated-length-octet",
+  "subset": "nas-tcp",
+  "case_class": "truncation",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.4"
+    ]
+  },
+  "direction": "either",
+  "role": "nas-tcp-endpoint",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "One length octet is still need-more-data, not a final reject"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/truncated-length-octet.hex",
+    "digest_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  "semantic_assertions": [
+    "need_more_data=true"
+  ],
+  "expected_outcome": "need-more-data",
+  "runtime_claim": false
+}

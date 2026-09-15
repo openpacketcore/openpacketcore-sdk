@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.positive-handshake-header",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 6347",
+    "release": "RFC 6347",
+    "clauses": [
+      "4.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Identity is a typed expected-peer label, not a certificate dump",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "DTLS record/handshake headers only; no certificate or key bytes"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-handshake-header.hex",
+    "digest_sha256": "46926ce332255e2a8c62b739f7aa39ab05d1a8386842b3891cbc4e63a433445a"
+  },
+  "semantic_assertions": [
+    "content_type=handshake",
+    "identity=expected-peer-label"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

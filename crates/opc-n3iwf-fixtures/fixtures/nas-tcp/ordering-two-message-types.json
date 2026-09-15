@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.ordering-two-message-types",
+  "subset": "nas-tcp",
+  "case_class": "ordering",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.2.4",
+      "9.4"
+    ]
+  },
+  "direction": "either",
+  "role": "nas-tcp-endpoint",
+  "prerequisite": "Stream order is the only order",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Registration-request-shaped then identity-request-shaped opaque headers"
+  },
+  "sanitized_fields": [
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-two-message-types.hex",
+    "digest_sha256": "0ef3da5fd4a5f43c9d72a54815f4f3af7605997d37010af9e41dbb18490c718b"
+  },
+  "semantic_assertions": [
+    "stream_order_preserved=true"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

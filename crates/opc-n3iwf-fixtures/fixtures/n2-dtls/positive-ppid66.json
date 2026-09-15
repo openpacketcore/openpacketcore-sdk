@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.positive-ppid66",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Reuse public SDK DTLS/SCTP machinery; PPID 66 is not a security flag",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-sctp/src/lib.rs",
+    "notes": "NGAP over DTLS/SCTP uses PPID 66"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-ppid66.hex",
+    "digest_sha256": "825ac1bb838d399fb1ba55a6247e2c8c7a0c3ec25898f3c94dbfb51fa6e73951"
+  },
+  "semantic_assertions": [
+    "ppid=66",
+    "protection_required=true"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

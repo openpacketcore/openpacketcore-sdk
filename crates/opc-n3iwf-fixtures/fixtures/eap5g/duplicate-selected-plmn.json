@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.duplicate-selected-plmn",
+  "subset": "eap5g",
+  "case_class": "duplicate",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.2.2.2"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "Caller selects duplicate-singleton policy separately",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Duplicate selected-PLMN is caller policy, not unknown-parameter ignore"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-selected-plmn.hex",
+    "digest_sha256": "2966cf33d2271ed77b9b363ae19a5ffcb34de58a4ca1296a395fd87ecdd3d03b"
+  },
+  "semantic_assertions": [
+    "duplicate_singleton=selected-plmn",
+    "disposition=caller-duplicate-singleton-policy"
+  ],
+  "expected_outcome": "caller-policy",
+  "runtime_claim": false
+}

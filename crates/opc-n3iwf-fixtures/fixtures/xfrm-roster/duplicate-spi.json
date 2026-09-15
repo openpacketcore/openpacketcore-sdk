@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.duplicate-spi",
+  "subset": "xfrm-roster",
+  "case_class": "duplicate",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Inbound and outbound SPI must differ unless explicitly overlapped",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Inbound and outbound SPI labels are identical"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-spi.hex",
+    "digest_sha256": "a6dd8197de6e6c0717a2b21b4c33efd9c41087f9543a22ae80ca1d2eeeedbc31"
+  },
+  "semantic_assertions": [
+    "duplicate_spi=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

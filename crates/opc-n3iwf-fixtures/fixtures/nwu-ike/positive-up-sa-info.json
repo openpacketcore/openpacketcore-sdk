@@ -1,0 +1,46 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.positive-up-sa-info",
+  "subset": "nwu-ike",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.3",
+      "9.3.1.8"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "Inbound ESP SPI allocated by caller",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "UP_SA_INFO 55508 with synthetic SPI 0x0a0b0c0d; not a live SA"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-up-sa-info.hex",
+    "digest_sha256": "18d616995d697a767514bea738f6dbc073d6f8cbe613a8fe6f10a65ef0a96d0a"
+  },
+  "semantic_assertions": [
+    "notify_type=55508",
+    "spi_size=4",
+    "spi_label=synthetic"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

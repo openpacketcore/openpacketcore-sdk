@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.restart-path-failure",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 4960",
+    "release": "RFC 4960",
+    "clauses": [
+      "6.4"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Path failure is a transport event, not an NGAP cause",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Restart/path-failure label without peer addresses"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/restart-path-failure.hex",
+    "digest_sha256": "ee0b1d89c879f3923f9f6abe13bafc1ac3a29f9c409c5fde95ddd2bff8d5433b"
+  },
+  "semantic_assertions": [
+    "path_failure=true",
+    "peer_address_published=false"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

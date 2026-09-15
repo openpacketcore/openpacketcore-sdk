@@ -1,0 +1,45 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.positive-generation-1",
+  "subset": "protocol-key",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "amf-to-n3iwf-handoff",
+  "role": "n3iwf",
+  "prerequisite": "Association generation 1 and pending IKE operation",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Known-answer label only; no key bytes are published"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    },
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-generation-1.hex",
+    "digest_sha256": "3c936bcd5edfa0bd93dc5b970cb8c9639b3d66bbdc578ea51479f411d830b81e"
+  },
+  "semantic_assertions": [
+    "purpose=K_N3IWF",
+    "generation=1",
+    "exportable=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.malformed-label",
+  "subset": "protocol-key",
+  "case_class": "malformed",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Single 0xff is not a labeled KAT"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-label.hex",
+    "digest_sha256": "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89"
+  },
+  "semantic_assertions": [
+    "label_malformed=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

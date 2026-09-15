@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.malformed-length",
+  "subset": "eap5g",
+  "case_class": "malformed",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.2.2.1",
+      "IETF RFC 3748 4.1"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "EAP Length claims 16 octets over a 14-octet Start body"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/malformed-length.hex",
+    "digest_sha256": "2efd77d85fdf21b3bc71ec5d69e63bed093a963999b862c76367dd49bf2e6a37"
+  },
+  "semantic_assertions": [
+    "eap_length_mismatch=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

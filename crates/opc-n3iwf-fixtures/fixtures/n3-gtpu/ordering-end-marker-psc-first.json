@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.ordering-end-marker-psc-first",
+  "subset": "n3-gtpu",
+  "case_class": "ordering",
+  "source": {
+    "document": "3GPP TS 29.281",
+    "release": "V18.4.0",
+    "clauses": [
+      "5.2.1",
+      "7.3.2"
+    ]
+  },
+  "direction": "n3-downlink",
+  "role": "gtpu-endpoint",
+  "prerequisite": "Issue 341 End Marker extension order",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-gtpu/fuzz/corpus/decode/control_end_marker_psc_order",
+    "notes": "PSC first then unknown optional extensions"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-end-marker-psc-first.hex",
+    "digest_sha256": "702b102013f23bb570e25e286a2e77fe7743ca813e472c1d360e5827a1e08ea1"
+  },
+  "semantic_assertions": [
+    "psc_first=true"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

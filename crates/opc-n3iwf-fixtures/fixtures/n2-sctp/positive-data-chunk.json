@@ -1,0 +1,40 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.positive-data-chunk",
+  "subset": "n2-sctp",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 4960",
+    "release": "RFC 4960",
+    "clauses": [
+      "3.3.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Ordinary SCTP DATA chunk; NGAP bytes are out of band",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "DATA chunk header with PPID 60 and empty user data"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-data-chunk.hex",
+    "digest_sha256": "28ada546d37b3abc24544d7df57a688b90aaceb7b966c6851b583261be48e134"
+  },
+  "semantic_assertions": [
+    "chunk=DATA",
+    "ppid=60",
+    "user_data_len=0"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

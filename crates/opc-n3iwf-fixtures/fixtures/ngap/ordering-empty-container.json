@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.ordering-empty-container",
+  "subset": "ngap",
+  "case_class": "ordering",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "R18",
+    "clauses": [
+      "9.2"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "IE order is insignificant for empty containers",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Empty container has no IE order; documents that wire order is not a send claim"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-empty-container.hex",
+    "digest_sha256": "193c92d29856d6379feeb797a5dd94fe68b5a0ed2770020cc5ba0fbb61403d3a"
+  },
+  "semantic_assertions": [
+    "ie_order=empty",
+    "constructed_send=unsupported"
+  ],
+  "expected_outcome": "unsupported",
+  "runtime_claim": false
+}

@@ -1,0 +1,41 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.positive-ngsetup-external",
+  "subset": "ngap",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "R18",
+    "clauses": [
+      "9.2.6.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Existing opc-proto-ngap DecodeContext policy from issue 493",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ngap/src/lib.rs::ngsetup_request_fixture",
+    "notes": "78-byte independent libngap NGSetupRequest already proven in opc-proto-ngap"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-ngsetup-external.hex",
+    "digest_sha256": "183cf47d3546a4a0a9ac72ae66ca166da4ae90c6bed0ed98e82f38832be57f2d"
+  },
+  "semantic_assertions": [
+    "procedure=21",
+    "outcome=initiating",
+    "ie_ids=27,82,102,21",
+    "canonical_typed_encode=unsupported"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

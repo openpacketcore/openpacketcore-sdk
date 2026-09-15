@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.positive-downlink-rqi",
+  "subset": "gre-qfi",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.3.2",
+      "9.3.3"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "Child SA selected; QFI mapping is caller-owned",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "C=0 K=1 S=0 Protocol Type 0, QFI 9, RQI indicated"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-downlink-rqi.hex",
+    "digest_sha256": "81b8d024e3b0d5b158b4d041fb0a67f5f930a3282e1f277cd57fca678d80209d"
+  },
+  "semantic_assertions": [
+    "c=0",
+    "k=1",
+    "s=0",
+    "protocol_type=0",
+    "qfi=9",
+    "rqi=1"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

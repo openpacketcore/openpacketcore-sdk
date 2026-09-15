@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.bounded-spi-size-overflow",
+  "subset": "nwu-ike",
+  "case_class": "bounded-overflow",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "3.10"
+    ]
+  },
+  "direction": "peer-to-local",
+  "role": "ike-endpoint",
+  "prerequisite": "Caller SPI-size bound",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "SPI Size 255 on a four-octet notify header"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/bounded-spi-size-overflow.hex",
+    "digest_sha256": "c79d58c5216b6c50ec2e0cf0e2677b8455ab220d3f5503fe800420ea135a2549"
+  },
+  "semantic_assertions": [
+    "spi_size=255"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

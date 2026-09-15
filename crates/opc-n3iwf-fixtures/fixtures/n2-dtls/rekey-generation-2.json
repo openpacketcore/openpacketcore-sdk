@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.rekey-generation-2",
+  "subset": "n2-dtls",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4.4"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Key id rotation wraps 65535 to 1",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-sctp/src/lib.rs",
+    "notes": "Rekey/rotation generation label"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/rekey-generation-2.hex",
+    "digest_sha256": "38ba5fdae4824ae904473ed5844af594947bd5af7ba01781a789a87e2cc727a5"
+  },
+  "semantic_assertions": [
+    "rekey=true",
+    "generation=2"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

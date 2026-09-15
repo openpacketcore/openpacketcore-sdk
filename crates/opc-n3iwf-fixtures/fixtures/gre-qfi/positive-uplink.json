@@ -1,0 +1,40 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.positive-uplink",
+  "subset": "gre-qfi",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.3.2",
+      "9.3.3"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "Same GRE profile",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Uplink RQI must be not-indicated"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-uplink.hex",
+    "digest_sha256": "b494fcac19fc88c073939af6f9bb236a84234cb51d7698b0af0443cd0d94b2d4"
+  },
+  "semantic_assertions": [
+    "qfi=9",
+    "rqi=0"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

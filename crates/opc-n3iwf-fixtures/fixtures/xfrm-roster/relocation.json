@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.relocation",
+  "subset": "xfrm-roster",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.23"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Authenticated relocation authority; source address is not authority",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-ipsec-xfrm/tests/xfrm_sa_relocation_recovery_privileged.rs",
+    "notes": "Same SPI pair under generation 4 after roster relocation"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/relocation.hex",
+    "digest_sha256": "27caea7d387fd97af51bed6d42b30c3e4d831e812382e048ce79c1d6973b0352"
+  },
+  "semantic_assertions": [
+    "relocation=true",
+    "source_address_observation=not-authority"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

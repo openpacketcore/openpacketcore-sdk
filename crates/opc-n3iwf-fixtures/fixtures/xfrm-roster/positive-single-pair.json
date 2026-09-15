@@ -1,0 +1,45 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.positive-single-pair",
+  "subset": "xfrm-roster",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Reuse durable roster primitives; IKE notifies are in nwu-ike",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-ipsec-xfrm/src/durable_roster.rs",
+    "notes": "Generation 1 inbound/outbound synthetic SPI pair; no key material"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-single-pair.hex",
+    "digest_sha256": "1dfd6302426025c32f3ebdaa92e5f2de77dafc97e245b62748438bacec5d4764"
+  },
+  "semantic_assertions": [
+    "generation=1",
+    "inbound_spi_label=0x0a0b0c0d",
+    "overlap=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

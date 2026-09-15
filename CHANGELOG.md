@@ -65,6 +65,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Synthetic N3IWF fixture contracts — `opc-n3iwf-fixtures`:** independently
+  complete wire and transport manifests for eap5g, nwu-ike, ngap, n2-sctp,
+  gre-qfi, n3-gtpu, protocol-key, nas-tcp, xfrm-roster, and n2-dtls. Each
+  subset publishes required case classes, sanitized-field inventory, SHA-256
+  digests, constructed/receive/unsupported outcomes, and
+  `runtime_claim=false`. Reuses the issue 493 NGAP DecodeContext vector and
+  issue 341 GTP-U Echo/PSC bytes by digest. Crate and rust-gates detectors
+  fail closed on missing classes, digest mutation, and forbidden content.
+  No codec, adapter, or key-handle runtime is activated (Fixes #784).
 - **Selectable fixed-quorum persistence — `opc-session-store`:** supported
   `SessionPersistenceMode::Async` acknowledges validated resident storage,
   real quorum replication, and committed application while one coalescing

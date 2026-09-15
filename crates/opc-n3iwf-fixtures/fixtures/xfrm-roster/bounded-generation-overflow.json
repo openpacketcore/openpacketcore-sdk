@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.bounded-generation-overflow",
+  "subset": "xfrm-roster",
+  "case_class": "bounded-overflow",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Caller generation bound",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Generation 0xffffff exceeds a 16-bit caller bound"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/bounded-generation-overflow.hex",
+    "digest_sha256": "1999ea85e66a29b4d020f7abe2aaa43ebb58ea07449ed539f41fea15f57a0531"
+  },
+  "semantic_assertions": [
+    "generation=16777215"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

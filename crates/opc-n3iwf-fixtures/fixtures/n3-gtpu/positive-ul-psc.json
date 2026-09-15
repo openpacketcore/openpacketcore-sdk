@@ -1,0 +1,40 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.positive-ul-psc",
+  "subset": "n3-gtpu",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.415",
+    "release": "V18.2.0",
+    "clauses": [
+      "5.5.3"
+    ]
+  },
+  "direction": "n3-uplink",
+  "role": "n3iwf-to-upf",
+  "prerequisite": "Uplink PSC is QFI-only; PPI/RQI forbidden",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-gtpu/src/lib.rs::PduSessionContainer::new_uplink",
+    "notes": "UL PDU type 1 QFI 9"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-ul-psc.hex",
+    "digest_sha256": "771b544f069e1825c0508aab4eb24459089288cb93dc59f1a2e15cdae68be2c5"
+  },
+  "semantic_assertions": [
+    "direction=uplink",
+    "pdu_type=1",
+    "qfi=9"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

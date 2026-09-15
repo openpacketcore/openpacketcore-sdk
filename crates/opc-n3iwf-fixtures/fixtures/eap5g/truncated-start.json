@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.truncated-start",
+  "subset": "eap5g",
+  "case_class": "truncation",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.2.2.1"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Start missing the spare octet"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/truncated-start.hex",
+    "digest_sha256": "a1250e3340fe3af3831412d75fd59bbe04e3f7a12500ead42a5f64be6ae3fd90"
+  },
+  "semantic_assertions": [
+    "truncated=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

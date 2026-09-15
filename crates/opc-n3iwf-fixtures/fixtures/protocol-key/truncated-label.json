@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.truncated-label",
+  "subset": "protocol-key",
+  "case_class": "truncation",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "None",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Prefix of the KAT label"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/truncated-label.hex",
+    "digest_sha256": "45f0d3f9853bf5fc3e2cb1b13434440146db8fa9485029b39a3f77509da6f908"
+  },
+  "semantic_assertions": [
+    "truncated=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

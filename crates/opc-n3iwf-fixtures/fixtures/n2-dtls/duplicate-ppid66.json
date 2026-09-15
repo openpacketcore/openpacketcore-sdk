@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.duplicate-ppid66",
+  "subset": "n2-dtls",
+  "case_class": "duplicate",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "One PPID per association profile",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Repeated PPID 66 metadata"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/duplicate-ppid66.hex",
+    "digest_sha256": "b837605ac34a575f45fdbb773874d1966c03ba132be125abc8927ddfa8567352"
+  },
+  "semantic_assertions": [
+    "duplicate_ppid=true"
+  ],
+  "expected_outcome": "caller-policy",
+  "runtime_claim": false
+}

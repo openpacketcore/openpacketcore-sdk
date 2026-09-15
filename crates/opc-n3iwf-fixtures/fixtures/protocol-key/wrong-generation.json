@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.wrong-generation",
+  "subset": "protocol-key",
+  "case_class": "malformed",
+  "source": {
+    "document": "3GPP TS 33.501",
+    "release": "V18.12.0",
+    "clauses": [
+      "7.2.1"
+    ]
+  },
+  "direction": "amf-to-n3iwf-handoff",
+  "role": "n3iwf",
+  "prerequisite": "Handle bound to generation 1",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Generation 2 label must not consume a generation-1 handle"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    },
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/wrong-generation.hex",
+    "digest_sha256": "00d90a5776278001d5a9bde43d4b4272e31221f5254796ac550dead305802b4e"
+  },
+  "semantic_assertions": [
+    "generation=2",
+    "consume=reject"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

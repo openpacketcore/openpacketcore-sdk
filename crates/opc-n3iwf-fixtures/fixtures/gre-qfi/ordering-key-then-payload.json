@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.ordering-key-then-payload",
+  "subset": "gre-qfi",
+  "case_class": "ordering",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.3"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "RFC 2890 key field precedes payload",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Canonical header-then-payload order"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-key-then-payload.hex",
+    "digest_sha256": "81b8d024e3b0d5b158b4d041fb0a67f5f930a3282e1f277cd57fca678d80209d"
+  },
+  "semantic_assertions": [
+    "header_before_payload=true"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

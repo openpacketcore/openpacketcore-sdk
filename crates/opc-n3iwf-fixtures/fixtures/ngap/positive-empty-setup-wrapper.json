@@ -1,0 +1,41 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.positive-empty-setup-wrapper",
+  "subset": "ngap",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "R18",
+    "clauses": [
+      "9.2",
+      "X.691"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Issue 493 empty-IE wrapper helper",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ngap/src/lib.rs::empty_ie_pdu",
+    "notes": "Initiating procedure 21 with empty ProtocolIE-Container"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-empty-setup-wrapper.hex",
+    "digest_sha256": "193c92d29856d6379feeb797a5dd94fe68b5a0ed2770020cc5ba0fbb61403d3a"
+  },
+  "semantic_assertions": [
+    "procedure=21",
+    "ie_count=0",
+    "constructed_typed_encode=unsupported"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

@@ -1,0 +1,39 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.sctp-auth-length",
+  "subset": "n2-dtls",
+  "case_class": "positive",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4.4"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "opc-sctp SctpAuthKey::for_rfc6083 requires 64-octet exporter",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-sctp/src/lib.rs::SctpAuthKey::for_rfc6083",
+    "notes": "Length/label only; exporter secret is not published"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/sctp-auth-length.hex",
+    "digest_sha256": "4bf3644ee18e05a39eab1ee55a01cf4de74359c11f19496cab6caa69d81deb07"
+  },
+  "semantic_assertions": [
+    "exporter_len=64",
+    "material_published=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

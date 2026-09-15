@@ -1,0 +1,44 @@
+{
+  "subset": "n3-gtpu",
+  "status": "complete",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.n3-gtpu.v1.positive-echo-request",
+    "opc.n3iwf.n3-gtpu.v1.positive-echo-response-recovery-zero",
+    "opc.n3iwf.n3-gtpu.v1.receive-recovery-ignored",
+    "opc.n3iwf.n3-gtpu.v1.positive-dl-psc",
+    "opc.n3iwf.n3-gtpu.v1.positive-ul-psc",
+    "opc.n3iwf.n3-gtpu.v1.unknown-required-extension",
+    "opc.n3iwf.n3-gtpu.v1.duplicate-recovery",
+    "opc.n3iwf.n3-gtpu.v1.ordering-end-marker-psc-first",
+    "opc.n3iwf.n3-gtpu.v1.malformed-echo-request",
+    "opc.n3iwf.n3-gtpu.v1.truncated-header",
+    "opc.n3iwf.n3-gtpu.v1.bounded-length-overflow"
+  ],
+  "constructed": [
+    "Echo Request",
+    "Echo Response Recovery 0",
+    "uplink PSC"
+  ],
+  "receive": [
+    "downlink PSC",
+    "ignored nonzero Recovery",
+    "End Marker PSC order"
+  ],
+  "unsupported": [
+    "backend control port",
+    "eBPF offload",
+    "Tunnel Status"
+  ]
+}

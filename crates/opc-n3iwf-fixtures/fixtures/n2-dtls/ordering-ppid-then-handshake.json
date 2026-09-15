@@ -1,0 +1,43 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.ordering-ppid-then-handshake",
+  "subset": "n2-dtls",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "PPID selected before handshake bytes are admitted",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "PPID 66 followed by the handshake header"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/ordering-ppid-then-handshake.hex",
+    "digest_sha256": "6981dfa4f71c61136e5c134f9ef1d79009e086eed7d7282d75864af7d8d146e2"
+  },
+  "semantic_assertions": [
+    "order=ppid-then-handshake"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

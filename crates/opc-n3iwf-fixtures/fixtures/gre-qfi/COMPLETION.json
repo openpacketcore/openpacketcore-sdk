@@ -1,0 +1,38 @@
+{
+  "subset": "gre-qfi",
+  "status": "complete",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.gre-qfi.v1.positive-downlink-rqi",
+    "opc.n3iwf.gre-qfi.v1.positive-uplink",
+    "opc.n3iwf.gre-qfi.v1.receive-nonzero-protocol-type",
+    "opc.n3iwf.gre-qfi.v1.duplicate-key-header",
+    "opc.n3iwf.gre-qfi.v1.ordering-key-then-payload",
+    "opc.n3iwf.gre-qfi.v1.malformed-missing-key",
+    "opc.n3iwf.gre-qfi.v1.truncated-key",
+    "opc.n3iwf.gre-qfi.v1.bounded-qfi-overflow"
+  ],
+  "constructed": [
+    "downlink QFI+RQI",
+    "uplink QFI without RQI"
+  ],
+  "receive": [
+    "nonzero Protocol Type ignored"
+  ],
+  "unsupported": [
+    "XFRM install",
+    "QFI allocation",
+    "default-fallback policy"
+  ]
+}

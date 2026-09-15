@@ -1,0 +1,38 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.bounded-an-parameter-overflow",
+  "subset": "eap5g",
+  "case_class": "bounded-overflow",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.2.2.2"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "Caller-selected AN-parameter bound",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "AN-parameter length 0xFF overflows the declared AN-parameters region"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/bounded-an-parameter-overflow.hex",
+    "digest_sha256": "d9e72897f473d7ac020d279b8255be8337ef11eae90ea47da46ab11d2d831984"
+  },
+  "semantic_assertions": [
+    "an_parameter_length_overflow=true"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

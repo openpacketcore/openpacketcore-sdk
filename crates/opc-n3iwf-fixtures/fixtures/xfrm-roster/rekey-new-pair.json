@@ -1,0 +1,44 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.rekey-new-pair",
+  "subset": "xfrm-roster",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "2.8"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Old pair remains until caller retires it",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Generation 3 replacement pair"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/rekey-new-pair.hex",
+    "digest_sha256": "3de2b5eb795199e9fa8c8ae9c69d81bd6bb3ec6370675a0040cc705a7845f423"
+  },
+  "semantic_assertions": [
+    "rekey=true",
+    "order=install-new-then-retire-old"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

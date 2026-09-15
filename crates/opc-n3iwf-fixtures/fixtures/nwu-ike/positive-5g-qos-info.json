@@ -1,0 +1,41 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.positive-5g-qos-info",
+  "subset": "nwu-ike",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "8.3",
+      "9.3.1.1"
+    ]
+  },
+  "direction": "n3iwf-to-ue",
+  "role": "n3iwf",
+  "prerequisite": "CREATE_CHILD_SA for one PDU session",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "5G_QOS_INFO 55501 with PDU session 5 and QFI 9"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-5g-qos-info.hex",
+    "digest_sha256": "d3f92ee511444c9cdbd585b74ff2bc4a10bccc8ec3f685dfd2de37e351a036f9"
+  },
+  "semantic_assertions": [
+    "notify_type=55501",
+    "pdu_session=5",
+    "qfi=9"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

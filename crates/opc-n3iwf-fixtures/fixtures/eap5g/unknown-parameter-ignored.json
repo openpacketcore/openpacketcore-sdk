@@ -1,0 +1,45 @@
+{
+  "sdk_fixture_id": "opc.n3iwf.eap5g.v1.unknown-parameter-ignored",
+  "subset": "eap5g",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 24.502",
+    "release": "V18.8.0",
+    "clauses": [
+      "9.3.2.2.2"
+    ]
+  },
+  "direction": "ue-to-n3iwf",
+  "role": "ue",
+  "prerequisite": "Same as positive NAS response",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "Spare AN-parameter type 20H must be ignored on receive"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "nas-pdu",
+      "treatment": "opaque-placeholder-header-only",
+      "value_class": "non-subscriber"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-parameter-ignored.hex",
+    "digest_sha256": "22bac3c805d35626dc732637b6ebab1bd3a6d8a971a3f077a2ff47bfbd8e9111"
+  },
+  "semantic_assertions": [
+    "spare_an_parameter_type=0x20",
+    "receiver_disposition=ignore",
+    "not_caller_duplicate_policy"
+  ],
+  "expected_outcome": "ignore",
+  "runtime_claim": false
+}
