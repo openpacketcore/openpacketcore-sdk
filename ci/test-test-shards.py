@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -131,6 +134,22 @@ class ManifestTestSourceAuditTests(unittest.TestCase):
 
 class QuiescentShardPlanTests(unittest.TestCase):
     """The protected private-lib contracts must remain total and disjoint."""
+
+    def test_plan_stdout_contains_only_executable_commands(self) -> None:
+        for shard in TEST_SHARDS.shard_ids(TEST_SHARDS.load_plan()):
+            with self.subTest(shard=shard):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), "plan", "--shard", shard],
+                    cwd=SCRIPT.parent.parent,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                commands = result.stdout.splitlines()
+                self.assertTrue(commands, "CI must receive a nonempty plan")
+                for command in commands:
+                    self.assertIn(shlex.split(command)[0], {"cargo", "env"})
+                self.assertIn("manifest test-source audit ok:", result.stderr)
 
     def test_selector_contract_keeps_one_exact_ordinary_profile_run(self) -> None:
         name = (
