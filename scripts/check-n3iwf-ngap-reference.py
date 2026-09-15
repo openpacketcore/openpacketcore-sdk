@@ -56,7 +56,11 @@ def read_spec(path: Path | None) -> bytes:
     if path is not None:
         return read_bounded(path, MAX_SPEC_BYTES)
     # The URL and digest are compile-time pins, never taken from a manifest.
-    with urllib.request.urlopen(SPEC_URL, timeout=30) as response:
+    # ETSI rejects urllib's default client identity with HTTP 403.
+    request = urllib.request.Request(
+        SPEC_URL, headers={"User-Agent": "OpenPacketCore-SDK-reference/1.0"}
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
         require(response.url.startswith("https://"), "spec-transport")
         return response.read(MAX_SPEC_BYTES + 1)
 
