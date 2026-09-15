@@ -34,6 +34,13 @@ kubectl kustomize operators/sdk-reference-operator/config/default > /dev/null
 
 All pull requests must be green on the following commands before review:
 
+On Linux, set `TMPDIR` to an existing private directory on disk before running
+the test gates. Check its filesystem with `findmnt -T "$TMPDIR"`. The selector's
+one-second durable request test rejects `tmpfs` and `ramfs`: file-backed databases
+on those filesystems do not exercise disk-sync latency. Setting
+`OPC_FS_VERITY_SNAPSHOT_ROOT` places immutable snapshots only; it does not move
+the mutable databases or WALs out of `TMPDIR`.
+
 ```bash
 cargo fmt --all --check
 git diff --check
@@ -50,6 +57,24 @@ cargo test --workspace --all-features --quiet -- --test-threads=4
 ( cd operators/sdk-reference-operator && go vet ./... && go test ./... )
 kubectl kustomize operators/sdk-reference-operator/config/default > /dev/null
 ```
+
+For CI qualification, replace the broad workspace test command above with
+`cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1`
+and all CI shard plans. This preserves CI's test isolation and profile choices.
+Run the commands produced by
+`python3 ci/test-shards.py plan --shard ID` for every ID from
+`python3 ci/test-shards.py ids`; first run `precheck --shard ID` for each shard.
+Use the same Rust version as the CI run and set `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=0`, and `CARGO_PROFILE_TEST_DEBUG=0`.
+
+The separate **Rust GTP-U unsupported-platform cfg tests** job in
+[ci.yml](.github/workflows/ci.yml) also uses
+`RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and
+`--no-default-features`. The ordinary workspace run does not cover that profile.
+Its selector test must resolve exactly once and run alone with the same
+one-second deadline, after the other cfg tests finish. Use a separate
+`CARGO_TARGET_DIR` for this profile, as the workflow does. Local timing passes
+remain specific to the local storage and host load.
 
 If the pull request touches operator-sdk-go or the Helm chart, also run:
 

@@ -202,7 +202,8 @@ def verify_manifest_test_sources(packages: list[dict]) -> None:
         sys.exit("\n".join(errors))
     print(
         "manifest test-source audit ok: every direct tests/*.rs source is a "
-        "Cargo target or one explicit crate-private module"
+        "Cargo target or one explicit crate-private module",
+        file=sys.stderr,
     )
 
 

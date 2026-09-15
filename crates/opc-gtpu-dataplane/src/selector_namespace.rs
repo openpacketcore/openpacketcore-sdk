@@ -1015,9 +1015,77 @@ impl fmt::Debug for SelectorOperationStampInventory {
     }
 }
 
+/// Owned by one supervised namespace operation, never cached on an authority
+/// or shared across workers. Only a confirmed durable acquire/renew can install
+/// timing; clearing it permanently fences an uncertain or expired worker.
+struct SelectorWorkerLease {
+    guard: opc_session_store::LeaseGuard,
+    timing: Option<SelectorLeaseTiming>,
+}
+
+struct SelectorLeaseTiming {
+    requested_at: Instant,
+    requested_wall: SystemTime,
+    renew_after: Duration,
+    monotonic_deadline: Instant,
+    wall_deadline: SystemTime,
+}
+
+impl SelectorLeaseTiming {
+    fn start(ttl: Duration) -> Result<Self, GtpuSessionSelectorNamespaceError> {
+        let requested_at = Instant::now();
+        let requested_wall = SystemTime::now();
+        let renew_after = SELECTOR_NAMESPACE_LEASE_RENEW_INTERVAL.min(ttl / 2);
+        if renew_after.is_zero() {
+            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        }
+        Ok(Self {
+            requested_at,
+            requested_wall,
+            renew_after,
+            monotonic_deadline: requested_at
+                .checked_add(ttl)
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?,
+            wall_deadline: requested_wall
+                .checked_add(ttl)
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?,
+        })
+    }
+
+    fn renewal_due(&self) -> Result<bool, GtpuSessionSelectorNamespaceError> {
+        self.renewal_due_within(Duration::ZERO)
+    }
+
+    fn renewal_due_within(
+        &self,
+        reserve: Duration,
+    ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
+        self.renewal_due_at(Instant::now(), SystemTime::now(), reserve)
+    }
+
+    fn renewal_due_at(
+        &self,
+        monotonic: Instant,
+        wall: SystemTime,
+        reserve: Duration,
+    ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
+        let monotonic_age = monotonic
+            .checked_duration_since(self.requested_at)
+            .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let wall_age = wall
+            .duration_since(self.requested_wall)
+            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        if monotonic >= self.monotonic_deadline || wall >= self.wall_deadline {
+            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        }
+        let threshold = self.renew_after.saturating_sub(reserve);
+        Ok(monotonic_age >= threshold || wall_age >= threshold)
+    }
+}
+
 /// A non-cloneable, short backend mutation authorization. It is minted only
-/// after a successful durable lease renewal and carries both monotonic and
-/// wall-clock deadlines; a clock ambiguity is always stale.
+/// under a confirmed, current durable worker lease and carries both monotonic
+/// and wall-clock deadlines; a clock ambiguity is always stale.
 #[must_use = "a backend mutation window must be consumed by its authorized request"]
 pub(crate) struct SelectorBackendMutationWindow {
     coordinate: [u8; 32],
@@ -4577,7 +4645,7 @@ where
         &self,
         backend: &D,
         desired: GtpuSessionGroup,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -4711,7 +4779,7 @@ where
         backend: &D,
         desired: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -4957,7 +5025,7 @@ where
         backend: &D,
         active: GtpuSessionSelectorActiveClaim,
         expected: GtpuSessionGroup,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5034,7 +5102,7 @@ where
         &self,
         backend: &D,
         expected: GtpuSessionGroup,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5162,7 +5230,7 @@ where
         backend: &D,
         expected: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5215,7 +5283,7 @@ where
         desired: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
         reuse: Option<crate::GtpuSessionSelectorReuseProof>,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5246,7 +5314,7 @@ where
         desired: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
         request: GtpuSessionGroupReconcileRequest,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5316,7 +5384,7 @@ where
         backend: &D,
         desired: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<(), GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5334,7 +5402,7 @@ where
         backend: &D,
         expected: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<AuthorizedSelectorReadback, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5364,7 +5432,7 @@ where
         backend: &D,
         expected: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5498,7 +5566,7 @@ where
         &self,
         backend: &D,
         desired: &GtpuSessionGroup,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5609,7 +5677,7 @@ where
         backend: &D,
         desired: &GtpuSessionGroup,
         proof: &crate::GtpuSessionSelectorReuseProof,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5827,7 +5895,7 @@ where
     async fn ensure_backend_namespace<D>(
         &self,
         backend: &D,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<(), GtpuSessionSelectorNamespaceError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5895,7 +5963,7 @@ where
     async fn provision_with_lease<D>(
         &self,
         backend: &D,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<(), GtpuSessionSelectorNamespaceError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -5982,12 +6050,11 @@ where
             // compare-and-set or an interrupted terminal effect recover from
             // authoritative durable state rather than an in-memory plan.
             let mut lease = self
-                .store
-                .acquire(&self.namespace_key, self.owner.clone(), self.lease_ttl)
+                .acquire_worker_lease()
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             let attempt = self.decommission_with_lease(backend, &mut lease).await;
-            let released = self.store.release(lease).await;
+            let released = self.release_worker_lease(lease).await;
             let attempt = match attempt {
                 Err(error) => return Err(error),
                 Ok(attempt) if released.is_ok() => attempt,
@@ -6018,7 +6085,7 @@ where
     async fn decommission_with_lease<D>(
         &self,
         backend: &D,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<DecommissionAttempt, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
@@ -6190,42 +6257,102 @@ where
         Ok(DecommissionAttempt::Complete)
     }
 
-    /// Acquire the sole durable worker lease for an operation. Callers that
-    /// cross an Installing/Retiring handoff retain this guard through every
-    /// backend observation and terminal fenced CAS; they never reacquire a
-    /// competing in-process credential.
+    /// Acquire the sole durable worker lease for an operation. Callers retain
+    /// this non-cloneable owner through backend observations and fenced CASes;
+    /// the process supervisor prevents a competing same-owner acquisition.
     async fn acquire_worker_lease(
         &self,
-    ) -> Result<opc_session_store::LeaseGuard, GtpuSessionSelectorNamespaceError> {
-        self.store
+    ) -> Result<SelectorWorkerLease, GtpuSessionSelectorNamespaceError> {
+        // Start before the durable call: an acknowledgement never restarts
+        // the lifetime of a lease already granted by the store.
+        let timing = SelectorLeaseTiming::start(self.lease_ttl)?;
+        let guard = self
+            .store
             .acquire(&self.namespace_key, self.owner.clone(), self.lease_ttl)
             .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)
+            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        Ok(SelectorWorkerLease {
+            guard,
+            timing: Some(timing),
+        })
     }
 
     async fn release_worker_lease(
         &self,
-        lease: opc_session_store::LeaseGuard,
+        lease: SelectorWorkerLease,
     ) -> Result<(), GtpuSessionSelectorNamespaceError> {
         self.store
-            .release(lease)
+            .release(lease.guard)
             .await
             .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)
     }
 
-    /// Renew immediately before handing authority to a backend. The returned
-    /// non-cloneable window remains valid for no more than half the durable
-    /// lease (and never more than the fixed backend-effect bound).
-    async fn mint_backend_mutation_window(
+    /// Renew at the admitted cadence, retaining the exact credential. Every
+    /// CAS still checks it at the store. An uncertain renewal invalidates this
+    /// worker even if the future is cancelled before returning an outcome.
+    async fn renew_worker_lease_if_due(
         &self,
-        lease: &mut opc_session_store::LeaseGuard,
-    ) -> Result<SelectorBackendMutationWindow, GtpuSessionSelectorNamespaceError> {
-        *lease = self
+        lease: &mut SelectorWorkerLease,
+        reserve: Duration,
+    ) -> Result<(), GtpuSessionSelectorNamespaceError> {
+        let due = lease
+            .timing
+            .as_ref()
+            .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+            .renewal_due_within(reserve);
+        if due == Ok(false) {
+            return Ok(());
+        }
+        lease.timing = None;
+        due?;
+        let timing = SelectorLeaseTiming::start(self.lease_ttl)?;
+        let renewed = self
             .store
-            .renew(lease, self.lease_ttl)
+            .renew(&lease.guard, self.lease_ttl)
             .await
             .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
-        SelectorBackendMutationWindow::mint(self.lease_ttl)
+        if renewed.key() != lease.guard.key()
+            || renewed.owner() != lease.guard.owner()
+            || renewed.fence() != lease.guard.fence()
+            || renewed.credential_id() != lease.guard.credential_id()
+        {
+            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        }
+        lease.guard = renewed;
+        if timing.renewal_due()? {
+            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        }
+        lease.timing = Some(timing);
+        Ok(())
+    }
+
+    /// Mint a fresh affine backend request under this worker's durable lease.
+    /// Its deadline is capped by the original call's conservative expiry;
+    /// repeated minting cannot extend the lease or its renewal cadence.
+    async fn mint_backend_mutation_window(
+        &self,
+        lease: &mut SelectorWorkerLease,
+    ) -> Result<SelectorBackendMutationWindow, GtpuSessionSelectorNamespaceError> {
+        let reserve = SELECTOR_NAMESPACE_MAX_EFFECT_DURATION.min(self.lease_ttl / 2);
+        self.renew_worker_lease_if_due(lease, reserve).await?;
+        let timing = lease
+            .timing
+            .as_ref()
+            .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let mut window = SelectorBackendMutationWindow::mint(self.lease_ttl)?;
+        // Even a delayed acknowledgement cannot authorize a backend step
+        // beyond the renewal cadence. These sums fit inside the checked TTL.
+        window.monotonic_deadline = window
+            .monotonic_deadline
+            .min(timing.requested_at + timing.renew_after);
+        window.wall_deadline = window
+            .wall_deadline
+            .min(timing.requested_wall + timing.renew_after);
+        if !window.is_current() {
+            lease.timing = None;
+            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        }
+        Ok(window)
     }
 
     /// A release failure means a successful operation can no longer report a
@@ -6233,7 +6360,7 @@ where
     /// callers need to classify the already-started backend operation.
     async fn finish_worker_operation<T>(
         &self,
-        lease: opc_session_store::LeaseGuard,
+        lease: SelectorWorkerLease,
         result: Result<T, GtpuSessionSelectorCoordinatorError>,
     ) -> Result<T, GtpuSessionSelectorCoordinatorError> {
         let release = self.release_worker_lease(lease).await;
@@ -6253,7 +6380,7 @@ where
         desired: &GtpuSessionGroup,
         admission: &GtpuSessionSelectorAdmission,
         reason: PoisonReason,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<(), GtpuSessionSelectorCoordinatorError> {
         self.poison_with_lease(desired, admission, reason, lease)
             .await
@@ -6265,15 +6392,15 @@ where
 
     /// Fenced durable replacement using an already-held worker lease.
     ///
-    /// The compare-and-set consumes a clone of the guard because store ports
-    /// deliberately make the credential affine. The original guard remains
-    /// available solely for an explicit release after this sequence; no
-    /// second write is made without first renewing it again.
+    /// Each compare-and-set submits the exact credential to the store, which
+    /// checks expiry, owner, fence, and generation at the mutation boundary.
+    /// The sole worker retains the guard and renews at the admitted cadence;
+    /// no backend mutation window is reused across steps.
     async fn replace_with_lease(
         &self,
         current: Option<&StoredSessionRecord>,
         state: NamespaceState,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
         if !state.is_complete() {
             return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
@@ -6289,20 +6416,13 @@ where
                 .ok_or(GtpuSessionSelectorNamespaceError::GenerationExhausted)?,
             None => Generation::new(1),
         };
-        // Renew immediately before the fenced CAS. This makes a backend that
-        // cannot prove lease continuity fail closed, and ensures the exact
-        // fence persisted below is the current worker fence rather than an
-        // acquire-time observation that might have expired while encoding.
-        *lease = self
-            .store
-            .renew(lease, self.lease_ttl)
-            .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        self.renew_worker_lease_if_due(lease, Duration::ZERO)
+            .await?;
         let replacement = StoredSessionRecord {
             key: self.namespace_key.clone(),
             generation,
             owner: self.owner.clone(),
-            fence: lease.fence(),
+            fence: lease.guard.fence(),
             state_class: StateClass::AuthoritativeSession,
             state_type: StateType::from_static("gtpu-selector-namespace-v1"),
             expires_at: None,
@@ -6313,7 +6433,7 @@ where
             .store
             .compare_and_set(CompareAndSet {
                 key: self.namespace_key.clone(),
-                lease: lease.clone(),
+                lease: lease.guard.clone(),
                 expected_generation,
                 new_record: replacement.clone(),
             })
@@ -6326,7 +6446,7 @@ where
     }
 
     /// Replace only the exact currently durable group coordinate with a
-    /// terminal poison record. The lease is renewed by `replace_with_lease`,
+    /// terminal poison record. The lease is checked by `replace_with_lease`,
     /// and the replacement is accepted only after an exact durable readback.
     /// Therefore a worker that lost its lease, or that races a successor CAS,
     /// cannot poison the successor it no longer owns.
@@ -6335,7 +6455,7 @@ where
         desired: &GtpuSessionGroup,
         expected: &GtpuSessionSelectorAdmission,
         reason: PoisonReason,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state().await?;
@@ -6425,7 +6545,7 @@ where
     async fn mark_install_backend_started_with_lease(
         &self,
         desired: &GtpuSessionGroup,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<BackendStartHandoff, GtpuSessionSelectorNamespaceError> {
         let canonical = CanonicalClaim::from_group(desired);
         for _ in 0..MAX_CAS_RETRIES {
@@ -6507,7 +6627,7 @@ where
     async fn mark_retirement_backend_started_with_lease(
         &self,
         expected: &GtpuSessionGroup,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<BackendStartHandoff, GtpuSessionSelectorNamespaceError> {
         let canonical = CanonicalClaim::from_group(expected);
         for _ in 0..MAX_CAS_RETRIES {
@@ -6587,7 +6707,7 @@ where
     async fn activate_claim_with_lease(
         &self,
         desired: &GtpuSessionGroup,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorNamespaceError> {
         self.transition_phase_with_lease(desired, 0, lease)
             .await
@@ -6610,7 +6730,7 @@ where
     async fn transition_retiring_with_lease(
         &self,
         admission: &GtpuSessionSelectorAdmission,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
         self.transition_phase_for_admission_with_lease(admission, 1, None, lease)
             .await
@@ -6620,7 +6740,7 @@ where
         &self,
         admission: &GtpuSessionSelectorAdmission,
         removed_dataplane_generation: NonZeroU64,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
         self.transition_phase_for_admission_with_lease(
             admission,
@@ -6857,7 +6977,7 @@ where
         &self,
         desired: &GtpuSessionGroup,
         phase: u8,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
         let canonical = CanonicalClaim::from_group(desired);
         let (_, state) = self.read_state().await?;
@@ -6904,7 +7024,7 @@ where
         admission: &GtpuSessionSelectorAdmission,
         phase: u8,
         retired_dataplane_generation: Option<NonZeroU64>,
-        lease: &mut opc_session_store::LeaseGuard,
+        lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state().await?;
@@ -10506,6 +10626,8 @@ fn hmac_bytes(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    mod worker_lease;
+
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
     use std::time::Duration;

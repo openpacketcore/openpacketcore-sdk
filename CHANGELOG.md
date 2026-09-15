@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `opc-gtpu-dataplane`: renew the owned selector worker lease at the bounded
+  cadence instead of before every backend step and fenced write. Retain
+  conservative call-start timing, fresh backend authorizations, exact store
+  credential checks, and the original request deadlines. Ambiguous or late
+  renewals fence the worker (Refs #821).
 - `opc-session-store`: separate a pinned snapshot directory's original configured
   namespace name from its owned I/O capability. Independent processes no longer
   share a lease key merely because their inherited descriptor numbers match.
