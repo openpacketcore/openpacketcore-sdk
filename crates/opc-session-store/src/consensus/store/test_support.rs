@@ -49,6 +49,26 @@ use crate::lease::SessionLeaseManager;
 use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
 use crate::record::EncryptedSessionPayload;
 
+/// Make this store's restore-scan dispatch return a fixed unavailable result
+/// after its real logical-time barrier, without changing exact-record reads.
+pub fn set_consensus_restore_scan_unavailable_for_test(
+    store: &ConsensusSessionStore,
+    unavailable: bool,
+) {
+    store
+        .inner
+        .restore_scan_unavailable_for_test
+        .store(unavailable, Ordering::Release);
+}
+
+/// Number of restore scans that reached the armed dispatch fault.
+pub fn consensus_restore_scan_rejections_for_test(store: &ConsensusSessionStore) -> u64 {
+    store
+        .inner
+        .restore_scan_rejections_for_test
+        .load(Ordering::Acquire)
+}
+
 const ADMISSION_REQUEST_MAGIC: [u8; 8] = *b"OPCRPA1\0";
 const TERMINAL_REQUEST_MAGIC: [u8; 8] = *b"OPCRPT1\0";
 const ADMISSION_RESPONSE_MAGIC: [u8; 8] = *b"OPCRPS1\0";

@@ -1856,6 +1856,10 @@ struct ConsensusSessionStoreInner {
     remote_forward_attempts: AtomicU64,
     raft_handler: SessionRaftRpcHandler,
     backend: SqliteSessionBackend,
+    #[cfg(feature = "test-control")]
+    restore_scan_unavailable_for_test: AtomicBool,
+    #[cfg(feature = "test-control")]
+    restore_scan_rejections_for_test: AtomicU64,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
     consensus_log_prune_lane: Option<Arc<crate::sqlite::consensus::ConsensusLogPruneLane>>,
     storage_identity: SessionConsensusIdentity,
@@ -3460,6 +3464,10 @@ impl ConsensusSessionStore {
             remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
+            #[cfg(feature = "test-control")]
+            restore_scan_unavailable_for_test: AtomicBool::new(false),
+            #[cfg(feature = "test-control")]
+            restore_scan_rejections_for_test: AtomicU64::new(0),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -3684,6 +3692,10 @@ impl ConsensusSessionStore {
             remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
+            #[cfg(feature = "test-control")]
+            restore_scan_unavailable_for_test: AtomicBool::new(false),
+            #[cfg(feature = "test-control")]
+            restore_scan_rejections_for_test: AtomicU64::new(0),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -15247,6 +15259,17 @@ impl SessionBackend for ConsensusSessionStore {
             tokio::time::timeout_at(deadline, self.logical_read_time_before(None, deadline))
                 .await
                 .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
+        #[cfg(feature = "test-control")]
+        if self
+            .inner
+            .restore_scan_unavailable_for_test
+            .load(Ordering::Acquire)
+        {
+            self.inner
+                .restore_scan_rejections_for_test
+                .fetch_add(1, Ordering::AcqRel);
+            return Err(consensus_unavailable());
+        }
         let page = self
             .inner
             .backend
