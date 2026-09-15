@@ -237,6 +237,13 @@ tokio::task_local! {
     static CONSUMER_CAS_TEST_COUNTERS: Arc<ConsumerCasTestCounters>;
 }
 
+// Inject one closed read-barrier outcome in the explicitly scoped dispatch
+// task only. Other tasks and subsequent reads still execute the real barrier.
+#[cfg(test)]
+tokio::task_local! {
+    static PUBLICATION_BARRIER_FAILURE_FOR_TEST: std::cell::Cell<Option<(usize, LinearizableBarrierFailure)>>;
+}
+
 #[cfg(test)]
 fn reset_consumer_consensus_proposal_count() {
     CONSUMER_CONSENSUS_PROPOSAL_COUNT.store(0, Ordering::Relaxed);
@@ -1049,6 +1056,12 @@ enum LinearizableBarrierFailure {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedRosterProfileCheckFailure {
+    Unavailable,
+    Rejected,
+}
+
 /// Recovery-gate result at a local readiness boundary.
 ///
 /// This deliberately keeps immutable terminal proof failures separate from
@@ -1843,6 +1856,10 @@ struct ConsensusSessionStoreInner {
     remote_forward_attempts: AtomicU64,
     raft_handler: SessionRaftRpcHandler,
     backend: SqliteSessionBackend,
+    #[cfg(feature = "test-control")]
+    restore_scan_unavailable_for_test: AtomicBool,
+    #[cfg(feature = "test-control")]
+    restore_scan_rejections_for_test: AtomicU64,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
     consensus_log_prune_lane: Option<Arc<crate::sqlite::consensus::ConsensusLogPruneLane>>,
     storage_identity: SessionConsensusIdentity,
@@ -3447,6 +3464,10 @@ impl ConsensusSessionStore {
             remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
+            #[cfg(feature = "test-control")]
+            restore_scan_unavailable_for_test: AtomicBool::new(false),
+            #[cfg(feature = "test-control")]
+            restore_scan_rejections_for_test: AtomicU64::new(0),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -3671,6 +3692,10 @@ impl ConsensusSessionStore {
             remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
+            #[cfg(feature = "test-control")]
+            restore_scan_unavailable_for_test: AtomicBool::new(false),
+            #[cfg(feature = "test-control")]
+            restore_scan_rejections_for_test: AtomicU64::new(0),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -4240,22 +4265,30 @@ impl ConsensusSessionStore {
     async fn require_protected_roster_profile_v2_activation_before(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<(), StoreError> {
-        self.require_exact_membership_admission()?;
+    ) -> Result<(), ProtectedRosterProfileCheckFailure> {
+        self.require_exact_membership_admission()
+            .map_err(|_| ProtectedRosterProfileCheckFailure::Rejected)?;
         self.linearizable_barrier_before(deadline)
             .await
-            .map_err(|_| consensus_unavailable())?;
+            .map_err(|failure| match failure {
+                LinearizableBarrierFailure::Unavailable => {
+                    ProtectedRosterProfileCheckFailure::Unavailable
+                }
+                LinearizableBarrierFailure::RecoveryRequired => {
+                    ProtectedRosterProfileCheckFailure::Rejected
+                }
+            })?;
         self.require_application_traffic_authority_before(deadline)
-            .await?;
+            .await
+            .map_err(|_| ProtectedRosterProfileCheckFailure::Rejected)?;
         if self
             .activated_protected_roster_profile_v2_scope_is_current()
-            .await?
+            .await
+            .map_err(|_| ProtectedRosterProfileCheckFailure::Rejected)?
         {
             Ok(())
         } else {
-            Err(StoreError::CapabilityNotSupported(
-                "protected_roster_profile_v2_not_activated".into(),
-            ))
+            Err(ProtectedRosterProfileCheckFailure::Rejected)
         }
     }
 
@@ -9017,6 +9050,19 @@ impl ConsensusSessionStore {
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
         #[cfg(test)]
         ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Ok(Some(failure)) = PUBLICATION_BARRIER_FAILURE_FOR_TEST.try_with(|fault| {
+            let (remaining, failure) = fault.get()?;
+            if remaining == 0 {
+                fault.set(None);
+                Some(failure)
+            } else {
+                fault.set(Some((remaining - 1, failure)));
+                None
+            }
+        }) {
+            return Err(failure);
+        }
         self.require_durable_fixed_quorum_admission_before(deadline)
             .await
             .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
@@ -12341,10 +12387,17 @@ fn roster_terminal_read_rejected(
     )
 }
 
-/// Do not distinguish malformed, stale, expired, foreign, or unavailable
-/// current-publication-authority reads. This private capability is only a
-/// Boolean eligibility check to the consumed publication adapter.
-fn roster_current_publication_authority_rejected() -> SessionConsumerResponse {
+/// Keep authority rejection distinct from a known unavailable read using the
+/// existing generic envelope. Neither response grants publication authority;
+/// malformed, stale, expired and foreign bindings retain the Boolean rejection.
+fn roster_current_publication_authority_rejected(
+    rejection: SessionConsumerRosterRejection,
+) -> SessionConsumerResponse {
+    if rejection == SessionConsumerRosterRejection::Unavailable {
+        // This envelope already exists in every supported consumer profile.
+        // Keep Current/Rejected wire tags unchanged for older peers.
+        return SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable);
+    }
     SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
         SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected,
     )
@@ -13634,7 +13687,8 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
             |recovery, rejection| roster_admission_read_rejected(recovery, rejection);
         let terminal_response = |rejection| roster_terminal_mutation_rejected(rejection);
         let terminal_read_response = |rejection| roster_terminal_read_rejected(rejection);
-        let current_authority_response = || roster_current_publication_authority_rejected();
+        let current_authority_response =
+            |rejection| roster_current_publication_authority_rejected(rejection);
 
         let rejection_response = |rejection| match ingress_kind {
             1 => admission_response(rejection),
@@ -13642,7 +13696,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
             3 => admission_read_response(true, rejection),
             4 => terminal_response(rejection),
             5 => terminal_read_response(rejection),
-            6 => current_authority_response(),
+            6 => current_authority_response(rejection),
             _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized),
         };
 
@@ -14136,7 +14190,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 if capsule.scope() != session_consumer_roster_scope_commitment(request.scope())
                     || authorization.authorize_session_key(capsule.key()).is_err()
                 {
-                    return current_authority_response();
+                    return current_authority_response(SessionConsumerRosterRejection::Authority);
                 }
                 let initial_guard = match self
                     .store
@@ -14144,16 +14198,19 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     .await
                 {
                     Ok(guard) => guard,
-                    Err(_) => return current_authority_response(),
+                    Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
                 };
                 drop(initial_guard);
-                if self
-                    .store
-                    .linearizable_barrier_before(deadline)
-                    .await
-                    .is_err()
-                {
-                    return current_authority_response();
+                if let Err(error) = self.store.linearizable_barrier_before(deadline).await {
+                    let rejection = match error {
+                        LinearizableBarrierFailure::Unavailable => {
+                            SessionConsumerRosterRejection::Unavailable
+                        }
+                        LinearizableBarrierFailure::RecoveryRequired => {
+                            SessionConsumerRosterRejection::RecoveryRequired
+                        }
+                    };
+                    return current_authority_response(rejection);
                 }
                 let _post_barrier_guard = match self
                     .store
@@ -14161,7 +14218,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     .await
                 {
                     Ok(guard) => guard,
-                    Err(_) => return current_authority_response(),
+                    Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
                 };
                 let wall_time_floor = self.store.inner.clock.now_utc();
                 let authority_time = match self
@@ -14176,7 +14233,11 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     .await
                 {
                     Ok(time) => time,
-                    Err(_) => return current_authority_response(),
+                    Err(_) => {
+                        return current_authority_response(
+                            SessionConsumerRosterRejection::Authority,
+                        )
+                    }
                 };
                 // The barrier can wait through an ingress certificate or
                 // traffic-authority change. Re-check both at the exact time
@@ -14191,7 +14252,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                         .await
                         .is_err()
                 {
-                    return current_authority_response();
+                    return current_authority_response(SessionConsumerRosterRejection::Authority);
                 }
                 SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
                     SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current,
@@ -14377,12 +14438,19 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 );
             }
         };
-        if self
+        if let Err(failure) = self
             .store
             .require_protected_roster_profile_v2_activation_before(deadline)
             .await
-            .is_err()
         {
+            if failure == ProtectedRosterProfileCheckFailure::Unavailable
+                && matches!(
+                    request.operation(),
+                    SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority { .. }
+                )
+            {
+                return SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable);
+            }
             return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
         }
         let operation = request.operation().clone();
@@ -14403,7 +14471,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
             3 => roster_admission_read_rejected(true, rejection),
             4 => roster_terminal_mutation_rejected(rejection),
             5 => roster_terminal_read_rejected(rejection),
-            6 => roster_current_publication_authority_rejected(),
+            6 => roster_current_publication_authority_rejected(rejection),
             _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized),
         };
         match operation {
@@ -14794,16 +14862,19 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     .await
                 {
                     Ok(guard) => guard,
-                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                    Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
                 };
                 drop(guard);
-                if self
-                    .store
-                    .linearizable_barrier_before(deadline)
-                    .await
-                    .is_err()
-                {
-                    return reject(SessionConsumerRosterRejection::Unavailable);
+                if let Err(error) = self.store.linearizable_barrier_before(deadline).await {
+                    let rejection = match error {
+                        LinearizableBarrierFailure::Unavailable => {
+                            SessionConsumerRosterRejection::Unavailable
+                        }
+                        LinearizableBarrierFailure::RecoveryRequired => {
+                            SessionConsumerRosterRejection::RecoveryRequired
+                        }
+                    };
+                    return reject(rejection);
                 }
                 let _guard = match self
                     .store
@@ -14811,7 +14882,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     .await
                 {
                     Ok(guard) => guard,
-                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                    Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
                 };
                 let authority_time = match self
                     .store
@@ -15188,6 +15259,17 @@ impl SessionBackend for ConsensusSessionStore {
             tokio::time::timeout_at(deadline, self.logical_read_time_before(None, deadline))
                 .await
                 .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
+        #[cfg(feature = "test-control")]
+        if self
+            .inner
+            .restore_scan_unavailable_for_test
+            .load(Ordering::Acquire)
+        {
+            self.inner
+                .restore_scan_rejections_for_test
+                .fetch_add(1, Ordering::AcqRel);
+            return Err(consensus_unavailable());
+        }
         let page = self
             .inner
             .backend
@@ -15418,6 +15500,7 @@ mod membership_tests {
         QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
         ReplicaId, ReplicaTlsIdentity,
     };
+    use crate::RosterIngressAttestationV2;
 
     fn fixed_counter_total<const N: usize>(counters: &[u64; N]) -> u64 {
         counters.iter().copied().sum()
@@ -16123,6 +16206,43 @@ mod membership_tests {
                 sign_roster_test_digest(&self.ingress_key, input.digest().expect("ingress digest")),
             )
             .expect("ingress attestation")
+        }
+
+        fn ingress_v2(
+            &self,
+            peer_identity_commitment: [u8; 32],
+            scope: [u8; 32],
+            request_id: SessionConsumerRequestId,
+            operation_tag: u8,
+            capsule: [u8; 32],
+        ) -> RosterIngressAttestationV2 {
+            let input = crate::fenced_mutation_roster::RosterIngressAttestationSigningInputV2 {
+                peer_identity_commitment,
+                consumer_scope: scope,
+                request_id: *request_id.as_bytes(),
+                operation_tag,
+                canonical_capsule_digest: capsule,
+                authenticated_at: self.valid_from,
+                peer_certificate_expires_at: self.valid_until,
+                material_generation: 1,
+                handshake_epoch: 1,
+            };
+            RosterIngressAttestationV2::issue_from_signed_parts(
+                &self.root,
+                self.certificate(
+                    RosterAttestationCertificateRoleV1::TransportIngress,
+                    scope,
+                    peer_identity_commitment,
+                    [0x45; 32],
+                    self.ingress_key.verifying_key(),
+                ),
+                &input,
+                sign_roster_test_digest(
+                    &self.ingress_key,
+                    input.digest().expect("V2 ingress digest"),
+                ),
+            )
+            .expect("V2 ingress attestation")
         }
 
         fn compact_admission(
@@ -22090,7 +22210,7 @@ mod membership_tests {
             service
                 .execute_roster_ingress(
                     &roster_authorization,
-                    publication_request,
+                    publication_request.clone(),
                     issuer.ingress(
                         peer_identity_commitment,
                         roster_scope.digest(),
@@ -22105,6 +22225,122 @@ mod membership_tests {
                 SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current
             )
         ));
+
+        store
+            .activate_protected_roster_profile_v2()
+            .await
+            .expect("activate V2 read control");
+        let publication_log = store.inner.raft.metrics().borrow().last_log_index;
+        let authority_rejected =
+            SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
+                SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected,
+            );
+        for (profile, barriers_to_skip) in [
+            (SessionConsumerRosterTransportProfile::current(), 0),
+            (SessionConsumerRosterTransportProfile::v2(), 1),
+            (SessionConsumerRosterTransportProfile::v2(), 0),
+        ] {
+            for failure in [
+                LinearizableBarrierFailure::Unavailable,
+                LinearizableBarrierFailure::RecoveryRequired,
+            ] {
+                let attestation = if profile.is_current() {
+                    RosterIngressAttestation::V1(issuer.ingress(
+                        peer_identity_commitment,
+                        roster_scope.digest(),
+                        publication_request_id,
+                        publication_tag,
+                        publication_digest,
+                    ))
+                } else {
+                    RosterIngressAttestation::V2(issuer.ingress_v2(
+                        peer_identity_commitment,
+                        roster_scope.digest(),
+                        publication_request_id,
+                        publication_tag,
+                        publication_digest,
+                    ))
+                };
+                let response = PUBLICATION_BARRIER_FAILURE_FOR_TEST
+                    .scope(
+                        std::cell::Cell::new(Some((barriers_to_skip, failure))),
+                        async {
+                            let response = service
+                                .execute_roster_ingress_for_profile(
+                                    profile,
+                                    &roster_authorization,
+                                    publication_request.clone(),
+                                    attestation,
+                                    None,
+                                )
+                                .await;
+                            assert!(
+                                PUBLICATION_BARRIER_FAILURE_FOR_TEST
+                                    .with(|fault| fault.get().is_none()),
+                                "the selected barrier must actually consume the fault"
+                            );
+                            response
+                        },
+                    )
+                    .await;
+                let expected = if failure == LinearizableBarrierFailure::Unavailable {
+                    SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+                } else if profile.is_v2() && barriers_to_skip == 0 {
+                    SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+                } else {
+                    authority_rejected.clone()
+                };
+                assert_eq!(
+                    response, expected,
+                    "publication read: profile_v2={} barriers_to_skip={barriers_to_skip} unavailable={}",
+                    profile.is_v2(),
+                    failure == LinearizableBarrierFailure::Unavailable
+                );
+            }
+            let attestation = if profile.is_current() {
+                RosterIngressAttestation::V1(issuer.ingress(
+                    peer_identity_commitment,
+                    roster_scope.digest(),
+                    publication_request_id,
+                    publication_tag,
+                    publication_digest,
+                ))
+            } else {
+                RosterIngressAttestation::V2(issuer.ingress_v2(
+                    peer_identity_commitment,
+                    roster_scope.digest(),
+                    publication_request_id,
+                    publication_tag,
+                    publication_digest,
+                ))
+            };
+            let response = service
+                .execute_roster_ingress_for_profile(
+                    profile,
+                    &roster_authorization,
+                    publication_request.clone(),
+                    attestation,
+                    None,
+                )
+                .await;
+            assert_eq!(
+                response,
+                if profile.is_current() {
+                    SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
+                        SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current,
+                    )
+                } else {
+                    // This terminal belongs exclusively to V1: resolving an
+                    // unavailable V2 read must not authorize cross-profile state.
+                    authority_rejected.clone()
+                }
+            );
+            assert_eq!(
+                store.inner.raft.metrics().borrow().last_log_index,
+                publication_log,
+                "publication checks cannot append another consensus mutation"
+            );
+        }
 
         let wrong_ingress_publication =
             crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule::new(

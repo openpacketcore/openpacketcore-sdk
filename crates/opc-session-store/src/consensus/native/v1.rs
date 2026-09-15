@@ -295,11 +295,11 @@ impl NativeDelta<'_> {
             self.base.identity,
             &self.base.members,
         );
-        if !self
+        if self
             .frontiers
             .v1_activation
             .as_ref()
-            .is_some_and(|existing| existing.voters == protected)
+            .is_none_or(|existing| existing.voters != protected)
         {
             self.frontiers.v1_activation = Some(activation);
         }

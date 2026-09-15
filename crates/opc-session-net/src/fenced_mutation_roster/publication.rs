@@ -15,7 +15,8 @@ use super::{
     client::{EstablishedPublication, PublicationState},
     diagnostics::{Counter as DiagnosticsCounter, RosterDiagnostics},
     runtime::{
-        CurrentPublicationAuthorityRead, LocalAuthorityRegistry, PublicationAuthorityReader,
+        CurrentPublicationAuthorityRead, LocalAuthorityRegistry, PublicationAuthorityCheckError,
+        PublicationAuthorityReader,
     },
     scheduler::ProviderWorkScheduler,
 };
@@ -37,6 +38,12 @@ pub enum PublicationAdapterError {
     /// The established capability is no longer the current half-open lease
     /// authority at the pre-effect read barrier.
     AuthorityRejected,
+    /// The next provider operation was not entered because a local or backend
+    /// authority check was unavailable. Earlier operations in this publish
+    /// call may already have run. Retry only the same retained capsule, with
+    /// its existing state and the caller's existing deadline; this result
+    /// grants neither fresh execution nor a non-transmission exception.
+    AuthorityUnavailable,
     /// The effect may have crossed, its reply was invalid, or the post-effect
     /// authority barrier did not prove that this exact capability remains
     /// current.  Recover with provider `status` and, where applicable, `adopt`.
@@ -65,6 +72,7 @@ impl fmt::Display for PublicationAdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::AuthorityRejected => "publication authority rejected",
+            Self::AuthorityUnavailable => "publication authority unavailable",
             Self::RecoveryRequired => "publication recovery required",
             Self::Busy => "publication provider busy",
             Self::PayloadConflict => "publication payload conflict",
@@ -75,6 +83,15 @@ impl fmt::Display for PublicationAdapterError {
 }
 
 impl std::error::Error for PublicationAdapterError {}
+
+impl From<PublicationAuthorityCheckError> for PublicationAdapterError {
+    fn from(error: PublicationAuthorityCheckError) -> Self {
+        match error {
+            PublicationAuthorityCheckError::Rejected => Self::AuthorityRejected,
+            PublicationAuthorityCheckError::Unavailable => Self::AuthorityUnavailable,
+        }
+    }
+}
 
 /// Startup-owned provider-local publication seam.
 ///
@@ -547,17 +564,17 @@ where
     ) -> Result<(), PublicationAdapterError> {
         self.local_authority
             .permit_for_publication(call)
-            .map_err(|_| PublicationAdapterError::AuthorityRejected)?;
+            .map_err(PublicationAdapterError::from)?;
         let current = CurrentPublicationAuthorityRead::from_publication_call(call)
             .map_err(|_| PublicationAdapterError::AuthorityRejected)?;
         self.authority_reader
             .read_current_publication_authority(current)
             .await
-            .map_err(|_| PublicationAdapterError::AuthorityRejected)?;
+            .map_err(PublicationAdapterError::from)?;
         self.local_authority
             .permit_for_publication(call)
             .map(|_| ())
-            .map_err(|_| PublicationAdapterError::AuthorityRejected)
+            .map_err(PublicationAdapterError::from)
     }
 
     /// Repeat the backend-current read and local validation after every
@@ -1870,6 +1887,8 @@ mod tests {
         terminalizations: AtomicUsize,
         authority_reads: AtomicUsize,
         authority_read_expired: AtomicBool,
+        authority_read_unavailable_once: AtomicBool,
+        authority_read_unavailable_at: AtomicUsize,
         current_authority: Mutex<Option<AuthorityBinding>>,
         committed: Mutex<Option<super::super::runtime::CommittedTerminal>>,
         recovery: Mutex<Option<(BackendRegistration, Arc<super::super::canonical::Admission>)>>,
@@ -2035,31 +2054,42 @@ mod tests {
 
     #[async_trait]
     impl PublicationAuthorityReader for CountingBackend {
-        type Error = ();
-
         async fn read_current_publication_authority(
             &self,
             request: CurrentPublicationAuthorityRead<'_>,
-        ) -> Result<(), Self::Error> {
-            self.authority_reads.fetch_add(1, Ordering::SeqCst);
+        ) -> Result<(), PublicationAuthorityCheckError> {
+            let read = self.authority_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if self
+                .authority_read_unavailable_at
+                .compare_exchange(read, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(PublicationAuthorityCheckError::Unavailable);
+            }
+            if self
+                .authority_read_unavailable_once
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(PublicationAuthorityCheckError::Unavailable);
+            }
             let (registration, admission) = self
                 .recovery
                 .lock()
                 .expect("recovery test record lock")
                 .clone()
-                .ok_or(())?;
+                .ok_or(PublicationAuthorityCheckError::Rejected)?;
             let committed = self
                 .committed
                 .lock()
                 .expect("terminal test record lock")
                 .clone()
-                .ok_or(())?;
+                .ok_or(PublicationAuthorityCheckError::Rejected)?;
             let current = self
                 .current_authority
                 .lock()
                 .expect("current authority lock")
                 .clone()
-                .ok_or(())?;
+                .ok_or(PublicationAuthorityCheckError::Rejected)?;
             if request.roster_id() != admission.roster_id()
                 || request.admission_commitment() != admission.body_commitment()
                 || request.terminal_body_commitment() != committed.record().body_commitment()
@@ -2067,7 +2097,7 @@ mod tests {
                 || request.logical_owner() != admission.logical_owner()
                 || request.admission_fence() != admission.admission_fence()
             {
-                return Err(());
+                return Err(PublicationAuthorityCheckError::Rejected);
             }
             let now = if self.authority_read_expired.load(Ordering::SeqCst) {
                 current.expires_at()
@@ -2076,7 +2106,7 @@ mod tests {
             };
             request
                 .validate_backend_current(registration, &current, now)
-                .map_err(|_| ())
+                .map_err(|_| PublicationAuthorityCheckError::Rejected)
         }
     }
 
@@ -2804,6 +2834,233 @@ mod tests {
         assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 0);
         assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
         assert!(journal.snapshots().is_empty());
+        assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_initial_publication_read_preserves_current_capsule_without_provider_io() {
+        let provider = Arc::new(DurablePublicationProvider::pending_then_published());
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+        let diagnostics_before = fixture.client.diagnostics();
+        let reads_before = fixture.backend.authority_reads();
+        fixture
+            .backend
+            .authority_read_unavailable_once
+            .store(true, Ordering::SeqCst);
+
+        let unavailable = fixture.adapter.publish(&mut fixture.publication).await;
+        assert!(unavailable.is_err());
+        assert!(!fixture
+            .backend
+            .authority_read_unavailable_once
+            .load(Ordering::SeqCst));
+        assert_eq!(fixture.backend.authority_reads(), reads_before + 1);
+        let diagnostics_after = fixture.client.diagnostics();
+        assert_eq!(
+            diagnostics_after.publication_status_calls,
+            diagnostics_before.publication_status_calls
+        );
+        assert_eq!(
+            diagnostics_after.publication_begin_calls,
+            diagnostics_before.publication_begin_calls
+        );
+        assert_eq!(
+            diagnostics_after.publication_adopt_calls,
+            diagnostics_before.publication_adopt_calls
+        );
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 0);
+        assert!(provider.snapshots().is_empty());
+
+        // Neither the retained binding nor either clock changed. Prove the
+        // exact original capsule remains current before asking it to recover.
+        let call = EstablishedPublicationCall::from_established(&fixture.publication)
+            .expect("retained publication call");
+        fixture
+            .adapter
+            .local_authority
+            .permit_for_publication(&call)
+            .expect("local authority remains current");
+        fixture
+            .backend
+            .read_current_publication_authority(
+                CurrentPublicationAuthorityRead::from_publication_call(&call)
+                    .expect("exact current-authority read"),
+            )
+            .await
+            .expect("backend authority remains current");
+        fixture
+            .adapter
+            .publish(&mut fixture.publication)
+            .await
+            .expect("the same retained capsule recovers after read availability returns");
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            unavailable,
+            Err(PublicationAdapterError::AuthorityUnavailable),
+            "an unavailable precheck cannot claim the independently current authority was rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_shard_contention_returns_unavailable_without_provider_io() {
+        use futures_util::FutureExt;
+
+        let provider = Arc::new(DurablePublicationProvider::pending_then_published());
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+        let registry = fixture.adapter.local_authority.clone();
+        let call = EstablishedPublicationCall::from_established(&fixture.publication)
+            .expect("exact retained publication call");
+        let held = registry.lock_publication_shard_for_test(&call);
+        let reads_before = fixture.backend.authority_reads();
+        let unavailable = fixture
+            .adapter
+            .publish(&mut fixture.publication)
+            .now_or_never()
+            .expect("a contended authority shard must not wait");
+        assert_eq!(
+            unavailable,
+            Err(PublicationAdapterError::AuthorityUnavailable)
+        );
+        assert_eq!(fixture.backend.authority_reads(), reads_before);
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 0);
+        drop(held);
+
+        fixture
+            .adapter
+            .publish(&mut fixture.publication)
+            .await
+            .expect("the same capsule revalidates after contention ends");
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_begin_precheck_after_status_preserves_status_adopt_only() {
+        let provider = Arc::new(DurablePublicationProvider::ambiguous_then(
+            StatusAfterAdopt::Absent,
+        ));
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+        fixture
+            .backend
+            .authority_read_unavailable_at
+            .store(fixture.backend.authority_reads() + 3, Ordering::SeqCst);
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::AuthorityUnavailable)
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .authority_read_unavailable_at
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(matches!(
+            fixture.publication.state(),
+            PublicationState::StatusAdoptOnly
+        ));
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::RecoveryRequired)
+        );
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_postcheck_cannot_restore_direct_begin_retry() {
+        let mut provider = DurablePublicationProvider::not_transmitted_then_published();
+        provider.status_after_adopt = StatusAfterAdopt::Absent;
+        let provider = Arc::new(provider);
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+        fixture
+            .backend
+            .authority_read_unavailable_at
+            .store(fixture.backend.authority_reads() + 4, Ordering::SeqCst);
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::RecoveryRequired)
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .authority_read_unavailable_at
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(matches!(
+            fixture.publication.state(),
+            PublicationState::StatusAdoptOnly
+        ));
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.client.diagnostics().publication_acknowledged, 0);
+
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::RecoveryRequired)
+        );
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_postcheck_after_effect_recovers_without_duplicate_effect() {
+        let provider = Arc::new(DurablePublicationProvider::pending_then_published());
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+        fixture
+            .backend
+            .authority_read_unavailable_at
+            .store(fixture.backend.authority_reads() + 6, Ordering::SeqCst);
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::RecoveryRequired)
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .authority_read_unavailable_at
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(matches!(
+            fixture.publication.state(),
+            PublicationState::StatusAdoptOnly
+        ));
+        assert_eq!(fixture.client.diagnostics().publication_acknowledged, 0);
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 1);
+
+        fixture
+            .adapter
+            .publish(&mut fixture.publication)
+            .await
+            .expect("status recovers the completed effect");
+        assert_eq!(provider.begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.external_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.client.diagnostics().publication_acknowledged, 1);
         assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
     }

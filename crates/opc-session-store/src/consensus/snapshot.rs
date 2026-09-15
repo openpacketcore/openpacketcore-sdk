@@ -514,44 +514,60 @@ impl RetainedSnapshotDirectory {
         .map_err(io::Error::from)
     }
 
-    #[cfg(unix)]
-    pub(crate) fn sync(&self) -> io::Result<()> {
-        #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, target_os = "linux"))]
+    fn sync_with_test_hooks(
+        &self,
+        registry: &std::sync::Mutex<BTreeMap<PathBuf, RetainedNamespaceSyncTestHooks>>,
+        sync_directory: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         {
             use std::os::unix::fs::MetadataExt as _;
 
             let metadata = (**self.directory).metadata()?;
             let identity = (metadata.dev(), metadata.ino());
-            let mut hooks = retained_namespace_sync_test_hooks()
-                .lock()
-                .expect("retained namespace sync hooks");
-            let Some(hooks) = hooks.get_mut(self.cleanup_latch_identity()) else {
-                return (**self.directory).sync_all();
-            };
-            if let Some(observer) = &mut hooks.observer {
-                observer.observed.push(identity);
-            }
-            if std::mem::take(&mut hooks.fail) {
-                return Err(io::Error::other(
-                    "injected retained snapshot namespace sync failure",
-                ));
+            let mut hooks = registry.lock().expect("retained namespace sync hooks");
+            if let Some(hooks) = hooks.get_mut(self.cleanup_latch_identity()) {
+                if let Some(observer) = &mut hooks.observer {
+                    observer.observed.push(identity);
+                }
+                if std::mem::take(&mut hooks.fail) {
+                    return Err(io::Error::other(
+                        "injected retained snapshot namespace sync failure",
+                    ));
+                }
             }
         }
-        #[cfg(all(test, not(target_os = "linux")))]
+        // Directory I/O must not serialize unrelated fixture namespaces
+        // behind the process-wide test-hook registry, including no-hook calls.
+        sync_directory()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        #[cfg(all(test, target_os = "linux"))]
         {
-            let mut hooks = retained_namespace_sync_test_hooks()
-                .lock()
-                .expect("retained namespace sync hooks");
-            if hooks
-                .get_mut(self.cleanup_latch_identity())
-                .is_some_and(|hooks| std::mem::take(&mut hooks.fail))
-            {
-                return Err(io::Error::other(
-                    "injected retained snapshot namespace sync failure",
-                ));
-            }
+            self.sync_with_test_hooks(retained_namespace_sync_test_hooks(), || {
+                (**self.directory).sync_all()
+            })
         }
-        (**self.directory).sync_all()
+        #[cfg(not(all(test, target_os = "linux")))]
+        {
+            #[cfg(test)]
+            {
+                let mut hooks = retained_namespace_sync_test_hooks()
+                    .lock()
+                    .expect("retained namespace sync hooks");
+                if hooks
+                    .get_mut(self.cleanup_latch_identity())
+                    .is_some_and(|hooks| std::mem::take(&mut hooks.fail))
+                {
+                    return Err(io::Error::other(
+                        "injected retained snapshot namespace sync failure",
+                    ));
+                }
+            }
+            (**self.directory).sync_all()
+        }
     }
 
     /// Enumerate at most `limit + 1` child basenames through a duplicate of
@@ -4373,6 +4389,115 @@ mod tests {
     };
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
+
+    #[cfg(target_os = "linux")]
+    fn retained_sync_namespace() -> (tempfile::TempDir, super::RetainedSnapshotDirectory) {
+        let directory = tempdir().unwrap();
+        let namespace = super::RetainedSnapshotDirectory::from_directory_file(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            std::fs::File::open(directory.path()).unwrap(),
+        )
+        .unwrap();
+        (directory, namespace)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_namespace_sync_releases_test_registry_before_directory_io() {
+        use std::cell::Cell;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        let (_directory, namespace) = retained_sync_namespace();
+        for observer_present in [true, false] {
+            // The actual test-build sync path takes this same helper. A local
+            // registry excludes unrelated tests from this ownership probe.
+            let registry = Mutex::new(BTreeMap::new());
+            if observer_present {
+                registry.lock().unwrap().insert(
+                    namespace.cleanup_latch_identity().to_path_buf(),
+                    super::RetainedNamespaceSyncTestHooks {
+                        fail: false,
+                        observer: Some(super::RetainedNamespaceSyncObserver {
+                            observed: Vec::new(),
+                        }),
+                    },
+                );
+            }
+            let calls = Cell::new(0);
+            let registry_available = Cell::new(false);
+            namespace
+                .sync_with_test_hooks(&registry, || {
+                    calls.set(calls.get() + 1);
+                    registry_available.set(registry.try_lock().is_ok());
+                    (**namespace.directory).sync_all()
+                })
+                .unwrap();
+            assert_eq!(calls.get(), 1, "one actual directory-sync boundary");
+            // Assert after the helper returns so even the defective branch
+            // releases its guard without poisoning the registry on failure.
+            assert!(
+                registry_available.get(),
+                "directory sync must not retain the test registry mutex"
+            );
+            if observer_present {
+                assert_eq!(
+                    registry.lock().unwrap()[namespace.cleanup_latch_identity()]
+                        .observer
+                        .as_ref()
+                        .unwrap()
+                        .observed,
+                    vec![namespace.directory_identity()]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_namespace_sync_failure_remains_once_only_and_precedes_directory_io() {
+        use std::cell::Cell;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        let (_directory, namespace) = retained_sync_namespace();
+        let registry = Mutex::new(BTreeMap::from([(
+            namespace.cleanup_latch_identity().to_path_buf(),
+            super::RetainedNamespaceSyncTestHooks {
+                fail: true,
+                observer: Some(super::RetainedNamespaceSyncObserver {
+                    observed: Vec::new(),
+                }),
+            },
+        )]));
+        let calls = Cell::new(0);
+        let failed = namespace.sync_with_test_hooks(&registry, || {
+            calls.set(calls.get() + 1);
+            (**namespace.directory).sync_all()
+        });
+        assert!(
+            failed.is_err(),
+            "the armed sync failure must remain effective"
+        );
+        assert_eq!(calls.get(), 0, "injected failure precedes directory I/O");
+        assert!(!registry.lock().unwrap()[namespace.cleanup_latch_identity()].fail);
+        namespace
+            .sync_with_test_hooks(&registry, || {
+                calls.set(calls.get() + 1);
+                (**namespace.directory).sync_all()
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1, "the next sync reaches real directory I/O");
+        assert_eq!(
+            registry.lock().unwrap()[namespace.cleanup_latch_identity()]
+                .observer
+                .as_ref()
+                .unwrap()
+                .observed,
+            vec![namespace.directory_identity(); 2]
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

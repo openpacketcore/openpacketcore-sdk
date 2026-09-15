@@ -3432,6 +3432,7 @@ async fn run_traffic_mutation_task(
                 }
                 match reconcile_traffic_mutation_checkpoint(
                     &protected,
+                    &store,
                     &key,
                     &owner,
                     &mut lease,
@@ -3555,6 +3556,7 @@ async fn run_traffic_mutation_task(
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_traffic_mutation_checkpoint(
     protected: &ProtectedStore,
+    store: &ConsensusSessionStore,
     key: &SessionKey,
     owner: &OwnerId,
     lease: &mut Option<LeaseGuard>,
@@ -3570,6 +3572,7 @@ async fn reconcile_traffic_mutation_checkpoint(
     if traffic_failure_retains_known_authority(initial_failure) {
         return reconcile_traffic_known_authority(
             protected,
+            store,
             key,
             owner,
             lease.as_ref(),
@@ -3604,6 +3607,7 @@ async fn reconcile_traffic_mutation_checkpoint(
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_traffic_known_authority(
     protected: &ProtectedStore,
+    store: &ConsensusSessionStore,
     key: &SessionKey,
     owner: &OwnerId,
     lease: Option<&LeaseGuard>,
@@ -3717,7 +3721,157 @@ async fn reconcile_traffic_known_authority(
             QualificationTrafficFailureStage::Get,
         ));
     }
+    if initial_failure.stage == QualificationTrafficFailureStage::RestoreScan {
+        // The exact get retains record and lease authority, but cannot prove
+        // the independently admitted restore scan. Re-execute that same scan
+        // inside this episode, retaining every original page validation.
+        prove_traffic_restore_scan_recovery(
+            || {
+                protected.scan_restore_records(RestoreScanRequest::all(
+                    QUALIFICATION_TRAFFIC_RESTORE_LIMIT,
+                ))
+            },
+            &stored,
+            recovery_started_at,
+            deadline,
+            consecutive_availability_interruptions,
+            observation,
+        )
+        .await?;
+    } else if initial_failure.stage == QualificationTrafficFailureStage::ReadinessProbe {
+        // An exact get proves the retained record through a logical-time
+        // proposal. It does not prove the separate quorum read-index path that
+        // failed. Keep this same interruption episode open until that path is
+        // ready, charging every failed proof against the original budget.
+        prove_traffic_readiness_recovery(
+            || async { store.probe_durable_readiness().await.is_ready() },
+            recovery_started_at,
+            deadline,
+            consecutive_availability_interruptions,
+            observation,
+        )
+        .await?;
+    }
     Ok(())
+}
+
+async fn prove_traffic_restore_scan_recovery<P, F>(
+    mut scan: P,
+    expected: &StoredSessionRecord,
+    recovery_started_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure>
+where
+    P: FnMut() -> F,
+    F: std::future::Future<Output = Result<opc_session_store::RestoreScanPage, StoreError>>,
+{
+    let stage = QualificationTrafficFailureStage::RestoreScan;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                stage,
+                recovery_started_at,
+            ));
+        }
+        // Cancelling this read observer does not abandon a session mutation
+        // or replace the retained lease. Logical-time work stays owned by
+        // the store; this observer uses the original recovery deadline.
+        let result = tokio::time::timeout_at(deadline, scan()).await;
+        let failure = match result {
+            Ok(Ok(page)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                        stage,
+                        recovery_started_at,
+                    ));
+                }
+                if !page.complete
+                    || page.next_cursor.is_some()
+                    || page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
+                    || page.loaded_count != page.records.len()
+                    || page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT
+                    || !page
+                        .records
+                        .iter()
+                        .any(|candidate| traffic_record_is_exact(expected, candidate))
+                {
+                    return Err(QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::RestoreScanRejected,
+                        stage,
+                    ));
+                }
+                return Ok(());
+            }
+            Ok(Err(error)) => QualificationTrafficFailure::store(
+                QualificationTrafficFailureCode::RestoreScanRejected,
+                stage,
+                &error,
+            ),
+            Err(_) => QualificationTrafficFailure::backend_unavailable(
+                QualificationTrafficFailureCode::RestoreScanRejected,
+                stage,
+            ),
+        };
+        if !traffic_failure_is_recoverable(failure)
+            || !observation.record_availability_interruption(consecutive_availability_interruptions)
+        {
+            return Err(failure);
+        }
+        if !wait_for_traffic_recovery_retry(deadline).await {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                stage,
+                recovery_started_at,
+            ));
+        }
+    }
+}
+
+async fn prove_traffic_readiness_recovery<P, F>(
+    mut probe: P,
+    recovery_started_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure>
+where
+    P: FnMut() -> F,
+    F: std::future::Future<Output = bool>,
+{
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::ReadinessProbe,
+                recovery_started_at,
+            ));
+        }
+        // This is a read-only proof, so its observer can be cancelled without
+        // abandoning a mutation or replacing retained lease authority.
+        let readiness = tokio::time::timeout_at(deadline, probe()).await;
+        if matches!(readiness, Ok(true)) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                    QualificationTrafficFailureStage::ReadinessProbe,
+                    recovery_started_at,
+                ));
+            }
+            return Ok(());
+        }
+        let failure = QualificationTrafficFailure::backend_unavailable(
+            QualificationTrafficFailureCode::ReadinessUnavailable,
+            QualificationTrafficFailureStage::ReadinessProbe,
+        );
+        if !observation.record_availability_interruption(consecutive_availability_interruptions) {
+            return Err(failure);
+        }
+        if readiness.is_err() || !wait_for_traffic_recovery_retry(deadline).await {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::ReadinessProbe,
+                recovery_started_at,
+            ));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6371,6 +6525,14 @@ fn main() -> ExitCode {
 #[cfg(test)]
 #[path = "opc-session-quorum-node/shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "opc-session-quorum-node/readiness_recovery_tests.rs"]
+mod readiness_recovery_tests;
+
+#[cfg(all(test, feature = "test-control"))]
+#[path = "opc-session-quorum-node/restore_scan_recovery_tests.rs"]
+mod restore_scan_recovery_tests;
 
 #[cfg(test)]
 mod tests {

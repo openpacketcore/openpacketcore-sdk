@@ -4248,6 +4248,16 @@ pub struct RosterCompactAdmissionProvenanceV2 {
 }
 
 impl RosterCompactAdmissionProvenanceV2 {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_read_allocation_bytes(&self) -> Option<usize> {
+        // Certificate and signing fields are inline; member projections own
+        // one vector of scalar commitments with no nested allocations.
+        self.input
+            .members
+            .capacity()
+            .checked_mul(std::mem::size_of::<RosterCompactAdmissionMemberProjectionV2>())
+    }
+
     /// Return the consensus configuration that authenticated this immutable
     /// admission provenance. Restart validation consumes it only after the
     /// persisted membership lineage has independently admitted the identity.
@@ -4632,6 +4642,16 @@ pub struct RosterProfileV2CompactAdmissionProvenanceV1 {
 }
 
 impl RosterProfileV2CompactAdmissionProvenanceV1 {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_read_allocation_bytes(&self) -> Option<usize> {
+        // Certificate and signing fields are inline; member projections own
+        // one vector of scalar commitments with no nested allocations.
+        self.input
+            .members
+            .capacity()
+            .checked_mul(std::mem::size_of::<RosterCompactAdmissionMemberProjectionV2>())
+    }
+
     pub const fn configuration_identity(&self) -> SessionConsensusIdentity {
         self.input.configuration_identity
     }

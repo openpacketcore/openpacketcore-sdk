@@ -267,9 +267,7 @@ fn roster_ingress_unavailable_response(
             )
         }
         SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority { .. } => {
-            SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
-                SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected,
-            )
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
         }
         _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest),
     }
@@ -14088,12 +14086,11 @@ impl AuthenticatedRosterConsumer {
         capsule: SessionConsumerRosterCurrentPublicationAuthorityCapsule,
     ) -> Result<
         SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
-        ProtectedRosterTransportError,
+        SessionConsumerClientError,
     > {
         self.client
             .fenced_mutation_roster_current_publication_authority(request_id, &capsule)
             .await
-            .map_err(|_| ProtectedRosterTransportError)
     }
 }
 
@@ -20709,9 +20706,7 @@ fn consumer_timeout_response(
             );
         }
         ConsumerOperationKind::FencedMutationRosterCurrentPublicationAuthority => {
-            return SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
-                SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected,
-            );
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable);
         }
         _ => {}
     }
@@ -21012,6 +21007,116 @@ mod tests {
             sequence: NonZeroU32::new(sequence).expect("test correlation is nonzero"),
             nonce: uuid::Uuid::from_u128(u128::from(sequence)),
         }
+    }
+
+    #[test]
+    fn publication_precheck_preserves_legacy_response_bytes_and_authority_retirement() {
+        // These are the existing revision-five response bytes, shared by
+        // both protected-roster profiles. No new publication outcome tag is
+        // required to carry a known unavailable read.
+        for (bytes, unavailable, retires) in [
+            (br#"{"response":"rejected","body":"Unavailable"}"#.as_slice(), true, false),
+            (br#"{"response":"rejected","body":"Unauthorized"}"#.as_slice(), false, true),
+            (br#"{"response":"rejected","body":"ScopeMismatch"}"#.as_slice(), false, true),
+            (br#"{"response":"rejected","body":"TopologyMismatch"}"#.as_slice(), false, true),
+            (br#"{"response":"rejected","body":"MalformedRequest"}"#.as_slice(), false, true),
+            (br#"{"response":"fenced_mutation_roster_current_publication_authority","body":{"outcome":"rejected"}}"#.as_slice(), false, false),
+        ] {
+            let wire: ConsumerSessionResponseWire = serde_json::from_slice(bytes).expect("legacy response decodes");
+            assert_eq!(serde_json::to_vec(&wire).expect("legacy response encodes"), bytes);
+            let response = SessionConsumerResponse::try_from(wire).expect("typed response");
+            assert!(response_matches_operation(ConsumerOperationKind::FencedMutationRosterCurrentPublicationAuthority, &response));
+            assert!(super::response_is_known_failure(&response));
+            assert_eq!(response_retires_connection_authority(&response), retires);
+            assert_eq!(matches!(response, SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)), unavailable);
+        }
+        let unknown = br#"{"response":"fenced_mutation_roster_current_publication_authority","body":{"outcome":"unavailable"}}"#;
+        assert!(
+            serde_json::from_slice::<ConsumerSessionResponseWire>(unknown).is_err(),
+            "unknown publication tags remain protocol failures for existing peers"
+        );
+    }
+
+    #[test]
+    fn publication_authority_server_timeout_preserves_unavailability() {
+        let key = SessionKey {
+            tenant: TenantId::new("publication-timeout").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"publication-timeout")
+                .try_into()
+                .expect("test key"),
+        };
+        let acquired_at = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let owner = OwnerId::new("publication-timeout").expect("test owner");
+        let capsule =
+            opc_session_store::SessionConsumerRosterCurrentPublicationAuthorityCapsule::new(
+                [1; 32],
+                key,
+                [2; 16],
+                [3; 32],
+                [4; 32],
+                [5; 32],
+                owner.clone(),
+                FenceToken::new(1),
+                [6; 32],
+                [7; 56],
+                [8; 32],
+                owner,
+                FenceToken::new(1),
+                1,
+                Generation::new(1),
+                acquired_at,
+                acquired_at.add_seconds(1).expect("test expiry"),
+            )
+            .expect("synthetic untrusted authority query");
+        let operation = SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+            request: Box::new(capsule),
+        };
+        assert!(!consumer_operation_is_effectful(&operation));
+        let request_id = SessionConsumerRequestId::from_bytes([9; 16]);
+        let response = consumer_timeout_response(
+            ConsumerOperationKind::from_operation(&operation),
+            request_id,
+        );
+        let wire = consumer_wire_response_from_public(ConsumerLeaseWireContext::Other, response)
+            .expect("timeout response encodes");
+        let frame = ConsumerWireResponse::Response(ConsumerCallResponse {
+            correlation: correlation(1),
+            response: Box::new(wire),
+        });
+        let bytes = serde_json::to_vec(&frame).expect("timeout frame encodes");
+        let ConsumerWireResponse::Response(ConsumerCallResponse {
+            correlation: actual,
+            response,
+        }) = decode_consumer_frame_payload::<ConsumerWireResponse>(&bytes)
+            .expect("timeout frame decodes")
+        else {
+            panic!("timeout keeps its response family");
+        };
+        assert!(exact_correlation(correlation(1), actual).is_ok());
+        assert!(exact_correlation(correlation(2), actual).is_err());
+        let response =
+            SessionConsumerResponse::try_from(*response).expect("typed timeout response");
+        assert!(response_matches_operation(
+            ConsumerOperationKind::from_operation(&operation),
+            &response
+        ));
+        assert!(!response_retires_connection_authority(&response));
+        let SessionConsumerResponse::Rejected(rejection) = response else {
+            panic!("an unavailable read cannot conclusively reject the retained authority");
+        };
+        assert_eq!(
+            consumer_rejection_into_client_error(rejection),
+            SessionConsumerClientError::Unavailable
+        );
+        assert!(
+            matches!(
+                consumer_timeout_response(ConsumerOperationKind::CompareAndSet, request_id),
+                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation { request_id: actual }) if actual == request_id
+            ),
+            "mutation timeouts retain ambiguous-effect semantics"
+        );
     }
 
     #[test]

@@ -486,9 +486,20 @@ authority ambiguous discard the prior guard, reacquire same-owner authority
 with a strictly higher fence, and validate the exact scheduled record.
 Read-only get, restore-scan, and readiness outcomes retain the already-proven
 guard and validate that same exact record without minting unnecessary fencing
-authority. Evidence binds this routing as `stage-aware-known-authority/v1`.
-The private
-schedule drops one successful release response per mutator to prove this path.
+authority. Historical traffic-resource/v6 evidence binds this routing as
+`stage-aware-known-authority/v1`. The current traffic-resource/v9 schedule uses
+`stage-aware-known-authority-readiness-and-scan-reproof/v1`: readiness-origin recovery
+must also reprove durable readiness after the exact record check, retaining the
+same guard and original deadline. Every failed or timed-out proof counts
+against the existing interruption allowance. Restore-scan-origin recovery
+repeats the complete scan and validates its cursor profile, counts, bounds,
+and exact record with the same guard, deadline, and allowance. A get alone
+cannot certify scan recovery; terminal scan errors remain terminal. Historical
+v8 retains its readiness-only reproof meaning. The distinct traffic-resource/v7
+retained-acquisition profile is not consumed by this schedule. The
+[qualification contract](../crates/opc-session-testkit/README.md) describes these
+separate bindings. The private schedule drops one successful release response
+per mutator to prove this path.
 More than eight such outcomes per node, any recovery episode beyond the fixed
 26-second two-election-plus-operation transition envelope, any retry before the
 fixed 50 ms delay, or phase completion with an unresolved interruption fails

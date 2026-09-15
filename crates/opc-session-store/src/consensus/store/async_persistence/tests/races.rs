@@ -120,7 +120,7 @@ impl ReplyHold {
                 let Some(append) = append_request(&request) else {
                     return;
                 };
-                if !append_last(&append).is_some_and(|last| last.index >= minimum_index)
+                if append_last(&append).is_none_or(|last| last.index < minimum_index)
                     || !matches!(
                         decode_bounded::<
                             Result<

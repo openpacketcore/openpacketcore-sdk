@@ -16,10 +16,11 @@ use super::{
     runtime::{
         AdmissionStatusRequest, AuthorityBinding, BackendRegistration, BackendRejection,
         CommittedTerminal, CurrentPublicationAuthorityRead, FencedMutationRosterExecutorAttestor,
-        ProfiledTerminalConflictTombstone, PublicationAuthorityReader, RecoveryRequest,
-        RegistrationAdmissionProvenance, RegistrationDecision, RegistrationRequest, RosterExecutor,
-        RosterExecutorBackend, TerminalBody, TerminalStatusDecision, TerminalStatusRequest,
-        TerminalizeDecision, TerminalizeRequest,
+        ProfiledTerminalConflictTombstone, PublicationAuthorityCheckError,
+        PublicationAuthorityReader, RecoveryRequest, RegistrationAdmissionProvenance,
+        RegistrationDecision, RegistrationRequest, RosterExecutor, RosterExecutorBackend,
+        TerminalBody, TerminalStatusDecision, TerminalStatusRequest, TerminalizeDecision,
+        TerminalizeRequest,
     },
 };
 use crate::consumer::{
@@ -363,7 +364,7 @@ impl RosterQuorumPort {
         capsule: SessionConsumerRosterCurrentPublicationAuthorityCapsule,
     ) -> Result<
         SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
-        ProtectedRosterTransportError,
+        crate::consumer::SessionConsumerClientError,
     > {
         self.consumer
             .current_publication_authority(request_id, capsule)
@@ -520,15 +521,13 @@ impl RosterExecutorBackend for RosterQuorumPort {
 
 #[async_trait::async_trait]
 impl PublicationAuthorityReader for RosterQuorumPort {
-    type Error = AdapterError;
-
     async fn read_current_publication_authority(
         &self,
         request: CurrentPublicationAuthorityRead<'_>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PublicationAuthorityCheckError> {
         let authority = request.current_authority();
         if authority.ingress_scope() != self.scope {
-            return Err(AdapterError);
+            return Err(PublicationAuthorityCheckError::Rejected);
         }
         let (registration_handle, registration_request_id, registration_terminal_slot) =
             request.current_registration().consensus_parts();
@@ -551,7 +550,7 @@ impl PublicationAuthorityReader for RosterQuorumPort {
             request.current_lease_acquired_at(),
             request.current_lease_expires_at(),
         )
-        .map_err(|_| AdapterError)?;
+        .map_err(|_| PublicationAuthorityCheckError::Rejected)?;
         match self
             .current_publication_authority(
                 recovery_request_id(
@@ -562,14 +561,31 @@ impl PublicationAuthorityReader for RosterQuorumPort {
                 capsule,
             )
             .await
-            .map_err(|_| AdapterError)?
+            .map_err(publication_authority_client_error)?
         {
             SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current => Ok(()),
             SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected => {
-                Err(AdapterError)
+                Err(PublicationAuthorityCheckError::Rejected)
             }
-            _ => Err(AdapterError),
+            _ => Err(PublicationAuthorityCheckError::Rejected),
         }
+    }
+}
+
+fn publication_authority_client_error(
+    error: crate::consumer::SessionConsumerClientError,
+) -> PublicationAuthorityCheckError {
+    use crate::consumer::SessionConsumerClientError;
+    match error {
+        SessionConsumerClientError::Unavailable
+        | SessionConsumerClientError::Deadline
+        | SessionConsumerClientError::Overloaded => PublicationAuthorityCheckError::Unavailable,
+        SessionConsumerClientError::Authentication
+        | SessionConsumerClientError::AuthorityRevoked
+        | SessionConsumerClientError::Scope
+        | SessionConsumerClientError::Protocol
+        | SessionConsumerClientError::Unsupported
+        | SessionConsumerClientError::ShuttingDown => PublicationAuthorityCheckError::Rejected,
     }
 }
 
@@ -1661,6 +1677,34 @@ fn encode_terminal_response_v2(wire: &TerminalResponseWireV2) -> Result<Vec<u8>,
 mod tests {
     use super::*;
     use crate::fenced_mutation_roster::{client::ClientError, runtime::ExecutorError};
+
+    #[test]
+    fn publication_client_failures_preserve_authority_rejection() {
+        use crate::consumer::SessionConsumerClientError;
+        for error in [
+            SessionConsumerClientError::Authentication,
+            SessionConsumerClientError::AuthorityRevoked,
+            SessionConsumerClientError::Scope,
+            SessionConsumerClientError::Protocol,
+            SessionConsumerClientError::Unsupported,
+            SessionConsumerClientError::ShuttingDown,
+        ] {
+            assert_eq!(
+                publication_authority_client_error(error),
+                PublicationAuthorityCheckError::Rejected
+            );
+        }
+        for error in [
+            SessionConsumerClientError::Unavailable,
+            SessionConsumerClientError::Deadline,
+            SessionConsumerClientError::Overloaded,
+        ] {
+            assert_eq!(
+                publication_authority_client_error(error),
+                PublicationAuthorityCheckError::Unavailable
+            );
+        }
+    }
 
     const PROFILE_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR: &[u8] = concat!(
         "admission-request-v2=postcard-frame,magic:OPCRPA2\\0,domain:admission-port/profile-v2/request/v1,wire:AdmissionRequestWire(register:scope,admission,authority|recover:scope,roster-id,original-owner,original-admission-fence,authority)\n",

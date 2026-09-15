@@ -369,8 +369,32 @@ into an `EstablishedPublication`. The publication adapter first observes or
 creates an inert provider-local intent and then adopts it. Its durable logical
 state is monotonic (`Absent -> Reserved -> Attempted -> Published`), absence is
 non-exclusionary after ambiguity, and an attempted or published identity must
-not be deleted back to absence. The adapter makes no consensus call.
+not be deleted back to absence. The adapter makes no consensus mutation.
 `FencedMutationRosterAbortedTerminal` deliberately has no publication method.
+
+Each provider operation is preceded by local authority validation, a
+linearizable read of the exact current publication binding, and a second
+local validation. `PublicationAdapterError::AuthorityUnavailable` means this
+next provider operation was not entered because the authority check was
+unavailable. Earlier provider operations in the same outer call may already
+have run. The caller may retry only the same retained capsule and its current
+state within the caller's existing deadline. This error does not restore
+fresh execution or direct intent-admission permission after ambiguity.
+Conclusive expiry, successor, binding, authentication, scope, and protocol
+rejections remain fail-closed. An unavailable post-provider check remains
+`RecoveryRequired`, including after a direct `NotTransmitted` reply; it cannot
+acknowledge an effect or restore direct retry authority.
+
+Both roster profiles preserve known read unavailability using the existing
+generic `Rejected(Unavailable)` consumer response, including server request
+timeouts and V2's activation read barrier. The `Current` and `Rejected`
+publication response tags, transport revision, and profile negotiation remain
+unchanged. Older readers already decode this generic rejection and fail
+closed; their publication adapter does not gain the new retry distinction.
+A new reader also treats an older server's undifferentiated publication
+`Rejected` response as a rejection. Unknown response shapes remain protocol
+failures. Opaque storage and traffic-authority failures are not reclassified
+as proven temporary failures.
 
 V1 and Profile V2 share one ledger-global capacity and terminal-retention
 order while keeping their canonical payload rows and wire profiles disjoint.
