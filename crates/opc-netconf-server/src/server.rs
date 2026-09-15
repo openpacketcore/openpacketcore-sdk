@@ -17224,6 +17224,133 @@ mod tests {
         assert!(commit_events[1].tx_id.is_some());
     }
 
+    async fn assert_running_edit_requires_audit_intent(edit: &str) {
+        for failure in [
+            CommitAuditFailure::IntentError,
+            CommitAuditFailure::IntentPanic,
+        ] {
+            let audit = ScriptedCommitAudit::new(failure);
+            let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
+            let registry = SessionRegistry::new();
+            let _registration = registry.register(1).expect("register session");
+            let request_id = RequestId::new();
+            let rejected = server
+                .handle_rpc_for_session_async(
+                    request_id,
+                    &principal(),
+                    edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+
+            assert_eq!(
+                bus.current_snapshot().version,
+                ConfigVersion::new(1),
+                "failed required intent must prevent a running configuration commit"
+            );
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+            assert!(rejected
+                .reply_xml
+                .contains("<error-tag>operation-failed</error-tag>"));
+            assert!(!rejected.reply_xml.contains("<ok/>"));
+            assert!(!rejected.reply_xml.contains("secret-admin"));
+            assert!(!rejected.reply_xml.contains("/sys:system"));
+            assert_eq!(registry.running_write_owner_for_test(), None);
+            {
+                let attempts = audit.attempts.lock().expect("audit attempts mutex");
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].request_id, request_id);
+                assert_eq!(attempts[0].outcome, AuditOutcome::Intent);
+                assert_eq!(attempts[0].operation, AuditOperation::Update);
+                assert_eq!(
+                    attempts[0].schema_paths,
+                    vec![schema_node_path("/sys:system/sys:hostname")]
+                );
+                assert!(attempts[0].tx_id.is_none());
+            }
+
+            let retry_request_id = RequestId::new();
+            let retried = server
+                .handle_rpc_for_session_async(
+                    retry_request_id,
+                    &principal(),
+                    edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+            assert!(retried.reply_xml.contains("<ok/>"));
+            assert_eq!(bus.current_snapshot().version, ConfigVersion::new(2));
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+            assert_eq!(registry.running_write_owner_for_test(), None);
+            let attempts = audit.attempts.lock().expect("audit attempts mutex");
+            assert_eq!(attempts.len(), 3);
+            assert_eq!(attempts[1].request_id, retry_request_id);
+            assert_eq!(attempts[2].request_id, retry_request_id);
+            assert_eq!(attempts[1].outcome, AuditOutcome::Intent);
+            assert_eq!(attempts[2].outcome, AuditOutcome::Success);
+            assert_eq!(attempts[1].schema_paths, attempts[2].schema_paths);
+        }
+    }
+
+    #[tokio::test]
+    async fn running_edit_config_requires_audit_intent() {
+        let edit = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        assert_running_edit_requires_audit_intent(&edit).await;
+    }
+
+    #[tokio::test]
+    async fn running_edit_data_requires_audit_intent() {
+        let edit = edit_data_rpc(
+            "running",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        assert_running_edit_requires_audit_intent(&edit).await;
+    }
+
+    #[tokio::test]
+    async fn running_edits_contain_audit_intent_construction_panic() {
+        let config = r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#;
+        for edit in [
+            edit_config_rpc(config, "merge"),
+            edit_data_rpc("running", config, "merge"),
+        ] {
+            let (server, bus, _) =
+                generated_edit_server_with_audit(CommitConstructionPanicAudit).await;
+            let registry = SessionRegistry::new();
+            let _registration = registry.register(1).expect("register session");
+            let rejected = server
+                .handle_rpc_for_session_async(
+                    RequestId::new(),
+                    &principal(),
+                    &edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+            assert_eq!(
+                bus.current_snapshot().version,
+                ConfigVersion::new(1),
+                "audit future construction failure must prevent the commit"
+            );
+            assert!(rejected
+                .reply_xml
+                .contains("<error-tag>operation-failed</error-tag>"));
+            assert!(!rejected
+                .reply_xml
+                .contains("scripted audit construction panic"));
+            assert_eq!(registry.running_write_owner_for_test(), None);
+        }
+    }
+
     #[tokio::test]
     async fn commit_intent_audit_failure_preserves_running_and_candidate() {
         for failure in [
