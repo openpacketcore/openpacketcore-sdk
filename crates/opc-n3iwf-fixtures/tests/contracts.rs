@@ -169,6 +169,10 @@ fn ike_and_xfrm_are_separated() {
     let ike_needles = [
         "procedure=create-child-sa",
         "procedure=modify-child-sa",
+        "notify_type=55504",
+        "notify_type=55508",
+        "notify_types=55501,55504",
+        "notify_types=55508,55501",
         "protocol=ESP",
         "mobility_wire_only=true",
         "backend_roster=out-of-scope",
@@ -242,12 +246,97 @@ fn ngap_publishes_matrices_for_every_admitted_outcome() {
         assert!(messages.contains(admitted.as_str()), "{admitted}");
     }
     assert!(saw_paging);
+    assert!(completion
+        .admission_scope
+        .contains("first-cnf-typed-subset"));
     assert!(fixture_ids
         .iter()
         .any(|id| id.contains("positive-ngsetup-external")));
     assert!(fixture_ids
         .iter()
         .any(|id| id.contains("unsupported-paging-5-4")));
+}
+
+#[test]
+fn ngap_matrices_lock_ie_ids_to_policy_rs() {
+    let catalog = FixtureCatalog::load().expect("catalog must load");
+    let policy = include_str!("../../opc-proto-ngap/src/policy.rs");
+    let names = [
+        ("NGSetupRequest", "NG_SETUP_REQUEST"),
+        ("NGSetupResponse", "NG_SETUP_RESPONSE"),
+        ("NGSetupFailure", "NG_SETUP_FAILURE"),
+        ("InitialUEMessage", "INITIAL_UE_MESSAGE"),
+        ("DownlinkNASTransport", "DOWNLINK_NAS_TRANSPORT"),
+        ("UplinkNASTransport", "UPLINK_NAS_TRANSPORT"),
+        (
+            "InitialContextSetupRequest",
+            "INITIAL_CONTEXT_SETUP_REQUEST",
+        ),
+        (
+            "InitialContextSetupResponse",
+            "INITIAL_CONTEXT_SETUP_RESPONSE",
+        ),
+        (
+            "InitialContextSetupFailure",
+            "INITIAL_CONTEXT_SETUP_FAILURE",
+        ),
+        (
+            "PDUSessionResourceSetupRequest",
+            "PDU_SESSION_RESOURCE_SETUP_REQUEST",
+        ),
+        (
+            "PDUSessionResourceSetupResponse",
+            "PDU_SESSION_RESOURCE_SETUP_RESPONSE",
+        ),
+        (
+            "PDUSessionResourceReleaseCommand",
+            "PDU_SESSION_RESOURCE_RELEASE_COMMAND",
+        ),
+        (
+            "PDUSessionResourceReleaseResponse",
+            "PDU_SESSION_RESOURCE_RELEASE_RESPONSE",
+        ),
+        ("UEContextReleaseCommand", "UE_CONTEXT_RELEASE_COMMAND"),
+        ("UEContextReleaseComplete", "UE_CONTEXT_RELEASE_COMPLETE"),
+        ("Paging", "PAGING"),
+    ];
+    for matrix in catalog.ngap_matrices() {
+        let const_name = names
+            .iter()
+            .find(|(message, _)| *message == matrix.message)
+            .map(|(_, name)| *name)
+            .expect(matrix.message.as_str());
+        let marker = format!("const {const_name}: IeProfile");
+        let start = policy.find(&marker).expect(const_name);
+        let rest = &policy[start..];
+        let end = rest.find("]);").expect("profile end");
+        let block = &rest[..end];
+        let mut ids = BTreeSet::new();
+        for line in block.lines() {
+            let Some(after) = line.split("IeRule::singleton(").nth(1) else {
+                continue;
+            };
+            let parts: Vec<&str> = after.split(',').collect();
+            let id: u16 = parts[0].trim().parse().expect("ie id");
+            let crit = if parts[1].contains("REJECT") {
+                "reject"
+            } else if parts[1].contains("IGNORE") {
+                "ignore"
+            } else {
+                "notify"
+            };
+            ids.insert((id, crit.to_string()));
+        }
+        let published: BTreeSet<(u16, String)> = matrix
+            .ies
+            .iter()
+            .map(|ie| (ie.id, ie.criticality.clone()))
+            .collect();
+        assert_eq!(published, ids, "{}", matrix.message);
+        assert!(matrix
+            .n3iwf_content_exceptions
+            .contains("5.3 RAN-specific ignore is not encoded"));
+    }
 }
 
 #[test]

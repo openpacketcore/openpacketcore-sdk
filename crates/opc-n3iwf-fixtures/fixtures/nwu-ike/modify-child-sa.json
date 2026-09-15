@@ -6,9 +6,10 @@
     "document": "3GPP TS 24.502",
     "release": "V18.8.0",
     "clauses": [
-      "7.6",
+      "7.6.2",
       "8.3",
-      "9.3.1.1"
+      "9.3.1.1",
+      "9.3.1.8"
     ]
   },
   "direction": "n3iwf-to-ue",
@@ -19,7 +20,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Clause 7.6 modify-child-sa 5G_QOS_INFO with updated QFI 10"
+    "notes": "Clause 7.6.2 INFORMATIONAL: UP_SA_INFO 55508 then 5G_QOS_INFO QFI 10"
   },
   "sanitized_fields": [
     {
@@ -30,11 +31,12 @@
   ],
   "wire": {
     "path": "wire/modify-child-sa.hex",
-    "digest_sha256": "87574934ef5571990465aad007a73c88cec8f2a713ad4147d9e5b134e1bfe6da"
+    "digest_sha256": "da2e875ee2734de12b306d976b24d3ffedc971a4f316479ef5dfcb1e04fa8271"
   },
   "semantic_assertions": [
     "procedure=modify-child-sa",
-    "notify_type=55501",
+    "notify_types=55508,55501",
+    "spi_size=4",
     "qfi=10",
     "backend_roster=out-of-scope"
   ],

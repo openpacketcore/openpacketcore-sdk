@@ -98,5 +98,6 @@
     "matrices/ue-context-release-command.json",
     "matrices/ue-context-release-complete.json",
     "matrices/paging.json"
-  ]
+  ],
+  "admission_scope": "issue-493-first-cnf-typed-subset-admitted-by-ts29413-5.2"
 }

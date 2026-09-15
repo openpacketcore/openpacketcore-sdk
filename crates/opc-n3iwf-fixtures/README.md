@@ -23,7 +23,7 @@ without waiting for the remaining subsets.
 | --- | --- |
 | `eap5g` | TS 24.502 V18.8.0 EAP-5G Start/NAS/Notification/Stop; spare ignore ≠ caller duplicate-singleton |
 | `nwu-ike` | TS 24.502 7.5/7.6 create/modify plus notify/Delete/MOBIKE wire; XFRM roster is out of scope |
-| `ngap` | TS 38.413 V18.10.0 Rel-18 NGSetupRequest plus 29.413 5.2–5.4 IE matrices; constructed send unsupported |
+| `ngap` | TS 38.413 V18.10.0 Rel-18 NGSetupRequest plus first-CNF 29.413 5.2–5.4 IE matrices; constructed send unsupported |
 | `n2-sctp` | TS 38.412 V18.1.0 clause 7 PPID 60 / port 38412; PPID 66 belongs to `n2-dtls` |
 | `gre-qfi` | NWu GRE C=0 K=1 S=0; received nonzero Protocol Type ignored |
 | `n3-gtpu` | Reuses issue 341 Echo/Recovery/PSC vectors; direction-specific PSC; Recovery zero/ignored |

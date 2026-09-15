@@ -133,6 +133,12 @@ def check_catalog() -> list[str]:
             errors.append(f"{rel}: TS 29.413 release must be V18.5.0")
         if matrix.get("constructed_send") is True:
             errors.append(f"{rel}: constructed send must stay unsupported")
+        if "5.3 RAN-specific ignore is not encoded" not in matrix.get(
+            "n3iwf_content_exceptions", ""
+        ):
+            errors.append(f"{rel}: missing 5.3 non-encoding note")
+    if "first-cnf-typed-subset" not in ngap_completion.get("admission_scope", ""):
+        errors.append("ngap: admission_scope must stay first-CNF typed subset")
 
     def has_id_fragment(subset: str, fragment: str) -> bool:
         return any(

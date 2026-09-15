@@ -941,7 +941,8 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
     nas_ip4 = "00 00 00 0c 00 00 d8 ce c0 00 02 0a"
     nas_tcp = "00 00 00 0a 00 00 d8 d2 4e 20"
     qos = "00 00 00 0d 00 00 d8 cd 04 05 01 09 00"
-    up_ip4 = "00 00 00 0c 00 00 d8 d4 c0 00 02 0b"
+    up_ip4 = "00 00 00 0c 00 00 d8 d0 c0 00 02 0b"
+    up_sa = "00 00 00 0c 03 04 d8 d4 0a 0b 0c 0d"
     delete = "00 00 00 0c 03 04 00 01 0a 0b 0c 0d"
     mobike = "00 00 00 0c 00 00 40 0d c0 00 02 0a"
     unknown_crit = "00 80 00 08 7f 00 00 00"
@@ -951,15 +952,19 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
     truncated = "00 00 00 0c 00 00 d8 ce c0"
     overflow = "00 00 00 08 ff 00 d8 ce"
     create_child = (
-        "29 00 00 0d 00 00 d8 cd 04 05 01 09 00 "
-        "00 00 00 0c 00 00 d8 d4 c0 00 02 0b"
+        "29 00 00 0d 00 00 d8 cd 04 05 01 09 02 "
+        "00 00 00 0c 00 00 d8 d0 c0 00 02 0b"
     )
-    modify_child = "00 00 00 0d 00 00 d8 cd 04 05 01 0a 00"
+    modify_child = (
+        "29 00 00 0c 03 04 d8 d4 0a 0b 0c 0d "
+        "00 00 00 0d 00 00 d8 cd 04 05 01 0a 00"
+    )
     wires = [
         nas_ip4,
         nas_tcp,
         qos,
         up_ip4,
+        up_sa,
         delete,
         mobike,
         create_child,
@@ -1035,17 +1040,41 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             case_class="positive",
             document="3GPP TS 24.502",
             release="V18.8.0",
-            clauses=["7.5.2", "9.3.1.8"],
+            clauses=["7.5.2", "9.3.1.4"],
             direction="n3iwf-to-ue",
             role="n3iwf",
             prerequisite="CREATE_CHILD_SA selected; XFRM roster is a separate subset",
             provenance_class="spec-authored",
-            notes="UP_IP4_ADDRESS 55508 with documentation IPv4 192.0.2.11",
+            notes="UP_IP4_ADDRESS 55504 with documentation IPv4 192.0.2.11",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="positive-up-ip4",
             wire_hex=up_ip4,
-            assertions=["notify_type=55508", "address=192.0.2.11", "spi_size=0"],
+            assertions=["notify_type=55504", "address=192.0.2.11", "spi_size=0"],
+            outcome="constructed",
+        ),
+        manifest(
+            subset="nwu-ike",
+            name="positive-up-sa-info",
+            case_class="positive",
+            document="3GPP TS 24.502",
+            release="V18.8.0",
+            clauses=["7.6.2", "9.3.1.8"],
+            direction="n3iwf-to-ue",
+            role="n3iwf",
+            prerequisite="Existing Child SA; roster SPI provenance is a separate subset",
+            provenance_class="spec-authored",
+            notes="UP_SA_INFO 55508 with Protocol ID ESP, SPI Size 4, synthetic inbound SPI",
+            referenced=None,
+            sanitized=SYN_ID,
+            wire_name="positive-up-sa-info",
+            wire_hex=up_sa,
+            assertions=[
+                "notify_type=55508",
+                "protocol=ESP",
+                "spi_size=4",
+                "backend_roster=out-of-scope",
+            ],
             outcome="constructed",
         ),
         manifest(
@@ -1097,14 +1126,15 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             role="n3iwf",
             prerequisite="CREATE_CHILD_SA selected; XFRM roster is a separate subset",
             provenance_class="spec-authored",
-            notes="Clause 7.5 CREATE_CHILD_SA notify chain: 5G_QOS_INFO then UP_IP4_ADDRESS",
+            notes="Clause 7.5 CREATE_CHILD_SA notify chain: 5G_QOS_INFO (DCSI) then UP_IP4_ADDRESS 55504",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="create-child-sa",
             wire_hex=create_child,
             assertions=[
                 "procedure=create-child-sa",
-                "notify_types=55501,55508",
+                "notify_types=55501,55504",
+                "dcsi=1",
                 "backend_roster=out-of-scope",
             ],
             outcome="constructed",
@@ -1115,19 +1145,20 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             case_class="positive",
             document="3GPP TS 24.502",
             release="V18.8.0",
-            clauses=["7.6", "8.3", "9.3.1.1"],
+            clauses=["7.6.2", "8.3", "9.3.1.1", "9.3.1.8"],
             direction="n3iwf-to-ue",
             role="n3iwf",
             prerequisite="Existing Child SA; INFORMATIONAL modify; roster stays out of scope",
             provenance_class="spec-authored",
-            notes="Clause 7.6 modify-child-sa 5G_QOS_INFO with updated QFI 10",
+            notes="Clause 7.6.2 INFORMATIONAL: UP_SA_INFO 55508 then 5G_QOS_INFO QFI 10",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="modify-child-sa",
             wire_hex=modify_child,
             assertions=[
                 "procedure=modify-child-sa",
-                "notify_type=55501",
+                "notify_types=55508,55501",
+                "spi_size=4",
                 "qfi=10",
                 "backend_roster=out-of-scope",
             ],
@@ -1261,10 +1292,11 @@ overlap, SPI provenance, rekey, and roster relocation belong to `xfrm-roster`.
 | NAS_IP4_ADDRESS | 55502 | 192.0.2.10 |
 | NAS_TCP_PORT | 55506 | 20000 |
 | 5G_QOS_INFO | 55501 | PDU session 5, QFI 9 or 10 |
-| UP_IP4_ADDRESS | 55508 | 192.0.2.11 |
+| UP_IP4_ADDRESS | 55504 | 192.0.2.11 |
+| UP_SA_INFO | 55508 | ESP SPI Size 4, synthetic SPI |
 | ADDITIONAL_IP4_ADDRESS | 16397 | 192.0.2.10 |
-| CREATE_CHILD_SA chain | TS 24.502 7.5 | 55501 then 55508 |
-| MODIFY_CHILD_SA | TS 24.502 7.6 | 55501 QFI 10 |
+| CREATE_CHILD_SA chain | TS 24.502 7.5.2 | 55501 then 55504 |
+| MODIFY_CHILD_SA | TS 24.502 7.6.2 | 55508 then 55501 |
 | Delete ESP | RFC 7296 §3.11 | one synthetic SPI |
 """,
     )
@@ -1278,8 +1310,9 @@ overlap, SPI provenance, rekey, and roster relocation belong to `xfrm-roster`.
                 "NAS_TCP_PORT",
                 "5G_QOS_INFO",
                 "UP_IP4_ADDRESS",
+                "UP_SA_INFO",
                 "CREATE_CHILD_SA notify chain",
-                "MODIFY_CHILD_SA 5G_QOS_INFO",
+                "MODIFY_CHILD_SA INFORMATIONAL pair",
                 "Delete ESP",
             ],
             receive=["MOBIKE additional-address notify", "notify reordering"],
@@ -1311,8 +1344,13 @@ def ngap_matrix_record(spec: dict) -> dict:
         "application": {
             "document": "3GPP TS 29.413",
             "release": "V18.5.0",
-            "clauses": [spec["ts29413_clause"], "5.3"],
+            "clauses": [spec["ts29413_clause"]],
         },
+        "n3iwf_content_exceptions": (
+            "TS 29.413 5.3 RAN-specific ignore is not encoded; "
+            "rows are TS 38.413 identifier/criticality/cardinality"
+        ),
+        "admission_scope": "issue-493-first-cnf-typed-subset",
         "wire_fixture_id": spec["wire_fixture_id"],
         "ies": [
             {
@@ -1588,7 +1626,9 @@ V18.5.0 clauses 5.2–5.4 decide which first-CNF messages are admitted for
 N3IWF. Canonical typed encode remains unsupported.
 
 `matrices/` publishes identifier/criticality/cardinality for every admitted
-sent/received outcome plus Paging (5.4 discard). Constructed N3IWF send is
+first-CNF sent/received outcome plus Paging (5.4 discard). TS 29.413 5.2
+messages outside the issue 493 typed subset stay unpublished. Clause 5.3
+RAN-specific ignore is not encoded in the rows. Constructed N3IWF send is
 unsupported. This crate does not select an AMF or apply subscriber policy.
 """,
     )
@@ -1603,6 +1643,7 @@ unsupported. This crate does not select an AMF or apply subscriber policy.
             extra={
                 "admitted_outcomes": admitted,
                 "matrices": matrix_paths,
+                "admission_scope": "issue-493-first-cnf-typed-subset-admitted-by-ts29413-5.2",
             },
         ),
     )
@@ -3345,7 +3386,11 @@ def write_publication(existing: dict | None = None) -> None:
 
 
 def stamp_publication_from_git() -> None:
-    """Record the public HEAD commit and fixtures tree after they exist."""
+    """Record the public HEAD commit and fixtures tree after they exist.
+
+    Run this only on the catalog content commit. A later stamp at the
+    publication commit would point ``head`` at itself.
+    """
     head = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()

@@ -76,8 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TS 38.415 V18.2.0 5.5.3, TS 33.501 V18.12.0 7.2.1, RFC 7296, and RFC 4555.
   Reuses the issue 493 NGAP DecodeContext vector and issue 341 GTP-U
   Echo/PSC bytes by digest. NGAP publishes Rel-18 bytes plus IE
-  cardinality/criticality matrices for every admitted 5.2 outcome; Paging is
-  5.4 unsupported. Crate and rust-gates detectors fail closed on missing
+  cardinality/criticality matrices for every admitted first-CNF 5.2 outcome;
+  Paging is 5.4 unsupported. 5.2 messages outside that typed subset stay
+  unpublished. Crate and rust-gates detectors fail closed on missing
   classes, digest mutation, and forbidden content. No codec, adapter, or
   key-handle runtime is activated. Application policy, subscriber
   authentication decisions, AMF selection, deployment, readiness, and

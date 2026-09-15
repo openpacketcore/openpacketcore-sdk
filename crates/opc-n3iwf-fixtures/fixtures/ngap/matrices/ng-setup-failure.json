@@ -17,10 +17,11 @@
     "document": "3GPP TS 29.413",
     "release": "V18.5.0",
     "clauses": [
-      "5.2",
-      "5.3"
+      "5.2"
     ]
   },
+  "n3iwf_content_exceptions": "TS 29.413 5.3 RAN-specific ignore is not encoded; rows are TS 38.413 identifier/criticality/cardinality",
+  "admission_scope": "issue-493-first-cnf-typed-subset",
   "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ng-setup-failure",
   "ies": [
     {

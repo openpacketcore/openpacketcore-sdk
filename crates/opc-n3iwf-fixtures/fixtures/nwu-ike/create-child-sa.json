@@ -20,7 +20,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Clause 7.5 CREATE_CHILD_SA notify chain: 5G_QOS_INFO then UP_IP4_ADDRESS"
+    "notes": "Clause 7.5 CREATE_CHILD_SA notify chain: 5G_QOS_INFO (DCSI) then UP_IP4_ADDRESS 55504"
   },
   "sanitized_fields": [
     {
@@ -31,11 +31,12 @@
   ],
   "wire": {
     "path": "wire/create-child-sa.hex",
-    "digest_sha256": "15c0bc68370a25658a48d1584f7dec6d32cc4bd4ba917111dad4ab694fc41194"
+    "digest_sha256": "b4bbac8d9c06838a1148a0f1d7a294e9b7213d5ab3e8499b7caa1f31e920c4f9"
   },
   "semantic_assertions": [
     "procedure=create-child-sa",
-    "notify_types=55501,55508",
+    "notify_types=55501,55504",
+    "dcsi=1",
     "backend_roster=out-of-scope"
   ],
   "expected_outcome": "constructed",

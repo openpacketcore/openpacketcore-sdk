@@ -259,6 +259,9 @@ pub struct SubsetCompletion {
     /// Relative matrix paths owned by this subset.
     #[serde(default)]
     pub matrices: Vec<String>,
+    /// Limits NGAP admission to the first-CNF typed subset, if present.
+    #[serde(default)]
+    pub admission_scope: String,
 }
 
 /// One IE identifier/criticality/cardinality row.
@@ -295,6 +298,12 @@ pub struct MessageIeMatrix {
     pub source: SourceRef,
     /// TS 29.413 application to non-3GPP access.
     pub application: SourceRef,
+    /// Reminder that clause 5.3 ignore-on-receive is not encoded in the rows.
+    #[serde(default)]
+    pub n3iwf_content_exceptions: String,
+    /// First-CNF typed subset vs the full 5.2 message list.
+    #[serde(default)]
+    pub admission_scope: String,
     /// Manifest that carries the admitted wire octets.
     #[serde(default)]
     pub wire_fixture_id: Option<String>,
@@ -619,7 +628,11 @@ fn detect_completion(
         return Err(ContractError::new(ContractErrorCode::CompletionMismatch));
     }
     if subset == "ngap"
-        && (completion.admitted_outcomes.is_empty() || completion.matrices.is_empty())
+        && (completion.admitted_outcomes.is_empty()
+            || completion.matrices.is_empty()
+            || !completion
+                .admission_scope
+                .contains("first-cnf-typed-subset"))
     {
         return Err(ContractError::new(ContractErrorCode::MissingMatrix));
     }

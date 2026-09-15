@@ -71,9 +71,12 @@ Every subset publishes at least one fixture in each class:
   open. EOF/loss of an incomplete frame or bounded-length overflow finalizes
   as reject.
 - NGAP reuses the issue 493 Rel-18 DecodeContext vector (TS 38.413 V18.10.0).
-  TS 29.413 V18.5.0 5.2–5.4 decide admission. Every admitted sent/received
-  outcome publishes an IE cardinality/criticality matrix. Paging is 5.4
-  unsupported. Canonical typed encode remains unsupported.
+  TS 29.413 V18.5.0 5.2–5.4 decide admission for the issue 493 first-CNF
+  typed subset. Every admitted first-CNF sent/received outcome publishes an
+  IE cardinality/criticality matrix. Paging is 5.4 unsupported. Clause 5.3
+  RAN-specific ignore is documented, not encoded. Canonical typed encode
+  remains unsupported. 5.2 messages outside that typed subset stay
+  unpublished.
 - NWu GRE received nonzero Protocol Type is ignored.
 - N3 GTP-U downlink PSC is type 0; uplink PSC is type 1 QFI-only. Received
   Recovery is ignored and canonicalized to zero.

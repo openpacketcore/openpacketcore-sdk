@@ -45,7 +45,7 @@ subset alone. 🚫 = explicitly unsupported in this crate.
 | --- | --- | --- | --- | --- |
 | eap5g | ✅ | Start; Notification (Message-Id 3) | NAS; Stop (Message-Id 4); spare ignore; permitted reorder | subscriber authentication, SUCI, EAP key derivation |
 | nwu-ike | ✅ | notifies; CREATE_CHILD_SA 7.5; MODIFY_CHILD_SA 7.6; Delete ESP | MOBIKE ADDITIONAL_IP4_ADDRESS | XFRM install, SPI allocation, authentication |
-| ngap | ✅ | none (typed encode unsupported) | Rel-18 NGSetupRequest; 5.2 empty wrappers + IE matrices | constructed send; Paging (29.413 5.4); AMF selection |
+| ngap | ✅ | none (typed encode unsupported) | Rel-18 NGSetupRequest; first-CNF 5.2 empty wrappers + IE matrices | constructed send; 5.2 messages outside first-CNF; Paging (29.413 5.4); AMF selection |
 | n2-sctp | ✅ | PPID 60 / port 38412 | metadata order variants | PPID 66 on this profile; DTLS |
 | gre-qfi | ✅ | downlink QFI+RQI | uplink QFI; nonzero Protocol Type ignore | XFRM install; QFI allocation |
 | n3-gtpu | ✅ | Echo Request/Response Recovery 0; uplink PSC | downlink PSC; ignored Recovery; End Marker order | backend control port; eBPF offload (issue 644) |
