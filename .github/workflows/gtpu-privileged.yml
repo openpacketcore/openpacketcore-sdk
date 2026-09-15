@@ -455,7 +455,9 @@ jobs:
           # floating `latest` would silently drift onto a newer z-stream and
           # quietly stop testing the shipping kernel.
           image="${RUNNER_TEMP}/rocky94-el9.qcow2"
-          curl --fail --location --retry 3 \
+          # Hosted HTTP/2 transfers from this vault have repeatedly ended with
+          # curl error 92 before completion. Use HTTP/1.1 for this pinned image.
+          curl --http1.1 --fail --location --retry 3 \
             --output "${image}" \
             https://dl.rockylinux.org/vault/rocky/9.4/images/x86_64/Rocky-9-GenericCloud-Base-9.4-20240609.1.x86_64.qcow2
           echo "2179864f4fa9799f11c0824c439666c2451d6751450494e20034efd4f3fa0559  ${image}" \
