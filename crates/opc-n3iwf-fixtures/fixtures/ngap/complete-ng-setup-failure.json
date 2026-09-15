@@ -1,0 +1,80 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "ngap-release18-message",
+  "context": {
+    "message": "NGSetupFailure",
+    "independent_asn1_validation": true,
+    "reference_error": null,
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "preserve",
+    "validation_level": "strict",
+    "sdk_structural_outcome": "receive",
+    "sdk_semantic_validation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.complete-ng-setup-failure",
+  "subset": "ngap",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.6.3",
+      "9.4.4",
+      "9.4.5",
+      "TS 29.413 5.3"
+    ]
+  },
+  "direction": "amf-to-n3iwf",
+  "role": "amf",
+  "prerequisite": "Independent Pycrate 0.8.1 compiled from the hash-pinned ETSI Release 18.10 publication. Existing SDK tests exercise structural decode separately. Session outcomes use synthetic requested resources; inner NAS is opaque.",
+  "provenance": {
+    "class": "spec-authored",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json",
+    "notes": "Independently encoded ASN.1 recipe; no SDK encoder, capture, or real peer. Source SHA-256 21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2. The reference gate recompiles all six modules and checks the complete wire, nested transfers, mandatory fields and enumerated N3IWF conditions."
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "SecurityKey",
+      "treatment": "all-zero-256-bit-test-placeholder-if-present",
+      "value_class": "synthetic-not-peer-key"
+    },
+    {
+      "name": "NAS-PDU",
+      "treatment": "opaque-synthetic-four-octet-container",
+      "value_class": "non-subscriber"
+    },
+    {
+      "name": "addresses",
+      "treatment": "RFC5737-and-RFC3849-documentation-ranges",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "PLMN",
+      "treatment": "reserved-test-001-01",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/complete-ng-setup-failure.hex",
+    "digest_sha256": "e391328d1ff2210900d3301cd895d73cbfdcbdae1ea2e37a784177261090e18a"
+  },
+  "semantic_assertions": [
+    "message=NGSetupFailure",
+    "reference=pycrate-0.8.1-ts38413-v18.10.0",
+    "reference_result=accept",
+    "sdk_structural_result=receive",
+    "inner_nas=opaque",
+    "constructed_sdk_encode=unsupported",
+    "runtime_claim=false"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

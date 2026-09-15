@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import n3iwf_fixture_oracles as oracle
 
@@ -313,6 +314,40 @@ class PublicationRegressions(unittest.TestCase):
 
 
 class GeneratorRegressions(unittest.TestCase):
+
+    def test_ngap_reference_cannot_escape_or_overwrite_an_output(self):
+        spec = importlib.util.spec_from_file_location(
+            "writer", ROOT / "scripts/generate-n3iwf-fixtures.py"
+        )
+        writer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(writer)
+        reference_path = Path(
+            "crates/opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json"
+        )
+        original = (ROOT / reference_path).read_text()
+        for mutation in ("escape", "duplicate", "digest"):
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                reference = json.loads(original)
+                if mutation == "escape":
+                    reference["cases"][0]["name"] = "../../escaped"
+                elif mutation == "duplicate":
+                    reference["cases"][1]["name"] = reference["cases"][0]["name"]
+                else:
+                    reference["cases"][0]["wire_sha256"] = "0" * 64
+                (root / reference_path).parent.mkdir(parents=True)
+                (root / reference_path).write_text(json.dumps(reference))
+                writer.ROOT = root
+                destination = root / "output/ngap"
+                destination.mkdir(parents=True)
+                # Keep the test safe even when the path guard is removed.
+                with mock.patch.object(writer, "dump_manifest") as publish:
+                    with self.assertRaises(ValueError):
+                        writer.ngap_complete_messages(destination)
+                    publish.assert_not_called()
+
     def test_check_is_read_only_and_rejects_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

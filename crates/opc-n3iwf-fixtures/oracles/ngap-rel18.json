@@ -1,7 +1,7 @@
 {
   "document": "3GPP TS 38.413",
   "release": "V18.10.0",
-  "clause": "9.4.3",
+  "clause": "9.4.4",
   "source_url": "https://www.etsi.org/deliver/etsi_ts/138400_138499/138413/18.10.00_60/ts_138413v181000p.pdf",
   "source_sha256": "21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2",
   "scope": "Top-level protocol IE sets only. TS 29.413 application exceptions and inner IE value constraints are separate.",

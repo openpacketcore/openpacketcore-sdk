@@ -87,6 +87,21 @@ jobs:
           python3 scripts/check-n3iwf-fixture-contracts.py --self-test
           python3 scripts/check-n3iwf-fixture-contracts.py --check
 
+      - name: Validate complete NGAP messages with independent Release 18 ASN.1
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/ngap-reference"
+          "${RUNNER_TEMP}/ngap-reference/bin/pip" install --require-hashes --only-binary=:all: \
+            -r scripts/n3iwf-ngap-reference-requirements.txt
+          "${RUNNER_TEMP}/ngap-reference/bin/python" scripts/check-n3iwf-ngap-reference.py \
+            --report "${RUNNER_TEMP}/ngap-reference-report.json"
+
+      - name: Archive independent NGAP validation report
+        uses: actions/upload-artifact@v7
+        with:
+          name: ngap-independent-release18-reference
+          path: ${{ runner.temp }}/ngap-reference-report.json
+          if-no-files-found: error
+
       - name: Test SDK-702 release-attestation wrapper environment
         run: |
           python3 ci/test-sdk702-release-attest.py
