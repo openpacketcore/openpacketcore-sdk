@@ -5840,6 +5840,14 @@ where
             }
         }
 
+        let intent_event = AuditEvent::new(
+            context.request_id,
+            context.principal,
+            self.transport,
+            AuditOperation::Update,
+            AuditOutcome::Intent,
+        )
+        .with_paths(self.schema_paths_for_changed_paths(&changed_paths, kind.path()));
         let commit_request = CommitRequest::commit(
             context.request_id,
             context.principal.clone(),
@@ -5851,6 +5859,19 @@ where
             Instant::now() + Duration::from_secs(30),
         )
         .with_base_version(snapshot.version);
+
+        if commit_audit_failed(&self.audit, &intent_event).await {
+            record_rpc_error(
+                kind.metric(),
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
 
         match bus.submit(commit_request).await {
             Ok(result) => {
@@ -13637,13 +13658,17 @@ mod tests {
         assert_eq!(sessions.running_write_owner_for_test(), None);
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].operation, AuditOperation::Update);
-        assert_eq!(events[0].outcome, AuditOutcome::Success);
-        assert_eq!(
-            events[0].schema_paths,
-            vec![schema_node_path("/sys:system/sys:hostname")]
-        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        for event in events.iter() {
+            assert_eq!(event.operation, AuditOperation::Update);
+            assert_eq!(
+                event.schema_paths,
+                vec![schema_node_path("/sys:system/sys:hostname")]
+            );
+        }
         assert!(netconf_rpc_requests("edit-config", "success") > successes_before);
     }
 
@@ -13674,10 +13699,11 @@ mod tests {
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
+        let audit = ScriptedCommitAudit::new(CommitAuditFailure::TerminalError);
         let server = ReadOnlyNetconfServer::new(
             binding,
             FixedPolicy(policy_allow_system_but_deny_secret()),
-            FailingAudit,
+            audit.clone(),
             TransportType::NetconfTls,
         )
         .expect("server");
@@ -13708,6 +13734,15 @@ mod tests {
         let snapshot = bus.current_snapshot();
         assert_eq!(snapshot.config.hostname, "amf-2");
 
+        {
+            let attempts = audit.attempts.lock().expect("audit attempts mutex");
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].outcome, AuditOutcome::Intent);
+            assert_eq!(attempts[1].outcome, AuditOutcome::Success);
+            assert_eq!(attempts[0].request_id, request_id);
+            assert_eq!(attempts[1].request_id, request_id);
+            assert!(audit.failure.lock().expect("audit failure mutex").is_none());
+        }
         let latest = store.latest().await.expect("durable commit record");
         assert_eq!(latest.config.hostname, "amf-2");
         assert_eq!(latest.source, RequestSource::Northbound);
@@ -13803,11 +13838,18 @@ mod tests {
         assert_eq!(sessions.running_write_owner_for_test(), None);
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
         assert_eq!(events[0].operation, AuditOperation::Update);
-        assert_eq!(events[0].outcome, audit_failed("authorization_denied"));
+        assert_eq!(events[0].request_id, events[1].request_id);
         assert_eq!(
             events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert_eq!(events[1].operation, AuditOperation::Update);
+        assert_eq!(events[1].outcome, audit_failed("authorization_denied"));
+        assert_eq!(
+            events[1].schema_paths,
             vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
         );
     }
@@ -16271,8 +16313,12 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.operation, AuditOperation::Update))
             .collect();
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].outcome, AuditOutcome::Success);
+        assert_eq!(events.len(), 2);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].outcome, AuditOutcome::Intent);
+        assert_eq!(updates[1].outcome, AuditOutcome::Success);
+        assert_eq!(updates[0].request_id, updates[1].request_id);
+        assert_eq!(updates[0].schema_paths, updates[1].schema_paths);
     }
 
     #[tokio::test]
@@ -16562,13 +16608,17 @@ mod tests {
         assert!(!result.reply_xml.contains("do-not-leak"));
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].operation, AuditOperation::Update);
-        assert_eq!(events[0].outcome, AuditOutcome::Success);
-        assert_eq!(
-            events[0].schema_paths,
-            vec![schema_node_path("/sys:system/sys:hostname")]
-        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        for event in events.iter() {
+            assert_eq!(event.operation, AuditOperation::Update);
+            assert_eq!(
+                event.schema_paths,
+                vec![schema_node_path("/sys:system/sys:hostname")]
+            );
+        }
         assert!(netconf_rpc_requests("edit-data", "success") > successes_before);
     }
 
@@ -17222,6 +17272,133 @@ mod tests {
         assert_eq!(commit_events[0].transport, TransportType::NetconfTls);
         assert!(commit_events[0].tx_id.is_none());
         assert!(commit_events[1].tx_id.is_some());
+    }
+
+    async fn assert_running_edit_requires_audit_intent(edit: &str) {
+        for failure in [
+            CommitAuditFailure::IntentError,
+            CommitAuditFailure::IntentPanic,
+        ] {
+            let audit = ScriptedCommitAudit::new(failure);
+            let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
+            let registry = SessionRegistry::new();
+            let _registration = registry.register(1).expect("register session");
+            let request_id = RequestId::new();
+            let rejected = server
+                .handle_rpc_for_session_async(
+                    request_id,
+                    &principal(),
+                    edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+
+            assert_eq!(
+                bus.current_snapshot().version,
+                ConfigVersion::new(1),
+                "failed required intent must prevent a running configuration commit"
+            );
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+            assert!(rejected
+                .reply_xml
+                .contains("<error-tag>operation-failed</error-tag>"));
+            assert!(!rejected.reply_xml.contains("<ok/>"));
+            assert!(!rejected.reply_xml.contains("secret-admin"));
+            assert!(!rejected.reply_xml.contains("/sys:system"));
+            assert_eq!(registry.running_write_owner_for_test(), None);
+            {
+                let attempts = audit.attempts.lock().expect("audit attempts mutex");
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].request_id, request_id);
+                assert_eq!(attempts[0].outcome, AuditOutcome::Intent);
+                assert_eq!(attempts[0].operation, AuditOperation::Update);
+                assert_eq!(
+                    attempts[0].schema_paths,
+                    vec![schema_node_path("/sys:system/sys:hostname")]
+                );
+                assert!(attempts[0].tx_id.is_none());
+            }
+
+            let retry_request_id = RequestId::new();
+            let retried = server
+                .handle_rpc_for_session_async(
+                    retry_request_id,
+                    &principal(),
+                    edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+            assert!(retried.reply_xml.contains("<ok/>"));
+            assert_eq!(bus.current_snapshot().version, ConfigVersion::new(2));
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+            assert_eq!(registry.running_write_owner_for_test(), None);
+            let attempts = audit.attempts.lock().expect("audit attempts mutex");
+            assert_eq!(attempts.len(), 3);
+            assert_eq!(attempts[1].request_id, retry_request_id);
+            assert_eq!(attempts[2].request_id, retry_request_id);
+            assert_eq!(attempts[1].outcome, AuditOutcome::Intent);
+            assert_eq!(attempts[2].outcome, AuditOutcome::Success);
+            assert_eq!(attempts[1].schema_paths, attempts[2].schema_paths);
+        }
+    }
+
+    #[tokio::test]
+    async fn running_edit_config_requires_audit_intent() {
+        let edit = edit_config_rpc(
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        assert_running_edit_requires_audit_intent(&edit).await;
+    }
+
+    #[tokio::test]
+    async fn running_edit_data_requires_audit_intent() {
+        let edit = edit_data_rpc(
+            "running",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        assert_running_edit_requires_audit_intent(&edit).await;
+    }
+
+    #[tokio::test]
+    async fn running_edits_contain_audit_intent_construction_panic() {
+        let config = r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#;
+        for edit in [
+            edit_config_rpc(config, "merge"),
+            edit_data_rpc("running", config, "merge"),
+        ] {
+            let (server, bus, _) =
+                generated_edit_server_with_audit(CommitConstructionPanicAudit).await;
+            let registry = SessionRegistry::new();
+            let _registration = registry.register(1).expect("register session");
+            let rejected = server
+                .handle_rpc_for_session_async(
+                    RequestId::new(),
+                    &principal(),
+                    &edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+            assert_eq!(
+                bus.current_snapshot().version,
+                ConfigVersion::new(1),
+                "audit future construction failure must prevent the commit"
+            );
+            assert!(rejected
+                .reply_xml
+                .contains("<error-tag>operation-failed</error-tag>"));
+            assert!(!rejected
+                .reply_xml
+                .contains("scripted audit construction panic"));
+            assert_eq!(registry.running_write_owner_for_test(), None);
+        }
     }
 
     #[tokio::test]

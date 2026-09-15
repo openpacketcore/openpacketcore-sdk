@@ -171,6 +171,21 @@ so sink implementations must never place sensitive content in panic payloads.
 This contract describes candidate `<commit>`; it does not claim identical
 ordering for every NETCONF operation.
 
+## Running edit audit intent
+
+`<edit-config>` and `<edit-data>` targeting running request an
+`AuditOutcome::Intent` after candidate construction and write authorization,
+before config-bus submission. The intent carries the canonical changed schema
+paths and request identity. A rejected intent or an unwinding sink prevents
+submission, returns a value-free `operation-failed`, and releases the running
+write reservation. The commit request retains its original deadline while
+waiting for the asynchronous audit result.
+
+This pre-submit gate does not complete the terminal-outcome contract in
+issue #796: running edits still return `operation-failed` when terminal audit
+recording fails after a known commit. Recoverable terminal obligations and
+the remaining mutation paths require separate implementation and evidence.
+
 ## Relationships
 
 - Uses `opc-config-bus` and `opc-config-model` for config commits.
