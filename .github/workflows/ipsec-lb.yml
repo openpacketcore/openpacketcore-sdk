@@ -69,6 +69,7 @@ jobs:
           ordinary_timing_contracts=(
             persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
             persistent_three_voter_first_transition_has_one_leader_activation_proof
+            protected_consumer_chain_after_activation_elides_outer_capability_wire_calls
             persistent_three_voter_protected_roster_survives_real_os_process_loss
           )
           # Keep the original bounds while optimizing snapshot log generation

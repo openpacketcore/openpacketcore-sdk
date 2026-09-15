@@ -2489,6 +2489,8 @@ struct CountingFencedConsumerOperations {
     inner: Arc<dyn SessionQuorumConsumer>,
     capability_calls: AtomicUsize,
     transition_calls: AtomicUsize,
+    // Zero means no completed transition has been observed.
+    transition_elapsed_us: AtomicU64,
     status_calls: AtomicUsize,
 }
 
@@ -2498,6 +2500,7 @@ impl CountingFencedConsumerOperations {
             inner,
             capability_calls: AtomicUsize::new(0),
             transition_calls: AtomicUsize::new(0),
+            transition_elapsed_us: AtomicU64::new(0),
             status_calls: AtomicUsize::new(0),
         }
     }
@@ -2510,6 +2513,11 @@ impl SessionQuorumConsumer for CountingFencedConsumerOperations {
         identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
+        let transition_started = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedTransition { .. }
+        )
+        .then(Instant::now);
         match request.operation() {
             SessionConsumerOperation::FencedTransitionCapability => {
                 self.capability_calls.fetch_add(1, Ordering::SeqCst);
@@ -2522,7 +2530,14 @@ impl SessionQuorumConsumer for CountingFencedConsumerOperations {
             }
             _ => {}
         }
-        self.inner.execute(identity, request).await
+        let response = self.inner.execute(identity, request).await;
+        if let Some(started) = transition_started {
+            self.transition_elapsed_us.store(
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+        }
+        response
     }
 
     async fn watch(
@@ -5425,7 +5440,10 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
     fleet.quiesce().await;
 }
 
-#[tokio::test]
+// These colocated voters need the SDK runtime's bounded scheduler handoff
+// during synchronous SQLite commits, even with one async worker. A shared
+// current-thread runtime serializes every voter's disk wait with the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_calls() {
     let pki = Arc::new(TestPki::new());
     let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
@@ -5647,6 +5665,14 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         elapsed.as_micros(),
         executed.is_err(),
         fleet.read_barrier_calls(),
+    );
+    eprintln!(
+        "protected_runtime_observation runtime={:?} server_elapsed_us={:?}",
+        tokio::runtime::Handle::current().runtime_flavor(),
+        counted_services
+            .iter()
+            .map(|service| service.transition_elapsed_us.load(Ordering::SeqCst))
+            .collect::<Vec<_>>(),
     );
     executed
         .expect("prewarmed follower route reaches the elected voter inside the caller budget")
