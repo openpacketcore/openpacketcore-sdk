@@ -422,9 +422,9 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
     nas_ip4 = "00 00 00 0c 00 00 d8 ce c0 00 02 0a"
     nas_tcp = "00 00 00 0a 00 00 d8 d2 4e 20"
     qos = "00 00 00 0d 00 00 d8 cd 04 05 01 09 00"
-    up_sa = "00 00 00 0c 00 04 d8 d4 0a 0b 0c 0d"
-    delete = "00 00 00 0c 03 04 00 02 0a 0b 0c 0d"
-    mobike = "00 00 00 08 00 00 40 40"
+    up_ip4 = "00 00 00 0c 00 00 d8 d4 c0 00 02 0b"
+    delete = "00 00 00 0c 03 04 00 01 0a 0b 0c 0d"
+    mobike = "00 00 00 0c 00 00 40 0d c0 00 02 0a"
     unknown_crit = "00 80 00 08 7f 00 00 00"
     duplicate = "00 00 00 0c 00 00 d8 ce c0 00 02 0a 00 00 00 0c 00 00 d8 ce c0 00 02 0b"
     ordered = "00 00 00 0a 00 00 d8 d2 4e 20 00 00 00 0c 00 00 d8 ce c0 00 02 0a"
@@ -435,7 +435,7 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
         nas_ip4,
         nas_tcp,
         qos,
-        up_sa,
+        up_ip4,
         delete,
         mobike,
         unknown_crit,
@@ -505,21 +505,21 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
         ),
         manifest(
             subset="nwu-ike",
-            name="positive-up-sa-info",
+            name="positive-up-ip4",
             case_class="positive",
             document="3GPP TS 24.502",
             release="V18.8.0",
-            clauses=["8.3", "9.3.1.8"],
+            clauses=["7.5.2", "9.3.1.8"],
             direction="n3iwf-to-ue",
             role="n3iwf",
-            prerequisite="Inbound ESP SPI allocated by caller",
+            prerequisite="CREATE_CHILD_SA selected; XFRM roster is a separate subset",
             provenance_class="spec-authored",
-            notes="UP_SA_INFO 55508 with synthetic SPI 0x0a0b0c0d; not a live SA",
+            notes="UP_IP4_ADDRESS 55508 with documentation IPv4 192.0.2.11",
             referenced=None,
-            sanitized=SYN_ID + NO_KEY,
-            wire_name="positive-up-sa-info",
-            wire_hex=up_sa,
-            assertions=["notify_type=55508", "spi_size=4", "spi_label=synthetic"],
+            sanitized=SYN_ID,
+            wire_name="positive-up-ip4",
+            wire_hex=up_ip4,
+            assertions=["notify_type=55508", "address=192.0.2.11", "spi_size=0"],
             outcome="constructed",
         ),
         manifest(
@@ -552,12 +552,12 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             role="ike-endpoint",
             prerequisite="MOBIKE enabled by caller policy",
             provenance_class="spec-authored",
-            notes="ADDITIONAL_IP4_ADDRESSES notify type 16384 with empty list body",
+            notes="ADDITIONAL_IP4_ADDRESS notify type 16397 with documentation IPv4 192.0.2.10",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="mobility-additional-addresses",
             wire_hex=mobike,
-            assertions=["notify_type=16384", "mobility_wire_only=true"],
+            assertions=["notify_type=16397", "address=192.0.2.10", "mobility_wire_only=true"],
             outcome="receive",
         ),
         manifest(
@@ -688,7 +688,9 @@ provenance, rekey, and roster relocation belong to `xfrm-roster`.
 | NAS_IP4_ADDRESS | 55502 | 192.0.2.10 |
 | NAS_TCP_PORT | 55506 | 20000 |
 | 5G_QOS_INFO | 55501 | PDU session 5, QFI 9 |
-| UP_SA_INFO | 55508 | SPI label 0x0a0b0c0d |
+| UP_IP4_ADDRESS | 55508 | 192.0.2.11 |
+| ADDITIONAL_IP4_ADDRESS | 16397 | 192.0.2.10 |
+| Delete ESP | RFC 7296 §3.11 | one synthetic SPI |
 """,
     )
     write_completion(
@@ -696,7 +698,7 @@ provenance, rekey, and roster relocation belong to `xfrm-roster`.
         completion(
             "nwu-ike",
             fixtures,
-            constructed=["NAS_IP4_ADDRESS", "NAS_TCP_PORT", "5G_QOS_INFO", "UP_SA_INFO", "Delete ESP"],
+            constructed=["NAS_IP4_ADDRESS", "NAS_TCP_PORT", "5G_QOS_INFO", "UP_IP4_ADDRESS", "Delete ESP"],
             receive=["MOBIKE additional-address notify", "notify reordering"],
             unsupported=[
                 "XFRM install",
@@ -902,7 +904,8 @@ def ngap(subset_dir: Path) -> list[dict]:
 public 78-byte NGSetupRequest vector. Canonical typed encode remains
 unsupported. Release 18 identifier/criticality/cardinality matrices for the
 typed procedures live in `crates/opc-proto-ngap/src/policy.rs` and are
-referenced by digest/path rather than copied.
+cited by path. The 78-byte vector is copied by digest and locked to that
+source file by `tests/contracts.rs`.
 
 Admitted send/receive outcomes in this subset: receive NGSetupRequest and
 empty wrappers. Constructed N3IWF encode is unsupported until issue 787.
@@ -922,10 +925,6 @@ empty wrappers. Constructed N3IWF encode is unsupported until issue 787.
             ],
         ),
     )
-    # constructed must be non-empty for detector - I required constructed nonempty.
-    # Fix: use "none-documented" or change detector. I'll put a documented
-    # constructed=unsupported row as a string in constructed? Better update
-    # completion to include a constructed list item that says none.
     return fixtures
 
 
@@ -1292,6 +1291,7 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
 | 4 | `09` | QFI 9 |
 | 5..6 | `00 00` | Spare |
 | 7 | `80` or `00` | RQI downlink-only |
+| 8 | `00` | Next-header / payload terminator used by these frames |
 
 Received nonzero Protocol Type is ignored.
 """,
@@ -2232,13 +2232,17 @@ contain only version, generation, and synthetic SPI labels.
 
 def n2_dtls(subset_dir: Path) -> list[dict]:
     positive = "00 00 00 42"
-    hello = "16 fe fd 00 00 00 00 00 00 00 00 00 0c 01 00 00 06 00 00 00 00 00 00"
+    hello = (
+        "16 fe fd 00 00 00 00 00 00 00 00 00 0c "
+        "01 00 00 00 00 00 00 00 00 00 00 00"
+    )
+    identity = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-expected-peer")
     auth = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-sctp-auth-kat-len-64")
     rekey = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-rekey-generation-2")
     restart = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-path-failure")
     unknown = "00 00 00 3c"
     duplicate = "00 00 00 42 00 00 00 42"
-    ordered = "00 00 00 42 16 fe fd 00 00 00 00 00 00 00 00 00 0c 01 00 00 06 00 00 00 00 00 00"
+    ordered = "00 00 00 42 " + hello
     malformed = "16 03 03 00 00"
     truncated = "16 fe fd"
     overflow = "16 fe fd ff ff"
@@ -2246,6 +2250,7 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
     wires = [
         positive,
         hello,
+        identity,
         auth,
         rekey,
         restart,
@@ -2288,12 +2293,37 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             role="n3iwf",
             prerequisite="Identity is a typed expected-peer label, not a certificate dump",
             provenance_class="synthetic-kat",
-            notes="DTLS record/handshake headers only; no certificate or key bytes",
+            notes="DTLS 1.2 record plus 12-octet handshake header; fragment length 0",
             referenced=None,
             sanitized=SYN_ID + NO_KEY,
             wire_name="positive-handshake-header",
             wire_hex=hello,
-            assertions=["content_type=handshake", "identity=expected-peer-label"],
+            assertions=[
+                "content_type=handshake",
+                "version=dtls-1.2",
+                "record_length=12",
+                "handshake_type=client_hello",
+                "fragment_length=0",
+            ],
+            outcome="constructed",
+        ),
+        manifest(
+            subset="n2-dtls",
+            name="positive-identity-label",
+            case_class="positive",
+            document="IETF RFC 6083",
+            release="RFC 6083",
+            clauses=["4"],
+            direction="local",
+            role="n3iwf",
+            prerequisite="Identity is a typed expected-peer label, not a certificate dump",
+            provenance_class="synthetic-kat",
+            notes="Expected-peer identity label only; no certificate or exporter secret",
+            referenced=None,
+            sanitized=SYN_ID + NO_KEY,
+            wire_name="positive-identity-label",
+            wire_hex=identity,
+            assertions=["identity=expected-peer-label", "material_published=false"],
             outcome="constructed",
         ),
         manifest(
@@ -2502,7 +2532,7 @@ subset. No certificates or exporter secrets are published.
         completion(
             "n2-dtls",
             fixtures,
-            constructed=["PPID 66", "handshake header", "SCTP-AUTH length label"],
+            constructed=["PPID 66", "handshake header", "expected-peer identity label", "SCTP-AUTH length label"],
             receive=["rekey", "path failure"],
             unsupported=["PPID 60 as protection", "NGAP procedure state", "certificate dumps"],
         ),

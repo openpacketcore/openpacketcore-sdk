@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -51,6 +52,16 @@ def check_catalog() -> list[str]:
         "interoperability_note", ""
     ):
         errors.append("publication missing interoperability limit")
+    head = publication.get("head", "")
+    tree = publication.get("tree", "")
+    if head != "landing-revision" and not (
+        isinstance(head, str) and len(head) == 40 and all(ch in "0123456789abcdef" for ch in head)
+    ):
+        errors.append("publication head is not a public SHA or landing-revision")
+    if tree and not (
+        isinstance(tree, str) and len(tree) == 40 and all(ch in "0123456789abcdef" for ch in tree)
+    ):
+        errors.append("publication tree is not a 40-hex object id")
 
     for subset in SUBSETS:
         directory = FIXTURE_ROOT / subset
@@ -64,12 +75,44 @@ def check_catalog() -> list[str]:
             if path.name == "COMPLETION.json":
                 continue
             manifest = load_json(path)
+            required_fields = (
+                "sdk_fixture_id",
+                "source",
+                "direction",
+                "role",
+                "prerequisite",
+                "provenance",
+                "sanitized_fields",
+                "wire",
+                "semantic_assertions",
+                "expected_outcome",
+            )
+            for field in required_fields:
+                if not manifest.get(field):
+                    errors.append(f"{path.name}: missing {field}")
             if manifest.get("runtime_claim") is not False:
                 errors.append(f"{path.name}: runtime_claim must be false")
             classes.add(manifest.get("case_class"))
             text = path.read_text(encoding="utf-8").lower()
             if "aaron" in text or "chartier" in text or "-----begin" in text:
                 errors.append(f"{path.name}: forbidden content")
+            wire_rel = (manifest.get("wire") or {}).get("path")
+            digest = (manifest.get("wire") or {}).get("digest_sha256")
+            if not wire_rel or not digest:
+                errors.append(f"{path.name}: missing wire locator")
+                continue
+            wire_path = directory / wire_rel
+            if not wire_path.is_file():
+                errors.append(f"{path.name}: missing wire file")
+                continue
+            tokens = wire_path.read_text(encoding="utf-8").split()
+            try:
+                raw = bytes(int(token, 16) for token in tokens)
+            except ValueError:
+                errors.append(f"{path.name}: unreadable wire hex")
+                continue
+            if hashlib.sha256(raw).hexdigest() != digest:
+                errors.append(f"{path.name}: digest mismatch")
         if REQUIRED - classes:
             errors.append(f"{subset}: missing {sorted(REQUIRED - classes)}")
     return errors

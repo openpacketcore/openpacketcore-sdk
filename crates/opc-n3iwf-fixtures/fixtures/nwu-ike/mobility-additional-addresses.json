@@ -17,7 +17,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "ADDITIONAL_IP4_ADDRESSES notify type 16384 with empty list body"
+    "notes": "ADDITIONAL_IP4_ADDRESS notify type 16397 with documentation IPv4 192.0.2.10"
   },
   "sanitized_fields": [
     {
@@ -28,10 +28,11 @@
   ],
   "wire": {
     "path": "wire/mobility-additional-addresses.hex",
-    "digest_sha256": "ecc6ff169022807756d513a7f478375aac8ff7f565013ac01fdbdb973a51dbdf"
+    "digest_sha256": "61cdeed8eb84452be5d857aca28ba5a31e47e645f2acbbb192f1d451a44fe2cf"
   },
   "semantic_assertions": [
-    "notify_type=16384",
+    "notify_type=16397",
+    "address=192.0.2.10",
     "mobility_wire_only=true"
   ],
   "expected_outcome": "receive",

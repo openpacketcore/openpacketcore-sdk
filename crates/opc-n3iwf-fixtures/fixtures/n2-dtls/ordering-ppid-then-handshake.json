@@ -33,7 +33,7 @@
   ],
   "wire": {
     "path": "wire/ordering-ppid-then-handshake.hex",
-    "digest_sha256": "6981dfa4f71c61136e5c134f9ef1d79009e086eed7d7282d75864af7d8d146e2"
+    "digest_sha256": "8330a947dab5d8ddb09e4cf60e4b6044dea1e8cfc7516b82d663cc7394b79c12"
   },
   "semantic_assertions": [
     "order=ppid-then-handshake"

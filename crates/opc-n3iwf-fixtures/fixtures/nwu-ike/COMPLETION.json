@@ -17,7 +17,7 @@
     "opc.n3iwf.nwu-ike.v1.positive-nas-ip4",
     "opc.n3iwf.nwu-ike.v1.positive-nas-tcp-port",
     "opc.n3iwf.nwu-ike.v1.positive-5g-qos-info",
-    "opc.n3iwf.nwu-ike.v1.positive-up-sa-info",
+    "opc.n3iwf.nwu-ike.v1.positive-up-ip4",
     "opc.n3iwf.nwu-ike.v1.delete-esp",
     "opc.n3iwf.nwu-ike.v1.mobility-additional-addresses",
     "opc.n3iwf.nwu-ike.v1.unknown-critical-payload",
@@ -31,7 +31,7 @@
     "NAS_IP4_ADDRESS",
     "NAS_TCP_PORT",
     "5G_QOS_INFO",
-    "UP_SA_INFO",
+    "UP_IP4_ADDRESS",
     "Delete ESP"
   ],
   "receive": [

@@ -468,6 +468,12 @@ fn detect_publication(publication: &PublicSdkPublication) -> Result<(), Contract
         || publication.base.len() != 40
         || !publication.base.chars().all(|ch| ch.is_ascii_hexdigit())
         || publication.head.is_empty()
+        || !(publication.head == "landing-revision"
+            || (publication.head.len() == 40
+                && publication.head.chars().all(|ch| ch.is_ascii_hexdigit())))
+        || !(publication.tree.is_empty()
+            || (publication.tree.len() == 40
+                && publication.tree.chars().all(|ch| ch.is_ascii_hexdigit())))
         || publication.tree_path != "crates/opc-n3iwf-fixtures/fixtures"
         || !publication
             .interoperability_note

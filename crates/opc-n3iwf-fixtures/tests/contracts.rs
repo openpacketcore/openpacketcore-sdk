@@ -176,6 +176,61 @@ fn dtls_covers_ppid66_and_redacted_errors() {
 }
 
 #[test]
+fn reused_public_vectors_remain_locked_to_merged_sources() {
+    let catalog = FixtureCatalog::load().expect("catalog must load");
+    let ngap_src = include_str!("../../opc-proto-ngap/src/lib.rs");
+    let gtpu_control = include_str!("../../opc-proto-gtpu/tests/control_messages.rs");
+    let gtpu_user = include_str!("../../opc-proto-gtpu/tests/gtpu_tests.rs");
+    assert!(
+        ngap_src.contains("0x00, 0x15, 0x40, 0x4a") && ngap_src.contains("0x00, 0x13, 0x88"),
+        "issue 493 NGSetupRequest vector must remain in opc-proto-ngap"
+    );
+    assert!(
+        gtpu_control.contains("0x32, 0x01, 0x00, 0x04") && gtpu_control.contains("0x0e, 0,"),
+        "issue 341 Echo Request/Response vectors must remain in opc-proto-gtpu"
+    );
+    assert!(
+        gtpu_user.contains("0x36,")
+            && gtpu_user.contains("0x85,")
+            && gtpu_user.contains("0x00, 0x09"),
+        "issue 341 downlink PSC vector must remain in opc-proto-gtpu"
+    );
+    for (manifest, wire) in catalog.manifests() {
+        if manifest
+            .sdk_fixture_id
+            .ends_with("positive-ngsetup-external")
+        {
+            assert_eq!(wire_digest(wire), manifest.wire.digest_sha256);
+            assert_eq!(wire.len(), 78);
+        }
+        if manifest.sdk_fixture_id.ends_with("positive-echo-request") {
+            assert_eq!(
+                wire,
+                &[0x32, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0x12, 0x34, 0, 0]
+            );
+        }
+        if manifest
+            .sdk_fixture_id
+            .ends_with("positive-echo-response-recovery-zero")
+        {
+            assert_eq!(
+                wire,
+                &[0x32, 0x02, 0x00, 0x06, 0, 0, 0, 0, 0x12, 0x34, 0, 0, 0x0e, 0]
+            );
+        }
+        if manifest.sdk_fixture_id.ends_with("positive-dl-psc") {
+            assert_eq!(
+                wire,
+                &[
+                    0x36, 0xff, 0x00, 0x08, 0x11, 0x22, 0x33, 0x44, 0x00, 0x05, 0x00, 0x85, 0x01,
+                    0x00, 0x09, 0x00
+                ]
+            );
+        }
+    }
+}
+
+#[test]
 fn publication_records_public_sdk_and_interoperability_limit() {
     let catalog = FixtureCatalog::load().expect("catalog must load");
     let publication = catalog.publication();

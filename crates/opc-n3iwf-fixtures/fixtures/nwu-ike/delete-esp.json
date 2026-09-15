@@ -29,7 +29,7 @@
   ],
   "wire": {
     "path": "wire/delete-esp.hex",
-    "digest_sha256": "d8ee5ee1f220a91881a41121709d32e856316b9795905d734a15a1aecd68f044"
+    "digest_sha256": "05c84b5034024801c7866aaa06892be3c247e8b3fb251b5f2bf4b4780b264bdc"
   },
   "semantic_assertions": [
     "protocol=ESP",

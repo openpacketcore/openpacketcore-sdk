@@ -8,6 +8,7 @@
 | 4 | `09` | QFI 9 |
 | 5..6 | `00 00` | Spare |
 | 7 | `80` or `00` | RQI downlink-only |
+| 8 | `00` | Next-header / payload terminator used by these frames |
 
 Received nonzero Protocol Type is ignored.
 

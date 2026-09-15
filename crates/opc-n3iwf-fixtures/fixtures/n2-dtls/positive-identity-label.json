@@ -1,24 +1,23 @@
 {
-  "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.positive-up-sa-info",
-  "subset": "nwu-ike",
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.positive-identity-label",
+  "subset": "n2-dtls",
   "case_class": "positive",
   "source": {
-    "document": "3GPP TS 24.502",
-    "release": "V18.8.0",
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
     "clauses": [
-      "8.3",
-      "9.3.1.8"
+      "4"
     ]
   },
-  "direction": "n3iwf-to-ue",
+  "direction": "local",
   "role": "n3iwf",
-  "prerequisite": "Inbound ESP SPI allocated by caller",
+  "prerequisite": "Identity is a typed expected-peer label, not a certificate dump",
   "provenance": {
-    "class": "spec-authored",
+    "class": "synthetic-kat",
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "UP_SA_INFO 55508 with synthetic SPI 0x0a0b0c0d; not a live SA"
+    "notes": "Expected-peer identity label only; no certificate or exporter secret"
   },
   "sanitized_fields": [
     {
@@ -33,13 +32,12 @@
     }
   ],
   "wire": {
-    "path": "wire/positive-up-sa-info.hex",
-    "digest_sha256": "18d616995d697a767514bea738f6dbc073d6f8cbe613a8fe6f10a65ef0a96d0a"
+    "path": "wire/positive-identity-label.hex",
+    "digest_sha256": "10ab6e5ef90f8250860d1f74756fc0b5984df98dddbda4475659623c6cbbb14a"
   },
   "semantic_assertions": [
-    "notify_type=55508",
-    "spi_size=4",
-    "spi_label=synthetic"
+    "identity=expected-peer-label",
+    "material_published=false"
   ],
   "expected_outcome": "constructed",
   "runtime_claim": false

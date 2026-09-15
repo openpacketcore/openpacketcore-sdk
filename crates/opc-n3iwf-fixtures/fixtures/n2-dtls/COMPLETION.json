@@ -16,6 +16,7 @@
   "fixture_ids": [
     "opc.n3iwf.n2-dtls.v1.positive-ppid66",
     "opc.n3iwf.n2-dtls.v1.positive-handshake-header",
+    "opc.n3iwf.n2-dtls.v1.positive-identity-label",
     "opc.n3iwf.n2-dtls.v1.sctp-auth-length",
     "opc.n3iwf.n2-dtls.v1.rekey-generation-2",
     "opc.n3iwf.n2-dtls.v1.restart-path-failure",
@@ -30,6 +31,7 @@
   "constructed": [
     "PPID 66",
     "handshake header",
+    "expected-peer identity label",
     "SCTP-AUTH length label"
   ],
   "receive": [

@@ -17,7 +17,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "DTLS record/handshake headers only; no certificate or key bytes"
+    "notes": "DTLS 1.2 record plus 12-octet handshake header; fragment length 0"
   },
   "sanitized_fields": [
     {
@@ -33,11 +33,14 @@
   ],
   "wire": {
     "path": "wire/positive-handshake-header.hex",
-    "digest_sha256": "46926ce332255e2a8c62b739f7aa39ab05d1a8386842b3891cbc4e63a433445a"
+    "digest_sha256": "aade87b38e8caee5fa8d021ef18adf29a6c4cec54e9dfb5b024796ebd73b3e3a"
   },
   "semantic_assertions": [
     "content_type=handshake",
-    "identity=expected-peer-label"
+    "version=dtls-1.2",
+    "record_length=12",
+    "handshake_type=client_hello",
+    "fragment_length=0"
   ],
   "expected_outcome": "constructed",
   "runtime_claim": false

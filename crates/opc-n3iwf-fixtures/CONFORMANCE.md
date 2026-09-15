@@ -36,7 +36,7 @@ subset alone. 🚫 = explicitly unsupported in this crate.
 | Subset | Status | Constructed | Receive | Unsupported |
 | --- | --- | --- | --- | --- |
 | eap5g | ✅ | EAP-Request/5G-Start | EAP-Response/5G-NAS; spare AN-parameter ignore | subscriber authentication, SUCI, EAP key derivation |
-| nwu-ike | ✅ | NAS_IP4_ADDRESS, NAS_TCP_PORT, 5G_QOS_INFO, UP_IP_ADDRESS, Delete ESP | MOBIKE additional addresses | XFRM install, SPI allocation, authentication |
+| nwu-ike | ✅ | NAS_IP4_ADDRESS, NAS_TCP_PORT, 5G_QOS_INFO, UP_IP4_ADDRESS, Delete ESP | MOBIKE ADDITIONAL_IP4_ADDRESS | XFRM install, SPI allocation, authentication |
 | ngap | ✅ | none (typed encode unsupported) | 78-byte NGSetupRequest; empty wrapper | canonical typed encode; constructed N3IWF send |
 | n2-sctp | ✅ | PPID 60 / port 38412 | metadata order variants | PPID 66 on this profile; DTLS |
 | gre-qfi | ✅ | downlink QFI+RQI | uplink QFI; nonzero Protocol Type ignore | XFRM install; QFI allocation |
@@ -44,7 +44,7 @@ subset alone. 🚫 = explicitly unsupported in this crate.
 | protocol-key | ✅ | generation-1 consume-once label | drop zeroize | byte export; hierarchy derivation |
 | nas-tcp | ✅ | complete two-octet envelope | two-frame stream; unknown inner EPD left opaque | TCP listen; reconnect; security termination |
 | xfrm-roster | ✅ | inbound/outbound SPI pair label | overlap/rekey/relocate labels | IKE notify parsing |
-| n2-dtls | ✅ | PPID 66; handshake header; SCTP-AUTH length | rekey; path failure | PPID 60 as protection; certificates |
+| n2-dtls | ✅ | PPID 66; handshake header; expected-peer identity label; SCTP-AUTH length | rekey; path failure | PPID 60 as protection; certificates |
 
 Every subset includes the required case classes: positive, malformed,
 duplicate, unknown-critical, ordering, truncation, and bounded-overflow.
@@ -56,6 +56,10 @@ duplicate, unknown-critical, ordering, truncation, and bounded-overflow.
 | 493 | closed DecodeContext / IE cardinality | NGAP 78-byte NGSetupRequest and policy paths by digest/path |
 | 341 | GTP-U control codec already on main | Echo Request/Response and downlink PSC by digest |
 | 644 | closed eBPF checksum | not duplicated; dataplane runtime remains out of scope |
+
+`tests/contracts.rs` locks the reused octets to the merged `opc-proto-ngap`
+and `opc-proto-gtpu` source files so a later edit of those proven vectors
+fails this crate.
 
 ## Provenance
 
