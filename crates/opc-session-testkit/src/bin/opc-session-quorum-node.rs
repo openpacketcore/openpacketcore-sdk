@@ -3413,13 +3413,16 @@ async fn run_traffic_mutation_task(
                 }
                 let recovery_started_at = tokio::time::Instant::now();
                 let deadline = traffic_recovery_deadline(recovery_started_at, shutdown_deadline);
+                let diagnostic_lease_fence = lease.as_ref().map(|guard| guard.fence().get());
+                let diagnostic_cycles = observation.mutation_cycles.load(Ordering::Acquire);
                 if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
                     // Fixed enums and atomic counters only, after the failed
                     // public call and inside the original recovery budget.
                     // No backend lock, payload, credential or error string.
                     eprintln!(
-                        "qualification_local_durable_progress kind=traffic_interruption elapsed_millis={} node_index={node_index} failure={failure:?} diagnostics={:?}",
+                        "qualification_local_durable_progress kind=traffic_interruption elapsed_millis={} node_index={node_index} failure={failure:?} cycles={diagnostic_cycles} known_authority={} diagnostics={:?}",
                         diagnostic_started_at.elapsed().as_millis(),
+                        traffic_failure_retains_known_authority(failure),
                         store.diagnostic_snapshot(),
                     );
                     #[cfg(feature = "test-control")]
@@ -3448,6 +3451,17 @@ async fn run_traffic_mutation_task(
                 .await
                 {
                     Ok(()) => {
+                        if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
+                            eprintln!(
+                                "qualification_local_durable_progress kind=traffic_recovery elapsed_millis={} node_index={node_index} initial_failure={failure:?} known_authority={} cycles_at_entry={diagnostic_cycles} cycles_at_recovery={} same_guard={} recovery_elapsed_millis={} original_remaining_millis={} consecutive={consecutive_availability_interruptions}",
+                                diagnostic_started_at.elapsed().as_millis(),
+                                traffic_failure_retains_known_authority(failure),
+                                observation.mutation_cycles.load(Ordering::Acquire),
+                                diagnostic_lease_fence == lease.as_ref().map(|guard| guard.fence().get()),
+                                recovery_started_at.elapsed().as_millis(),
+                                deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis(),
+                            );
+                        }
                         observation.record_availability_recovery(
                             &mut consecutive_availability_interruptions,
                         );
