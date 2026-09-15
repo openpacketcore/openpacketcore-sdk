@@ -40,13 +40,17 @@ validate the exact scheduled record. Read-only get, restore-scan, and readiness
 outcomes retain the already-proven guard and validate that same exact record
 without minting unnecessary fencing authority. Historical traffic-resource/v6
 evidence binds that routing as `stage-aware-known-authority/v1`. The current
-traffic-resource/v8 schedule binds
-`stage-aware-known-authority-readiness-reproof/v1`: a readiness-origin recovery
+traffic-resource/v9 schedule binds
+`stage-aware-known-authority-readiness-and-scan-reproof/v1`: a readiness-origin recovery
 also proves durable readiness again after the exact record check, using the
 same guard and original episode deadline. Failed and timed-out proofs count
 against the unchanged interruption allowance; an exact record read alone does
-not complete readiness recovery. The distinct traffic-resource/v7 retained-
-acquisition profile keeps its historical meaning; v8 does not consume that
+not complete readiness recovery. A restore-scan-origin recovery instead repeats
+the complete scan and validates its cursor profile, counts, bounds, and exact
+record under the same deadline and allowance; terminal scan errors stay
+terminal. Historical v8 retains its readiness-only reproof meaning. The
+distinct traffic-resource/v7 retained-acquisition profile keeps its historical
+meaning; v9 does not consume that
 algorithm. See the [qualification contract](../../crates/opc-session-testkit/README.md).
 The fixed schedule drops one successful release response per mutator, allows eight
 outcomes per node, uses the fixed 26-second two-election-plus-operation

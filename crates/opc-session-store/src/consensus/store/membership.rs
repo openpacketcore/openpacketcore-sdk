@@ -1455,6 +1455,10 @@ impl ConsensusSessionStore {
             remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
+            #[cfg(feature = "test-control")]
+            restore_scan_unavailable_for_test: AtomicBool::new(false),
+            #[cfg(feature = "test-control")]
+            restore_scan_rejections_for_test: AtomicU64::new(0),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
