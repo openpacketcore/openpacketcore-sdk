@@ -178,7 +178,7 @@ pub use consensus::{
     SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,
     SessionStorageFailureKind, SessionStorageFailureStage, SessionStorageState,
     SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
-    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError, SnapshotDirectory,
     SnapshotIntegrityPolicy, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,

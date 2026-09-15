@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `opc-session-store`: separate a pinned snapshot directory's original configured
+  namespace name from its owned I/O capability. Independent processes no longer
+  share a lease key merely because their inherited descriptor numbers match.
+  The explicit fixed-quorum handoff and qualification consumer retain directory
+  and database exclusion, replacement/cleanup custody, independent flock
+  ownership, and existing persistence and integrity policies (Refs #808).
 - **TLS dependency security:** require Rustls 0.23.45 for
   RUSTSEC-2026-0285, preserving the existing provider and TLS feature policy.
   Refresh the workspace and standalone reference lockfiles, including the
