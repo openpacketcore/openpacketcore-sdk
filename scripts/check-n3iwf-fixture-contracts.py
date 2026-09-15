@@ -115,6 +115,11 @@ def check_catalog() -> list[str]:
                 errors.append(f"{path.name}: digest mismatch")
         if REQUIRED - classes:
             errors.append(f"{subset}: missing {sorted(REQUIRED - classes)}")
+        readme = directory / "README.md"
+        if readme.is_file():
+            data = readme.read_bytes()
+            if data.endswith(b"\n\n") or not data.endswith(b"\n"):
+                errors.append(f"{subset}: README has invalid trailing newlines")
 
     ngap_completion = load_json(FIXTURE_ROOT / "ngap" / "COMPLETION.json")
     if not ngap_completion.get("admitted_outcomes") or not ngap_completion.get("matrices"):

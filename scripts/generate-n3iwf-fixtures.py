@@ -592,7 +592,11 @@ def write_completion(subset_dir: Path, record: dict) -> None:
 
 
 def write_readme(subset_dir: Path, title: str, body: str) -> None:
-    (subset_dir / "README.md").write_text(f"# {title}\n\n{body}\n", encoding="utf-8")
+    # Triple-quoted bodies already end with a newline. A second trailing
+    # newline is a blank line at EOF and fails `git diff --check`.
+    (subset_dir / "README.md").write_text(
+        f"# {title}\n\n{body.rstrip()}\n", encoding="utf-8"
+    )
 
 
 SYN_ID = [
@@ -3462,6 +3466,10 @@ def main() -> int:
         generated = generate()
         assert len(generated) == 10
         assert "eap5g" in generated
+        for readme in FIXTURE_ROOT.rglob("README.md"):
+            data = readme.read_bytes()
+            if data.endswith(b"\n\n") or not data.endswith(b"\n"):
+                raise SystemExit(f"{readme}: invalid trailing newlines")
         print("generate-n3iwf-fixtures self-test ok")
         return 0
     if args.check:

@@ -11,4 +11,3 @@
 | 8 | `00` | Next-header / payload terminator used by these frames |
 
 Received nonzero Protocol Type is ignored.
-

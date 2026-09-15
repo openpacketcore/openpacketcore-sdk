@@ -10,4 +10,3 @@ first-CNF sent/received outcome plus Paging (5.4 discard). TS 29.413 5.2
 messages outside the issue 493 typed subset stay unpublished. Clause 5.3
 RAN-specific ignore is not encoded in the rows. Constructed N3IWF send is
 unsupported. This crate does not select an AMF or apply subscriber policy.
-

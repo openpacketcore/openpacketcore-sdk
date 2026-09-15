@@ -17,4 +17,3 @@ Unknown spare AN-parameters and AN-parameter reordering are permitted on
 receive. Duplicate selected-PLMN is a caller duplicate-singleton policy, not
 the spare-parameter ignore rule. Notification (Message-Id 3) and Stop
 (Message-Id 4) are published. NAS remains opaque. `runtime_claim=false`.
-

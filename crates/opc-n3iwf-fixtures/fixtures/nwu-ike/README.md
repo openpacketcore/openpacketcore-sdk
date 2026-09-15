@@ -14,4 +14,3 @@ overlap, SPI provenance, rekey, and roster relocation belong to `xfrm-roster`.
 | CREATE_CHILD_SA chain | TS 24.502 7.5.2 | 55501 then 55504 |
 | MODIFY_CHILD_SA | TS 24.502 7.6.2 | 55508 then 55501 |
 | Delete ESP | RFC 7296 §3.11 | one synthetic SPI |
-
