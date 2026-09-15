@@ -47,8 +47,11 @@ impl SnapshotDirectory {
     /// construction. Supply the original configured filesystem name, never a
     /// process-relative descriptor locator such as `/proc/self/fd/N/`. Neither a
     /// descriptor number nor the canonical target replaces that logical key.
-    /// The final component must be a directory, not a symlink; the directory must
-    /// be owned by the effective UID and not group/world writable.
+    /// Linux `O_NOFOLLOW` applies to the terminal pathname lookup. Intermediate
+    /// symlinks may be traversed, including a link followed by a trailing slash;
+    /// this is not a spelling-independent symlink rejection policy. The resolved
+    /// directory must match the supplied descriptor, be owned by the effective
+    /// UID and not be group/world writable.
     ///
     /// An independent open-file description is acquired relative to `directory`.
     /// This prevents lease acquisition or failed admission from unlocking a flock
