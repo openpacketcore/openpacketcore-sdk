@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use aes_gcm_siv::{
-    aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
+    aead::{AeadInOut, KeyInit},
     Aes256GcmSiv,
 };
 use hmac::{Hmac, Mac};
@@ -7744,13 +7744,15 @@ impl NamespaceState {
         coordinate[57..65].copy_from_slice(&decommissioned.generation.get().to_be_bytes());
         coordinate[65..81].copy_from_slice(&decommissioned.nonce);
         let nonce = hmac_bytes(&nonce_key, &[aad.as_slice(), coordinate.as_slice()]);
-        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(aead_key.as_ref()));
+        let cipher = Aes256GcmSiv::new((&*aead_key).into());
         let mut ciphertext = coordinate;
         let tag = cipher
-            .encrypt_in_place_detached(
-                GenericArray::from_slice(&nonce[..12]),
+            .encrypt_inout_detached(
+                nonce[..12]
+                    .try_into()
+                    .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?,
                 &aad,
-                &mut ciphertext,
+                ciphertext.as_mut_slice().into(),
             )
             .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         let mut capsule = [0_u8; DECOMMISSION_CAPSULE_LEN];
@@ -7782,16 +7784,19 @@ impl NamespaceState {
         let mut aad = Vec::with_capacity(DECOMMISSION_AAD_DOMAIN.len() + binding.len());
         aad.extend_from_slice(DECOMMISSION_AAD_DOMAIN);
         aad.extend_from_slice(&binding);
-        let cipher = Aes256GcmSiv::new(GenericArray::from_slice(aead_key.as_ref()));
+        let cipher = Aes256GcmSiv::new((&*aead_key).into());
         let mut coordinate = [0_u8; DECOMMISSION_COORDINATE_LEN];
         coordinate.copy_from_slice(&fence.capsule[13..94]);
-        let tag = GenericArray::clone_from_slice(&fence.capsule[94..110]);
         cipher
-            .decrypt_in_place_detached(
-                GenericArray::from_slice(&fence.capsule[1..13]),
+            .decrypt_inout_detached(
+                fence.capsule[1..13]
+                    .try_into()
+                    .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?,
                 &aad,
-                &mut coordinate,
-                &tag,
+                coordinate.as_mut_slice().into(),
+                fence.capsule[94..110]
+                    .try_into()
+                    .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?,
             )
             .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         let expected_nonce = hmac_bytes(&nonce_key, &[aad.as_slice(), coordinate.as_slice()]);

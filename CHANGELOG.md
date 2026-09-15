@@ -770,6 +770,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Modelling grouped-IE flag bits remains deferred.
 
 ### Changed
+- **Dependency compatibility:** update AES-GCM-SIV to 0.12.1 and tower-http to
+  0.7.1 across the workspace and standalone SMF consumer. Preserve persisted
+  ciphertext compatibility and Rust 1.88 support, retaining AES 0.9.2. Update
+  both Go operator modules to Kubernetes 0.37.0 / controller-runtime 0.25.0
+  together (Refs #836).
 - **Strict-default IKEv2 nonce validation with initial-exchange compatibility — `opc-proto-ikev2`, `opc-ipsec-xfrm` (breaking):**
   parent IKE-SA and IKE-SA-rekey KDFs now reject nonce inputs below the selected
   PRF half-key floor by default. The explicit `Ikev2InitialExchangeNoncePolicy`
