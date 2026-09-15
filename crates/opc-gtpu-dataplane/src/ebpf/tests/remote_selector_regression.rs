@@ -28,6 +28,28 @@ const REQUEST_BUDGET: Duration = Duration::from_secs(1);
 // This is an owned cleanup/functional containment bound, never a request budget.
 const CLEANUP_BOUND: Duration = Duration::from_secs(20);
 
+/// `start_fixed_durable` places its databases and WALs below `temp_dir()`.
+/// Reject known RAM filesystems before setup: successful syncs there do not
+/// exercise the storage latency measured by the disk-backed Linux CI gate.
+/// This check does not qualify a device's power-loss or latency guarantees.
+#[cfg(target_os = "linux")]
+fn require_disk_backed_deadline_scratch() {
+    // Linux UAPI filesystem identifiers from linux/magic.h. rustix exposes
+    // statfs safely, but does not export these two identifiers.
+    const TMPFS_MAGIC: u32 = 0x0102_1994;
+    const RAMFS_MAGIC: u32 = 0x8584_58f6;
+    let filesystem = checked(
+        rustix::fs::statfs(std::env::temp_dir()),
+        "selector deadline scratch filesystem observation",
+    );
+    let kind = filesystem.f_type as u32;
+    eprintln!("sdk_selector_scratch filesystem_type={kind:#x}");
+    assert!(
+        !matches!(kind, TMPFS_MAGIC | RAMFS_MAGIC),
+        "selector durable deadline requires disk-backed TMPDIR; tmpfs/ramfs cannot qualify disk-sync latency; OPC_FS_VERITY_SNAPSHOT_ROOT only controls snapshots"
+    );
+}
+
 // Each lab owns three durable voters on the same test filesystem. Keep these
 // independent labs from adding disk load to the singleton request measurement.
 // The permit spans startup through shutdown; each lab still runs its original
@@ -530,6 +552,8 @@ async fn descriptor_commit<B: ProtectedSessionBackend>(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn singleton_public_protected_flow_keeps_original_request_deadline() {
+    #[cfg(target_os = "linux")]
+    require_disk_backed_deadline_scratch();
     let lab = start_lab(0x91).await;
     let storage_before = lab.fixture.local_storage_timing();
     // Startup, required voter activation, stopped namespace provisioning, and

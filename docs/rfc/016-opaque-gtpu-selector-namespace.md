@@ -1048,6 +1048,18 @@ per-process number of supervisors and report only a closed cancellation
 classification. If the SDK runtime cannot provide this worker ownership, the
 capability is unsupported.
 
+Short steps within that one owned operation may share a confirmed durable
+lease. Its conservative monotonic and wall-clock budgets start **before** the
+acquire or renewal request, including acknowledgement latency. Each backend
+step still receives a fresh affine authorization, capped by the original
+renewal deadline and the five-second effect bound. Renew early when a full
+backend step would cross the ten-second cadence; minting another authorization
+never restarts that cadence. Clear the worker's timing before awaiting renewal,
+so cancellation, failure, or a late reply cannot revive it. Every ledger CAS
+still submits the exact guard for the store's expiry, credential, fence, and
+generation checks. This timing belongs only to the non-cloneable worker lease;
+it is never cached on an authority or shared between operations.
+
 The durable lock/CAS authority, not a process mutex, decides cross-process
 ownership. The process-local worker gate prevents only reentrant acquisition by
 one replica identity; it is not a distributed fence. Concurrent replicas with

@@ -264,6 +264,13 @@ python3 scripts/check-management-plane-policy.py --check
 
 ### 5. Workspace Test Suite
 Run all unit, integration, and chaos test suites:
+
+On Linux, first set `TMPDIR` to a private disk-backed directory. The selector's
+one-second durable request gate rejects RAM-backed scratch. The snapshot root
+does not control database or WAL placement. See the
+[local and CI validation profiles](CONTRIBUTING.md#validation-gates) for storage,
+toolchain, test-isolation, and forced-cfg requirements.
+
 ```bash
 cargo test --locked -p opc-persist --no-run
 cargo test --locked -p opc-persist \
