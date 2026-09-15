@@ -117,7 +117,227 @@ async fn public_dynamic_consensus_rejects_unsupported_platform_before_durable_in
     );
 }
 
-type LoopbackHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>;
+type LoopbackHandler = Arc<tokio::sync::RwLock<Option<LoopbackIncarnation>>>;
+
+struct LoopbackIncarnation {
+    handler: Arc<dyn SessionConsensusRpcHandler>,
+    calls: Arc<tokio::sync::RwLock<()>>,
+}
+
+struct AdmittedLoopbackCall {
+    // Drop the handler before releasing the call guard. Retirement must not
+    // complete while this clone still retains the store's namespace lease.
+    handler: Arc<dyn SessionConsensusRpcHandler>,
+    _call: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+#[derive(Debug, Default)]
+struct HeldLoopbackCall {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+struct HeldLoopbackHandler {
+    gate: Arc<HeldLoopbackCall>,
+    inner: Option<Arc<dyn SessionConsensusRpcHandler>>,
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for HeldLoopbackHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        self.gate.entered.notify_one();
+        self.gate.release.notified().await;
+        if let Some(inner) = &self.inner {
+            return inner.handle(authenticated_sender, request).await;
+        }
+        SessionConsensusWireResponse {
+            result: Err(SessionConsensusPeerError::Rejected),
+        }
+    }
+}
+
+#[tokio::test]
+async fn retiring_loopback_incarnation_drains_owned_handlers() {
+    for profile in [
+        V2ProfilePeerOverride::Exact,
+        V2ProfilePeerOverride::MismatchedV2,
+    ] {
+        for cancel in [false, true] {
+            let members = (0..INITIAL_MEMBER_COUNT).map(member).collect::<Vec<_>>();
+            let cluster = ConsensusClusterId::new("loopback-retirement").expect("cluster");
+            let identity = consensus_identity(&members, cluster, 1);
+            let nodes = members
+                .iter()
+                .map(|member| {
+                    opc_consensus::derive_node_id(cluster, member.replica_id().as_str().as_bytes())
+                        .expect("node ID")
+                })
+                .collect::<Vec<_>>();
+            let sender = nodes[0];
+            let target = nodes[1];
+            let mut network = LoopbackNetwork::new(nodes);
+            network.v2_profile_overrides[0][1].store(profile as usize, Ordering::Release);
+            let held = Arc::new(HeldLoopbackCall::default());
+            let handler = Arc::new(HeldLoopbackHandler {
+                gate: Arc::clone(&held),
+                inner: None,
+            });
+            let retired_handler = Arc::downgrade(&handler);
+            network.install(1, handler).await;
+            let peer = network
+                .peers_for_indices(0, identity, [1])
+                .remove(&target)
+                .expect("incoming peer");
+            let request = SessionConsensusWireRequest::try_new(
+                identity,
+                sender,
+                SessionConsensusRpcFamily::ReadBarrier,
+                vec![0; 32],
+            )
+            .expect("bounded request");
+            let incoming = {
+                let peer = Arc::clone(&peer);
+                let request = request.clone();
+                tokio::spawn(async move { peer.call(request).await })
+            };
+            tokio::time::timeout(STORE_OPERATION_TIMEOUT, held.entered.notified())
+                .await
+                .expect("RPC entered its handler");
+
+            let mut retirement = Box::pin(network.retire_incarnation(1));
+            let waited_for_call = futures_util::poll!(&mut retirement).is_pending();
+            // New requests must fail promptly while an older call drains.
+            assert_eq!(
+                tokio::time::timeout(STORE_OPERATION_TIMEOUT, peer.call(request))
+                    .await
+                    .expect("retired route rejects a new request"),
+                Err(SessionConsensusPeerError::Unavailable)
+            );
+            assert!(
+                retired_handler.upgrade().is_some(),
+                "in-flight handler is owned"
+            );
+            if cancel {
+                incoming.abort();
+                assert!(incoming
+                    .await
+                    .expect_err("caller is cancelled")
+                    .is_cancelled());
+            } else {
+                held.release.notify_one();
+                incoming
+                    .await
+                    .expect("owned call joined")
+                    .expect("handler responded");
+            }
+            if waited_for_call {
+                tokio::time::timeout(STORE_OPERATION_TIMEOUT, retirement)
+                    .await
+                    .expect("retirement finishes after the call releases its handler");
+            }
+            assert!(
+                retired_handler.upgrade().is_none(),
+                "old handler must be dropped"
+            );
+            assert!(
+                waited_for_call,
+                "incarnation retired while an RPC still owned its handler and storage lease"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn undrained_loopback_handler_retains_the_durable_namespace_lease() {
+    let directory = tempfile::tempdir().expect("owned durable fixture");
+    let cluster = ConsensusClusterId::new("loopback-storage-lease").expect("cluster");
+    let members = vec![member(0)];
+    let identity = consensus_identity(&members, cluster, 1);
+    let topology =
+        ValidatedQuorumTopology::try_new_consensus_lab_singleton(replica_id(0), members, identity)
+            .expect("singleton topology");
+    let target = topology.local_consensus_node_id().expect("local node");
+    let sender = opc_consensus::derive_node_id(cluster, replica_id(1).as_str().as_bytes())
+        .expect("sender node");
+    let backend = SqliteSessionBackend::open(directory.path().join("node.sqlite"))
+        .expect("file-backed backend");
+    let clock = Arc::new(MutableClock::new(Timestamp::now_utc()));
+    let open = || {
+        ConsensusSessionStore::open_with_clock(
+            topology.clone(),
+            backend.clone(),
+            directory.path().join("snapshots"),
+            std::collections::BTreeMap::new(),
+            clock.clone(),
+            STORE_OPERATION_TIMEOUT,
+        )
+    };
+    let store = open().await.expect("first store incarnation");
+    let network = LoopbackNetwork::new(vec![target, sender]);
+    let held = Arc::new(HeldLoopbackCall::default());
+    network
+        .install(
+            0,
+            Arc::new(HeldLoopbackHandler {
+                gate: Arc::clone(&held),
+                inner: Some(store.rpc_handler()),
+            }),
+        )
+        .await;
+    let peer = network
+        .peers_for_indices(1, identity, [0])
+        .remove(&target)
+        .expect("incoming peer");
+    let request = SessionConsensusWireRequest::try_new(
+        identity,
+        sender,
+        SessionConsensusRpcFamily::ReadBarrier,
+        Vec::new(),
+    )
+    .expect("bounded request");
+    let incoming = tokio::spawn(async move { peer.call(request).await });
+    tokio::time::timeout(STORE_OPERATION_TIMEOUT, held.entered.notified())
+        .await
+        .expect("RPC owns the real store handler");
+
+    // Deliberately reproduce the former fixture retirement: remove the route
+    // without draining an admitted call, then stop and drop the store handle.
+    drop(network.handlers[0].write().await.take());
+    store.shutdown().await.expect("core shutdown completes");
+    drop(store);
+    let blocked = match open().await {
+        Err(error) => Some(error),
+        Ok(unexpected) => {
+            unexpected
+                .shutdown()
+                .await
+                .expect("unexpected opener cleanup");
+            None
+        }
+    };
+    held.release.notify_one();
+    tokio::time::timeout(STORE_OPERATION_TIMEOUT, incoming)
+        .await
+        .expect("held RPC finishes")
+        .expect("held RPC joined")
+        .expect("handler returns a response");
+    let reopened = open()
+        .await
+        .expect("same storage opens after the RPC is dropped");
+    reopened.shutdown().await.expect("replacement shutdown");
+    drop(reopened);
+    assert_eq!(
+        blocked,
+        Some(opc_session_store::ConsensusSessionStoreOpenError::StorageUnavailable),
+        "an undrained RPC must reproduce the observed reopen classification"
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -149,6 +369,22 @@ struct LoopbackPeer {
     v2_profile_probes: Arc<AtomicUsize>,
     install_snapshot_received: Arc<AtomicUsize>,
     install_snapshot_notify: Arc<tokio::sync::Notify>,
+}
+
+impl LoopbackPeer {
+    async fn admit_call(&self) -> Result<AdmittedLoopbackCall, SessionConsensusPeerError> {
+        let installed = self.handler.read().await;
+        let Some(incarnation) = installed.as_ref() else {
+            return Err(SessionConsensusPeerError::Unavailable);
+        };
+        // Admit while holding the route read lock, so retirement cannot take
+        // the incarnation before this call has acquired its drain guard.
+        let call = Arc::clone(&incarnation.calls).read_owned().await;
+        Ok(AdmittedLoopbackCall {
+            handler: Arc::clone(&incarnation.handler),
+            _call: call,
+        })
+    }
 }
 
 impl fmt::Debug for LoopbackPeer {
@@ -213,18 +449,14 @@ impl SessionConsensusPeer for LoopbackPeer {
                         .last_mut()
                         .expect("V2 profile probe payload is nonempty");
                     *last ^= 0x01;
-                    let Some(handler) = self.handler.read().await.clone() else {
-                        return Err(SessionConsensusPeerError::Unavailable);
-                    };
-                    return Ok(handler.handle(mismatched.sender, mismatched).await);
+                    let call = self.admit_call().await?;
+                    return Ok(call.handler.handle(mismatched.sender, mismatched).await);
                 }
                 V2ProfilePeerOverride::Exact => unreachable!("exact override returned early"),
             }
         }
-        let Some(handler) = self.handler.read().await.clone() else {
-            return Err(SessionConsensusPeerError::Unavailable);
-        };
-        let response = handler.handle(request.sender, request).await;
+        let call = self.admit_call().await?;
+        let response = call.handler.handle(request.sender, request).await;
         if family == SessionConsensusRpcFamily::InstallSnapshot {
             let engine_accepted = response.result.as_ref().ok().is_some_and(|payload| {
                 postcard::from_bytes::<
@@ -310,11 +542,14 @@ impl LoopbackNetwork {
     }
 
     async fn install(&self, index: usize, handler: Arc<dyn SessionConsensusRpcHandler>) {
-        *self.handlers[index].write().await = Some(handler);
+        *self.handlers[index].write().await = Some(LoopbackIncarnation {
+            handler,
+            calls: Arc::new(tokio::sync::RwLock::new(())),
+        });
     }
 
     async fn retire_incarnation(&mut self, index: usize) {
-        *self.handlers[index].write().await = None;
+        let retired = self.handlers[index].write().await.take();
         for target in 0..self.node_ids.len() {
             if target == index {
                 continue;
@@ -324,6 +559,13 @@ impl LoopbackNetwork {
                 Arc::new(AtomicBool::new(true)),
             );
             retired.store(false, Ordering::Release);
+        }
+        if let Some(retired) = retired {
+            // Removing the route rejects new inbound calls; disabling the old
+            // links stops this incarnation from forwarding more work. Drain
+            // admitted calls before shutdown/reopen, including cancellation
+            // paths, without holding the route lock across RPC execution.
+            let _drained = retired.calls.write().await;
         }
     }
 
