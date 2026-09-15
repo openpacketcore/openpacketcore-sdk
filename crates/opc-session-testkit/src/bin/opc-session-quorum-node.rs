@@ -6440,6 +6440,10 @@ mod shutdown_tests;
 #[path = "opc-session-quorum-node/readiness_recovery_tests.rs"]
 mod readiness_recovery_tests;
 
+#[cfg(all(test, feature = "test-control"))]
+#[path = "opc-session-quorum-node/restore_scan_recovery_tests.rs"]
+mod restore_scan_recovery_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
