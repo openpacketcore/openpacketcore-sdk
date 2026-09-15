@@ -37,6 +37,27 @@ async fn readiness_recovery_case(clear: ClearBarrier) {
     );
     let key = qualification_traffic_key(follower).unwrap();
     let owner = OwnerId::new(format!("rotation-traffic-owner-{follower}")).unwrap();
+    // The complete checkpoint also has an acquisition lane. Read-only
+    // recovery must retain this unused lane without changing its journal.
+    let acquisition_directory = tempfile::tempdir().unwrap();
+    let acquisition_database = acquisition_directory.path().join("replica.sqlite");
+    let journal = traffic_acquire::Journal::open(
+        &acquisition_database,
+        traffic_acquire::Binding::new(
+            store.consumer_scope().unwrap(),
+            follower,
+            key.clone(),
+            owner.clone(),
+            QUALIFICATION_TRAFFIC_TTL,
+        ),
+        QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
+    )
+    .unwrap();
+    let journal_path = acquisition_database.with_extension("traffic-acquire-v1.json");
+    let journal_before = fs::read(&journal_path).unwrap();
+    let mut acquirer = traffic_acquire::Acquirer::from_store(journal, &store)
+        .await
+        .unwrap();
     let lease = protected
         .acquire(&key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
         .await
@@ -98,6 +119,7 @@ async fn readiness_recovery_case(clear: ClearBarrier) {
             &key,
             &owner,
             &mut retained,
+            &mut acquirer,
             seed,
             3,
             follower,
@@ -143,10 +165,17 @@ async fn readiness_recovery_case(clear: ClearBarrier) {
     cluster.set_ordinary_read_barrier_online(follower, leader, true);
     let cleared_readiness = store.probe_durable_readiness().await.is_ready();
     let final_record = protected.get(&key).await.unwrap().unwrap();
+    let journal_unchanged = fs::read(&journal_path).unwrap() == journal_before;
     protected.release(retained).await.unwrap();
+    drop(acquirer);
     drop(protected);
     drop(store);
     cluster.shutdown().await;
+
+    assert!(
+        journal_unchanged,
+        "read-only recovery must not acquire authority"
+    );
 
     assert!(
         same_leader,

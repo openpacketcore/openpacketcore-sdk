@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-testkit`: retain each synthetic traffic acquisition's exact
   consumer request and fixed deadline before polling. Reconcile uncertain
   outcomes before admitting a successor, preserve custody across restart, and
-  retire recorded old acquisitions before fresh restart authority. The v7
-  qualification schedule binds this recovery profile; ordinary lease APIs,
-  stale-fence checks and existing recovery bounds are unchanged (Refs #819).
+  retire recorded old acquisitions before fresh restart authority. The v10
+  qualification schedule combines this recovery profile with readiness and scan
+  reproof from v9; ordinary lease APIs, stale-fence checks and existing recovery
+  bounds are unchanged (Refs #819).
 - `opc-session-store`: separate a pinned snapshot directory's original configured
   namespace name from its owned I/O capability. Independent processes no longer
   share a lease key merely because their inherited descriptor numbers match.

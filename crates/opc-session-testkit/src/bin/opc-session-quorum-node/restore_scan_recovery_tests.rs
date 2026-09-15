@@ -32,6 +32,27 @@ async fn restore_scan_recovery_case(clear: ClearScan) {
     );
     let key = qualification_traffic_key(0).unwrap();
     let owner = OwnerId::new("rotation-traffic-owner-0").unwrap();
+    // Keep the real acquisition lane available to the complete checkpoint,
+    // and prove that scan recovery does not mutate its retained custody.
+    let acquisition_directory = tempfile::tempdir().unwrap();
+    let acquisition_database = acquisition_directory.path().join("replica.sqlite");
+    let journal = traffic_acquire::Journal::open(
+        &acquisition_database,
+        traffic_acquire::Binding::new(
+            store.consumer_scope().unwrap(),
+            0,
+            key.clone(),
+            owner.clone(),
+            QUALIFICATION_TRAFFIC_TTL,
+        ),
+        QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
+    )
+    .unwrap();
+    let journal_path = acquisition_database.with_extension("traffic-acquire-v1.json");
+    let journal_before = fs::read(&journal_path).unwrap();
+    let mut acquirer = traffic_acquire::Acquirer::from_store(journal, &store)
+        .await
+        .unwrap();
     let lease = protected
         .acquire(&key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
         .await
@@ -88,6 +109,7 @@ async fn restore_scan_recovery_case(clear: ClearScan) {
             &key,
             &owner,
             &mut retained,
+            &mut acquirer,
             seed,
             3,
             0,
@@ -133,11 +155,17 @@ async fn restore_scan_recovery_case(clear: ClearScan) {
         .await
         .unwrap();
     let final_record = protected.get(&key).await.unwrap().unwrap();
+    let journal_unchanged = fs::read(&journal_path).unwrap() == journal_before;
     protected.release(retained).await.unwrap();
+    drop(acquirer);
     drop(protected);
     drop(store);
     cluster.shutdown().await;
 
+    assert!(
+        journal_unchanged,
+        "read-only recovery must not acquire authority"
+    );
     assert!(same_authority);
     assert!(traffic_record_is_exact(&expected, &final_record));
     assert!(cleared_page.complete);
