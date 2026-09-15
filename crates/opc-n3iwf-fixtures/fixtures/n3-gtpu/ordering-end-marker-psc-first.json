@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 65535,
+    "unknown_ie_policy": "reject"
+  },
   "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.ordering-end-marker-psc-first",
   "subset": "n3-gtpu",
   "case_class": "ordering",
@@ -29,7 +35,7 @@
   ],
   "wire": {
     "path": "wire/ordering-end-marker-psc-first.hex",
-    "digest_sha256": "702b102013f23bb570e25e286a2e77fe7743ca813e472c1d360e5827a1e08ea1"
+    "digest_sha256": "89d5931e93769196f644c58c1c019099513767ea4bbfb27f67feabea1ec0780c"
   },
   "semantic_assertions": [
     "psc_first=true"

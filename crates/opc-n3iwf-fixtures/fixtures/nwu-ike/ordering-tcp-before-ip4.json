@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 41,
+    "max_spi_bytes": 4
+  },
   "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.ordering-tcp-before-ip4",
   "subset": "nwu-ike",
   "case_class": "ordering",
@@ -30,7 +36,7 @@
   ],
   "wire": {
     "path": "wire/ordering-tcp-before-ip4.hex",
-    "digest_sha256": "da6efc9a617f11ac44c93e85bd44677c5c8d641b2116ebf1a9ef6d970753b6cc"
+    "digest_sha256": "f3a7517438f10d49e25450e6446f23ef3c9b3faad61e9589684d19c1d4c594a3"
   },
   "semantic_assertions": [
     "notify_order=tcp-then-ip4"

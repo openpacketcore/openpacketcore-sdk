@@ -1,4 +1,18 @@
 {
+  "encoding": "scenario-label",
+  "validation_scope": "handle-lifecycle-contract",
+  "context": {
+    "bound_generation": 1,
+    "requested_generation": 1,
+    "purpose": "K_N3IWF",
+    "max_label_bytes": 64,
+    "actions": [
+      "bind",
+      "cancel",
+      "consume"
+    ],
+    "expected_state": "cancelled"
+  },
   "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.cancellation",
   "subset": "protocol-key",
   "case_class": "ordering",

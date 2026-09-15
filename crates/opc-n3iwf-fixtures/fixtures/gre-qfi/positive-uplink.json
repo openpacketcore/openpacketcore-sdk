@@ -1,4 +1,9 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "gre-header",
+  "context": {
+    "max_qfi": 63
+  },
   "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.positive-uplink",
   "subset": "gre-qfi",
   "case_class": "positive",

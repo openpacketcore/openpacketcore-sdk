@@ -28,31 +28,36 @@
       "id": 10,
       "name": "id-AMF-UE-NGAP-ID",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 85,
       "name": "id-RAN-UE-NGAP-ID",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 132,
       "name": "id-PDUSessionResourceFailedToSetupListCxtFail",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 15,
       "name": "id-Cause",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 19,
       "name": "id-CriticalityDiagnostics",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     }
   ]
 }

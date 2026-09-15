@@ -1,4 +1,13 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "aper-structural-dispatch",
+  "context": {
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "reject",
+    "mandatory_presence_validation": false,
+    "inner_ie_validation": false
+  },
   "sdk_fixture_id": "opc.n3iwf.ngap.v1.unknown-critical-ie",
   "subset": "ngap",
   "case_class": "unknown-critical",
@@ -28,7 +37,7 @@
   ],
   "wire": {
     "path": "wire/unknown-critical-ie.hex",
-    "digest_sha256": "f2aed51fffd508869d068432f58e233ee2beab35e1edaa97acb2180af016ac11"
+    "digest_sha256": "94d8bf0280c04093fd1a44ba045a7f8812b7dcea1d0fc6badbabfdd470cbc405"
   },
   "semantic_assertions": [
     "unknown_ie=255",

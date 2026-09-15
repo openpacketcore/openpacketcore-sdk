@@ -28,13 +28,15 @@
       "id": 114,
       "name": "id-UE-NGAP-IDs",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 15,
       "name": "id-Cause",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     }
   ]
 }

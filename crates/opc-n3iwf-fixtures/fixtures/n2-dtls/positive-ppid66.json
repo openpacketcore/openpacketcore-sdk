@@ -1,12 +1,26 @@
 {
+  "encoding": "metadata-record",
+  "validation_scope": "dtls-association-metadata",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
   "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.positive-ppid66",
   "subset": "n2-dtls",
   "case_class": "positive",
   "source": {
-    "document": "IETF RFC 6083",
-    "release": "RFC 6083",
+    "document": "3GPP TS 38.412",
+    "release": "V18.1.0",
     "clauses": [
-      "4"
+      "7"
     ]
   },
   "direction": "n3iwf-to-amf",

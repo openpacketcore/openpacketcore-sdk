@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 11,
+    "unknown_ie_policy": "reject"
+  },
   "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.bounded-length-overflow",
   "subset": "n3-gtpu",
   "case_class": "bounded-overflow",
@@ -17,7 +23,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Length 255 over an 8-octet datagram"
+    "notes": "Complete 12-octet Echo Request exceeds the explicit 11-octet caller bound"
   },
   "sanitized_fields": [
     {
@@ -28,10 +34,11 @@
   ],
   "wire": {
     "path": "wire/bounded-length-overflow.hex",
-    "digest_sha256": "64e60233504a8193d6ce91d2ebece8277439f0985699e3cf446fa3d311323053"
+    "digest_sha256": "5bbf0da59f87048287d0354dafbe4dcd09148cbf54643cb58244a35c692deb36"
   },
   "semantic_assertions": [
-    "declared_length=255"
+    "message_length=12",
+    "caller_max_message_len=11"
   ],
   "expected_outcome": "reject",
   "runtime_claim": false

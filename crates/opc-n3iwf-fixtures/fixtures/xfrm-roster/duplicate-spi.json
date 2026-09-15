@@ -1,4 +1,13 @@
 {
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": false
+  },
   "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.duplicate-spi",
   "subset": "xfrm-roster",
   "case_class": "duplicate",
@@ -17,7 +26,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Inbound and outbound SPI labels are identical"
+    "notes": "Two generations claim the same inbound SPI in one receiver namespace"
   },
   "sanitized_fields": [
     {
@@ -28,7 +37,7 @@
   ],
   "wire": {
     "path": "wire/duplicate-spi.hex",
-    "digest_sha256": "a6dd8197de6e6c0717a2b21b4c33efd9c41087f9543a22ae80ca1d2eeeedbc31"
+    "digest_sha256": "5b81a085a82317c848b4cdfc70f06d61257285e55bf57ce6223f94c25936f70f"
   },
   "semantic_assertions": [
     "duplicate_spi=true"

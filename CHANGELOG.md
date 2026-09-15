@@ -65,25 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
-- **Synthetic N3IWF fixture contracts — `opc-n3iwf-fixtures`:** independently
-  complete wire and transport manifests for eap5g, nwu-ike, ngap, n2-sctp,
-  gre-qfi, n3-gtpu, protocol-key, nas-tcp, xfrm-roster, and n2-dtls. Each
-  subset publishes required case classes, sanitized-field inventory, SHA-256
-  digests, constructed/receive/unsupported outcomes, and
-  `runtime_claim=false`. Oracles are TS 24.502 V18.8.0 7.3–7.7 / 8.2–8.3 /
-  9.3–9.4, TS 29.413 V18.5.0 5.2–5.4, TS 38.413 V18.10.0, TS 38.412 V18.1.0
-  clause 7, RFC 6083, TS 29.281 V18.4.0 4.4 / 5.2.2.7 / 7.2–7.3 / 8.2,
-  TS 38.415 V18.2.0 5.5.3, TS 33.501 V18.12.0 7.2.1, RFC 7296, and RFC 4555.
-  Reuses the issue 493 NGAP DecodeContext vector and issue 341 GTP-U
-  Echo/PSC bytes by digest. NGAP publishes Rel-18 bytes plus IE
-  cardinality/criticality matrices for every admitted first-CNF 5.2 outcome;
-  Paging is 5.4 unsupported. 5.2 messages outside that typed subset stay
-  unpublished. Crate and rust-gates detectors fail closed on missing
-  classes, digest mutation, and forbidden content. No codec, adapter, or
-  key-handle runtime is activated. Application policy, subscriber
-  authentication decisions, AMF selection, deployment, readiness, and
-  product claims stay out of scope. Tracking issue 795 is not implemented
-  (Fixes #784).
+- **Synthetic N3IWF fixture contracts — `opc-n3iwf-fixtures`:** ten independently
+  consumable inventories with explicit encoding, validation scope, caller
+  context, provenance, and byte digests. Catalog loading validates bounded
+  regular files, redacted diagnostics, unique JSON fields, and pinned
+  TS 38.413 V18.10.0 IE presence/criticality/cardinality matrices. Read-only
+  generation, independent envelope/scenario oracles, existing NGAP/GTP-U codec
+  tests, and Git content stamps guard the inventory. The reused legacy NGAP
+  vector is sanitized structural evidence; complete Release-18 N3IWF messages,
+  typed encoding, cryptography, transports, and kernel state remain unproven.
+  All records keep `runtime_claim=false`. This establishes the documented
+  fixture boundaries and leaves broader evidence tracked in #784; issue 795
+  remains outside this change.
 - **Selectable fixed-quorum persistence — `opc-session-store`:** supported
   `SessionPersistenceMode::Async` acknowledges validated resident storage,
   real quorum replication, and committed application while one coalescing

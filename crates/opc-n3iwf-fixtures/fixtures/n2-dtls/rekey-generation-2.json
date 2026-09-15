@@ -1,4 +1,18 @@
 {
+  "encoding": "scenario-label",
+  "validation_scope": "dtls-lifecycle-contract",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
   "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.rekey-generation-2",
   "subset": "n2-dtls",
   "case_class": "ordering",
@@ -6,7 +20,8 @@
     "document": "IETF RFC 6083",
     "release": "RFC 6083",
     "clauses": [
-      "4.4"
+      "4.8",
+      "5"
     ]
   },
   "direction": "local",

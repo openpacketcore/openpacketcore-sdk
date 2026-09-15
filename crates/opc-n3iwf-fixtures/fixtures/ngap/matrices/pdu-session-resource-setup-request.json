@@ -28,43 +28,50 @@
       "id": 10,
       "name": "id-AMF-UE-NGAP-ID",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 85,
       "name": "id-RAN-UE-NGAP-ID",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 83,
       "name": "id-RANPagingPriority",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 38,
       "name": "id-NAS-PDU",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 74,
       "name": "id-PDUSessionResourceSetupListSUReq",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 110,
       "name": "id-UEAggregateMaximumBitRate",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 335,
       "name": "id-UESliceMaximumBitRateList",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     }
   ]
 }

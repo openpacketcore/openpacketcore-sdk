@@ -1,4 +1,13 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "aper-structural-dispatch",
+  "context": {
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "reject",
+    "mandatory_presence_validation": false,
+    "inner_ie_validation": false
+  },
   "sdk_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-context-setup-request",
   "subset": "ngap",
   "case_class": "positive",

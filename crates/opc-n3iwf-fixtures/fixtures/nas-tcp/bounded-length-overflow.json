@@ -1,4 +1,11 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "nas-tcp-envelope",
+  "context": {
+    "max_payload_len": 256,
+    "min_payload_len": 1,
+    "stream_open": true
+  },
   "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.bounded-length-overflow",
   "subset": "nas-tcp",
   "case_class": "bounded-overflow",
@@ -17,7 +24,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Length 256 exceeds a 256-byte caller max that excludes the envelope header"
+    "notes": "Length 257 exceeds the inclusive caller maximum of 256 NAS payload octets; the two-octet header is excluded"
   },
   "sanitized_fields": [
     {
@@ -28,10 +35,10 @@
   ],
   "wire": {
     "path": "wire/bounded-length-overflow.hex",
-    "digest_sha256": "aa25e1d595a77c375b40b4796ea4ff044890efeebd4bd15d16d54387a5a8fc37"
+    "digest_sha256": "d93dea04051ac941188b26ec5af729a8ed1731a54978d8ce713513995a106937"
   },
   "semantic_assertions": [
-    "length=256",
+    "length=257",
     "caller_max=256",
     "finalization=reject"
   ],

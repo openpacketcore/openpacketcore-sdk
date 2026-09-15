@@ -1,4 +1,13 @@
 {
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": true
+  },
   "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.overlap-rekey",
   "subset": "xfrm-roster",
   "case_class": "positive",
@@ -33,7 +42,7 @@
   ],
   "wire": {
     "path": "wire/overlap-rekey.hex",
-    "digest_sha256": "47eb21ed67df16b6bc2cc5d794e764d62d6c0319fb422c140427fc50a20321b9"
+    "digest_sha256": "2b5f418ad1832a521bff368e48dd236b8078b7c1354dda08645ddaaf1f5d47e1"
   },
   "semantic_assertions": [
     "overlap=true",

@@ -28,109 +28,113 @@
       "id": 115,
       "name": "id-UEPagingIdentity",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 50,
       "name": "id-PagingDRX",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 103,
       "name": "id-TAIListForPaging",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 52,
       "name": "id-PagingPriority",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 118,
       "name": "id-UERadioCapabilityForPaging",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 51,
       "name": "id-PagingOrigin",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 11,
       "name": "id-AssistanceDataForPaging",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 203,
       "name": "id-NB-IoT-Paging-eDRXInfo",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 202,
       "name": "id-NB-IoT-PagingDRX",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 205,
       "name": "id-Enhanced-CoverageRestriction",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 208,
       "name": "id-WUS-Assistance-Information",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 223,
       "name": "id-EUTRA-PagingeDRXInformation",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 222,
       "name": "id-CEmodeBrestricted",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 332,
       "name": "id-NR-PagingeDRXInformation",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 342,
       "name": "id-PagingCause",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 344,
       "name": "id-PEIPSassistanceInformation",
       "criticality": "ignore",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 477,
-      "name": "id-LPWUSPSAssistanceInformation",
-      "criticality": "ignore",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 495,
-      "name": "id-LPWUSDisableIndication",
-      "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     }
   ]
 }

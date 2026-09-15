@@ -1,4 +1,9 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "gre-header",
+  "context": {
+    "max_qfi": 63
+  },
   "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.receive-nonzero-protocol-type",
   "subset": "gre-qfi",
   "case_class": "unknown-critical",
@@ -33,7 +38,8 @@
   },
   "semantic_assertions": [
     "protocol_type=0x0800",
-    "receiver_disposition=ignore"
+    "receiver_disposition=ignore",
+    "packet_disposition=receive"
   ],
   "expected_outcome": "ignore",
   "runtime_claim": false

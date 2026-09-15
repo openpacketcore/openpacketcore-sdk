@@ -1,4 +1,9 @@
 {
+  "encoding": "construction-argument",
+  "validation_scope": "qfi-construction-bound",
+  "context": {
+    "max_qfi": 63
+  },
   "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.bounded-qfi-overflow",
   "subset": "gre-qfi",
   "case_class": "bounded-overflow",
@@ -28,10 +33,12 @@
   ],
   "wire": {
     "path": "wire/bounded-qfi-overflow.hex",
-    "digest_sha256": "ce5cb0c816258f78b24409f52a04537043ed7ba919186c19022c09dfe938eb48"
+    "digest_sha256": "c3641f8544d7c02f3580b07c0f9887f0c6a27ff5ab1d4a3e29caf197cfc299ae"
   },
   "semantic_assertions": [
-    "reserved_bits_or_qfi_bound=true"
+    "qfi_input=64",
+    "max_qfi=63",
+    "wire_encoding=not-attempted"
   ],
   "expected_outcome": "reject",
   "runtime_claim": false

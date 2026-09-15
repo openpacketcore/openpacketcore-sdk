@@ -1,4 +1,11 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "sctp-data-chunk",
+  "context": {
+    "layout": "ppid-port",
+    "ppid": 60,
+    "max_port": 65534
+  },
   "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.positive-data-chunk",
   "subset": "n2-sctp",
   "case_class": "positive",
@@ -28,12 +35,14 @@
   ],
   "wire": {
     "path": "wire/positive-data-chunk.hex",
-    "digest_sha256": "28ada546d37b3abc24544d7df57a688b90aaceb7b966c6851b583261be48e134"
+    "digest_sha256": "9d7e6a0179d33afaaa70ef98831312b8ecb2545c48f9f424183c6c70426c1caa"
   },
   "semantic_assertions": [
     "chunk=DATA",
     "ppid=60",
-    "user_data_len=0"
+    "user_data_len=1",
+    "user_data=opaque-synthetic-octet",
+    "ngap_message_validation=unsupported"
   ],
   "expected_outcome": "constructed",
   "runtime_claim": false

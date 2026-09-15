@@ -1,4 +1,9 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "eap-envelope",
+  "context": {
+    "max_an_bytes": 1024
+  },
   "sdk_fixture_id": "opc.n3iwf.eap5g.v1.bounded-an-parameter-overflow",
   "subset": "eap5g",
   "case_class": "bounded-overflow",
@@ -28,7 +33,7 @@
   ],
   "wire": {
     "path": "wire/bounded-an-parameter-overflow.hex",
-    "digest_sha256": "d9e72897f473d7ac020d279b8255be8337ef11eae90ea47da46ab11d2d831984"
+    "digest_sha256": "f6e3eede46b603e8c62543479243cfbe106fdaa366354b42517a542474ed550d"
   },
   "semantic_assertions": [
     "an_parameter_length_overflow=true"

@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 41,
+    "max_spi_bytes": 4
+  },
   "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.create-child-sa",
   "subset": "nwu-ike",
   "case_class": "positive",
@@ -35,6 +41,8 @@
   },
   "semantic_assertions": [
     "procedure=create-child-sa",
+    "payload_chain_only=true",
+    "complete_ike_exchange=unsupported",
     "notify_types=55501,55504",
     "dcsi=1",
     "backend_roster=out-of-scope"

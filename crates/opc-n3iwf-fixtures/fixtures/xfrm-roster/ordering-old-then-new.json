@@ -1,4 +1,13 @@
 {
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "install",
+    "old_pair_retained": true
+  },
   "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.ordering-old-then-new",
   "subset": "xfrm-roster",
   "case_class": "ordering",
@@ -33,7 +42,7 @@
   ],
   "wire": {
     "path": "wire/ordering-old-then-new.hex",
-    "digest_sha256": "fb75e993126a5749077679466f8a0d50093fe8d3c7eceb103a728c5e6e59b5c7"
+    "digest_sha256": "5a7ff7060a074f1e48998ef6ea8c37e2a87d708ddeb9e75cc59b0e95a08db4e4"
   },
   "semantic_assertions": [
     "order=old-then-new"

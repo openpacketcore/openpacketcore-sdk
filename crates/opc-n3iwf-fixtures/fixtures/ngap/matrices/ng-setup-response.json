@@ -28,67 +28,64 @@
       "id": 1,
       "name": "id-AMFName",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 96,
       "name": "id-ServedGUAMIList",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 86,
       "name": "id-RelativeAMFCapacity",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 80,
       "name": "id-PLMNSupportList",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 19,
       "name": "id-CriticalityDiagnostics",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 147,
       "name": "id-UERetentionInformation",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 200,
       "name": "id-IAB-Supported",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 274,
       "name": "id-Extended-AMFName",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 404,
       "name": "id-MobileIAB-Supported",
       "criticality": "ignore",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 467,
-      "name": "id-AIOTFIdentifier",
-      "criticality": "reject",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 476,
-      "name": "id-AIOTFName",
-      "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     }
   ]
 }

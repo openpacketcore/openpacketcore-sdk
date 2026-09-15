@@ -3,7 +3,7 @@
 
 This script is the deterministic writer for crates/opc-n3iwf-fixtures/fixtures.
 It emits spec-authored hex, SHA-256 digests, completion records, and subset
-README octet tables. It never copies production captures or key material.
+subset READMEs. It never copies production captures or key material.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = ROOT / "crates" / "opc-n3iwf-fixtures" / "fixtures"
-PUBLIC_BASE = "3194cf3c06ab0f6aeed3f39b00f1055702c75f09"
+PUBLIC_BASE = "82027e46d8706bc11f226fbfaf95da7858be7e4c"
 ISSUE = 784
 
 # Existing public SDK vectors reused by digest (issues 341/493).
@@ -31,6 +31,146 @@ NGSETUP_EXTERNAL = (
 GTPU_ECHO_REQUEST = "32 01 00 04 00 00 00 00 12 34 00 00"
 GTPU_ECHO_RESPONSE = "32 02 00 06 00 00 00 00 12 34 00 00 0e 00"
 GTPU_DL_PSC = "36 ff 00 08 11 22 33 44 00 05 00 85 01 00 09 00"
+
+
+# Retain the upstream octets as provenance, but publish only a documented
+# synthetic derivative. The legacy vector is structural APER evidence, not
+# a standards-valid N3IWF NG Setup or an independent Release-18 peer oracle.
+NGSETUP_SANITIZED = (
+    bytes.fromhex(NGSETUP_EXTERNAL)
+    .replace(bytes.fromhex("02 f8 98"), bytes.fromhex("00 f1 10"))
+    .replace(bytes.fromhex("02 f8 39"), bytes.fromhex("00 f1 10"))
+    .replace(b"My little gNB", b"Synthetic RAN")
+)
+NGSETUP_SANITIZED = (NGSETUP_SANITIZED[:2] + b"\x00" + NGSETUP_SANITIZED[3:]).hex(" ")
+
+
+def contract_layer(subset: str, name: str) -> tuple[str, str]:
+    if subset == "protocol-key":
+        return "scenario-label", "handle-lifecycle-contract"
+    if subset == "xfrm-roster":
+        return "scenario-record", "roster-transition-contract"
+    if subset == "n2-sctp":
+        return (
+            ("protocol-wire", "sctp-data-chunk")
+            if name == "positive-data-chunk"
+            else ("metadata-record", "association-metadata")
+        )
+    if subset == "n2-dtls":
+        if name == "reliable-delivery-data":
+            return "protocol-wire", "sctp-data-chunk"
+        if name in {
+            "positive-handshake-header",
+            "malformed-tls-version",
+            "truncated-record",
+            "bounded-record-overflow",
+        }:
+            return "protocol-wire", "dtls-record"
+        if name in {
+            "positive-ppid66",
+            "duplicate-ppid66",
+            "unknown-ppid60",
+            "ordering-ppid-then-handshake",
+        }:
+            return "metadata-record", "dtls-association-metadata"
+        return "scenario-label", "dtls-lifecycle-contract"
+    if subset == "gre-qfi" and name == "bounded-qfi-overflow":
+        return "construction-argument", "qfi-construction-bound"
+    return "protocol-wire", {
+        "eap5g": "eap-envelope",
+        "nwu-ike": "ike-payload",
+        "ngap": "aper-structural-dispatch",
+        "gre-qfi": "gre-header",
+        "n3-gtpu": "gtpu-message",
+        "nas-tcp": "nas-tcp-envelope",
+    }[subset]
+
+
+def fixture_context(subset: str, name: str) -> dict:
+    if subset == "eap5g":
+        return {"max_an_bytes": 1024}
+    if subset == "nwu-ike":
+        return {
+            "initial_payload_type": 42
+            if name == "delete-esp"
+            else 127
+            if name == "unknown-critical-payload"
+            else 41,
+            "max_spi_bytes": 4,
+        }
+    if subset == "nas-tcp":
+        return {
+            "max_payload_len": 256,
+            "min_payload_len": 1,
+            "stream_open": name != "eof-loss-incomplete-frame",
+        }
+    if subset == "gre-qfi":
+        return {"max_qfi": 63}
+    if subset == "ngap":
+        return {
+            "max_ies": 256,
+            "duplicate_ie_policy": "reject",
+            "unknown_ie_policy": "reject",
+            "mandatory_presence_validation": False,
+            "inner_ie_validation": False,
+        }
+    if subset == "n2-sctp":
+        return {
+            "layout": "port-ppid"
+            if name == "ordering-port-before-ppid"
+            else "ppid-port",
+            "ppid": 60,
+            "max_port": 65534,
+        }
+    if subset == "n3-gtpu":
+        return {
+            "max_message_len": 11 if name == "bounded-length-overflow" else 65535,
+            "unknown_ie_policy": "reject",
+        }
+    if subset == "protocol-key":
+        actions = {
+            "reuse-after-consume": ["bind", "consume", "consume"],
+            "drop-zeroize": ["bind", "drop"],
+            "cancellation": ["bind", "cancel", "consume"],
+        }.get(name, ["bind", "consume"])
+        return {
+            "bound_generation": 1,
+            "requested_generation": 2 if name == "wrong-generation" else 1,
+            "purpose": "unknown" if name == "unknown-purpose" else "K_N3IWF",
+            "max_label_bytes": 64,
+            "actions": actions,
+            "expected_state": "zeroized"
+            if name == "drop-zeroize"
+            else "cancelled"
+            if name == "cancellation"
+            else "consumed",
+        }
+    if subset == "xfrm-roster":
+        return {
+            "max_generation": 65535,
+            "inbound_provenance_valid": name != "unknown-inbound-spi",
+            "relocation_authorized": True,
+            "operation": "relocate"
+            if name == "relocation"
+            else "install-new-then-retire-old"
+            if name == "rekey-new-pair"
+            else "install",
+            "old_pair_retained": name in {"overlap-rekey", "ordering-old-then-new"},
+        }
+    if subset == "n2-dtls":
+        return {
+            "ppid": 66,
+            "max_record_payload": 16384,
+            "max_label_bytes": 64,
+            "delivery_policy": "reliable-ordered",
+            "identity_verified": True,
+            "exporter_length": 64,
+            "old_auth_key_id": 2 if name == "rotation-generation-3" else 1,
+            "new_auth_key_id": 3 if name == "rotation-generation-3" else 2,
+            "switch_auth_key_before_finished": True,
+            "retire_old_key_after_ack": True,
+        }
+    raise ValueError("unknown fixture subset")
 
 
 def hex_bytes(text: str) -> bytes:
@@ -66,7 +206,11 @@ def manifest(
     assertions: list[str],
     outcome: str,
 ) -> dict:
+    encoding, scope = contract_layer(subset, name)
     return {
+        "encoding": encoding,
+        "validation_scope": scope,
+        "context": fixture_context(subset, name),
         "sdk_fixture_id": f"opc.n3iwf.{subset}.v1.{name}",
         "subset": subset,
         "case_class": case_class,
@@ -116,6 +260,7 @@ def completion(
     record = {
         "subset": subset,
         "status": "complete",
+        "completion_scope": "fixture-inventory-at-declared-validation-scopes",
         "issue": ISSUE,
         "runtime_claim": False,
         "consumers_may_depend": True,
@@ -140,8 +285,8 @@ def empty_ie_pdu(choice: int, procedure: int, criticality: int) -> str:
     return f"{choice:02x} {procedure:02x} {criticality:02x} 03 00 00 00"
 
 
-# TS 38.413 V18.10.0 IE identifier/criticality/cardinality transcribed from
-# crates/opc-proto-ngap/src/policy.rs (issue 493 first-CNF profiles).
+# Message dispatch metadata for the first-CNF structural subset. IE rows
+# come from the pinned Release-18 ASN.1 oracle, never the current codec tables.
 # TS 29.413 V18.5.0 clause 5.2 admits these N3IWF–AMF messages; clause 5.4
 # discards Paging. Constructed N3IWF send remains unsupported.
 NGAP_CRITICALITY = {"reject": 0x00, "ignore": 0x40, "notify": 0x80}
@@ -160,17 +305,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.6.1"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.positive-ngsetup-external",
         "emit_empty_wrapper": False,
-        "ies": [
-            (27, "id-GlobalRANNodeID", "reject"),
-            (82, "id-RANNodeName", "ignore"),
-            (102, "id-SupportedTAList", "reject"),
-            (21, "id-DefaultPagingDRX", "ignore"),
-            (147, "id-UERetentionInformation", "ignore"),
-            (204, "id-NB-IoT-DefaultPagingDRX", "ignore"),
-            (273, "id-Extended-RANNodeName", "ignore"),
-            (475, "id-AIoT-Support", "reject"),
-            (483, "id-AdditionalULI", "ignore"),
-        ],
     },
     {
         "slug": "ng-setup-response",
@@ -184,19 +318,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.6.2"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ng-setup-response",
         "emit_empty_wrapper": True,
-        "ies": [
-            (1, "id-AMFName", "reject"),
-            (96, "id-ServedGUAMIList", "reject"),
-            (86, "id-RelativeAMFCapacity", "ignore"),
-            (80, "id-PLMNSupportList", "reject"),
-            (19, "id-CriticalityDiagnostics", "ignore"),
-            (147, "id-UERetentionInformation", "ignore"),
-            (200, "id-IAB-Supported", "ignore"),
-            (274, "id-Extended-AMFName", "ignore"),
-            (404, "id-MobileIAB-Supported", "ignore"),
-            (467, "id-AIOTFIdentifier", "reject"),
-            (476, "id-AIOTFName", "reject"),
-        ],
     },
     {
         "slug": "ng-setup-failure",
@@ -210,11 +331,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.6.3"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ng-setup-failure",
         "emit_empty_wrapper": True,
-        "ies": [
-            (15, "id-Cause", "ignore"),
-            (107, "id-TimeToWait", "ignore"),
-            (19, "id-CriticalityDiagnostics", "ignore"),
-        ],
     },
     {
         "slug": "initial-ue-message",
@@ -228,33 +344,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.5.1"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-ue-message",
         "emit_empty_wrapper": True,
-        "ies": [
-            (85, "id-RAN-UE-NGAP-ID", "reject"),
-            (38, "id-NAS-PDU", "reject"),
-            (121, "id-UserLocationInformation", "reject"),
-            (90, "id-RRCEstablishmentCause", "ignore"),
-            (26, "id-FiveG-S-TMSI", "reject"),
-            (3, "id-AMFSetID", "ignore"),
-            (112, "id-UEContextRequest", "ignore"),
-            (0, "id-AllowedNSSAI", "reject"),
-            (171, "id-SourceToTarget-AMFInformationReroute", "ignore"),
-            (174, "id-SelectedPLMNIdentity", "ignore"),
-            (201, "id-IABNodeIndication", "reject"),
-            (224, "id-CEmodeBSupport-Indicator", "reject"),
-            (225, "id-LTEM-Indication", "ignore"),
-            (227, "id-EDT-Session", "ignore"),
-            (245, "id-AuthenticatedIndication", "ignore"),
-            (259, "id-NPN-AccessInformation", "reject"),
-            (333, "id-RedCapIndication", "ignore"),
-            (371, "id-SelectedNID", "ignore"),
-            (402, "id-MobileIABNodeIndication", "reject"),
-            (414, "id-Partially-Allowed-NSSAI", "ignore"),
-            (427, "id-ERedCapIndication", "ignore"),
-            (440, "id-AUN3DeviceAccessInfo", "ignore"),
-            (28, "id-GUAMI", "ignore"),
-            (176, "id-GUAMIType", "ignore"),
-            (454, "id-RequestedNSSAI", "ignore"),
-        ],
     },
     {
         "slug": "downlink-nas-transport",
@@ -268,31 +357,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.5.2"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-downlink-nas-transport",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "reject"),
-            (85, "id-RAN-UE-NGAP-ID", "reject"),
-            (48, "id-OldAMF", "reject"),
-            (83, "id-RANPagingPriority", "ignore"),
-            (38, "id-NAS-PDU", "reject"),
-            (36, "id-MobilityRestrictionList", "ignore"),
-            (31, "id-IndexToRFSP", "ignore"),
-            (110, "id-UEAggregateMaximumBitRate", "ignore"),
-            (0, "id-AllowedNSSAI", "reject"),
-            (177, "id-SRVCCOperationPossible", "ignore"),
-            (205, "id-Enhanced-CoverageRestriction", "ignore"),
-            (206, "id-Extended-ConnectedTime", "ignore"),
-            (209, "id-UE-DifferentiationInfo", "ignore"),
-            (222, "id-CEmodeBrestricted", "ignore"),
-            (117, "id-UERadioCapability", "ignore"),
-            (228, "id-UECapabilityInfoRequest", "ignore"),
-            (226, "id-EndIndication", "ignore"),
-            (264, "id-UERadioCapabilityID", "reject"),
-            (334, "id-TargetNSSAIInformation", "ignore"),
-            (34, "id-MaskedIMEISV", "ignore"),
-            (414, "id-Partially-Allowed-NSSAI", "ignore"),
-            (400, "id-MobileIAB-Authorized", "ignore"),
-            (443, "id-ExtendedOldAMF", "ignore"),
-        ],
     },
     {
         "slug": "uplink-nas-transport",
@@ -306,15 +370,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.5.3"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-uplink-nas-transport",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "reject"),
-            (85, "id-RAN-UE-NGAP-ID", "reject"),
-            (38, "id-NAS-PDU", "reject"),
-            (121, "id-UserLocationInformation", "ignore"),
-            (239, "id-W-AGFIdentityInformation", "reject"),
-            (246, "id-TNGFIdentityInformation", "reject"),
-            (247, "id-TWIFIdentityInformation", "reject"),
-        ],
     },
     {
         "slug": "initial-context-setup-request",
@@ -328,64 +383,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.2.1"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-context-setup-request",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "reject"),
-            (85, "id-RAN-UE-NGAP-ID", "reject"),
-            (48, "id-OldAMF", "reject"),
-            (110, "id-UEAggregateMaximumBitRate", "reject"),
-            (18, "id-CoreNetworkAssistanceInformationForInactive", "ignore"),
-            (28, "id-GUAMI", "reject"),
-            (71, "id-PDUSessionResourceSetupListCxtReq", "reject"),
-            (0, "id-AllowedNSSAI", "reject"),
-            (119, "id-UESecurityCapabilities", "reject"),
-            (94, "id-SecurityKey", "reject"),
-            (108, "id-TraceActivation", "ignore"),
-            (36, "id-MobilityRestrictionList", "ignore"),
-            (117, "id-UERadioCapability", "ignore"),
-            (31, "id-IndexToRFSP", "ignore"),
-            (34, "id-MaskedIMEISV", "ignore"),
-            (38, "id-NAS-PDU", "ignore"),
-            (24, "id-EmergencyFallbackIndicator", "reject"),
-            (91, "id-RRCInactiveTransitionReportRequest", "ignore"),
-            (118, "id-UERadioCapabilityForPaging", "ignore"),
-            (146, "id-RedirectionVoiceFallback", "ignore"),
-            (33, "id-LocationReportingRequestType", "ignore"),
-            (165, "id-CNAssistedRANTuning", "ignore"),
-            (177, "id-SRVCCOperationPossible", "ignore"),
-            (199, "id-IAB-Authorized", "ignore"),
-            (205, "id-Enhanced-CoverageRestriction", "ignore"),
-            (206, "id-Extended-ConnectedTime", "ignore"),
-            (209, "id-UE-DifferentiationInfo", "ignore"),
-            (216, "id-NRV2XServicesAuthorized", "ignore"),
-            (215, "id-LTEV2XServicesAuthorized", "ignore"),
-            (218, "id-NRUESidelinkAggregateMaximumBitrate", "ignore"),
-            (217, "id-LTEUESidelinkAggregateMaximumBitrate", "ignore"),
-            (219, "id-PC5QoSParameters", "ignore"),
-            (222, "id-CEmodeBrestricted", "ignore"),
-            (234, "id-UE-UP-CIoT-Support", "ignore"),
-            (238, "id-RGLevelWirelineAccessCharacteristics", "ignore"),
-            (254, "id-ManagementBasedMDTPLMNList", "ignore"),
-            (264, "id-UERadioCapabilityID", "reject"),
-            (326, "id-TimeSyncAssistanceInfo", "ignore"),
-            (328, "id-QMCConfigInfo", "ignore"),
-            (334, "id-TargetNSSAIInformation", "ignore"),
-            (335, "id-UESliceMaximumBitRateList", "ignore"),
-            (345, "id-FiveG-ProSeAuthorized", "ignore"),
-            (346, "id-FiveG-ProSeUEPC5AggregateMaximumBitRate", "ignore"),
-            (347, "id-FiveG-ProSePC5QoSParameters", "ignore"),
-            (367, "id-NetworkControlledRepeaterAuthorized", "ignore"),
-            (373, "id-AerialUEsubscriptionInformation", "ignore"),
-            (374, "id-NR-A2X-ServicesAuthorized", "ignore"),
-            (375, "id-LTE-A2X-ServicesAuthorized", "ignore"),
-            (376, "id-NR-A2X-UE-PC5-AggregateMaximumBitRate", "ignore"),
-            (377, "id-LTE-A2X-UE-PC5-AggregateMaximumBitRate", "ignore"),
-            (378, "id-A2X-PC5-QoS-Parameters", "ignore"),
-            (400, "id-MobileIAB-Authorized", "ignore"),
-            (414, "id-Partially-Allowed-NSSAI", "ignore"),
-            (430, "id-SLPositioningRangingServiceInfo", "ignore"),
-            (443, "id-ExtendedOldAMF", "ignore"),
-            (450, "id-AMF-UE-NGAP-ID2", "ignore"),
-        ],
     },
     {
         "slug": "initial-context-setup-response",
@@ -399,13 +396,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.2.2"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-context-setup-response",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "ignore"),
-            (85, "id-RAN-UE-NGAP-ID", "ignore"),
-            (72, "id-PDUSessionResourceSetupListCxtRes", "ignore"),
-            (55, "id-PDUSessionResourceFailedToSetupListCxtRes", "ignore"),
-            (19, "id-CriticalityDiagnostics", "ignore"),
-        ],
     },
     {
         "slug": "initial-context-setup-failure",
@@ -419,13 +409,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.2.3"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-initial-context-setup-failure",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "ignore"),
-            (85, "id-RAN-UE-NGAP-ID", "ignore"),
-            (132, "id-PDUSessionResourceFailedToSetupListCxtFail", "ignore"),
-            (15, "id-Cause", "ignore"),
-            (19, "id-CriticalityDiagnostics", "ignore"),
-        ],
     },
     {
         "slug": "pdu-session-resource-setup-request",
@@ -439,15 +422,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.1.1"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-setup-request",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "reject"),
-            (85, "id-RAN-UE-NGAP-ID", "reject"),
-            (83, "id-RANPagingPriority", "ignore"),
-            (38, "id-NAS-PDU", "reject"),
-            (74, "id-PDUSessionResourceSetupListSUReq", "reject"),
-            (110, "id-UEAggregateMaximumBitRate", "ignore"),
-            (335, "id-UESliceMaximumBitRateList", "ignore"),
-        ],
     },
     {
         "slug": "pdu-session-resource-setup-response",
@@ -461,14 +435,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.1.2"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-setup-response",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "ignore"),
-            (85, "id-RAN-UE-NGAP-ID", "ignore"),
-            (75, "id-PDUSessionResourceSetupListSURes", "ignore"),
-            (58, "id-PDUSessionResourceFailedToSetupListSURes", "ignore"),
-            (19, "id-CriticalityDiagnostics", "ignore"),
-            (121, "id-UserLocationInformation", "ignore"),
-        ],
     },
     {
         "slug": "pdu-session-resource-release-command",
@@ -482,13 +448,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.1.3"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-release-command",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "reject"),
-            (85, "id-RAN-UE-NGAP-ID", "reject"),
-            (83, "id-RANPagingPriority", "ignore"),
-            (38, "id-NAS-PDU", "ignore"),
-            (79, "id-PDUSessionResourceToReleaseListRelCmd", "reject"),
-        ],
     },
     {
         "slug": "pdu-session-resource-release-response",
@@ -502,13 +461,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.1.4"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-pdu-session-resource-release-response",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "ignore"),
-            (85, "id-RAN-UE-NGAP-ID", "ignore"),
-            (70, "id-PDUSessionResourceReleasedListRelRes", "ignore"),
-            (121, "id-UserLocationInformation", "ignore"),
-            (19, "id-CriticalityDiagnostics", "ignore"),
-        ],
     },
     {
         "slug": "ue-context-release-command",
@@ -522,10 +474,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.2.4"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ue-context-release-command",
         "emit_empty_wrapper": True,
-        "ies": [
-            (114, "id-UE-NGAP-IDs", "reject"),
-            (15, "id-Cause", "ignore"),
-        ],
     },
     {
         "slug": "ue-context-release-complete",
@@ -539,15 +487,6 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.2.5"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ue-context-release-complete",
         "emit_empty_wrapper": True,
-        "ies": [
-            (10, "id-AMF-UE-NGAP-ID", "ignore"),
-            (85, "id-RAN-UE-NGAP-ID", "ignore"),
-            (121, "id-UserLocationInformation", "ignore"),
-            (32, "id-InfoOnRecommendedCellsAndRANNodesForPaging", "ignore"),
-            (60, "id-PDUSessionResourceListCxtRelCpl", "reject"),
-            (19, "id-CriticalityDiagnostics", "ignore"),
-            (207, "id-PagingAssisDataforCEcapabUE", "ignore"),
-        ],
     },
     {
         "slug": "paging",
@@ -561,28 +500,14 @@ NGAP_IE_MATRICES: list[dict] = [
         "clauses_38413": ["9.2.4.1"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.unsupported-paging-5-4",
         "emit_empty_wrapper": True,
-        "ies": [
-            (115, "id-UEPagingIdentity", "ignore"),
-            (50, "id-PagingDRX", "ignore"),
-            (103, "id-TAIListForPaging", "ignore"),
-            (52, "id-PagingPriority", "ignore"),
-            (118, "id-UERadioCapabilityForPaging", "ignore"),
-            (51, "id-PagingOrigin", "ignore"),
-            (11, "id-AssistanceDataForPaging", "ignore"),
-            (203, "id-NB-IoT-Paging-eDRXInfo", "ignore"),
-            (202, "id-NB-IoT-PagingDRX", "ignore"),
-            (205, "id-Enhanced-CoverageRestriction", "ignore"),
-            (208, "id-WUS-Assistance-Information", "ignore"),
-            (223, "id-EUTRA-PagingeDRXInformation", "ignore"),
-            (222, "id-CEmodeBrestricted", "ignore"),
-            (332, "id-NR-PagingeDRXInformation", "ignore"),
-            (342, "id-PagingCause", "ignore"),
-            (344, "id-PEIPSassistanceInformation", "ignore"),
-            (477, "id-LPWUSPSAssistanceInformation", "ignore"),
-            (495, "id-LPWUSDisableIndication", "ignore"),
-        ],
     },
 ]
+
+NGAP_RELEASE_ORACLE = json.loads(
+    (ROOT / "crates/opc-n3iwf-fixtures/oracles/ngap-rel18.json").read_text()
+)
+for _matrix in NGAP_IE_MATRICES:
+    _matrix["ies"] = NGAP_RELEASE_ORACLE["messages"][_matrix["message"]]
 
 
 def write_completion(subset_dir: Path, record: dict) -> None:
@@ -643,9 +568,7 @@ def eap5g(subset_dir: Path) -> list[dict]:
     malformed = "01 01 00 10 fe 00 28 af 00 00 00 03 01 00"
     unknown_critical = "01 01 00 0e fe 00 28 af 00 00 00 03 7f 00"
     truncated = "01 01 00 0e fe 00 28 af 00 00 00 03 01"
-    overflow = (
-        "02 02 00 12 fe 00 28 af 00 00 00 03 02 00 00 08 02 ff 00"
-    )
+    overflow = "02 02 00 15 fe 00 28 af 00 00 00 03 02 00 00 03 02 ff 00 00 00"
     notification = "01 03 00 10 fe 00 28 af 00 00 00 03 03 00 00 00"
     stop = "02 04 00 0e fe 00 28 af 00 00 00 03 04 00"
     fixtures = [
@@ -950,18 +873,18 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
     delete = "00 00 00 0c 03 04 00 01 0a 0b 0c 0d"
     mobike = "00 00 00 0c 00 00 40 0d c0 00 02 0a"
     unknown_crit = "00 80 00 08 7f 00 00 00"
-    duplicate = "00 00 00 0c 00 00 d8 ce c0 00 02 0a 00 00 00 0c 00 00 d8 ce c0 00 02 0b"
-    ordered = "00 00 00 0a 00 00 d8 d2 4e 20 00 00 00 0c 00 00 d8 ce c0 00 02 0a"
-    malformed = "00 00 00 0c 00 04 d8 ce c0 00 02"
+    duplicate = (
+        "29 00 00 0c 00 00 d8 ce c0 00 02 0a 00 00 00 0c 00 00 d8 ce c0 00 02 0b"
+    )
+    ordered = "29 00 00 0a 00 00 d8 d2 4e 20 00 00 00 0c 00 00 d8 ce c0 00 02 0a"
+    malformed = "00 00 00 0c 00 03 d8 ce c0 00 02 0a"
     truncated = "00 00 00 0c 00 00 d8 ce c0"
-    overflow = "00 00 00 08 ff 00 d8 ce"
+    overflow = "00 00 00 08 00 ff d8 ce"
     create_child = (
-        "29 00 00 0d 00 00 d8 cd 04 05 01 09 02 "
-        "00 00 00 0c 00 00 d8 d0 c0 00 02 0b"
+        "29 00 00 0d 00 00 d8 cd 04 05 01 09 02 00 00 00 0c 00 00 d8 d0 c0 00 02 0b"
     )
     modify_child = (
-        "29 00 00 0c 03 04 d8 d4 0a 0b 0c 0d "
-        "00 00 00 0d 00 00 d8 cd 04 05 01 0a 00"
+        "29 00 00 0c 03 04 d8 d4 0a 0b 0c 0d 00 00 00 0d 00 00 d8 cd 04 05 01 0a 00"
     )
     wires = [
         nas_ip4,
@@ -1116,7 +1039,11 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="mobility-additional-addresses",
             wire_hex=mobike,
-            assertions=["notify_type=16397", "address=192.0.2.10", "mobility_wire_only=true"],
+            assertions=[
+                "notify_type=16397",
+                "address=192.0.2.10",
+                "mobility_wire_only=true",
+            ],
             outcome="receive",
         ),
         manifest(
@@ -1137,6 +1064,8 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             wire_hex=create_child,
             assertions=[
                 "procedure=create-child-sa",
+                "payload_chain_only=true",
+                "complete_ike_exchange=unsupported",
                 "notify_types=55501,55504",
                 "dcsi=1",
                 "backend_roster=out-of-scope",
@@ -1161,8 +1090,10 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             wire_hex=modify_child,
             assertions=[
                 "procedure=modify-child-sa",
+                "payload_chain_only=true",
+                "complete_ike_exchange=unsupported",
                 "notify_types=55508,55501",
-                "spi_size=4",
+                "up_sa_spi_size=4",
                 "qfi=10",
                 "backend_roster=out-of-scope",
             ],
@@ -1184,7 +1115,11 @@ def nwu_ike(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="unknown-critical-payload",
             wire_hex=unknown_crit,
-            assertions=["critical=true", "unknown_payload_type=127"],
+            assertions=[
+                "critical=true",
+                "unknown_payload_type=127",
+                "initial_payload_type=127",
+            ],
             outcome="reject",
         ),
         manifest(
@@ -1356,35 +1291,24 @@ def ngap_matrix_record(spec: dict) -> dict:
         ),
         "admission_scope": "issue-493-first-cnf-typed-subset",
         "wire_fixture_id": spec["wire_fixture_id"],
-        "ies": [
-            {
-                "id": ie_id,
-                "name": name,
-                "criticality": crit,
-                "cardinality": "singleton",
-            }
-            for ie_id, name, crit in spec["ies"]
-        ],
+        "ies": spec["ies"],
     }
 
 
 def ngap(subset_dir: Path) -> list[dict]:
     empty_setup = empty_ie_pdu(0x00, 21, 0x00)
     unknown_crit = (
-        "00 15 40 4a 00 00 04 00 ff 00 08 40 02 f8 98 00 00 00 00 00 52 40 0f "
-        "06 00 4d 79 20 6c 69 74 74 6c 65 20 67 4e 42 00 66 00 1f 01 00 00 00 "
-        "00 00 02 f8 98 00 01 00 08 00 80 00 00 01 00 02 f8 39 00 01 00 18 81 "
-        "c0 00 13 88 00 15 40 01 40"
-    )
-    duplicate = (
-        "00 15 00 0d 00 00 02 00 1b 00 01 00 00 1b 00 01 00"
-    )
+        bytes.fromhex(NGSETUP_SANITIZED)[:7]
+        + bytes.fromhex("00 ff")
+        + bytes.fromhex(NGSETUP_SANITIZED)[9:]
+    ).hex(" ")
+    duplicate = "00 15 00 0d 00 00 02 00 1b 00 01 00 00 1b 00 01 00"
     ordered = "00 15 00 03 00 00 00"
     malformed = "00 15 00 01 00"
     truncated = "00 15"
     overflow = "00 15 00 03 00 ff ff"
     wires = [
-        NGSETUP_EXTERNAL,
+        NGSETUP_SANITIZED,
         empty_setup,
         unknown_crit,
         duplicate,
@@ -1405,11 +1329,11 @@ def ngap(subset_dir: Path) -> list[dict]:
             role="n3iwf",
             prerequisite="Existing opc-proto-ngap DecodeContext policy from issue 493",
             provenance_class="referenced-public-vector",
-            notes="78-byte independent Rel-18 libngap NGSetupRequest already proven in opc-proto-ngap; TS 29.413 V18.5.0 5.2 admits NG Setup",
+            notes="Sanitized derivative of the legacy libngap SDK APER fixture: Outer criticality at offset 2 set to reject; PLMNs at offsets 12,48,61 replaced with test PLMN 001/01; RANNodeName replaced with Synthetic RAN. Source SHA-256 183cf47d3546a4a0a9ac72ae66ca166da4ae90c6bed0ed98e82f38832be57f2d. Structural dispatch only; no independent Release-18 N3IWF message evidence.",
             referenced="crates/opc-proto-ngap/src/lib.rs::ngsetup_request_fixture",
             sanitized=SYN_ID,
             wire_name="positive-ngsetup-external",
-            wire_hex=NGSETUP_EXTERNAL,
+            wire_hex=NGSETUP_SANITIZED,
             assertions=[
                 "procedure=21",
                 "outcome=initiating",
@@ -1417,6 +1341,7 @@ def ngap(subset_dir: Path) -> list[dict]:
                 "ts29413=5.2",
                 "matrix=ng-setup-request",
                 "canonical_typed_encode=unsupported",
+                "standards_valid_n3iwf_message=unproven",
             ],
             outcome="receive",
         ),
@@ -1436,7 +1361,11 @@ def ngap(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="positive-empty-setup-wrapper",
             wire_hex=empty_setup,
-            assertions=["procedure=21", "ie_count=0", "constructed_typed_encode=unsupported"],
+            assertions=[
+                "procedure=21",
+                "ie_count=0",
+                "constructed_typed_encode=unsupported",
+            ],
             outcome="receive",
         ),
         manifest(
@@ -1455,7 +1384,11 @@ def ngap(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="unknown-critical-ie",
             wire_hex=unknown_crit,
-            assertions=["unknown_ie=255", "criticality=reject", "code=UnknownCriticalIe"],
+            assertions=[
+                "unknown_ie=255",
+                "criticality=reject",
+                "code=UnknownCriticalIe",
+            ],
             outcome="reject",
         ),
         manifest(
@@ -1560,7 +1493,7 @@ def ngap(subset_dir: Path) -> list[dict]:
     matrix_paths: list[str] = []
     admitted: list[str] = []
     receive_labels = [
-        "NGSetupRequest external Rel-18 vector",
+        "NGSetupRequest sanitized legacy structural derivative",
         "empty initiating NG Setup wrapper",
     ]
     unsupported_labels = [
@@ -1625,7 +1558,9 @@ def ngap(subset_dir: Path) -> list[dict]:
         subset_dir,
         "NGAP N3IWF fixture subset",
         """Reuses the issue 493 DecodeContext / IE cardinality contract and the
-public 78-byte Rel-18 NGSetupRequest vector (TS 38.413 V18.10.0). TS 29.413
+sanitized 78-byte derivative of the legacy libngap structural vector. It is
+not an independent Release-18 N3IWF message oracle. IE tables are extracted
+separately from TS 38.413 V18.10.0 ASN.1, including presence rules. TS 29.413
 V18.5.0 clauses 5.2–5.4 decide which first-CNF messages are admitted for
 N3IWF. Canonical typed encode remains unsupported.
 
@@ -1656,14 +1591,23 @@ unsupported. This crate does not select an AMF or apply subscriber policy.
 
 def n2_sctp(subset_dir: Path) -> list[dict]:
     positive = "00 00 00 3c 96 1c"
-    data = "00 03 00 10 00 00 00 01 00 00 00 00 00 00 00 3c"
+    data = "00 03 00 11 00 00 00 01 00 00 00 00 00 00 00 3c 00 00 00 00"
     unknown = "00 00 00 42 96 1c"
     duplicate = "00 00 00 3c 96 1c 00 00 00 3c 96 1c"
     ordered = "96 1c 00 00 00 3c"
     malformed = "00 00 00 3c"
     truncated = "00 00 00"
     overflow = "00 00 00 3c ff ff"
-    wires = [positive, data, unknown, duplicate, ordered, malformed, truncated, overflow]
+    wires = [
+        positive,
+        data,
+        unknown,
+        duplicate,
+        ordered,
+        malformed,
+        truncated,
+        overflow,
+    ]
     fixtures = [
         manifest(
             subset="n2-sctp",
@@ -1700,7 +1644,13 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="positive-data-chunk",
             wire_hex=data,
-            assertions=["chunk=DATA", "ppid=60", "user_data_len=0"],
+            assertions=[
+                "chunk=DATA",
+                "ppid=60",
+                "user_data_len=1",
+                "user_data=opaque-synthetic-octet",
+                "ngap_message_validation=unsupported",
+            ],
             outcome="constructed",
         ),
         manifest(
@@ -1832,7 +1782,10 @@ not cryptographic protection. PPID 66 is reserved for `n2-dtls`.
         completion(
             "n2-sctp",
             fixtures,
-            constructed=["PPID 60 / port 38412 association metadata", "DATA chunk header"],
+            constructed=[
+                "PPID 60 / port 38412 association metadata",
+                "DATA chunk header",
+            ],
             receive=["metadata order variants"],
             unsupported=["PPID 66 on this profile", "DTLS", "NGAP procedure state"],
         ),
@@ -1848,8 +1801,17 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
     ordered = "20 00 00 00 09 00 00 80 00"
     malformed = "00 00 00 00 09 00 00 00"
     truncated = "20 00 00 00 09"
-    overflow = "20 00 00 00 4f 00 00 00"
-    wires = [pos_dl, pos_ul, nonzero, duplicate, ordered, malformed, truncated, overflow]
+    overflow = "40"
+    wires = [
+        pos_dl,
+        pos_ul,
+        nonzero,
+        duplicate,
+        ordered,
+        malformed,
+        truncated,
+        overflow,
+    ]
     fixtures = [
         manifest(
             subset="gre-qfi",
@@ -1905,7 +1867,11 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="receive-nonzero-protocol-type",
             wire_hex=nonzero,
-            assertions=["protocol_type=0x0800", "receiver_disposition=ignore"],
+            assertions=[
+                "protocol_type=0x0800",
+                "receiver_disposition=ignore",
+                "packet_disposition=receive",
+            ],
             outcome="ignore",
         ),
         manifest(
@@ -1924,8 +1890,8 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="duplicate-key-header",
             wire_hex=duplicate,
-            assertions=["duplicate_gre_header=true"],
-            outcome="reject",
+            assertions=["gre_header_count=1", "trailing_bytes=opaque-payload"],
+            outcome="receive",
         ),
         manifest(
             subset="gre-qfi",
@@ -2000,7 +1966,7 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="bounded-qfi-overflow",
             wire_hex=overflow,
-            assertions=["reserved_bits_or_qfi_bound=true"],
+            assertions=["qfi_input=64", "max_qfi=63", "wire_encoding=not-attempted"],
             outcome="reject",
         ),
     ]
@@ -2040,10 +2006,10 @@ def n3_gtpu(subset_dir: Path) -> list[dict]:
     ul_psc = "36 ff 00 08 00 00 00 01 00 05 00 85 01 10 09 00"
     unknown = "36 ff 00 08 11 22 33 44 00 05 00 84 01 aa bb 00"
     duplicate = "32 02 00 08 00 00 00 00 12 34 00 00 0e 00 0e 00"
-    ordered = "34 fe 00 10 de ad be ef 00 00 00 85 01 00 09 00 07 01 aa bb 06 01 cc dd 00"
+    ordered = "34 fe 00 10 de ad be ef 00 00 00 85 01 00 09 07 01 aa bb 06 01 cc dd 00"
     malformed = "32 01 00 04 00 00 00 00 12 34"
     truncated = "32 01 00 04"
-    overflow = "32 01 00 ff 00 00 00 00"
+    overflow = GTPU_ECHO_REQUEST
     wires = [
         GTPU_ECHO_REQUEST,
         GTPU_ECHO_RESPONSE,
@@ -2259,12 +2225,12 @@ def n3_gtpu(subset_dir: Path) -> list[dict]:
             role="gtpu-endpoint",
             prerequisite="Caller datagram bound",
             provenance_class="synthetic-negative",
-            notes="Length 255 over an 8-octet datagram",
+            notes="Complete 12-octet Echo Request exceeds the explicit 11-octet caller bound",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="bounded-length-overflow",
             wire_hex=overflow,
-            assertions=["declared_length=255"],
+            assertions=["message_length=12", "caller_max_message_len=11"],
             outcome="reject",
         ),
     ]
@@ -2285,7 +2251,11 @@ dataplane runtime and is not duplicated here.
             "n3-gtpu",
             fixtures,
             constructed=["Echo Request", "Echo Response Recovery 0", "uplink PSC"],
-            receive=["downlink PSC", "ignored nonzero Recovery", "End Marker PSC order"],
+            receive=[
+                "downlink PSC",
+                "ignored nonzero Recovery",
+                "End Marker PSC order",
+            ],
             unsupported=["backend control port", "eBPF offload", "Tunnel Status"],
         ),
     )
@@ -2302,9 +2272,7 @@ def protocol_key(subset_dir: Path) -> list[dict]:
     )
     reuse = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-protocol-key-kat-v1-reuse")
     drop = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-protocol-key-kat-v1-drop")
-    cancel = " ".join(
-        f"{byte:02x}" for byte in b"opc-n3iwf-protocol-key-kat-v1-cancel"
-    )
+    cancel = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-protocol-key-kat-v1-cancel")
     unknown = " ".join(
         f"{byte:02x}" for byte in b"opc-n3iwf-protocol-key-kat-v1-purpose-x"
     )
@@ -2313,8 +2281,21 @@ def protocol_key(subset_dir: Path) -> list[dict]:
     )
     malformed = "ff"
     truncated = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf")
-    overflow = " ".join(f"{byte:02x}" for byte in (b"opc-n3iwf-protocol-key-kat-v1-" + b"A" * 200))
-    wires = [positive, wrong, reuse, drop, cancel, unknown, ordered, malformed, truncated, overflow]
+    overflow = " ".join(
+        f"{byte:02x}" for byte in (b"opc-n3iwf-protocol-key-kat-v1-" + b"A" * 200)
+    )
+    wires = [
+        positive,
+        wrong,
+        reuse,
+        drop,
+        cancel,
+        unknown,
+        ordered,
+        malformed,
+        truncated,
+        overflow,
+    ]
     fixtures = [
         manifest(
             subset="protocol-key",
@@ -2512,7 +2493,8 @@ def protocol_key(subset_dir: Path) -> list[dict]:
     write_readme(
         subset_dir,
         "Protocol-key fixture subset",
-        """Synthetic known-answer labels only. No key, MSK, or K_N3IWF bytes are
+        """Synthetic scenario labels and caller state transitions only; no cryptographic
+known-answer or zeroization evidence. No key, MSK, or K_N3IWF bytes are
 published. Wrong-generation, reuse, drop, and cancellation are semantic
 outcomes for issue 791.
 """,
@@ -2524,7 +2506,11 @@ outcomes for issue 791.
             fixtures,
             constructed=["generation-1 consume-once label"],
             receive=["drop zeroize"],
-            unsupported=["byte export", "hierarchy derivation", "authentication decision"],
+            unsupported=[
+                "byte export",
+                "hierarchy derivation",
+                "authentication decision",
+            ],
         ),
     )
     return fixtures
@@ -2537,7 +2523,7 @@ def nas_tcp(subset_dir: Path) -> list[dict]:
     ordered = "00 03 7e 00 41 00 03 7e 00 5d"
     malformed = "00 00"
     truncated = "00"
-    overflow = "01 00" + " 00" * 16
+    overflow = "01 01" + " 00" * 16
     unknown = "00 03 7f 00 00"
     eof_loss = "00 05 7e 00"
     wires = [
@@ -2677,12 +2663,12 @@ def nas_tcp(subset_dir: Path) -> list[dict]:
             role="nas-tcp-endpoint",
             prerequisite="Caller-selected maximum 256",
             provenance_class="synthetic-negative",
-            notes="Length 256 exceeds a 256-byte caller max that excludes the envelope header",
+            notes="Length 257 exceeds the inclusive caller maximum of 256 NAS payload octets; the two-octet header is excluded",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="bounded-length-overflow",
             wire_hex=overflow,
-            assertions=["length=256", "caller_max=256", "finalization=reject"],
+            assertions=["length=257", "caller_max=256", "finalization=reject"],
             outcome="reject",
         ),
         manifest(
@@ -2701,7 +2687,10 @@ def nas_tcp(subset_dir: Path) -> list[dict]:
             sanitized=NAS_OPAQUE,
             wire_name="unknown-epd",
             wire_hex=unknown,
-            assertions=["envelope_complete=true", "inner_nas=opaque-or-reject-by-nas-codec"],
+            assertions=[
+                "envelope_complete=true",
+                "inner_nas=opaque-or-reject-by-nas-codec",
+            ],
             outcome="receive",
         ),
         manifest(
@@ -2747,7 +2736,12 @@ a trailing partial or complete frame is valid buffered input.
             fixtures,
             constructed=["complete two-octet envelope"],
             receive=["two-frame stream", "unknown inner EPD left opaque"],
-            unsupported=["TCP listen", "reconnect", "security termination", "UE lifecycle"],
+            unsupported=[
+                "TCP listen",
+                "reconnect",
+                "security termination",
+                "UE lifecycle",
+            ],
         ),
     )
     return fixtures
@@ -2755,13 +2749,15 @@ a trailing partial or complete frame is valid buffered input.
 
 def xfrm_roster(subset_dir: Path) -> list[dict]:
     positive = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e"
-    overlap = "01 00 00 02 0a 0b 0c 0d 0a 0b 0c 0f"
+    overlap = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e 01 00 00 02 0a 0b 0c 0f 0a 0b 0c 10"
     rekey = "01 00 00 03 0a 0b 0c 11 0a 0b 0c 12"
     relocate = "01 00 00 04 0a 0b 0c 0d 0a 0b 0c 0e"
     unknown = "01 00 00 01 ff 00 00 00 0a 0b 0c 0e"
-    duplicate = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0d"
-    ordered = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e 02 00 00 02 0a 0b 0c 11 0a 0b 0c 12"
-    malformed = "00 00 00 01 0a 0b 0c 0d"
+    duplicate = (
+        "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e 01 00 00 02 0a 0b 0c 0d 0a 0b 0c 0f"
+    )
+    ordered = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e 01 00 00 02 0a 0b 0c 11 0a 0b 0c 12"
+    malformed = "00 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e"
     truncated = "01 00 00 01 0a 0b"
     overflow = "01 ff ff ff 0a 0b 0c 0d 0a 0b 0c 0e"
     wires = [
@@ -2793,7 +2789,11 @@ def xfrm_roster(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID + NO_KEY,
             wire_name="positive-single-pair",
             wire_hex=positive,
-            assertions=["generation=1", "inbound_spi_label=0x0a0b0c0d", "overlap=false"],
+            assertions=[
+                "generation=1",
+                "inbound_spi_label=0x0a0b0c0d",
+                "overlap=false",
+            ],
             outcome="constructed",
         ),
         manifest(
@@ -2883,7 +2883,7 @@ def xfrm_roster(subset_dir: Path) -> list[dict]:
             role="xfrm-backend",
             prerequisite="Inbound and outbound SPI must differ unless explicitly overlapped",
             provenance_class="synthetic-negative",
-            notes="Inbound and outbound SPI labels are identical",
+            notes="Two generations claim the same inbound SPI in one receiver namespace",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="duplicate-spi",
@@ -2973,7 +2973,9 @@ def xfrm_roster(subset_dir: Path) -> list[dict]:
     write_readme(
         subset_dir,
         "XFRM roster fixture subset",
-        """Backend overlap, SPI provenance, rekey, and authenticated relocation.
+        """Synthetic roster records and explicit caller preconditions for overlap,
+SPI provenance, rekey, and authorized relocation. These model transitions;
+they do not prove kernel installation or authentication.
 IKE notify/create/modify/delete/mobility bytes live in `nwu-ike`. Records
 contain only version, generation, and synthetic SPI labels.
 """,
@@ -2993,10 +2995,7 @@ contain only version, generation, and synthetic SPI labels.
 
 def n2_dtls(subset_dir: Path) -> list[dict]:
     positive = "00 00 00 42"
-    hello = (
-        "16 fe fd 00 00 00 00 00 00 00 00 00 0c "
-        "01 00 00 00 00 00 00 00 00 00 00 00"
-    )
+    hello = "16 fe fd 00 00 00 00 00 00 00 00 00 0c 0e 00 00 00 00 00 00 00 00 00 00 00"
     identity = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-expected-peer")
     auth = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-sctp-auth-kat-len-64")
     rekey = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-rekey-generation-2")
@@ -3004,12 +3003,14 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
     unknown = "00 00 00 3c"
     duplicate = "00 00 00 42 00 00 00 42"
     ordered = "00 00 00 42 " + hello
-    malformed = "16 03 03 00 00"
+    malformed = "16 03 03" + hello[8:]
     truncated = "16 fe fd"
-    overflow = "16 fe fd ff ff"
+    overflow = "16 fe fd 00 00 00 00 00 00 00 00 ff ff"
     redacted = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-error-redacted")
-    reliable = "00 03 00 10 00 00 00 01 00 00 00 00 00 00 00 42"
-    rotation = " ".join(f"{byte:02x}" for byte in b"opc-n3iwf-dtls-rotation-generation-3")
+    reliable = "00 03 00 29 00 00 00 01 00 00 00 00 00 00 00 42 " + hello + " 00 00 00"
+    rotation = " ".join(
+        f"{byte:02x}" for byte in b"opc-n3iwf-dtls-rotation-generation-3"
+    )
     wires = [
         positive,
         hello,
@@ -3032,9 +3033,9 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             subset="n2-dtls",
             name="positive-ppid66",
             case_class="positive",
-            document="IETF RFC 6083",
-            release="RFC 6083",
-            clauses=["4"],
+            document="3GPP TS 38.412",
+            release="V18.1.0",
+            clauses=["7"],
             direction="n3iwf-to-amf",
             role="n3iwf",
             prerequisite="Reuse public SDK DTLS/SCTP machinery; PPID 66 is not a security flag",
@@ -3056,9 +3057,9 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             clauses=["4.1"],
             direction="n3iwf-to-amf",
             role="n3iwf",
-            prerequisite="Identity is a typed expected-peer label, not a certificate dump",
-            provenance_class="synthetic-kat",
-            notes="DTLS 1.2 record plus 12-octet handshake header; fragment length 0",
+            prerequisite="Server endpoint after its preceding handshake flight; this isolated ServerHelloDone is not a completed handshake",
+            provenance_class="spec-authored",
+            notes="DTLS 1.2 ServerHelloDone with an empty body, as RFC 6347 4.2.2 and RFC 5246 7.4.5 permit; no ClientHello, random, certificate, or key material",
             referenced=None,
             sanitized=SYN_ID + NO_KEY,
             wire_name="positive-handshake-header",
@@ -3067,7 +3068,7 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
                 "content_type=handshake",
                 "version=dtls-1.2",
                 "record_length=12",
-                "handshake_type=client_hello",
+                "handshake_type=server_hello_done",
                 "fragment_length=0",
             ],
             outcome="constructed",
@@ -3097,7 +3098,7 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             case_class="positive",
             document="IETF RFC 6083",
             release="RFC 6083",
-            clauses=["4.4"],
+            clauses=["4.8", "5"],
             direction="local",
             role="n3iwf",
             prerequisite="opc-sctp SctpAuthKey::for_rfc6083 requires 64-octet exporter",
@@ -3116,7 +3117,7 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             case_class="ordering",
             document="IETF RFC 6083",
             release="RFC 6083",
-            clauses=["4.4"],
+            clauses=["4.8", "5"],
             direction="local",
             role="n3iwf",
             prerequisite="Key id rotation wraps 65535 to 1",
@@ -3259,7 +3260,7 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="bounded-record-overflow",
             wire_hex=overflow,
-            assertions=["declared_length=65535"],
+            assertions=["declared_length=65535", "caller_max_record=16384"],
             outcome="reject",
         ),
         manifest(
@@ -3290,14 +3291,20 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             clauses=["4", "IETF RFC 4960 3.3.1"],
             direction="n3iwf-to-amf",
             role="n3iwf",
-            prerequisite="SCTP DATA B/E bits set; PPID 66; user data out of band",
+            prerequisite="Reliable ordered delivery is a caller precondition; B/E flags identify an unfragmented DATA message",
             provenance_class="spec-authored",
-            notes="Unfragmented DATA chunk (B=1 E=1) carrying PPID 66",
+            notes="Unfragmented DATA chunk (B=1 E=1) carrying PPID 66 and an isolated ServerHelloDone; flags do not prove reliability or authentication",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="reliable-delivery-data",
             wire_hex=reliable,
-            assertions=["chunk=DATA", "flags=B+E", "ppid=66", "reliable_delivery=true"],
+            assertions=[
+                "chunk=DATA",
+                "flags=B+E",
+                "ppid=66",
+                "reliable_delivery=true",
+                "reliability=caller-precondition",
+            ],
             outcome="constructed",
         ),
         manifest(
@@ -3306,7 +3313,7 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
             case_class="ordering",
             document="IETF RFC 6083",
             release="RFC 6083",
-            clauses=["4.4"],
+            clauses=["4.8", "5"],
             direction="local",
             role="n3iwf",
             prerequisite="Key-id rotation after rekey-generation-2; exporter secret unpublished",
@@ -3325,9 +3332,11 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
     write_readme(
         subset_dir,
         "N2 DTLS fixture subset",
-        """PPID 66, handshake/identity labels, SCTP-AUTH length, reliable DATA
-B/E delivery, rekey, rotation, restart/path failure, and bounded redacted
-errors. Ordinary PPID 60 associations cannot satisfy this subset. No
+        """PPID 66 metadata, isolated ServerHelloDone framing, and lifecycle labels.
+SCTP-AUTH length, verified identity, reliable delivery, and key rotation are
+explicit caller preconditions. DATA B/E flags describe message boundaries;
+they do not prove reliability. Restart/path failure and error labels model
+scenarios without executing a transport or handshake. Ordinary PPID 60 associations cannot satisfy this subset. No
 certificates or exporter secrets are published.
 """,
     )
@@ -3344,7 +3353,11 @@ certificates or exporter secrets are published.
                 "SCTP DATA B/E PPID 66",
             ],
             receive=["rekey", "rotation generation 3", "path failure"],
-            unsupported=["PPID 60 as protection", "NGAP procedure state", "certificate dumps"],
+            unsupported=[
+                "PPID 60 as protection",
+                "NGAP procedure state",
+                "certificate dumps",
+            ],
         ),
     )
     return fixtures
@@ -3360,7 +3373,7 @@ def read_existing_publication() -> dict | None:
         return None
 
 
-def write_publication(existing: dict | None = None) -> None:
+def write_publication(existing: dict | None = None, root: Path = FIXTURE_ROOT) -> None:
     prior = existing if existing is not None else read_existing_publication()
     head = "landing-revision"
     tree = ""
@@ -3383,8 +3396,8 @@ def write_publication(existing: dict | None = None) -> None:
             "outcomes with fixture provenance and digests only."
         ),
     }
-    FIXTURE_ROOT.mkdir(parents=True, exist_ok=True)
-    (FIXTURE_ROOT / "PUBLIC_SDK.json").write_text(
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "PUBLIC_SDK.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )
 
@@ -3395,6 +3408,12 @@ def stamp_publication_from_git() -> None:
     Run this only on the catalog content commit. A later stamp at the
     publication commit would point ``head`` at itself.
     """
+    if subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT
+    ):
+        raise ValueError("n3iwf_fixture_stamp_requires_clean_content_commit")
+    if check() != 0:
+        raise ValueError("n3iwf_fixture_generated_drift")
     head = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()
@@ -3406,10 +3425,13 @@ def stamp_publication_from_git() -> None:
     write_publication({"head": head, "tree": tree})
 
 
-def generate() -> dict[str, list[dict]]:
+def generate(root: Path = FIXTURE_ROOT) -> dict[str, list[dict]]:
     existing_publication = read_existing_publication()
-    if FIXTURE_ROOT.exists():
-        for path in FIXTURE_ROOT.rglob("*"):
+    if root.is_symlink():
+        raise ValueError("n3iwf_fixture_symlink_forbidden")
+    if root.exists():
+        snapshot(root)  # Refuse symlinks before deleting or writing any files.
+        for path in root.rglob("*"):
             if path.is_file():
                 path.unlink()
     writers = {
@@ -3426,52 +3448,55 @@ def generate() -> dict[str, list[dict]]:
     }
     generated: dict[str, list[dict]] = {}
     for name, writer in writers.items():
-        generated[name] = writer(FIXTURE_ROOT / name)
-    write_publication(existing_publication)
+        generated[name] = writer(root / name)
+    write_publication(existing_publication, root)
     return generated
 
 
+def snapshot(root: Path) -> dict[str, bytes]:
+    result = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("n3iwf_fixture_symlink_forbidden")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = path.read_bytes()
+    return result
+
+
 def check() -> int:
-    expected = generate()
-    errors = 0
-    required = {
-        "positive",
-        "malformed",
-        "duplicate",
-        "unknown-critical",
-        "ordering",
-        "truncation",
-        "bounded-overflow",
-    }
-    for subset, fixtures in expected.items():
-        classes = {item["case_class"] for item in fixtures}
-        missing = required - classes
-        if missing:
-            print(f"{subset}: missing {sorted(missing)}", file=sys.stderr)
-            errors += 1
-        if any(item["runtime_claim"] for item in fixtures):
-            print(f"{subset}: runtime_claim must be false", file=sys.stderr)
-            errors += 1
-    return errors
+    # Never repair the evidence being checked. Include extra and missing files.
+    with tempfile.TemporaryDirectory(prefix="n3iwf-expected-") as directory:
+        expected_root = Path(directory)
+        generate(expected_root)
+        if snapshot(expected_root) != snapshot(FIXTURE_ROOT):
+            print("n3iwf_fixture_generated_drift", file=sys.stderr)
+            return 1
+    return 0
+
+
+def self_test() -> int:
+    with tempfile.TemporaryDirectory(prefix="n3iwf-writer-test-") as directory:
+        root = Path(directory)
+        generated = generate(root / "first")
+        generate(root / "second")
+        if len(generated) != 10 or snapshot(root / "first") != snapshot(
+            root / "second"
+        ):
+            print("n3iwf_fixture_nondeterministic_writer", file=sys.stderr)
+            return 1
+    return check()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--write", action="store_true")
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--stamp-git", action="store_true")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--write", action="store_true")
+    modes.add_argument("--check", action="store_true")
+    modes.add_argument("--self-test", action="store_true")
+    modes.add_argument("--stamp-git", action="store_true")
     args = parser.parse_args()
     if args.self_test:
-        generated = generate()
-        assert len(generated) == 10
-        assert "eap5g" in generated
-        for readme in FIXTURE_ROOT.rglob("README.md"):
-            data = readme.read_bytes()
-            if data.endswith(b"\n\n") or not data.endswith(b"\n"):
-                raise SystemExit(f"{readme}: invalid trailing newlines")
-        print("generate-n3iwf-fixtures self-test ok")
-        return 0
+        return self_test()
     if args.check:
         return check()
     if args.stamp_git:
@@ -3479,9 +3504,13 @@ def main() -> int:
         print("stamped PUBLIC_SDK.json from git HEAD")
         return 0
     generate()
-    print(f"wrote fixtures under {FIXTURE_ROOT}")
+    print("wrote N3IWF fixture catalog")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        print("n3iwf_fixture_writer_failed", file=sys.stderr)
+        sys.exit(1)

@@ -1,4 +1,9 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "eap-envelope",
+  "context": {
+    "max_an_bytes": 1024
+  },
   "sdk_fixture_id": "opc.n3iwf.eap5g.v1.malformed-length",
   "subset": "eap5g",
   "case_class": "malformed",

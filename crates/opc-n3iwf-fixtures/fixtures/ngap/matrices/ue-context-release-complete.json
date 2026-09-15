@@ -28,43 +28,50 @@
       "id": 10,
       "name": "id-AMF-UE-NGAP-ID",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 85,
       "name": "id-RAN-UE-NGAP-ID",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 121,
       "name": "id-UserLocationInformation",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 32,
       "name": "id-InfoOnRecommendedCellsAndRANNodesForPaging",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 60,
       "name": "id-PDUSessionResourceListCxtRelCpl",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 19,
       "name": "id-CriticalityDiagnostics",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 207,
       "name": "id-PagingAssisDataforCEcapabUE",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     }
   ]
 }

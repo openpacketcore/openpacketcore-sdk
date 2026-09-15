@@ -1,109 +1,103 @@
 # N3IWF fixture contracts
 
-Synthetic wire and transport contracts for N3IWF primitives. Owned by
-`opc-n3iwf-fixtures`. This is fixture and conformance evidence only.
+`opc-n3iwf-fixtures` publishes ten independently consumable synthetic fixture
+inventories. See its [README](../crates/opc-n3iwf-fixtures/README.md) and
+[conformance boundary](../crates/opc-n3iwf-fixtures/CONFORMANCE.md).
 
-These contracts do not activate a codec, adapter, key handle, or transport
-runtime. `runtime_claim` is false.
-
-Scope is reusable SDK contracts only. They do not encode application policy,
-subscriber authentication decisions, AMF selection, deployment topology,
-readiness, or product claims. Tracking issue 795 is tracking-only and is not
-implemented here.
-
-## Why a dedicated crate
-
-Several N3IWF primitives (NWu GRE, NAS-over-TCP, protocol-key KATs, XFRM
-roster, N2 DTLS metadata) have no owning codec crate yet. ADR 0015 still
-requires spec-authored bytes, provenance, and honest unsupported outcomes
-before a later codec lands. Independent subset completion records let
-consumers depend on one primitive without waiting for the remaining nine.
-
-## Public SDK publication
-
-`crates/opc-n3iwf-fixtures/fixtures/PUBLIC_SDK.json` publishes:
-
-- repository URL
-- public SDK base commit used as the reuse floor
-- landing head commit
-- fixtures tree path and tree object
-- constructed / receive / unsupported outcomes on each subset completion record
-- provenance class and SHA-256 wire digest on every manifest
-
-Round trips of these bytes do not prove external interoperability.
-
-## Subset layout
+## Layout and interpretation
 
 ```
-crates/opc-n3iwf-fixtures/fixtures/
-  PUBLIC_SDK.json
-  <subset>/
-    COMPLETION.json
-    README.md
-    <case>.json
-    wire/<case>.hex
+crates/opc-n3iwf-fixtures/
+  oracles/ngap-rel18.json
+  fixtures/
+    PUBLIC_SDK.json
+    <subset>/
+      COMPLETION.json
+      README.md
+      <case>.json
+      wire/<case>.hex
 ```
 
-Each manifest carries a stable `opc.n3iwf.<subset>.v1.<name>` identifier,
-source release and clauses, direction and role, prerequisite, provenance,
-sanitized-field inventory, wire digest, semantic assertions, expected
-outcome, and `runtime_claim=false`.
+Every manifest records a stable ID, pinned source, provenance, sanitized-field
+inventory, byte digest, assertions, expected outcome, and `runtime_claim=false`.
+`encoding` distinguishes protocol bytes from metadata, construction arguments,
+and scenario records. `validation_scope` defines what acceptance proves.
+`context` contains explicit caller bounds and preconditions; those values are
+not necessarily protocol constants. Completion covers that declared inventory.
 
-## Required case classes
+Required case classes describe envelope errors or scenario conditions as
+appropriate. For example, an unknown key purpose is a local scenario, not an
+unknown critical network IE. No wire encoding is attempted for QFI input 64.
 
-Every subset publishes at least one fixture in each class:
+## Important boundaries
 
-- positive
-- malformed
-- duplicate
-- unknown-critical
-- ordering
-- truncation
-- bounded-overflow
+- EAP spare AN parameters are ignored; duplicate singleton handling is a
+  separate caller policy. NAS contents remain opaque.
+- Partial NAS-over-TCP input stays `need-more-data` while the stream is open.
+  EOF of an incomplete frame rejects. The example bound of 256 is inclusive.
+- IKE examples contain generic payload headers, not complete authenticated
+  IKE exchanges. Chained payloads must name the next payload correctly.
+- GRE nonzero Protocol Type is ignored as a field. The packet and opaque
+  payload remain receivable, including payload bytes resembling a GRE header.
+- GTP-U receive Recovery canonicalizes to zero. End Marker extension chains
+  and direction-specific PSCs are tested through existing SDK codecs.
+- SCTP DATA has nonempty user data and excludes padding from its length.
+  B/E flags describe fragmentation; reliable delivery is a separate policy.
+- DTLS ServerHelloDone is an isolated record. Identity verification,
+  64-octet exporter output, key switching before Finished, and retiring old
+  keys after acknowledgment are caller obligations, not established sessions.
+- SPI records use a documented synthetic encoding, not Linux netlink wire.
+  Reusing an inbound SPI in one receiver namespace differs from equal numeric
+  inbound/outbound SPIs in opposite receiver namespaces.
 
-## Semantic distinctions the catalog locks
+## NGAP evidence
 
-- EAP-5G spare AN-parameters and AN-parameter reordering are permitted on
-  receive. Duplicate selected-PLMN is a caller duplicate-singleton policy,
-  not the spare-parameter ignore rule. Notification is Message-Id 3; Stop is
-  Message-Id 4.
-- NAS-over-TCP partial prefixes remain `need-more-data` while the stream is
-  open. EOF/loss of an incomplete frame or bounded-length overflow finalizes
-  as reject.
-- NGAP reuses the issue 493 Rel-18 DecodeContext vector (TS 38.413 V18.10.0).
-  TS 29.413 V18.5.0 5.2–5.4 decide admission for the issue 493 first-CNF
-  typed subset. Every admitted first-CNF sent/received outcome publishes an
-  IE cardinality/criticality matrix. Paging is 5.4 unsupported. Clause 5.3
-  RAN-specific ignore is documented, not encoded. Canonical typed encode
-  remains unsupported. 5.2 messages outside that typed subset stay
-  unpublished.
-- NWu GRE received nonzero Protocol Type is ignored.
-- N3 GTP-U downlink PSC is type 0; uplink PSC is type 1 QFI-only. Received
-  Recovery is ignored and canonicalized to zero.
-- IKE wire notifies/create/modify/delete/mobility stay in `nwu-ike`. Backend
-  overlap, SPI provenance, rekey, and roster relocation stay in `xfrm-roster`.
-- Protocol-key fixtures are synthetic known-answer labels only. Wrong
-  generation, reuse, drop, and cancellation are published. No key, MSK, or
-  K_N3IWF bytes.
-- N2 DTLS requires handshake/identity labels, PPID 66, SCTP-AUTH, reliable
-  DATA B/E delivery, rekey/rotation, and restart/path-failure labels.
-  Ordinary PPID 60 associations cannot satisfy that subset. Errors are
-  bounded redacted labels.
+`oracles/ngap-rel18.json` pins the ETSI PDF URL, document SHA-256, and ASN.1
+clause 9.4.3 for TS 38.413 V18.10.0. It records each IE's identifier,
+criticality, singleton cardinality, and mandatory/optional/conditional
+presence. These rows were extracted from that release, independently of the
+SDK's current policy tables, which also admit later extensions.
 
-## Gates
+The legacy libngap NGSetupRequest is a **sanitized structural derivative**.
+Its original source digest and exact transforms are recorded in the manifest
+and verified against the complete upstream literal. Test PLMN 001/01 replaces
+operator PLMNs, the RAN name becomes synthetic, and outer procedure criticality
+is corrected to reject. This is not independent Release-18 N3IWF message
+conformance evidence.
 
-- Crate: `cargo test -p opc-n3iwf-fixtures` loads the catalog, asserts
-  subset completion, and proves fix-removal plus adversarial mutation fail
-  the detector.
-- Repository: `scripts/check-n3iwf-fixture-contracts.py` is invoked from
-  rust-gates.
+Empty IE wrappers exercise dispatch only. Mandatory presence, inner IE values,
+TS 29.413 clause 5.3 content exceptions, complete N3IWF messages, and canonical
+typed encoding remain unproven/unsupported. Paging is unsupported by the
+N3IWF application under clause 5.4 even though its APER wrapper can be parsed.
+Issue 784 remains the tracker for evidence beyond these published boundaries.
 
-## Regeneration
+## Maintenance and publication
+
+Both `--check` and `--self-test` generate into temporary directories. They
+reject changed, missing, extra, or symlinked files without repairing the input.
+Only explicit `--write` changes fixtures.
 
 ```bash
 python3 scripts/generate-n3iwf-fixtures.py --write
+python3 scripts/test-n3iwf-fixture-contracts.py
+python3 scripts/n3iwf_fixture_oracles.py
+cargo test --locked -p opc-n3iwf-fixtures
+```
+
+Commit the reviewed content first. On that clean commit:
+
+```bash
+python3 scripts/generate-n3iwf-fixtures.py --stamp-git
 python3 scripts/check-n3iwf-fixture-contracts.py --self-test
 ```
 
-The generator is the deterministic writer. It never copies production
-captures or key material.
+Commit the resulting publication stamp separately. `PUBLIC_SDK.json` names
+an actual ancestor content commit and its fixtures tree; it cannot name its
+own commit without creating a self-reference. The gate verifies base/head
+ancestry, tree identity, and every current fixture blob against that commit,
+excluding only the root publication stamp. Any later fixture change requires
+a new content commit and stamp. Preserve the content commit when merging;
+squashing/rebasing requires restamping before the final gate.
+
+Round trips alone do not prove external interoperability. These gates do not
+prove live dataplane, authenticated transport, cryptography, or kernel state.

@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 65535,
+    "unknown_ie_policy": "reject"
+  },
   "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.positive-ul-psc",
   "subset": "n3-gtpu",
   "case_class": "positive",

@@ -1,53 +1,57 @@
 # opc-n3iwf-fixtures
 
-SDK-owned synthetic N3IWF wire and transport fixture contracts.
+SDK-owned synthetic N3IWF fixture contracts. The crate validates bounded
+catalog files, SHA-256 digests, provenance, inventories, and pinned NGAP IE
+matrices. It activates no protocol, key, transport, or dataplane runtime.
+Every manifest and completion record has `runtime_claim=false`.
 
-This crate publishes independently reviewable manifests for the ten N3IWF
-primitive subsets tracked by issue 784. It owns fixture metadata, SHA-256
-digests, subset completion records, and catalog detectors only. It does not
-activate a codec, adapter, key handle, transport, or dataplane runtime.
+## Published scope
 
-`runtime_claim` is false on every manifest and completion record.
+`COMPLETION.json` means the inventory is complete **at the manifest's
+`validation_scope`**. It does not establish protocol implementation, a valid
+complete exchange, or external interoperability. Each subset can be loaded
+independently with `FixtureCatalog::load_subset_from(root, subset)`.
 
-This crate publishes reusable SDK contracts only. It does not encode
-application policy, subscriber authentication decisions, AMF selection,
-deployment topology, readiness, or product claims. Tracking issue 795 is
-tracking-only and is not implemented here.
-
-## Subsets
-
-Each subset is independently complete. Consumers may depend on one record
-without waiting for the remaining subsets.
-
-| Subset | Contract |
+| Subset | Evidence boundary |
 | --- | --- |
-| `eap5g` | TS 24.502 V18.8.0 EAP-5G Start/NAS/Notification/Stop; spare ignore ≠ caller duplicate-singleton |
-| `nwu-ike` | TS 24.502 7.5/7.6 create/modify plus notify/Delete/MOBIKE wire; XFRM roster is out of scope |
-| `ngap` | TS 38.413 V18.10.0 Rel-18 NGSetupRequest plus first-CNF 29.413 5.2–5.4 IE matrices; constructed send unsupported |
-| `n2-sctp` | TS 38.412 V18.1.0 clause 7 PPID 60 / port 38412; PPID 66 belongs to `n2-dtls` |
-| `gre-qfi` | NWu GRE C=0 K=1 S=0; received nonzero Protocol Type ignored |
-| `n3-gtpu` | Reuses issue 341 Echo/Recovery/PSC vectors; direction-specific PSC; Recovery zero/ignored |
-| `protocol-key` | Synthetic KAT labels only; wrong-generation, reuse, drop, cancellation; no key material |
-| `nas-tcp` | Two-octet length plus opaque NAS; need-more-data until EOF/loss or bounded finalization |
-| `xfrm-roster` | Backend overlap, SPI provenance, rekey, relocation; IKE notify parsing is out of scope |
-| `n2-dtls` | RFC 6083 PPID 66, handshake/identity, SCTP-AUTH, reliable DATA, rekey/rotation, restart, redacted errors |
+| `eap5g` | EAP Expanded envelope, AN TLVs, opaque inner NAS |
+| `nwu-ike` | Notify/Delete payload chains; create/modify labels identify intended use |
+| `ngap` | Structural APER dispatch and exact TS 38.413 V18.10.0 IE matrices |
+| `n2-sctp` | PPID 60/port 38412 metadata and a DATA chunk with opaque user data |
+| `gre-qfi` | GRE header, QFI/RQI fields, opaque trailing payload, QFI constructor bound |
+| `n3-gtpu` | Existing SDK GTP-U codecs: Echo, Recovery, PSC, End Marker |
+| `protocol-key` | Synthetic labels and consume/cancel/drop reference state transitions |
+| `nas-tcp` | Two-octet length, caller bounds, partial reads/EOF, opaque inner NAS |
+| `xfrm-roster` | Synthetic SPI roster records and explicit provenance/relocation preconditions |
+| `n2-dtls` | PPID 66, isolated DTLS record/DATA framing, lifecycle preconditions |
 
-Issue 644 checksum-offload behavior is dataplane runtime and is not duplicated.
+Key and transport scenario labels contain no key material. They are not
+cryptographic known-answer tests. A reference state called `zeroized` is an
+obligation for a future implementation; it does not prove memory erasure.
 
-## Manifest fields
+## Validation layers
 
-Every JSON manifest includes a stable SDK fixture ID, source release and
-clauses, direction and role, prerequisite, provenance, sanitized-field
-inventory, wire digest, semantic assertions, expected outcome, and
-`runtime_claim=false`.
+Each manifest separates `encoding` (protocol wire, metadata, scenario, or
+construction input), `validation_scope`, and `context` (caller bounds and
+preconditions) from its outcome and semantic assertions.
 
-## Verification
+`FixtureCatalog::load` validates before exposing bytes. Files must be regular,
+bounded, and located at canonical subset paths. Unknown fields, duplicate JSON
+keys, digest changes, duplicate IDs, incomplete inventories, and matrix drift
+are errors. Debug output is redacted; errors contain constant codes. Content
+screening is a bounded denylist, not a general detector of subscriber data.
+Provenance and sanitized fields still require review. Load from a stable local
+checkout; this API does not sandbox a concurrently hostile filesystem.
+
+The repository gate adds read-only regeneration, independent envelope/scenario
+oracles, existing SDK codec tests, and verification of Git publication history.
+The Python reference oracles never import the fixture writer.
 
 ```bash
-python3 scripts/generate-n3iwf-fixtures.py --self-test
-python3 scripts/check-n3iwf-fixture-contracts.py --check
-cargo test -p opc-n3iwf-fixtures
+python3 scripts/check-n3iwf-fixture-contracts.py --self-test
+cargo test --locked -p opc-n3iwf-fixtures
 ```
 
-See [CONFORMANCE.md](CONFORMANCE.md) and
-[docs/n3iwf-fixture-contracts.md](../../docs/n3iwf-fixture-contracts.md).
+See [CONFORMANCE.md](CONFORMANCE.md) for limitations and
+[fixture maintenance](../../docs/n3iwf-fixture-contracts.md) for regeneration
+and publication. Product integration and issue 795 remain outside this crate.

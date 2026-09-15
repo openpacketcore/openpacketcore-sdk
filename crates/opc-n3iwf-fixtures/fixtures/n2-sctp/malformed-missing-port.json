@@ -1,4 +1,11 @@
 {
+  "encoding": "metadata-record",
+  "validation_scope": "association-metadata",
+  "context": {
+    "layout": "ppid-port",
+    "ppid": 60,
+    "max_port": 65534
+  },
   "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.malformed-missing-port",
   "subset": "n2-sctp",
   "case_class": "malformed",

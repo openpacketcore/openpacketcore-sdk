@@ -28,55 +28,50 @@
       "id": 27,
       "name": "id-GlobalRANNodeID",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 82,
       "name": "id-RANNodeName",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 102,
       "name": "id-SupportedTAList",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 21,
       "name": "id-DefaultPagingDRX",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 147,
       "name": "id-UERetentionInformation",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 204,
       "name": "id-NB-IoT-DefaultPagingDRX",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 273,
       "name": "id-Extended-RANNodeName",
       "criticality": "ignore",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 475,
-      "name": "id-AIoT-Support",
-      "criticality": "reject",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 483,
-      "name": "id-AdditionalULI",
-      "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     }
   ]
 }

@@ -1,4 +1,11 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "nas-tcp-envelope",
+  "context": {
+    "max_payload_len": 256,
+    "min_payload_len": 1,
+    "stream_open": true
+  },
   "sdk_fixture_id": "opc.n3iwf.nas-tcp.v1.positive-envelope",
   "subset": "nas-tcp",
   "case_class": "positive",

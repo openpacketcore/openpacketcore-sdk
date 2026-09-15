@@ -22,9 +22,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![deny(missing_docs)]
 
+mod json;
+
+use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -153,7 +157,8 @@ impl fmt::Display for ContractErrorCode {
 }
 
 /// One sanitized field inventory entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SanitizedField {
     /// Protocol or transport field name.
     pub name: String,
@@ -164,7 +169,8 @@ pub struct SanitizedField {
 }
 
 /// Normative source citation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceRef {
     /// Specification document identifier.
     pub document: String,
@@ -175,7 +181,8 @@ pub struct SourceRef {
 }
 
 /// Independent provenance block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     /// ADR 0015 provenance class.
     pub class: String,
@@ -191,7 +198,8 @@ pub struct Provenance {
 }
 
 /// Wire locator and digest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireRef {
     /// Path relative to the subset directory.
     pub path: String,
@@ -200,8 +208,15 @@ pub struct WireRef {
 }
 
 /// One independently reviewable fixture manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FixtureManifest {
+    /// Whether octets are protocol wire, metadata, scenario labels, or a construction argument.
+    pub encoding: String,
+    /// Exact validation layer; acceptance never implies validation of an opaque inner payload.
+    pub validation_scope: String,
+    /// Explicit caller bounds and preconditions, separate from normative wire fields.
+    pub context: BTreeMap<String, serde_json::Value>,
     /// Stable SDK fixture identifier.
     pub sdk_fixture_id: String,
     /// Subset name.
@@ -231,8 +246,11 @@ pub struct FixtureManifest {
 }
 
 /// Reviewed subset completion record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubsetCompletion {
+    /// Completion applies only to the inventory at each declared validation scope.
+    pub completion_scope: String,
     /// Subset name.
     pub subset: String,
     /// `complete` when consumers may depend on this subset alone.
@@ -265,7 +283,8 @@ pub struct SubsetCompletion {
 }
 
 /// One IE identifier/criticality/cardinality row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IeCardinality {
     /// NGAP ProtocolIE-ID.
     pub id: u16,
@@ -275,10 +294,13 @@ pub struct IeCardinality {
     pub criticality: String,
     /// Top-level cardinality; first-CNF IEs are singleton.
     pub cardinality: String,
+    /// Normative Release-18 presence: mandatory, optional, or conditional.
+    pub presence: String,
 }
 
 /// Message/IE matrix for one admitted or explicitly unsupported NGAP outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageIeMatrix {
     /// Message name.
     pub message: String,
@@ -312,7 +334,8 @@ pub struct MessageIeMatrix {
 }
 
 /// Public SDK revision publication for these contracts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicSdkPublication {
     /// Canonical public repository URL.
     pub repository: String,
@@ -330,13 +353,38 @@ pub struct PublicSdkPublication {
 }
 
 /// Loaded catalog for one or every subset.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FixtureCatalog {
     publication: PublicSdkPublication,
     completions: BTreeMap<String, SubsetCompletion>,
     manifests: Vec<(PathBuf, FixtureManifest, Vec<u8>)>,
     ngap_matrices: Vec<MessageIeMatrix>,
+    matrix_paths: BTreeSet<String>,
 }
+
+// Public data can be populated by callers as well as the reviewed catalog.
+// Never derive Debug on a value-bearing surface, including nested metadata.
+macro_rules! redacted_debug {
+    ($($kind:ty),+ $(,)?) => { $(
+        impl fmt::Debug for $kind {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(concat!(stringify!($kind), "(<redacted>)"))
+            }
+        }
+    )+ };
+}
+redacted_debug!(
+    SanitizedField,
+    SourceRef,
+    Provenance,
+    WireRef,
+    FixtureManifest,
+    SubsetCompletion,
+    IeCardinality,
+    MessageIeMatrix,
+    PublicSdkPublication,
+    FixtureCatalog
+);
 
 impl FixtureCatalog {
     /// Directory that contains subset folders.
@@ -361,17 +409,41 @@ impl FixtureCatalog {
     ///
     /// Same as [`Self::load`].
     pub fn load_from(root: &Path) -> Result<Self, ContractError> {
+        Self::load_selected(root, SUBSETS)
+    }
+
+    /// Load one independently consumable subset without reading its siblings.
+    ///
+    /// # Errors
+    /// Returns a redacted error for an unknown subset or invalid selected content.
+    pub fn load_subset_from(root: &Path, subset: &str) -> Result<Self, ContractError> {
+        if !SUBSETS.contains(&subset) {
+            return Err(ContractError::new(ContractErrorCode::IncompleteSubset));
+        }
+        Self::load_selected(root, &[subset])
+    }
+
+    fn load_selected(root: &Path, selected: &[&str]) -> Result<Self, ContractError> {
+        require_directory(root)?;
         let publication = read_publication(&root.join("PUBLIC_SDK.json"))?;
         let mut completions = BTreeMap::new();
         let mut manifests = Vec::new();
         let mut seen_ids = BTreeSet::new();
-        let ngap_matrices = read_ngap_matrices(&root.join("ngap").join("matrices"))?;
+        let (matrix_paths, ngap_matrices) = if selected.contains(&"ngap") {
+            require_directory(&root.join("ngap"))?;
+            read_ngap_matrices(&root.join("ngap").join("matrices"))?
+        } else {
+            (BTreeSet::new(), Vec::new())
+        };
 
-        for subset in SUBSETS {
+        for subset in selected {
             let subset_dir = root.join(subset);
+            require_directory(&subset_dir)?;
+            require_directory(&subset_dir.join("wire"))?;
             let completion = read_completion(&subset_dir.join("COMPLETION.json"))?;
             if completion.subset != *subset
                 || completion.status != "complete"
+                || completion.completion_scope != "fixture-inventory-at-declared-validation-scopes"
                 || completion.runtime_claim
                 || !completion.consumers_may_depend
                 || completion.issue != 784
@@ -380,20 +452,23 @@ impl FixtureCatalog {
             }
             completions.insert((*subset).to_string(), completion);
 
-            let entries = fs::read_dir(&subset_dir)
-                .map_err(|_| ContractError::new(ContractErrorCode::MissingField))?;
-            let mut json_paths: Vec<PathBuf> = entries
-                .filter_map(|entry| entry.ok().map(|value| value.path()))
-                .filter(|path| {
-                    path.extension().and_then(|ext| ext.to_str()) == Some("json")
-                        && path.file_name().and_then(|name| name.to_str())
-                            != Some("COMPLETION.json")
-                })
-                .collect();
-            json_paths.sort();
+            let json_paths = json_files(&subset_dir, ContractErrorCode::MissingField)?;
 
             for path in json_paths {
+                if path.file_name().and_then(|name| name.to_str()) == Some("COMPLETION.json") {
+                    continue;
+                }
                 let manifest = read_manifest(&path)?;
+                let stem = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| ContractError::new(ContractErrorCode::MissingField))?;
+                if !valid_slug(stem)
+                    || manifest.sdk_fixture_id != format!("opc.n3iwf.{subset}.v1.{stem}")
+                    || manifest.wire.path != format!("wire/{stem}.hex")
+                {
+                    return Err(ContractError::new(ContractErrorCode::MissingWire));
+                }
                 if manifest.subset != *subset {
                     return Err(ContractError::new(ContractErrorCode::MissingField));
                 }
@@ -405,12 +480,15 @@ impl FixtureCatalog {
             }
         }
 
-        Ok(Self {
+        let catalog = Self {
             publication,
             completions,
             manifests,
             ngap_matrices,
-        })
+            matrix_paths,
+        };
+        catalog.detect()?;
+        Ok(catalog)
     }
 
     /// Public SDK publication block.
@@ -445,108 +523,186 @@ impl FixtureCatalog {
     /// Returns the first redaction-safe violation.
     pub fn detect(&self) -> Result<(), ContractError> {
         detect_publication(&self.publication)?;
-        detect_text(&serde_json::to_string(&self.publication).unwrap_or_default())?;
+        detect_serialized(&self.publication)?;
 
         for (subset, completion) in &self.completions {
             detect_completion(subset, completion, &self.manifests)?;
-            detect_text(&serde_json::to_string(completion).unwrap_or_default())?;
+            detect_serialized(completion)?;
         }
 
         let mut classes: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-        for (path, manifest, wire) in &self.manifests {
+        for (_, manifest, wire) in &self.manifests {
             detect_manifest(manifest)?;
             detect_wire(manifest, wire)?;
-            detect_text(&fs::read_to_string(path).unwrap_or_default())?;
+            detect_serialized(manifest)?;
             classes
                 .entry(manifest.subset.as_str())
                 .or_default()
                 .insert(manifest.case_class.as_str());
         }
 
-        for subset in SUBSETS {
-            let present = classes.get(subset).cloned().unwrap_or_default();
+        for subset in self.completions.keys() {
+            let present = classes.get(subset.as_str()).cloned().unwrap_or_default();
             for required in REQUIRED_CASE_CLASSES {
                 if !present.contains(required) {
                     return Err(ContractError::new(ContractErrorCode::IncompleteSubset));
                 }
             }
         }
-        detect_ngap_matrices(
-            self.completions.get("ngap"),
-            &self.ngap_matrices,
-            &self.manifests,
-        )?;
+        if let Some(completion) = self.completions.get("ngap") {
+            let recorded: BTreeSet<String> = completion.matrices.iter().cloned().collect();
+            if recorded != self.matrix_paths || recorded.len() != completion.matrices.len() {
+                return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+            }
+            detect_ngap_matrices(Some(completion), &self.ngap_matrices, &self.manifests)?;
+        }
         Ok(())
     }
 }
 
+// These limits bound catalog reads, not any protocol's runtime limits.
+const MAX_FILE_BYTES: u64 = 256 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 512;
+
+fn require_directory(path: &Path) -> Result<(), ContractError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| ContractError::new(ContractErrorCode::MissingField))?;
+    if !metadata.file_type().is_dir() {
+        return Err(ContractError::new(ContractErrorCode::MissingField));
+    }
+    Ok(())
+}
+
+fn json_files(dir: &Path, code: ContractErrorCode) -> Result<Vec<PathBuf>, ContractError> {
+    require_directory(dir)?;
+    let mut paths = Vec::new();
+    let entries = fs::read_dir(dir).map_err(|_| ContractError::new(code))?;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_DIRECTORY_ENTRIES {
+            return Err(ContractError::new(code));
+        }
+        let path = entry.map_err(|_| ContractError::new(code))?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_text(path: &Path, code: ContractErrorCode) -> Result<String, ContractError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| ContractError::new(code))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_FILE_BYTES {
+        return Err(ContractError::new(code));
+    }
+    let mut raw = String::new();
+    fs::File::open(path)
+        .map_err(|_| ContractError::new(code))?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| ContractError::new(code))?;
+    if raw.len() as u64 > MAX_FILE_BYTES {
+        return Err(ContractError::new(code));
+    }
+    Ok(raw)
+}
+
+fn read_json<T: DeserializeOwned + Serialize>(
+    path: &Path,
+    code: ContractErrorCode,
+) -> Result<T, ContractError> {
+    let raw = read_text(path, code)?;
+    let value: T = json::parse(&raw).map_err(|_| ContractError::new(code))?;
+    detect_serialized(&value)?;
+    Ok(value)
+}
+
+fn detect_serialized<T: Serialize>(value: &T) -> Result<(), ContractError> {
+    let text = serde_json::to_string(value)
+        .map_err(|_| ContractError::new(ContractErrorCode::MissingField))?;
+    detect_text(&text)
+}
+
 fn read_publication(path: &Path) -> Result<PublicSdkPublication, ContractError> {
-    let raw = fs::read_to_string(path)
-        .map_err(|_| ContractError::new(ContractErrorCode::MissingPublication))?;
-    serde_json::from_str(&raw)
-        .map_err(|_| ContractError::new(ContractErrorCode::MissingPublication))
+    read_json(path, ContractErrorCode::MissingPublication)
 }
 
 fn read_completion(path: &Path) -> Result<SubsetCompletion, ContractError> {
-    let raw = fs::read_to_string(path)
-        .map_err(|_| ContractError::new(ContractErrorCode::CompletionMismatch))?;
-    serde_json::from_str(&raw)
-        .map_err(|_| ContractError::new(ContractErrorCode::CompletionMismatch))
+    read_json(path, ContractErrorCode::CompletionMismatch)
 }
 
 fn read_manifest(path: &Path) -> Result<FixtureManifest, ContractError> {
-    let raw = fs::read_to_string(path)
-        .map_err(|_| ContractError::new(ContractErrorCode::MissingField))?;
-    serde_json::from_str(&raw).map_err(|_| ContractError::new(ContractErrorCode::MissingField))
+    read_json(path, ContractErrorCode::MissingField)
 }
 
-fn read_ngap_matrices(dir: &Path) -> Result<Vec<MessageIeMatrix>, ContractError> {
-    if !dir.is_dir() {
-        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
-    }
-    let entries =
-        fs::read_dir(dir).map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|value| value.path()))
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
+fn read_ngap_matrices(
+    dir: &Path,
+) -> Result<(BTreeSet<String>, Vec<MessageIeMatrix>), ContractError> {
+    let paths = json_files(dir, ContractErrorCode::MissingMatrix)?;
     if paths.is_empty() {
         return Err(ContractError::new(ContractErrorCode::MissingMatrix));
     }
+    let mut names = BTreeSet::new();
     let mut matrices = Vec::new();
     for path in paths {
-        let raw = fs::read_to_string(&path)
-            .map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
-        detect_text(&raw)?;
-        let matrix: MessageIeMatrix = serde_json::from_str(&raw)
-            .map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
-        if matrix.message.is_empty()
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ContractError::new(ContractErrorCode::MissingMatrix))?;
+        names.insert(format!("matrices/{name}"));
+        let matrix: MessageIeMatrix = read_json(&path, ContractErrorCode::MissingMatrix)?;
+        let mut ids = BTreeSet::new();
+        if matrix.message.trim().is_empty()
             || matrix.ies.is_empty()
             || matrix.ts29413_clause.is_empty()
             || matrix.admitted_disposition.is_empty()
+            || matrix.source.document != "3GPP TS 38.413"
             || matrix.source.release != "V18.10.0"
+            || matrix.application.document != "3GPP TS 29.413"
             || matrix.application.release != "V18.5.0"
+            || !nonempty_strings(&matrix.source.clauses)
+            || !nonempty_strings(&matrix.application.clauses)
         {
             return Err(ContractError::new(ContractErrorCode::MissingMatrix));
         }
         for ie in &matrix.ies {
-            if ie.name.is_empty()
+            if !ids.insert(ie.id)
+                || ie.name.trim().is_empty()
                 || !matches!(ie.criticality.as_str(), "reject" | "ignore" | "notify")
                 || ie.cardinality != "singleton"
+                || !matches!(
+                    ie.presence.as_str(),
+                    "mandatory" | "optional" | "conditional"
+                )
             {
                 return Err(ContractError::new(ContractErrorCode::MissingMatrix));
             }
         }
         matrices.push(matrix);
     }
-    Ok(matrices)
+    Ok((names, matrices))
 }
 
 fn read_wire(path: &Path) -> Result<Vec<u8>, ContractError> {
-    let raw =
-        fs::read_to_string(path).map_err(|_| ContractError::new(ContractErrorCode::MissingWire))?;
-    parse_hex(&raw).ok_or_else(|| ContractError::new(ContractErrorCode::MissingWire))
+    let raw = read_text(path, ContractErrorCode::MissingWire)?;
+    let bytes =
+        parse_hex(&raw).ok_or_else(|| ContractError::new(ContractErrorCode::MissingWire))?;
+    if bytes.is_empty() {
+        return Err(ContractError::new(ContractErrorCode::MissingWire));
+    }
+    detect_text(&String::from_utf8_lossy(&bytes))?;
+    Ok(bytes)
+}
+
+fn valid_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn nonempty_strings(values: &[String]) -> bool {
+    !values.is_empty() && values.iter().all(|value| !value.trim().is_empty())
 }
 
 /// Parse whitespace-separated hex octets.
@@ -580,17 +736,18 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn is_sha(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn detect_publication(publication: &PublicSdkPublication) -> Result<(), ContractError> {
     if publication.repository != "https://github.com/openpacketcore/openpacketcore-sdk"
-        || publication.base.len() != 40
-        || !publication.base.chars().all(|ch| ch.is_ascii_hexdigit())
-        || publication.head.is_empty()
-        || !(publication.head == "landing-revision"
-            || (publication.head.len() == 40
-                && publication.head.chars().all(|ch| ch.is_ascii_hexdigit())))
-        || !(publication.tree.is_empty()
-            || (publication.tree.len() == 40
-                && publication.tree.chars().all(|ch| ch.is_ascii_hexdigit())))
+        || !is_sha(&publication.base, 40)
+        || !is_sha(&publication.head, 40)
+        || !is_sha(&publication.tree, 40)
         || publication.tree_path != "crates/opc-n3iwf-fixtures/fixtures"
         || !publication
             .interoperability_note
@@ -612,8 +769,19 @@ fn detect_completion(
         .map(|(_, manifest, _)| manifest.sdk_fixture_id.as_str())
         .collect();
     let recorded: BTreeSet<&str> = completion.fixture_ids.iter().map(String::as_str).collect();
-    if ids != recorded {
+    if ids != recorded || recorded.len() != completion.fixture_ids.len() {
         return Err(ContractError::new(ContractErrorCode::CompletionMismatch));
+    }
+    let actual_classes: BTreeSet<&str> = manifests
+        .iter()
+        .filter(|(_, manifest, _)| manifest.subset == subset)
+        .map(|(_, manifest, _)| manifest.case_class.as_str())
+        .collect();
+    let recorded_classes: BTreeSet<&str> =
+        completion.case_classes.iter().map(String::as_str).collect();
+    if actual_classes != recorded_classes || recorded_classes.len() != completion.case_classes.len()
+    {
+        return Err(ContractError::new(ContractErrorCode::IncompleteSubset));
     }
     for required in REQUIRED_CASE_CLASSES {
         if !completion
@@ -624,7 +792,13 @@ fn detect_completion(
             return Err(ContractError::new(ContractErrorCode::IncompleteSubset));
         }
     }
-    if completion.receive.is_empty() || completion.unsupported.is_empty() {
+    if !nonempty_strings(&completion.receive)
+        || !nonempty_strings(&completion.unsupported)
+        || completion
+            .constructed
+            .iter()
+            .any(|value| value.trim().is_empty())
+    {
         return Err(ContractError::new(ContractErrorCode::CompletionMismatch));
     }
     if subset == "ngap"
@@ -651,6 +825,22 @@ fn detect_ngap_matrices(
         .iter()
         .map(|matrix| matrix.message.as_str())
         .collect();
+    let admitted: BTreeSet<&str> = completion
+        .admitted_outcomes
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let expected_admitted: BTreeSet<&str> = matrix_messages
+        .iter()
+        .copied()
+        .filter(|message| *message != "Paging")
+        .collect();
+    if admitted != expected_admitted || admitted.len() != completion.admitted_outcomes.len() {
+        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+    }
+    if matrix_messages.len() != matrices.len() {
+        return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+    }
     for admitted in &completion.admitted_outcomes {
         if !matrix_messages.contains(admitted.as_str()) {
             return Err(ContractError::new(ContractErrorCode::MissingMatrix));
@@ -661,8 +851,28 @@ fn detect_ngap_matrices(
         .filter(|(_, manifest, _)| manifest.subset == "ngap")
         .map(|(_, manifest, _)| manifest.sdk_fixture_id.as_str())
         .collect();
+    let oracle: serde_json::Value =
+        serde_json::from_str(include_str!("../oracles/ngap-rel18.json"))
+            .map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
+    let oracle_rows: BTreeMap<String, Vec<IeCardinality>> = serde_json::from_value(
+        oracle
+            .get("messages")
+            .cloned()
+            .ok_or_else(|| ContractError::new(ContractErrorCode::MissingMatrix))?,
+    )
+    .map_err(|_| ContractError::new(ContractErrorCode::MissingMatrix))?;
     let mut saw_paging = false;
     for matrix in matrices {
+        if oracle_rows.get(&matrix.message) != Some(&matrix.ies) {
+            return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+        }
+        let dispatch = &oracle["dispatch"][&matrix.message];
+        if dispatch["procedure_code"].as_u64() != Some(u64::from(matrix.procedure_code))
+            || dispatch["outcome"].as_str() != Some(matrix.outcome.as_str())
+            || dispatch["direction"].as_str() != Some(matrix.direction.as_str())
+        {
+            return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+        }
         match matrix.ts29413_clause.as_str() {
             "5.2" => {
                 if matrix.admitted_disposition != "receive" || matrix.constructed_send {
@@ -677,32 +887,66 @@ fn detect_ngap_matrices(
             }
             _ => return Err(ContractError::new(ContractErrorCode::MissingMatrix)),
         }
-        if let Some(fixture_id) = &matrix.wire_fixture_id {
-            if !fixture_ids.contains(fixture_id.as_str()) {
-                return Err(ContractError::new(ContractErrorCode::MissingMatrix));
-            }
+        let Some(fixture_id) = &matrix.wire_fixture_id else {
+            return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+        };
+        if !fixture_ids.contains(fixture_id.as_str()) {
+            return Err(ContractError::new(ContractErrorCode::MissingMatrix));
+        }
+        let (_, manifest, wire) = manifests
+            .iter()
+            .find(|(_, manifest, _)| &manifest.sdk_fixture_id == fixture_id)
+            .ok_or_else(|| ContractError::new(ContractErrorCode::MissingMatrix))?;
+        let choice = match matrix.outcome.as_str() {
+            "initiating" => 0,
+            "successful" => 0x20,
+            "unsuccessful" => 0x40,
+            _ => return Err(ContractError::new(ContractErrorCode::MissingMatrix)),
+        };
+        if wire.first() != Some(&choice)
+            || wire.get(1) != Some(&matrix.procedure_code)
+            || wire.get(2).map(|octet| u64::from(*octet)) != dispatch["criticality_octet"].as_u64()
+            || manifest.direction != matrix.direction
+            || matrix.constructed_send
+        {
+            return Err(ContractError::new(ContractErrorCode::MissingMatrix));
         }
     }
-    if !saw_paging || matrices.len() < completion.admitted_outcomes.len() {
+    if !saw_paging || matrices.len() != completion.admitted_outcomes.len() + 1 {
         return Err(ContractError::new(ContractErrorCode::MissingMatrix));
     }
     Ok(())
 }
 
 fn detect_manifest(manifest: &FixtureManifest) -> Result<(), ContractError> {
-    if manifest.sdk_fixture_id.is_empty()
+    if ![
+        "protocol-wire",
+        "metadata-record",
+        "scenario-label",
+        "scenario-record",
+        "construction-argument",
+    ]
+    .contains(&manifest.encoding.as_str())
+        || manifest.validation_scope.trim().is_empty()
+        || manifest.context.is_empty()
+        || manifest.sdk_fixture_id.is_empty()
         || !manifest.sdk_fixture_id.starts_with("opc.n3iwf.")
         || manifest.source.document.is_empty()
         || manifest.source.release.is_empty()
-        || manifest.source.clauses.is_empty()
+        || !nonempty_strings(&manifest.source.clauses)
         || manifest.direction.is_empty()
         || manifest.role.is_empty()
         || manifest.prerequisite.is_empty()
         || manifest.provenance.notes.is_empty()
         || manifest.sanitized_fields.is_empty()
-        || manifest.semantic_assertions.is_empty()
+        || !nonempty_strings(&manifest.semantic_assertions)
+        || manifest.sanitized_fields.iter().any(|field| {
+            field.name.trim().is_empty()
+                || field.treatment.trim().is_empty()
+                || field.value_class.trim().is_empty()
+        })
         || manifest.wire.path.is_empty()
-        || manifest.wire.digest_sha256.len() != 64
+        || !is_sha(&manifest.wire.digest_sha256, 64)
     {
         return Err(ContractError::new(ContractErrorCode::MissingField));
     }

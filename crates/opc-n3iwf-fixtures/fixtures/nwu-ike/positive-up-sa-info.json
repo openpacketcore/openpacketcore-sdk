@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 41,
+    "max_spi_bytes": 4
+  },
   "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.positive-up-sa-info",
   "subset": "nwu-ike",
   "case_class": "positive",

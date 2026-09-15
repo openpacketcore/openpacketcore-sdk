@@ -1,4 +1,9 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "gre-header",
+  "context": {
+    "max_qfi": 63
+  },
   "sdk_fixture_id": "opc.n3iwf.gre-qfi.v1.duplicate-key-header",
   "subset": "gre-qfi",
   "case_class": "duplicate",
@@ -31,8 +36,9 @@
     "digest_sha256": "c2a6c6516f912367bb8a51d61cf18bb7a090cf3c655da215ce8638d6a1a550eb"
   },
   "semantic_assertions": [
-    "duplicate_gre_header=true"
+    "gre_header_count=1",
+    "trailing_bytes=opaque-payload"
   ],
-  "expected_outcome": "reject",
+  "expected_outcome": "receive",
   "runtime_claim": false
 }

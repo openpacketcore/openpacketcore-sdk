@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 41,
+    "max_spi_bytes": 4
+  },
   "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.malformed-spi-size",
   "subset": "nwu-ike",
   "case_class": "malformed",
@@ -28,7 +34,7 @@
   ],
   "wire": {
     "path": "wire/malformed-spi-size.hex",
-    "digest_sha256": "764ef1290a74a0bbce263aad67d61f305825f6244977fbd3dafbbf2c8754a972"
+    "digest_sha256": "36e907950684a664a5705ab0ffe35b401ae1f6a756caf744c9326222a7be177c"
   },
   "semantic_assertions": [
     "spi_size_inconsistent=true"

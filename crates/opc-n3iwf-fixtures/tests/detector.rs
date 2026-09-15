@@ -93,8 +93,7 @@ fn adversarial_digest_mutation_fails_detector() {
     let original = fs::read_to_string(&wire).expect("wire");
     fs::write(&wire, "ff ff ff ff\n").expect("mutate");
     let err = FixtureCatalog::load_from(&root)
-        .expect("manifest still loads")
-        .detect()
+        .and_then(|catalog| catalog.detect())
         .expect_err("mutated digest must fail");
     assert_eq!(err.code(), ContractErrorCode::DigestMismatch);
     assert_ne!(original.trim(), "ff ff ff ff");
@@ -108,8 +107,7 @@ fn runtime_claim_true_is_rejected() {
     let mutated = raw.replace("\"runtime_claim\": false", "\"runtime_claim\": true");
     fs::write(&path, mutated).expect("write");
     let err = FixtureCatalog::load_from(&root)
-        .expect("load")
-        .detect()
+        .and_then(|catalog| catalog.detect())
         .expect_err("runtime claim must fail");
     assert_eq!(err.code(), ContractErrorCode::RuntimeClaimForbidden);
 }
@@ -130,8 +128,7 @@ fn personal_name_in_notes_is_rejected() {
         .collect();
     fs::write(&path, raw.replace("forbidden personal name token", &token)).expect("write");
     let err = FixtureCatalog::load_from(&root)
-        .expect("load")
-        .detect()
+        .and_then(|catalog| catalog.detect())
         .expect_err("personal name must fail");
     assert_eq!(err.code(), ContractErrorCode::ForbiddenContent);
 }

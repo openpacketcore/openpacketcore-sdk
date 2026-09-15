@@ -1,4 +1,13 @@
 {
+  "encoding": "scenario-record",
+  "validation_scope": "roster-transition-contract",
+  "context": {
+    "max_generation": 65535,
+    "inbound_provenance_valid": true,
+    "relocation_authorized": true,
+    "operation": "relocate",
+    "old_pair_retained": false
+  },
   "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.relocation",
   "subset": "xfrm-roster",
   "case_class": "positive",

@@ -1,6 +1,7 @@
 {
   "subset": "nwu-ike",
   "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
   "issue": 784,
   "runtime_claim": false,
   "consumers_may_depend": true,

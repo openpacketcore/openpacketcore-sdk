@@ -258,7 +258,7 @@ fn ngap_publishes_matrices_for_every_admitted_outcome() {
 }
 
 #[test]
-fn ngap_matrices_lock_ie_ids_to_policy_rs() {
+fn ngap_matrices_use_pinned_release18_rows_supported_by_policy_rs() {
     let catalog = FixtureCatalog::load().expect("catalog must load");
     let policy = include_str!("../../opc-proto-ngap/src/policy.rs");
     let names = [
@@ -332,7 +332,17 @@ fn ngap_matrices_lock_ie_ids_to_policy_rs() {
             .iter()
             .map(|ie| (ie.id, ie.criticality.clone()))
             .collect();
-        assert_eq!(published, ids, "{}", matrix.message);
+        // The current codec admits newer-release extensions as well. The
+        // fixture's exact Release-18 row set is independently pinned below.
+        assert!(
+            published.is_subset(&ids),
+            "Release-18 rules drifted from the codec"
+        );
+        let oracle: serde_json::Value =
+            serde_json::from_str(include_str!("../oracles/ngap-rel18.json"))
+                .expect("pinned oracle");
+        let expected = &oracle["messages"][&matrix.message];
+        assert_eq!(serde_json::to_value(&matrix.ies).expect("rows"), *expected);
         assert!(matrix
             .n3iwf_content_exceptions
             .contains("5.3 RAN-specific ignore is not encoded"));
@@ -464,29 +474,63 @@ fn reused_public_vectors_remain_locked_to_merged_sources() {
     let ngap_src = include_str!("../../opc-proto-ngap/src/lib.rs");
     let gtpu_control = include_str!("../../opc-proto-gtpu/tests/control_messages.rs");
     let gtpu_user = include_str!("../../opc-proto-gtpu/tests/gtpu_tests.rs");
-    assert!(
-        ngap_src.contains("0x00, 0x15, 0x40, 0x4a") && ngap_src.contains("0x00, 0x13, 0x88"),
-        "issue 493 NGSetupRequest vector must remain in opc-proto-ngap"
+    fn octets(source: &str, marker: &str) -> Vec<u8> {
+        let body = source
+            .split_once(marker)
+            .expect("source marker")
+            .1
+            .split_once(']')
+            .expect("literal end")
+            .0;
+        let stripped = body
+            .lines()
+            .map(|line| line.split("//").next().expect("line"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        stripped
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                if let Some(hex) = token.strip_prefix("0x") {
+                    u8::from_str_radix(hex, 16).expect("hex octet")
+                } else {
+                    token.parse().expect("decimal octet")
+                }
+            })
+            .collect()
+    }
+    let source = ngap_src
+        .split_once("fn ngsetup_request_fixture()")
+        .expect("source function")
+        .1;
+    let mut ngap = octets(source, "vec![");
+    assert_eq!(
+        wire_digest(&ngap),
+        "183cf47d3546a4a0a9ac72ae66ca166da4ae90c6bed0ed98e82f38832be57f2d"
     );
-    assert!(
-        gtpu_control.contains("0x32, 0x01, 0x00, 0x04") && gtpu_control.contains("0x0e, 0,"),
-        "issue 341 Echo Request/Response vectors must remain in opc-proto-gtpu"
-    );
-    assert!(
-        gtpu_user.contains("0x36,")
-            && gtpu_user.contains("0x85,")
-            && gtpu_user.contains("0x00, 0x09"),
-        "issue 341 downlink PSC vector must remain in opc-proto-gtpu"
-    );
+    ngap[2] = 0; // Correct NGSetup procedure criticality to reject.
+    for offset in [12, 48, 61] {
+        ngap[offset..offset + 3].copy_from_slice(&[0, 0xf1, 0x10]);
+    }
+    ngap[25..38].copy_from_slice(b"Synthetic RAN");
+    let request = octets(gtpu_control, "const ECHO_REQUEST: &[u8] = &[");
+    let response = octets(gtpu_control, "const ECHO_RESPONSE: &[u8] = &[");
+    let psc_source = gtpu_user
+        .split_once("fn test_decode_with_extension_headers()")
+        .expect("PSC source")
+        .1;
+    let psc = octets(psc_source, "let raw = vec![");
     for (manifest, wire) in catalog.manifests() {
         if manifest
             .sdk_fixture_id
             .ends_with("positive-ngsetup-external")
         {
             assert_eq!(wire_digest(wire), manifest.wire.digest_sha256);
-            assert_eq!(wire.len(), 78);
+            assert_eq!(wire, ngap);
         }
         if manifest.sdk_fixture_id.ends_with("positive-echo-request") {
+            assert_eq!(wire, request);
             assert_eq!(
                 wire,
                 &[0x32, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0x12, 0x34, 0, 0]
@@ -496,12 +540,14 @@ fn reused_public_vectors_remain_locked_to_merged_sources() {
             .sdk_fixture_id
             .ends_with("positive-echo-response-recovery-zero")
         {
+            assert_eq!(wire, response);
             assert_eq!(
                 wire,
                 &[0x32, 0x02, 0x00, 0x06, 0, 0, 0, 0, 0x12, 0x34, 0, 0, 0x0e, 0]
             );
         }
         if manifest.sdk_fixture_id.ends_with("positive-dl-psc") {
+            assert_eq!(wire, psc);
             assert_eq!(
                 wire,
                 &[

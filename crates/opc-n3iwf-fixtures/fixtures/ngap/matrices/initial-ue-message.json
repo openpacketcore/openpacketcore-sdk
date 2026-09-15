@@ -28,151 +28,155 @@
       "id": 85,
       "name": "id-RAN-UE-NGAP-ID",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 38,
       "name": "id-NAS-PDU",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 121,
       "name": "id-UserLocationInformation",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 90,
       "name": "id-RRCEstablishmentCause",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "mandatory"
     },
     {
       "id": 26,
       "name": "id-FiveG-S-TMSI",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 3,
       "name": "id-AMFSetID",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 112,
       "name": "id-UEContextRequest",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 0,
       "name": "id-AllowedNSSAI",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 171,
       "name": "id-SourceToTarget-AMFInformationReroute",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 174,
       "name": "id-SelectedPLMNIdentity",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 201,
       "name": "id-IABNodeIndication",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 224,
       "name": "id-CEmodeBSupport-Indicator",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 225,
       "name": "id-LTEM-Indication",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 227,
       "name": "id-EDT-Session",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 245,
       "name": "id-AuthenticatedIndication",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 259,
       "name": "id-NPN-AccessInformation",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 333,
       "name": "id-RedCapIndication",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 371,
       "name": "id-SelectedNID",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 402,
       "name": "id-MobileIABNodeIndication",
       "criticality": "reject",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 414,
       "name": "id-Partially-Allowed-NSSAI",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 427,
       "name": "id-ERedCapIndication",
       "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     },
     {
       "id": 440,
       "name": "id-AUN3DeviceAccessInfo",
       "criticality": "ignore",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 28,
-      "name": "id-GUAMI",
-      "criticality": "ignore",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 176,
-      "name": "id-GUAMIType",
-      "criticality": "ignore",
-      "cardinality": "singleton"
-    },
-    {
-      "id": 454,
-      "name": "id-RequestedNSSAI",
-      "criticality": "ignore",
-      "cardinality": "singleton"
+      "cardinality": "singleton",
+      "presence": "optional"
     }
   ]
 }

@@ -1,4 +1,10 @@
 {
+  "encoding": "protocol-wire",
+  "validation_scope": "ike-payload",
+  "context": {
+    "initial_payload_type": 127,
+    "max_spi_bytes": 4
+  },
   "sdk_fixture_id": "opc.n3iwf.nwu-ike.v1.unknown-critical-payload",
   "subset": "nwu-ike",
   "case_class": "unknown-critical",
@@ -32,7 +38,8 @@
   },
   "semantic_assertions": [
     "critical=true",
-    "unknown_payload_type=127"
+    "unknown_payload_type=127",
+    "initial_payload_type=127"
   ],
   "expected_outcome": "reject",
   "runtime_claim": false

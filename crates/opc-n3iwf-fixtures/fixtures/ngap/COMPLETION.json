@@ -1,6 +1,7 @@
 {
   "subset": "ngap",
   "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
   "issue": 784,
   "runtime_claim": false,
   "consumers_may_depend": true,
@@ -40,7 +41,7 @@
   ],
   "constructed": [],
   "receive": [
-    "NGSetupRequest external Rel-18 vector",
+    "NGSetupRequest sanitized legacy structural derivative",
     "empty initiating NG Setup wrapper",
     "NGSetupResponse empty wrapper",
     "NGSetupFailure empty wrapper",
