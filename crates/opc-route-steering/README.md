@@ -244,11 +244,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   must durably reconstruct the complete desired set before reconciling; an
   empty desired set intentionally garbage-collects every representable owned
   object in that scope. The backend does not persist product intent.
-- Every Linux read, mutation, and convergence operation acquires one
-  clone-shared lock inside its blocking worker. A pair holds the lock once
+- `LinuxRouteSteeringBackend::plan_owned_route_rules` creates an opaque,
+  backend-bound reconciliation receipt. Advance it with
+  `reconcile_owned_route_rules_step`; every call performs exactly one cursor
+  poll, entry classification/canonical insertion, ordered merge comparison, or
+  mutation/ACK/verification unit. A returned state is quiescent: it holds no
+  shared operation lock and leaves no worker, poll, or mutation in flight.
+  Plans bind the backend identity, scope, desired state, authoritative
+  baseline, and generation. `Superseded` (another exact or legacy mutation)
+  and `Indeterminate` (possibly transmitted without authoritative proof) are
+  terminal and must be discarded, never replayed. The legacy complete-scope
+  API retains its existing serialized authoritative behavior.
+- Legacy Linux reads, mutations, and complete-scope convergence acquire one
+  clone-shared lock inside their blocking worker. A pair holds the lock once
   through post-install verification and rollback. If its async waiter is
   cancelled, the worker retains the lock and completes; the caller must retry
-  to obtain the resulting typed state.
+  to obtain the resulting typed state. Stepped-plan calls are different: each
+  call executes its one bounded unit inline, releases the shared lock before
+  returning, and never leaves detached polling or mutation work after the
+  future is dropped.
 - A Linux mutation is counted as acknowledged only after exactly one matching
   zero-error `NLMSG_ERROR` ACK. Empty or `NOOP`-only datagrams do not complete
   the operation; `DONE`, arbitrary payload messages, duplicate ACKs, timeout,

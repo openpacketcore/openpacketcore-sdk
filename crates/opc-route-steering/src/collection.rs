@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 
 use crate::error::RouteSteeringError;
@@ -185,6 +186,7 @@ pub struct OwnedRouteRuleSet {
     scope: OwnedRouteRuleScope,
     routes: Vec<RouteRequest>,
     rules: Vec<RuleRequest>,
+    canonical_digest: u64,
 }
 
 impl OwnedRouteRuleSet {
@@ -208,10 +210,14 @@ impl OwnedRouteRuleSet {
             MAX_OWNED_ROUTE_COLLECTION_ENTRIES,
             MAX_OWNED_RULE_COLLECTION_ENTRIES,
         )
-        .map(|(routes, rules)| Self {
-            scope,
-            routes,
-            rules,
+        .map(|(routes, rules)| {
+            let canonical_digest = canonical_collection_digest(scope, &routes, &rules);
+            Self {
+                scope,
+                routes,
+                rules,
+                canonical_digest,
+            }
         })
     }
 
@@ -233,11 +239,67 @@ impl OwnedRouteRuleSet {
         &self.rules
     }
 
+    /// Deterministic digest of the already validated canonical desired set.
+    /// It is computed during construction, never logged, and lets opaque
+    /// backend plans bind to their exact desired authority without rescanning
+    /// a large collection at plan creation.
+    #[must_use]
+    pub(crate) const fn canonical_digest(&self) -> u64 {
+        self.canonical_digest
+    }
+
     /// Consume the set into its scope and canonical route and rule vectors.
     #[must_use]
     pub fn into_parts(self) -> (OwnedRouteRuleScope, Vec<RouteRequest>, Vec<RuleRequest>) {
         (self.scope, self.routes, self.rules)
     }
+}
+
+#[derive(Default)]
+struct CanonicalDigestHasher(u64);
+
+impl CanonicalDigestHasher {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn with_domain(domain: u8) -> Self {
+        let mut hasher = Self(Self::OFFSET);
+        hasher.write_u8(domain);
+        hasher
+    }
+}
+
+impl Hasher for CanonicalDigestHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+}
+
+fn canonical_collection_digest(
+    scope: OwnedRouteRuleScope,
+    routes: &[RouteRequest],
+    rules: &[RuleRequest],
+) -> u64 {
+    let mut hasher = CanonicalDigestHasher::with_domain(1);
+    scope.hash(&mut hasher);
+    routes.len().hash(&mut hasher);
+    for route in routes {
+        2_u8.hash(&mut hasher);
+        route.hash(&mut hasher);
+    }
+    rules.len().hash(&mut hasher);
+    for rule in rules {
+        3_u8.hash(&mut hasher);
+        rule.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl fmt::Debug for OwnedRouteRuleSet {
@@ -303,6 +365,25 @@ impl OwnedRouteRuleSnapshot {
             routes,
             rules,
         })
+    }
+
+    /// Build a snapshot from the stepped Linux collector.
+    ///
+    /// The collector has already validated scope membership, canonical route
+    /// keys, exact duplicates, and source-range sibling disjointness while it
+    /// consumed each netlink object.  Its ordered iterators materialize these
+    /// vectors one item per public advance, so re-running the normal
+    /// whole-collection validator here would defeat the bounded-step contract.
+    pub(crate) fn from_incremental_collector(
+        scope: OwnedRouteRuleScope,
+        routes: Vec<RouteRequest>,
+        rules: Vec<RuleRequest>,
+    ) -> Self {
+        Self {
+            scope,
+            routes,
+            rules,
+        }
     }
 
     /// Exclusive-writer scope represented by this snapshot.
