@@ -89,6 +89,7 @@ QUIESCENT_CONSENSUS_OPENRAFT_TARGET = "consensus_openraft"
 QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
     "lagging_replica_installs_compacted_snapshot_without_losing_committed_state",
     "fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect",
+    "compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart",
 )
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {

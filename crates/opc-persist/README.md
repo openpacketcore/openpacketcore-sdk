@@ -80,6 +80,12 @@ async fn open_store() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
+`ConsumerCheckpointStore` provides separate, sealed single-owner consumer
+storage with explicit provision/reopen, bounded CAS/readback and owned shutdown.
+It implements no configuration-authoring or voter trait. Its
+[consumer contract](../opc-config-bus-consensus/CONSUMER_CHECKPOINT.md) documents
+the exact custody, apply ordering and rollback-freshness limits.
+
 ## One consensus authority
 
 The HA composition is:

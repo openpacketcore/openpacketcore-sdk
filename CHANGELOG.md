@@ -112,6 +112,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic. Losing the volatile quorum can lose acknowledged results; local
   persistence does not authorize recovery. No automatic mode migration is
   provided. See ADR 0022 for semantics and qualification boundaries.
+- **Durable non-voting configuration consumers:** `DurableConfigConsumer` composes
+  authenticated snapshot/tail recovery with a sealed SDK checkpoint and a
+  product-owned apply/readback port. It persists original committed revisions
+  and complete apply intent, rejects rollback/conflict/gaps, and reconciles
+  interrupted application without replay. `ConsumerCheckpointStore` adds
+  bounded explicit provision/reopen and atomic CAS, using purpose-separated
+  `ConfigConsumerCheckpoint` custody. Accepted storage bounds account for SQLite
+  overflow pages at the maximum payload, and canonical checkpoints preserve
+  typed JSON integer precision without changing shared Serde JSON features.
+  This adds no voter or authoring authority
+  and no independent global-freshness claim; see SDK #799's consumer contract.
 - **Retained configuration-authority lifecycle — `opc-persist`:** explicit
   provisioning, ordinary reopen, and member-repair APIs bind local storage to
   exact consensus, backing and key scope. Reopen rejects missing or incomplete

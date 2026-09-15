@@ -281,6 +281,7 @@ impl KeyProvider for KmsKeyProvider {
 
         let purpose = match purpose_str.as_str() {
             "config" => KeyPurpose::Config,
+            "config-consumer-checkpoint" => KeyPurpose::ConfigConsumerCheckpoint,
             "shadow-security" => KeyPurpose::ShadowSecurity,
             "session" => KeyPurpose::Session,
             "ipsec-sa" => KeyPurpose::IpsecSa,

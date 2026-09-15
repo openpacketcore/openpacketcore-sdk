@@ -519,6 +519,7 @@ fn parse_wrapped_key_id(
     })?;
     let purpose = match purpose_str {
         "config" => KeyPurpose::Config,
+        "config-consumer-checkpoint" => KeyPurpose::ConfigConsumerCheckpoint,
         "shadow-security" => KeyPurpose::ShadowSecurity,
         "session" => KeyPurpose::Session,
         "ipsec-sa" => KeyPurpose::IpsecSa,
