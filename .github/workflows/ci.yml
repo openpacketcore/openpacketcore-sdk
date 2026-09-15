@@ -321,7 +321,23 @@ jobs:
               sys.exit(f"unsupported selector must resolve exactly once: {selected!r}")
           PYCODE
           cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet -- --exact --skip "$selector"
-          cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --test-threads=1 --exact "$selector" --nocapture
+          # Preserve the request/test contract and retain whole-command host
+          # pressure for deadline failures. These are diagnostic counters only.
+          selector_resources() {
+            date -u +selector_resources_utc=%Y-%m-%dT%H:%M:%S.%NZ || printf 'selector_clock unavailable=true\n'
+            for resource in cpu io memory; do
+              printf 'selector_pressure_%s\n' "$resource"
+              if ! cat "/proc/pressure/$resource" 2>/dev/null; then
+                printf 'unavailable\n'
+              fi
+            done
+            sed -n '1p' /proc/stat 2>/dev/null || printf 'selector_cpu unavailable=true\n'
+          }
+          selector_resources || :
+          selector_exit=0
+          /usr/bin/time -v cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --test-threads=1 --exact "$selector" --nocapture || selector_exit=$?
+          selector_resources || :
+          exit "$selector_exit"
 
   # `rust-gtpu-cfg` above forces the Linux backend unavailable; these two lanes
   # cover the orthogonal axis of host portability. `opc-gtpu-dataplane` ships a
