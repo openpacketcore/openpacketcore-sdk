@@ -1,3 +1,6 @@
+#[path = "consensus_openraft/late_acquire.rs"]
+mod late_acquire;
+
 #[path = "consensus_openraft/stepdown.rs"]
 mod stepdown;
 

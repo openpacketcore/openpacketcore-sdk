@@ -21,7 +21,8 @@ use opc_persist::{
     CommitRecord, CommitSource, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,
     ConfigConsensusConfigurationId, ConfigConsensusIdentity, ConfigConsensusNodeId,
     ConfigConsensusRequestId, ConfigConsensusTopology, ConfigStore, ConsensusConfigStore,
-    LegacyConfigTailDisposition, PersistErrorKind, RollbackTarget, SqliteBackend,
+    LegacyConfigTailDisposition, PersistErrorKind, RetainedConfigBinding, RetainedConfigDurability,
+    RetainedConfigOptions, RollbackTarget, SqliteBackend,
 };
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
 use sha2::{Digest, Sha256};
@@ -157,6 +158,13 @@ impl ConsensusPeer for LoopbackPeer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FixtureStorage {
+    Legacy,
+    RetainedNew,
+    RetainedRepair,
+}
+
 struct ThreeNodeCluster {
     _directory: tempfile::TempDir,
     stores: Vec<ConsensusConfigStore>,
@@ -179,6 +187,13 @@ impl ThreeNodeCluster {
     }
 
     async fn build(audit_key_material: [[u8; 32]; 3]) -> Self {
+        Self::build_with_storage(audit_key_material, FixtureStorage::Legacy).await
+    }
+
+    async fn build_with_storage(
+        audit_key_material: [[u8; 32]; 3],
+        lifecycle: FixtureStorage,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("cluster directory");
         let nodes = [1_u64, 2, 3].map(|value| ConfigConsensusNodeId::new(value).expect("node ID"));
         let members = nodes.into_iter().collect::<BTreeSet<_>>();
@@ -203,14 +218,38 @@ impl ThreeNodeCluster {
         }
         let mut stores = Vec::new();
         for (index, topology) in topologies.iter().cloned().enumerate() {
-            let backend = SqliteBackend::open_with_audit_key(
-                directory.path().join(format!("node-{index}.sqlite")),
-                true,
-                0,
-                AuditKey::new(audit_key_material[index]).expect("audit key"),
-            )
-            .await
-            .expect("backend");
+            let backend = if matches!(lifecycle, FixtureStorage::RetainedRepair) {
+                SqliteBackend::provision_config_member_repair(
+                    retained_options(
+                        &directory.path().join(format!("node-{index}.sqlite")),
+                        topology.clone(),
+                        index as u8 + 1,
+                    ),
+                    AuditKey::new(audit_key_material[index]).expect("audit key"),
+                )
+                .await
+                .expect("repair backend")
+            } else if matches!(lifecycle, FixtureStorage::RetainedNew) {
+                SqliteBackend::provision_config_authority(
+                    retained_options(
+                        &directory.path().join(format!("node-{index}.sqlite")),
+                        topology.clone(),
+                        index as u8 + 1,
+                    ),
+                    AuditKey::new(audit_key_material[index]).expect("audit key"),
+                )
+                .await
+                .expect("retained backend")
+            } else {
+                SqliteBackend::open_with_audit_key(
+                    directory.path().join(format!("node-{index}.sqlite")),
+                    true,
+                    0,
+                    AuditKey::new(audit_key_material[index]).expect("audit key"),
+                )
+                .await
+                .expect("backend")
+            };
             let peers = (0..3)
                 .filter(|target| *target != index)
                 .map(|target| {
@@ -1979,4 +2018,263 @@ async fn voter_subset_is_rejected_without_changing_epoch_membership() {
         .await
         .expect("snapshot exact membership");
     cluster.shutdown().await;
+}
+
+fn retained_options(
+    path: &std::path::Path,
+    topology: ConfigConsensusTopology,
+    backing: u8,
+) -> RetainedConfigOptions {
+    RetainedConfigOptions::new(
+        path,
+        RetainedConfigBinding::new(topology, [backing; 32], [0x61; 32]).expect("binding"),
+        RetainedConfigDurability::Ephemeral,
+        64 * 1024 * 1024,
+        Duration::from_secs(30),
+    )
+    .expect("retained options")
+}
+
+#[tokio::test]
+async fn retained_consensus_snapshot_and_reopen_preserve_committed_history() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    let backend = SqliteBackend::provision_config_authority(
+        retained_options(&path, topology(), 1),
+        audit_key(),
+    )
+    .await
+    .expect("provision");
+    let store = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("store");
+    store.initialize_cluster().await.expect("initialize");
+    let tx = TxId::new();
+    store
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x31; 16]),
+            attested(commit(tx, None, 1, 1), audit(tx)),
+        )
+        .await
+        .expect("commit");
+    store.trigger_snapshot().await.expect("snapshot");
+    store.shutdown().await.expect("shutdown");
+    drop(store);
+    let backend =
+        SqliteBackend::reopen_config_authority(retained_options(&path, topology(), 1), audit_key())
+            .await
+            .expect("reopen");
+    let store = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("restore");
+    store.initialize_cluster().await.expect("readmit");
+    assert_eq!(
+        store
+            .load_latest()
+            .await
+            .expect("load")
+            .expect("head")
+            .record
+            .tx_id,
+        tx
+    );
+    store.shutdown().await.expect("shutdown restored");
+}
+
+#[tokio::test]
+async fn retained_member_repair_recovers_from_surviving_quorum() {
+    let mut cluster =
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+    let (a, b, c) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster()
+    );
+    a.expect("first");
+    b.expect("second");
+    c.expect("third");
+    cluster.wait_ready().await;
+    let tx = TxId::new();
+    cluster.stores[cluster.leader()]
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x32; 16]),
+            attested(commit(tx, None, 1, 1), audit(tx)),
+        )
+        .await
+        .expect("commit");
+    // The canonical bootstrap voter is deliberately repaired: repair must
+    // never execute its normal first-formation genesis path.
+    cluster.stores[0]
+        .shutdown()
+        .await
+        .expect("stop canonical voter");
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            *peer.handler.write().await = None;
+        }
+    }
+    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).expect("node"));
+    let identity = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("opc-persist-three-node-tests").expect("cluster"),
+        ConfigConsensusConfigurationId::from_bytes([0x99; 32]),
+        ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
+    );
+    let topology =
+        ConfigConsensusTopology::try_new(identity, nodes[0], nodes.into_iter().collect())
+            .expect("topology");
+    let path = cluster._directory.path().join("replacement.sqlite");
+    assert!(SqliteBackend::reopen_config_authority(
+        retained_options(&path, topology.clone(), 9),
+        audit_key()
+    )
+    .await
+    .is_err());
+    assert!(!path.exists());
+    let backend = SqliteBackend::provision_config_member_repair(
+        retained_options(&path, topology.clone(), 9),
+        audit_key(),
+    )
+    .await
+    .expect("explicit repair");
+    let peers = (1..3)
+        .map(|target| {
+            let peer: Arc<dyn ConsensusPeer> = cluster.paths[&(0, target)].clone();
+            (nodes[target], peer)
+        })
+        .collect();
+    let replacement = ConsensusConfigStore::open_with_operation_timeout(
+        topology,
+        backend,
+        cluster._directory.path().join("replacement-snapshots"),
+        peers,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("replacement store");
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            peer.install(replacement.rpc_handler()).await;
+        }
+    }
+    cluster.stores[0] = replacement;
+    cluster.stores[0]
+        .initialize_cluster()
+        .await
+        .expect("recover exact membership");
+    cluster.wait_ready().await;
+    assert_eq!(
+        cluster.stores[0]
+            .load_latest()
+            .await
+            .expect("load repaired")
+            .expect("retained head")
+            .record
+            .tx_id,
+        tx
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn retained_whole_group_repair_cannot_form_new_genesis() {
+    let cluster =
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedRepair).await;
+    let (a, b, c) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster()
+    );
+    assert!(a.is_err() && b.is_err() && c.is_err());
+    for store in &cluster.stores {
+        assert!(!store.status().admitted);
+        assert!(store.status().applied_index.is_none());
+    }
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn retained_committed_wal_crash_child() {
+    let Some(root) = std::env::var_os("OPC_RETAINED_COMMIT_CRASH_DIRECTORY") else {
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let path = root.join("retained.sqlite");
+    let backend = SqliteBackend::provision_config_authority(
+        retained_options(&path, topology(), 1),
+        audit_key(),
+    )
+    .await
+    .expect("provision");
+    let store =
+        ConsensusConfigStore::open(topology(), backend, root.join("snapshots"), BTreeMap::new())
+            .await
+            .expect("store");
+    store.initialize_cluster().await.expect("initialize");
+    let tx = TxId::new();
+    store
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x33; 16]),
+            attested(commit(tx, None, 1, 1), audit(tx)),
+        )
+        .await
+        .expect("committed");
+    // Process exit intentionally skips SQLite Drop/checkpoint. The parent
+    // verifies the original ciphertext after ordinary WAL-aware reopening.
+    std::process::exit(91);
+}
+
+#[tokio::test]
+async fn retained_reopen_recovers_committed_wal_after_process_loss() {
+    let dir = tempfile::tempdir().expect("storage");
+    let output = std::process::Command::new(std::env::current_exe().expect("binary"))
+        .args([
+            "--exact",
+            "retained_committed_wal_crash_child",
+            "--nocapture",
+        ])
+        .env("OPC_RETAINED_COMMIT_CRASH_DIRECTORY", dir.path())
+        .output()
+        .expect("crash child");
+    assert_eq!(output.status.code(), Some(91));
+    assert!(
+        std::fs::metadata(dir.path().join("retained.sqlite-wal"))
+            .expect("uncheckpointed WAL")
+            .len()
+            > 0
+    );
+    let path = dir.path().join("retained.sqlite");
+    let backend =
+        SqliteBackend::reopen_config_authority(retained_options(&path, topology(), 1), audit_key())
+            .await
+            .expect("reopen WAL");
+    let store = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("restore");
+    store.initialize_cluster().await.expect("readmit");
+    let head = store
+        .load_latest()
+        .await
+        .expect("load")
+        .expect("committed head");
+    assert_eq!(head.record.version, ConfigVersion::new(1));
+    assert_eq!(
+        head.record.plaintext_digest,
+        Sha256::digest([1; 32]).to_vec()
+    );
+    store.shutdown().await.expect("shutdown");
 }

@@ -38,20 +38,40 @@ recovery. Mutation or lease outcomes that can make authority ambiguous discard
 the prior guard, reacquire same-owner authority at a strictly higher fence, and
 validate the exact scheduled record. Read-only get, restore-scan, and readiness
 outcomes retain the already-proven guard and validate that same exact record
-without minting unnecessary fencing authority. Historical traffic-resource/v6
-evidence binds that routing as `stage-aware-known-authority/v1`. The current
-traffic-resource/v9 schedule binds
-`stage-aware-known-authority-readiness-and-scan-reproof/v1`: a readiness-origin recovery
-also proves durable readiness again after the exact record check, using the
-same guard and original episode deadline. Failed and timed-out proofs count
-against the unchanged interruption allowance; an exact record read alone does
-not complete readiness recovery. A restore-scan-origin recovery instead repeats
-the complete scan and validates its cursor profile, counts, bounds, and exact
-record under the same deadline and allowance; terminal scan errors stay
-terminal. Historical v8 retains its readiness-only reproof meaning. The
-distinct traffic-resource/v7 retained-acquisition profile keeps its historical
-meaning; v9 does not consume that
-algorithm. See the [qualification contract](../../crates/opc-session-testkit/README.md).
+without minting unnecessary fencing authority. The current schedule binds
+`stage-aware-known-authority-readiness-and-scan-reproof/v2`.
+After a readiness failure, the retained-authority checkpoint also requires a
+fresh durable-readiness proof. An exact get uses a logical-time proposal and
+cannot certify the separate read-index path. Every completed not-ready proof
+and proof timeout consumes the existing interruption budget, bounded by the
+remaining original episode deadline. Recovery closes only after both the
+exact record and readiness are proven. After a restore-scan failure, recovery
+repeats the complete scan and requires the same exact record, durable cursor
+profile, count and page bounds. An exact get cannot certify scan availability.
+The scan uses that same original deadline and interruption allowance;
+malformed pages and terminal scan errors remain terminal.
+
+Before every acquisition, the synthetic caller syncs its exact consumer request
+ID, body, scope, identity and original absolute deadline into a private,
+single-writer journal beside its database. The complete image is bounded to
+4096 bytes. Uncertainty is reconciled through the existing consumer receipt
+API; `NotFound` permits only an explicit retry of that identical live request,
+never a distinct successor. At restart, a recorded terminal acquisition is
+retired before fresh authority. Expired unknown requests stay fenced, and
+retries never extend their deadlines. Missing or mismatched journal custody
+beside an existing database fails closed. This trusted local qualification
+caller adds no consumer-mTLS or production persistence claim and changes no
+ordinary lease API. Its acquisition profile is
+`retained-consumer-id-receipt-before-successor/v1`.
+
+The current `opc-session-ha/traffic-resource/v10` schedule binds both behaviors.
+Historical v6, v7, v8 and v9 retain their original meanings: v7 added retained
+acquisitions, v8 added readiness reproof, and v9 added complete scan reproof.
+The combined schedule changes no numeric workload, timeout, interruption or
+resource bound. Current 3/5-voter traffic and mTLS candidate digests bind the
+combined algorithm.
+
+See the [qualification contract](../../crates/opc-session-testkit/README.md).
 The fixed schedule drops one successful release response per mutator, allows eight
 outcomes per node, uses the fixed 26-second two-election-plus-operation
 transition envelope per recovery episode, and applies a 50 ms retry delay;

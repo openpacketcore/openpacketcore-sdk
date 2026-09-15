@@ -273,6 +273,41 @@ fn validate_config_replay_lookup_index(conn: &Connection) -> Result<(), rusqlite
     Ok(())
 }
 
+/// Compare retained base DDL with the SDK schema without initializing `conn`.
+/// The caller separately validates the exact consensus and admission catalogs.
+pub(crate) fn validate_retained_base_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+        WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' \
+        AND NOT (name GLOB 'config_raft_*' OR tbl_name GLOB 'config_raft_*') \
+        AND NOT (name = 'consensus_retained_binding' OR tbl_name = 'consensus_retained_binding')";
+    // Only this private in-memory reference is initialized. The compatibility
+    // digest in retained storage cannot authorize that storage's own DDL, and
+    // its historical exclusions do not exempt any base object from admission.
+    let expected = Connection::open_in_memory()?;
+    initialize_schema(&expected)?;
+    let count_query = format!("SELECT COUNT(*) FROM ({OBJECTS})");
+    let expected_count: i64 = expected.query_row(&count_query, [], |row| row.get(0))?;
+    let actual_count: i64 = conn.query_row(&count_query, [], |row| row.get(0))?;
+    if actual_count != expected_count {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let mut statement = expected.prepare(OBJECTS)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        // Read only bounded SDK-authored DDL into Rust memory. The supplied
+        // catalog is compared inside SQLite instead of allocating its text.
+        let matches: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND tbl_name = ?3 AND sql = ?4)",
+            rusqlite::params![row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?],
+            |row| row.get(0),
+        )?;
+        if !matches {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    Ok(())
+}
+
 fn table_has_column(
     conn: &Connection,
     table_name: &str,

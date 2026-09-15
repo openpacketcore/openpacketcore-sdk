@@ -21,8 +21,13 @@ accepted single-replica profile.
   follower-local `load_committed_latest`, bounded ordered `load_since`,
   `wait_for_committed_change`, `load_rollback`, `append_commit`,
   `mark_confirmed`, `create_rollback_point`, and `preflight`.
-- `SqliteBackend::open_with_audit_key` opens durable SQLite state. Durable
-  opens require an explicit non-zero `AuditKey`.
+- `SqliteBackend::open_with_audit_key` opens or creates SQLite state. Durable
+  opens require an explicit non-zero `AuditKey`; this API is not reopen-only.
+- Retained configuration voters use explicit `provision_config_authority`,
+  `reopen_config_authority`, and `provision_config_member_repair` operations.
+  Missing retained storage never falls back to creation during reopen. See the
+  [retained lifecycle contract](RETAINED_CONFIG.md) for scope binding,
+  interruption, repair, durability choices and rollback-freshness limits.
 - `AuditKey::new([u8; 32])` rejects all-zero keys, and
   `AuditKey::new_with_epoch` adds an explicit rotation epoch. Consensus binds
   the non-secret epoch/fingerprint into peer and durable identity and verifies

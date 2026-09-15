@@ -14,6 +14,9 @@ Openraft engine.
 Amended 2026-07-16 for the shared config-bus adapter and atomic named rollback
 points.
 
+Amended 2026-09-13 for explicit retained-authority provisioning, reopening and
+member repair (SDK #800).
+
 ## Context
 
 Single-node SQLite persistence cannot support a carrier-HA configuration
@@ -90,7 +93,18 @@ database/volume encryption layer protects them.
 
 ### Storage authority claim
 
-Opening a pristine database creates the Openraft schema and durable
+The retained-voter lifecycle separates new provisioning, ordinary reopening,
+and explicit member repair. Reopen validates established storage without
+creating a missing database or initializing missing authority metadata.
+An authenticated SDK-owned local admission record binds exact topology,
+backing, key scope and provisioning disposition; it does not replicate.
+Member repair recovers through the existing authenticated quorum and cannot
+bootstrap genesis. Interrupted provisioning preserves its bounded artifacts.
+See the [retained lifecycle contract](../../crates/opc-persist/RETAINED_CONFIG.md)
+for ordering, explicit durability choices, rejection/indeterminate outcomes,
+and the separate external rollback-freshness obligation.
+
+Explicit provisioning of a pristine database creates the Openraft schema and durable
 `config_raft_identity` authority marker in one immediate SQLite transaction.
 The same transaction checks legacy authority first. Every standalone SQLite
 mutation checks that marker under the shared connection lock and fails closed

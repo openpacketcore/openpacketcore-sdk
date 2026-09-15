@@ -279,7 +279,7 @@ const LEGACY_RAFT_TABLES: &[&str] = &[
 
 #[derive(Clone)]
 pub(crate) struct ConfigConsensusCore {
-    pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    pub(crate) conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     pub(crate) identity: ConsensusIdentity,
     pub(crate) expected_members: Arc<BTreeSet<ConsensusNodeId>>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
@@ -376,6 +376,7 @@ impl ConfigConsensusCore {
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
+        let retained = backend.retained_binding.is_some();
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
@@ -383,15 +384,30 @@ impl ConfigConsensusCore {
             let _permit = permit;
             let progress_cancellation = worker_cancellation.clone();
             worker_conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
-            let result = initialize_schema(
-                &worker_conn,
-                identity,
-                &worker_members,
-                &worker_audit_key,
-                recovery.as_ref(),
-                &worker_cancellation,
-                before_commit,
-            );
+            let result = if retained {
+                if recovery.is_some() {
+                    Err(ConfigConsensusStorageError::RecoveryRequired)
+                } else {
+                    validate_existing_schema(
+                        &worker_conn,
+                        identity,
+                        &worker_members,
+                        &worker_audit_key,
+                        false,
+                        &worker_cancellation,
+                    )
+                }
+            } else {
+                initialize_schema(
+                    &worker_conn,
+                    identity,
+                    &worker_members,
+                    &worker_audit_key,
+                    recovery.as_ref(),
+                    &worker_cancellation,
+                    before_commit,
+                )
+            };
             worker_conn.progress_handler(0, None::<fn() -> bool>);
             result
         });
@@ -536,7 +552,7 @@ where
 
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
-    conn: Arc<tokio::sync::Mutex<Connection>>,
+    conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     deadline: tokio::time::Instant,
     operation: F,
 ) -> io::Result<T>
@@ -605,6 +621,41 @@ where
     };
     cancel_on_drop.disarm();
     result
+}
+
+/// Provision consensus schema without starting an engine, listener or voter.
+pub(crate) fn provision_retained_schema(
+    conn: &Connection,
+    topology: &super::ConfigConsensusTopology,
+    audit_key: &AuditKey,
+    deadline: std::time::Instant,
+) -> Result<(), ConfigConsensusStorageError> {
+    initialize_schema(
+        conn,
+        topology.identity(),
+        topology.members(),
+        audit_key,
+        None,
+        &Arc::new(SqliteWorkCancellation::with_deadline(deadline)),
+        None,
+    )
+}
+
+/// Read existing schema and authenticated history without any initialization.
+pub(crate) fn validate_retained_schema(
+    conn: &Connection,
+    topology: &super::ConfigConsensusTopology,
+    audit_key: &AuditKey,
+    deadline: std::time::Instant,
+) -> Result<(), ConfigConsensusStorageError> {
+    validate_existing_schema(
+        conn,
+        topology.identity(),
+        topology.members(),
+        audit_key,
+        false,
+        &SqliteWorkCancellation::with_deadline(deadline),
+    )
 }
 
 fn initialize_schema(
@@ -3103,6 +3154,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
             DELETE FROM config_raft_purged;
             DELETE FROM config_raft_log;
             DELETE FROM config_raft_snapshot;
+            DROP TABLE IF EXISTS consensus_retained_binding;
             PRAGMA journal_mode = DELETE;
             VACUUM;
             "#,
@@ -3126,6 +3178,18 @@ fn validate_snapshot_has_no_log_authority(
     conn: &Connection,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    let local_binding: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'consensus_retained_binding')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if local_binding {
+        return Err(invalid_data(
+            "config snapshot contains local storage authority",
+        ));
+    }
     for table in [
         "config_raft_vote",
         "config_raft_committed",
@@ -4299,6 +4363,145 @@ mod tests {
         assert!(validate_history_chain_sync(&conn).is_err());
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .expect("restore foreign keys");
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_excludes_sender_binding_and_preserves_receiver_binding() {
+        use crate::{RetainedConfigBinding, RetainedConfigDurability, RetainedConfigOptions};
+
+        let directory = tempfile::tempdir().expect("storage");
+        let topology = super::super::ConfigConsensusTopology::try_new(
+            identity(),
+            node_id(),
+            expected_members(),
+        )
+        .expect("topology");
+        let options = |name: &str, backing| {
+            RetainedConfigOptions::new(
+                directory.path().join(name),
+                RetainedConfigBinding::new(topology.clone(), [backing; 32], [0x42; 32])
+                    .expect("binding"),
+                RetainedConfigDurability::Ephemeral,
+                16 * 1024 * 1024,
+                Duration::from_secs(30),
+            )
+            .expect("options")
+        };
+        let key = || AuditKey::new([0x71; 32]).expect("key");
+        let source = SqliteBackend::provision_config_authority(options("source.sqlite", 1), key())
+            .await
+            .expect("source provision");
+        let target =
+            SqliteBackend::provision_config_member_repair(options("target.sqlite", 2), key())
+                .await
+                .expect("receiver repair provision");
+        let source_conn = source.conn();
+        let source_conn = source_conn.lock().await;
+        let target_conn = target.conn();
+        let target_conn = target_conn.lock().await;
+        let binding = |conn: &Connection| -> Vec<u8> {
+            conn.query_row(
+                "SELECT record FROM consensus_retained_binding WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("local admission binding")
+        };
+        let sender_binding = binding(&source_conn);
+        let receiver_binding = binding(&target_conn);
+        assert_ne!(sender_binding, receiver_binding);
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &expected_members(),
+            vec![membership_entry()],
+        )
+        .expect("source membership");
+        let snapshot_path = directory.path().join("snapshot.sqlite");
+        let (last_log_id, last_membership) = build_snapshot_database_sync(
+            &source_conn,
+            identity(),
+            &expected_members(),
+            source.audit_key(),
+            &snapshot_path,
+        )
+        .expect("snapshot database before envelope sealing");
+        let incoming = Connection::open(&snapshot_path).expect("inspect snapshot");
+        let contains_binding: bool = incoming.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'consensus_retained_binding')",
+            [], |row| row.get(0),
+        ).expect("snapshot schema");
+        assert!(
+            !contains_binding,
+            "a snapshot must not carry sender-local admission authority"
+        );
+        drop(incoming);
+        let meta = SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "retained-binding".to_owned(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &expected_members(),
+            target.audit_key(),
+            &snapshot_path,
+            &meta,
+            "snapshot-retained.opc",
+            [0x81; 32],
+            1,
+        )
+        .expect("install replicated state into admitted receiver");
+        assert_eq!(
+            Some(log_id(0)),
+            read_applied_sync(&target_conn, identity()).expect("applied membership")
+        );
+        assert_eq!(
+            receiver_binding,
+            binding(&target_conn),
+            "install must preserve receiver-local authority"
+        );
+
+        // A peer-controlled snapshot containing even a syntactically valid
+        // local binding is rejected before changing the receiver's state.
+        let incoming = Connection::open(&snapshot_path).expect("tamper snapshot fixture");
+        incoming.execute_batch("CREATE TABLE consensus_retained_binding (singleton INTEGER PRIMARY KEY, record BLOB NOT NULL)")
+            .expect("inject sender binding table");
+        incoming
+            .execute(
+                "INSERT INTO consensus_retained_binding VALUES (1, ?1)",
+                [sender_binding],
+            )
+            .expect("inject sender binding");
+        drop(incoming);
+        target_conn
+            .execute(
+                "UPDATE config_raft_machine SET application_sequence = 73 WHERE singleton = 1",
+                [],
+            )
+            .expect("target rejection sentinel");
+        assert!(install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &expected_members(),
+            target.audit_key(),
+            &snapshot_path,
+            &meta,
+            "snapshot-rejected.opc",
+            [0x82; 32],
+            1,
+        )
+        .is_err());
+        let sequence: i64 = target_conn
+            .query_row(
+                "SELECT application_sequence FROM config_raft_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sentinel after rejection");
+        assert_eq!(73, sequence);
+        assert_eq!(receiver_binding, binding(&target_conn));
     }
 
     #[tokio::test]
