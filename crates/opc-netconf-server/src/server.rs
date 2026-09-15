@@ -5840,6 +5840,14 @@ where
             }
         }
 
+        let intent_event = AuditEvent::new(
+            context.request_id,
+            context.principal,
+            self.transport,
+            AuditOperation::Update,
+            AuditOutcome::Intent,
+        )
+        .with_paths(self.schema_paths_for_changed_paths(&changed_paths, kind.path()));
         let commit_request = CommitRequest::commit(
             context.request_id,
             context.principal.clone(),
@@ -5851,6 +5859,19 @@ where
             Instant::now() + Duration::from_secs(30),
         )
         .with_base_version(snapshot.version);
+
+        if commit_audit_failed(&self.audit, &intent_event).await {
+            record_rpc_error(
+                kind.metric(),
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
 
         match bus.submit(commit_request).await {
             Ok(result) => {
@@ -13637,13 +13658,17 @@ mod tests {
         assert_eq!(sessions.running_write_owner_for_test(), None);
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].operation, AuditOperation::Update);
-        assert_eq!(events[0].outcome, AuditOutcome::Success);
-        assert_eq!(
-            events[0].schema_paths,
-            vec![schema_node_path("/sys:system/sys:hostname")]
-        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        for event in events.iter() {
+            assert_eq!(event.operation, AuditOperation::Update);
+            assert_eq!(
+                event.schema_paths,
+                vec![schema_node_path("/sys:system/sys:hostname")]
+            );
+        }
         assert!(netconf_rpc_requests("edit-config", "success") > successes_before);
     }
 
@@ -13674,10 +13699,11 @@ mod tests {
             with_defaults: false,
             get_schema_mode: GetSchemaMode::Ok,
         };
+        let audit = ScriptedCommitAudit::new(CommitAuditFailure::TerminalError);
         let server = ReadOnlyNetconfServer::new(
             binding,
             FixedPolicy(policy_allow_system_but_deny_secret()),
-            FailingAudit,
+            audit.clone(),
             TransportType::NetconfTls,
         )
         .expect("server");
@@ -13708,6 +13734,15 @@ mod tests {
         let snapshot = bus.current_snapshot();
         assert_eq!(snapshot.config.hostname, "amf-2");
 
+        {
+            let attempts = audit.attempts.lock().expect("audit attempts mutex");
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].outcome, AuditOutcome::Intent);
+            assert_eq!(attempts[1].outcome, AuditOutcome::Success);
+            assert_eq!(attempts[0].request_id, request_id);
+            assert_eq!(attempts[1].request_id, request_id);
+            assert!(audit.failure.lock().expect("audit failure mutex").is_none());
+        }
         let latest = store.latest().await.expect("durable commit record");
         assert_eq!(latest.config.hostname, "amf-2");
         assert_eq!(latest.source, RequestSource::Northbound);
@@ -13803,11 +13838,18 @@ mod tests {
         assert_eq!(sessions.running_write_owner_for_test(), None);
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
         assert_eq!(events[0].operation, AuditOperation::Update);
-        assert_eq!(events[0].outcome, audit_failed("authorization_denied"));
+        assert_eq!(events[0].request_id, events[1].request_id);
         assert_eq!(
             events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert_eq!(events[1].operation, AuditOperation::Update);
+        assert_eq!(events[1].outcome, audit_failed("authorization_denied"));
+        assert_eq!(
+            events[1].schema_paths,
             vec![schema_node_path(NETCONF_EDIT_CONFIG_PATH)]
         );
     }
@@ -16271,8 +16313,12 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.operation, AuditOperation::Update))
             .collect();
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].outcome, AuditOutcome::Success);
+        assert_eq!(events.len(), 2);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].outcome, AuditOutcome::Intent);
+        assert_eq!(updates[1].outcome, AuditOutcome::Success);
+        assert_eq!(updates[0].request_id, updates[1].request_id);
+        assert_eq!(updates[0].schema_paths, updates[1].schema_paths);
     }
 
     #[tokio::test]
@@ -16562,13 +16608,17 @@ mod tests {
         assert!(!result.reply_xml.contains("do-not-leak"));
 
         let events = audit.events.lock().expect("audit mutex");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].operation, AuditOperation::Update);
-        assert_eq!(events[0].outcome, AuditOutcome::Success);
-        assert_eq!(
-            events[0].schema_paths,
-            vec![schema_node_path("/sys:system/sys:hostname")]
-        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, AuditOutcome::Intent);
+        assert_eq!(events[1].outcome, AuditOutcome::Success);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        for event in events.iter() {
+            assert_eq!(event.operation, AuditOperation::Update);
+            assert_eq!(
+                event.schema_paths,
+                vec![schema_node_path("/sys:system/sys:hostname")]
+            );
+        }
         assert!(netconf_rpc_requests("edit-data", "success") > successes_before);
     }
 
