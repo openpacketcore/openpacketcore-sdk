@@ -828,6 +828,18 @@ missing namespace MUST be created `0700`; SDK snapshot files MUST be created
 parent-path replacement cannot redirect accepted work. Durable snapshot rows
 name logical basenames, not a mutable parent path.
 
+A pinned-directory handoff MUST distinguish the original configured absolute
+namespace name from the owned directory capability. Construction MUST verify
+name/capability correspondence and obtain an independent open-file description;
+duplicating an existing description is insufficient for independent flock
+ownership. The configured name MUST remain the socket and pending-cleanup key,
+including across a parent-symlink retarget. A process-relative descriptor locator
+MUST NOT replace that key. After construction, store admission MUST use the
+retained capability and recheck its permission policy without redirecting I/O
+through a replacement pathname. Directory and database exclusion, atomic database
+admission, and cleanup-owned lease retirement MUST remain unchanged. This handoff
+does not alter Durable/Async acknowledgement, snapshot integrity or deadlines.
+
 Supported writers are cooperative SDK processes under one dedicated service
 UID, serialized by the snapshot/database leases. Operators MUST use a private
 parent directory, must not share that UID with untrusted workloads, and MUST

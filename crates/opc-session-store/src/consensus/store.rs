@@ -3286,6 +3286,38 @@ impl ConsensusSessionStore {
         snapshot_integrity: super::SnapshotIntegrityPolicy,
         persistence: SessionPersistenceMode,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_fixed_quorum_with_snapshot_directory(
+            topology,
+            backend,
+            super::SnapshotDirectory::from_path(snapshot_dir),
+            peers,
+            clock,
+            operation_timeout,
+            snapshot_integrity,
+            persistence,
+        )
+        .await
+    }
+
+    /// Open a fixed quorum with an explicit snapshot namespace/capability handoff.
+    ///
+    /// This has exactly the admission, operation deadline, snapshot integrity
+    /// and acknowledgement semantics of
+    /// [`Self::open_fixed_quorum_with_clock_and_persistence`]. Use
+    /// [`super::SnapshotDirectory::from_pinned`] when a supervisor supplies a
+    /// directory capability and its original configured namespace name. A
+    /// process-relative descriptor locator is not the configured namespace.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_fixed_quorum_with_snapshot_directory(
+        topology: ValidatedQuorumTopology,
+        backend: SqliteSessionBackend,
+        snapshot_dir: super::SnapshotDirectory,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+        snapshot_integrity: super::SnapshotIntegrityPolicy,
+        persistence: SessionPersistenceMode,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
         if !cfg!(target_os = "linux") {
             return Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform);
         }
@@ -16650,14 +16682,20 @@ mod membership_tests {
         )
         .expect("open no-follow inherited snapshot leaf");
         let snapshot_path = PathBuf::from(format!("/proc/self/fd/{}/", snapshot_fd.as_raw_fd()));
+        let descriptor = std::fs::File::open(snapshot_path).expect("reopen inherited capability");
+        let snapshot_directory = crate::SnapshotDirectory::from_pinned(&snapshots, descriptor)
+            .expect("bind the configured name to the inherited capability");
         let topology = fixed_shutdown_topology();
-        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+        let store = ConsensusSessionStore::open_fixed_quorum_with_snapshot_directory(
             topology.clone(),
             SqliteSessionBackend::open(workspace.path().join("store.sqlite"))
                 .expect("open procfd fixed-store backend"),
-            snapshot_path,
+            snapshot_directory,
             unavailable_fixed_shutdown_peers(&topology),
+            Arc::new(SystemClock),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
             crate::SnapshotIntegrityPolicy::PortableVerified,
+            SessionPersistenceMode::Durable,
         )
         .await
         .expect("full fixed-store admission through inherited procfd snapshot leaf");
