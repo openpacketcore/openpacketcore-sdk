@@ -1664,7 +1664,7 @@ dependencies = [
 name = "opc-redaction"
 version = "0.2.0"
 dependencies = [
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opc-data-governance",
  "serde",
  "serde_json",
@@ -1734,7 +1734,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "imbl",
  "libc",
  "nix",
