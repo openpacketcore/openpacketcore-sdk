@@ -124,12 +124,15 @@ manifest/digest mismatch, verifies current audit HMACs using the deployment
 audit-key epoch/fingerprint, and bounds retained durable outcomes to the newest
 4,096 application sequences.
 
-Config command and config-specific RPC revision 3 add named rollback-point
+Config command and config-specific RPC revision 3 added named rollback-point
 creation to the same applied mutation as the encrypted commit. Revisions 1 and
 2 remain readable only under their original semantics; a revision-1 or
 revision-2 command cannot claim the inline-label behavior. Exact formation and
-RPC checks reject mixed revisions, so this change requires a drained,
-coordinated stop/upgrade/start of the complete config voter set.
+RPC checks reject mixed revisions. Revision 4 now adds acknowledged history
+retention and storage/snapshot representation 2. Representation-1 files are
+refused without silently creating or converting authority; a coordinated binary
+restart alone cannot perform this cutover. The current contract and conversion
+limitation are specified in [ADR 0023](0023-bounded-configuration-history.md).
 
 The snapshot root is an exact private `0700`, non-symlink directory on the
 SQLite durable device. The adapter holds its opened directory descriptor,

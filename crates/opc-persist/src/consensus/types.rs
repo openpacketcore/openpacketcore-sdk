@@ -33,18 +33,19 @@ pub(crate) const ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 ///
 /// Revision 2 added atomic commit-confirmed resolution and recovery-fence
 /// clearing. Revision 3 adds an inline named rollback point to an appended
-/// encrypted record. Older commands remain readable under their original
+/// encrypted record. Revision 4 adds authenticated history retention. Older
+/// commands remain readable under their original
 /// semantics so existing durable logs can be replayed after upgrade.
-pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 3;
+pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 4;
 /// Current SQLite authority schema revision.
-pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 1;
+pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 2;
 /// Current config snapshot envelope revision.
-pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 1;
+pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 2;
 /// Current config-specific RPC payload revision.
 ///
-/// Revision 3 carries the revision-3 command admission contract. Peers require
+/// Revision 4 carries the revision-4 command admission contract. Peers require
 /// an exact match and do not negotiate a downgrade.
-pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 3;
+pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 4;
 
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
@@ -338,6 +339,8 @@ pub(crate) enum ConfigMutationIntent {
     },
     /// Clear the config-bus recovery fence marker on one durable record.
     ClearRecoveryRequired { tx_id: TxId },
+    /// Explicit acknowledged-prefix retention under exact-head authority.
+    RetainHistory(super::ConfigHistoryRetention),
 }
 
 impl ConfigMutationIntent {
@@ -349,6 +352,7 @@ impl ConfigMutationIntent {
             Self::ResolveConfirmedAndAppend { .. } | Self::ClearRecoveryRequired { .. } => {
                 ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
+            Self::RetainHistory(_) => CONFIG_CONSENSUS_COMMAND_VERSION,
         }
     }
 
@@ -359,7 +363,8 @@ impl ConfigMutationIntent {
             }
             Self::MarkConfirmed { .. }
             | Self::CreateRollbackPoint { .. }
-            | Self::ClearRecoveryRequired { .. } => Ok(None),
+            | Self::ClearRecoveryRequired { .. }
+            | Self::RetainHistory(_) => Ok(None),
         }
     }
 }
@@ -437,6 +442,7 @@ impl ConfigConsensusCommand {
                 self.intent.minimum_command_version() <= ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
                     && !has_inline_rollback_label
             }
+            3 => self.intent.minimum_command_version() <= 3,
             CONFIG_CONSENSUS_COMMAND_VERSION => true,
             _ => false,
         };
@@ -451,6 +457,7 @@ impl ConfigConsensusCommand {
                 commit.validate()?;
                 validate_confirmed_resolution(&commit.record, *resolution)?;
             }
+            ConfigMutationIntent::RetainHistory(retention) => retention.validate()?,
             ConfigMutationIntent::ClearRecoveryRequired { .. } => {}
             ConfigMutationIntent::MarkConfirmed { .. } => {}
             ConfigMutationIntent::CreateRollbackPoint { label, .. } => {
@@ -479,6 +486,10 @@ pub(crate) enum ConfigMutationFailure {
     RequestIdCollision,
     /// The sealed command or audit chain was malformed.
     InvalidInput,
+    /// Retained canonical history has reached its admitted bound.
+    HistoryFull,
+    /// Pending resolution or rollback references still protect the prefix.
+    HistoryProtected,
 }
 
 impl ConfigMutationFailure {
@@ -490,6 +501,8 @@ impl ConfigMutationFailure {
             }
             Self::RequestIdCollision => PersistError::request_id_collision(),
             Self::InvalidInput => PersistError::corrupt_blob(),
+            Self::HistoryFull => PersistError::config_history_full(),
+            Self::HistoryProtected => PersistError::config_history_protected(),
         }
     }
 }
@@ -797,7 +810,7 @@ mod tests {
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
-        assert_eq!(3, CONFIG_CONSENSUS_WIRE_VERSION);
+        assert_eq!(4, CONFIG_CONSENSUS_WIRE_VERSION);
         let current = encode_config_wire(&7_u64).expect("current wire");
         assert_eq!(
             7,
@@ -832,8 +845,56 @@ mod tests {
     }
 
     #[test]
+    fn history_retention_rejects_downgrade_and_invalid_received_bounds() {
+        let identity = ConfigConsensusIdentity::new(
+            ConfigConsensusClusterId::new("config-history-revision-test").expect("cluster"),
+            ConfigConsensusConfigurationId::from_bytes([0xC3; 32]),
+            ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
+        );
+        let retention = crate::ConfigHistoryRetention::new(
+            TxId::new(),
+            opc_types::ConfigVersion::new(6),
+            opc_types::ConfigVersion::new(3),
+            opc_types::ConfigVersion::new(4),
+            crate::ConfigHistoryLimits::new(4, 1_048_576).expect("limits"),
+        )
+        .expect("retention decision");
+        let mut command = ConfigConsensusCommand {
+            schema_version: CONFIG_CONSENSUS_COMMAND_VERSION,
+            identity,
+            request_id: ConfigConsensusRequestId::from_bytes([0xC4; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: ConfigMutationIntent::RetainHistory(retention.clone()),
+        };
+        assert!(command.validate(identity).is_ok());
+        for schema_version in 1..CONFIG_CONSENSUS_COMMAND_VERSION {
+            command.schema_version = schema_version;
+            assert!(command.validate(identity).is_err());
+        }
+        command.schema_version = CONFIG_CONSENSUS_COMMAND_VERSION;
+        let original = serde_json::to_value(retention).expect("received decision");
+        for limits in [
+            serde_json::json!({"max_records": 1, "max_bytes": 1_048_576}),
+            serde_json::json!({"max_records": 4, "max_bytes": 0}),
+            serde_json::json!({"max_records": 1_000_001, "max_bytes": 1_048_576}),
+            serde_json::json!({"max_records": 4, "max_bytes": 1_073_741_825}),
+        ] {
+            let mut received = original.clone();
+            received["limits"] = limits;
+            // Deserialization cannot bypass constructor-level admission.
+            command.intent = ConfigMutationIntent::RetainHistory(
+                serde_json::from_value(received).expect("typed received command"),
+            );
+            assert!(command.validate(identity).is_err());
+        }
+        let mut unknown = original;
+        unknown["implicit_acknowledgement"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<crate::ConfigHistoryRetention>(unknown).is_err());
+    }
+
+    #[test]
     fn older_persisted_commands_decode_but_cannot_claim_newer_intents() {
-        assert_eq!(3, CONFIG_CONSENSUS_COMMAND_VERSION);
+        assert_eq!(4, CONFIG_CONSENSUS_COMMAND_VERSION);
         let identity = ConfigConsensusIdentity::new(
             ConfigConsensusClusterId::new("config-command-v1-replay-test").expect("cluster"),
             ConfigConsensusConfigurationId::from_bytes([0xB1; 32]),

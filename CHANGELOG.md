@@ -112,6 +112,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Bounded acknowledged configuration history — `opc-persist`:** the existing
+  consensus authority commits exact-head retention decisions with record and
+  encoded-byte limits, authenticated cursor boundaries, and protected rollback
+  references. Capacity rejection rolls back the entire mutation; retained
+  outcomes and original encrypted lineage survive pruning, reopen, natural
+  election and member snapshot repair. Real encrypted ConfigWatch recovery
+  resumes from a complete snapshot and its ordered tail. Configuration wire and
+  command revision 4 and storage/snapshot representation 2 require a coordinated
+  cutover; no representation-1 authority conversion is provided. Legacy command
+  semantics remain preserved. See ADR 0023 (Refs #802).
 - **Synthetic N3IWF fixture contracts — `opc-n3iwf-fixtures`:** ten independently
   consumable inventories with explicit encoding, validation scope, caller
   context, provenance, and byte digests. Catalog loading validates bounded

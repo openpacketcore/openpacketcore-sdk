@@ -35,3 +35,4 @@ accepted.
 | [0020](0020-portable-verified-consensus-snapshots.md) | Fixed membership is independent of snapshot integrity policy; portable snapshots verify the bytes consumed, including SQLite reads, while strict fs-verity remains explicit. Implementation qualification is pending. |
 | [0021](0021-sequential-session-raft-wal.md) | Historical private segmented WAL and SQLite-projection design; its ordered durable implementation is preserved, while ADR 0022 supersedes application composition and public activation. |
 | [0022](0022-native-session-persistence-modes.md) | Native session storage supports explicit Durable and Async acknowledgement modes; Async restart requires a fresh live-quorum cut and fenced local catch-up before participation. |
+| [0023](0023-bounded-configuration-history.md) | Configuration history is pruned only by an acknowledged, exact-head consensus decision with authenticated boundaries, protected references, and atomic capacity rejection. |

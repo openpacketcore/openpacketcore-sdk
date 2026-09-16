@@ -219,10 +219,16 @@ Strict operational requirements:
   SPIFFE identities and the product schema digest, and set the config candidate
   byte admission limit so one complete revision fits the response-frame
   contract;
-- for command/RPC revision 3, drain config writers, stop the complete config
-  voter set, upgrade every member, and restart the set together. Revisions 1
-  and 2 remain replayable only under their original semantics; there is no
-  mixed-revision downgrade.
+- command/RPC revision 4 and storage/snapshot representation 2 require an exact
+  matching configuration-authority set. Persisted command revisions 1 through 3
+  retain their original semantics; there is no mixed-revision downgrade.
+  Representation-1 files are refused. A coordinated binary restart is not a
+  conversion, and this change supplies no existing-authority format conversion;
+- retention is an explicit privileged authority operation. Resolve outstanding
+  work and references before acknowledging a prefix, preserve capacity for
+  required mutations, and recover a compacted watch through a complete snapshot.
+  See [ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for bounds,
+  protected references, authenticated floors and the format cutover limitation.
 
 The broader multi-group failure and restart qualification tracked by
 `GAP-001-006` remains required before this crate's source-build-only status can

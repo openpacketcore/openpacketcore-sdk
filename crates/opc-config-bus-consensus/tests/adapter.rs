@@ -444,6 +444,141 @@ async fn unavailable_persistence_maps_to_retryable_store_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_config_bus_replay_precedes_new_operation_base_guard() {
+    let cluster = ProjectionCluster::start().await;
+    let authority = Arc::clone(&cluster.stores[cluster.leader()]);
+    let source = Arc::new(EncryptingManagedDatastore::new(
+        Arc::new(RaftManagedDatastore::<TestConfig>::new_local_authority(
+            Arc::clone(&authority),
+        )),
+        provider(),
+    ));
+    source
+        .append_commit(projection_record(TxId::new(), None, 1, "revision-1"))
+        .await
+        .expect("encrypted initial configuration");
+    let bus = ConfigBus::restore_or_new_dev_only(
+        TestConfig {
+            name: "initial".to_owned(),
+        },
+        Arc::clone(&source),
+    )
+    .await
+    .expect("real encrypted bus");
+    let replacement = |version: u64| {
+        CommitRequest::commit(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Internal,
+            ConfigOperation::Replace,
+            TestConfig {
+                name: format!("revision-{version}"),
+            },
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .with_base_version(ConfigVersion::new(version - 1))
+        .with_idempotency_key(
+            opc_config_model::IdempotencyKey::new(format!("revision-{version}")).expect("key"),
+        )
+    };
+    bus.submit(replacement(2))
+        .await
+        .expect("second configuration");
+    let mut rollback = CommitRequest::rollback(
+        RequestId::new(),
+        principal(),
+        TransportType::Internal,
+        RequestSource::Internal,
+        RollbackTarget::Previous,
+        Vec::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .with_base_version(ConfigVersion::new(2))
+    .with_idempotency_key(
+        opc_config_model::IdempotencyKey::new("acknowledged-rollback").expect("key"),
+    );
+    bus.submit(rollback.clone())
+        .await
+        .expect("original rollback");
+    bus.submit(replacement(4))
+        .await
+        .expect("fourth configuration");
+    let mut current_request = replacement(5);
+    let current = bus
+        .submit(current_request.clone())
+        .await
+        .expect("fifth configuration");
+    authority
+        .retain_history_idempotent(
+            opc_persist::ConfigConsensusRequestId::from_bytes([0xEC; 16]),
+            opc_persist::ConfigHistoryRetention::new(
+                current.tx_id,
+                ConfigVersion::new(5),
+                ConfigVersion::new(3),
+                ConfigVersion::new(4),
+                opc_persist::ConfigHistoryLimits::new(3, 1_048_576).expect("limits"),
+            )
+            .expect("acknowledged prefix"),
+        )
+        .await
+        .expect("real consensus pruning");
+    assert_eq!(
+        source
+            .retained_history_floor()
+            .await
+            .expect("authenticated floor"),
+        Some(ConfigVersion::new(3))
+    );
+    // Only the call deadline is refreshed; request identity, payload and base
+    // remain the original request. The retained result wins before admission.
+    current_request.deadline = Instant::now() + Duration::from_secs(5);
+    let replay = bus
+        .submit(current_request)
+        .await
+        .expect("retained exact replay");
+    assert_eq!(replay, current);
+    rollback.deadline = Instant::now() + Duration::from_secs(5);
+    let error = bus
+        .submit(rollback)
+        .await
+        .expect_err("retired rollback cannot become a fresh write");
+    assert_eq!(
+        error.code,
+        opc_config_model::CommitErrorCode::AdmissionRejected
+    );
+    assert_eq!(bus.version(), ConfigVersion::new(5));
+    assert_eq!(
+        source
+            .load_committed_latest()
+            .await
+            .expect("unchanged head")
+            .expect("head")
+            .tx_id,
+        current.tx_id
+    );
+    // A new request at the current base can still use the retained Previous
+    // target. Refusing the stale request did not fence a healthy bus.
+    bus.submit(
+        CommitRequest::rollback(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Internal,
+            RollbackTarget::Previous,
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .with_base_version(ConfigVersion::new(5)),
+    )
+    .await
+    .expect("fresh rollback");
+    assert_eq!(bus.version(), ConfigVersion::new(6));
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promoted_follower_reconciles_the_live_bus_before_writing() {
     let cluster = ProjectionCluster::start().await;
     let original_leader = cluster.leader();
