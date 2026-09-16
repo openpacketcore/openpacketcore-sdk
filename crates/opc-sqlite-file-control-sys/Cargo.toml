@@ -20,7 +20,7 @@ test-vfs = []
 
 [dependencies]
 libc = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [lints.rust]
 unsafe_code = "allow"
