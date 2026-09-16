@@ -2778,6 +2778,17 @@ pub(crate) fn apply_entries_cancellable_sync(
                         .map_err(|_| invalid_data("config consensus applied digest failed"))?;
                     tx.execute_batch("SAVEPOINT config_history_command")
                         .map_err(db_error)?;
+                    let updates_existing_records = match &command.intent {
+                        ConfigMutationIntent::AppendCommit(_)
+                        | ConfigMutationIntent::RetainHistory(_) => false,
+                        ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
+                        | ConfigMutationIntent::ClearRecoveryRequired { .. }
+                        | ConfigMutationIntent::MarkConfirmed { .. }
+                        | ConfigMutationIntent::CreateRollbackPoint { .. } => true,
+                    };
+                    if updates_existing_records {
+                        super::history::validate_record_chain_sync(&tx, audit_key, cancellation)?;
+                    }
                     let mut result = match &command.intent {
                         ConfigMutationIntent::RetainHistory(retention) => {
                             validate_sealed_state_sync(&tx, audit_key, cancellation)?;
@@ -2793,7 +2804,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                         )?,
                     };
                     if result.is_ok() {
-                        result = super::history::refresh_sync(&tx, audit_key)?;
+                        result = super::history::refresh_sync(
+                            &tx,
+                            audit_key,
+                            updates_existing_records,
+                            cancellation,
+                        )?;
                     }
                     if result.is_err() {
                         tx.execute_batch("ROLLBACK TO config_history_command")
@@ -4938,9 +4954,14 @@ mod tests {
         // This existing raw lifecycle-fault fixture owns its synthetic seed.
         // Admit that seed into the authenticated head before injecting the
         // mid-command fault, so the detector still reaches the intended effect.
-        super::super::history::refresh_sync(&conn, backend.audit_key())
-            .expect("authenticate lifecycle fixture")
-            .expect("unbounded fixture history");
+        super::super::history::refresh_sync(
+            &conn,
+            backend.audit_key(),
+            false,
+            &SqliteWorkCancellation::new(),
+        )
+        .expect("authenticate lifecycle fixture")
+        .expect("unbounded fixture history");
         let entry = mark_confirmed_entry(1, [0xA1; 16], tx_id);
         append_logs_sync(
             &conn,

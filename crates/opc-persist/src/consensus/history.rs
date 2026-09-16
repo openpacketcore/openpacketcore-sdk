@@ -201,7 +201,68 @@ fn audit_anchor_digest(count: i64, terminal: &[u8]) -> io::Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
-fn extend_record_chain(previous: [u8; 32], head: &HistoryHead, audit_anchor: [u8; 32]) -> [u8; 32] {
+fn record_metadata_digest(
+    conn: &Connection,
+    head: &HistoryHead,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<[u8; 32]> {
+    use rusqlite::types::ValueRef;
+
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/config-consensus/history-metadata/v1\0");
+    // These closed queries bind the metadata that can authorize rollback,
+    // publication and replay, plus its labels and lifecycle audit. They never
+    // expose that content outside the existing persistence authority.
+    for (domain, sql) in [
+        (b"record\0".as_slice(), "SELECT parent_tx_id, committed_at, principal, source, schema_digest, plaintext_digest, rollback_point, rollback_label, confirmed_deadline, confirmed_at FROM config_history WHERE tx_id = ?1"),
+        (b"labels\0".as_slice(), "SELECT label, created_at FROM rollback_labels WHERE tx_id = ?1 ORDER BY label ASC"),
+        (b"lifecycle\0".as_slice(), "SELECT id, action, principal, occurred_at, details FROM config_lifecycle_audit WHERE tx_id = ?1 ORDER BY id ASC"),
+    ] {
+        cancellation.check_io()?;
+        digest.update(domain);
+        let mut statement = conn.prepare(sql).map_err(database_error)?;
+        let width = statement.column_count();
+        let mut rows = statement.query([head.tx_id.as_uuid().as_bytes().as_slice()])
+            .map_err(database_error)?;
+        let mut count = 0_u64;
+        while let Some(row) = rows.next().map_err(database_error)? {
+            cancellation.check_io()?;
+            count = count.checked_add(1).ok_or_else(corrupt)?;
+            digest.update([1]);
+            digest.update(u64::try_from(width).map_err(|_| corrupt())?.to_be_bytes());
+            for index in 0..width {
+                match row.get_ref(index).map_err(database_error)? {
+                    ValueRef::Null => digest.update([0]),
+                    ValueRef::Integer(value) => {
+                        digest.update([1]);
+                        digest.update(value.to_be_bytes());
+                    }
+                    ValueRef::Text(value) => {
+                        digest.update([2]);
+                        digest.update(u64::try_from(value.len()).map_err(|_| corrupt())?.to_be_bytes());
+                        digest.update(value);
+                    }
+                    ValueRef::Blob(value) => {
+                        digest.update([3]);
+                        digest.update(u64::try_from(value.len()).map_err(|_| corrupt())?.to_be_bytes());
+                        digest.update(value);
+                    }
+                    ValueRef::Real(_) => return Err(corrupt()),
+                }
+            }
+        }
+        digest.update([0]);
+        digest.update(count.to_be_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn extend_record_chain(
+    previous: [u8; 32],
+    head: &HistoryHead,
+    audit_anchor: [u8; 32],
+    metadata: [u8; 32],
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(RECORD_CHAIN_DOMAIN);
     digest.update(previous);
@@ -209,6 +270,7 @@ fn extend_record_chain(previous: [u8; 32], head: &HistoryHead, audit_anchor: [u8
     digest.update(head.version.get().to_be_bytes());
     digest.update(head.encrypted_digest);
     digest.update(audit_anchor);
+    digest.update(metadata);
     digest.finalize().into()
 }
 
@@ -236,7 +298,12 @@ fn record_chain_sync(
             version: ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?),
             encrypted_digest: Sha256::digest(encrypted).into(),
         };
-        digest = extend_record_chain(digest, &head, audit_anchor_digest(count, &terminal)?);
+        digest = extend_record_chain(
+            digest,
+            &head,
+            audit_anchor_digest(count, &terminal)?,
+            record_metadata_digest(conn, &head, cancellation)?,
+        );
     }
     Ok(digest)
 }
@@ -244,7 +311,8 @@ fn record_chain_sync(
 /// Full validation precedes pruning, retained reopen and snapshot acceptance.
 /// Framing/AAD validation cannot authenticate opaque ciphertext without the
 /// decryption key. The history HMAC authenticates this ordered digest, including
-/// each record's audit anchor so removing both audit rows and their anchor fails.
+/// each record's audit anchor and mutable reference metadata. Removing audit
+/// rows together with their anchor, or clearing a protected reference, fails.
 pub(crate) fn validate_record_chain_sync(
     conn: &Connection,
     key: &AuditKey,
@@ -465,9 +533,13 @@ pub(crate) fn validate_sync(conn: &Connection, key: &AuditKey) -> io::Result<()>
 
 /// Runs in the existing per-command SQLite savepoint after a possible mutation.
 /// Capacity rejection rolls that savepoint back, including pending resolution.
+/// Rebinding an existing record requires validation of the prior chain before
+/// the command's effects; appends extend the old digest without rehashing it.
 pub(crate) fn refresh_sync(
     conn: &Connection,
     key: &AuditKey,
+    updates_existing_records: bool,
+    cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     let mut state = load_state(conn, key)?.ok_or_else(corrupt)?;
     if let Some(limits) = state.limits {
@@ -497,13 +569,22 @@ pub(crate) fn refresh_sync(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(database_error)?;
-        state.record_chain = extend_record_chain(
-            state.record_chain,
-            next,
-            audit_anchor_digest(count, &terminal)?,
-        );
+        if !updates_existing_records {
+            state.record_chain = extend_record_chain(
+                state.record_chain,
+                next,
+                audit_anchor_digest(count, &terminal)?,
+                record_metadata_digest(conn, next, cancellation)?,
+            );
+        }
     } else if records != state.records {
         return Err(corrupt());
+    }
+    if updates_existing_records {
+        // Only a command whose prior chain was authenticated may rebind an
+        // existing record's mutable metadata. Otherwise a legitimate lifecycle
+        // update could bless unrelated historical damage.
+        state.record_chain = record_chain_sync(conn, cancellation)?;
     }
     state.head = head;
     state.records = records;

@@ -3269,3 +3269,231 @@ async fn retained_reopen_recovers_committed_wal_after_process_loss() {
     );
     store.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn history_retention_refuses_damaged_mutable_references() {
+    for mutation in [
+        "rollback_flag",
+        "rollback_flag_then_append",
+        "rollback_flag_then_lifecycle",
+        "pending_deadline",
+        "named_label",
+        "lifecycle_row",
+        "plaintext_digest",
+    ] {
+        let dir = tempfile::tempdir().expect("directory");
+        let database = dir.path().join("config.sqlite");
+        let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+        let total = if mutation == "pending_deadline" { 3 } else { 5 };
+        let mut ids: Vec<_> = (0..total).map(|_| TxId::new()).collect();
+        for index in 0..total {
+            let mut record = commit(
+                ids[index],
+                index.checked_sub(1).map(|previous| ids[previous]),
+                index as u64 + 1,
+                0x62,
+            );
+            if mutation == "pending_deadline" && index == total - 1 {
+                record.confirmed_deadline = Some(Timestamp::now_utc());
+            }
+            store
+                .append_attested_commit(attested(record, audit(ids[index])))
+                .await
+                .expect("complete encrypted history");
+        }
+        if mutation.starts_with("rollback_flag") {
+            store
+                .create_rollback_point(ids[0], None)
+                .await
+                .expect("explicit protected reference");
+        } else if mutation == "named_label" || mutation == "lifecycle_row" {
+            store
+                .create_rollback_point(ids[total - 1], Some("retained-current".to_owned()))
+                .await
+                .expect("current named rollback reference");
+        }
+        let observer = rusqlite::Connection::open(&database).expect("adversarial connection");
+        let sql = match mutation {
+            "rollback_flag" | "rollback_flag_then_append" | "rollback_flag_then_lifecycle" =>
+                "UPDATE config_history SET rollback_point = 0 WHERE version = 1",
+            "pending_deadline" => "UPDATE config_history SET confirmed_deadline = NULL WHERE version = 3",
+            "named_label" => "UPDATE rollback_labels SET label = 'substituted-current' WHERE label = 'retained-current'",
+            "lifecycle_row" => "DELETE FROM config_lifecycle_audit",
+            "plaintext_digest" => "UPDATE config_history SET plaintext_digest = zeroblob(32) WHERE version = 1",
+            _ => unreachable!("closed mutation list"),
+        };
+        assert_eq!(
+            observer
+                .execute(sql, [])
+                .expect("damage exactly one reference"),
+            1
+        );
+        if mutation == "rollback_flag_then_append" {
+            let next = TxId::new();
+            store
+                .append_attested_commit(attested(
+                    commit(next, Some(ids[total - 1]), total as u64 + 1, 0x62),
+                    audit(next),
+                ))
+                .await
+                .expect("append does not reauthenticate older mutable metadata");
+            ids.push(next);
+        } else if mutation == "rollback_flag_then_lifecycle" {
+            // This ordinary operation may refuse the damaged prior state. If
+            // it proceeds, it must never reauthenticate unrelated corruption.
+            let _ = store.create_rollback_point(ids[total - 1], None).await;
+        }
+        let version = ids.len() as u64;
+        let result = store
+            .retain_history_idempotent(
+                ConfigConsensusRequestId::from_bytes([0xD7; 16]),
+                retention(
+                    *ids.last().expect("head"),
+                    version,
+                    version - 1,
+                    2,
+                    1_048_576,
+                ),
+            )
+            .await;
+        let count: i64 = observer
+            .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+            .expect("independent row readback");
+        let encoded: Vec<u8> = observer
+            .query_row(
+                "SELECT state_json FROM config_raft_history_retention",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unchanged boundary readback");
+        drop(observer);
+        store.shutdown().await.expect("shutdown");
+        assert!(
+            result.is_err(),
+            "{mutation}: damaged lifecycle/reference metadata cannot authorize pruning"
+        );
+        assert_eq!(
+            count as u64, version,
+            "{mutation}: every original row survives"
+        );
+        let state: serde_json::Value = serde_json::from_slice(&encoded).expect("state shape");
+        assert!(
+            state["boundary"].is_null(),
+            "no compaction permission minted over damaged references"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_history_lifecycle_metadata_is_authenticated_on_reopen() {
+    for mutation in ["rollback_flag", "named_label", "lifecycle_row"] {
+        let dir = tempfile::tempdir().expect("directory");
+        let path = dir.path().join("retained.sqlite");
+        let backend = SqliteBackend::provision_config_authority(
+            retained_options(&path, topology(), 1),
+            audit_key(),
+        )
+        .await
+        .expect("explicit provision");
+        let store = ConsensusConfigStore::open(
+            topology(),
+            backend,
+            dir.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("store");
+        store.initialize_cluster().await.expect("initialize");
+        let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+        for index in 0..5 {
+            store
+                .append_attested_commit(attested(
+                    commit(
+                        ids[index],
+                        index.checked_sub(1).map(|i| ids[i]),
+                        index as u64 + 1,
+                        0x62,
+                    ),
+                    audit(ids[index]),
+                ))
+                .await
+                .expect("encrypted configuration");
+        }
+        store
+            .retain_history_idempotent(
+                ConfigConsensusRequestId::from_bytes([0xD8; 16]),
+                retention(ids[4], 5, 3, 3, 1_048_576),
+            )
+            .await
+            .expect("retained prefix");
+        store
+            .create_rollback_point(ids[4], Some("retained-current".to_owned()))
+            .await
+            .expect("legitimate lifecycle change after pruning");
+        store.shutdown().await.expect("shutdown");
+        drop(store);
+        let clean = SqliteBackend::reopen_config_authority(
+            retained_options(&path, topology(), 1),
+            audit_key(),
+        )
+        .await
+        .expect("legitimate lifecycle mutation survives retained reopen");
+        drop(clean);
+        let attacker = rusqlite::Connection::open(&path).expect("offline corruptor");
+        let (read, damage, repair) = match mutation {
+            "rollback_flag" => (
+                "SELECT rollback_point FROM config_history WHERE version = 5",
+                "UPDATE config_history SET rollback_point = 0 WHERE version = 5",
+                "UPDATE config_history SET rollback_point = ?1 WHERE version = 5",
+            ),
+            "named_label" => (
+                "SELECT label, tx_id, created_at FROM rollback_labels WHERE label = 'retained-current'",
+                "DELETE FROM rollback_labels WHERE label = 'retained-current'",
+                "INSERT INTO rollback_labels (label, tx_id, created_at) VALUES (?1, ?2, ?3)",
+            ),
+            "lifecycle_row" => (
+                "SELECT id, tx_id, action, principal, occurred_at, details FROM config_lifecycle_audit",
+                "DELETE FROM config_lifecycle_audit",
+                "INSERT INTO config_lifecycle_audit (id, tx_id, action, principal, occurred_at, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ),
+            _ => unreachable!("closed mutation list"),
+        };
+        let original = attacker
+            .query_row(read, [], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("preserve the exact synthetic metadata before damage");
+        assert_eq!(
+            attacker
+                .execute(damage, [])
+                .expect("damage one retained reference"),
+            1
+        );
+        drop(attacker);
+        assert!(
+            matches!(
+                SqliteBackend::reopen_config_authority(
+                    retained_options(&path, topology(), 1),
+                    audit_key(),
+                )
+                .await,
+                Err(opc_persist::RetainedConfigError::Rejected)
+            ),
+            "{mutation}: retained reopen must reject unauthenticated lifecycle changes"
+        );
+        let repair_connection =
+            rusqlite::Connection::open(&path).expect("restore only the damaged row");
+        assert_eq!(
+            repair_connection
+                .execute(repair, rusqlite::params_from_iter(original.iter()))
+                .expect("restore original metadata without changing the authenticated digest"),
+            1
+        );
+        drop(repair_connection);
+        SqliteBackend::reopen_config_authority(retained_options(&path, topology(), 1), audit_key())
+            .await
+            .expect("exact metadata restoration restores admission");
+    }
+}

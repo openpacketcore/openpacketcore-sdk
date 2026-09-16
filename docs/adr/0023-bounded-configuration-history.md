@@ -36,17 +36,24 @@ window than the acknowledged prefix requires.
 A singleton authenticated state binds the exact consensus identity and epoch,
 audit-key epoch, limits, acknowledged prefix, surviving boundary, complete
 head's transaction/version/ciphertext digest, retained record count, and an
-ordered digest of every retained transaction/version/ciphertext and audit anchor. The
+ordered digest of every retained transaction/version/ciphertext, audit anchor,
+record metadata, named rollback reference and lifecycle audit row. The
 existing audit-key HMAC primitive has a separate history domain. The canonical
 state is bounded to 4096 encoded bytes, uses a closed versioned shape, and is
 verified before authoritative reads, retention, reopen, and snapshot acceptance.
 The key does not leave the existing persistence authority.
 
 Append extends the authenticated record digest with the new record only;
-it cannot authenticate an unrelated change to an older record. Before pruning,
+it cannot authenticate an unrelated change to an older record. A command that
+legitimately changes an existing record first validates the complete prior
+digest, then recomputes it after that mutation within the same savepoint. This
+includes confirmation, recovery-marker clearing and rollback-point creation;
+such an operation cannot re-authenticate unrelated damage. Before pruning,
 retained reopen, or snapshot acceptance, full sealed-state validation checks the
 ordered digest and every retained audit anchor and encrypted metadata binding.
-Removing an audit chain together with its count/terminal hash is also corruption.
+Removing an audit chain together with its count/terminal hash, clearing a rollback
+flag or confirmation deadline, or damaging labels and lifecycle metadata is also
+corruption.
 Pruning recomputes the digest over the surviving rows in the same transaction.
 These scans retain one record at a time and honor cancellation. No decryption
 key or plaintext configuration is needed, and corruption in a prefix cannot be
