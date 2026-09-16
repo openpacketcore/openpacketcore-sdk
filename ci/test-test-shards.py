@@ -154,7 +154,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
     def test_selector_contract_keeps_one_exact_ordinary_profile_run(self) -> None:
         name = (
             "ebpf::tests::remote_selector_regression::"
-            "singleton_public_protected_flow_keeps_original_request_deadline"
+            "singleton_public_protected_flow_preserves_durable_state"
         )
         commands = TEST_SHARDS.commands(
             {"heavy": {"target": "fixture", "shards": []}}, "misc", []

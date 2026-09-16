@@ -157,7 +157,9 @@ jobs:
       # check themselves in their precheck step -- so this is the readable
       # place to see a plan failure, not the thing that gates them.
       - name: Test test-shard manifest audit
-        run: python3 ci/test-test-shards.py
+        run: |
+          python3 ci/test-test-shards.py
+          python3 ci/test-performance-tests.py
 
       - name: Verify test shard plan
         run: python3 ci/test-shards.py verify
@@ -330,15 +332,15 @@ jobs:
         with:
           shared-key: opc-rust-gtpu-cfg
 
-      # The composed request has the same literal one-second contract here
-      # as in the ordinary shard. Keep this cfg and feature selection, but
-      # run it after unrelated test runtimes have exited.
+      # Keep the functional composed request in this cfg/feature selection.
+      # The separate CNF performance workflow qualifies its one-second limit.
+      # Run the durable fixture after unrelated test runtimes have exited.
       - name: Run GTP-U unsupported-platform cfg tests
         env:
           RUSTFLAGS: "--cfg opc_linux_gtpu_sys_force_unsupported"
         run: |
           set -euo pipefail
-          selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_keeps_original_request_deadline
+          selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_preserves_durable_state
           cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --list --exact "$selector" > unsupported-selector-tests.txt
           python3 - "$selector" <<'PYCODE'
           import pathlib
@@ -683,8 +685,8 @@ jobs:
           shared-key: ${{ matrix.cache_key }}
 
       - name: Run opc-session-net tests on i686
-        # The stateless three-voter consumer proofs retain literal authority,
-        # snapshot, and 100/250 ms caller budgets. Run every test exactly once,
+        # The stateless three-voter consumer proofs retain literal authority
+        # and snapshot budgets. Run every functional test exactly once,
         # but give each wall-time contract a fresh 32-bit process so completed
         # fixture runtimes cannot consume a later contract's budget.
         run: |

@@ -5445,6 +5445,18 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
 // current-thread runtime serializes every voter's disk wait with the client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_calls() {
+    // Functional CI still checks the real durable request and every wire-count
+    // and receipt assertion. This bound contains hangs; it is not an SLO.
+    protected_consumer_chain_after_activation(Duration::from_secs(10)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "CNF performance gate: python3 ci/performance-tests.py --profile core-protected"]
+async fn protected_consumer_chain_after_activation_meets_100ms_request_deadline() {
+    protected_consumer_chain_after_activation(Duration::from_millis(100)).await;
+}
+
+async fn protected_consumer_chain_after_activation(caller_budget: Duration) {
     let pki = Arc::new(TestPki::new());
     let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let (leader, _, _) = fleet.observed_leader();
@@ -5631,7 +5643,6 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         "prepare relies on exact token construction, journal health, and pre-Ready readiness"
     );
 
-    let caller_budget = Duration::from_millis(100);
     let started = std::time::Instant::now();
     let executed = tokio::time::timeout(caller_budget, outer.fenced_transition(&prepared)).await;
     let elapsed = started.elapsed();
@@ -5659,10 +5670,11 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         })
         .collect::<Vec<_>>();
     eprintln!(
-        "protected_prepared_execution elapsed_us={} timeout={} physical_calls={physical_calls:?} \
+        "protected_prepared_execution elapsed_us={} budget_us={} timeout={} physical_calls={physical_calls:?} \
          capability_calls={capability_calls:?} read_barriers={} before_proposal={before_proposal} \
          voter_progress={progress:?}",
         elapsed.as_micros(),
+        caller_budget.as_micros(),
         executed.is_err(),
         fleet.read_barrier_calls(),
     );
@@ -5679,7 +5691,7 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         .expect("one real protected physical transition");
     assert!(
         elapsed <= caller_budget,
-        "a ready future must not bypass the original 100 ms caller budget: {elapsed:?}"
+        "a ready future must not bypass the selected caller budget {caller_budget:?}: {elapsed:?}"
     );
     assert_eq!(
         1,

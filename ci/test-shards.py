@@ -70,7 +70,7 @@ HARNESS = ["--test-threads=4"]
 QUIESCENT_LIB_MODULE = "stateless_quorum_consumer"
 QUIESCENT_SELECTOR_LIB_MODULE = "ebpf::tests::remote_selector_regression"
 QUIESCENT_SELECTOR_LIB_TEST = (
-    "singleton_public_protected_flow_keeps_original_request_deadline"
+    "singleton_public_protected_flow_preserves_durable_state"
 )
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
@@ -104,8 +104,9 @@ OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
 if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
 # Keep O1 confined to the protected-transition and snapshot/restart proofs.
-# The 100 ms protected request qualifies optimized execution, with debug
-# assertions and overflow checks still enabled. Match the IPsec/i686 lanes.
+# Its functional counterpart uses the same optimized execution, debug
+# assertions, and overflow checks as the separate 100 ms performance gate.
+# Match the IPsec/i686 lanes.
 # Applying it to unrelated expiry/fault tests changes their lifecycle timing
 # and would no longer qualify the repository's ordinary test profile.
 OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"

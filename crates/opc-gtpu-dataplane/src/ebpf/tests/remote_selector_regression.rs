@@ -308,11 +308,11 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn new() -> Self {
+    fn new(budget: Duration) -> Self {
         let start = Instant::now();
         Self {
             start,
-            deadline: start + REQUEST_BUDGET,
+            deadline: start + budget,
             steps: Vec::new(),
         }
     }
@@ -360,7 +360,7 @@ impl RequestTiming {
             );
         }
         eprintln!("sdk_selector_singleton stage=Total elapsed_us={} budget_us={} result={classification:?} setup=Excluded qualification=LocalObservation",
-            total.as_micros(), REQUEST_BUDGET.as_micros());
+            total.as_micros(), self.deadline.duration_since(self.start).as_micros());
     }
 }
 
@@ -376,7 +376,7 @@ async fn join_owned_commit<T>(
 
 #[tokio::test]
 async fn request_timing_rejects_non_yielding_late_completion() {
-    let mut timing = RequestTiming::new();
+    let mut timing = RequestTiming::new(REQUEST_BUDGET);
     let mut completed = false;
     let result = timing
         .step(Stage::DescriptorReadBefore, || async {
@@ -397,7 +397,7 @@ async fn request_timing_rejects_non_yielding_late_completion() {
 
 #[tokio::test]
 async fn request_timing_preserves_early_success_and_rejection() {
-    let mut timing = RequestTiming::new();
+    let mut timing = RequestTiming::new(REQUEST_BUDGET);
     let deadline = timing.deadline;
     assert!(timing
         .step(Stage::DescriptorReadBefore, || async { Ok::<_, ()>(17) })
@@ -416,7 +416,7 @@ async fn request_timing_preserves_early_success_and_rejection() {
 
 #[tokio::test]
 async fn request_timing_does_not_start_work_after_expiry() {
-    let mut timing = RequestTiming::new();
+    let mut timing = RequestTiming::new(REQUEST_BUDGET);
     timing.start -= REQUEST_BUDGET;
     timing.deadline = timing.start + REQUEST_BUDGET;
     let mut called = false;
@@ -433,7 +433,7 @@ async fn request_timing_does_not_start_work_after_expiry() {
 #[tokio::test(start_paused = true)]
 async fn request_timing_completion_uses_exact_deadline_before_quantization() {
     for elapsed in [REQUEST_BUDGET, REQUEST_BUDGET + Duration::from_nanos(1)] {
-        let mut timing = RequestTiming::new();
+        let mut timing = RequestTiming::new(REQUEST_BUDGET);
         let result = timing
             .step(Stage::DescriptorReadBefore, || async {
                 tokio::time::advance(elapsed).await;
@@ -454,7 +454,7 @@ async fn request_timing_completion_uses_exact_deadline_before_quantization() {
 
 #[tokio::test(start_paused = true)]
 async fn request_timing_shares_one_budget_across_steps() {
-    let mut timing = RequestTiming::new();
+    let mut timing = RequestTiming::new(REQUEST_BUDGET);
     let original_deadline = timing.deadline;
     // Each step fits a fresh budget; their sum must exhaust the single budget.
     let step_time = REQUEST_BUDGET / 2 + Duration::from_millis(50);
@@ -477,7 +477,7 @@ async fn request_timing_shares_one_budget_across_steps() {
 
 #[tokio::test]
 async fn request_timing_late_completed_commit_is_already_joined() {
-    let mut timing = RequestTiming::new();
+    let mut timing = RequestTiming::new(REQUEST_BUDGET);
     let mut commit = Some(tokio::spawn(async {
         std::thread::sleep(REQUEST_BUDGET);
         Ok::<_, ()>(())
@@ -494,7 +494,7 @@ async fn request_timing_late_completed_commit_is_already_joined() {
 
 #[tokio::test(start_paused = true)]
 async fn request_timing_pending_commit_remains_owned_for_cleanup() {
-    let mut timing = RequestTiming::new();
+    let mut timing = RequestTiming::new(REQUEST_BUDGET);
     let (release, held) = tokio::sync::oneshot::channel();
     let mut commit = Some(tokio::spawn(async { held.await.map_err(|_| ()) }));
     let result = timing
@@ -551,15 +551,27 @@ async fn descriptor_commit<B: ProtectedSessionBackend>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn singleton_public_protected_flow_preserves_durable_state() {
+    // Preserve all completion, exact readback, recovery, and mutation checks
+    // in required CI. This is a hang guard, not latency qualification.
+    singleton_public_protected_flow(Duration::from_secs(10)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CNF performance gate: python3 ci/performance-tests.py --profile core-selector"]
 async fn singleton_public_protected_flow_keeps_original_request_deadline() {
+    singleton_public_protected_flow(REQUEST_BUDGET).await;
+}
+
+async fn singleton_public_protected_flow(request_budget: Duration) {
     #[cfg(target_os = "linux")]
     require_disk_backed_deadline_scratch();
     let lab = start_lab(0x91).await;
     let storage_before = lab.fixture.local_storage_timing();
     // Startup, required voter activation, stopped namespace provisioning, and
     // protected open precede this request. All ordinary request storage calls
-    // share this one original one-second deadline.
-    let mut timing = RequestTiming::new();
+    // share one deadline, including the unchanged one-second performance gate.
+    let mut timing = RequestTiming::new(request_budget);
     let mut pending_descriptor_commit = None;
     let outcome = async {
         let before = timing
