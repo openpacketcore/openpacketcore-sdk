@@ -33,7 +33,8 @@ use rsa::{
     pkcs8::{DecodePublicKey, EncodePublicKey as RsaEncodePublicKey},
     Pkcs1v15Sign, RsaPublicKey,
 };
-use sha2::{Digest, Sha256};
+// RSA 0.9 exposes digest 0.10 traits; keep this adapter on its re-export.
+use rsa::sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, SubjectPublicKeyInfo, X509Certificate};
 
 use crate::{

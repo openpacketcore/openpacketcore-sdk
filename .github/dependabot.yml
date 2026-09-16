@@ -15,10 +15,6 @@ updates:
         update-types:
           - minor
           - patch
-    ignore:
-      # aes 0.9.3 requires Rust 1.89; the SDK still supports Rust 1.88.
-      - dependency-name: aes
-        versions: ["0.9.3"]
 
   - package-ecosystem: gomod
     # The reference operator replaces the SDK module with the local directory.

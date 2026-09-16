@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use crate::consensus::snapshot::{rename_exchange_in_directory, rename_noreplace_in_directory};
-use hmac::Mac;
+use hmac::{KeyInit, Mac};
 use opc_consensus::engine::LogId;
 use opc_types::Timestamp;
 use rusqlite::backup::Backup;

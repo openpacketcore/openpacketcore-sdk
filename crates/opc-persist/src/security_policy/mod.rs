@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use hmac::Mac;
+use hmac::{KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;

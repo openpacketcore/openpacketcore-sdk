@@ -1058,7 +1058,7 @@ dependencies = [
  "asn1-rs 0.6.2",
  "displaydoc",
  "nom 7.1.3",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-traits",
  "rusticata-macros",
 ]
@@ -1072,7 +1072,7 @@ dependencies = [
  "asn1-rs 0.7.2",
  "displaydoc",
  "nom 7.1.3",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-traits",
  "rusticata-macros",
 ]
@@ -1925,7 +1925,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2",
  "tokio",
  "tower-service",
  "tracing",
@@ -2115,18 +2115,6 @@ checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
  "block-padding",
  "hybrid-array",
-]
-
-[[package]]
-name = "internal-russh-num-bigint"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae8e22120c32fb4d19ec55fba35015f57095cd95a2e3b732e44457f5915b2ee8"
-dependencies = [
- "num-integer",
- "num-traits",
- "rand 0.10.2",
- "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2426,6 +2414,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+dependencies = [
+ "num-integer",
+ "num-traits",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "num-bigint-dig"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2545,7 +2545,7 @@ dependencies = [
  "opc-redaction",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -2616,7 +2616,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -2667,7 +2667,7 @@ dependencies = [
  "opc-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -2733,7 +2733,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
  "uuid",
@@ -2746,7 +2746,7 @@ dependencies = [
  "opc-key",
  "opc-types",
  "rand 0.10.2",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -2829,7 +2829,7 @@ dependencies = [
  "rand 0.10.2",
  "rustix",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -2842,13 +2842,14 @@ version = "0.2.0"
 name = "opc-evidence"
 version = "0.2.0"
 dependencies = [
+ "hex",
  "num_cpus",
  "once_cell",
  "opc-data-governance",
  "opc-schema-validate",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -2913,7 +2914,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tonic",
- "tonic-build",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
 ]
 
@@ -2926,7 +2928,7 @@ dependencies = [
  "aya",
  "aya-obj",
  "bytes",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "nix",
  "opc-dataplane-observation",
  "opc-gtpu-ebpf-common",
@@ -2942,7 +2944,7 @@ dependencies = [
  "rand 0.10.2",
  "rustix",
  "sha1",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.20",
  "tokio",
@@ -2957,6 +2959,7 @@ version = "0.2.0"
 name = "opc-identity"
 version = "0.2.0"
 dependencies = [
+ "hex",
  "opc-redaction",
  "opc-types",
  "rcgen",
@@ -2964,7 +2967,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -2981,7 +2984,7 @@ dependencies = [
  "async-trait",
  "aya",
  "bytes",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "nix",
  "opc-identity",
  "opc-ipsec-lb-ebpf-common",
@@ -3000,7 +3003,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.20",
@@ -3020,7 +3022,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "aya",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "nix",
  "opc-crypto-provider",
  "opc-ipsec-xfrm-ebpf-common",
@@ -3030,7 +3032,6 @@ dependencies = [
  "opc-types",
  "rand 0.10.2",
  "rustix",
- "sha2 0.10.9",
  "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.20",
@@ -3048,7 +3049,7 @@ version = "0.2.0"
 dependencies = [
  "aes-gcm-siv",
  "async-trait",
- "hkdf 0.12.4",
+ "hkdf 0.13.0",
  "opc-crypto-provider",
  "opc-identity",
  "opc-tls",
@@ -3057,7 +3058,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.20",
  "tokio",
@@ -3237,7 +3238,7 @@ dependencies = [
  "opc-protocol",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
 ]
 
@@ -3332,7 +3333,7 @@ name = "opc-persist"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "libc",
  "opc-alarm",
  "opc-consensus",
@@ -3347,7 +3348,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -3372,13 +3373,13 @@ name = "opc-proto-diameter"
 version = "0.2.0"
 dependencies = [
  "bytes",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opc-proto-eap",
  "opc-protocol",
  "opc-testbed",
  "opc-types",
  "quickcheck",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "url",
  "zeroize",
@@ -3420,7 +3421,7 @@ dependencies = [
  "bytes",
  "cbc",
  "crypto-bigint 0.7.5",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opc-crypto-provider",
  "opc-proto-eap",
  "opc-proto-gtpv2c",
@@ -3435,7 +3436,6 @@ dependencies = [
  "rand 0.10.2",
  "rsa",
  "sha1",
- "sha2 0.10.9",
  "sha2 0.11.0",
  "spki 0.8.0",
  "subtle",
@@ -3496,11 +3496,11 @@ dependencies = [
 name = "opc-redaction"
 version = "0.2.0"
 dependencies = [
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opc-data-governance",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "zeroize",
 ]
@@ -3714,7 +3714,7 @@ name = "opc-session-net"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "futures-util",
  "opc-consensus",
@@ -3735,7 +3735,7 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -3754,7 +3754,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "hmac 0.12.1",
+ "hex",
+ "hmac 0.13.0",
  "imbl",
  "libc",
  "nix",
@@ -3776,7 +3777,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "sha2 0.11.0",
  "subtle",
  "tempfile",
@@ -3795,6 +3795,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
+ "hex",
  "opc-consensus",
  "opc-identity",
  "opc-key",
@@ -3810,7 +3811,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -3864,7 +3865,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -4138,11 +4139,12 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "petgraph"
-version = "0.7.1"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
+checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
 dependencies = [
  "fixedbitset",
+ "hashbrown 0.15.5",
  "indexmap",
 ]
 
@@ -4404,9 +4406,9 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
  "prost-derive",
@@ -4414,15 +4416,14 @@ dependencies = [
 
 [[package]]
 name = "prost-build"
-version = "0.13.5"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
  "itertools",
  "log",
  "multimap",
- "once_cell",
  "petgraph",
  "prettyplease",
  "prost",
@@ -4434,9 +4435,9 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.13.5"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
  "itertools",
@@ -4447,9 +4448,9 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
-version = "0.13.5"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
+checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
 ]
@@ -4546,9 +4547,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
 ]
@@ -4577,7 +4578,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4614,7 +4615,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2",
  "tracing",
  "windows-sys 0.52.0",
 ]
@@ -4753,7 +4754,7 @@ dependencies = [
  "chrono",
  "either",
  "nom 7.1.3",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
  "once_cell",
@@ -4998,9 +4999,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.62.4"
+version = "0.63.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8b67b5a0d8068c89dcbe9d95df986af7a851d1f3c604525274c37468e60464f"
+checksum = "036204edbd199552a5b3832f63c60dcdf395dc44c7f06b4af1c0e8139cc11bce"
 dependencies = [
  "aes 0.9.2",
  "bitflags",
@@ -5027,13 +5028,12 @@ dependencies = [
  "hex-literal",
  "hmac 0.13.0",
  "inout 0.2.2",
- "internal-russh-num-bigint",
  "keccak",
  "log",
  "md5",
  "ml-kem",
  "module-lattice",
- "num-bigint",
+ "num-bigint 0.5.1",
  "p256 0.14.0",
  "p384 0.14.0",
  "p521",
@@ -5501,7 +5501,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-traits",
  "thiserror 2.0.20",
  "time",
@@ -5538,16 +5538,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5854,7 +5844,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.4",
+ "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -5936,9 +5926,9 @@ dependencies = [
 
 [[package]]
 name = "tonic"
-version = "0.13.1"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
+checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
  "axum",
@@ -5953,8 +5943,8 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "prost",
- "socket2 0.5.10",
+ "socket2",
+ "sync_wrapper",
  "tokio",
  "tokio-stream",
  "tower",
@@ -5965,9 +5955,32 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.13.1"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
+checksum = "c68f61875ac5293cf72e6c8cf0158086428c82c37229e98c840878f1706b0322"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "tonic-prost"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
+dependencies = [
+ "bytes",
+ "prost",
+ "tonic",
+]
+
+[[package]]
+name = "tonic-prost-build"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "654e5643eff75d7f8c99197ce1440ed19a3474eada74c12bbac488b2cafdae27"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -5975,6 +5988,8 @@ dependencies = [
  "prost-types",
  "quote",
  "syn 2.0.117",
+ "tempfile",
+ "tonic-build",
 ]
 
 [[package]]

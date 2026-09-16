@@ -914,56 +914,41 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
 #[test]
 fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_PROFILE_V6_JSON.as_bytes())
-        ),
+        hex::encode(Sha256::digest(SESSION_HA_PROFILE_V6_JSON.as_bytes())),
         "4ba6d641d3ed7f03badf2759efa8d1135a4e64f126496423493fbe613ad8d107"
     );
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_PROFILE_V6_SCHEMA_JSON.as_bytes())
-        ),
+        hex::encode(Sha256::digest(SESSION_HA_PROFILE_V6_SCHEMA_JSON.as_bytes())),
         "3e4429f2f2abc8ac535a8bed2c0b99ac5913d009694e42812bdbdb282a1ce794"
     );
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON.as_bytes())
-        ),
+        hex::encode(Sha256::digest(
+            SESSION_HA_EVIDENCE_V6_SCHEMA_JSON.as_bytes()
+        )),
         "4e85242efe548f9c9612e3802cf51371b713a2fcd4120765afce7bfe91666532"
     );
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
-        ),
+        hex::encode(Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())),
         "875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7"
     );
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_PROFILE_V7_SCHEMA_JSON.as_bytes())
-        ),
+        hex::encode(Sha256::digest(SESSION_HA_PROFILE_V7_SCHEMA_JSON.as_bytes())),
         "3ce5f0e622508ba89820742514eddfd2c0575265754c0bdd1a726e5b3335ecca"
     );
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON.as_bytes())
-        ),
+        hex::encode(Sha256::digest(
+            SESSION_HA_EVIDENCE_V7_SCHEMA_JSON.as_bytes()
+        )),
         "0b02633f0118283f425c4b60d8540de4503023d3759b7c6939ebaf2d16365772"
     );
     assert_eq!(
-        format!("{:x}", Sha256::digest(V7_EVIDENCE_FIXTURE.as_bytes())),
+        hex::encode(Sha256::digest(V7_EVIDENCE_FIXTURE.as_bytes())),
         "44da16640ac29a8e1bec77fadf784a86015bb8a64af8ecacc768888117642d7c"
     );
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON.as_bytes())
-        ),
+        hex::encode(Sha256::digest(
+            SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON.as_bytes()
+        )),
         "5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd"
     );
 
@@ -1635,7 +1620,7 @@ fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
 #[test]
 fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
-    assert!(workspace.contains("rust-version = \"1.88\""));
+    assert!(workspace.contains("rust-version = \"1.89\""));
     assert!(workspace.contains(
         "openraft = { version = \"=0.9.24\", git = \"https://github.com/openpacketcore/openraft\", rev = \"dddfe2ee7c51394c1b5ed601c85225ce9eca680d\""
     ));

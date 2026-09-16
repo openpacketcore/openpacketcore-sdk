@@ -15345,7 +15345,7 @@ mod aya_runtime {
     use opc_linux_gtpu_sys as sys;
     use rand::{rngs::SysRng, TryRng};
     use sha1::{Digest as Sha1Digest, Sha1};
-    use sha2::{Digest as Sha2Digest, Sha256};
+    use sha2::Sha256;
 
     use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::GtpuTrafficObservationRegistration;
     use opc_gtpu_ebpf_common::{

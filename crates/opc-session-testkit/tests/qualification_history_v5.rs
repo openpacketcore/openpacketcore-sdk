@@ -52,7 +52,7 @@ fn run_checker(evidence: &Path, fault_schedule: &Path, history: &Path) -> Output
 }
 
 fn exact_sha256(raw: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(raw))
+    format!("sha256:{}", hex::encode(Sha256::digest(raw)))
 }
 
 fn write_bound_evidence_with(

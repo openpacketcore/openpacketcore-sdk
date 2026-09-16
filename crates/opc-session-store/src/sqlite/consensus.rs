@@ -40455,7 +40455,7 @@ mod tests {
     }
 
     fn sdk741_hash(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        hex::encode(Sha256::digest(bytes))
     }
 
     fn sdk741_state_hash(conn: &Connection) -> String {
@@ -40477,7 +40477,7 @@ mod tests {
             count += 1;
             assert!(count <= 64);
         }
-        format!("{:x}", digest.finalize())
+        hex::encode(digest.finalize())
     }
 
     enum Sdk741Expected<'a> {

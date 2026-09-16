@@ -365,7 +365,7 @@ fn sha256_file(path: &Path) -> Result<String, HarnessError> {
 fn sha256_bytes(encoded: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(encoded);
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn domain_separated_sha256(
@@ -390,7 +390,7 @@ fn domain_separated_sha256(
         );
         hasher.update(part);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn aggregate_file_sha256(domain: &str, paths: &[PathBuf]) -> Result<String, HarnessError> {

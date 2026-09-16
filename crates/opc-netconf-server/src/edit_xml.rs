@@ -85,7 +85,6 @@ fn parse_edit_config_xml_inner(
 ) -> Result<EditConfigNode, NetconfEditError> {
     let mut reader = Reader::from_str(config_xml);
     reader.config_mut().trim_text(false);
-    let decoder = reader.decoder();
 
     let mut stack: Vec<Frame> = Vec::new();
     let mut addressed_nodes = 0usize;
@@ -100,20 +99,20 @@ fn parse_edit_config_xml_inner(
                 if root.is_some() {
                     return Err(NetconfEditError::MalformedXml);
                 }
-                validate_start_limits(&start, decoder, limits)?;
+                validate_start_limits(&start, limits)?;
                 check_depth(stack.len() + 1, limits)?;
                 count_addressed_node(&stack, &mut addressed_nodes, limits)?;
-                let frame = push_element(&start, &mut stack, registry, decoder, default_operation)?;
+                let frame = push_element(&start, &mut stack, registry, default_operation)?;
                 stack.push(frame);
             }
             quick_xml::events::Event::Empty(start) => {
                 if root.is_some() {
                     return Err(NetconfEditError::MalformedXml);
                 }
-                validate_start_limits(&start, decoder, limits)?;
+                validate_start_limits(&start, limits)?;
                 check_depth(stack.len() + 1, limits)?;
                 count_addressed_node(&stack, &mut addressed_nodes, limits)?;
-                let frame = push_element(&start, &mut stack, registry, decoder, default_operation)?;
+                let frame = push_element(&start, &mut stack, registry, default_operation)?;
                 // Empty elements close immediately; finalize and attach to parent.
                 let node = finalize_frame(frame, registry)?;
                 attach_child(&mut stack, node)?;
@@ -145,18 +144,16 @@ fn parse_edit_config_xml_inner(
             }
             quick_xml::events::Event::Text(text) => {
                 check_value_bytes(text.as_ref().len(), limits)?;
-                let decoded = text.decode().map_err(|_| NetconfEditError::MalformedXml)?;
                 if let Some(frame) = stack.last_mut() {
-                    frame.text.push_str(&decoded);
-                } else if !decoded.trim().is_empty() {
+                    frame.text.push_str(&text);
+                } else if !text.trim().is_empty() {
                     return Err(NetconfEditError::MalformedXml);
                 }
             }
             quick_xml::events::Event::CData(cdata) => {
                 check_value_bytes(cdata.as_ref().len(), limits)?;
-                let decoded = cdata.decode().map_err(|_| NetconfEditError::MalformedXml)?;
                 let frame = stack.last_mut().ok_or(NetconfEditError::MalformedXml)?;
-                frame.text.push_str(&decoded);
+                frame.text.push_str(&cdata);
             }
             quick_xml::events::Event::Comment(_) => {}
             quick_xml::events::Event::Eof => return root.ok_or(NetconfEditError::MalformedXml),
@@ -167,7 +164,6 @@ fn parse_edit_config_xml_inner(
 
 fn validate_start_limits(
     start: &BytesStart<'_>,
-    decoder: quick_xml::encoding::Decoder,
     limits: Option<&MgmtLimits>,
 ) -> Result<(), NetconfEditError> {
     let mut attribute_count = 0usize;
@@ -176,9 +172,9 @@ fn validate_start_limits(
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
         attribute_count = attribute_count.saturating_add(1);
-        let key = decode_utf8(attr.key.as_ref())?;
+        let key = attr.key.as_ref();
         let value = attr
-            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|_| NetconfEditError::MalformedXml)?;
         check_value_bytes(value.len(), limits)?;
 
@@ -313,14 +309,13 @@ fn push_element(
     start: &BytesStart<'_>,
     stack: &mut [Frame],
     registry: &'static dyn SchemaRegistry,
-    decoder: quick_xml::encoding::Decoder,
     default_operation: EditDefaultOperation,
 ) -> Result<Frame, NetconfEditError> {
     if stack.is_empty() {
         // The first element must be the NETCONF `<config>` wrapper. The bounded
         // capture loses ancestor namespace declarations, so a bare `<config>`
         // (no explicit namespace) is accepted as the base NETCONF namespace.
-        let (local, namespace, ns_scope) = resolve_config_start(start, decoder)?;
+        let (local, namespace, ns_scope) = resolve_config_start(start)?;
         if local != "config" {
             return Err(NetconfEditError::MalformedXml);
         }
@@ -339,7 +334,7 @@ fn push_element(
     }
 
     let parent_scope = stack.last().map(|f| &f.ns_scope);
-    let (local, namespace, ns_scope, op_attr) = resolve_start(start, parent_scope, decoder)?;
+    let (local, namespace, ns_scope, op_attr) = resolve_start(start, parent_scope)?;
 
     let parent = stack.last().expect("non-empty stack has a parent");
     if matches!(parent.node_kind, NodeKind::Leaf | NodeKind::LeafList) {
@@ -386,7 +381,6 @@ fn push_element(
 fn resolve_start(
     start: &BytesStart<'_>,
     parent_scope: Option<&NsScope>,
-    decoder: quick_xml::encoding::Decoder,
 ) -> Result<(String, String, NsScope, Option<EditOperation>), NetconfEditError> {
     let raw_name = start.name();
     let (prefix, local) = split_qname(raw_name.as_ref())?;
@@ -398,15 +392,15 @@ fn resolve_start(
     // because the XML parser yielded attributes in source order.
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
-        let key = decode_utf8(attr.key.as_ref())?;
+        let key = attr.key.as_ref();
         if key == "xmlns" {
             let value = attr
-                .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|_| NetconfEditError::MalformedXml)?;
             scope.default = Some(value.to_string());
         } else if let Some(prefix) = key.strip_prefix("xmlns:") {
             let value = attr
-                .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|_| NetconfEditError::MalformedXml)?;
             scope.bindings.insert(prefix.to_string(), value.to_string());
         }
@@ -415,12 +409,12 @@ fn resolve_start(
     let mut operation = None;
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
-        let key = decode_utf8(attr.key.as_ref())?;
+        let key = attr.key.as_ref();
         if key == "xmlns" || key.starts_with("xmlns:") {
             continue;
         }
         let value = attr
-            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|_| NetconfEditError::MalformedXml)?;
         let value = value.as_ref();
 
@@ -466,7 +460,6 @@ fn resolve_start(
 )]
 fn resolve_config_start(
     start: &BytesStart<'_>,
-    decoder: quick_xml::encoding::Decoder,
 ) -> Result<(String, String, NsScope), NetconfEditError> {
     let raw_name = start.name();
     let (prefix, local) = split_qname(raw_name.as_ref())?;
@@ -474,9 +467,9 @@ fn resolve_config_start(
 
     for attr in start.attributes().with_checks(true) {
         let attr = attr.map_err(|_| NetconfEditError::MalformedXml)?;
-        let key = decode_utf8(attr.key.as_ref())?;
+        let key = attr.key.as_ref();
         let value = attr
-            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|_| NetconfEditError::MalformedXml)?;
         let value = value.as_ref();
 
@@ -515,7 +508,7 @@ fn resolve_config_start(
 }
 
 fn validate_end(
-    raw_name: &[u8],
+    raw_name: &str,
     scope: &NsScope,
     expected_local: &str,
     expected_namespace: &str,
@@ -636,8 +629,7 @@ fn find_root_schema_path(
     found.ok_or_else(|| NetconfEditError::UnknownPath(format!("/{local}")))
 }
 
-fn split_qname(raw: &[u8]) -> Result<(Option<&str>, &str), NetconfEditError> {
-    let name = decode_utf8(raw)?;
+fn split_qname(name: &str) -> Result<(Option<&str>, &str), NetconfEditError> {
     if name.is_empty() {
         return Err(NetconfEditError::MalformedXml);
     }
@@ -649,10 +641,6 @@ fn split_qname(raw: &[u8]) -> Result<(Option<&str>, &str), NetconfEditError> {
     } else {
         Ok((None, name))
     }
-}
-
-fn decode_utf8(raw: &[u8]) -> Result<&str, NetconfEditError> {
-    std::str::from_utf8(raw).map_err(|_| NetconfEditError::MalformedXml)
 }
 
 fn last_segment(path: &str) -> &str {

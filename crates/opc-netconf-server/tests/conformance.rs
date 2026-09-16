@@ -772,20 +772,20 @@ fn extract_hostname(config_xml: &str) -> Result<String, EditConfigError> {
             .read_event()
             .map_err(|_| EditConfigError::InvalidValue)?
         {
-            Event::Start(start) if local_name(start.name().as_ref()) == b"hostname" => {
+            Event::Start(start) if local_name(start.name().as_ref()) == "hostname" => {
                 in_hostname = true;
                 value.clear();
             }
-            Event::Empty(start) if local_name(start.name().as_ref()) == b"hostname" => {
+            Event::Empty(start) if local_name(start.name().as_ref()) == "hostname" => {
                 return Ok(String::new());
             }
             Event::Text(text) if in_hostname => {
-                value.push_str(&text.decode().map_err(|_| EditConfigError::InvalidValue)?);
+                value.push_str(&text);
             }
             Event::CData(text) if in_hostname => {
-                value.push_str(&text.decode().map_err(|_| EditConfigError::InvalidValue)?);
+                value.push_str(&text);
             }
-            Event::End(end) if local_name(end.name().as_ref()) == b"hostname" && in_hostname => {
+            Event::End(end) if local_name(end.name().as_ref()) == "hostname" && in_hostname => {
                 return Ok(value);
             }
             Event::Eof => return Err(EditConfigError::InvalidValue),
@@ -794,8 +794,8 @@ fn extract_hostname(config_xml: &str) -> Result<String, EditConfigError> {
     }
 }
 
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
+fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
 }
 
 async fn rpc11(client: &mut DuplexStream, xml: &str) -> String {

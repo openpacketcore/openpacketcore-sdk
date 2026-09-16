@@ -47,7 +47,7 @@ implicit policy does not survive contact with routine maintenance:
    (rustls-backed, built on hyper) is tolerated in leaf adapter crates
    (currently `opc-key-vault`) but must not spread into core crates.
 5. **MSRV is the measured floor of the resolved graph, not an aspiration.**
-   Currently **1.88** (set by `time`). The CI `msrv` job compiles the whole
+   Currently **1.89** (set by `russh`). The CI `msrv` job compiles the whole
    workspace (`--all-targets --all-features`) on exactly the declared
    version; a lockfile update that raises the floor must raise
    `rust-version`, this ADR's record, and the contributor docs in the same

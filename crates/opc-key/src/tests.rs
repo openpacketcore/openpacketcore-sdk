@@ -43,6 +43,29 @@ fn session_aad() -> EnvelopeAad {
 }
 
 #[test]
+fn keyed_digest_matches_independent_hkdf_sha256_vector() {
+    let handle = KeyHandle::new(
+        KeyId::new("config-key").expect("key id"),
+        KeyPurpose::Config,
+        tenant(),
+        Zeroizing::new([0x42; AES_256_GCM_SIV_KEY_LEN]),
+    );
+    // RFC 5869 extract/expand computed with Python hmac: salt=fixture-domain,
+    // info=big-endian u64 length-prefixed config, tenant-a, record-123.
+    assert_eq!(
+        handle.keyed_digest(b"fixture-domain", b"record-123"),
+        [
+            130, 226, 110, 247, 1, 248, 30, 24, 159, 233, 89, 249, 187, 175, 166, 223, 90, 157, 20,
+            177, 102, 93, 40, 139, 74, 127, 165, 149, 89, 244, 135, 176
+        ]
+    );
+    assert_ne!(
+        handle.keyed_digest(b"fixture-domain", b"record-123"),
+        handle.keyed_digest(b"other-domain", b"record-123")
+    );
+}
+
+#[test]
 fn bound_aad_decode_requires_complete_canonical_shape() {
     let aad = session_aad();
     let key_id = KeyId::new("session-key-2026-07").expect("key ID");

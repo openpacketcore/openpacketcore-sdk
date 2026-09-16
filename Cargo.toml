@@ -23,7 +23,7 @@ authors = ["OpenPacketCore Contributors"]
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/openpacketcore/openpacketcore-sdk"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 linux-raw-sys = { version = "0.12", features = ["ioctl"] }
@@ -37,27 +37,23 @@ time = "0.3"
 async-trait = "0.1"
 allocation-counter = "0.8.1"
 serde_json = "1.0"
-base64 = "0.22.1"
+base64 = "0.23.0"
 serde_ignored = "0.1"
 num_cpus = "1.16"
-# sha2/hkdf/hmac share the digest 0.10 trait line and must migrate together.
-# The AEAD implementations consume the derived key bytes independently.
-sha2 = "0.10"
-# IKEv2 PRF and integrity state is key-derived and must be wiped on drop. Keep
-# this explicit alias on the RustCrypto digest 0.11 line with zeroization until
-# the remaining workspace crypto stack can move as one compatibility change.
-sha2-zeroize = { package = "sha2", version = "0.11", features = ["zeroize"] }
+# HMAC, HKDF, and SHA-2 share digest 0.11 and must migrate together.
+# Keep zeroization for key-derived IKEv2, redirect, and journal digest state.
+sha2 = { version = "0.11", features = ["zeroize"] }
 sha1 = { version = "0.11", features = ["zeroize"] }
 rand = "0.10"
-# aes 0.9.3 requires Rust 1.89; retain the workspace's Rust 1.88 contract.
+# Keep the qualified AES version; patch upgrades are handled by Dependabot.
 aes = { version = "=0.9.2", features = ["zeroize"] }
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-gcm-siv = "0.12"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding", "zeroize"] }
-hkdf = "0.12"
+hkdf = "0.13"
 subtle = "2.6"
 zeroize = "1.8"
-hmac = "0.12"
+hmac = { version = "0.13", features = ["zeroize"] }
 rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

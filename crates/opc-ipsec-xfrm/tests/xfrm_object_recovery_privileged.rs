@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest,
     IpAddress, KeyMaterial, LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,

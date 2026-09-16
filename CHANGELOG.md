@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Raise the minimum supported Rust version to **1.89** for `russh` 0.63.3,
+  and keep the workspace, standalone SMF consumer, and CI compiler gate aligned.
+- Upgrade `quick-xml` to 0.42, `base64` to 0.23, and the gNMI Prost/Tonic stack
+  to 0.14. Adapt the UTF-8 XML API and the separate Tonic Prost codec/generator;
+  retain raw SSH host-key pinning and fail closed on host certificates.
+- Migrate workspace HMAC/HKDF/SHA-2 together to the digest 0.11 generation,
+  including both Cargo lockfiles and zeroization of key-derived hash state.
+  Keep RSA's digest adapter on its supported trait generation, and preserve
+  persisted envelopes, privacy digests, and protobuf wire bytes.
+
 ### Fixed
+- Wait for Raft's metrics publication before asserting the held vote in the
+  five-voter async-persistence regression test. The real response remains held,
+  and the existing operation and election bounds still apply.
 - `opc-gtpu-dataplane`: admit one exact marked IPv4 child under a current
   unmarked default group without retiring that default. Preserve independent
   subscribers using the same bearer mark, require exact quiescence before

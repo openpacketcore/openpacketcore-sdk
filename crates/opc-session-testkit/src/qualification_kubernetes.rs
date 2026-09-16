@@ -400,7 +400,7 @@ fn content_addressed_config_map_name(
     let encoded = serde_json::to_vec(node_configs)
         .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)?;
     let digest = Sha256::digest(encoded);
-    Ok(format!("{CONFIG_MAP_NAME_PREFIX}-{digest:x}"))
+    Ok(format!("{CONFIG_MAP_NAME_PREFIX}-{}", hex::encode(digest)))
 }
 
 fn production_lifecycle(

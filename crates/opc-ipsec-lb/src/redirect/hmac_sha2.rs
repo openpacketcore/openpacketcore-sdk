@@ -2,9 +2,9 @@
 //!
 //! This mirrors the established IKEv2 SDK helper: the normalized key,
 //! ipad/opad, inner digest, and final output are all owned by zeroizing values,
-//! while `sha2-zeroize` wipes the digest state itself on drop.
+//! while `sha2` with its `zeroize` feature wipes the digest state itself on drop.
 
-use sha2_zeroize::{Digest, Sha256};
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 const SHA256_BLOCK_BYTES: usize = 64;

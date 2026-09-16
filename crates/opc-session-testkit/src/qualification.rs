@@ -197,7 +197,7 @@ fn persistent_consumer_v9_path_binding_sha256(domain: &[u8], label: &[u8], path:
             .to_be_bytes(),
     );
     hasher.update(path.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 /// Domain-separated commitment to the exact canonical `CARGO_TARGET_DIR`.
@@ -3160,7 +3160,7 @@ impl SessionHaPersistentConsumerEvidenceV7 {
         };
         let encoded =
             serde_json::to_vec(&transcript).map_err(|_| "v7 transcript encoding failed")?;
-        Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+        Ok(format!("sha256:{}", hex::encode(Sha256::digest(encoded))))
     }
 
     /// Validate semantic relationships JSON Schema cannot express, including
@@ -3902,7 +3902,7 @@ impl QualificationSha256 {
     /// Compute the exact manifest form for a bounded byte artifact.
     #[must_use]
     pub fn digest(bytes: &[u8]) -> Self {
-        Self(format!("sha256:{:x}", Sha256::digest(bytes)))
+        Self(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
     }
 
     /// Borrow the canonical digest string.

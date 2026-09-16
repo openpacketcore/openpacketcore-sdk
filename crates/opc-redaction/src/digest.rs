@@ -76,6 +76,21 @@ mod tests {
     use opc_data_governance::{DataClass, IdentifierType};
 
     #[test]
+    fn privacy_digest_matches_independent_hmac_sha256_vector() {
+        // Python hmac.digest with the unpadded 32-byte key and the documented
+        // NUL-separated fields. Keep correlation IDs stable across crypto upgrades.
+        assert_eq!(
+            compute_digest(
+                &DigestKey::new([0x42; 32]),
+                DataClass::SubscriberId,
+                IdentifierType::Supi,
+                "123456789012345",
+            ),
+            "0f9cff41c104c60fdd3bcf705bb375f20cf1ef01179b658a30363ec0310a3d93"
+        );
+    }
+
+    #[test]
     fn digest_is_stable_for_same_inputs() {
         let key = DigestKey::new([0x42; 32]);
         let d1 = compute_digest(

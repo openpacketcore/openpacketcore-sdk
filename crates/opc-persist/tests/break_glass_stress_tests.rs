@@ -1,4 +1,4 @@
-use hmac::Mac;
+use hmac::{KeyInit, Mac};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Mutex as TokioMutex;

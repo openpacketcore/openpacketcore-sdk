@@ -1,6 +1,6 @@
 use aes::{cipher::block_padding::NoPadding, Aes256};
 use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_proto_ikev2::{
     ikev2_aes_cbc_protected_body_len, ikev2_aes_cbc_protected_payload_len,
     ikev2_aes_gcm_protected_body_len, open_protected_payloads,
@@ -733,7 +733,8 @@ fn cbc_open_preserves_typed_failures_with_uniform_outer_rejection() {
     let mut body = Vec::new();
     body.extend_from_slice(&CBC_IV);
     body.extend_from_slice(&invalid_plaintext);
-    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(material.sk_ai()).expect("test HMAC key");
+    let mut mac =
+        <Hmac<Sha512> as KeyInit>::new_from_slice(material.sk_ai()).expect("test HMAC key");
     mac.update(&invalid_padding_prefix);
     mac.update(&body);
     body.extend_from_slice(&mac.finalize().into_bytes()[..32]);

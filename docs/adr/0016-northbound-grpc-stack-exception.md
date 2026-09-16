@@ -30,16 +30,16 @@ to expose gNMI — not an internal SDK transport and not a 3GPP data-plane codec
 
 ## Decision
 
-Permit `tonic`, `prost`, and `prost-types` **only for the northbound gNMI server
+Permit `tonic`, `tonic-prost`, `prost`, and `prost-types` **only for the northbound gNMI server
 crate**, `opc-gnmi-server`. `prost-types` is included because the vendored
 OpenConfig gNMI proto uses standard Google protobuf types such as
-`google.protobuf.Any`. `tonic-build` is permitted only as that crate's
-build-time proto-generation dependency if the Phase-0 spike chooses build-time
-generation. Any future gRPC-based management crate requires an explicit ADR
+`google.protobuf.Any`. `tonic-prost-build` (and its `tonic-build` dependency) is permitted only
+for build-time proto generation in that crate. Tonic 0.14 moves its Prost codec
+and generator into these two adapters; they retain the same scope boundary. Any future gRPC-based management crate requires an explicit ADR
 amendment and an update to the mechanical allow-list; this exception is not a
 blanket "management crates may use gRPC" policy. Specifically:
 
-1. **Scope boundary.** `tonic`/`prost`/`prost-types` MUST NOT appear in any core SDK crate
+1. **Scope boundary.** `tonic`/`tonic-prost`/`prost`/`prost-types` MUST NOT appear in any core SDK crate
    (`opc-config-bus`, `opc-config-model`, `opc-persist`, `opc-runtime`,
    `opc-identity`, `opc-tls`, `opc-nacm`, `opc-yanggen`, the `opc-proto-*`
    codecs, `opc-sbi`, the `opc-mgmt-*` foundation crates, etc.). They live only
@@ -50,7 +50,7 @@ blanket "management crates may use gRPC" policy. Specifically:
 2. **Boundary is enforced mechanically.**
    `scripts/check-management-plane-policy.py --check` asserts that no crate
    outside the explicit allowed set directly or transitively depends on
-   `tonic`/`prost`/`prost-types`/`tonic-build`, or on `opc-gnmi-server` itself.
+   `tonic`/`tonic-prost`/`prost`/`prost-types`/`tonic-build`/`tonic-prost-build`, or on `opc-gnmi-server` itself.
    The CI job runs this gate. The initial allowed set is exactly
    `opc-gnmi-server`.
 3. **One TLS stack only (ADR 0014 §1 preserved).** `opc-gnmi-server` serves
@@ -58,10 +58,10 @@ blanket "management crates may use gRPC" policy. Specifically:
    (`ring` provider), not tonic's own/native TLS. No `openssl`/`native-tls`
    enters the graph (verify `tonic`/`hyper` features with `default-features =
    false`, rustls only).
-4. **Dependency hygiene (ADR 0014 §6/§7).** `tonic`/`prost`/`prost-types` are
+4. **Dependency hygiene (ADR 0014 §6/§7).** `tonic`/`tonic-prost`/`prost`/`prost-types` are
    MIT/Apache — compatible with the license gate. The PR adding them justifies
    them per §7 and passes `cargo deny`. The pinned `tonic` version MUST compile
-   on the workspace MSRV (currently 1.88, ADR 0014 §5); the Phase-0 spike
+   on the workspace MSRV (currently 1.89, ADR 0014 §5); the Phase-0 spike
    validates this before the version is pinned, and any MSRV bump follows the
    §5 process.
 5. **Proto pin and generation mode.** The gNMI proto is vendored at an exact tag
@@ -69,7 +69,7 @@ blanket "management crates may use gRPC" policy. Specifically:
    tag/commit in their header, and the advertised gNMI version string derives
    from this pin. The Phase-0 spike must choose and document exactly one
    generation mode:
-   - build-time generation with `tonic-build`, which adds an explicit `protoc`
+   - build-time generation with `tonic-prost-build`, which adds an explicit `protoc`
      build prerequisite and a CI check that generated output is reproducible; or
    - checked-in generated Rust, which avoids `protoc` in downstream builds but
      requires a regeneration script and a CI drift check.
@@ -82,7 +82,7 @@ blanket "management crates may use gRPC" policy. Specifically:
 ## Consequences
 
 - A downstream CNF outside this workspace that embeds `opc-gnmi-server` inherits
-  `tonic`/`prost`/`prost-types`. That is an explicit opt-in to gNMI; CNFs that
+  `tonic`/`tonic-prost`/`prost`/`prost-types`. That is an explicit opt-in to gNMI; CNFs that
   do not expose gNMI never pull the stack.
 - The core SDK graph stays gRPC-free and auditable, exactly as ADR 0014 §3
   intends; only the optional northbound server adds gRPC.

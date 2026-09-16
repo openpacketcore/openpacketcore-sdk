@@ -1,7 +1,7 @@
 //! Core types for the persistence layer: records, stored configs, and the ConfigStore trait.
 
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_data_governance::DataClass;
 use opc_redaction::{redact, RedactionLevel};
 use serde::de::{IgnoredAny, MapAccess, Visitor};

@@ -6646,7 +6646,7 @@ fn clean_worktree_sha256(revision: &str, tree: &str, index_stage_manifest: &[u8]
     digest.update(tree.as_bytes());
     digest.update([0]);
     digest.update(index_stage_manifest);
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 #[allow(clippy::option_env_unwrap)] // Release recipe requires these compile-time attestations.
@@ -6732,22 +6732,17 @@ fn release_evidence_provenance_snapshot() -> ReleaseEvidenceProvenance {
         repository_metadata.ino(),
     )
     .expect("open descriptor-pinned repository root for Cargo.lock");
-    let runtime_cargo_lock_sha256 = format!(
-        "{:x}",
-        Sha256::digest(
-            read_bounded_nofollow_regular_file(
-                &repository_parent,
-                OsStr::new("Cargo.lock"),
-                RELEASE_GIT_STDOUT_MAX_BYTES,
-                "runtime Cargo.lock",
-            )
-            .expect("read bounded no-follow Cargo.lock for release qualification evidence")
+    let runtime_cargo_lock_sha256 = hex::encode(Sha256::digest(
+        read_bounded_nofollow_regular_file(
+            &repository_parent,
+            OsStr::new("Cargo.lock"),
+            RELEASE_GIT_STDOUT_MAX_BYTES,
+            "runtime Cargo.lock",
         )
-    );
-    let build_cargo_lock_sha256 = format!(
-        "{:x}",
-        Sha256::digest(include_bytes!("../../../Cargo.lock"))
-    );
+        .expect("read bounded no-follow Cargo.lock for release qualification evidence"),
+    ));
+    let build_cargo_lock_sha256 =
+        hex::encode(Sha256::digest(include_bytes!("../../../Cargo.lock")));
     assert_eq!(
         runtime_cargo_lock_sha256, build_cargo_lock_sha256,
         "runtime Cargo.lock must equal the build-tracked Cargo.lock"
@@ -6767,7 +6762,7 @@ fn release_evidence_provenance_snapshot() -> ReleaseEvidenceProvenance {
     let build_schema_sha256 = option_env!("OPC_QUAL_RELEASE_SCHEMA_SHA256").expect(
         "OPC_QUAL_RELEASE_SCHEMA_SHA256 must be set at compile time for the release recipe",
     );
-    let compiled_schema_sha256 = format!("{:x}", Sha256::digest(RELEASE_EVIDENCE_SCHEMA));
+    let compiled_schema_sha256 = hex::encode(Sha256::digest(RELEASE_EVIDENCE_SCHEMA));
     assert_eq!(
         build_revision, revision,
         "the runtime clean HEAD must equal the build-time source revision"
@@ -6840,8 +6835,8 @@ fn qualification_enabled_features() -> Vec<String> {
 
 fn redacted_path_id(path: &Path) -> String {
     format!(
-        "sha256:{:x}",
-        Sha256::digest(path.as_os_str().as_encoded_bytes())
+        "sha256:{}",
+        hex::encode(Sha256::digest(path.as_os_str().as_encoded_bytes()))
     )
 }
 
@@ -6862,10 +6857,9 @@ fn is_sha256_path_id(value: &str) -> bool {
 /// exact checked-in wrapper bytes cannot accept an attestation emitted by a
 /// different wrapper. Cargo tracks `include_bytes!` as a build dependency.
 fn compiled_release_attestation_wrapper_sha256() -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(include_bytes!("../../../ci/sdk702-release-attest.py"))
-    )
+    hex::encode(Sha256::digest(include_bytes!(
+        "../../../ci/sdk702-release-attest.py"
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7003,7 +6997,7 @@ fn hash_pinned_regular_file_streaming(
     {
         return Err("pinned executable changed while streaming hash");
     }
-    Ok((format!("{:x}", digest.finalize()), rustix_identity(initial)))
+    Ok((hex::encode(digest.finalize()), rustix_identity(initial)))
 }
 
 fn require_exact_release_build_attestation_namespace(parent: &File) -> Result<(), &'static str> {
@@ -7084,7 +7078,7 @@ fn required_release_build_attestation(
     )?;
     Ok((
         canonical_path,
-        format!("{:x}", Sha256::digest(encoded)),
+        hex::encode(Sha256::digest(encoded)),
         attestation,
     ))
 }
@@ -8124,7 +8118,7 @@ fn process_loss_path_commitment(
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hash_v1_v9_pair_part(&mut hasher, label, path.as_bytes())?;
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn process_loss_v9_pair_directory(root: &str) -> Result<String, &'static str> {
@@ -8296,7 +8290,7 @@ fn verify_live_process_loss_cargo_alias_with_seam(
     {
         return Err("V9 Cargo executable alias changed during digest");
     }
-    if format!("sha256:{:x}", hasher.finalize()) != invocation.cargo_executable_sha256 {
+    if format!("sha256:{}", hex::encode(hasher.finalize())) != invocation.cargo_executable_sha256 {
         return Err("V9 Cargo executable backing digest changed");
     }
     Ok(())
@@ -8520,7 +8514,7 @@ fn process_loss_command_argv_sha256(
     for argument in &companion.invocation.canonical_cargo_argv {
         hash_v1_v9_pair_part(&mut hasher, b"argv", argument.as_bytes())?;
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn v1_v9_pair_run_id(
@@ -8596,7 +8590,7 @@ fn v1_v9_pair_run_id(
         b"v9-claims-preimage",
         &process_loss_v9_claims_preimage(v9)?,
     )?;
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 const PROCESS_LOSS_V9_RUN_ID_PREIMAGE_PLACEHOLDER: &str =
@@ -8788,7 +8782,8 @@ fn strict_decode_process_loss_pair(
                 &v9.bindings.fs_verity_snapshot_root_directory,
                 &v9.invocation.cargo_executable_alias,
             )?
-        || v9.bindings.v1_canonical_sha256 != format!("sha256:{:x}", Sha256::digest(v1_encoded))
+        || v9.bindings.v1_canonical_sha256
+            != format!("sha256:{}", hex::encode(Sha256::digest(v1_encoded)))
         || v1_pair_binding(&v1, "source_revision")? != expected_source.revision
         || v1_pair_binding(&v1, "source_tree")? != expected_source.tree
         || v1_pair_binding(&v1, "source_worktree_sha256")?
@@ -8868,7 +8863,7 @@ fn release_process_loss_binding(
         // continues to say only graceful same-process reopen.
         scope: "external_session_testkit_multiprocess_mtls_only".to_owned(),
         companion_path_id: redacted_path_id(path),
-        companion_sha256: format!("{:x}", Sha256::digest(bytes)),
+        companion_sha256: hex::encode(Sha256::digest(bytes)),
         companion_schema_sha256: companion.bindings.v9_schema_sha256.clone(),
         companion_source_revision: companion.provenance.source_revision.clone(),
         companion_source_tree: companion.provenance.source_tree.clone(),
@@ -8978,7 +8973,7 @@ fn required_process_loss_companion(
         "process-loss leaf changed after wrapper pinning"
     );
     assert_eq!(
-        format!("{:x}", Sha256::digest(&bytes)),
+        hex::encode(Sha256::digest(&bytes)),
         wrapper_sha256,
         "process-loss bytes changed after wrapper pinning"
     );
@@ -8987,7 +8982,7 @@ fn required_process_loss_companion(
         "process-loss V1 leaf changed after wrapper pinning"
     );
     assert_eq!(
-        format!("{:x}", Sha256::digest(&v1_bytes)),
+        hex::encode(Sha256::digest(&v1_bytes)),
         wrapper_v1_sha256,
         "process-loss V1 bytes changed after wrapper pinning"
     );
@@ -9159,11 +9154,11 @@ fn revalidate_pinned_process_loss_companion(
         PROCESS_LOSS_V1_EVIDENCE_MAX_BYTES,
         "process-loss V1 pair revalidation",
     )?;
-    if identity != pinned.identity || format!("{:x}", Sha256::digest(&bytes)) != pinned.sha256 {
+    if identity != pinned.identity || hex::encode(Sha256::digest(&bytes)) != pinned.sha256 {
         return Err("process-loss companion leaf changed before publication");
     }
     if v1_identity != pinned.v1_identity
-        || format!("{:x}", Sha256::digest(&v1_bytes)) != pinned.v1_sha256
+        || hex::encode(Sha256::digest(&v1_bytes)) != pinned.v1_sha256
     {
         return Err("process-loss V1 companion leaf changed before publication");
     }
@@ -9672,7 +9667,7 @@ fn write_release_evidence_artifact_with_seams_and_lease(
             after_parent_fsync();
         }
         verify_private_evidence_final(artifact, bytes, published_identity)?;
-        let marker_bytes = format!("sha256:{:x}", Sha256::digest(bytes));
+        let marker_bytes = format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
         let mut accepted = File::from(
             openat(
                 &artifact.namespace_parent,
@@ -10160,7 +10155,7 @@ fn validate_release_evidence(evidence: &ReleaseQualificationEvidence) -> Result<
         || evidence.execution.current_exe_device == 0
         || evidence.execution.current_exe_inode == 0
         || evidence.execution.compiled_schema_sha256
-            != format!("{:x}", Sha256::digest(RELEASE_EVIDENCE_SCHEMA))
+            != hex::encode(Sha256::digest(RELEASE_EVIDENCE_SCHEMA))
         || !is_sha256_path_id(&evidence.execution.build_attestation_path_id)
         || !is_lower_hex_exact(&evidence.execution.build_attestation_sha256, 64)
         || evidence.execution.build_attestation_wrapper_sha256
@@ -10190,7 +10185,10 @@ fn validate_release_evidence(evidence: &ReleaseQualificationEvidence) -> Result<
         || !is_sha256_path_id(&evidence.process_loss.companion_path_id)
         || evidence.process_loss.companion_sha256.len() != 64
         || evidence.process_loss.companion_schema_sha256
-            != format!("sha256:{:x}", Sha256::digest(PROCESS_LOSS_EVIDENCE_SCHEMA))
+            != format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(PROCESS_LOSS_EVIDENCE_SCHEMA))
+            )
         || evidence.process_loss.companion_source_revision != evidence.source.revision
         || evidence.process_loss.companion_source_tree != evidence.source.tree
         || evidence.process_loss.companion_source_worktree_sha256
@@ -10735,7 +10733,7 @@ fn validate_existing_release_evidence_namespace_with_context(
         "existing release evidence acceptance marker",
     )?
     .0;
-    let expected = format!("sha256:{:x}", Sha256::digest(&encoded));
+    let expected = format!("sha256:{}", hex::encode(Sha256::digest(&encoded)));
     if accepted != expected.as_bytes() {
         return Err("existing evidence namespace acceptance marker does not bind canonical bytes");
     }
@@ -10866,7 +10864,7 @@ fn release_evidence_test_fixture() -> ReleaseQualificationEvidence {
             current_exe_sha256: "d".repeat(64),
             current_exe_device: 1,
             current_exe_inode: 1,
-            compiled_schema_sha256: format!("{:x}", Sha256::digest(RELEASE_EVIDENCE_SCHEMA)),
+            compiled_schema_sha256: hex::encode(Sha256::digest(RELEASE_EVIDENCE_SCHEMA)),
             build_attestation_path_id: format!("sha256:{}", "4".repeat(64)),
             build_attestation_sha256: "5".repeat(64),
             build_attestation_wrapper_sha256: compiled_release_attestation_wrapper_sha256(),
@@ -10895,8 +10893,8 @@ fn release_evidence_test_fixture() -> ReleaseQualificationEvidence {
             companion_path_id: format!("sha256:{}", "1".repeat(64)),
             companion_sha256: "2".repeat(64),
             companion_schema_sha256: format!(
-                "sha256:{:x}",
-                Sha256::digest(PROCESS_LOSS_EVIDENCE_SCHEMA)
+                "sha256:{}",
+                hex::encode(Sha256::digest(PROCESS_LOSS_EVIDENCE_SCHEMA))
             ),
             companion_source_revision: "a".repeat(40),
             companion_source_tree: "b".repeat(40),
@@ -11404,8 +11402,10 @@ fn process_loss_exact_pair_test_fixture(
         .to_owned();
     v9.invocation.cargo_executable = canonical(&backing);
     v9.invocation.cargo_executable_sha256 = format!(
-        "sha256:{:x}",
-        Sha256::digest(std::fs::read(&backing).expect("read Cargo backing"))
+        "sha256:{}",
+        hex::encode(Sha256::digest(
+            std::fs::read(&backing).expect("read Cargo backing")
+        ))
     );
     v9.invocation.cargo_executable_mode = 0o700;
     v9.invocation.reproduction_command = process_loss_v9_reproduction_command(
@@ -11424,7 +11424,8 @@ fn process_loss_exact_pair_test_fixture(
         v9.bindings.harness_sha256.clone(),
     );
     let v1_encoded = serde_json::to_vec(&v1).expect("canonical V1 pair fixture");
-    v9.bindings.v1_canonical_sha256 = format!("sha256:{:x}", Sha256::digest(&v1_encoded));
+    v9.bindings.v1_canonical_sha256 =
+        format!("sha256:{}", hex::encode(Sha256::digest(&v1_encoded)));
     v9.invocation.run_id_sha256 =
         v1_v9_pair_run_id(&v1, &v1_encoded, &v9).expect("producer-compatible pair run ID");
     (expected, wrapper_target, pair_directory, v1_encoded, v9)
@@ -11846,8 +11847,10 @@ fn process_loss_v9_alias_binds_rustup_style_spelling_backing_and_digest() {
         .to_string_lossy()
         .into_owned();
     invocation.cargo_executable_sha256 = format!(
-        "sha256:{:x}",
-        Sha256::digest(std::fs::read(&backing).expect("read backing"))
+        "sha256:{}",
+        hex::encode(Sha256::digest(
+            std::fs::read(&backing).expect("read backing")
+        ))
     );
     invocation.cargo_executable_mode = 0o700;
     assert!(verify_live_process_loss_cargo_alias(&invocation).is_ok());
@@ -11977,7 +11980,7 @@ fn release_build_attestation_test_provenance() -> ReleaseEvidenceProvenance {
         },
         build_cargo_lock_sha256: "d".repeat(64),
         runtime_cargo_lock_sha256: "d".repeat(64),
-        compiled_schema_sha256: format!("{:x}", Sha256::digest(RELEASE_EVIDENCE_SCHEMA)),
+        compiled_schema_sha256: hex::encode(Sha256::digest(RELEASE_EVIDENCE_SCHEMA)),
         canonical_gitdir: PathBuf::from("/test-only-gitdir"),
         canonical_common_gitdir: PathBuf::from("/test-only-common-gitdir"),
     }
@@ -13187,7 +13190,10 @@ fn qualification_quiet_host_classifier_is_exact_and_redaction_safe() {
 fn process_loss_v9_recipe_matches_the_producer_canonical_argv() {
     assert_eq!(PROCESS_LOSS_CANONICAL_CARGO_ARGV.len(), 15);
     assert_eq!(
-        format!("sha256:{:x}", Sha256::digest(PROCESS_LOSS_EVIDENCE_SCHEMA)),
+        format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(PROCESS_LOSS_EVIDENCE_SCHEMA))
+        ),
         PROCESS_LOSS_V9_SCHEMA_SHA256,
         "the local V9 schema digest literal binds the current producer schema"
     );
@@ -14839,7 +14845,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     println!(
         "SDK702_RELEASE_EVIDENCE artifact_path_id={} artifact_sha256={} existing_validation_recipe={}",
         artifact.evidence.path_id,
-        format_args!("{:x}", Sha256::digest(&evidence)),
+        format_args!("{}", hex::encode(Sha256::digest(&evidence))),
         RELEASE_EVIDENCE_EXISTING_ARTIFACT_VALIDATION_RECIPE,
     );
 }

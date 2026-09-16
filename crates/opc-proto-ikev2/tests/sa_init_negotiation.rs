@@ -1,7 +1,7 @@
 use aes::{cipher::block_padding::NoPadding, Aes256};
 use bytes::BytesMut;
 use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_proto_ikev2::{
     build_ike_auth_cleartext_payload_chain, build_ike_sa_init_response,
     decode_ike_sa_init_request_payloads, derive_ike_sa_init_key_material,
@@ -210,7 +210,7 @@ fn independently_verify_and_open_cbc_sha512(
     assert!(message.len() >= 32 + 16 + 16 + 32);
 
     let icv_start = message.len() - 32;
-    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(integrity_key)
+    let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(integrity_key)
         .expect("independent HMAC-SHA2-512 key");
     mac.update(&message[..icv_start]);
     let expected_icv = mac.finalize().into_bytes();
@@ -557,7 +557,7 @@ fn capture_shaped_responder_proof_reaches_bidirectional_protected_ike_auth() {
     invalid_padding[preceding_last_byte] ^= valid_pad_len ^ 0xff;
     let new_icv_start = invalid_padding.len() - icv_len;
     let mut mac =
-        <Hmac<Sha512> as Mac>::new_from_slice(material.sk_ai()).expect("test HMAC key length");
+        <Hmac<Sha512> as KeyInit>::new_from_slice(material.sk_ai()).expect("test HMAC key length");
     mac.update(&invalid_padding[..new_icv_start]);
     let icv = mac.finalize().into_bytes();
     invalid_padding[new_icv_start..].copy_from_slice(&icv[..icv_len]);

@@ -3440,7 +3440,7 @@ impl CandidatePublicMaterialManifest {
         let mut hasher = self.hasher.clone();
         hasher.update(b"publication-count\0");
         hasher.update(self.publication_count.to_be_bytes());
-        Ok(format!("sha256:{:x}", hasher.finalize()))
+        Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
     }
 }
 
@@ -8165,7 +8165,7 @@ fn candidate_sha256_file(path: &Path, maximum_bytes: u64) -> io::Result<String> 
         }
         hasher.update(&encoded[..read]);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn candidate_configuration_sha256(config_paths: &[PathBuf]) -> io::Result<String> {
@@ -8181,7 +8181,7 @@ fn candidate_configuration_sha256(config_paths: &[PathBuf]) -> io::Result<String
         hasher.update(length.to_be_bytes());
         hasher.update(encoded);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn candidate_source_provenance_at(
@@ -8283,7 +8283,7 @@ fn candidate_source_provenance_at(
     Ok((
         revision,
         tree_status,
-        format!("sha256:{:x}", hasher.finalize()),
+        format!("sha256:{}", hex::encode(hasher.finalize())),
     ))
 }
 
@@ -8729,8 +8729,8 @@ fn release_gate_provenance_at(repository: &Path) -> io::Result<ReleaseGateProven
     Ok(ReleaseGateProvenance {
         source_revision,
         source_tree,
-        source_worktree_sha256: format!("sha256:{:x}", source_hasher.finalize()),
-        cargo_lock_sha256: format!("sha256:{:x}", cargo_lock_hasher.finalize()),
+        source_worktree_sha256: format!("sha256:{}", hex::encode(source_hasher.finalize())),
+        cargo_lock_sha256: format!("sha256:{}", hex::encode(cargo_lock_hasher.finalize())),
         cargo_target_directory: external_namespaces.cargo_target_directory,
         cargo_target_directory_sha256: external_namespaces.cargo_target_directory_sha256,
         evidence_root_directory: external_namespaces.evidence_root_directory,
@@ -8742,7 +8742,7 @@ fn release_gate_provenance_at(repository: &Path) -> io::Result<ReleaseGateProven
         fs_verity_snapshot_root_inode: external_namespaces.fs_verity_snapshot_root_inode,
         pair_directory: external_namespaces.pair_directory,
         pair_directory_sha256: external_namespaces.pair_directory_sha256,
-        command_argv_sha256: format!("sha256:{:x}", command_hasher.finalize()),
+        command_argv_sha256: format!("sha256:{}", hex::encode(command_hasher.finalize())),
         cargo_executable_alias: v9_canonical_path_string(
             &observed_cargo.alias,
             "release-gate Cargo executable alias",
@@ -8878,7 +8878,7 @@ fn release_gate_cargo_backing_sha256_from_descriptor(
             "release-gate Cargo backing changed while its descriptor was hashed",
         ));
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn release_gate_cargo_executable_binding_at(
@@ -9526,7 +9526,7 @@ fn write_private_candidate_file_at<Fd: AsFd>(
 const V9_EXTERNAL_TEST_ID: &str = "three_process_projected_mtls_persistent_v2_batch_release_gate";
 
 fn v9_sha256(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 /// Recompute the opaque run identity from both canonical artifacts' shared
@@ -9648,7 +9648,7 @@ fn v9_pair_run_id_material(
     )?;
     hash_candidate_source_part(&mut hasher, b"v1-canonical", v1_canonical)?;
     hash_candidate_source_part(&mut hasher, b"v9-claims-preimage", v9_claims_preimage)?;
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn v1_v9_release_gate_process_generations_agree(

@@ -5,7 +5,7 @@ authors = ["OpenPacketCore Contributors"]
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/openpacketcore/openpacketcore-sdk"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Reference SMF consumer example for the OpenPacketCore SDK"
 publish = false
 

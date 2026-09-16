@@ -101,7 +101,7 @@ not as an `epdg` product facade or production-ready EPC control plane.
 
 All future work under this boundary inherits existing SDK policy:
 
-1. ADR 0014 remains in force: rustls only, tokio only, workspace MSRV 1.88,
+1. ADR 0014 remains in force: rustls only, tokio only, workspace MSRV 1.89,
    compatible licenses, justified dependencies, and no unauthorized gRPC stack.
 2. ADR 0015 remains in force for every `opc-proto-*` codec: spec-authored or
    independent fixtures, byte-exact decode/encode where claimed, raw preservation,
