@@ -1421,6 +1421,17 @@ mod platform {
 
         #[test]
         fn persistent_file_identity_is_stable_and_rejects_forced_inode_reuse_when_supported() {
+            qualify_persistent_identity_inode_reuse(false);
+        }
+
+        #[test]
+        fn persistent_file_identity_rejects_reuse_when_first_inode_is_unavailable() {
+            // Keep the unlinked original open so its inode cannot be reused.
+            // The fixture must still exercise a real reuse of a later file.
+            qualify_persistent_identity_inode_reuse(true);
+        }
+
+        fn qualify_persistent_identity_inode_reuse(hold_original: bool) {
             let directory = tempfile::tempdir().expect("create identity qualification directory");
             let path = directory.path().join("persistent-file-identity");
             std::fs::write(&path, b"persistent file identity A")
@@ -1452,26 +1463,37 @@ mod platform {
             // even if this filesystem recycles its inode number. The hosted
             // qualification requires an actual reuse, rather than treating a
             // merely different inode as evidence for this crash boundary.
-            drop(original);
+            let _held_original = hold_original.then_some(original);
             std::fs::remove_file(&path).expect("remove original identity file");
+            // Another filesystem user can claim the original inode after the
+            // unlink. Remember each identity observed at this private path so
+            // any actual reuse of one of our deleted files proves the same
+            // generation boundary, without depending on that first inode
+            // remaining available to this fixture.
+            let mut deleted_identities =
+                std::collections::BTreeMap::from([(original_inode, first)]);
             let replacement = (0..4_096).find_map(|_| {
                 std::fs::write(&path, b"persistent file identity A")
                     .expect("recreate byte-identical identity file");
                 let candidate = File::open(&path).expect("open replacement identity file");
-                if candidate
+                let candidate_inode = candidate
                     .metadata()
                     .expect("read replacement identity metadata")
-                    .ino()
-                    == original_inode
-                {
-                    Some(candidate)
+                    .ino();
+                if let Some(previous) = deleted_identities.get(&candidate_inode) {
+                    Some((candidate_inode, previous.clone(), candidate))
                 } else {
+                    deleted_identities.insert(
+                        candidate_inode,
+                        persistent_file_identity(candidate.as_fd())
+                            .expect("read candidate persistent identity before deletion"),
+                    );
                     drop(candidate);
                     std::fs::remove_file(&path).expect("remove non-reused candidate");
                     None
                 }
             });
-            let Some(replacement) = replacement else {
+            let Some((reused_inode, previous, replacement)) = replacement else {
                 if qualification_required() {
                     panic!(
                         "persistent identity qualification filesystem did not recycle an inode within the bounded test"
@@ -1487,13 +1509,16 @@ mod platform {
                     .metadata()
                     .expect("read reused replacement identity metadata")
                     .ino(),
-                original_inode,
+                reused_inode,
                 "the qualification must exercise an actual reused inode number"
             );
+            if hold_original {
+                assert_ne!(reused_inode, original_inode);
+            }
             let replacement = persistent_file_identity(replacement.as_fd())
                 .expect("read replacement persistent identity");
             assert_ne!(
-                first, replacement,
+                previous, replacement,
                 "recreated inode retained a prior durable file handle"
             );
         }

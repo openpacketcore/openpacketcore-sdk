@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- Make the persistent-file identity qualification recognize actual reuse of
+  any inode it previously deleted, retaining the 4,096-attempt bound and the
+  generation-change assertion when another filesystem user takes the first inode.
 - Wait for Raft's metrics publication before asserting the held vote in the
   five-voter async-persistence regression test. The real response remains held,
   and the existing operation and election bounds still apply.
