@@ -52,6 +52,11 @@ rejecting unexpected triggers, indexes, constraints and temporary objects before
 history use. Only bounded SDK-authored DDL enters Rust memory; the supplied
 catalog is compared inside SQLite. A schema-only change cannot make a legitimate
 lifecycle update alter and re-authenticate an unrelated protected revision.
+Snapshot installation also checks the destination schema in its replacement
+transaction before deleting or copying authority rows. Rejection preserves the
+previous history, applied position and snapshot reference and emits no durable
+application notification. This destination check authenticates schema only:
+repair must remain able to replace damaged rows from a validated source snapshot.
 These scans use the existing bounded, cancellable blocking worker. Every apply
 batch likewise authenticates its prior history in the same transaction before
 admission or cached-outcome decisions. Missing consensus identity with residual

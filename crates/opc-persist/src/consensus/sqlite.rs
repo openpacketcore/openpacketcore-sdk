@@ -3448,6 +3448,10 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     }
     cancellation.check_io()?;
     let tx = conn.unchecked_transaction().map_err(db_error)?;
+    // Validate the destination before replacing authority. Source authentication
+    // cannot prevent a destination trigger or temporary table from changing the
+    // imported state. Repair may replace damaged rows, so check only schema here.
+    validate_live_history_schema_sync(&tx, cancellation)?;
     for table in [
         "config_lifecycle_audit",
         "rollback_labels",
