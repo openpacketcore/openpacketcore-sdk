@@ -178,7 +178,8 @@ fn sqlite_close_keeps_admission_after_authorizer_removal() {
         .authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
             let _ = &probe;
             rusqlite::hooks::Authorization::Allow
-        }));
+        }))
+        .expect("SQLite test hook registration");
     drop(backend);
     assert!(
         saw_lock.load(Ordering::Acquire),

@@ -61,9 +61,13 @@ const RESTORE_SCAN_PAYLOAD_SQL: &str = r#"
 
 struct RestoreScanProgressGuard<'a>(&'a Connection);
 
+// Registration/removal can fail only for a borrowed raw SQLite handle. The
+// restore worker opens an owning connection and retains it through this guard.
 impl Drop for RestoreScanProgressGuard<'_> {
     fn drop(&mut self) {
-        self.0.progress_handler(0, None::<fn() -> bool>);
+        self.0
+            .progress_handler(0, None::<fn() -> bool>)
+            .expect("restore scan owns its SQLite connection");
     }
 }
 
@@ -108,7 +112,8 @@ fn install_restore_scan_progress_budget(
                 )
                 || std::time::Instant::now() >= sqlite_deadline
         }),
-    );
+    )
+    .expect("restore scan owns its SQLite connection");
     RestoreScanProgressGuard(conn)
 }
 

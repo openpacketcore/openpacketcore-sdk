@@ -15,6 +15,14 @@ updates:
         update-types:
           - minor
           - patch
+      # Breaking upgrades still need both lockfiles updated in the same PR.
+      # Keep each dependency separate so its migration can be reviewed alone.
+      rust-major:
+        group-by: dependency-name
+        patterns:
+          - "*"
+        update-types:
+          - major
 
   - package-ecosystem: gomod
     # The reference operator replaces the SDK module with the local directory.

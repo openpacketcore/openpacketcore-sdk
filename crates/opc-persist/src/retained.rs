@@ -552,7 +552,8 @@ fn open_authority_sync(
         } else {
             rusqlite::hooks::Authorization::Deny
         }
-    }));
+    }))
+    .map_err(|_| RetainedConfigError::Unavailable)?;
     work.check()?;
     Ok(SqliteBackend::from_retained_connection(
         options.path,
@@ -730,7 +731,8 @@ fn validate_connection(
     work: &Arc<AdmissionWork>,
 ) -> Result<(), RetainedConfigError> {
     let progress = Arc::clone(work);
-    conn.progress_handler(1000, Some(move || progress.check().is_err()));
+    conn.progress_handler(1000, Some(move || progress.check().is_err()))
+        .map_err(|_| RetainedConfigError::Unavailable)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|_| RetainedConfigError::Rejected)?;
@@ -785,7 +787,8 @@ fn validate_connection(
         work.deadline,
     )
     .map_err(|_| RetainedConfigError::Rejected)?;
-    conn.progress_handler(0, None::<fn() -> bool>);
+    conn.progress_handler(0, None::<fn() -> bool>)
+        .map_err(|_| RetainedConfigError::Unavailable)?;
     work.check()
 }
 

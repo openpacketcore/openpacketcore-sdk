@@ -77,7 +77,8 @@ fn native_snapshot_export_reuses_insert_preparations_and_preserves_exact_rows() 
             observed[slot].fetch_add(1, Ordering::Relaxed);
         }
         rusqlite::hooks::Authorization::Allow
-    }));
+    }))
+    .expect("SQLite test hook registration");
     let started = Instant::now();
     storage
         .export_cold_install_base_checked(&conn, &|| Ok(()))

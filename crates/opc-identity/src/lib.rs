@@ -251,9 +251,9 @@ pub enum SpiffeSanError {
 /// Extract exactly one canonical, bounded OpenPacketCore SPIFFE ID from an
 /// X.509 certificate's Subject Alternative Name extension.
 ///
-/// Non-URI SAN entries are ignored. A certificate with more than one URI SAN
-/// is rejected even when only one is a SPIFFE URI, so callers never select an
-/// identity from an ambiguous X.509-SVID.
+/// Well-formed non-URI SAN entries are ignored; malformed entries are rejected.
+/// A certificate with more than one URI SAN is rejected even when only one is a
+/// SPIFFE URI, so callers never select an identity from an ambiguous X.509-SVID.
 pub fn extract_spiffe_id_from_cert_der(cert_der: &[u8]) -> Result<SpiffeId, SpiffeSanError> {
     let (remaining, x509) =
         X509Certificate::from_der(cert_der).map_err(|_| SpiffeSanError::MalformedCertificate)?;
@@ -268,6 +268,11 @@ pub fn extract_spiffe_id_from_cert_der(cert_der: &[u8]) -> Result<SpiffeId, Spif
 
     let mut candidate = None;
     for name in &san.value.general_names {
+        // x509-parser retains malformed entries instead of failing the SAN
+        // extension. They must not disappear from identity validation.
+        if matches!(name, GeneralName::Invalid(..)) {
+            return Err(SpiffeSanError::MalformedCertificate);
+        }
         let GeneralName::URI(uri) = name else {
             continue;
         };
@@ -712,6 +717,23 @@ mod spiffe_san_tests {
     }
 
     #[test]
+    fn strict_extractor_accepts_well_formed_non_uri_san() {
+        let mut params = CertificateParams::new(vec!["service.example.test".into()]).unwrap();
+        params
+            .subject_alt_names
+            .push(SanType::URI(SPIFFE_ID.try_into().unwrap()));
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(cert.der())
+                .unwrap()
+                .as_str(),
+            SPIFFE_ID
+        );
+    }
+
+    #[test]
     fn strict_extractor_rejects_missing_spiffe_uri() {
         let cert = certificate_with_uris(&[]);
 
@@ -739,6 +761,31 @@ mod spiffe_san_tests {
             extract_spiffe_id_from_cert_der(&cert),
             Err(SpiffeSanError::MultipleUriSans)
         );
+    }
+
+    #[test]
+    fn strict_extractor_rejects_malformed_san_alongside_valid_spiffe_uri() {
+        const MALFORMED: &str = "https://malformed.example.test";
+        // Exercise an invalid URI and an invalid DNS name, on either side of
+        // the valid identity. Extraction checks structure, not the signature.
+        for tag in [0x86, 0x82] {
+            for uris in [[SPIFFE_ID, MALFORMED], [MALFORMED, SPIFFE_ID]] {
+                let mut cert = certificate_with_uris(&uris);
+                let position = cert
+                    .windows(MALFORMED.len())
+                    .position(|bytes| bytes == MALFORMED.as_bytes())
+                    .unwrap();
+                assert_eq!(cert[position - 2], 0x86);
+                assert_eq!(usize::from(cert[position - 1]), MALFORMED.len());
+                cert[position - 2] = tag;
+                cert[position] = 0xff; // Not a valid UTF-8/IA5 string.
+
+                assert_eq!(
+                    extract_spiffe_id_from_cert_der(&cert),
+                    Err(SpiffeSanError::MalformedCertificate)
+                );
+            }
+        }
     }
 
     #[test]

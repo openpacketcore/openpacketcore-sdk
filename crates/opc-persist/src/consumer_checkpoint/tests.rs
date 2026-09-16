@@ -94,7 +94,8 @@ async fn checkpoint_drop_and_shutdown_hold_admission_through_sqlite_close() {
             .authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
                 let _ = &probe;
                 rusqlite::hooks::Authorization::Allow
-            }));
+            }))
+            .expect("SQLite test hook registration");
         if explicit_shutdown {
             store.shutdown().await.expect("shutdown");
         } else {

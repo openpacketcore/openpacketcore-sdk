@@ -9617,7 +9617,8 @@ mod tests {
             } else {
                 Authorization::Allow
             }
-        }));
+        }))
+        .expect("SQLite test hook registration");
         let publication = publish_snapshot_metadata_with_readback(
             &conn,
             state_machine.core.storage_identity,
@@ -9743,7 +9744,8 @@ mod tests {
                     } else {
                         Authorization::Allow
                     }
-                }));
+                }))
+                .expect("SQLite test hook registration");
             }
             let (meta, file_name, checksum, byte_length) =
                 consensus::read_current_snapshot_sync(&conn, state_machine.core.storage_identity)
@@ -10204,7 +10206,8 @@ mod tests {
                     }
                     Authorization::Allow
                 }
-            }));
+            }))
+            .expect("SQLite test hook registration");
         }
         target
             .install_snapshot(&built.meta, receiving)
@@ -10228,7 +10231,8 @@ mod tests {
         );
         {
             let conn = target.core.conn.lock().await;
-            conn.authorizer(Some(|_: AuthContext<'_>| Authorization::Allow));
+            conn.authorizer(Some(|_: AuthContext<'_>| Authorization::Allow))
+                .expect("SQLite test hook registration");
             let (observed_meta, file_name, _, _) =
                 consensus::read_current_snapshot_sync(&conn, target.core.storage_identity)
                     .expect("read durably installed snapshot metadata")
@@ -12108,7 +12112,8 @@ mod tests {
                 } else {
                     Authorization::Allow
                 }
-            }));
+            }))
+            .expect("SQLite test hook registration");
         }
         assert!(
             install_private_snapshot(&mut machine, &built.meta, receiving)
@@ -12123,7 +12128,8 @@ mod tests {
         assert!(machine.applied_state().await.is_err());
         {
             let conn = machine.core.conn.lock().await;
-            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .expect("SQLite test hook registration");
             assert_eq!(
                 consensus::read_applied_sync(&conn, identity(1)).unwrap(),
                 Some(log_id(2))
@@ -13625,7 +13631,8 @@ mod tests {
                     );
                 }
                 reject_commit
-            }));
+            }))
+            .expect("SQLite test hook registration");
         let commit = tokio::spawn(async move { log_store.save_committed(Some(log_id(1))).await });
         let abort_commit = commit.abort_handle();
         let observer_core = state_machine.core.clone();
@@ -13648,7 +13655,8 @@ mod tests {
             .conn
             .lock()
             .await
-            .commit_hook(None::<fn() -> bool>);
+            .commit_hook(None::<fn() -> bool>)
+            .expect("SQLite test hook registration");
         let observer_result = observer.await;
         let (committed, autocommit) = {
             let conn = state_machine.core.conn.lock().await;

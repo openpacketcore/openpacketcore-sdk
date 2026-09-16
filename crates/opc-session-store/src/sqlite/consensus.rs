@@ -4907,6 +4907,8 @@ struct ConsensusLogPruneTurnControl {
 /// cross-thread interrupt arrives with no VDBE active and SQLite clears it.
 /// Cleanup removes this callback before rollback, so a retained stop cannot
 /// prevent the transaction from returning its writer ownership.
+/// The worker opens an owning connection; rusqlite's rejection of hooks on
+/// borrowed raw handles is therefore an invariant violation here.
 struct ConsensusLogPruneProgressGuard<'a> {
     conn: &'a Connection,
 }
@@ -4941,14 +4943,17 @@ impl<'a> ConsensusLogPruneProgressGuard<'a> {
                 }
                 preempt
             }),
-        );
+        )
+        .expect("consensus worker owns its SQLite connection");
         Self { conn }
     }
 }
 
 impl Drop for ConsensusLogPruneProgressGuard<'_> {
     fn drop(&mut self) {
-        self.conn.progress_handler(0, None::<fn() -> bool>);
+        self.conn
+            .progress_handler(0, None::<fn() -> bool>)
+            .expect("consensus worker owns its SQLite connection");
     }
 }
 
@@ -35535,9 +35540,13 @@ fn validate_snapshot_compaction_foreign_keys_sync(conn: &Connection) -> io::Resu
 
 struct SnapshotCompactionProgressGuard<'a>(&'a Connection);
 
+// Compaction opens an owning destination connection and retains it through
+// this guard. Hook removal cannot encounter a borrowed raw SQLite handle.
 impl Drop for SnapshotCompactionProgressGuard<'_> {
     fn drop(&mut self) {
-        self.0.progress_handler(0, None::<fn() -> bool>);
+        self.0
+            .progress_handler(0, None::<fn() -> bool>)
+            .expect("consensus worker owns its SQLite connection");
     }
 }
 
@@ -35555,7 +35564,8 @@ fn install_snapshot_compaction_progress_handler(
     conn: &Connection,
     progress: impl FnMut() -> bool + Send + 'static,
 ) -> SnapshotCompactionProgressGuard<'_> {
-    conn.progress_handler(SNAPSHOT_COMPACTION_FOREGROUND_PROGRESS_OPS, Some(progress));
+    conn.progress_handler(SNAPSHOT_COMPACTION_FOREGROUND_PROGRESS_OPS, Some(progress))
+        .expect("consensus worker owns its SQLite connection");
     SnapshotCompactionProgressGuard(conn)
 }
 
@@ -49356,7 +49366,8 @@ mod tests {
             } else {
                 rusqlite::hooks::Authorization::Allow
             }
-        }));
+        }))
+        .expect("SQLite test hook registration");
 
         validate_existing_schema(&conn, identity())
             .expect("aggregate roster validation is a read-only schema projection");
@@ -49516,7 +49527,8 @@ mod tests {
                 observed_validation_views.fetch_add(1, Ordering::SeqCst);
             }
             Authorization::Allow
-        }));
+        }))
+        .expect("SQLite test hook registration");
         let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
             open_nofollow_read(&snapshot_path).expect("pin valid forward source"),
             snapshot_path.clone(),
@@ -58722,9 +58734,11 @@ LIMIT 20000;
                 observed_steps.fetch_add(1, Ordering::Relaxed);
                 false
             }),
-        );
+        )
+        .expect("SQLite test hook registration");
         let validation = validate_fenced_transition_receipts_sync(&conn, identity());
-        conn.progress_handler(0, None::<fn() -> bool>);
+        conn.progress_handler(0, None::<fn() -> bool>)
+            .expect("SQLite test hook registration");
 
         assert!(validation.is_err());
         assert!(
@@ -60241,7 +60255,8 @@ LIMIT 20000;
                 _ => {}
             }
             rusqlite::hooks::Authorization::Allow
-        }));
+        }))
+        .expect("SQLite test hook registration");
 
         assert_eq!(
             fenced_transition_v2_ledger_layout_sync(&conn).expect("direct V2 schema audit"),
@@ -60602,7 +60617,8 @@ LIMIT 20000;
                 _ => {}
             }
             rusqlite::hooks::Authorization::Allow
-        }));
+        }))
+        .expect("SQLite test hook registration");
         assert_eq!(
             fenced_transition_v2_ledger_layout_sync(&conn).expect("direct V2 schema audit"),
             FencedTransitionV2LedgerLayout::Activated,
@@ -64392,7 +64408,8 @@ BEGIN IMMEDIATE;
                 observed_target_delete_attempts.fetch_add(1, Ordering::Relaxed);
             }
             rusqlite::hooks::Authorization::Allow
-        }));
+        }))
+        .expect("SQLite test hook registration");
         for case in [
             "outcome-one-over",
             "outcome-materially-oversized",
@@ -68052,12 +68069,14 @@ BEGIN IMMEDIATE;
                 );
             }
             rusqlite::hooks::Authorization::Allow
-        }));
+        }))
+        .expect("SQLite test hook registration");
         let projection = MembershipLogProjection::load(&conn, identity(), false)
             .expect("load the snapshot that preceded the concurrent write");
         conn.authorizer(
             None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
-        );
+        )
+        .expect("SQLite test hook registration");
         assert!(
             changed.load(Ordering::SeqCst),
             "writer must run during load"
@@ -68133,7 +68152,8 @@ BEGIN IMMEDIATE;
                     observed_selects.fetch_add(1, Ordering::Relaxed);
                 }
                 rusqlite::hooks::Authorization::Allow
-            }));
+            }))
+            .expect("SQLite test hook registration");
             for _ in 0..16 {
                 let projection = MembershipLogProjection::load(&conn, identity(), false)
                     .expect("warm exact projection queries");
@@ -76227,7 +76247,8 @@ BEGIN IMMEDIATE;
             {
                 observed_history_updates.fetch_add(1, Ordering::Relaxed);
             }
-        }));
+        }))
+        .expect("SQLite test hook registration");
         let requests = maximum_fenced_transition_v2_batch_requests();
         let applied = apply_entries_sync(
             &conn,

@@ -102,7 +102,7 @@ bytes = { workspace = true }
 futures-util = "0.3"
 rcgen = { workspace = true }
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled"] }
 tempfile = "3"
 
 [lints]

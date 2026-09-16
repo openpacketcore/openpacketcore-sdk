@@ -390,7 +390,9 @@ impl ConfigConsensusCore {
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let progress_cancellation = worker_cancellation.clone();
-            worker_conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+            worker_conn
+                .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+                .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
             let result = if retained {
                 if recovery.is_some() {
                     Err(ConfigConsensusStorageError::RecoveryRequired)
@@ -420,7 +422,9 @@ impl ConfigConsensusCore {
                 // the awaiting future is cancelled after the durable claim.
                 worker_backend.require_config_consensus_history();
             }
-            worker_conn.progress_handler(0, None::<fn() -> bool>);
+            worker_conn
+                .progress_handler(0, None::<fn() -> bool>)
+                .expect("installed SQLite hook belongs to an owned connection");
             result
         });
         let initialization = match tokio::time::timeout_at(deadline, &mut worker).await {
@@ -591,17 +595,21 @@ where
         let commit_cancellation = worker_cancellation.clone();
         conn.commit_hook(Some(move || {
             commit_cancellation.authorize_commit().is_err()
-        }));
+        }))
+        .map_err(db_error)?;
         let progress_cancellation = worker_cancellation.clone();
         conn.progress_handler(
             1_000,
             Some(move || {
                 progress_cancellation.is_cancelled() || std::time::Instant::now() >= std_deadline
             }),
-        );
+        )
+        .map_err(db_error)?;
         let result = operation(&conn, &worker_cancellation);
-        conn.commit_hook(None::<fn() -> bool>);
-        conn.progress_handler(0, None::<fn() -> bool>);
+        conn.commit_hook(None::<fn() -> bool>)
+            .expect("installed SQLite hook belongs to an owned connection");
+        conn.progress_handler(0, None::<fn() -> bool>)
+            .expect("installed SQLite hook belongs to an owned connection");
         result
     });
     let result = match tokio::time::timeout_at(deadline, &mut worker).await {
@@ -859,7 +867,8 @@ fn validate_legacy_recovery_snapshot(
     )
     .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let progress_cancellation = cancellation.clone();
-    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
@@ -3241,7 +3250,9 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     validate_fixed_membership(&membership, expected_members)?;
     let mut destination = Connection::open(path).map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
-    destination.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+    destination
+        .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+        .map_err(db_error)?;
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
         loop {
@@ -3337,7 +3348,8 @@ fn validate_snapshot_database_sync(
     )
     .map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
-    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+        .map_err(db_error)?;
     // Keep the same read transaction from validation through copying. The
     // retained destination's pinned VFS intentionally rejects ATTACH paths
     // outside its own namespace; it must not be widened for snapshot import.
@@ -4974,7 +4986,7 @@ mod tests {
                 } else {
                     Authorization::Allow
                 }
-            }));
+            })).expect("SQLite test hook registration");
         }
 
         let backend = initialized_backend().await;
@@ -5059,7 +5071,8 @@ mod tests {
                     observed_writes.fetch_or(bit, Ordering::SeqCst);
                 }
             },
-        ));
+        ))
+        .expect("SQLite test hook registration");
         let fault_reached = Arc::new(AtomicBool::new(false));
         deny_insert(&conn, "config_lifecycle_audit", Arc::clone(&fault_reached));
         let error = apply_entries_sync(
@@ -5072,7 +5085,8 @@ mod tests {
         .expect_err("mid-intent SQLite fault must abort apply");
         assert_eq!(io::ErrorKind::Other, error.kind());
         assert!(!error.to_string().contains("config_lifecycle_audit"));
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .expect("SQLite test hook registration");
         assert!(fault_reached.load(Ordering::SeqCst));
         assert_eq!(
             writes.load(Ordering::SeqCst),
@@ -5130,8 +5144,10 @@ mod tests {
             vec![entry.clone()],
         )
         .expect_err("fault after domain, outcome, and machine writes must abort apply");
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-        conn.update_hook(None::<fn(Action, &str, &str, i64)>);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .expect("SQLite test hook registration");
+        conn.update_hook(None::<fn(Action, &str, &str, i64)>)
+            .expect("SQLite test hook registration");
         assert!(fault_reached.load(Ordering::SeqCst));
         assert_eq!(
             writes.load(Ordering::SeqCst),

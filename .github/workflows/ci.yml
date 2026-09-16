@@ -867,7 +867,10 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.89)
-        uses: dtolnay/rust-toolchain@1.89
+        # Keep the supported compiler version independent of action updates.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.89.0"
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2

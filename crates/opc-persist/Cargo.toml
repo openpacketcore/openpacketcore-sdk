@@ -28,9 +28,7 @@ serde_json = { workspace = true }
 zeroize = { workspace = true }
 
 # SQLite with bundled static library (no system SQLite needed)
-# rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script needs cfg_select!
-# (Rust 1.91); held at 0.32 while the workspace MSRV is 1.89.
-rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks"] }
+rusqlite = { workspace = true, features = ["backup", "bundled", "hooks"] }
 rand = { workspace = true }
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
