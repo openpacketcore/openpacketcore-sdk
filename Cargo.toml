@@ -46,7 +46,7 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 sha1 = { version = "0.11", features = ["zeroize"] }
 rand = "0.10"
 # Keep the qualified AES version; patch upgrades are handled by Dependabot.
-aes = { version = "=0.9.2", features = ["zeroize"] }
+aes = { version = "=0.9.3", features = ["zeroize"] }
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-gcm-siv = "0.12"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding", "zeroize"] }
