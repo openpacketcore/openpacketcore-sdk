@@ -224,6 +224,7 @@ fn scratch_cargo_toml(workspace_dir: &std::path::Path) -> String {
     let path = |name: &str| workspace_dir.join(format!("crates/{name}"));
     let time_version = common::locked_version(workspace_dir, "time");
     let tonic_version = common::locked_version(workspace_dir, "tonic");
+    let tonic_prost_version = common::locked_version(workspace_dir, "tonic-prost");
     let prost_version = common::locked_version(workspace_dir, "prost");
     let tokio_version = common::locked_version(workspace_dir, "tokio");
     let hyper_util_version = common::locked_version(workspace_dir, "hyper-util");
@@ -250,7 +251,8 @@ serde_json = "={serde_json_version}"
 time = "={time_version}"
 tokio = {{ version = "={tokio_version}", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }}
 tokio-rustls = {{ version = "0.26", default-features = false, features = ["ring"] }}
-tonic = {{ version = "={tonic_version}", default-features = false, features = ["channel", "codegen", "prost"] }}
+tonic = {{ version = "={tonic_version}", default-features = false, features = ["channel", "codegen"] }}
+tonic-prost = "={tonic_prost_version}"
 opc-config-bus = {{ path = "{}" }}
 opc-config-model = {{ path = "{}" }}
 opc-data-governance = {{ path = "{}" }}
@@ -333,12 +335,12 @@ use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use tonic::client::Grpc;
-use tonic::codec::ProstCodec;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::codegen::http::Uri;
 use tonic::codegen::Service;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
+use tonic_prost::ProstCodec;
 
 #[derive(Clone)]
 struct FixedPolicy(NacmPolicy);
