@@ -744,7 +744,7 @@ fn initialize_schema_transaction(
             ],
         )
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
-        super::history::initialize_sync(&tx, identity, audit_key)
+        super::history::initialize_sync(&tx, identity, audit_key, cancellation)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if let Some(recovery) = recovery {
             tx.execute(
@@ -2780,8 +2780,8 @@ pub(crate) fn apply_entries_cancellable_sync(
                         .map_err(db_error)?;
                     let mut result = match &command.intent {
                         ConfigMutationIntent::RetainHistory(retention) => {
-                            validate_history_chain_cancellable_sync(&tx, cancellation)?;
-                            super::history::retain_sync(&tx, audit_key, retention)?
+                            validate_sealed_state_sync(&tx, audit_key, cancellation)?;
+                            super::history::retain_sync(&tx, audit_key, retention, cancellation)?
                         }
                         _ => execute_intent_sync(
                             &tx,
@@ -2866,6 +2866,7 @@ fn validate_sealed_state_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
     super::history::validate_sync(conn, audit_key)?;
+    super::history::validate_record_chain_sync(conn, audit_key, cancellation)?;
     validate_history_chain_cancellable_sync(conn, cancellation)?;
     let mut statement = conn
         .prepare(

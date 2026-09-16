@@ -12,10 +12,12 @@ use opc_consensus::ConsensusIdentity;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use super::sqlite::SqliteWorkCancellation;
 use super::types::ConfigMutationFailure;
 use crate::AuditKey;
 
 const HISTORY_DOMAIN: &[u8] = b"openpacketcore/config-consensus/history-retention/v1\0";
+const RECORD_CHAIN_DOMAIN: &[u8] = b"openpacketcore/config-consensus/history-record-chain/v1\0";
 const STATE_MAX_BYTES: usize = 4096;
 
 /// Explicit bounds for canonical retained configuration records and their data.
@@ -137,6 +139,7 @@ struct HistoryState {
     boundary: Option<HistoryBoundary>,
     head: Option<HistoryHead>,
     records: u64,
+    record_chain: [u8; 32],
 }
 
 fn corrupt() -> io::Error {
@@ -183,6 +186,78 @@ fn head_sync(conn: &Connection) -> io::Result<Option<HistoryHead>> {
     .transpose()
 }
 
+fn empty_record_chain() -> [u8; 32] {
+    Sha256::digest(RECORD_CHAIN_DOMAIN).into()
+}
+
+fn audit_anchor_digest(count: i64, terminal: &[u8]) -> io::Result<[u8; 32]> {
+    let count = u32::try_from(count).map_err(|_| corrupt())?;
+    if count as usize > super::types::CONFIG_AUDIT_RECORDS_MAX || terminal.len() != 32 {
+        return Err(corrupt());
+    }
+    let mut digest = Sha256::new();
+    digest.update(count.to_be_bytes());
+    digest.update(terminal);
+    Ok(digest.finalize().into())
+}
+
+fn extend_record_chain(previous: [u8; 32], head: &HistoryHead, audit_anchor: [u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(RECORD_CHAIN_DOMAIN);
+    digest.update(previous);
+    digest.update(head.tx_id.as_uuid().as_bytes());
+    digest.update(head.version.get().to_be_bytes());
+    digest.update(head.encrypted_digest);
+    digest.update(audit_anchor);
+    digest.finalize().into()
+}
+
+fn record_chain_sync(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<[u8; 32]> {
+    let mut statement = conn
+        .prepare("SELECT tx_id, version, encrypted_blob, audit_count, audit_terminal_hash FROM config_history ORDER BY version ASC")
+        .map_err(database_error)?;
+    let mut rows = statement.query([]).map_err(database_error)?;
+    let mut digest = empty_record_chain();
+    loop {
+        cancellation.check_io()?;
+        let Some(row) = rows.next().map_err(database_error)? else {
+            break;
+        };
+        let tx_id: Vec<u8> = row.get(0).map_err(database_error)?;
+        let version: i64 = row.get(1).map_err(database_error)?;
+        let encrypted: Vec<u8> = row.get(2).map_err(database_error)?;
+        let count: i64 = row.get(3).map_err(database_error)?;
+        let terminal: Vec<u8> = row.get(4).map_err(database_error)?;
+        let head = HistoryHead {
+            tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?),
+            version: ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?),
+            encrypted_digest: Sha256::digest(encrypted).into(),
+        };
+        digest = extend_record_chain(digest, &head, audit_anchor_digest(count, &terminal)?);
+    }
+    Ok(digest)
+}
+
+/// Full validation precedes pruning, retained reopen and snapshot acceptance.
+/// Framing/AAD validation cannot authenticate opaque ciphertext without the
+/// decryption key. The history HMAC authenticates this ordered digest, including
+/// each record's audit anchor so removing both audit rows and their anchor fails.
+pub(crate) fn validate_record_chain_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    if let Some(state) = load_state(conn, key)? {
+        if record_chain_sync(conn, cancellation)? != state.record_chain {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
 fn save_state(conn: &Connection, key: &AuditKey, state: &HistoryState) -> io::Result<()> {
     let encoded = serde_json::to_vec(state).map_err(|_| corrupt())?;
     if encoded.len() > STATE_MAX_BYTES {
@@ -201,6 +276,7 @@ pub(crate) fn initialize_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
     save_state(
         conn,
@@ -214,6 +290,7 @@ pub(crate) fn initialize_sync(
             boundary: None,
             head: head_sync(conn)?,
             records: record_count(conn)?,
+            record_chain: record_chain_sync(conn, cancellation)?,
         },
     )
 }
@@ -399,8 +476,37 @@ pub(crate) fn refresh_sync(
             return Ok(Err(ConfigMutationFailure::HistoryFull));
         }
     }
-    state.head = head_sync(conn)?;
-    state.records = record_count(conn)?;
+    let head = head_sync(conn)?;
+    let records = record_count(conn)?;
+    if head != state.head {
+        let next = head.as_ref().ok_or_else(corrupt)?;
+        if state.records.checked_add(1) != Some(records)
+            || state.head.as_ref().is_some_and(|previous| {
+                previous.version.get().checked_add(1) != Some(next.version.get())
+            })
+            || state.head.is_none() && state.records != 0
+        {
+            return Err(corrupt());
+        }
+        // Extend the authenticated prior digest with only this new record.
+        // Rehashing old rows here would bless unrelated on-disk corruption.
+        let (count, terminal): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT audit_count, audit_terminal_hash FROM config_history WHERE tx_id = ?1",
+                [next.tx_id.as_uuid().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(database_error)?;
+        state.record_chain = extend_record_chain(
+            state.record_chain,
+            next,
+            audit_anchor_digest(count, &terminal)?,
+        );
+    } else if records != state.records {
+        return Err(corrupt());
+    }
+    state.head = head;
+    state.records = records;
     save_state(conn, key, &state)?;
     Ok(Ok(()))
 }
@@ -409,6 +515,7 @@ pub(crate) fn retain_sync(
     conn: &Connection,
     key: &AuditKey,
     decision: &ConfigHistoryRetention,
+    cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     if decision.validate().is_err() {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
@@ -450,6 +557,7 @@ pub(crate) fn retain_sync(
         })
         .map_err(database_error)?;
     for row in rows {
+        cancellation.check_io()?;
         let (principal, rollback) = row.map_err(database_error)?;
         if rollback || crate::types::config_recovery_required(&principal).map_err(|_| corrupt())? {
             return Ok(Err(ConfigMutationFailure::HistoryProtected));
@@ -515,6 +623,7 @@ pub(crate) fn retain_sync(
         conn.execute("DELETE FROM config_lifecycle_audit WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
         conn.execute("DELETE FROM config_history WHERE version < ?1", [from])
             .map_err(database_error)?;
+        state.record_chain = record_chain_sync(conn, cancellation)?;
     }
     state.records = record_count(conn)?;
     state.limits = Some(decision.limits);

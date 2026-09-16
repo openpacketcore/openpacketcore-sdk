@@ -980,6 +980,186 @@ async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_st
 }
 
 #[tokio::test]
+async fn history_retention_refuses_to_erase_corrupt_acknowledged_prefix() {
+    for mutation in [
+        "audit",
+        "audit_anchor",
+        "envelope",
+        "ciphertext",
+        "ciphertext_then_append",
+    ] {
+        let dir = tempfile::tempdir().expect("directory");
+        let database = dir.path().join("config.sqlite");
+        let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+        let mut ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+        for index in 0..5 {
+            store
+                .append_attested_commit(attested(
+                    commit(
+                        ids[index],
+                        index.checked_sub(1).map(|previous| ids[previous]),
+                        index as u64 + 1,
+                        0x62,
+                    ),
+                    audit(ids[index]),
+                ))
+                .await
+                .expect("complete encrypted history");
+        }
+        let observer = rusqlite::Connection::open(&database).expect("adversarial connection");
+        if mutation == "audit" || mutation == "audit_anchor" {
+            observer
+                .execute(
+                    "DELETE FROM audit_trail WHERE tx_id = (SELECT tx_id FROM config_history WHERE version = 1)",
+                    [],
+                )
+                .expect("remove one required audit entry");
+            if mutation == "audit_anchor" {
+                observer
+                    .execute("UPDATE config_history SET audit_count = 0, audit_terminal_hash = zeroblob(32) WHERE version = 1", [])
+                    .expect("also remove the unauthenticated row audit anchor");
+            }
+        } else if mutation == "envelope" {
+            observer
+                .execute(
+                    "UPDATE config_history SET encrypted_blob = x'01' WHERE version = 1",
+                    [],
+                )
+                .expect("malformed older envelope");
+        } else {
+            let mut blob: Vec<u8> = observer
+                .query_row(
+                    "SELECT encrypted_blob FROM config_history WHERE version = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("older complete envelope");
+            *blob.last_mut().expect("ciphertext tag") ^= 1;
+            opc_crypto::CryptoEnvelopeV1::decode(&blob).expect("still a well-formed envelope");
+            observer
+                .execute(
+                    "UPDATE config_history SET encrypted_blob = ?1 WHERE version = 1",
+                    [blob],
+                )
+                .expect("modified older ciphertext");
+        }
+        if mutation == "ciphertext_then_append" {
+            let next = TxId::new();
+            store
+                .append_attested_commit(attested(commit(next, Some(ids[4]), 6, 0x62), audit(next)))
+                .await
+                .expect("append cannot bless corruption in an older ciphertext");
+            ids.push(next);
+        }
+        let version = ids.len() as u64;
+        let result = store
+            .retain_history_idempotent(
+                ConfigConsensusRequestId::from_bytes([0xEE; 16]),
+                retention(
+                    *ids.last().expect("head"),
+                    version,
+                    version - 1,
+                    2,
+                    1_048_576,
+                ),
+            )
+            .await;
+        let count: i64 = observer
+            .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+            .expect("independent retained-row readback");
+        let state: Vec<u8> = observer
+            .query_row(
+                "SELECT state_json FROM config_raft_history_retention",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unchanged boundary readback");
+        drop(observer);
+        store.shutdown().await.expect("shutdown");
+        assert!(
+            result.is_err(),
+            "{mutation}: corruption cannot be legitimized by pruning"
+        );
+        assert_eq!(
+            count as u64, version,
+            "{mutation}: no acknowledged row was removed"
+        );
+        let state: serde_json::Value = serde_json::from_slice(&state).expect("state shape");
+        assert!(
+            state["boundary"].is_null(),
+            "no authenticated compaction permission was minted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_ciphertext_corruption_is_refused_on_explicit_reopen() {
+    let dir = tempfile::tempdir().expect("directory");
+    let path = dir.path().join("retained.sqlite");
+    let backend = SqliteBackend::provision_config_authority(
+        retained_options(&path, topology(), 1),
+        audit_key(),
+    )
+    .await
+    .expect("explicit provision");
+    let store = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("store");
+    store.initialize_cluster().await.expect("initialize");
+    let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+    for index in 0..5 {
+        store
+            .append_attested_commit(attested(
+                commit(
+                    ids[index],
+                    index.checked_sub(1).map(|i| ids[i]),
+                    index as u64 + 1,
+                    0x62,
+                ),
+                audit(ids[index]),
+            ))
+            .await
+            .expect("encrypted configuration");
+    }
+    store
+        .retain_history_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xEF; 16]),
+            retention(ids[4], 5, 3, 3, 1_048_576),
+        )
+        .await
+        .expect("keep versions three through five");
+    store.shutdown().await.expect("shutdown");
+    drop(store);
+    let attacker = rusqlite::Connection::open(&path).expect("offline corruptor");
+    let mut blob: Vec<u8> = attacker
+        .query_row(
+            "SELECT encrypted_blob FROM config_history WHERE version = 4",
+            [],
+            |row| row.get(0),
+        )
+        .expect("middle ciphertext, neither head nor boundary");
+    *blob.last_mut().expect("ciphertext tag") ^= 1;
+    opc_crypto::CryptoEnvelopeV1::decode(&blob).expect("framing remains valid");
+    attacker
+        .execute(
+            "UPDATE config_history SET encrypted_blob = ?1 WHERE version = 4",
+            [blob],
+        )
+        .expect("modify middle ciphertext only");
+    drop(attacker);
+    assert!(matches!(
+        SqliteBackend::reopen_config_authority(retained_options(&path, topology(), 1), audit_key())
+            .await,
+        Err(opc_persist::RetainedConfigError::Rejected)
+    ));
+}
+
+#[tokio::test]
 async fn retained_history_floor_limits_and_outcomes_survive_explicit_reopen() {
     let dir = tempfile::tempdir().expect("directory");
     let path = dir.path().join("retained.sqlite");
