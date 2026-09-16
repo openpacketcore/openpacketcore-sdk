@@ -111,19 +111,13 @@ fn check_application_read_deadline(deadline: Option<Instant>) -> io::Result<()> 
 }
 
 fn projection_schema_version(conn: &Connection) -> io::Result<i64> {
-    conn.pragma_query_value(
-        Some(rusqlite::DatabaseName::Main),
-        "schema_version",
-        |row| row.get(0),
-    )
-    .map_err(db_error)
+    conn.pragma_query_value(Some("main"), "schema_version", |row| row.get(0))
+        .map_err(db_error)
 }
 
 fn projection_data_version(conn: &Connection) -> io::Result<i64> {
-    conn.pragma_query_value(Some(rusqlite::DatabaseName::Main), "data_version", |row| {
-        row.get(0)
-    })
-    .map_err(db_error)
+    conn.pragma_query_value(Some("main"), "data_version", |row| row.get(0))
+        .map_err(db_error)
 }
 
 pub(super) fn validate_applied_prefix(state: &State, binding: Binding) -> io::Result<()> {
@@ -813,16 +807,10 @@ fn read_cache_guard(conn: &Connection, token: [u8; 16]) -> io::Result<CacheGuard
         token,
         changes: conn.total_changes(),
         data_version: conn
-            .pragma_query_value(Some(rusqlite::DatabaseName::Main), "data_version", |row| {
-                row.get(0)
-            })
+            .pragma_query_value(Some("main"), "data_version", |row| row.get(0))
             .map_err(db_error)?,
         schema_version: conn
-            .pragma_query_value(
-                Some(rusqlite::DatabaseName::Main),
-                "schema_version",
-                |row| row.get(0),
-            )
+            .pragma_query_value(Some("main"), "schema_version", |row| row.get(0))
             .map_err(db_error)?,
     })
 }

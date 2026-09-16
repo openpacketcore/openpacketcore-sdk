@@ -2566,7 +2566,7 @@ fn v2_journal_limits() -> Result<[(Limit, i32); 9], StoreError> {
 
 fn verify_v2_journal_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, expected) in v2_journal_limits()? {
-        if conn.limit(limit) != expected {
+        if conn.limit(limit).map_err(|_| v2_journal_unavailable())? != expected {
             return Err(v2_journal_unavailable());
         }
     }
@@ -2575,7 +2575,8 @@ fn verify_v2_journal_limits(conn: &Connection) -> Result<(), StoreError> {
 
 fn configure_v2_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, requested) in v2_journal_limits()? {
-        conn.set_limit(limit, requested);
+        conn.set_limit(limit, requested)
+            .map_err(|_| v2_journal_unavailable())?;
     }
     verify_v2_journal_limits(conn)
 }
@@ -4051,10 +4052,13 @@ fn update_v2_journal_membership_after_insert(
 fn install_journal_progress_handler(conn: &Connection) -> Arc<JournalSqliteProgressBudget> {
     let progress_budget = Arc::new(JournalSqliteProgressBudget::new());
     let handler_budget = Arc::clone(&progress_budget);
+    // rusqlite rejects hooks on borrowed raw handles. Journal constructors
+    // open owning connections, so rejection here is an ownership invariant.
     conn.progress_handler(
         JOURNAL_SQLITE_PROGRESS_INSTRUCTION_INTERVAL,
         Some(move || handler_budget.should_interrupt()),
-    );
+    )
+    .expect("journal owns its SQLite connection");
     progress_budget
 }
 
@@ -4407,7 +4411,8 @@ fn journal_sqlite_length_limit() -> Result<i32, StoreError> {
 
 fn configure_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, requested) in journal_sqlite_limits()? {
-        conn.set_limit(limit, requested);
+        conn.set_limit(limit, requested)
+            .map_err(|_| journal_unavailable())?;
     }
     verify_journal_sqlite_limits(conn)
 }
@@ -4428,7 +4433,7 @@ fn journal_sqlite_limits() -> Result<[(Limit, i32); 9], StoreError> {
 
 fn verify_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, requested) in journal_sqlite_limits()? {
-        if conn.limit(limit) != requested {
+        if conn.limit(limit).map_err(|_| journal_unavailable())? != requested {
             return Err(journal_unavailable());
         }
     }
@@ -6504,15 +6509,19 @@ mod tests {
 
             let callbacks = Arc::new(AtomicUsize::new(0));
             let handler_callbacks = Arc::clone(&callbacks);
-            connection.progress_handler(
-                1,
-                Some(move || {
-                    handler_callbacks.fetch_add(1, Ordering::Relaxed);
-                    false
-                }),
-            );
+            connection
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        handler_callbacks.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }),
+                )
+                .expect("SQLite test hook registration");
             scan_journal_membership(&connection, &incarnation, 1).expect("measure membership scan");
-            connection.progress_handler(0, None::<fn() -> bool>);
+            connection
+                .progress_handler(0, None::<fn() -> bool>)
+                .expect("SQLite test hook registration");
             callbacks.load(Ordering::Relaxed)
         }
 
@@ -6652,7 +6661,9 @@ mod tests {
             .expect("journal length limit is representable")
             .checked_sub(1)
             .expect("journal length limit is positive");
-        connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, lowered_limit);
+        connection
+            .set_limit(Limit::SQLITE_LIMIT_LENGTH, lowered_limit)
+            .unwrap();
         assert_coarse_unavailable(verify_connection_profile(&connection));
     }
 

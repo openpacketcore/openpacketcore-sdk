@@ -607,7 +607,8 @@ fn native_snapshot_generic_projection_reuses_preparation_and_reads_current_rows(
             observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         rusqlite::hooks::Authorization::Allow
-    }));
+    }))
+    .expect("SQLite test hook registration");
     for _ in 0..4 {
         for (id, digest, response) in &expected {
             assert_eq!(

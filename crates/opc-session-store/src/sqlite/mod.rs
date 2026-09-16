@@ -712,9 +712,13 @@ impl Drop for SqliteOperationCancellation {
 
 struct SqliteOperationProgressGuard<'a>(&'a Connection);
 
+// Worker connections are opened by the backend, never borrowed raw handles.
+// rusqlite's hook ownership check therefore must hold until guard removal.
 impl Drop for SqliteOperationProgressGuard<'_> {
     fn drop(&mut self) {
-        self.0.progress_handler(0, None::<fn() -> bool>);
+        self.0
+            .progress_handler(0, None::<fn() -> bool>)
+            .expect("SQLite worker owns its connection");
     }
 }
 
@@ -929,7 +933,8 @@ fn install_sqlite_operation_progress_handler(
                 .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
                 || std::time::Instant::now() >= deadline
         }),
-    );
+    )
+    .expect("SQLite worker owns its connection");
     SqliteOperationProgressGuard(conn)
 }
 
@@ -5010,18 +5015,20 @@ mod operation_lifetime_tests {
         };
         let reader = readers.pop().expect("reader to return");
         let checkpoint_attempts = Arc::new(AtomicUsize::new(0));
-        reader.authorizer(Some({
-            let checkpoint_attempts = Arc::clone(&checkpoint_attempts);
-            move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
-                AuthAction::Pragma { pragma_name, .. }
-                    if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
-                {
-                    checkpoint_attempts.fetch_add(1, Ordering::AcqRel);
-                    Authorization::Deny
+        reader
+            .authorizer(Some({
+                let checkpoint_attempts = Arc::clone(&checkpoint_attempts);
+                move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                    AuthAction::Pragma { pragma_name, .. }
+                        if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
+                    {
+                        checkpoint_attempts.fetch_add(1, Ordering::AcqRel);
+                        Authorization::Deny
+                    }
+                    _ => Authorization::Allow,
                 }
-                _ => Authorization::Allow,
-            }
-        }));
+            }))
+            .expect("SQLite test hook registration");
 
         let first = reader
             .unchecked_transaction()
@@ -5101,18 +5108,20 @@ mod operation_lifetime_tests {
             readers
         };
         for reader in readers {
-            reader.authorizer(Some({
-                let checkpoint_attempts = Arc::clone(&checkpoint_attempts);
-                move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
-                    AuthAction::Pragma { pragma_name, .. }
-                        if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
-                    {
-                        checkpoint_attempts.fetch_add(1, Ordering::AcqRel);
-                        Authorization::Deny
+            reader
+                .authorizer(Some({
+                    let checkpoint_attempts = Arc::clone(&checkpoint_attempts);
+                    move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                        AuthAction::Pragma { pragma_name, .. }
+                            if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
+                        {
+                            checkpoint_attempts.fetch_add(1, Ordering::AcqRel);
+                            Authorization::Deny
+                        }
+                        _ => Authorization::Allow,
                     }
-                    _ => Authorization::Allow,
-                }
-            }));
+                }))
+                .expect("SQLite test hook registration");
             pool.sender
                 .try_send(reader)
                 .expect("return instrumented reader lane");
@@ -5207,12 +5216,14 @@ mod operation_lifetime_tests {
         reader
             .execute_batch("ROLLBACK")
             .expect("close reader transaction");
-        reader.authorizer(Some(
-            |context: rusqlite::hooks::AuthContext<'_>| match context.action {
-                AuthAction::Select => Authorization::Deny,
-                _ => Authorization::Allow,
-            },
-        ));
+        reader
+            .authorizer(Some(
+                |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                    AuthAction::Select => Authorization::Deny,
+                    _ => Authorization::Allow,
+                },
+            ))
+            .expect("SQLite test hook registration");
         assert!(
             !pool.connection_is_usable(&reader),
             "a reader that cannot run its SELECT 1 health probe is retired",

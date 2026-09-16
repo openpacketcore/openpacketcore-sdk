@@ -507,7 +507,8 @@ impl ConsumerCheckpointStore {
                     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
                 let conn = slot.as_mut().ok_or(ConsumerCheckpointError::Closed)?;
                 let progress = Arc::clone(&task_work);
-                conn.progress_handler(1000, Some(move || progress.check().is_err()));
+                conn.progress_handler(1000, Some(move || progress.check().is_err()))
+                    .map_err(|_| ConsumerCheckpointError::Unavailable)?;
                 check_storage_size(&options)?;
                 if let Some((expected, verified_digest, row)) = update {
                     let current = read_row(conn, &options)?;
@@ -835,7 +836,8 @@ fn prepare_files(
         copy_for_validation(options, &destination, work)?;
         let conn = open_sqlite(&destination)?;
         let progress = Arc::clone(work);
-        conn.progress_handler(1000, Some(move || progress.check().is_err()));
+        conn.progress_handler(1000, Some(move || progress.check().is_err()))
+            .map_err(|_| ConsumerCheckpointError::Unavailable)?;
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .map_err(|_| ConsumerCheckpointError::Rejected)?;
@@ -919,8 +921,10 @@ fn finish_open(
         } else {
             rusqlite::hooks::Authorization::Deny
         }
-    }));
-    conn.progress_handler(0, None::<fn() -> bool>);
+    }))
+    .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+    conn.progress_handler(0, None::<fn() -> bool>)
+        .map_err(|_| ConsumerCheckpointError::Unavailable)?;
     work.check()?;
     Ok(BackendConnection::retained(conn, prepared.admission))
 }
@@ -931,7 +935,8 @@ fn configure_connection(
     work: &Arc<Work>,
 ) -> Result<(), ConsumerCheckpointError> {
     let progress = Arc::clone(work);
-    conn.progress_handler(1000, Some(move || progress.check().is_err()));
+    conn.progress_handler(1000, Some(move || progress.check().is_err()))
+        .map_err(|_| ConsumerCheckpointError::Unavailable)?;
     crate::schema::apply_pragma_profile(conn).map_err(|_| ConsumerCheckpointError::Unavailable)?;
     let page_size: u64 = conn
         .pragma_query_value(None, "page_size", |r| r.get(0))

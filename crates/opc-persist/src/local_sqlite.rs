@@ -184,7 +184,7 @@ pub(crate) fn open_sqlite(path: &Path) -> Result<Connection, RetainedConfigError
     )
     .map_err(|_| RetainedConfigError::Rejected)?;
     if conn
-        .is_readonly(rusqlite::DatabaseName::Main)
+        .is_readonly(rusqlite::MAIN_DB)
         .map_err(|_| RetainedConfigError::Rejected)?
     {
         return Err(RetainedConfigError::Rejected);

@@ -990,7 +990,8 @@ fn inspect_replica_from_pinned_with<T>(
     run_pinned_inspection_path_swap_hook(true, &database_path);
     let started = budget.started;
     let max_duration = input.limits.max_duration();
-    conn.progress_handler(1_000, Some(move || started.elapsed() >= max_duration));
+    conn.progress_handler(1_000, Some(move || started.elapsed() >= max_duration))
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
     validate_database_snapshot(&conn, &budget)?;
     let evidence = if table_exists(&conn, "consensus_identity")? {
         inspect_current(
