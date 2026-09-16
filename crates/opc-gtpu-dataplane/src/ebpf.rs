@@ -2685,6 +2685,7 @@ struct SelectorOperationStamp {
 #[derive(Clone, Copy)]
 struct SelectorOperationStampAuthority {
     binding: crate::selector_namespace::GtpuSessionSelectorBackendBinding,
+    bearer_parent: Option<[u8; GTPU_SESSION_GROUP_ID_LEN]>,
     install_effect_authority: bool,
     retirement_effect_authority: bool,
     retired_readback_authority: bool,
@@ -2705,6 +2706,9 @@ impl From<&crate::selector_namespace::GtpuSessionSelectorAdmission>
     fn from(admission: &crate::selector_namespace::GtpuSessionSelectorAdmission) -> Self {
         Self {
             binding: admission.binding(),
+            bearer_parent: admission
+                .bearer_parent()
+                .map(|parent| parent.id().to_bytes()),
             install_effect_authority: admission.authorizes_install_effect(),
             retirement_effect_authority: admission.authorizes_retirement_effect(),
             retired_readback_authority: admission.authorizes_retired_readback(),
@@ -6838,6 +6842,7 @@ impl EbpfGtpuDataplaneBackend {
             journal.group_id().to_bytes(),
             GtpuTrafficProofInvalidation::DataplaneGenerationChanged,
         );
+        self.invalidate_bearer_parent_traffic_attempts(stamp_authority);
 
         if journal.phase() == GtpuSessionTransactionPhase::Prepared {
             if base.is_none() {
@@ -6993,6 +6998,7 @@ impl EbpfGtpuDataplaneBackend {
             journal.group_id().to_bytes(),
             GtpuTrafficProofInvalidation::AuthorityRevoked,
         );
+        self.invalidate_bearer_parent_traffic_attempts(stamp_authority);
         if journal.phase() == GtpuSessionTransactionPhase::Prepared {
             currentness().map_err(|_| GtpuSessionGroupIndeterminateReason::AuthorityUnavailable)?;
             self.put_grouped_authority_exact(context, Some(base), removing, currentness)?;
@@ -7343,6 +7349,13 @@ impl EbpfGtpuDataplaneBackend {
             // from here until the final graph receipt.  A stale worker must
             // not observe a journal while queued behind a previous holder.
             currentness()?;
+            if let Some(parent) = admission.bearer_parent() {
+                if self.exact_active_traffic_group(parent).is_err() {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::AuthorityUnavailable,
+                    ));
+                }
+            }
             let observation = match self.stable_grouped_observation(&context, desired.id()) {
                 Ok(Some(observation)) => observation,
                 Ok(None) => {
@@ -7409,6 +7422,7 @@ impl EbpfGtpuDataplaneBackend {
                     desired.id().to_bytes(),
                     GtpuTrafficProofInvalidation::DataplaneGenerationChanged,
                 );
+                self.invalidate_bearer_parent_traffic_attempts(Some(stamp_authority));
                 currentness()?;
                 return match self.execute_grouped_install_journal(
                     &context,
@@ -7574,6 +7588,7 @@ impl EbpfGtpuDataplaneBackend {
                 ));
             }
             currentness()?;
+            self.invalidate_bearer_parent_traffic_attempts(Some(stamp_authority));
             if let Err(reason) = self.put_selector_operation_stamp_exact(
                 &context,
                 desired.id(),
@@ -7752,6 +7767,7 @@ impl EbpfGtpuDataplaneBackend {
                     expected.id().to_bytes(),
                     GtpuTrafficProofInvalidation::AuthorityRevoked,
                 );
+                self.invalidate_bearer_parent_traffic_attempts(authority);
                 currentness()?;
                 return match self.execute_grouped_removal_journal(
                     &context,
@@ -7845,6 +7861,7 @@ impl EbpfGtpuDataplaneBackend {
             };
             if let Some(authority) = authority {
                 currentness()?;
+                self.invalidate_bearer_parent_traffic_attempts(Some(authority));
                 if let Err(reason) = self.replace_selector_operation_stamp_exact(
                     &context,
                     expected.id(),
@@ -12115,6 +12132,18 @@ impl EbpfGtpuDataplaneBackend {
             {
                 Self::invalidate_traffic_attempt(attempt, invalidation);
             }
+        }
+    }
+
+    fn invalidate_bearer_parent_traffic_attempts(
+        &self,
+        authority: Option<SelectorOperationStampAuthority>,
+    ) {
+        if let Some(parent) = authority.and_then(|authority| authority.bearer_parent) {
+            self.invalidate_traffic_attempts_on_group(
+                parent,
+                GtpuTrafficProofInvalidation::AuthorityRevoked,
+            );
         }
     }
 
@@ -53677,6 +53706,7 @@ mod load_capability_tests {
 
 #[cfg(test)]
 mod tests {
+    mod grouped_bearer_transition;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]
