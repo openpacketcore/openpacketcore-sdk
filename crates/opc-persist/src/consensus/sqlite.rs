@@ -382,6 +382,7 @@ impl ConfigConsensusCore {
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
+        let worker_backend = backend.clone();
         let retained = backend.retained_binding.is_some();
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
@@ -414,6 +415,11 @@ impl ConfigConsensusCore {
                     before_commit,
                 )
             };
+            if result.is_ok() {
+                // Latch before releasing the shared connection, including when
+                // the awaiting future is cancelled after the durable claim.
+                worker_backend.require_config_consensus_history();
+            }
             worker_conn.progress_handler(0, None::<fn() -> bool>);
             result
         });
@@ -2707,7 +2713,7 @@ pub(crate) fn apply_entries_cancellable_sync(
             .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
     }
     let tx = conn.unchecked_transaction().map_err(db_error)?;
-    super::history::validate_sync(&tx, audit_key)?;
+    super::history::validate_access_sync(&tx, audit_key, true, cancellation)?;
     let mut last_applied = read_applied_sync(&tx, identity)?;
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());

@@ -9,6 +9,7 @@ pub(crate) mod history;
 mod raft_adapter;
 mod snapshot_file;
 mod sqlite;
+pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
 mod store;
 mod types;

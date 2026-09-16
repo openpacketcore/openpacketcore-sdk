@@ -308,7 +308,8 @@ fn record_chain_sync(
     Ok(digest)
 }
 
-/// Full validation precedes pruning, retained reopen and snapshot acceptance.
+/// Full validation precedes live reads/admission, pruning, retained reopen and
+/// snapshot acceptance, within the same transaction as the protected use.
 /// Framing/AAD validation cannot authenticate opaque ciphertext without the
 /// decryption key. The history HMAC authenticates this ordered digest, including
 /// each record's audit anchor and mutable reference metadata. Removing audit
@@ -363,12 +364,25 @@ pub(crate) fn initialize_sync(
     )
 }
 
+/// Presence is only a refusal fence: partial consensus state cannot grant the
+/// standalone path. An admitted backend also remembers this requirement if all
+/// these tables are subsequently removed by an independent connection.
+pub(crate) fn has_consensus_metadata_sync(conn: &Connection) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND (name GLOB 'config_raft_*' OR name = 'consensus_retained_binding'))",
+        [], |row| row.get(0),
+    ).map_err(database_error)
+}
+
 fn load_state(conn: &Connection, key: &AuditKey) -> io::Result<Option<HistoryState>> {
     let consensus: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_raft_identity')",
         [], |row| row.get(0),
     ).map_err(database_error)?;
     if !consensus {
+        if has_consensus_metadata_sync(conn)? {
+            return Err(corrupt());
+        }
         return Ok(None);
     }
     let (encoded, tag): (Vec<u8>, Vec<u8>) = conn
@@ -518,15 +532,43 @@ fn retained_size(conn: &Connection, before: Option<i64>) -> io::Result<(u64, u64
     ))
 }
 
+fn validate_limited_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
+    validate_state(conn, state)?;
+    if let Some(limits) = state.limits {
+        let (records, bytes) = retained_size(conn, None)?;
+        if records > u64::from(limits.max_records) || bytes > limits.max_bytes {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_sync(conn: &Connection, key: &AuditKey) -> io::Result<()> {
     if let Some(state) = load_state(conn, key)? {
-        validate_state(conn, &state)?;
-        if let Some(limits) = state.limits {
-            let (records, bytes) = retained_size(conn, None)?;
-            if records > u64::from(limits.max_records) || bytes > limits.max_bytes {
-                return Err(corrupt());
-            }
-        }
+        validate_limited_state(conn, &state)?;
+    }
+    Ok(())
+}
+
+/// Authenticate once per read/apply transaction, before even a negative lookup
+/// or metadata-based admission decision. Per-row projection must not repeat the
+/// complete scan; it runs in this same authenticated SQLite snapshot instead.
+pub(crate) fn validate_access_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    consensus_required: bool,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    let Some(state) = load_state(conn, key)? else {
+        return if consensus_required {
+            Err(corrupt())
+        } else {
+            Ok(())
+        };
+    };
+    validate_limited_state(conn, &state)?;
+    if record_chain_sync(conn, cancellation)? != state.record_chain {
+        return Err(corrupt());
     }
     Ok(())
 }

@@ -2528,6 +2528,140 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_encrypted_watch_refuses_a_tampered_live_publication_fence() {
+        use opc_config_bus::EncryptingManagedDatastore;
+        use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+        use opc_persist::{
+            AuditKey, ConfigConsensusNodeId, ConfigConsensusRequestId, ConfigConsensusTopology,
+            ConfigHistoryLimits, ConfigHistoryRetention, ConsensusConfigStore, SqliteBackend,
+        };
+        let directory = tempfile::tempdir().expect("consensus history directory");
+        let identity = scope(38);
+        let node = ConfigConsensusNodeId::new(1).expect("node");
+        let backend = SqliteBackend::open_with_audit_key(
+            directory.path().join("config.sqlite"),
+            true,
+            0,
+            AuditKey::new([0x62; 32]).expect("audit key"),
+        )
+        .await
+        .expect("configuration storage");
+        let consensus = Arc::new(
+            ConsensusConfigStore::open(
+                ConfigConsensusTopology::try_new(identity, node, [node].into_iter().collect())
+                    .expect("topology"),
+                backend,
+                directory.path().join("snapshots"),
+                Default::default(),
+            )
+            .await
+            .expect("real consensus"),
+        );
+        consensus
+            .initialize_cluster()
+            .await
+            .expect("admit authority");
+        let provider = Arc::new(MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                KeyId::new("history-test").expect("key ID"),
+                KeyPurpose::Config,
+                TenantId::new("test").expect("tenant"),
+                Zeroizing::new([0xA5; AES_256_GCM_SIV_KEY_LEN]),
+            )
+            .expect("encryption key");
+        let encrypted = Arc::new(EncryptingManagedDatastore::new(
+            Arc::new(crate::RaftManagedDatastore::<TestConfig>::new(
+                consensus.clone(),
+            )),
+            provider,
+        ));
+        let transactions: Vec<_> = (0..4).map(|_| TxId::new()).collect();
+        for index in 0..3 {
+            encrypted
+                .append_commit_write(CommitWrite::new(record(
+                    index as u64 + 1,
+                    transactions[index],
+                    index.checked_sub(1).map(|previous| transactions[previous]),
+                    &format!("complete-v{}", index + 1),
+                )))
+                .await
+                .expect("real encrypted append");
+        }
+        consensus
+            .retain_history_idempotent(
+                ConfigConsensusRequestId::from_bytes([0x38; 16]),
+                ConfigHistoryRetention::new(
+                    transactions[2],
+                    ConfigVersion::new(3),
+                    ConfigVersion::new(1),
+                    ConfigVersion::new(2),
+                    ConfigHistoryLimits::new(4, 1_048_576).expect("limits"),
+                )
+                .expect("acknowledged prefix"),
+            )
+            .await
+            .expect("production retention with spare capacity");
+        let mut fenced = record(4, transactions[3], Some(transactions[2]), "unresolved-v4");
+        fenced.recovery_required = true;
+        encrypted
+            .append_commit_write(CommitWrite::new(fenced))
+            .await
+            .expect("encrypted recovery-fenced head");
+        assert!(
+            encrypted
+                .load_latest()
+                .await
+                .expect("authenticated head")
+                .expect("head")
+                .recovery_required
+        );
+        let bus = Arc::new(
+            ConfigBus::restore_shadow(encrypted.clone())
+                .await
+                .expect("committed shadow"),
+        );
+        let tls = TestTls::new(38);
+        let (handle, address) = start_server(bus, &tls, identity).await;
+        let remote = tls.remote(identity, address);
+        let before = remote
+            .recover_from(Some(ConfigVersion::new(2)))
+            .await
+            .expect("valid recovery");
+        assert_eq!(before.snapshot().version, ConfigVersion::new(3));
+        drop(before);
+        let observer = rusqlite::Connection::open(directory.path().join("config.sqlite"))
+            .expect("independent SQLite connection");
+        assert_eq!(observer.execute(
+            "UPDATE config_history SET principal = replace(principal, '\"recovery_required\":true', '\"recovery_required\":false') WHERE version = 4", [],
+        ).expect("alter only the mutable wrapper flag"), 1);
+        let published_refused = encrypted.load_committed_latest().await.is_err();
+        let tail_refused = encrypted
+            .load_since(ConfigVersion::new(3), 8)
+            .await
+            .is_err();
+        let recovery_refused = remote
+            .recover_from(Some(ConfigVersion::new(3)))
+            .await
+            .is_err();
+        drop(observer);
+        handle.shutdown().await;
+        consensus.shutdown().await.expect("reap consensus engine");
+        assert!(
+            published_refused,
+            "AEAD alone cannot authenticate the mutable publication fence"
+        );
+        assert!(
+            tail_refused,
+            "the unresolved successor cannot enter the encrypted tail"
+        );
+        assert!(
+            recovery_refused,
+            "remote recovery cannot publish an unauthenticated head"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_consensus_retention_recovers_encrypted_snapshot_and_exact_remote_tail() {
         use opc_config_bus::EncryptingManagedDatastore;
         use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};

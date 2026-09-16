@@ -133,9 +133,12 @@ contract, and representation cutover limitation.
 
 Creating the `config_raft_identity` table claims the database for Openraft in
 the same immediate SQLite transaction that checks or imports legacy state.
-Every public standalone mutation checks that marker under the same connection
-lock and fails closed after the claim, including mutations through a retained
-or freshly reopened `SqliteBackend` clone. The backend exposes neither its raw
+Every public standalone mutation checks consensus metadata under the same
+connection lock. Each backend clone also retains the claimed requirement, so
+even removing all consensus tables cannot re-enable local writes. Live history
+reads authenticate the complete retained metadata chain and query it in one
+SQLite read transaction; missing or modified authority is a refusal, including
+negative lookups. The backend exposes neither its raw
 SQLite connection nor its audit key, and `AuditKey` does not expose key bytes;
 typed operations are the only safe public authority surface. Protect the
 database directory with the CNF's normal filesystem identity and permissions,

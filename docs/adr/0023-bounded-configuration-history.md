@@ -43,6 +43,18 @@ state is bounded to 4096 encoded bytes, uses a closed versioned shape, and is
 verified before authoritative reads, retention, reopen, and snapshot acceptance.
 The key does not leave the existing persistence authority.
 
+Every live history read, including floor and negative replay/rollback lookups,
+verifies the complete ordered record digest before consulting mutable metadata.
+Validation and the resulting query share one SQLite read transaction; the Rust
+connection mutex alone cannot exclude an independently opened SQLite writer.
+These scans use the existing bounded, cancellable blocking worker. Every apply
+batch likewise authenticates its prior history in the same transaction before
+admission or cached-outcome decisions. Missing consensus identity with residual
+consensus state is corruption. Once a backend has claimed consensus, every clone
+retains that requirement even if all consensus tables are later removed; absence
+cannot re-enable standalone reads or direct writes. An actual standalone backend
+that has never claimed consensus retains its existing contract.
+
 Append extends the authenticated record digest with the new record only;
 it cannot authenticate an unrelated change to an older record. A command that
 legitimately changes an existing record first validates the complete prior
@@ -155,7 +167,9 @@ are separate contracts and are unchanged.
 
 The real encrypted consensus and ConfigWatch detectors cover production pruning,
 exact and old cursors, complete snapshot/tail recovery, row/byte caps, protected
-references, atomic confirmation rollback, response replay, corruption, retained
+references, atomic confirmation rollback, response replay, immediate live-read
+and admission refusal after metadata corruption, concurrent SQLite mutation,
+missing identity and complete consensus-table removal, retained
 reopen, natural election and member snapshot installation. Preserve the initial
 missing-behavior RED, fix-removal RED, and independently mutated cursor RED.
 Repository gates and whole-change review are required before a merge claim.

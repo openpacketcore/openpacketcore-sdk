@@ -991,7 +991,7 @@ async fn history_retention_refuses_to_erase_corrupt_acknowledged_prefix() {
         let dir = tempfile::tempdir().expect("directory");
         let database = dir.path().join("config.sqlite");
         let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
-        let mut ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+        let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
         for index in 0..5 {
             store
                 .append_attested_commit(attested(
@@ -1048,8 +1048,7 @@ async fn history_retention_refuses_to_erase_corrupt_acknowledged_prefix() {
             store
                 .append_attested_commit(attested(commit(next, Some(ids[4]), 6, 0x62), audit(next)))
                 .await
-                .expect("append cannot bless corruption in an older ciphertext");
-            ids.push(next);
+                .expect_err("damaged prior ciphertext refuses append before mutation");
         }
         let version = ids.len() as u64;
         let result = store
@@ -3285,7 +3284,7 @@ async fn history_retention_refuses_damaged_mutable_references() {
         let database = dir.path().join("config.sqlite");
         let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
         let total = if mutation == "pending_deadline" { 3 } else { 5 };
-        let mut ids: Vec<_> = (0..total).map(|_| TxId::new()).collect();
+        let ids: Vec<_> = (0..total).map(|_| TxId::new()).collect();
         for index in 0..total {
             let mut record = commit(
                 ids[index],
@@ -3336,8 +3335,7 @@ async fn history_retention_refuses_damaged_mutable_references() {
                     audit(next),
                 ))
                 .await
-                .expect("append does not reauthenticate older mutable metadata");
-            ids.push(next);
+                .expect_err("damaged admission metadata refuses append before mutation");
         } else if mutation == "rollback_flag_then_lifecycle" {
             // This ordinary operation may refuse the damaged prior state. If
             // it proceeds, it must never reauthenticate unrelated corruption.
@@ -3382,6 +3380,268 @@ async fn history_retention_refuses_damaged_mutable_references() {
             "no compaction permission minted over damaged references"
         );
     }
+}
+
+// SDK #802: a live read must authenticate mutable publication/rollback metadata,
+// including a negative lookup, rather than waiting for pruning or reopening.
+#[cfg(feature = "dangerous-test-hooks")]
+#[tokio::test]
+async fn live_history_reads_refuse_unauthenticated_lifecycle_metadata() {
+    let mut accepted = Vec::new();
+    for mutation in ["publication_fence", "pending_deadline", "named_target"] {
+        let dir = tempfile::tempdir().expect("directory");
+        let database = dir.path().join("config.sqlite");
+        let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+        let ids = [TxId::new(), TxId::new(), TxId::new()];
+        for index in 0..ids.len() {
+            let mut record = commit(
+                ids[index],
+                index.checked_sub(1).map(|previous| ids[previous]),
+                index as u64 + 1,
+                0x63,
+            );
+            if mutation == "pending_deadline" && index == 2 {
+                record.confirmed_deadline = Some(Timestamp::now_utc());
+            }
+            let prepared = if mutation == "publication_fence" && index == 2 {
+                fenced_attested(record, audit(ids[index]))
+            } else {
+                attested(record, audit(ids[index]))
+            };
+            store
+                .append_attested_commit(prepared)
+                .await
+                .expect("authenticated history");
+        }
+        store
+            .create_rollback_point(ids[0], Some("retained-target".to_owned()))
+            .await
+            .expect("authenticated named target");
+        assert!(store.load_latest().await.expect("valid latest").is_some());
+        assert!(store
+            .load_committed_latest()
+            .await
+            .expect("valid visible head")
+            .is_some());
+        let absent_digest = "01".repeat(32);
+        assert!(store
+            .load_by_replay_lookup_digest(&absent_digest)
+            .await
+            .expect("authenticated negative lookup")
+            .is_none());
+
+        let observer = rusqlite::Connection::open(&database).expect("adversarial connection");
+        let changed = match mutation {
+            "publication_fence" => observer.execute(
+                "UPDATE config_history SET principal = replace(principal, '\"recovery_required\":true', '\"recovery_required\":false') WHERE version = 3",
+                [],
+            ),
+            "pending_deadline" => observer.execute(
+                "UPDATE config_history SET confirmed_deadline = NULL WHERE version = 3",
+                [],
+            ),
+            "named_target" => observer.execute(
+                "UPDATE rollback_labels SET tx_id = ?1 WHERE label = 'retained-target'",
+                [ids[1].as_uuid().as_bytes().as_slice()],
+            ),
+            _ => unreachable!("closed mutation list"),
+        }
+        .expect("alter one mutable field");
+        assert_eq!(changed, 1);
+        for (operation, refused) in [
+            ("latest", store.load_latest().await.is_err()),
+            ("published", store.load_committed_latest().await.is_err()),
+            (
+                "tail",
+                store.load_since(ConfigVersion::new(1), 64).await.is_err(),
+            ),
+            ("floor", store.retained_history_floor().await.is_err()),
+            (
+                "rollback",
+                store
+                    .load_rollback(RollbackTarget::ByLabel("retained-target".to_owned()))
+                    .await
+                    .is_err(),
+            ),
+            (
+                "negative_replay_lookup",
+                store
+                    .load_by_replay_lookup_digest(&absent_digest)
+                    .await
+                    .is_err(),
+            ),
+        ] {
+            if !refused {
+                accepted.push((mutation, operation));
+            }
+        }
+        drop(observer);
+        store.shutdown().await.expect("shutdown");
+    }
+    assert!(
+        accepted.is_empty(),
+        "unauthenticated live reads: {accepted:?}"
+    );
+}
+
+#[tokio::test]
+async fn live_history_append_refuses_a_cleared_pending_deadline() {
+    let dir = tempfile::tempdir().expect("directory");
+    let database = dir.path().join("config.sqlite");
+    let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+    let ids = [TxId::new(), TxId::new(), TxId::new()];
+    store
+        .append_attested_commit(attested(commit(ids[0], None, 1, 0x63), audit(ids[0])))
+        .await
+        .expect("first commit");
+    let mut pending = commit(ids[1], Some(ids[0]), 2, 0x63);
+    pending.confirmed_deadline = Some(Timestamp::now_utc());
+    store
+        .append_attested_commit(attested(pending, audit(ids[1])))
+        .await
+        .expect("pending commit");
+    let observer = rusqlite::Connection::open(&database).expect("adversarial connection");
+    assert_eq!(
+        observer
+            .execute(
+                "UPDATE config_history SET confirmed_deadline = NULL WHERE version = 2",
+                []
+            )
+            .expect("clear pending marker"),
+        1
+    );
+    let result = store
+        .append_attested_commit(attested(
+            commit(ids[2], Some(ids[1]), 3, 0x63),
+            audit(ids[2]),
+        ))
+        .await;
+    let count: i64 = observer
+        .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+        .expect("independent mutation readback");
+    drop(observer);
+    store.shutdown().await.expect("shutdown");
+    assert!(
+        result.is_err(),
+        "altered pending metadata cannot admit a new commit"
+    );
+    assert_eq!(
+        count, 2,
+        "no new canonical record after damaged admission state"
+    );
+}
+
+#[tokio::test]
+async fn live_history_missing_identity_never_becomes_standalone() {
+    let dir = tempfile::tempdir().expect("directory");
+    let database = dir.path().join("config.sqlite");
+    let backend = SqliteBackend::provision_config_authority(
+        retained_options(&database, topology(), 1),
+        audit_key(),
+    )
+    .await
+    .expect("explicit retained authority");
+    let store = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("store");
+    store.initialize_cluster().await.expect("initialize");
+    let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+    for index in 0..5 {
+        store
+            .append_attested_commit(attested(
+                commit(
+                    ids[index],
+                    index.checked_sub(1).map(|i| ids[i]),
+                    index as u64 + 1,
+                    0x63,
+                ),
+                audit(ids[index]),
+            ))
+            .await
+            .expect("complete history");
+    }
+    store
+        .retain_history_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xDA; 16]),
+            retention(ids[4], 5, 3, 3, 1_048_576),
+        )
+        .await
+        .expect("authenticated floor");
+    assert_eq!(
+        store.retained_history_floor().await.expect("floor"),
+        Some(ConfigVersion::new(2))
+    );
+    let observer = rusqlite::Connection::open(&database).expect("adversarial connection");
+    observer
+        .execute_batch("DROP TABLE config_raft_identity")
+        .expect("remove identity only");
+    let refused = [
+        store.retained_history_floor().await.is_err(),
+        store.load_latest().await.is_err(),
+        store.load_committed_latest().await.is_err(),
+        store.load_since(ConfigVersion::new(2), 64).await.is_err(),
+    ];
+    drop(observer);
+    store.shutdown().await.expect("shutdown");
+    assert!(
+        refused.into_iter().all(|value| value),
+        "lost identity must not authorize standalone reads"
+    );
+}
+
+#[tokio::test]
+async fn live_history_claim_survives_removal_of_all_consensus_tables() {
+    let dir = tempfile::tempdir().expect("directory");
+    let database = dir.path().join("config.sqlite");
+    let (store, bypass) = open_singleton(&database, &dir.path().join("snapshots")).await;
+    let tx_id = TxId::new();
+    store
+        .append_attested_commit(attested(commit(tx_id, None, 1, 0x64), audit(tx_id)))
+        .await
+        .expect("authenticated history");
+    let observer = rusqlite::Connection::open(&database).expect("independent connection");
+    let tables: Vec<String> = observer
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'config_raft_*'",
+        )
+        .expect("table inventory")
+        .query_map([], |row| row.get(0))
+        .expect("table names")
+        .collect::<Result<_, _>>()
+        .expect("closed schema");
+    assert!(!tables.is_empty());
+    for table in tables {
+        observer
+            .execute_batch(&format!("DROP TABLE \"{}\"", table.replace('"', "\"\"")))
+            .expect("remove consensus metadata");
+    }
+    // The clone predates the claim. It must still remember the same requirement
+    // when no on-disk marker remains; neither reads nor direct writes reopen.
+    let refused = [
+        bypass.load_latest().await.is_err(),
+        bypass.retained_history_floor().await.is_err(),
+        bypass.create_rollback_point(tx_id, None).await.is_err(),
+        store.load_committed_latest().await.is_err(),
+    ];
+    let rollback: bool = observer
+        .query_row(
+            "SELECT rollback_point FROM config_history WHERE version = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("independent no-mutation readback");
+    drop(observer);
+    store.shutdown().await.expect("shutdown");
+    assert!(refused.into_iter().all(|value| value));
+    assert!(
+        !rollback,
+        "erased authority never re-enables direct mutation"
+    );
 }
 
 #[tokio::test]
