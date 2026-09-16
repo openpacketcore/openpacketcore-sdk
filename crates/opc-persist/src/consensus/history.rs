@@ -347,6 +347,7 @@ pub(crate) fn initialize_sync(
     key: &AuditKey,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    super::sqlite::validate_live_history_schema_sync(conn, cancellation)?;
     save_state(
         conn,
         key,
@@ -559,6 +560,9 @@ pub(crate) fn validate_access_sync(
     consensus_required: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    if consensus_required || has_consensus_metadata_sync(conn)? {
+        super::sqlite::validate_live_history_schema_sync(conn, cancellation)?;
+    }
     let Some(state) = load_state(conn, key)? else {
         return if consensus_required {
             Err(corrupt())

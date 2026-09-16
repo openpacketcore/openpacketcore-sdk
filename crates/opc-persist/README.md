@@ -138,7 +138,9 @@ connection lock. Each backend clone also retains the claimed requirement, so
 even removing all consensus tables cannot re-enable local writes. Live history
 reads authenticate the complete retained metadata chain and query it in one
 SQLite read transaction; missing or modified authority is a refusal, including
-negative lookups. The backend exposes neither its raw
+negative lookups. The same transaction checks the SDK-defined base and consensus
+schema before reads or mutation, rejecting unexpected executable or temporary
+objects so a lifecycle update cannot re-authenticate unrelated damage. The backend exposes neither its raw
 SQLite connection nor its audit key, and `AuditKey` does not expose key bytes;
 typed operations are the only safe public authority surface. Protect the
 database directory with the CNF's normal filesystem identity and permissions,

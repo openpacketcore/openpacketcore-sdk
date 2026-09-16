@@ -3270,6 +3270,105 @@ async fn retained_reopen_recovers_committed_wal_after_process_loss() {
 }
 
 #[tokio::test]
+async fn live_history_schema_cannot_change_unrelated_protected_references() {
+    let dir = tempfile::tempdir().expect("directory");
+    let database = dir.path().join("config.sqlite");
+    let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+    let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+    for index in 0..ids.len() {
+        store
+            .append_attested_commit(attested(
+                commit(
+                    ids[index],
+                    index.checked_sub(1).map(|previous| ids[previous]),
+                    index as u64 + 1,
+                    0x62,
+                ),
+                audit(ids[index]),
+            ))
+            .await
+            .expect("complete encrypted history");
+    }
+    store
+        .create_rollback_point(ids[0], None)
+        .await
+        .expect("protect the oldest revision");
+    let observer = rusqlite::Connection::open(&database).expect("independent fixture connection");
+    // A schema-only fault leaves every authenticated row unchanged until the
+    // next ordinary lifecycle operation. Checking only the prior record chain
+    // must not authorize side effects on an unrelated protected revision.
+    observer
+        .execute_batch(
+            "CREATE TRIGGER fixture_unexpected_lifecycle \
+             AFTER UPDATE OF rollback_point ON config_history \
+             WHEN NEW.version = 5 BEGIN \
+             UPDATE config_history SET rollback_point = 0 WHERE version = 1; END;",
+        )
+        .expect("install isolated schema fault");
+    let changed_current = store.create_rollback_point(ids[4], None).await;
+    observer
+        .execute_batch("DROP TRIGGER fixture_unexpected_lifecycle")
+        .expect("remove isolated schema fault");
+    let retention_result = store
+        .retain_history_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xE4; 16]),
+            retention(ids[4], 5, 4, 2, 1_048_576),
+        )
+        .await;
+    let (count, protected): (i64, i64) = observer
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN version = 1 THEN rollback_point ELSE 0 END), 0) FROM config_history",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("independent protected-history readback");
+    store.shutdown().await.expect("shutdown");
+    assert!(
+        changed_current.is_err(),
+        "unexpected executable schema must refuse the lifecycle operation"
+    );
+    assert!(
+        retention_result.is_err(),
+        "an ordinary lifecycle update cannot authenticate unrelated reference loss"
+    );
+    assert_eq!(count, 5, "every original revision remains retained");
+    assert_eq!(
+        protected, 1,
+        "the unrelated rollback reference remains intact"
+    );
+}
+
+#[tokio::test]
+async fn live_history_reads_refuse_unexpected_schema() {
+    for schema_fault in [
+        "CREATE TRIGGER fixture_unexpected_read_guard AFTER UPDATE ON config_history BEGIN SELECT 1; END;",
+        "CREATE INDEX fixture_unexpected_index ON config_history(source);",
+        "ALTER TABLE rollback_labels ADD COLUMN fixture_unexpected_reference TEXT;",
+    ] {
+        let dir = tempfile::tempdir().expect("directory");
+        let database = dir.path().join("config.sqlite");
+        let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+        let tx_id = TxId::new();
+        store
+            .append_attested_commit(attested(commit(tx_id, None, 1, 0x62), audit(tx_id)))
+            .await
+            .expect("complete encrypted history");
+        let observer = rusqlite::Connection::open(&database).expect("independent fixture connection");
+        observer
+            .execute_batch(schema_fault)
+            .expect("change only the isolated schema");
+        let latest = store.load_latest().await;
+        let published = store.load_committed_latest().await;
+        let tail = store.load_since(ConfigVersion::new(0), 4).await;
+        let floor = store.retained_history_floor().await;
+        store.shutdown().await.expect("shutdown");
+        assert!(latest.is_err(), "latest read refuses an unadmitted schema");
+        assert!(published.is_err(), "publication refuses an unadmitted schema");
+        assert!(tail.is_err(), "tail read refuses an unadmitted schema");
+        assert!(floor.is_err(), "floor read refuses an unadmitted schema");
+    }
+}
+
+#[tokio::test]
 async fn history_retention_refuses_damaged_mutable_references() {
     for mutation in [
         "rollback_flag",

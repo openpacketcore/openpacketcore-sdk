@@ -115,6 +115,54 @@ async fn authenticated_history_read_keeps_one_sqlite_snapshot() {
 }
 
 #[tokio::test]
+async fn consensus_history_refuses_temporary_schema_shadowing() {
+    let dir = tempfile::tempdir().expect("directory");
+    let backend = SqliteBackend::open_with_audit_key(
+        dir.path().join("history.sqlite"),
+        true,
+        0,
+        AuditKey::new([0x66; 32]).expect("audit key"),
+    )
+    .await
+    .expect("backend");
+    let node = ConfigConsensusNodeId::new(1).expect("node");
+    let identity = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("read-schema-test").expect("cluster"),
+        ConfigConsensusConfigurationId::from_bytes([0x66; 32]),
+        ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
+    );
+    let topology = ConfigConsensusTopology::try_new(identity, node, [node].into_iter().collect())
+        .expect("topology");
+    let store = ConsensusConfigStore::open(
+        topology,
+        backend.clone(),
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("consensus");
+    store.initialize_cluster().await.expect("initialize");
+    store
+        .append_attested_commit(commit(TxId::new(), None, 1, false))
+        .await
+        .expect("record");
+    {
+        let connection = backend.conn.lock().await;
+        // Even an identical copy must not replace the admitted main table.
+        // Its rows authenticate, but its schema lacks the owned constraints.
+        connection
+            .execute_batch("CREATE TEMP TABLE config_history AS SELECT * FROM main.config_history")
+            .expect("isolated temporary schema fault");
+    }
+    let refused = backend.load_latest().await.is_err();
+    store.shutdown().await.expect("shutdown");
+    assert!(
+        refused,
+        "temporary schema cannot shadow authenticated history"
+    );
+}
+
+#[tokio::test]
 async fn genuine_standalone_history_keeps_its_read_and_write_contract() {
     let dir = tempfile::tempdir().expect("directory");
     let backend = SqliteBackend::open_with_audit_key(

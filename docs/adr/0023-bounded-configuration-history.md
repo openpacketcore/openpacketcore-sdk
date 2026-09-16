@@ -47,6 +47,11 @@ Every live history read, including floor and negative replay/rollback lookups,
 verifies the complete ordered record digest before consulting mutable metadata.
 Validation and the resulting query share one SQLite read transaction; the Rust
 connection mutex alone cannot exclude an independently opened SQLite writer.
+That transaction also validates the exact SDK-defined base and consensus schema,
+rejecting unexpected triggers, indexes, constraints and temporary objects before
+history use. Only bounded SDK-authored DDL enters Rust memory; the supplied
+catalog is compared inside SQLite. A schema-only change cannot make a legitimate
+lifecycle update alter and re-authenticate an unrelated protected revision.
 These scans use the existing bounded, cancellable blocking worker. Every apply
 batch likewise authenticates its prior history in the same transaction before
 admission or cached-outcome decisions. Missing consensus identity with residual
@@ -169,7 +174,8 @@ The real encrypted consensus and ConfigWatch detectors cover production pruning,
 exact and old cursors, complete snapshot/tail recovery, row/byte caps, protected
 references, atomic confirmation rollback, response replay, immediate live-read
 and admission refusal after metadata corruption, concurrent SQLite mutation,
-missing identity and complete consensus-table removal, retained
+unexpected executable schema and temporary shadowing, missing identity and
+complete consensus-table removal, retained
 reopen, natural election and member snapshot installation. Preserve the initial
 missing-behavior RED, fix-removal RED, and independently mutated cursor RED.
 Repository gates and whole-change review are required before a merge claim.

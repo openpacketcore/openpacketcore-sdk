@@ -1156,18 +1156,17 @@ fn validate_existing_schema(
         .map_err(|_| ConfigConsensusStorageError::CorruptState)
 }
 
+const CONFIG_SCHEMA_OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema \
+    WHERE type IN ('table', 'index', 'trigger', 'view') \
+    AND (name GLOB 'config_raft_*' OR tbl_name GLOB 'config_raft_*') \
+    AND name NOT GLOB 'sqlite_autoindex_*'";
+
 fn config_schema_manifest(
     conn: &Connection,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Vec<(String, String, String, String)>> {
     let mut statement = conn
-        .prepare(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master \
-             WHERE type IN ('table', 'index', 'trigger', 'view') \
-               AND (name GLOB 'config_raft_*' OR tbl_name GLOB 'config_raft_*') \
-               AND name NOT GLOB 'sqlite_autoindex_*' \
-             ORDER BY type, name",
-        )
+        .prepare(&format!("{CONFIG_SCHEMA_OBJECTS} ORDER BY type, name"))
         .map_err(db_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -1197,22 +1196,64 @@ fn config_schema_manifest_digest(
         .execute_batch(CONFIG_RAFT_SCHEMA)
         .map_err(db_error)?;
     let expected_manifest = config_schema_manifest(&expected, cancellation)?;
-    let live_manifest = config_schema_manifest(conn, cancellation)?;
-    if live_manifest != expected_manifest {
+    let live_count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM ({CONFIG_SCHEMA_OBJECTS})"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if usize::try_from(live_count).ok() != Some(expected_manifest.len()) {
         return Err(invalid_data(
             "config consensus owned schema manifest does not match",
         ));
     }
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"openpacketcore/config-consensus/storage-manifest/v1\0");
-    for (kind, name, table, sql) in live_manifest {
+    for (kind, name, table, sql) in expected_manifest {
         cancellation.check_io()?;
+        // Compare supplied DDL inside SQLite; only bounded SDK-authored DDL
+        // enters Rust memory. Equal manifests retain the original digest.
+        let matches: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = ?1 AND name = ?2 AND tbl_name = ?3 AND sql = ?4)",
+            params![kind, name, table, sql],
+            |row| row.get(0),
+        ).map_err(db_error)?;
+        if !matches {
+            return Err(invalid_data(
+                "config consensus owned schema manifest does not match",
+            ));
+        }
         for value in [kind, name, table, sql] {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value.as_bytes());
         }
     }
     Ok(hasher.finalize().into())
+}
+
+/// Validate the executable schema in the same transaction as history use.
+/// Authenticating rows alone cannot authorize a changed trigger or constraint
+/// to alter unrelated records during an otherwise legitimate lifecycle update.
+pub(super) fn validate_live_history_schema_sync(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    cancellation.check_io()?;
+    // No SDK operation needs a trigger or a temporary object. Check all main
+    // triggers, including objects on the separately owned admission table;
+    // temporary objects could otherwise shadow an authenticated main table.
+    let unexpected: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger') OR EXISTS(SELECT 1 FROM sqlite_temp_schema)",
+        [], |row| row.get(0),
+    ).map_err(db_error)?;
+    if unexpected {
+        return Err(invalid_data("config history schema is not admitted"));
+    }
+    crate::schema::validate_retained_base_schema(conn)
+        .map_err(|_| invalid_data("config history base schema does not match"))?;
+    config_schema_manifest_digest(conn, cancellation)?;
+    cancellation.check_io()
 }
 
 pub(crate) fn checked_i64(value: u64) -> io::Result<i64> {
@@ -2887,6 +2928,9 @@ fn validate_sealed_state_sync(
     audit_key: &AuditKey,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    if super::history::has_consensus_metadata_sync(conn)? {
+        validate_live_history_schema_sync(conn, cancellation)?;
+    }
     super::history::validate_sync(conn, audit_key)?;
     super::history::validate_record_chain_sync(conn, audit_key, cancellation)?;
     validate_history_chain_cancellable_sync(conn, cancellation)?;
@@ -4914,6 +4958,21 @@ mod tests {
 
     #[tokio::test]
     async fn committed_but_unapplied_entry_replays_after_atomic_apply_faults() {
+        use rusqlite::hooks::{Action, AuthAction, AuthContext, Authorization};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+        fn deny_insert(conn: &Connection, table: &'static str, reached: Arc<AtomicBool>) {
+            conn.authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Insert { table_name } if table_name == table)
+                {
+                    reached.store(true, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }));
+        }
+
         let backend = initialized_backend().await;
         let shared_conn = backend.conn();
         let conn = shared_conn.lock().await;
@@ -4979,16 +5038,26 @@ mod tests {
         save_committed_sync(&conn, identity(), Some(entry.log_id)).expect("normal committed");
         let baseline_machine = read_machine_sync(&conn, identity()).expect("baseline machine");
 
-        conn.execute_batch(
-            r#"
-            CREATE TRIGGER fail_config_lifecycle_apply
-            BEFORE INSERT ON config_lifecycle_audit
-            BEGIN
-                SELECT RAISE(ABORT, 'node-local-secret-canary');
-            END;
-            "#,
-        )
-        .expect("install mid-intent fault");
+        // Schema faults are now refused before apply. Inject the two intended
+        // I/O faults with the connection's test-only authorizer instead, and
+        // observe actual writes to prove both faults still occur mid-operation.
+        let writes = Arc::new(AtomicU8::new(0));
+        let observed_writes = Arc::clone(&writes);
+        conn.update_hook(Some(
+            move |_: Action, database: &str, table: &str, _: i64| {
+                if database == "main" {
+                    let bit = match table {
+                        "config_history" => 1,
+                        "config_raft_request_outcomes" => 2,
+                        "config_raft_machine" => 4,
+                        _ => 0,
+                    };
+                    observed_writes.fetch_or(bit, Ordering::SeqCst);
+                }
+            },
+        ));
+        let fault_reached = Arc::new(AtomicBool::new(false));
+        deny_insert(&conn, "config_lifecycle_audit", Arc::clone(&fault_reached));
         let error = apply_entries_sync(
             &conn,
             backend.audit_key(),
@@ -4998,9 +5067,14 @@ mod tests {
         )
         .expect_err("mid-intent SQLite fault must abort apply");
         assert_eq!(io::ErrorKind::Other, error.kind());
-        assert!(!error.to_string().contains("node-local-secret-canary"));
-        conn.execute("DROP TRIGGER fail_config_lifecycle_apply", [])
-            .expect("remove mid-intent fault");
+        assert!(!error.to_string().contains("config_lifecycle_audit"));
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert!(fault_reached.load(Ordering::SeqCst));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "domain write preceded fault"
+        );
 
         for stage in ["mid-intent", "before-commit"] {
             assert_eq!(
@@ -5041,17 +5115,9 @@ mod tests {
             );
         }
 
-        conn.execute_batch(
-            r#"
-            CREATE TRIGGER fail_config_applied_pointer
-            BEFORE INSERT ON config_raft_applied
-            WHEN NEW.log_index = 1
-            BEGIN
-                SELECT RAISE(ABORT, 'after-outcome-before-commit');
-            END;
-            "#,
-        )
-        .expect("install pre-commit fault");
+        writes.store(0, Ordering::SeqCst);
+        fault_reached.store(false, Ordering::SeqCst);
+        deny_insert(&conn, "config_raft_applied", Arc::clone(&fault_reached));
         apply_entries_sync(
             &conn,
             backend.audit_key(),
@@ -5060,8 +5126,14 @@ mod tests {
             vec![entry.clone()],
         )
         .expect_err("fault after domain, outcome, and machine writes must abort apply");
-        conn.execute("DROP TRIGGER fail_config_applied_pointer", [])
-            .expect("remove pre-commit fault");
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        conn.update_hook(None::<fn(Action, &str, &str, i64)>);
+        assert!(fault_reached.load(Ordering::SeqCst));
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            7,
+            "domain, outcome and machine writes preceded the pre-commit fault"
+        );
         assert_eq!(
             Some(log_id(0)),
             read_applied_sync(&conn, identity()).expect("applied after pre-commit fault")
