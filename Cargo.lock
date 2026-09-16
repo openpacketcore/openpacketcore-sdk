@@ -2926,7 +2926,7 @@ dependencies = [
  "aya",
  "aya-obj",
  "bytes",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "nix",
  "opc-dataplane-observation",
  "opc-gtpu-ebpf-common",
@@ -2981,7 +2981,7 @@ dependencies = [
  "async-trait",
  "aya",
  "bytes",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "nix",
  "opc-identity",
  "opc-ipsec-lb-ebpf-common",
@@ -3020,7 +3020,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "aya",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "nix",
  "opc-crypto-provider",
  "opc-ipsec-xfrm-ebpf-common",
@@ -3332,7 +3332,7 @@ name = "opc-persist"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "libc",
  "opc-alarm",
  "opc-consensus",
@@ -3372,7 +3372,7 @@ name = "opc-proto-diameter"
 version = "0.2.0"
 dependencies = [
  "bytes",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opc-proto-eap",
  "opc-protocol",
  "opc-testbed",
@@ -3420,7 +3420,7 @@ dependencies = [
  "bytes",
  "cbc",
  "crypto-bigint 0.7.5",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opc-crypto-provider",
  "opc-proto-eap",
  "opc-proto-gtpv2c",
@@ -3496,7 +3496,7 @@ dependencies = [
 name = "opc-redaction"
 version = "0.2.0"
 dependencies = [
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opc-data-governance",
  "serde",
  "serde_json",
@@ -3754,7 +3754,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "imbl",
  "libc",
  "nix",
