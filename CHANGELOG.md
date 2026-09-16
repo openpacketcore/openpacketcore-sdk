@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `opc-gtpu-dataplane`: admit one exact marked IPv4 child under a current
+  unmarked default group without retiring that default. Preserve independent
+  subscribers using the same bearer mark, require exact quiescence before
+  retired child reuse, and retain immutable parent lineage across bounded
+  default reattach. Child changes invalidate the parent's traffic proof while
+  leaving unrelated groups' authority intact. The consumer simulation refuses
+  live traffic-proof issuance; kernel and product qualification remain separate
+  (Refs #845).
 - `opc-gtpu-dataplane`: renew the owned selector worker lease at the bounded
   cadence instead of before every backend step and fenced write. Retain
   conservative call-start timing, fresh backend authorizations, exact store

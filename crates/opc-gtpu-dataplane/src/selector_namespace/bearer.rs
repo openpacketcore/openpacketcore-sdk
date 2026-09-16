@@ -16,8 +16,13 @@ where
     /// endpoints, link and protocol version, and distinct local TEIDs. The
     /// parent record and all unrelated groups remain unchanged. Only the
     /// recorded parent's PAA is shared; TEID and full-mask mark ownership is
-    /// exclusive. At most [`GTPU_SHARED_PAA_MAX_LIVE_BEARERS`] child may be live
-    /// or unresolved. A retired group ID is never usable again.
+    /// exclusive for each PAA. Independent default PAAs may use the same
+    /// numeric mark. Legacy fresh claims retain their global mark reservation.
+    /// At most [`GTPU_SHARED_PAA_MAX_LIVE_BEARERS`] child may be live
+    /// or unresolved. A retired group ID is never usable again. A fresh child
+    /// ID may reuse its retired predecessor's mark after backend quiescence,
+    /// including after its exact default's protected reattach successor chain.
+    /// No unrelated or stale default capability authorizes that history.
     ///
     /// Recover the parent's claim with [`Self::recover_active`] when needed.
     /// Remove the child with [`Self::retire`]; parent retirement is barred
@@ -83,14 +88,21 @@ where
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             self.require_exact_active(backend, parent.clone(), admission, &mut lease)
                 .await?;
-            let reuse = match state.single_bearer_reattach_source(&desired) {
+            let reuse = match state.single_bearer_reattach_source_for_parent(
+                &desired,
+                Some(parent_claim.0.group_fingerprint),
+            ) {
                 Some(source) => {
                     let source_claim = CanonicalClaim::from_group(&source)
                         .with_key(&state.selector_digest_key)
                         .ok_or(GtpuSessionSelectorCoordinatorError::Namespace)?;
-                    if state.bearer_parents.get(&source_claim.group_fingerprint)
-                        != Some(&parent_claim.0.group_fingerprint)
-                    {
+                    if !state.bearer_parent_reuse_is_exact(
+                        state
+                            .bearer_parents
+                            .get(&source_claim.group_fingerprint)
+                            .copied(),
+                        Some(parent_claim.0.group_fingerprint),
+                    ) {
                         return Err(GtpuSessionSelectorCoordinatorError::Namespace);
                     }
                     let proof = self
@@ -282,14 +294,121 @@ impl NamespaceState {
         if !shared_paa_bearer_is_exact(&parent, &child) {
             return None;
         }
+        let paa = claim
+            .atoms
+            .iter()
+            .find(|atom| atom.first() == Some(&b'P'))?;
+        let mark = claim
+            .atoms
+            .iter()
+            .find(|atom| atom.first() == Some(&b'M'))?;
+        let teid = claim
+            .atoms
+            .iter()
+            .find(|atom| atom.first() == Some(&b'T'))?;
+        // Child-only reservation profile: the actual uplink selector is the
+        // canonical PAA plus the complete mark, never the numeric mark alone.
+        // Framed RFC016 P/M atoms remain unchanged in the full fingerprint.
+        let mut scoped_mark = paa.clone();
+        scoped_mark.extend_from_slice(mark);
+        let scoped_mark = atom_codec(b'B', &scoped_mark);
         Some(
-            claim
-                .atoms
-                .iter()
-                .filter(|atom| atom.first() != Some(&b'P'))
+            [teid.as_slice(), scoped_mark.as_slice()]
+                .into_iter()
                 .map(|atom| keyed_digest(&self.selector_digest_key, ATOM_DOMAIN, atom))
                 .collect(),
         )
+    }
+
+    // A legacy M reserves the mark globally, including against B(P,M). All
+    // permanent history counts: terminal tombstones and poisoned debt cannot
+    // silently change the reservation profile on a later admission.
+    fn reserved_marks_for_profile(&self, child_profile: bool) -> Option<BTreeSet<Vec<u8>>> {
+        let mut marks = BTreeSet::new();
+        for (fingerprint, desired) in &self.canonical_desired {
+            if self.bearer_parents.contains_key(fingerprint) != child_profile {
+                continue;
+            }
+            let group = decode_canonical_desired(desired)?;
+            marks.extend(
+                CanonicalClaim::from_group(&group)
+                    .atoms
+                    .into_iter()
+                    .filter(|atom| atom.first() == Some(&b'M')),
+            );
+        }
+        Some(marks)
+    }
+
+    pub(super) fn mark_profile_conflicts(&self, claim: &CanonicalClaim) -> bool {
+        if !claim.atoms.iter().any(|atom| atom.first() == Some(&b'M')) {
+            return false;
+        }
+        self.reserved_marks_for_profile(!self.bearer_parents.contains_key(&claim.group_fingerprint))
+            .is_none_or(|other| claim.atoms.iter().any(|atom| other.contains(atom)))
+    }
+
+    pub(super) fn mark_profiles_are_disjoint(&self) -> bool {
+        match (
+            self.reserved_marks_for_profile(false),
+            self.reserved_marks_for_profile(true),
+        ) {
+            (Some(legacy), Some(children)) => legacy.is_disjoint(&children),
+            _ => false,
+        }
+    }
+
+    /// A child can reuse its own parent's history, or history inherited through
+    /// the exact default's durable retired-to-reattached successor chain.
+    pub(super) fn bearer_parent_reuse_is_exact(
+        &self,
+        source: Option<[u8; 32]>,
+        target: Option<[u8; 32]>,
+    ) -> bool {
+        let (Some(mut source), Some(target)) = (source, target) else {
+            return source.is_none() && target.is_none();
+        };
+        for _ in 0..=self.groups.len() {
+            if self.bearer_parents.contains_key(&source)
+                || self.bearer_parents.contains_key(&target)
+            {
+                return false;
+            }
+            if source == target {
+                return true;
+            }
+            let Some(GroupState::Retired {
+                successor: Some(next),
+                ..
+            }) = self.groups.get(&source)
+            else {
+                return false;
+            };
+            if !self.reattach_sources.contains(&source) || self.unresolved_bearer_count(source) != 0
+            {
+                return false;
+            }
+            let (Some(old), Some(new)) = (
+                self.canonical_group_for(source),
+                self.canonical_group_for(next.group),
+            ) else {
+                return false;
+            };
+            if !single_bearer_reattach_is_exact(&old, &new)
+                || old
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.context().bearer_mark.is_some())
+                || new
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.context().bearer_mark.is_some())
+            {
+                return false;
+            }
+            source = next.group;
+        }
+        false
     }
 
     pub(super) fn bearer_relations_are_exact(&self) -> bool {

@@ -632,6 +632,63 @@ Linux [membarrier.c](https://github.com/torvalds/linux/blob/v6.12/kernel/sched/m
 [network reader context](https://github.com/torvalds/linux/blob/v6.12/net/core/dev.c),
 and [kernel build profile](https://github.com/torvalds/linux/blob/v6.12/init/Makefile).
 
+### 5.5 Marked Child Under a Resident Default
+
+`reconcile_bearer` consumes a current exact default claim and admits one marked
+IPv4 child in the same protected namespace. Both groups have one entry and
+share the exact PAA, local and peer endpoints, link and protocol version; the
+child has a full-mask mark and a distinct local TEID. The unmarked default keeps
+its group identity, generation, selectors and installed context. At most one
+child may be live or unresolved for that default. This is a separate bounded
+profile, not general mixed-selector or arbitrary subset admission. Legacy
+`Fresh`, whole-set reuse and single-bearer reattach checks remain unchanged.
+
+The complete canonical P/M/T atoms and group fingerprints remain unchanged.
+For this profile only, the child reserves its T atom and a B atom whose payload
+is the concatenation of the framed canonical P and full-mask M atoms. This
+makes the actual `(PAA, mark)` selector exclusive while allowing independent
+default PAAs to use the same numeric bearer mark. Only the exact recorded
+default owns the shared P atom. Legacy groups retain their global M reservation
+semantics; this profile cannot reinterpret or appropriate those reservations.
+Any legacy global M history and a child B(P,M) with that M are mutually
+exclusive, regardless of PAA or lifecycle phase.
+Complete canonical atom counts still obey the configured operation capacity.
+
+The first child claim upgrades the ledger to `OPCSN18`. After the preceding
+fields it always carries the bounded unadmitted and reattach indexes, either
+of which may be empty, then a nonempty u32 big-endian child-parent count. Each
+entry contains a 32-byte child group commitment and a 32-byte parent group
+commitment, strictly sorted by child. Decode requires the complete descriptors,
+exact relationship, reservation profile, capacity and valid lifecycle states;
+missing, duplicate, foreign, inconsistent or truncated edges fail closed.
+Older readers refuse this format. Existing records retain their format until
+the corresponding transition; permanent history and record ceilings remain.
+
+Child install, recovery and retirement use the existing supervised lifecycle.
+Caller cancellation stops observation rather than dropping an admitted effect.
+Indeterminate writes retain permanent debt; incomplete stamp publication may
+make the namespace unavailable. Recovery does not guarantee cleanup and cannot
+replay an effect whose exact outcome remains unknown.
+The default cannot retire while a child is live or unresolved. A new child
+group may reuse an exactly retired child's mark only after the backend proves
+the source group's quiescence and the new local TEID is fresh. It may cross to a
+new default only through that default's recorded, bounded retired-to-reattached
+successor chain, with all predecessor children retired. Neither a shared PAA
+nor a reused mark alone authorizes this transfer. Old group IDs, TEIDs, parent
+edges and tombstones remain permanent; stale parent claims fail.
+
+Before a possible child map mutation, the eBPF adapter invalidates issued and
+pending traffic proof for the exact parent. Unrelated groups retain their
+authority. An application must separately complete its classifier and product
+owner transition and obtain fresh proof before reporting traffic readiness.
+The structural grouped simulation uses the protected coordinator, adapter
+codecs, index construction and stamp inventory validator. Its effects are
+atomic in memory, and its TFT replacement uses the SDK mock's transaction
+model after native representation validation. It cannot issue live traffic
+proof and does not exercise staged kernel IO faults or proof revocation; those
+require the separate adapter regressions. Simulation tests do not qualify
+kernel quiescence, packet forwarding or an application lifecycle.
+
 ## 6. Public Capability Surface
 
 The public API MUST expose SDK-minted, opaque, non-serializable, non-`Clone`

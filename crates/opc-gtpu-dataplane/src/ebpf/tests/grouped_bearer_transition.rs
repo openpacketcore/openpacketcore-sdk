@@ -19,6 +19,121 @@ struct Fixture {
     scope: SelectorLedgerStorageScope,
 }
 
+#[derive(Clone, Copy)]
+enum MarkHistory {
+    Active,
+    Retired,
+    AmbiguousRetirement,
+}
+
+async fn assert_cross_profile_mark_history_stays_reserved(child_first: bool, history: MarkHistory) {
+    let fixture = Fixture::new().await;
+    let child = fixture.child(0xb4, 0x1110, 6);
+    let mut legacy_context = child.entries()[0].context().clone();
+    legacy_context.ms_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 223));
+    legacy_context.local_teid = teid(0x1111);
+    legacy_context.peer_teid = teid(0x2111);
+    let legacy = grouped_group(
+        0xb5,
+        fixture.parent.device_id(),
+        vec![
+            GtpuSessionEntry::new(legacy_context, child.entries()[0].local_outer_address())
+                .unwrap(),
+        ],
+    );
+    let (source, active) = if child_first {
+        (child.clone(), fixture.add(child.clone()).await.unwrap())
+    } else {
+        (
+            legacy.clone(),
+            fixture
+                .authority
+                .reconcile_fresh(fixture.backend.clone(), legacy.clone())
+                .await
+                .unwrap(),
+        )
+    };
+    let parent = fixture.parent_claim().await;
+    match history {
+        MarkHistory::Active => drop(active),
+        MarkHistory::Retired => drop(
+            fixture
+                .authority
+                .retire(fixture.backend.clone(), active, source)
+                .await
+                .unwrap(),
+        ),
+        MarkHistory::AmbiguousRetirement => {
+            fixture.runtime.fail_in_order(["session_uplink_remove"]);
+            assert!(fixture
+                .authority
+                .retire(fixture.backend.clone(), active, source.clone())
+                .await
+                .is_err());
+            assert!(fixture.runtime.state().failures.is_empty());
+            assert!(fixture
+                .authority
+                .recover_retired(fixture.backend.clone(), source)
+                .await
+                .is_err());
+        }
+    }
+    let before = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+    let stamps = fixture.runtime.state().selector_operation_stamps.clone();
+    let result = if child_first {
+        fixture
+            .authority
+            .reconcile_fresh(fixture.backend.clone(), legacy)
+            .await
+    } else {
+        fixture
+            .authority
+            .reconcile_bearer(
+                fixture.backend.clone(),
+                parent,
+                fixture.parent.clone(),
+                child,
+            )
+            .await
+    };
+    assert!(
+        result.is_err(),
+        "legacy global marks must conflict with the child profile in both orders"
+    );
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == before);
+    assert_eq!(fixture.runtime.state().selector_operation_stamps, stamps);
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_cross_profile_legacy_active_mark_blocks_child() {
+    assert_cross_profile_mark_history_stays_reserved(false, MarkHistory::Active).await;
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_cross_profile_legacy_retired_mark_blocks_child() {
+    assert_cross_profile_mark_history_stays_reserved(false, MarkHistory::Retired).await;
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_cross_profile_legacy_ambiguous_mark_blocks_child() {
+    assert_cross_profile_mark_history_stays_reserved(false, MarkHistory::AmbiguousRetirement).await;
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_cross_profile_child_active_mark_blocks_legacy() {
+    assert_cross_profile_mark_history_stays_reserved(true, MarkHistory::Active).await;
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_cross_profile_child_retired_mark_blocks_legacy() {
+    assert_cross_profile_mark_history_stays_reserved(true, MarkHistory::Retired).await;
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_cross_profile_child_ambiguous_mark_blocks_legacy() {
+    assert_cross_profile_mark_history_stays_reserved(true, MarkHistory::AmbiguousRetirement).await;
+}
+
 impl Fixture {
     async fn parent_claim(&self) -> crate::GtpuSessionSelectorActiveClaim {
         self.authority
@@ -542,4 +657,604 @@ async fn protected_grouped_live_bearer_create_delete_create_preserves_parent_and
                 .unwrap(),
         );
     }
+}
+
+// Gate the real adapter after a map effect but before its acknowledgement.
+// This four-second test containment bound does not change any SDK deadline.
+pub(super) struct EffectGate {
+    group: [u8; GTPU_SESSION_GROUP_ID_LEN],
+    operation: &'static str,
+    entered: tokio::sync::Notify,
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+impl EffectGate {
+    fn new(group: &GtpuSessionGroup, operation: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            group: group.id().to_bytes(),
+            operation,
+            entered: tokio::sync::Notify::new(),
+            released: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        })
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+pub(super) fn pause_effect(
+    runtime: &FakeRuntime,
+    group: [u8; GTPU_SESSION_GROUP_ID_LEN],
+    operation: &'static str,
+) -> Result<(), GtpuError> {
+    let gate = {
+        let mut slot = runtime.bearer_effect_gate.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.group == group && gate.operation == operation)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        let (released, _) = gate
+            .wake
+            .wait_timeout_while(
+                gate.released.lock().unwrap(),
+                std::time::Duration::from_secs(4),
+                |released| !*released,
+            )
+            .unwrap();
+        if !*released {
+            return Err(state_indeterminate("bearer_effect_fixture_gate"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_grouped_bearer_cancelled_observation_waits_for_late_terminal_effect() {
+    for removing in [false, true] {
+        let fixture = Fixture::new().await;
+        let child = fixture.child(0xb4, 0x1110, 0x41);
+        let active = if removing {
+            Some(fixture.add(child.clone()).await.unwrap())
+        } else {
+            None
+        };
+        let operation = if removing {
+            "session_group_remove"
+        } else {
+            "session_group_put_active"
+        };
+        let gate = EffectGate::new(&child, operation);
+        *fixture.runtime.bearer_effect_gate.lock().unwrap() = Some(gate.clone());
+        if let Some(active) = active {
+            let observation =
+                fixture
+                    .authority
+                    .retire(fixture.backend.clone(), active, child.clone());
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified())
+                .await
+                .unwrap();
+            drop(observation);
+        } else {
+            let observation = fixture.authority.reconcile_bearer(
+                fixture.backend.clone(),
+                fixture.parent_claim().await,
+                fixture.parent.clone(),
+                child.clone(),
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified())
+                .await
+                .unwrap();
+            drop(observation);
+        }
+        // Drop has no authority to stop or replay an in-progress map effect.
+        gate.release();
+        if removing {
+            drop(
+                fixture
+                    .authority
+                    .recover_retired(fixture.backend.clone(), child.clone())
+                    .await
+                    .unwrap(),
+            );
+            assert!(!fixture
+                .runtime
+                .state()
+                .session_groups
+                .contains_key(&(S2BU_IFINDEX, child.id().to_bytes())));
+        } else {
+            drop(
+                fixture
+                    .authority
+                    .recover_active(fixture.backend.clone(), child.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let effect_count = fixture
+            .runtime
+            .state()
+            .operations
+            .iter()
+            .filter(|call| **call == operation)
+            .count();
+        assert_eq!(
+            effect_count,
+            if removing { 1 } else { 3 },
+            "late completion is observed without replay"
+        );
+        drop(fixture.parent_claim().await);
+        drop(
+            fixture
+                .authority
+                .recover_active(fixture.backend.clone(), fixture.sibling.clone())
+                .await
+                .unwrap(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_reuse_requires_quiescence_before_any_new_effect() {
+    let fixture = Fixture::new().await;
+    let child = fixture.child(0xb4, 0x1110, 0x41);
+    let active = fixture.add(child.clone()).await.unwrap();
+    drop(
+        fixture
+            .authority
+            .retire(fixture.backend.clone(), active, child)
+            .await
+            .unwrap(),
+    );
+    let next = fixture.child(0xb5, 0x1111, 0x41);
+    let before = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+    let stamps = fixture.runtime.state().selector_operation_stamps.clone();
+    assert!(fixture.add(next.clone()).await.is_err());
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == before);
+    assert_eq!(fixture.runtime.state().selector_operation_stamps, stamps);
+    fixture.runtime.state().grouped_reader_grace_enabled = true;
+    let active = fixture.add(next.clone()).await.unwrap();
+    drop(
+        fixture
+            .authority
+            .retire(fixture.backend.clone(), active, next)
+            .await
+            .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn consumer_simulation_runs_protected_bearer_and_tft_lifecycle_without_traffic_proof() {
+    use crate::testkit::GroupedGtpuDataplaneSimulation;
+    let fixture = Fixture::new().await;
+    let backend = Arc::new(GroupedGtpuDataplaneSimulation::new().unwrap());
+    let endpoints =
+        GtpuLocalEndpointSet::new(fixture.parent.entries()[0].local_outer_address(), None).unwrap();
+    let device = backend
+        .create_device_with_endpoints(grouped_device_request(
+            "simulated",
+            fixture.parent.device_id(),
+            endpoints,
+        ))
+        .await
+        .unwrap();
+    let scope = SelectorLedgerStorageScope::new(
+        TenantId::from_static("grouped-bearer-fixture"),
+        NetworkFunctionKind::from_static("grouped-simulation"),
+    );
+    let authority = crate::GtpuSessionSelectorNamespaceAuthority::provision_protected(
+        fixture.store.clone(),
+        scope.clone(),
+        backend
+            .selector_namespace_bootstrap(fixture.parent.device_id())
+            .await
+            .unwrap(),
+        backend.clone(),
+        OwnerId::new("consumer-simulation-worker").unwrap(),
+        crate::selector_namespace::SELECTOR_NAMESPACE_MAX_LEASE_TTL,
+        32,
+    )
+    .await
+    .unwrap();
+    let rebind = |group: &GtpuSessionGroup| {
+        let mut context = group.entries()[0].context().clone();
+        context.link_ifindex = device.ifindex;
+        grouped_group(
+            group.id().to_bytes()[0],
+            group.device_id(),
+            vec![GtpuSessionEntry::new(context, group.entries()[0].local_outer_address()).unwrap()],
+        )
+    };
+    let parent = rebind(&fixture.parent);
+    let sibling = rebind(&fixture.sibling);
+    for group in [&parent, &sibling] {
+        drop(
+            authority
+                .reconcile_fresh(backend.clone(), group.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(
+        authority
+            .reconcile_bearer(
+                backend.clone(),
+                fixture.parent_claim().await,
+                parent.clone(),
+                rebind(&fixture.child(0xb4, 0x1110, 0x41))
+            )
+            .await
+            .is_err(),
+        "real-adapter namespace receipts cannot control simulation state"
+    );
+    assert!(
+        fixture
+            .authority
+            .recover_active(backend.clone(), fixture.parent.clone())
+            .await
+            .is_err(),
+        "simulation cannot acquire a real-adapter namespace"
+    );
+    assert_eq!(backend.probe().await.unwrap().kind, GtpuBackendKind::Mock);
+    assert!(!backend.probe().await.unwrap().mutation_ready);
+    assert_eq!(
+        backend.gtpu_traffic_proof_capability(),
+        GtpuCapability::Missing
+    );
+    let policy = opc_dataplane_observation::TrafficContinuityPolicy::new(
+        2,
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(2),
+        8,
+    )
+    .unwrap();
+    assert!(backend
+        .register_gtpu_traffic_proof_authority(
+            GtpuTrafficProofAuthority::new(parent.clone(), 1, 2, 3, policy).unwrap()
+        )
+        .await
+        .is_err());
+    let default_tft = TftUplinkClassifier::new(
+        device.ifindex,
+        parent.entries()[0].context().ms_address,
+        vec![TftUplinkBearer::default_bearer()],
+    )
+    .unwrap();
+    assert_eq!(
+        backend
+            .reconcile_tft_uplink_classifier(default_tft.clone())
+            .await
+            .unwrap(),
+        TftUplinkClassifierReconcileOutcome::Installed
+    );
+    for cycle in 0..2 {
+        let child = rebind(&fixture.child(0xb4 + cycle, 0x1110 + u32::from(cycle), 0x41));
+        let parent_claim = authority
+            .recover_active(backend.clone(), parent.clone())
+            .await
+            .unwrap();
+        let active = authority
+            .reconcile_bearer(backend.clone(), parent_claim, parent.clone(), child.clone())
+            .await
+            .unwrap();
+        let filter = PacketFilter::new(
+            PacketFilterIdentifier::new(1).unwrap(),
+            PacketFilterDirection::UplinkOnly,
+            1,
+            vec![
+                PacketFilterComponent::ProtocolIdentifierNextHeader(17),
+                PacketFilterComponent::SingleLocalPort(10000 + u16::from(cycle)),
+            ],
+        )
+        .unwrap();
+        let tft = TftUplinkClassifier::new(
+            device.ifindex,
+            parent.entries()[0].context().ms_address,
+            vec![
+                TftUplinkBearer::default_bearer(),
+                TftUplinkBearer::dedicated(
+                    GtpBearerMark::new(0x41).unwrap(),
+                    TrafficFlowTemplate::create_new(vec![filter], Vec::new()).unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        backend.validate_tft_uplink_classifier(&tft).unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(device.ifindex, tft.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(tft.clone())
+        );
+        for group in [&parent, &sibling, &child] {
+            let context = group.entries()[0].context();
+            for selector in [
+                PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(context).unwrap(),
+                ),
+                PdpContextSelector::Uplink(
+                    PdpContextUplinkSelector::from_context(context).unwrap(),
+                ),
+            ] {
+                assert_eq!(
+                    backend.read_pdp_context(selector).await.unwrap(),
+                    PdpContextReadback::Present(context.clone())
+                );
+            }
+        }
+        assert!(backend
+            .install_pdp_context(child.entries()[0].context().clone())
+            .await
+            .is_err());
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(default_tft.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        drop(
+            authority
+                .retire(backend.clone(), active, child.clone())
+                .await
+                .unwrap(),
+        );
+        let context = child.entries()[0].context();
+        for selector in [
+            PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(context).unwrap(),
+            ),
+            PdpContextSelector::Uplink(PdpContextUplinkSelector::from_context(context).unwrap()),
+        ] {
+            assert_eq!(
+                backend.read_pdp_context(selector).await.unwrap(),
+                PdpContextReadback::Absent
+            );
+        }
+        drop(
+            authority
+                .recover_retired(backend.clone(), child)
+                .await
+                .unwrap(),
+        );
+        drop(
+            authority
+                .recover_active(backend.clone(), parent.clone())
+                .await
+                .unwrap(),
+        );
+        drop(
+            authority
+                .recover_active(backend.clone(), sibling.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        backend
+            .remove_tft_uplink_classifier_exact(default_tft)
+            .await
+            .unwrap(),
+        TftUplinkClassifierRemovalOutcome::Removed
+    );
+    let reopened = crate::GtpuSessionSelectorNamespaceAuthority::open_protected(
+        fixture.store.clone(),
+        scope,
+        backend
+            .selector_namespace_bootstrap(parent.device_id())
+            .await
+            .unwrap(),
+        backend.clone(),
+        OwnerId::new("consumer-simulation-reopened").unwrap(),
+        crate::selector_namespace::SELECTOR_NAMESPACE_MAX_LEASE_TTL,
+        32,
+    )
+    .await
+    .unwrap();
+    drop(
+        reopened
+            .recover_active(backend.clone(), parent)
+            .await
+            .unwrap(),
+    );
+    drop(reopened.recover_active(backend, sibling).await.unwrap());
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_profile_same_mark_is_scoped_to_exact_parent_paa() {
+    let fixture = Fixture::new().await;
+    let child = fixture.child(0xb4, 0x1110, 6);
+    let active = fixture.add(child.clone()).await.unwrap();
+    let mut other_context = fixture.sibling.entries()[0].context().clone();
+    other_context.local_teid = teid(0x1111);
+    other_context.peer_teid = teid(0x2111);
+    other_context.bearer_mark = GtpBearerMark::new(6);
+    let other = grouped_group(
+        0xb5,
+        fixture.parent.device_id(),
+        vec![GtpuSessionEntry::new(
+            other_context,
+            fixture.sibling.entries()[0].local_outer_address(),
+        )
+        .unwrap()],
+    );
+    let parent_before =
+        fixture.runtime.state().session_groups[&(S2BU_IFINDEX, fixture.parent.id().to_bytes())];
+    let sibling_before =
+        fixture.runtime.state().session_groups[&(S2BU_IFINDEX, fixture.sibling.id().to_bytes())];
+    let other_parent = fixture
+        .authority
+        .recover_active(fixture.backend.clone(), fixture.sibling.clone())
+        .await
+        .unwrap();
+    let other_active = fixture
+        .authority
+        .reconcile_bearer(
+            fixture.backend.clone(),
+            other_parent,
+            fixture.sibling.clone(),
+            other.clone(),
+        )
+        .await;
+    assert!(
+        other_active.is_ok(),
+        "two exact defaults must independently own PAA+mark 6: {other_active:?}"
+    );
+    assert_eq!(
+        fixture.runtime.state().session_groups[&(S2BU_IFINDEX, fixture.parent.id().to_bytes())],
+        parent_before
+    );
+    assert_eq!(
+        fixture.runtime.state().session_groups[&(S2BU_IFINDEX, fixture.sibling.id().to_bytes())],
+        sibling_before
+    );
+    drop(
+        fixture
+            .authority
+            .retire(fixture.backend.clone(), active, child)
+            .await
+            .unwrap(),
+    );
+    drop(
+        fixture
+            .authority
+            .recover_active(fixture.backend.clone(), other.clone())
+            .await
+            .unwrap(),
+    );
+    drop(
+        fixture
+            .authority
+            .retire(fixture.backend.clone(), other_active.unwrap(), other)
+            .await
+            .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn protected_grouped_bearer_profile_default_reattach_preserves_exact_child_lineage() {
+    let fixture = Fixture::new().await;
+    fixture.runtime.state().grouped_reader_grace_enabled = true;
+    let child = fixture.child(0xb4, 0x1110, 6);
+    let active = fixture.add(child.clone()).await.unwrap();
+    drop(
+        fixture
+            .authority
+            .retire(fixture.backend.clone(), active, child)
+            .await
+            .unwrap(),
+    );
+    let stale = fixture.parent_claim().await;
+    drop(
+        fixture
+            .authority
+            .retire(
+                fixture.backend.clone(),
+                fixture.parent_claim().await,
+                fixture.parent.clone(),
+            )
+            .await
+            .unwrap(),
+    );
+    let mut next_context = fixture.parent.entries()[0].context().clone();
+    next_context.local_teid = teid(0x1115);
+    next_context.peer_teid = teid(0x2115);
+    let parent = grouped_group(
+        0xb6,
+        fixture.parent.device_id(),
+        vec![GtpuSessionEntry::new(
+            next_context,
+            fixture.parent.entries()[0].local_outer_address(),
+        )
+        .unwrap()],
+    );
+    let new_parent = fixture
+        .authority
+        .reconcile_reattached(fixture.backend.clone(), parent.clone())
+        .await
+        .unwrap();
+    let child = fixture.child(0xb7, 0x1116, 6);
+    assert!(fixture
+        .authority
+        .reconcile_bearer(
+            fixture.backend.clone(),
+            stale,
+            fixture.parent.clone(),
+            child.clone()
+        )
+        .await
+        .is_err());
+    fixture.runtime.state().grouped_reader_grace_enabled = false;
+    let before = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+    assert!(
+        fixture
+            .authority
+            .reconcile_bearer(
+                fixture.backend.clone(),
+                new_parent,
+                parent.clone(),
+                child.clone()
+            )
+            .await
+            .is_err(),
+        "default reuse cannot replace child-source quiescence"
+    );
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == before);
+    fixture.runtime.state().grouped_reader_grace_enabled = true;
+    let new_parent = fixture
+        .authority
+        .recover_active(fixture.backend.clone(), parent.clone())
+        .await
+        .unwrap();
+    let active = fixture
+        .authority
+        .reconcile_bearer(
+            fixture.backend.clone(),
+            new_parent,
+            parent.clone(),
+            child.clone(),
+        )
+        .await;
+    assert!(active.is_ok(), "exact retired default lineage plus fresh current default must support child mark reuse: {active:?}");
+    drop(
+        fixture
+            .authority
+            .retire(fixture.backend.clone(), active.unwrap(), child)
+            .await
+            .unwrap(),
+    );
+    drop(
+        fixture
+            .authority
+            .recover_active(fixture.backend.clone(), parent)
+            .await
+            .unwrap(),
+    );
+    drop(
+        fixture
+            .authority
+            .recover_active(fixture.backend.clone(), fixture.sibling.clone())
+            .await
+            .unwrap(),
+    );
 }

@@ -30,6 +30,7 @@
 
 use std::cell::RefCell;
 
+pub(crate) mod grouped_simulation;
 mod workload_scope;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -54207,6 +54208,7 @@ mod tests {
     }
 
     struct FakeRuntime {
+        bearer_effect_gate: Mutex<Option<Arc<grouped_bearer_transition::EffectGate>>>,
         #[cfg(target_os = "linux")]
         selector_readback_gate: Mutex<Option<Arc<remote_selector_regression::ReadbackGate>>>,
         ifindexes: HashMap<String, u32>,
@@ -54910,6 +54912,7 @@ mod tests {
                 },
                 #[cfg(target_os = "linux")]
                 selector_readback_gate: Mutex::new(None),
+                bearer_effect_gate: Mutex::new(None),
                 cleanup_only_adoption_pause: Mutex::new(None),
                 historical_recovery_effect_pause: Mutex::new(None),
                 cleanup_only_adoption_entries: AtomicUsize::new(0),
@@ -61048,6 +61051,8 @@ mod tests {
             Self::fail_after_if_requested(&mut state, "session_group_put")?;
             Self::crash_if_requested(&mut state, phase_operation);
             Self::crash_if_requested(&mut state, "session_group_put");
+            drop(state);
+            grouped_bearer_transition::pause_effect(self, key, phase_operation)?;
             Ok(())
         }
 
@@ -61065,6 +61070,8 @@ mod tests {
             let removed = state.session_groups.remove(&(ifindex, key)).is_some();
             Self::fail_after_if_requested(&mut state, "session_group_remove")?;
             Self::crash_if_requested(&mut state, "session_group_remove");
+            drop(state);
+            grouped_bearer_transition::pause_effect(self, key, "session_group_remove")?;
             Ok(removed)
         }
 
