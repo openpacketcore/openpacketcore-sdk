@@ -1017,6 +1017,24 @@ async fn process_commit<C: OpcConfig>(
                 return Err(CommitError::recovery_required(reason));
             }
 
+            // After an exact replay miss, every new operation under retention
+            // must bind the current base, including candidate-free rollback.
+            // A retired request cannot become a fresh mutation at a newer head.
+            if store
+                .retained_history_floor()
+                .await
+                .map_err(|_| {
+                    CommitError::state_machine_fault("config history authority is unavailable")
+                })?
+                .is_some()
+                && request.base_version != current.version
+            {
+                return Err(CommitError::new(
+                    CommitErrorCode::AdmissionRejected,
+                    "config history replay requires the current base revision",
+                ));
+            }
+
             // A byte-for-byte retry of the request that created the pending
             // commit is resolved above before this new-write guard. Without
             // that ordering, a lost acknowledgement would make the original

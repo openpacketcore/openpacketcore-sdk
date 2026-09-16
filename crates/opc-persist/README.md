@@ -43,6 +43,12 @@ accepted single-replica profile.
   Openraft state skip bootstrap and re-admit normally. Clean first formation
   fails closed when the canonical node is absent; it never lets another
   pristine node mint competing initial authority.
+- `ConsensusConfigStore::retain_history_idempotent` commits an exact-head,
+  explicitly acknowledged retention decision with `ConfigHistoryRetention` and
+  `ConfigHistoryLimits`. `ConfigHistoryFull` rejects capacity overflow atomically;
+  `ConfigHistoryProtected` rejects unresolved history references. The authenticated
+  `retained_history_floor` distinguishes an intentionally pruned cursor from
+  corruption. Raft snapshots alone do not prune this application history.
 - `ConsensusConfigStore::rpc_handler` exposes the shared bounded inbound
   consensus port. `opc-persist` does not contain a second TCP or TLS transport.
 - `ConsensusConfigStore::ensure_local_authority` performs a local-only
@@ -116,11 +122,14 @@ and snapshot lineage. The removed custom Raft implementation, majority config
 wrapper, TCP peer/server, and standalone consensus-node binary are not
 alternative authority paths.
 
-Config command and config-specific RPC revision 3 add an inline named rollback
-point to the same deterministic state-machine mutation as its encrypted
-commit. Revisions 1 and 2 remain replayable only with their original semantics.
-Mixed config-consensus revisions do not negotiate: drain config writers, stop
-the complete voter set, upgrade every member, and restart the set together.
+Config command and config-specific RPC revision 4 add explicit acknowledged
+application-history retention. Revisions 1 through 3 retain their original
+command semantics. Configuration storage and snapshot representation 2 carry
+the authenticated history boundary. Representation-1 files are refused; a
+coordinated binary restart alone is not a state conversion. See
+[ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for the exact
+bounds, acknowledgement obligation, protected references, replay and recovery
+contract, and representation cutover limitation.
 
 Creating the `config_raft_identity` table claims the database for Openraft in
 the same immediate SQLite transaction that checks or imports legacy state.

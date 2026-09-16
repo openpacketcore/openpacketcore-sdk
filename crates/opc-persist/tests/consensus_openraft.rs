@@ -533,6 +533,817 @@ async fn open_singleton(
     (store, bypass)
 }
 
+// SDK #802: a real committed-history prune must produce the typed floor while
+// preserving the exact encrypted successor lineage and request outcome.
+#[tokio::test]
+async fn acknowledged_history_retention_produces_real_compacted_cursor() {
+    let directory = tempfile::tempdir().expect("test directory");
+    let database = directory.path().join("config.db");
+    let (store, backend) = open_singleton(&database, &directory.path().join("snapshots")).await;
+    let transactions: Vec<_> = (0..6).map(|_| TxId::new()).collect();
+    for (index, tx_id) in transactions.iter().copied().enumerate() {
+        let parent = index.checked_sub(1).map(|index| transactions[index]);
+        store
+            .append_attested_commit(attested(
+                commit(tx_id, parent, index as u64 + 1, 0x62),
+                vec![],
+            ))
+            .await
+            .expect("commit complete encrypted configuration");
+    }
+    let decision = opc_persist::ConfigHistoryRetention::new(
+        transactions[5],
+        ConfigVersion::new(6),
+        ConfigVersion::new(3),
+        ConfigVersion::new(4),
+        opc_persist::ConfigHistoryLimits::new(4, 1_048_576).expect("bounds"),
+    )
+    .expect("acknowledged boundary");
+    let request = ConfigConsensusRequestId::from_bytes([0xC2; 16]);
+    let outcome = store
+        .retain_history_idempotent(request, decision.clone())
+        .await;
+    // Always reap this real engine, including the preserved pre-fix detector.
+    if let Err(error) = outcome {
+        store
+            .shutdown()
+            .await
+            .expect("stop engine after rejected retention");
+        panic!("production retained-history decision did not apply: {error}");
+    }
+    let compacted = store
+        .load_since(ConfigVersion::new(2), 8)
+        .await
+        .expect_err("pruned successor");
+    assert!(matches!(
+        compacted.kind(),
+        PersistErrorKind::ConfigHistoryCompacted
+    ));
+    let retained = store
+        .load_since(ConfigVersion::new(3), 8)
+        .await
+        .expect("exact retained boundary");
+    assert_eq!(
+        retained
+            .iter()
+            .map(|entry| entry.record.version.get())
+            .collect::<Vec<_>>(),
+        vec![4, 5, 6]
+    );
+    assert_eq!(retained[0].record.parent_tx_id, Some(transactions[2]));
+    assert_eq!(retained[0].record.tx_id, transactions[3]);
+    store
+        .retain_history_idempotent(request, decision)
+        .await
+        .expect("exact retention replay");
+    let reader = rusqlite::Connection::open(&database).expect("independent database observation");
+    let count: i64 = reader
+        .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+        .expect("retained row count");
+    assert_eq!(count, 3);
+    drop(reader);
+    store.shutdown().await.expect("stop engine");
+    drop(store);
+    drop(backend);
+}
+
+fn retention(
+    head: TxId,
+    version: u64,
+    from: u64,
+    records: u32,
+    bytes: u64,
+) -> opc_persist::ConfigHistoryRetention {
+    opc_persist::ConfigHistoryRetention::new(
+        head,
+        ConfigVersion::new(version),
+        ConfigVersion::new(from - 1),
+        ConfigVersion::new(from),
+        opc_persist::ConfigHistoryLimits::new(records, bytes).expect("history bounds"),
+    )
+    .expect("history decision")
+}
+
+#[tokio::test]
+async fn history_retention_caps_are_atomic_and_outcomes_survive_pruning() {
+    let dir = tempfile::tempdir().expect("directory");
+    let path = dir.path().join("config.sqlite");
+    let (store, backend) = open_singleton(&path, &dir.path().join("snapshots")).await;
+    let ids: Vec<_> = (0..7).map(|_| TxId::new()).collect();
+    let original = commit(ids[0], None, 1, 0x62);
+    let original_request = ConfigConsensusRequestId::from_bytes([0xE0; 16]);
+    store
+        .append_commit_idempotent(original_request, attested(original.clone(), audit(ids[0])))
+        .await
+        .expect("first commit");
+    for index in 1..4 {
+        store
+            .append_attested_commit(attested(
+                commit(ids[index], Some(ids[index - 1]), index as u64 + 1, 0x62),
+                audit(ids[index]),
+            ))
+            .await
+            .expect("complete configuration");
+    }
+    let decision = retention(ids[3], 4, 3, 3, 1_048_576);
+    let request = ConfigConsensusRequestId::from_bytes([0xE1; 16]);
+    store
+        .retain_history_idempotent(request, decision.clone())
+        .await
+        .expect("prune acknowledged prefix");
+    store
+        .append_commit_idempotent(original_request, attested(original, audit(ids[0])))
+        .await
+        .expect("exact outcome remains after its history was acknowledged");
+    assert_eq!(
+        store
+            .load_latest()
+            .await
+            .expect("head")
+            .expect("record")
+            .record
+            .tx_id,
+        ids[3]
+    );
+    store
+        .append_attested_commit(attested(
+            commit(ids[4], Some(ids[3]), 5, 0x62),
+            audit(ids[4]),
+        ))
+        .await
+        .expect("last admitted row");
+    let over_request = ConfigConsensusRequestId::from_bytes([0xE2; 16]);
+    let over_record = commit(ids[5], Some(ids[4]), 6, 0x62);
+    let error = store
+        .append_commit_idempotent(over_request, attested(over_record.clone(), audit(ids[5])))
+        .await
+        .expect_err("hard record bound");
+    assert!(matches!(error.kind(), PersistErrorKind::ConfigHistoryFull));
+    assert_eq!(
+        store
+            .load_latest()
+            .await
+            .expect("head")
+            .expect("record")
+            .record
+            .tx_id,
+        ids[4]
+    );
+    // The original decision remains idempotent even after the head advances.
+    store
+        .retain_history_idempotent(request, decision.clone())
+        .await
+        .expect("retention outcome replay");
+    let stale = store
+        .retain_history_idempotent(ConfigConsensusRequestId::from_bytes([0xE3; 16]), decision)
+        .await
+        .expect_err("new request cannot reuse a stale exact head");
+    assert!(matches!(
+        stale.kind(),
+        PersistErrorKind::ConstraintViolation(_)
+    ));
+    let too_small = store
+        .retain_history_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xE4; 16]),
+            retention(ids[4], 5, 4, 3, 1),
+        )
+        .await
+        .expect_err("encoded byte bound");
+    assert!(matches!(
+        too_small.kind(),
+        PersistErrorKind::ConfigHistoryFull
+    ));
+    assert_eq!(
+        store
+            .load_since(ConfigVersion::new(2), 8)
+            .await
+            .expect("failed prune preserves floor")
+            .len(),
+        3
+    );
+    store
+        .retain_history_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xE5; 16]),
+            retention(ids[4], 5, 4, 3, 1_048_576),
+        )
+        .await
+        .expect("next acknowledged window");
+    // A rejected request keeps its definite result, even after capacity returns.
+    assert!(matches!(
+        store
+            .append_commit_idempotent(over_request, attested(over_record, audit(ids[5])))
+            .await
+            .expect_err("replay capacity rejection")
+            .kind(),
+        PersistErrorKind::ConfigHistoryFull
+    ));
+    store
+        .append_attested_commit(attested(
+            commit(ids[6], Some(ids[4]), 6, 0x62),
+            audit(ids[6]),
+        ))
+        .await
+        .expect("fresh operation after explicit retention");
+    assert!(matches!(
+        store
+            .load_since(ConfigVersion::new(2), 8)
+            .await
+            .expect_err("advanced floor")
+            .kind(),
+        PersistErrorKind::ConfigHistoryCompacted
+    ));
+    assert_eq!(
+        store
+            .load_since(ConfigVersion::new(3), 8)
+            .await
+            .expect("exact boundary")[0]
+            .record
+            .parent_tx_id,
+        Some(ids[2])
+    );
+    store
+        .trigger_snapshot()
+        .await
+        .expect("pruned snapshot validates original AEAD lineage");
+    store.shutdown().await.expect("shutdown");
+    drop(store);
+    drop(backend);
+}
+
+#[cfg(feature = "dangerous-test-hooks")]
+#[tokio::test]
+async fn history_retention_protects_rollback_pending_and_publication_predecessors() {
+    for protected in ["rollback", "pending", "recovery"] {
+        let dir = tempfile::tempdir().expect("directory");
+        let (store, _) = open_singleton(
+            &dir.path().join("config.sqlite"),
+            &dir.path().join("snapshots"),
+        )
+        .await;
+        let ids: Vec<_> = (0..3).map(|_| TxId::new()).collect();
+        for index in 0..3 {
+            let mut value = commit(
+                ids[index],
+                index.checked_sub(1).map(|previous| ids[previous]),
+                index as u64 + 1,
+                0x62,
+            );
+            if index == 2 && protected == "pending" {
+                value.confirmed_deadline = Some(Timestamp::now_utc());
+            }
+            let sealed = if index == 2 && protected == "recovery" {
+                fenced_attested(value, audit(ids[index]))
+            } else {
+                attested(value, audit(ids[index]))
+            };
+            store
+                .append_attested_commit(sealed)
+                .await
+                .expect("complete history");
+        }
+        if protected == "rollback" {
+            store
+                .create_rollback_point(ids[0], Some("retained-release".to_owned()))
+                .await
+                .expect("named rollback reference");
+        }
+        let decision = retention(ids[2], 3, 2, 2, 1_048_576);
+        // The head's unresolved predecessor is v2 and remains; v1 is the
+        // rollback predecessor of the latest confirmed configuration while v3
+        // is pending. Neither recovery nor confirmation may lose that chain.
+        let result = store
+            .retain_history_idempotent(ConfigConsensusRequestId::from_bytes([0xE6; 16]), decision)
+            .await;
+        if protected == "rollback" {
+            assert!(matches!(
+                result.expect_err("named rollback protected").kind(),
+                PersistErrorKind::ConfigHistoryProtected
+            ));
+            assert_eq!(
+                store
+                    .load_rollback(RollbackTarget::ByLabel("retained-release".to_owned()))
+                    .await
+                    .expect("rollback remains")
+                    .record
+                    .tx_id,
+                ids[0]
+            );
+        } else if protected == "pending" {
+            assert!(matches!(
+                result
+                    .expect_err("previous resolved rollback target protected")
+                    .kind(),
+                PersistErrorKind::ConfigHistoryProtected
+            ));
+            assert_eq!(
+                store
+                    .load_rollback(RollbackTarget::Previous)
+                    .await
+                    .expect("pending rollback predecessor")
+                    .record
+                    .tx_id,
+                ids[0]
+            );
+        } else {
+            result.expect("exact unresolved predecessor retained");
+            assert_eq!(
+                store
+                    .load_since(ConfigVersion::new(1), 8)
+                    .await
+                    .expect("publication-safe prefix")[0]
+                    .record
+                    .tx_id,
+                ids[1]
+            );
+        }
+        store.shutdown().await.expect("shutdown");
+    }
+}
+
+#[cfg(feature = "dangerous-test-hooks")]
+#[tokio::test]
+async fn history_retention_releases_acknowledged_rolled_back_pending_commit() {
+    let dir = tempfile::tempdir().expect("directory");
+    let (store, _) = open_singleton(
+        &dir.path().join("config.sqlite"),
+        &dir.path().join("snapshots"),
+    )
+    .await;
+    let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+    for index in 0..5 {
+        let mut value = commit(
+            ids[index],
+            index.checked_sub(1).map(|previous| ids[previous]),
+            index as u64 + 1,
+            0x62,
+        );
+        if index == 2 {
+            value.confirmed_deadline = Some(Timestamp::now_utc());
+        }
+        let sealed = if index == 3 {
+            attested_resolving(
+                value,
+                audit(ids[index]),
+                ConfirmedCommitResolution::Rollback {
+                    pending_tx_id: ids[2],
+                },
+            )
+        } else {
+            attested(value, audit(ids[index]))
+        };
+        store
+            .append_attested_commit(sealed)
+            .await
+            .expect("committed rollback resolves the current pending decision");
+    }
+    let result = store
+        .retain_history_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xED; 16]),
+            retention(ids[4], 5, 4, 2, 1_048_576),
+        )
+        .await;
+    let retained = store.load_since(ConfigVersion::new(3), 8).await;
+    let rollback = store.load_rollback(RollbackTarget::Previous).await;
+    store.shutdown().await.expect("shutdown");
+    result.expect("historical pending marker is resolved by its committed rollback");
+    let retained = retained.expect("retained exact suffix");
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[0].record.tx_id, ids[3]);
+    assert_eq!(retained[0].record.parent_tx_id, Some(ids[2]));
+    assert_eq!(retained[1].record.tx_id, ids[4]);
+    assert_eq!(rollback.expect("live rollback target").record.tx_id, ids[3]);
+}
+
+#[tokio::test]
+async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_state() {
+    for mutation in ["floor", "anchor", "record"] {
+        let dir = tempfile::tempdir().expect("directory");
+        let database = dir.path().join("config.sqlite");
+        let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+        let ids: Vec<_> = (0..4).map(|_| TxId::new()).collect();
+        for index in 0..4 {
+            store
+                .append_attested_commit(attested(
+                    commit(
+                        ids[index],
+                        index.checked_sub(1).map(|previous| ids[previous]),
+                        index as u64 + 1,
+                        0x62,
+                    ),
+                    vec![],
+                ))
+                .await
+                .expect("configuration");
+        }
+        store
+            .retain_history_idempotent(
+                ConfigConsensusRequestId::from_bytes([0xE7; 16]),
+                retention(ids[3], 4, 3, 3, 1_048_576),
+            )
+            .await
+            .expect("real prune");
+        // SQL is only the adversarial corruptor, never the positive producer.
+        let attacker = rusqlite::Connection::open(&database).expect("corruption fixture");
+        match mutation {
+            "floor" => {
+                attacker.execute("UPDATE config_raft_history_retention SET state_json = json_set(CAST(state_json AS TEXT), '$.boundary.first.version', 1)", []).expect("tamper floor without HMAC");
+            }
+            "anchor" => {
+                attacker
+                    .execute("DELETE FROM config_raft_history_retention", [])
+                    .expect("remove authenticated boundary");
+            }
+            "record" => {
+                attacker
+                    .execute_batch("PRAGMA foreign_keys = OFF")
+                    .expect("adversarial offline deletion");
+                attacker
+                    .execute("DELETE FROM config_history WHERE version = 3", [])
+                    .expect("remove retained predecessor");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            store.load_latest().await.is_err(),
+            "{mutation}: no snapshot authority from corruption"
+        );
+        let error = store
+            .load_since(ConfigVersion::new(1), 8)
+            .await
+            .expect_err("corruption is not intentional compaction");
+        assert!(!matches!(
+            error.kind(),
+            PersistErrorKind::ConfigHistoryCompacted
+        ));
+        store.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn retained_history_floor_limits_and_outcomes_survive_explicit_reopen() {
+    let dir = tempfile::tempdir().expect("directory");
+    let path = dir.path().join("retained.sqlite");
+    let backend = SqliteBackend::provision_config_authority(
+        retained_options(&path, topology(), 1),
+        audit_key(),
+    )
+    .await
+    .expect("explicit provision");
+    let store = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("store");
+    store.initialize_cluster().await.expect("initialize");
+    let ids: Vec<_> = (0..4).map(|_| TxId::new()).collect();
+    for index in 0..4 {
+        store
+            .append_attested_commit(attested(
+                commit(
+                    ids[index],
+                    index.checked_sub(1).map(|previous| ids[previous]),
+                    index as u64 + 1,
+                    0x62,
+                ),
+                audit(ids[index]),
+            ))
+            .await
+            .expect("configuration");
+    }
+    let decision = retention(ids[3], 4, 3, 2, 1_048_576);
+    let request = ConfigConsensusRequestId::from_bytes([0xE8; 16]);
+    store
+        .retain_history_idempotent(request, decision.clone())
+        .await
+        .expect("real prune");
+    store.trigger_snapshot().await.expect("snapshot");
+    store.shutdown().await.expect("shutdown");
+    drop(store);
+    let backend =
+        SqliteBackend::reopen_config_authority(retained_options(&path, topology(), 1), audit_key())
+            .await
+            .expect("explicit retained reopen");
+    let store = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("restore");
+    store.initialize_cluster().await.expect("readmit");
+    store
+        .retain_history_idempotent(request, decision)
+        .await
+        .expect("retained outcome");
+    assert!(matches!(
+        store
+            .load_since(ConfigVersion::new(1), 8)
+            .await
+            .expect_err("old cursor after reopen")
+            .kind(),
+        PersistErrorKind::ConfigHistoryCompacted
+    ));
+    let retained = store
+        .load_since(ConfigVersion::new(2), 8)
+        .await
+        .expect("exact restored boundary");
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[0].record.parent_tx_id, Some(ids[1]));
+    let new_id = TxId::new();
+    assert!(matches!(
+        store
+            .append_attested_commit(attested(commit(new_id, Some(ids[3]), 5, 0x62), vec![]))
+            .await
+            .expect_err("bound survives reopen")
+            .kind(),
+        PersistErrorKind::ConfigHistoryFull
+    ));
+    store.shutdown().await.expect("shutdown restored");
+}
+
+#[tokio::test]
+async fn history_retention_survives_natural_leader_change_and_member_snapshot_install() {
+    let mut cluster =
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+    let (a, b, c) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster()
+    );
+    a.expect("first");
+    b.expect("second");
+    c.expect("third");
+    cluster.wait_ready().await;
+    let original_leader = cluster.leader();
+    let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+    for index in 0..4 {
+        cluster.stores[original_leader]
+            .append_attested_commit(attested(
+                commit(
+                    ids[index],
+                    index.checked_sub(1).map(|previous| ids[previous]),
+                    index as u64 + 1,
+                    0x62,
+                ),
+                vec![],
+            ))
+            .await
+            .expect("quorum configuration");
+    }
+    let decision = retention(ids[3], 4, 3, 3, 1_048_576);
+    let request = ConfigConsensusRequestId::from_bytes([0xEB; 16]);
+    cluster.stores[original_leader]
+        .retain_history_idempotent(request, decision.clone())
+        .await
+        .expect("quorum retention");
+    // Real replayed commands move Raft beyond its production retained-log
+    // window without inflating canonical history or weakening the profile.
+    for _ in 0..opc_consensus::DURABLE_OPENRAFT_PROFILE.retained_logs + 16 {
+        cluster.stores[original_leader]
+            .retain_history_idempotent(request, decision.clone())
+            .await
+            .expect("stable retention outcome");
+    }
+    cluster.wait_ready().await;
+    for store in &cluster.stores {
+        store.trigger_snapshot().await.expect("production snapshot");
+    }
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        loop {
+            let mut complete = true;
+            for index in 0..3 {
+                let observer = rusqlite::Connection::open(cluster.database_path(index))
+                    .expect("snapshot observation");
+                let purged: bool = observer
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM config_raft_purged WHERE log_index > 0)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("purged prefix");
+                complete &= purged;
+            }
+            if complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("actual production log compaction");
+    let old_id = cluster.stores[original_leader].status().node_id;
+    let old_term = cluster.stores[original_leader].status().term;
+    cluster.isolate(original_leader);
+    cluster.stores[original_leader]
+        .shutdown()
+        .await
+        .expect("old leader stopped");
+    let replacement = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        loop {
+            for index in 0..3 {
+                if index == original_leader {
+                    continue;
+                }
+                let state = cluster.stores[index].status();
+                if state.term > old_term
+                    && state.leader_id == Some(state.node_id)
+                    && state.node_id != old_id
+                {
+                    return index;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("natural surviving-quorum election");
+    cluster.stores[replacement]
+        .retain_history_idempotent(request, decision.clone())
+        .await
+        .expect("outcome under replacement leader");
+    assert!(matches!(
+        cluster.stores[replacement]
+            .load_since(ConfigVersion::new(1), 8)
+            .await
+            .expect_err("floor after election")
+            .kind(),
+        PersistErrorKind::ConfigHistoryCompacted
+    ));
+    cluster.stores[replacement]
+        .append_attested_commit(attested(commit(ids[4], Some(ids[3]), 5, 0x62), vec![]))
+        .await
+        .expect("next canonical revision");
+    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).expect("node"));
+    let identity = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("opc-persist-three-node-tests").expect("cluster"),
+        ConfigConsensusConfigurationId::from_bytes([0x99; 32]),
+        ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
+    );
+    let topology = ConfigConsensusTopology::try_new(
+        identity,
+        nodes[original_leader],
+        nodes.into_iter().collect(),
+    )
+    .expect("repair topology");
+    let repair_path = cluster._directory.path().join("retention-repaired.sqlite");
+    let backend = SqliteBackend::provision_config_member_repair(
+        retained_options(&repair_path, topology.clone(), 9),
+        audit_key(),
+    )
+    .await
+    .expect("explicit member repair");
+    let peers = (0..3)
+        .filter(|index| *index != original_leader)
+        .map(|index| {
+            let peer: Arc<dyn ConsensusPeer> = cluster.paths[&(original_leader, index)].clone();
+            (nodes[index], peer)
+        })
+        .collect();
+    let repair = ConsensusConfigStore::open_with_operation_timeout(
+        topology,
+        backend,
+        cluster._directory.path().join("retention-repair-snapshots"),
+        peers,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("repair store");
+    for ((_, target), path) in &cluster.paths {
+        if *target == original_leader {
+            path.install(repair.rpc_handler()).await;
+        }
+    }
+    cluster.stores[original_leader] = repair;
+    cluster.heal(original_leader);
+    cluster.stores[original_leader]
+        .initialize_cluster()
+        .await
+        .expect("snapshot-backed member recovery");
+    cluster.wait_ready().await;
+    let observer =
+        rusqlite::Connection::open(&repair_path).expect("installed snapshot observation");
+    let snapshot_installed: bool = observer
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM config_raft_snapshot)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("snapshot state");
+    assert!(
+        snapshot_installed,
+        "repair must have installed a snapshot beyond the purged log prefix"
+    );
+    drop(observer);
+    let page = cluster.stores[original_leader]
+        .load_since(ConfigVersion::new(2), 8)
+        .await
+        .expect("repaired exact boundary");
+    assert_eq!(
+        page.iter()
+            .map(|entry| entry.record.version.get())
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert_eq!(page[0].record.parent_tx_id, Some(ids[1]));
+    assert!(matches!(
+        cluster.stores[original_leader]
+            .load_since(ConfigVersion::new(1), 8)
+            .await
+            .expect_err("installed authenticated floor")
+            .kind(),
+        PersistErrorKind::ConfigHistoryCompacted
+    ));
+    cluster.stores[original_leader]
+        .retain_history_idempotent(request, decision)
+        .await
+        .expect("installed outcome replay");
+    cluster.shutdown().await;
+}
+
+#[cfg(feature = "dangerous-test-hooks")]
+#[tokio::test]
+async fn history_capacity_rejection_rolls_back_pending_confirmation_atomically() {
+    let dir = tempfile::tempdir().expect("directory");
+    let database = dir.path().join("config.sqlite");
+    let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
+    let ids: Vec<_> = (0..5).map(|_| TxId::new()).collect();
+    for index in 0..3 {
+        store
+            .append_attested_commit(attested(
+                commit(
+                    ids[index],
+                    index.checked_sub(1).map(|previous| ids[previous]),
+                    index as u64 + 1,
+                    0x62,
+                ),
+                vec![],
+            ))
+            .await
+            .expect("history");
+    }
+    store
+        .retain_history_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xEA; 16]),
+            retention(ids[2], 3, 2, 3, 1_048_576),
+        )
+        .await
+        .expect("bounded history");
+    let mut pending = commit(ids[3], Some(ids[2]), 4, 0x62);
+    pending.confirmed_deadline = Some(Timestamp::now_utc());
+    store
+        .append_attested_commit(attested(pending, audit(ids[3])))
+        .await
+        .expect("pending fills cap");
+    let error = store
+        .append_attested_commit(attested_resolving(
+            commit(ids[4], Some(ids[3]), 5, 0x62),
+            audit(ids[4]),
+            ConfirmedCommitResolution::Confirm {
+                pending_tx_id: ids[3],
+            },
+        ))
+        .await
+        .expect_err("capacity after attempted resolution");
+    assert!(matches!(error.kind(), PersistErrorKind::ConfigHistoryFull));
+    assert_eq!(
+        store
+            .load_latest()
+            .await
+            .expect("head")
+            .expect("record")
+            .record
+            .tx_id,
+        ids[3]
+    );
+    let observer = rusqlite::Connection::open(&database).expect("readback");
+    let confirmed: Option<String> = observer
+        .query_row(
+            "SELECT confirmed_at FROM config_history WHERE version = 4",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pending readback");
+    let lifecycle: i64 = observer
+        .query_row("SELECT COUNT(*) FROM config_lifecycle_audit", [], |row| {
+            row.get(0)
+        })
+        .expect("lifecycle readback");
+    assert!(
+        confirmed.is_none(),
+        "rejected append cannot resolve its predecessor"
+    );
+    assert_eq!(
+        lifecycle, 0,
+        "rejected resolution cannot leave an audit side effect"
+    );
+    drop(observer);
+    store.shutdown().await.expect("shutdown");
+}
+
 async fn assert_all_direct_mutations_are_fenced(backend: &SqliteBackend, current_tx_id: TxId) {
     let appended_tx_id = TxId::new();
     for result in [

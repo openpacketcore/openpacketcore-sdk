@@ -797,10 +797,43 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let identity = self.core.identity;
-        self.core
-            .run_sqlite(move |conn| sqlite::purge_logs_sync(conn, identity, &log_id))
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
+        // Openraft queues snapshot installation on its independent state-machine
+        // worker before issuing purge. Do not mistake that in-flight install
+        // for durable application, or remove its logs before it commits. Wait
+        // outside SQLite's worker/connection under the existing 30-second bound.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut progress = self.core.durable_progress.subscribe_applied();
+        let result = async {
+            loop {
+                let purged = self
+                    .core
+                    .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                        cancellation.check_io()?;
+                        if sqlite::read_applied_sync(conn, identity)?
+                            .is_none_or(|applied| applied.index < log_id.index)
+                        {
+                            return Ok(false);
+                        }
+                        sqlite::purge_logs_sync(conn, identity, &log_id)?;
+                        Ok(true)
+                    })
+                    .await?;
+                if purged {
+                    return Ok(());
+                }
+                tokio::time::timeout_at(deadline, progress.changed())
+                    .await
+                    .map_err(|_| {
+                        sqlite::invalid_data("config consensus purge application wait expired")
+                    })?
+                    .map_err(|_| {
+                        sqlite::invalid_data("config consensus application progress unavailable")
+                    })?;
+                validate_snapshot_binding(&self.core)?;
+            }
+        }
+        .await;
+        result.map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 }
 
@@ -847,6 +880,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         })?;
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
+        let audit_key = self.core.audit_key.clone();
         let entries = collect_bounded_entries(entries)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
         let responses = self
@@ -858,6 +892,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     &members,
                     entries,
                     cancellation,
+                    &audit_key,
                 )
             })
             .await
@@ -2191,6 +2226,86 @@ mod tests {
         open(&backend, snapshot_path, identity(), members())
             .await
             .expect("clean retry after dropped initialization");
+    }
+
+    #[tokio::test]
+    async fn purge_waits_for_snapshot_application_and_requires_exact_durable_lineage() {
+        let temp = tempfile::tempdir().expect("snapshot directory");
+        let source = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("source");
+        let (_, mut source_machine, _) =
+            open(&source, temp.path().join("source"), identity(), members())
+                .await
+                .expect("source storage");
+        source_machine
+            .apply([membership_entry()])
+            .await
+            .expect("source membership");
+        let mut snapshot = source_machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("source snapshot");
+        let destination =
+            SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+                .await
+                .expect("destination");
+        let (mut log, mut machine, _) = open(
+            &destination,
+            temp.path().join("destination"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("destination storage");
+        let mut receiving = machine.begin_receiving_snapshot().await.expect("receiver");
+        tokio::io::copy(&mut snapshot.snapshot, &mut receiving)
+            .await
+            .expect("snapshot copy");
+        let through = snapshot.meta.last_log_id.expect("snapshot log identity");
+        {
+            let mut purge = std::pin::pin!(log.purge(through));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(25), &mut purge)
+                    .await
+                    .is_err(),
+                "purge must wait while the snapshot is not applied"
+            );
+            {
+                let conn = destination.conn();
+                let conn = conn.lock().await;
+                assert_eq!(
+                    sqlite::read_purged_sync(&conn, identity()).expect("no purge"),
+                    None
+                );
+                assert_eq!(
+                    sqlite::read_applied_sync(&conn, identity()).expect("no applied state"),
+                    None
+                );
+            }
+            machine
+                .install_snapshot(&snapshot.meta, receiving)
+                .await
+                .expect("install snapshot");
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut purge)
+                .await
+                .expect("durable application wakes purge")
+                .expect("snapshot proves exact purge boundary");
+        }
+        let mut wrong = through;
+        wrong.leader_id.term += 1;
+        assert!(
+            log.purge(wrong).await.is_err(),
+            "same index with another term is not authority"
+        );
+        let conn = destination.conn();
+        let conn = conn.lock().await;
+        assert_eq!(
+            sqlite::read_purged_sync(&conn, identity()).expect("unchanged exact floor"),
+            Some(through)
+        );
     }
 
     #[tokio::test]

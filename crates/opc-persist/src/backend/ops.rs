@@ -81,6 +81,11 @@ impl ConfigStore for SqliteBackend {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         let res = (|| {
+            crate::consensus::history::validate_cursor_sync(
+                &guard,
+                self.audit_key.as_ref(),
+                requested_version,
+            )?;
             let visible_head = Self::load_committed_latest_impl(&guard, self.audit_key.as_ref())?;
             if visible_head
                 .as_ref()
@@ -108,7 +113,25 @@ impl ConfigStore for SqliteBackend {
                 if crate::types::config_recovery_required(&record.record.principal)? {
                     break;
                 }
+                let expected = records
+                    .last()
+                    .map_or(requested_version, |previous: &StoredConfig| {
+                        previous.record.version
+                    })
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(PersistError::corrupt_blob)?;
+                if record.record.version.get() != expected {
+                    return Err(PersistError::corrupt_blob());
+                }
                 records.push(record);
+            }
+            if records.is_empty()
+                && visible_head
+                    .as_ref()
+                    .is_some_and(|head| requested_version < head.record.version)
+            {
+                return Err(PersistError::corrupt_blob());
             }
             Ok(records)
         })();
@@ -122,6 +145,11 @@ impl ConfigStore for SqliteBackend {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         res
+    }
+
+    async fn retained_history_floor(&self) -> Result<Option<ConfigVersion>, PersistError> {
+        let guard = self.conn.lock().await;
+        crate::consensus::history::floor_sync(&guard, self.audit_key.as_ref())
     }
 
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError> {
@@ -483,6 +511,8 @@ impl SqliteBackend {
         conn: &rusqlite::Connection,
         audit_key: &AuditKey,
     ) -> Result<Option<StoredConfig>, PersistError> {
+        crate::consensus::history::validate_sync(conn, audit_key)
+            .map_err(|_| PersistError::corrupt_blob())?;
         // Find the highest version (absolute latest)
         let tx_id_bytes: Option<Vec<u8>> = conn
             .query_row(
@@ -508,6 +538,8 @@ impl SqliteBackend {
         conn: &rusqlite::Connection,
         audit_key: &AuditKey,
     ) -> Result<Option<StoredConfig>, PersistError> {
+        crate::consensus::history::validate_sync(conn, audit_key)
+            .map_err(|_| PersistError::corrupt_blob())?;
         let first_fenced: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
             .query_row(
                 r#"SELECT tx_id, parent_tx_id
@@ -920,6 +952,15 @@ impl SqliteBackend {
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(PersistError::sqlite(e.to_string())),
         };
+
+        let parent_tx_id_out = crate::consensus::history::original_parent_sync(
+            conn,
+            audit_key,
+            &tx_id_out,
+            version,
+            parent_tx_id_out,
+        )
+        .map_err(|_| PersistError::corrupt_blob())?;
 
         // Fail closed: validate fixed-size fields
         if tx_id_out.len() != 16 {
