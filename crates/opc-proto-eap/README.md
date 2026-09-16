@@ -2,12 +2,45 @@
 
 `opc-proto-eap` provides a strict, allocation-bounded, product-neutral
 projection for complete EAP-AKA (Type 23) and EAP-AKA-prime (Type 50) Request
-and Response packets. It is shared by the IKEv2 and SWm Diameter-EAP
+and Response packets, alongside a bounded EAP-5G envelope codec. The AKA
+projection is shared by the IKEv2 and SWm Diameter-EAP
 boundaries so products do not need a second method parser. The crate remains
 an experimental workspace component and is not published independently until
 its protocol surface graduates.
 
 ## Scope
+
+The separate [`eap5g`](src/eap5g.rs) module constructs and parses EAP-5G
+Start, NAS Request/Response, Stop, and empty Notification envelopes. NAS is
+opaque; typed AN values cover selected PLMN, GUAMI, requested NSSAI, cause,
+selected NID, onboarding and GUAMI origin. Parsing allocates nothing and
+canonical encoding checks the complete EAP length before reserving memory or
+changing output. Every value-bearing type has redacted `Debug`.
+
+```rust
+use opc_proto_eap::eap5g::{Limits, Message, Packet};
+
+let start = Packet::new(1, Message::Start).encode(Limits::default())?;
+let received = Packet::parse(&start, Limits::default())?;
+assert!(matches!(received.message(), Message::Start));
+# Ok::<(), opc_proto_eap::eap5g::Error>(())
+```
+
+For an initial NAS response, call `AnParameters::validate_bootstrap` with
+explicit `BootstrapRequirements` from the access context. This profile
+requires selected PLMN and cause; the caller supplies NID/SNPN, GUAMI,
+NSSAI-inclusion and onboarding conditions. Ordinary parsing admits subsequent
+NAS responses with no AN parameters. The codec cannot infer those conditions
+from opaque NAS or establish that an EAP session completed.
+
+Receive-side parameter ordering is unrestricted. Duplicate singleton handling
+is an explicit caller policy (`Reject` by default, or `FirstWins` with all
+occurrences validated). Spare types and bits are ignored; canonical encoding
+omits ignored fields and zeros spare bits. Known UE-identity parameters and
+TNGF contact parameters return `UnsupportedParameter`; no identity parser is
+exposed. See the [EAP-5G conformance boundary](CONFORMANCE.md#eap-5g-bootstrap-envelopes).
+
+### AKA projections
 
 The parser covers the RFC 4187 AKA subtypes Challenge,
 Authentication-Reject, Synchronization-Failure, Identity, Notification,

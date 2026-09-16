@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `opc-proto-eap`: add bounded EAP-5G bootstrap envelopes with typed AN
+  parameters, opaque NAS forwarding, explicit duplicate and presence policy,
+  canonical construction and redacted diagnostics (Refs #785).
+
 ### Changed
 - Raise the minimum supported Rust version to **1.89** for `russh` 0.63.3,
   and keep the workspace, standalone SMF consumer, and CI compiler gate aligned.
