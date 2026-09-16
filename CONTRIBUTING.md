@@ -67,14 +67,63 @@ Run the commands produced by
 Use the same Rust version as the CI run and set `CARGO_INCREMENTAL=0`,
 `CARGO_PROFILE_DEV_DEBUG=0`, and `CARGO_PROFILE_TEST_DEBUG=0`.
 
+The native IPsec, i686 session-net, and egress host-source jobs are separate
+profiles: use `CARGO_INCREMENTAL=0` and their workflow commands, but leave
+`CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` unset, as those jobs do.
+Run the protected prepared-transition functional test alone with
+`CARGO_PROFILE_TEST_OPT_LEVEL=1` in the core, native, and i686 lanes. Debug
+assertions and overflow checks remain enabled. The selector functional test
+retains its ordinary test profile.
+
 The separate **Rust GTP-U unsupported-platform cfg tests** job in
 [ci.yml](.github/workflows/ci.yml) also uses
 `RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and
 `--no-default-features`. The ordinary workspace run does not cover that profile.
-Its selector test must resolve exactly once and run alone with the same
-one-second deadline, after the other cfg tests finish. Use a separate
-`CARGO_TARGET_DIR` for this profile, as the workflow does. Local timing passes
-remain specific to the local storage and host load.
+Its selector functional test must resolve exactly once and run alone after
+the other cfg tests finish. Use a separate `CARGO_TARGET_DIR` for this profile,
+as the workflow does.
+
+### CNF performance qualification
+
+Required CI checks durable completion, exact receipts/readback, quorum and
+wire-call counts, recovery, and authority expiry. The two composed latency
+scenarios also have explicit performance tests: the protected prepared
+transition must complete within **100 ms**, and the complete selector request
+within **one second**. Their functional counterparts run the same scenario
+with a ten-second hang guard; passing those tests does not qualify latency.
+Production deadlines, lease bounds, disk syncs, and durability checks are
+unchanged. Deadline-accounting and cancellation regression tests still run in
+required CI.
+
+The latency tests are marked `#[ignore]` so ordinary Cargo and required CI runs
+do not depend on shared-runner performance. Run them explicitly with:
+
+```bash
+python3 ci/performance-tests.py --profile core-protected
+python3 ci/performance-tests.py --profile core-selector
+python3 ci/performance-tests.py --profile native-protected
+python3 ci/performance-tests.py --profile i686-protected
+python3 ci/performance-tests.py --profile unsupported-selector
+```
+
+Use a separate `CARGO_TARGET_DIR` per profile and the same toolchain/storage
+setup as its CI lane; i686 also needs the 32-bit target and system toolchain.
+The script selects each ignored test exactly once, retains the original
+deadline, and fails on any failed measurement. Logs and a JSON result are
+written under `target/performance/PROFILE` (or `--output DIRECTORY`).
+
+Run the **CNF performance** workflow manually in Actions. It defaults to the
+existing GitHub-hosted `ubuntu-latest` runners. Set repository variable
+`OPC_PERFORMANCE_RUNNER` to an available Linux x64 runner label to qualify a
+different runner; the manual `runner` input overrides that variable. Set
+`OPC_PERFORMANCE_GATES=true` to run qualification automatically after pushes to
+`main`. It is separate from required PR checks and fails normally when a limit
+is missed. Do not make it a required merge check until the chosen runner is
+qualified. Each profile uploads its raw logs, host details, and result.
+
+Do not replace the performance deadlines or use RAM-backed database storage.
+A local timing pass qualifies only that local host/storage observation; it does
+not establish that the GitHub-hosted runner meets the limit.
 
 If the pull request touches operator-sdk-go or the Helm chart, also run:
 

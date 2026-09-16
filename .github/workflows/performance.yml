@@ -1,0 +1,80 @@
+name: CNF performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Linux x64 runner label (blank uses repository variable or ubuntu-latest)
+        type: string
+        required: false
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# This workflow is independent of required functional CI. Enable automatic
+# main-branch qualification with OPC_PERFORMANCE_GATES=true, or run manually.
+# Every enabled measurement fails normally when its original limit is missed.
+jobs:
+  latency:
+    name: CNF latency (${{ matrix.profile }})
+    if: github.event_name == 'workflow_dispatch' || vars.OPC_PERFORMANCE_GATES == 'true'
+    runs-on: ${{ inputs.runner || vars.OPC_PERFORMANCE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core-protected, core-selector, native-protected, i686-protected, unsupported-selector]
+    env:
+      CARGO_TERM_COLOR: always
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      PERFORMANCE_PROFILE: ${{ matrix.profile }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install 32-bit toolchain
+        if: matrix.profile == 'i686-protected'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gcc-multilib
+          rustup target add i686-unknown-linux-gnu
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Prepare ordinary disk scratch
+        run: |
+          scratch="$(mktemp -d "${RUNNER_TEMP}/cnf-performance.XXXXXX")"
+          printf 'TMPDIR=%s\n' "$scratch" >> "$GITHUB_ENV"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-performance-${{ matrix.profile }}
+
+      - name: Qualify original latency limit
+        run: |
+          set -euo pipefail
+          mkdir -p performance-results
+          {
+            uname -a
+            lscpu
+            findmnt -T "$TMPDIR"
+            df -h "$TMPDIR"
+          } > performance-results/host.txt
+          python3 ci/performance-tests.py --profile "$PERFORMANCE_PROFILE" --output performance-results
+
+      - name: Archive performance result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cnf-performance-${{ matrix.profile }}
+          path: performance-results/
+          if-no-files-found: error

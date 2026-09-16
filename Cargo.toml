@@ -40,9 +40,8 @@ serde_json = "1.0"
 base64 = "0.22.1"
 serde_ignored = "0.1"
 num_cpus = "1.16"
-# sha2/hkdf/hmac are coupled through digest/crypto-common 0.10 and must move
-# to the 0.11 trait line together with aes-gcm-siv, which has no stable
-# release on the new traits yet; partial bumps create duplicate digest versions.
+# sha2/hkdf/hmac share the digest 0.10 trait line and must migrate together.
+# The AEAD implementations consume the derived key bytes independently.
 sha2 = "0.10"
 # IKEv2 PRF and integrity state is key-derived and must be wiped on drop. Keep
 # this explicit alias on the RustCrypto digest 0.11 line with zeroization until
@@ -50,9 +49,10 @@ sha2 = "0.10"
 sha2-zeroize = { package = "sha2", version = "0.11", features = ["zeroize"] }
 sha1 = { version = "0.11", features = ["zeroize"] }
 rand = "0.10"
-aes = { version = "0.9.1", features = ["zeroize"] }
+# aes 0.9.3 requires Rust 1.89; retain the workspace's Rust 1.88 contract.
+aes = { version = "=0.9.2", features = ["zeroize"] }
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
-aes-gcm-siv = "0.11"
+aes-gcm-siv = "0.12"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding", "zeroize"] }
 hkdf = "0.12"
 subtle = "2.6"

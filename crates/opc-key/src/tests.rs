@@ -165,8 +165,15 @@ fn encrypt_and_decrypt_bound_payload_round_trip() {
     let encrypted = handle
         .encrypt_payload(&aad, plaintext, nonce)
         .expect("encrypt");
+    // Captured with aes-gcm-siv 0.11.1 before the 0.12 API migration.
+    // Persisted envelopes must retain identical ciphertext and remain readable.
+    let legacy_ciphertext_and_tag = [
+        9, 124, 67, 29, 119, 155, 146, 56, 138, 67, 156, 253, 104, 142, 167, 188, 126, 157, 102,
+        36, 80, 56, 175, 102, 217, 35, 235, 59, 23, 206, 95, 6, 24, 116, 178, 61, 11,
+    ];
+    assert_eq!(encrypted.ciphertext_and_tag, legacy_ciphertext_and_tag);
     let decrypted = handle
-        .decrypt_payload(&aad, &encrypted.aad, &encrypted.ciphertext_and_tag, nonce)
+        .decrypt_payload(&aad, &encrypted.aad, &legacy_ciphertext_and_tag, nonce)
         .expect("decrypt");
 
     assert_eq!(decrypted, plaintext);
@@ -175,6 +182,44 @@ fn encrypt_and_decrypt_bound_payload_round_trip() {
             .encrypt_payload(&aad, plaintext, nonce)
             .expect("encrypt again"),
         encrypted
+    );
+}
+
+#[test]
+fn decrypt_rejects_modified_ciphertext_tag_and_nonce() {
+    let handle = KeyHandle::new(
+        KeyId::new("config-active-2026-01").expect("key id"),
+        KeyPurpose::Config,
+        tenant(),
+        Zeroizing::new([0x42; AES_256_GCM_SIV_KEY_LEN]),
+    );
+    let aad = config_aad();
+    let nonce = *b"0123456789ab";
+    let encrypted = handle
+        .encrypt_payload(&aad, b"persisted payload", nonce)
+        .expect("encrypt");
+
+    // Exercise every ciphertext byte and every detached-tag byte.
+    for index in 0..encrypted.ciphertext_and_tag.len() {
+        let mut modified = encrypted.ciphertext_and_tag.clone();
+        modified[index] ^= 1;
+        assert_eq!(
+            handle.decrypt_payload(&aad, &encrypted.aad, &modified, nonce),
+            Err(CryptoOperationError::DecryptionFailed),
+            "modified byte {index} must fail authentication"
+        );
+    }
+
+    let mut wrong_nonce = nonce;
+    wrong_nonce[0] ^= 1;
+    assert_eq!(
+        handle.decrypt_payload(
+            &aad,
+            &encrypted.aad,
+            &encrypted.ciphertext_and_tag,
+            wrong_nonce
+        ),
+        Err(CryptoOperationError::DecryptionFailed)
     );
 }
 

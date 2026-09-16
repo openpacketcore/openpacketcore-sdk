@@ -154,7 +154,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
     def test_selector_contract_keeps_one_exact_ordinary_profile_run(self) -> None:
         name = (
             "ebpf::tests::remote_selector_regression::"
-            "singleton_public_protected_flow_keeps_original_request_deadline"
+            "singleton_public_protected_flow_preserves_durable_state"
         )
         commands = TEST_SHARDS.commands(
             {"heavy": {"target": "fixture", "shards": []}}, "misc", []
@@ -187,6 +187,32 @@ class QuiescentShardPlanTests(unittest.TestCase):
         self.assertEqual(set(ordinary) & set(optimized), set())
         self.assertEqual(
             set(optimized), TEST_SHARDS.OPTIMIZED_QUIESCENT_LIB_TESTS
+        )
+
+    def test_protected_transition_runs_once_in_the_optimized_shard(self) -> None:
+        name = (
+            "stateless_quorum_consumer::"
+            "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls"
+        )
+        plan = {"heavy": {"target": "fixture", "shards": []}}
+        ordinary = TEST_SHARDS.commands(plan, "misc", [])
+        optimized = TEST_SHARDS.commands(
+            plan, TEST_SHARDS.OPTIMIZED_QUIESCENT_SHARD, []
+        )
+        mentions = [command for command in ordinary + optimized if name in command]
+
+        self.assertEqual(len(mentions), 2)
+        self.assertEqual(mentions[0], ordinary[0])
+        self.assertEqual(mentions[0].count(name), 1)
+        self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
+        self.assertEqual(
+            mentions[1],
+            [
+                "env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", "cargo", "test",
+                "--locked", "--workspace", "--exclude", "opc-persist",
+                "--all-features", "--quiet", "--lib", "--",
+                "--test-threads=1", "--exact", name,
+            ],
         )
 
     def test_optimized_shard_preserves_exact_o1_commands(self) -> None:

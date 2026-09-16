@@ -70,15 +70,15 @@ HARNESS = ["--test-threads=4"]
 QUIESCENT_LIB_MODULE = "stateless_quorum_consumer"
 QUIESCENT_SELECTOR_LIB_MODULE = "ebpf::tests::remote_selector_regression"
 QUIESCENT_SELECTOR_LIB_TEST = (
-    "singleton_public_protected_flow_keeps_original_request_deadline"
+    "singleton_public_protected_flow_preserves_durable_state"
 )
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
-    "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
     QUIESCENT_SELECTOR_LIB_TEST,
+    "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
     "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
@@ -93,6 +93,7 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
 )
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
+        "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
         "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
@@ -102,7 +103,10 @@ OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
 )
 if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
-# Keep O1 confined to the snapshot/restart roster proofs.
+# Keep O1 confined to the protected-transition and snapshot/restart proofs.
+# Its functional counterpart uses the same optimized execution, debug
+# assertions, and overflow checks as the separate 100 ms performance gate.
+# Match the IPsec/i686 lanes.
 # Applying it to unrelated expiry/fault tests changes their lifecycle timing
 # and would no longer qualify the repository's ordinary test profile.
 OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"

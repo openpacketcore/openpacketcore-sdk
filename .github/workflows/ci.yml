@@ -157,7 +157,9 @@ jobs:
       # check themselves in their precheck step -- so this is the readable
       # place to see a plan failure, not the thing that gates them.
       - name: Test test-shard manifest audit
-        run: python3 ci/test-test-shards.py
+        run: |
+          python3 ci/test-test-shards.py
+          python3 ci/test-performance-tests.py
 
       - name: Verify test shard plan
         run: python3 ci/test-shards.py verify
@@ -330,15 +332,15 @@ jobs:
         with:
           shared-key: opc-rust-gtpu-cfg
 
-      # The composed request has the same literal one-second contract here
-      # as in the ordinary shard. Keep this cfg and feature selection, but
-      # run it after unrelated test runtimes have exited.
+      # Keep the functional composed request in this cfg/feature selection.
+      # The separate CNF performance workflow qualifies its one-second limit.
+      # Run the durable fixture after unrelated test runtimes have exited.
       - name: Run GTP-U unsupported-platform cfg tests
         env:
           RUSTFLAGS: "--cfg opc_linux_gtpu_sys_force_unsupported"
         run: |
           set -euo pipefail
-          selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_keeps_original_request_deadline
+          selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_preserves_durable_state
           cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --list --exact "$selector" > unsupported-selector-tests.txt
           python3 - "$selector" <<'PYCODE'
           import pathlib
@@ -650,6 +652,7 @@ jobs:
           - slice: contracts
             cache_key: opc-session-net-i686-contracts
     env:
+      CARGO_INCREMENTAL: "0"
       CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
       RUSTFLAGS: "-C link-arg=-m32"
       TARGET_CC: gcc
@@ -682,8 +685,8 @@ jobs:
           shared-key: ${{ matrix.cache_key }}
 
       - name: Run opc-session-net tests on i686
-        # The stateless three-voter consumer proofs retain literal authority,
-        # snapshot, and 100/250 ms caller budgets. Run every test exactly once,
+        # The stateless three-voter consumer proofs retain literal authority
+        # and snapshot budgets. Run every functional test exactly once,
         # but give each wall-time contract a fresh 32-bit process so completed
         # fixture runtimes cannot consume a later contract's budget.
         run: |
@@ -691,11 +694,11 @@ jobs:
           ordinary_timing_contracts=(
             persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
             persistent_three_voter_first_transition_has_one_leader_activation_proof
-            protected_consumer_chain_after_activation_elides_outer_capability_wire_calls
           )
-          # Keep the original bounds while optimizing snapshot log generation
-          # and the large protected-plan fixtures. Each still runs exactly once.
-          optimized_roster_contracts=(
+          # Keep the original bounds and debug/overflow assertions. Optimize
+          # the protected request and snapshot fixtures, matching the core lane.
+          optimized_timing_contracts=(
+            protected_consumer_chain_after_activation_elides_outer_capability_wire_calls
             persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
             persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal
             persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart
@@ -704,7 +707,7 @@ jobs:
             persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running
             persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart
           )
-          timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_roster_contracts[@]}")
+          timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_timing_contracts[@]}")
           case "${I686_SLICE}" in
             ordinary)
               skips=()
@@ -734,7 +737,7 @@ jobs:
                   --exact \
                   "stateless_quorum_consumer::$timing_contract"
               done
-              for timing_contract in "${optimized_roster_contracts[@]}"; do
+              for timing_contract in "${optimized_timing_contracts[@]}"; do
                 env CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
                   -p opc-session-net \
                   --all-features \
@@ -791,7 +794,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-hack@0.6.45
           fallback: none
