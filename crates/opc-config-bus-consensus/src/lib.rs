@@ -187,6 +187,8 @@ fn map_persist_error(error: PersistError) -> StoreError {
         PersistErrorKind::WalRecoveryFailed
         | PersistErrorKind::InconsistentState(_)
         | PersistErrorKind::ForeignKeyViolation
+        | PersistErrorKind::ConfigHistoryFull
+        | PersistErrorKind::ConfigHistoryProtected
         | PersistErrorKind::ConstraintViolation(_)
         | PersistErrorKind::RequestIdCollision
         | PersistErrorKind::Sqlite(_)
@@ -333,6 +335,13 @@ where
             .into_iter()
             .map(adapt_stored_config)
             .collect()
+    }
+
+    async fn retained_history_floor(&self) -> Result<Option<ConfigVersion>, StoreError> {
+        self.inner
+            .retained_history_floor()
+            .await
+            .map_err(map_persist_error)
     }
 
     async fn wait_for_committed_change(&self, version: ConfigVersion) -> Result<(), StoreError> {
@@ -530,6 +539,10 @@ impl ConfigStore for ConsensusConfigStoreAdapter {
         limit: usize,
     ) -> Result<Vec<opc_persist::StoredConfig>, PersistError> {
         ConfigStore::load_since(self.inner.as_ref(), version, limit).await
+    }
+
+    async fn retained_history_floor(&self) -> Result<Option<ConfigVersion>, PersistError> {
+        ConfigStore::retained_history_floor(self.inner.as_ref()).await
     }
 
     async fn wait_for_committed_change(&self, version: ConfigVersion) -> Result<(), PersistError> {
@@ -888,6 +901,10 @@ where
         limit: usize,
     ) -> Result<Vec<BusStoredConfig<SealedConfig<C>>>, StoreError> {
         self.adapter.load_since(version, limit).await
+    }
+
+    async fn retained_history_floor(&self) -> Result<Option<ConfigVersion>, StoreError> {
+        self.adapter.retained_history_floor().await
     }
 
     async fn wait_for_committed_change(&self, version: ConfigVersion) -> Result<(), StoreError> {

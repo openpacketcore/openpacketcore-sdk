@@ -797,10 +797,43 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let identity = self.core.identity;
-        self.core
-            .run_sqlite(move |conn| sqlite::purge_logs_sync(conn, identity, &log_id))
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
+        // Openraft queues snapshot installation on its independent state-machine
+        // worker before issuing purge. Do not mistake that in-flight install
+        // for durable application, or remove its logs before it commits. Wait
+        // outside SQLite's worker/connection under the existing 30-second bound.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut progress = self.core.durable_progress.subscribe_applied();
+        let result = async {
+            loop {
+                let purged = self
+                    .core
+                    .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                        cancellation.check_io()?;
+                        if sqlite::read_applied_sync(conn, identity)?
+                            .is_none_or(|applied| applied.index < log_id.index)
+                        {
+                            return Ok(false);
+                        }
+                        sqlite::purge_logs_sync(conn, identity, &log_id)?;
+                        Ok(true)
+                    })
+                    .await?;
+                if purged {
+                    return Ok(());
+                }
+                tokio::time::timeout_at(deadline, progress.changed())
+                    .await
+                    .map_err(|_| {
+                        sqlite::invalid_data("config consensus purge application wait expired")
+                    })?
+                    .map_err(|_| {
+                        sqlite::invalid_data("config consensus application progress unavailable")
+                    })?;
+                validate_snapshot_binding(&self.core)?;
+            }
+        }
+        .await;
+        result.map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 }
 
@@ -847,6 +880,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         })?;
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
+        let audit_key = self.core.audit_key.clone();
         let entries = collect_bounded_entries(entries)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
         let responses = self
@@ -858,6 +892,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     &members,
                     entries,
                     cancellation,
+                    &audit_key,
                 )
             })
             .await
@@ -2191,6 +2226,249 @@ mod tests {
         open(&backend, snapshot_path, identity(), members())
             .await
             .expect("clean retry after dropped initialization");
+    }
+
+    #[tokio::test]
+    async fn purge_waits_for_snapshot_application_and_requires_exact_durable_lineage() {
+        let temp = tempfile::tempdir().expect("snapshot directory");
+        let source = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("source");
+        let (_, mut source_machine, _) =
+            open(&source, temp.path().join("source"), identity(), members())
+                .await
+                .expect("source storage");
+        source_machine
+            .apply([membership_entry()])
+            .await
+            .expect("source membership");
+        let mut snapshot = source_machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("source snapshot");
+        let destination =
+            SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+                .await
+                .expect("destination");
+        let (mut log, mut machine, _) = open(
+            &destination,
+            temp.path().join("destination"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("destination storage");
+        let mut receiving = machine.begin_receiving_snapshot().await.expect("receiver");
+        tokio::io::copy(&mut snapshot.snapshot, &mut receiving)
+            .await
+            .expect("snapshot copy");
+        let through = snapshot.meta.last_log_id.expect("snapshot log identity");
+        {
+            let mut purge = std::pin::pin!(log.purge(through));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(25), &mut purge)
+                    .await
+                    .is_err(),
+                "purge must wait while the snapshot is not applied"
+            );
+            {
+                let conn = destination.conn();
+                let conn = conn.lock().await;
+                assert_eq!(
+                    sqlite::read_purged_sync(&conn, identity()).expect("no purge"),
+                    None
+                );
+                assert_eq!(
+                    sqlite::read_applied_sync(&conn, identity()).expect("no applied state"),
+                    None
+                );
+            }
+            machine
+                .install_snapshot(&snapshot.meta, receiving)
+                .await
+                .expect("install snapshot");
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut purge)
+                .await
+                .expect("durable application wakes purge")
+                .expect("snapshot proves exact purge boundary");
+        }
+        let mut wrong = through;
+        wrong.leader_id.term += 1;
+        assert!(
+            log.purge(wrong).await.is_err(),
+            "same index with another term is not authority"
+        );
+        let conn = destination.conn();
+        let conn = conn.lock().await;
+        assert_eq!(
+            sqlite::read_purged_sync(&conn, identity()).expect("unchanged exact floor"),
+            Some(through)
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_validates_destination_schema_before_replacing_authority() {
+        let temp = tempfile::tempdir().expect("snapshot directory");
+        let at = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("fixed timestamp"),
+        );
+        let protected_tx = TxId::from_uuid(uuid::Uuid::from_bytes([0x61; 16]));
+        let latest_tx = TxId::from_uuid(uuid::Uuid::from_bytes([0x62; 16]));
+        let previous_tx = TxId::from_uuid(uuid::Uuid::from_bytes([0x63; 16]));
+        let mut protected = snapshot_commit_record(protected_tx, None, 1, at, None, 0x61);
+        protected.rollback_point = true;
+        let source = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("source backend");
+        let (_, mut source_machine, _) =
+            open(&source, temp.path().join("source"), identity(), members())
+                .await
+                .expect("source storage");
+        let responses = source_machine
+            .apply([
+                membership_entry(),
+                snapshot_commit_entry(1, 0x61, protected),
+                snapshot_commit_entry(
+                    2,
+                    0x62,
+                    snapshot_commit_record(latest_tx, Some(protected_tx), 2, at, None, 0x62),
+                ),
+            ])
+            .await
+            .expect("source apply");
+        assert!(responses.iter().all(|response| response.result.is_ok()));
+        let mut snapshot = source_machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("authenticated source snapshot");
+
+        for (name, schema_change, schema_restore) in [
+            (
+                "trigger",
+                "CREATE TRIGGER fixture_snapshot_write AFTER INSERT ON config_history BEGIN UPDATE config_history SET rollback_point = 0 WHERE tx_id = NEW.tx_id; END",
+                "DROP TRIGGER fixture_snapshot_write",
+            ),
+            (
+                "temporary",
+                "CREATE TEMP TABLE config_history AS SELECT * FROM main.config_history",
+                "DROP TABLE temp.config_history",
+            ),
+            (
+                "index",
+                "CREATE INDEX fixture_snapshot_index ON config_history(rollback_point)",
+                "DROP INDEX fixture_snapshot_index",
+            ),
+        ] {
+            let destination =
+                SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+                    .await
+                    .expect("destination backend");
+            let (_, mut machine, progress) =
+                open(&destination, temp.path().join(name), identity(), members())
+                    .await
+                    .expect("destination storage");
+            let responses = machine
+                .apply([
+                    membership_entry(),
+                    snapshot_commit_entry(
+                        1,
+                        0x63,
+                        snapshot_commit_record(previous_tx, None, 1, at, None, 0x63),
+                    ),
+                ])
+                .await
+                .expect("previous destination state");
+            assert!(responses.iter().all(|response| response.result.is_ok()));
+            let previous = machine.applied_state().await.expect("previous applied state");
+            let previous_snapshot = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .expect("previous destination snapshot");
+            let applied_notifications = progress.subscribe_applied();
+            {
+                let conn = destination.conn();
+                conn.lock()
+                    .await
+                    .execute_batch(schema_change)
+                    .expect("isolated destination schema fixture");
+            }
+            snapshot.snapshot.rewind().await.expect("rewind snapshot");
+            let mut receiving = machine.begin_receiving_snapshot().await.expect("receiver");
+            tokio::io::copy(&mut snapshot.snapshot, &mut receiving)
+                .await
+                .expect("copy source snapshot");
+            let installed = machine.install_snapshot(&snapshot.meta, receiving).await;
+            {
+                let conn = destination.conn();
+                conn.lock()
+                    .await
+                    .execute_batch(schema_restore)
+                    .expect("restore destination schema");
+            }
+            assert!(
+                installed.is_err(),
+                "snapshot installation must reject an unadmitted destination schema"
+            );
+            assert!(
+                !applied_notifications.has_changed().expect("progress sender"),
+                "rejected repair must not report durable application"
+            );
+            assert_eq!(previous, machine.applied_state().await.expect("unchanged applied state"));
+            let current = machine
+                .get_current_snapshot()
+                .await
+                .expect("unchanged current snapshot")
+                .expect("previous snapshot retained");
+            assert_eq!(previous_snapshot.meta, current.meta);
+            let previous = crate::ConfigStore::load_latest(&destination)
+                .await
+                .expect("previous history still authenticates")
+                .expect("previous history retained");
+            assert!(previous.record.tx_id == previous_tx);
+
+            // Repair must replace damaged rows when the destination schema is
+            // valid; authenticating the old row chain would prevent recovery.
+            {
+                let conn = destination.conn();
+                conn.lock()
+                    .await
+                    .execute("UPDATE config_history SET rollback_point = 1", [])
+                    .expect("damage destination row without changing its schema");
+            }
+            assert!(crate::ConfigStore::load_latest(&destination).await.is_err());
+            snapshot.snapshot.rewind().await.expect("rewind repair source");
+            let mut receiving = machine.begin_receiving_snapshot().await.expect("repair receiver");
+            tokio::io::copy(&mut snapshot.snapshot, &mut receiving)
+                .await
+                .expect("copy authenticated repair source");
+            machine
+                .install_snapshot(&snapshot.meta, receiving)
+                .await
+                .expect("valid schema permits repair of damaged rows");
+            assert!(applied_notifications.has_changed().expect("repair notification"));
+            assert_eq!(
+                snapshot.meta.last_log_id,
+                machine.applied_state().await.expect("repaired applied state").0
+            );
+            let repaired = crate::ConfigStore::load_latest(&destination)
+                .await
+                .expect("repaired history authenticates")
+                .expect("repaired latest history");
+            assert!(repaired.record.tx_id == latest_tx);
+            let protected = crate::ConfigStore::load_rollback(
+                &destination,
+                crate::RollbackTarget::ByTxId(protected_tx),
+            )
+            .await
+            .expect("repaired protected history authenticates");
+            assert!(protected.record.rollback_point);
+        }
     }
 
     #[tokio::test]

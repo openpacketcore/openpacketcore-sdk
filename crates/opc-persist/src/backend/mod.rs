@@ -19,9 +19,7 @@
 
 use rand::{rngs::SysRng, TryRng};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "dangerous-test-hooks")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
@@ -199,6 +197,9 @@ pub struct SqliteBackend {
     /// Last SQLite data-version observed after authenticating management-audit
     /// state. SQLite advances this value only for commits by other connections.
     management_audit_data_version: Arc<AtomicU64>,
+    /// Monotonic refusal fence shared by every clone. Once consensus is claimed,
+    /// losing its tables cannot re-enable standalone reads or local mutation.
+    config_consensus_history_required: Arc<AtomicBool>,
     /// Cached preflight result (populated after first successful preflight).
     cached_caps: std::sync::OnceLock<PersistCapabilities>,
     /// Exact retained scope, absent only on the existing create-or-open API.
@@ -300,6 +301,11 @@ impl SqliteBackend {
         self.config_consensus_worker_gate.clone()
     }
 
+    pub(crate) fn require_config_consensus_history(&self) {
+        self.config_consensus_history_required
+            .store(true, Ordering::Release);
+    }
+
     pub(crate) const fn is_ephemeral(&self) -> bool {
         self.ephemeral
     }
@@ -356,6 +362,8 @@ impl SqliteBackend {
         }
 
         let conn = Self::open_connection(&path, &audit_key)?;
+        let consensus_required = crate::consensus::history::has_consensus_metadata_sync(&conn)
+            .map_err(|_| PersistError::corrupt_blob())?;
 
         let backend = Self {
             db_path: path,
@@ -370,6 +378,7 @@ impl SqliteBackend {
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
+            config_consensus_history_required: Arc::new(AtomicBool::new(consensus_required)),
             cached_caps: std::sync::OnceLock::new(),
             retained_binding: None,
             retained_repair_only: false,
@@ -408,6 +417,7 @@ impl SqliteBackend {
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
+            config_consensus_history_required: Arc::new(AtomicBool::new(true)),
             cached_caps: std::sync::OnceLock::new(),
             retained_binding: Some(binding),
             retained_repair_only: repair_only,

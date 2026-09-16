@@ -2689,6 +2689,7 @@ dependencies = [
  "opc-tls",
  "opc-types",
  "rcgen",
+ "rusqlite",
  "rustls-pki-types",
  "serde",
  "serde_json",
