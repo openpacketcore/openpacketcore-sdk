@@ -59,7 +59,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "t
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pki-types = { version = "1.8", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "ring"] }
-x509-parser = { version = "0.16" }
+x509-parser = { version = "0.18" }
 rcgen = { version = "0.14" }
 nix = { version = "0.31.3", default-features = false }
 openraft = { version = "=0.9.24", git = "https://github.com/openpacketcore/openraft", rev = "dddfe2ee7c51394c1b5ed601c85225ce9eca680d", features = ["serde", "storage-v2", "single-term-leader"] }
