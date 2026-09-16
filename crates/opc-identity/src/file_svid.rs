@@ -137,7 +137,7 @@ impl FileSvidSource {
 
 async fn snapshot_file(path: &Path, previous: Option<&FileSnapshot>) -> Option<FileSnapshot> {
     let content = tokio::fs::read(path).await.ok()?;
-    let hash = format!("{:x}", Sha256::digest(&content));
+    let hash = hex::encode(Sha256::digest(&content));
     if let Some(prev) = previous {
         if prev.hash == hash {
             return Some(prev.clone());

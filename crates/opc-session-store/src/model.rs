@@ -11,7 +11,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_types::{NetworkFunctionKind, TenantId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

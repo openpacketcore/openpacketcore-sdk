@@ -859,7 +859,7 @@ current candidate.
 The gates that passed in this pane and remain recorded as evidence are:
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-MSRV check (`cargo +1.88 check --workspace --all-targets --all-features`),
+MSRV check (`cargo +1.89 check --workspace --all-targets --all-features`),
 `cargo audit --no-fetch`, `cargo deny check bans` / `licenses` / `sources`,
 split workspace all-features tests, docs consistency, Kustomize/Helm rendering,
 Rust-side operator-lifecycle CLI tests, and the Go operator verification listed

@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_consensus::{ConsensusEntryDigest, ConsensusIdentity};
 use opc_crypto::CryptoEnvelopeV1;
 use opc_types::{Timestamp, TxId};

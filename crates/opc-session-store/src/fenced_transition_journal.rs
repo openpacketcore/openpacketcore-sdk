@@ -25,7 +25,7 @@ use rusqlite::{
     limits::Limit, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
     TransactionBehavior,
 };
-use sha2_zeroize::{Digest, Sha256};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 

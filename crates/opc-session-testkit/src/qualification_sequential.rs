@@ -58,7 +58,7 @@ impl QualificationSequentialRunScope {
         hasher.update(QUALIFICATION_SEQUENTIAL_RUN_SCOPE_DOMAIN);
         hasher.update([0]);
         hasher.update(history_id.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = hex::encode(hasher.finalize());
         let retained_hex = QUALIFICATION_SEQUENTIAL_RUN_SCOPE_HEX_BYTES
             .checked_mul(2)
             .ok_or(QualificationSequentialEvidenceError::RunScope)?;

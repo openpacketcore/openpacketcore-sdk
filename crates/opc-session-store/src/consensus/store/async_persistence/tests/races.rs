@@ -567,6 +567,17 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
             campaign.vote.leader_id.voted_for(),
             Some(fleet.peers[candidate].node)
         );
+        // The engine can send the captured grant before its next metrics flush.
+        // Keep that real response held while both engines publish the vote;
+        // the previous snapshot is not evidence that either forgot this vote.
+        until(
+            || {
+                contender.inner.raft.metrics().borrow().vote == campaign.vote
+                    && fleet.store(forgotten).inner.raft.metrics().borrow().vote == campaign.vote
+            },
+            "both engines publish the actual held campaign vote",
+        )
+        .await;
         assert_eq!(contender.inner.raft.metrics().borrow().vote, campaign.vote);
         assert_eq!(
             fleet.store(forgotten).inner.raft.metrics().borrow().vote,

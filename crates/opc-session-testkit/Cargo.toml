@@ -13,6 +13,7 @@ consumer-fixture = ["dep:rcgen", "dep:rustls-pki-types"]
 test-control = ["opc-session-store/test-control"]
 
 [dependencies]
+hex = "0.4.3"
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }

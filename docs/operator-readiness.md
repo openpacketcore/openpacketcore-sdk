@@ -59,7 +59,7 @@ worker pane. The following gates passed:
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo +1.88 check --workspace --all-targets --all-features`
+- `cargo +1.89 check --workspace --all-targets --all-features`
 - `cargo audit --no-fetch`
 - `cargo deny check bans` / `licenses` / `sources`
 - `cargo test --workspace --exclude opc-persist --all-features -- --test-threads=4`

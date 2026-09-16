@@ -454,12 +454,12 @@ mod tests {
     use tokio_rustls::rustls::pki_types::ServerName;
     use tokio_rustls::TlsConnector;
     use tonic::client::Grpc;
-    use tonic::codec::ProstCodec;
     use tonic::codegen::http::uri::PathAndQuery;
     use tonic::codegen::http::Uri;
     use tonic::codegen::Service;
     use tonic::transport::{Channel, Endpoint};
     use tonic::Request;
+    use tonic_prost::ProstCodec;
 
     use super::*;
     use crate::metrics::{GnmiListenerEvent, TRANSPORT_GNMI_TLS};

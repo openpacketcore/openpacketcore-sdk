@@ -3080,7 +3080,7 @@ mod tests {
         let checker_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/check-session-ha-concurrent-history-v5.py");
         let checker_bytes = fs::read(&checker_path).expect("frozen checker bytes");
-        let exact_sha256 = |raw: &[u8]| format!("sha256:{:x}", Sha256::digest(raw));
+        let exact_sha256 = |raw: &[u8]| format!("sha256:{}", hex::encode(Sha256::digest(raw)));
 
         let mut evidence: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/session-ha/candidate-evidence-v5.json"

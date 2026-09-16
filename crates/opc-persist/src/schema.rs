@@ -762,7 +762,11 @@ pub fn current_schema_digest(conn: &Connection) -> Result<String, rusqlite::Erro
         hasher.update(sql.as_bytes());
         hasher.update([0xff]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
 }
 
 /// Write the initial (or upgraded) schema version row.

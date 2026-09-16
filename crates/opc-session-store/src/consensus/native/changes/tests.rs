@@ -37,11 +37,11 @@ fn native_frontier_captures_preserve_nested_authority_without_allocating() {
     let json = serde_json::to_vec(&captured).unwrap();
     let binary = postcard::to_stdvec(&captured).unwrap();
     assert_eq!(
-        format!("{:x}", Sha256::digest(&json)),
+        hex::encode(Sha256::digest(&json)),
         "0cf2ee2600b40ea04bec298850fba698f1f6b7de2e57f3b6972f0bc0e732113e"
     );
     assert_eq!(
-        format!("{:x}", Sha256::digest(&binary)),
+        hex::encode(Sha256::digest(&binary)),
         "badd582d92db1e313b45d8e0ae7e8a848a155f4766e63bd1699c3e0af57259ae"
     );
     let decoded_json: NativeFrontiers = serde_json::from_slice(&json).unwrap();
@@ -71,8 +71,8 @@ fn native_frontier_captures_preserve_nested_authority_without_allocating() {
         }
     });
     eprintln!(
-        "native_frontier_capture clones=256 allocation_count={} allocation_bytes={} json_sha256={:x} binary_sha256={:x}",
-        memory.count_total, memory.bytes_total, Sha256::digest(&json), Sha256::digest(&binary)
+        "native_frontier_capture clones=256 allocation_count={} allocation_bytes={} json_sha256={} binary_sha256={}",
+        memory.count_total, memory.bytes_total, hex::encode(Sha256::digest(&json)), hex::encode(Sha256::digest(&binary))
     );
     assert_eq!(memory.bytes_current, 0);
     assert_eq!(

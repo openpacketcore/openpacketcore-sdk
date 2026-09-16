@@ -7,7 +7,7 @@ use crate::PersistError;
 
 use std::io;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_consensus::ConsensusIdentity;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};

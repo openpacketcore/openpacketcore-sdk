@@ -68,7 +68,10 @@ impl QualificationIsolatedScaleConfig {
             "opc-session-isolated-scale/v1;voters=3;mode={};clock={QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS};{workload}",
             self.persistence.label(),
         );
-        format!("sha256:{:x}", Sha256::digest(descriptor.as_bytes()))
+        format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(descriptor.as_bytes()))
+        )
     }
 }
 

@@ -2147,7 +2147,7 @@ mod tests {
         frame.extend_from_slice(&payload);
         let body = tonic::body::Body::new(http_body_util::Full::new(bytes::Bytes::from(frame)));
         let mut codec =
-            tonic::codec::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
+            tonic_prost::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
         tonic::Streaming::new_request(codec.decoder(), body, None, None)
     }
 
@@ -5303,7 +5303,7 @@ mod tests {
         )
         .await;
         let mut codec =
-            tonic::codec::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
+            tonic_prost::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
         let stream = tonic::Streaming::new_empty(codec.decoder(), tonic::body::Body::empty());
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
 
@@ -5629,7 +5629,7 @@ mod tests {
         assert_eq!(set.code(), Code::Unauthenticated);
 
         let mut codec =
-            tonic::codec::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
+            tonic_prost::ProstCodec::<gnmi::SubscribeResponse, gnmi::SubscribeRequest>::default();
         let subscribe_stream =
             tonic::Streaming::new_empty(codec.decoder(), tonic::body::Body::empty());
         let subscribe = match service.subscribe(Request::new(subscribe_stream)).await {

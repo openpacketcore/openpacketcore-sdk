@@ -14,6 +14,7 @@ documentation = "https://docs.rs/opc-evidence"
 keywords = ["5g", "cnf", "testing", "telecom", "packet-core"]
 categories = ["development-tools::testing", "network-programming"]
 [dependencies]
+hex = "0.4.3"
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 sha2 = { workspace = true }

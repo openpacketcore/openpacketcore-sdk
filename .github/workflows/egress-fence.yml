@@ -56,7 +56,9 @@ jobs:
   root-cgroup-egress:
     name: Root-cgroup egress fence
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Cold host builds and the full kernel proof suite can exceed one hour.
+    # This job budget leaves every test and product latency bound unchanged.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v7

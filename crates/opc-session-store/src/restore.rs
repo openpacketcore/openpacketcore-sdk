@@ -566,7 +566,7 @@ fn derive_restore_cursor_subkey(
     authentication_key: &[u8; 32],
     domain: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>, StoreError> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(authentication_key)
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(authentication_key)
         .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
     mac.update(domain);
     Ok(Zeroizing::new(mac.finalize().into_bytes().into()))
@@ -577,7 +577,7 @@ fn synthetic_restore_cursor_nonce(
     aad: &[u8],
     canonical_plaintext: &[u8],
 ) -> Result<[u8; RESTORE_SCAN_CURSOR_NONCE_BYTES], StoreError> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(nonce_key)
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(nonce_key)
         .map_err(|_| StoreError::BackendUnavailable("session restore cursor failed".into()))?;
     mac.update(aad);
     mac.update(canonical_plaintext);

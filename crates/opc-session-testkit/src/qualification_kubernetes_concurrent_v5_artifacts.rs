@@ -1798,7 +1798,7 @@ fn interpreter_identity<Fd: AsFd>(
     {
         return Err(QualificationKubernetesConcurrentV5ArtifactError::InterpreterUnavailable);
     }
-    let sha256 = QualificationSha256::new(format!("sha256:{:x}", hasher.finalize()))
+    let sha256 = QualificationSha256::new(format!("sha256:{}", hex::encode(hasher.finalize())))
         .map_err(|_| QualificationKubernetesConcurrentV5ArtifactError::InterpreterUnavailable)?;
     Ok(InterpreterIdentity {
         device: before.st_dev,

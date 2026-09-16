@@ -43,7 +43,7 @@
 //! @conformance scaffold — see CONFORMANCE.md
 
 use bytes::BytesMut;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, EncodeContext, EncodeError,
     EncodeErrorCode, SpecRef, UnknownIePolicy,

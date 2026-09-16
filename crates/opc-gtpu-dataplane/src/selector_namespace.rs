@@ -10761,7 +10761,7 @@ pub(crate) fn test_pin_commitment(key: &[u8; 32]) -> [u8; 32] {
 }
 
 fn keyed_digest(key: &[u8; 32], domain: &[u8], codec: &[u8]) -> [u8; 32] {
-    let Ok(mut mac) = <Hmac<Sha256> as Mac>::new_from_slice(key) else {
+    let Ok(mut mac) = <Hmac<Sha256> as KeyInit>::new_from_slice(key) else {
         return [0; 32];
     };
     mac.update(domain);
@@ -10770,7 +10770,7 @@ fn keyed_digest(key: &[u8; 32], domain: &[u8], codec: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_bytes(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
-    let Ok(mut mac) = <Hmac<Sha256> as Mac>::new_from_slice(key) else {
+    let Ok(mut mac) = <Hmac<Sha256> as KeyInit>::new_from_slice(key) else {
         return [0; 32];
     };
     for chunk in chunks {
