@@ -7159,8 +7159,16 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
             )
         });
         eprintln!(
-            "status_compaction_probe elapsed_ms={} progress={observation:?}",
-            workload_started.elapsed().as_millis()
+            "status_compaction_probe elapsed_ms={} read_barrier_attempts={} append_attempts_decoded={} append_decode_failures={} configured_enabled_paths={} progress={observation:?}",
+            workload_started.elapsed().as_millis(),
+            fleet.read_barrier_calls.load(Ordering::Relaxed),
+            fleet.append_entries_decoded.load(Ordering::Relaxed),
+            fleet.append_entries_decode_failures.load(Ordering::Relaxed),
+            fleet
+                .path_enabled
+                .values()
+                .filter(|enabled| enabled.load(Ordering::Relaxed))
+                .count(),
         );
     };
     let mut completed_for_diagnostic = 0_u64;
