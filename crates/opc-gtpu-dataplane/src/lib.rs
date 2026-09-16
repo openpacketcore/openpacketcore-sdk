@@ -62,6 +62,7 @@ pub mod model;
 pub mod reassembly;
 pub mod selector_namespace;
 mod selector_namespace_v2;
+pub mod testkit;
 pub mod tft_classifier;
 pub mod traffic_observation;
 pub mod unsupported;
@@ -186,6 +187,7 @@ pub use selector_namespace::{
     GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorRetiringNoEffectRequest,
     GtpuSessionSelectorReuseAuthorization, GtpuSessionSelectorReuseReceipt,
     GtpuSessionSelectorReuseRequest, GtpuSessionSelectorUnadmittedClaim,
+    GTPU_SHARED_PAA_MAX_LIVE_BEARERS,
 };
 #[cfg(test)]
 pub(crate) use selector_namespace::{

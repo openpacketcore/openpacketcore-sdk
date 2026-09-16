@@ -2188,6 +2188,29 @@ ledger to `OPCSN17`, which older readers refuse. Pending intent recovery uses
 the same supervised exact recovery path after reopen or caller cancellation.
 The record and permanent-group capacity limits remain unchanged.
 
+For a marked voice bearer sharing a current unmarked IPv4 default, use
+`reconcile_bearer` with the exact parent claim, parent group and new child group.
+The bounded profile permits one live or unresolved child per default. It
+retains the default's installed context and authority rather than retiring it.
+The child has a distinct local TEID and owns its exact `(PAA, full-mask mark)`
+selector, so unrelated default PAAs may use the same numeric mark. Legacy
+canonical fingerprints and `Fresh` mark reservations are unchanged. The
+protected `OPCSN18` ledger records the immutable child-parent relationship;
+parent retirement waits for exact child retirement.
+
+Use the ordinary exact child recovery and retirement operations after a failed
+or cancelled call. Mark reuse requires source quiescence and a fresh local TEID;
+reuse after default reattach additionally requires the protected predecessor
+chain to the current parent. A stale parent or another subscriber cannot claim
+that history. Child changes invalidate issued and pending parent traffic proof
+before possible map mutation. Product classifier/owner settlement and new
+traffic proof remain necessary afterward. See
+[RFC 016 §5.5](../../docs/rfc/016-opaque-gtpu-selector-namespace.md#55-marked-child-under-a-resident-default).
+`testkit::GroupedGtpuDataplaneSimulation` composes the protected coordinator,
+adapter codecs, index construction and inventory validation for structural
+consumer tests. Its in-memory effects are atomic; it does not model staged
+kernel IO faults or proof revocation and refuses live proof issuance.
+
 The built-in eBPF quiescence mechanism requires a qualified non-realtime Linux
 XDP/TC profile with non-expedited `MEMBARRIER_CMD_GLOBAL` available. Exact
 retirement and selector absence are checked before and after that boundary

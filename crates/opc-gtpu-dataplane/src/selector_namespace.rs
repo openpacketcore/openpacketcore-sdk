@@ -6,6 +6,9 @@
 //! it into a grouped reconcile request.  Selector bytes never leave this
 //! module and all public diagnostics are summaries.
 
+mod bearer;
+pub use bearer::GTPU_SHARED_PAA_MAX_LIVE_BEARERS;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -2271,6 +2274,8 @@ pub struct GtpuSessionSelectorAdmission {
     retired_dataplane_generation: Option<NonZeroU64>,
     phase: SelectorAdmissionPhase,
     retired_reissue: bool,
+    // A protected, immutable relation, never inferred from a matching PAA.
+    bearer_parent: Option<GtpuSessionGroup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2402,6 +2407,10 @@ impl GtpuSessionSelectorAdmission {
         self.retired_reissue
     }
 
+    pub(crate) fn bearer_parent(&self) -> Option<&GtpuSessionGroup> {
+        self.bearer_parent.as_ref()
+    }
+
     fn with_coordinates(
         &self,
         generation: GtpuSessionSelectorAuthorityGeneration,
@@ -2455,6 +2464,7 @@ impl GtpuSessionSelectorAdmission {
             retired_dataplane_generation: self.retired_dataplane_generation,
             phase,
             retired_reissue: self.retired_reissue,
+            bearer_parent: self.bearer_parent.clone(),
         })
     }
 }
@@ -3120,11 +3130,13 @@ impl<S: GtpuSessionSelectorNamespaceStore> TestGtpuSessionSelectorNamespaceAutho
             if state.group_was_reserved(&claim.group_fingerprint) {
                 return Err(GtpuSessionSelectorNamespaceError::GroupClaimed);
             }
-            if atoms.iter().any(|atom| {
-                state.selectors.contains_key(atom)
-                    || state.published_atoms.contains(atom)
-                    || state.tombstones.contains(atom)
-            }) {
+            if state.mark_profile_conflicts(&claim)
+                || atoms.iter().any(|atom| {
+                    state.selectors.contains_key(atom)
+                        || state.published_atoms.contains(atom)
+                        || state.tombstones.contains(atom)
+                })
+            {
                 return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
             }
             state.preflight_fresh_claim(atoms.len())?;
@@ -5571,6 +5583,20 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        self.claim_fresh_bearer_with_lease(backend, desired, None, lease)
+            .await
+    }
+
+    async fn claim_fresh_bearer_with_lease<D>(
+        &self,
+        backend: &D,
+        desired: &GtpuSessionGroup,
+        parent: Option<(&GtpuSessionGroup, &GtpuSessionSelectorAdmission)>,
+        lease: &mut SelectorWorkerLease,
+    ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
         self.ensure_backend_namespace(backend, lease).await?;
         let canonical = CanonicalClaim::from_group(desired);
         for _ in 0..MAX_CAS_RETRIES {
@@ -5580,23 +5606,34 @@ where
                 .clone()
                 .with_key(&state.selector_digest_key)
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
-            let atoms = claim
-                .selector_atoms(&state.selector_digest_key)
+            if let Some((expected, admission)) = parent {
+                state.preflight_bearer_parent(expected, admission, desired)?;
+                state
+                    .bearer_parents
+                    .insert(claim.group_fingerprint, admission.group_fingerprint);
+            }
+            let atoms = state
+                .owned_selector_atoms(&claim)
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
-            if atoms.len() > self.maximum_operation_atoms {
+            if claim.atoms.len() > self.maximum_operation_atoms {
                 return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
             }
             if state.group_was_reserved(&claim.group_fingerprint) {
                 return Err(GtpuSessionSelectorNamespaceError::GroupClaimed);
             }
-            if atoms.iter().any(|atom| {
-                state.selectors.contains_key(atom)
-                    || state.published_atoms.contains(atom)
-                    || state.tombstones.contains(atom)
-            }) {
+            if state.mark_profile_conflicts(&claim)
+                || atoms.iter().any(|atom| {
+                    state.selectors.contains_key(atom)
+                        || state.published_atoms.contains(atom)
+                        || state.tombstones.contains(atom)
+                })
+            {
                 return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
             }
             state.preflight_fresh_claim(atoms.len())?;
+            if parent.is_some() {
+                state.preflight_encoded_growth(68)?;
+            }
             state.retain_canonical_desired(claim.group_fingerprint, desired)?;
             let generation = state.next_generation()?;
             let operation_nonce = random_nonzero_nonce()?;
@@ -5682,6 +5719,21 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        self.claim_reused_bearer_with_lease(backend, desired, proof, None, lease)
+            .await
+    }
+
+    async fn claim_reused_bearer_with_lease<D>(
+        &self,
+        backend: &D,
+        desired: &GtpuSessionGroup,
+        proof: &crate::GtpuSessionSelectorReuseProof,
+        parent: Option<(&GtpuSessionGroup, &GtpuSessionSelectorAdmission)>,
+        lease: &mut SelectorWorkerLease,
+    ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
         self.ensure_backend_namespace(backend, lease).await?;
         let canonical = CanonicalClaim::from_group(desired);
         let source_canonical = CanonicalClaim::from_group(proof.retired_group());
@@ -5706,14 +5758,30 @@ where
                 .clone()
                 .with_key(&state.selector_digest_key)
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
-            let atoms = claim
-                .selector_atoms(&state.selector_digest_key)
+            if claim.atoms.len() > self.maximum_operation_atoms {
+                return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
+            }
+            if !state.bearer_parent_reuse_is_exact(
+                state.bearer_parents.get(&source.group_fingerprint).copied(),
+                parent.map(|(_, admission)| admission.group_fingerprint),
+            ) {
+                return Err(GtpuSessionSelectorNamespaceError::StaleGeneration);
+            }
+            if let Some((expected, admission)) = parent {
+                state.preflight_bearer_parent(expected, admission, desired)?;
+                state
+                    .bearer_parents
+                    .insert(claim.group_fingerprint, admission.group_fingerprint);
+            }
+            let atoms = state
+                .owned_selector_atoms(&claim)
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
-            let old_atoms = source
-                .selector_atoms(&state.selector_digest_key)
+            let old_atoms = state
+                .owned_selector_atoms(&source)
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
             let source_is_exact = matches!(state.groups.get(&source.group_fingerprint), Some(GroupState::Retired { device, selectors, desired: source_desired, atoms: source_atoms, successor: None, .. }) if *device == source.device_fingerprint && *selectors == source.selector_set_fingerprint && *source_desired == source.desired_fingerprint && *source_atoms == old_atoms);
             if state.group_was_reserved(&claim.group_fingerprint)
+                || state.mark_profile_conflicts(&claim)
                 || !source_is_exact
                 || !old_atoms.iter().all(|atom| {
                     matches!(state.selectors.get(atom), Some(SelectorState::Retired))
@@ -7105,6 +7173,9 @@ where
                         operation_nonce,
                     },
                 ) => {
+                    if state.unresolved_bearer_count(admission.group_fingerprint) != 0 {
+                        return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
+                    }
                     if device != admission.device_fingerprint
                         || selectors != admission.selector_set_fingerprint
                         || desired != admission.desired_fingerprint
@@ -7272,6 +7343,9 @@ struct NamespaceState {
     /// Immutable discriminator for bounded reattach edges. Their source rows
     /// retain the complete old graph and their one consumed successor forever.
     reattach_sources: BTreeSet<[u8; 32]>,
+    /// Immutable exact child-to-default authority edges. Children own their
+    /// TEID and mark atoms; only the recorded default owns their common PAA.
+    bearer_parents: BTreeMap<[u8; 32], [u8; 32]>,
     /// Protected canonical desired descriptors for every permanent group.
     /// This is the durable source of operation-stamp key reconstruction.
     canonical_desired: BTreeMap<[u8; 32], Zeroizing<Vec<u8>>>,
@@ -7294,11 +7368,18 @@ impl NamespaceState {
         &self,
         desired: &GtpuSessionGroup,
     ) -> Option<GtpuSessionGroup> {
+        self.single_bearer_reattach_source_for_parent(desired, None)
+    }
+
+    fn single_bearer_reattach_source_for_parent(
+        &self,
+        desired: &GtpuSessionGroup,
+        requested_parent: Option<[u8; 32]>,
+    ) -> Option<GtpuSessionGroup> {
         let claim = CanonicalClaim::from_group(desired).with_key(&self.selector_digest_key)?;
         if self.group_was_reserved(&claim.group_fingerprint) {
             return None;
         }
-        let desired_atoms = claim.selector_atoms(&self.selector_digest_key)?;
         let mut source = None;
         for (fingerprint, state) in &self.groups {
             let GroupState::Retired {
@@ -7313,6 +7394,16 @@ impl NamespaceState {
             if !single_bearer_reattach_is_exact(&candidate, desired) {
                 continue;
             }
+            let parent = self.bearer_parents.get(fingerprint).copied();
+            if !self.bearer_parent_reuse_is_exact(parent, requested_parent)
+                || requested_parent.is_some_and(|parent| {
+                    !matches!(self.groups.get(&parent), Some(GroupState::Active { .. }))
+                        || self.unresolved_bearer_count(parent) != 0
+                })
+            {
+                continue;
+            }
+            let desired_atoms = self.selector_atoms_under_parent(&claim, requested_parent)?;
             if source.is_some()
                 || !atoms.iter().all(|atom| {
                     matches!(self.selectors.get(atom), Some(SelectorState::Retired))
@@ -7368,6 +7459,13 @@ impl NamespaceState {
     }
 
     fn successor_provenance_is_exact(&self, source: [u8; 32], successor: RetiredSuccessor) -> bool {
+        let old_parent = self.bearer_parents.get(&source).copied();
+        let new_parent = self.bearer_parents.get(&successor.group).copied();
+        if !self.bearer_parent_reuse_is_exact(old_parent, new_parent)
+            || (old_parent != new_parent && !self.reattach_sources.contains(&source))
+        {
+            return false;
+        }
         let Some(old) = self.canonical_group_for(source) else {
             return false;
         };
@@ -7458,6 +7556,7 @@ impl NamespaceState {
             || !self.groups.is_empty()
             || !self.unadmitted_groups.is_empty()
             || !self.reattach_sources.is_empty()
+            || !self.bearer_parents.is_empty()
             || !self.canonical_desired.is_empty()
             || !self.published_atoms.is_empty()
             || !self.tombstones.is_empty()
@@ -7585,6 +7684,14 @@ impl NamespaceState {
             retired_dataplane_generation: None,
             phase,
             retired_reissue,
+            bearer_parent: self
+                .bearer_parents
+                .get(&claim.group_fingerprint)
+                .map(|parent| {
+                    self.canonical_group_for(*parent)
+                        .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)
+                })
+                .transpose()?,
         })
     }
 
@@ -8279,7 +8386,7 @@ impl NamespaceState {
         else {
             return false;
         };
-        let Some(source_atoms) = source.selector_atoms(&self.selector_digest_key) else {
+        let Some(source_atoms) = self.owned_selector_atoms(&source) else {
             return false;
         };
         (if descriptor.single_bearer_reattach {
@@ -8378,7 +8485,9 @@ impl NamespaceState {
         // OPCSN16 adds a permanent, disjoint no-admission index. Existing
         // OPCSN15 ledgers keep their exact encoding until the first seal CAS;
         // older readers then reject the new schema before issuing authority.
-        output.extend_from_slice(if !self.reattach_sources.is_empty() {
+        output.extend_from_slice(if !self.bearer_parents.is_empty() {
+            b"OPCSN18"
+        } else if !self.reattach_sources.is_empty() {
             b"OPCSN17"
         } else if self.unadmitted_groups.is_empty() {
             b"OPCSN15"
@@ -8610,7 +8719,10 @@ impl NamespaceState {
         for tombstone in &self.tombstones {
             output.extend_from_slice(tombstone);
         }
-        if !self.unadmitted_groups.is_empty() || !self.reattach_sources.is_empty() {
+        if !self.unadmitted_groups.is_empty()
+            || !self.reattach_sources.is_empty()
+            || !self.bearer_parents.is_empty()
+        {
             output.extend_from_slice(&(self.unadmitted_groups.len() as u32).to_be_bytes());
             for (group, sealed) in &self.unadmitted_groups {
                 output.extend_from_slice(group);
@@ -8619,10 +8731,17 @@ impl NamespaceState {
                 output.extend_from_slice(&sealed.desired);
             }
         }
-        if !self.reattach_sources.is_empty() {
+        if !self.reattach_sources.is_empty() || !self.bearer_parents.is_empty() {
             output.extend_from_slice(&(self.reattach_sources.len() as u32).to_be_bytes());
             for source in &self.reattach_sources {
                 output.extend_from_slice(source);
+            }
+        }
+        if !self.bearer_parents.is_empty() {
+            output.extend_from_slice(&(self.bearer_parents.len() as u32).to_be_bytes());
+            for (child, parent) in &self.bearer_parents {
+                output.extend_from_slice(child);
+                output.extend_from_slice(parent);
             }
         }
         output
@@ -8634,7 +8753,11 @@ impl NamespaceState {
         }
         let mut cursor = 0_usize;
         let version = take(bytes, &mut cursor, 7)?;
-        (version == b"OPCSN15" || version == b"OPCSN16" || version == b"OPCSN17").then_some(())?;
+        (version == b"OPCSN15"
+            || version == b"OPCSN16"
+            || version == b"OPCSN17"
+            || version == b"OPCSN18")
+            .then_some(())?;
         let lifecycle = match *take(bytes, &mut cursor, 1)?.first()? {
             0 => NamespaceLifecycle::Unprovisioned,
             1 => NamespaceLifecycle::Provisioned,
@@ -8808,7 +8931,9 @@ impl NamespaceState {
                     let reuse = if tag == 0 {
                         match *take(bytes, &mut cursor, 1)?.first()? {
                             0 => None,
-                            kind @ (1 | 2) if kind == 1 || version == b"OPCSN17" => {
+                            kind @ (1 | 2)
+                                if kind == 1 || version == b"OPCSN17" || version == b"OPCSN18" =>
+                            {
                                 let len = usize::from(u16::from_be_bytes(take_array(take(
                                     bytes,
                                     &mut cursor,
@@ -9000,7 +9125,7 @@ impl NamespaceState {
             tombstones.insert(tombstone);
         }
         let mut unadmitted_groups = BTreeMap::new();
-        if version == b"OPCSN16" || version == b"OPCSN17" {
+        if version == b"OPCSN16" || version == b"OPCSN17" || version == b"OPCSN18" {
             let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
             if (count == 0 && version == b"OPCSN16")
                 || count > MAX_PERMANENT_GROUPS
@@ -9033,9 +9158,9 @@ impl NamespaceState {
             }
         }
         let mut reattach_sources = BTreeSet::new();
-        if version == b"OPCSN17" {
+        if version == b"OPCSN17" || version == b"OPCSN18" {
             let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
-            if count == 0 || count > MAX_PERMANENT_GROUPS {
+            if (count == 0 && version == b"OPCSN17") || count > MAX_PERMANENT_GROUPS {
                 return None;
             }
             let mut previous = None;
@@ -9046,6 +9171,23 @@ impl NamespaceState {
                 }
                 previous = Some(source);
                 reattach_sources.insert(source);
+            }
+        }
+        let mut bearer_parents = BTreeMap::new();
+        if version == b"OPCSN18" {
+            let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
+            if count == 0 || count > MAX_PERMANENT_GROUPS {
+                return None;
+            }
+            let mut previous = None;
+            for _ in 0..count {
+                let child = take_array(take(bytes, &mut cursor, 32)?)?;
+                let parent = take_array(take(bytes, &mut cursor, 32)?)?;
+                if previous.is_some_and(|prior| prior >= child) {
+                    return None;
+                }
+                previous = Some(child);
+                bearer_parents.insert(child, parent);
             }
         }
         let state = Self {
@@ -9064,6 +9206,7 @@ impl NamespaceState {
             groups,
             unadmitted_groups,
             reattach_sources,
+            bearer_parents,
             canonical_desired,
             published_atoms,
             tombstones,
@@ -9128,11 +9271,12 @@ impl NamespaceState {
                 GroupState::LegacyPoisoned => return false,
             };
             claim.group_fingerprint == *group_fingerprint
+                && claim.atoms.len() <= self.capacity as usize
                 && claim.device_fingerprint == device
                 && claim.selector_set_fingerprint == selectors
                 && claim.desired_fingerprint == desired
-                && claim
-                    .selector_atoms(&self.selector_digest_key)
+                && self
+                    .owned_selector_atoms(&claim)
                     .is_some_and(|expected_atoms| expected_atoms == *atoms)
         })
     }
@@ -9151,6 +9295,8 @@ impl NamespaceState {
             && self.selectors.is_empty()
             && self.groups.is_empty()
             && self.unadmitted_groups.is_empty()
+            && self.reattach_sources.is_empty()
+            && self.bearer_parents.is_empty()
             && self.canonical_desired.is_empty()
             && self.published_atoms.is_empty()
             && self.tombstones.is_empty();
@@ -9182,6 +9328,8 @@ impl NamespaceState {
             && self.selectors.is_empty()
             && self.groups.is_empty()
             && self.unadmitted_groups.is_empty()
+            && self.reattach_sources.is_empty()
+            && self.bearer_parents.is_empty()
             && self.canonical_desired.is_empty()
             && self.published_atoms.is_empty()
             && self.tombstones.is_empty();
@@ -9359,6 +9507,8 @@ impl NamespaceState {
             && self.canonical_desired.len() <= MAX_CANONICAL_DESIRED_RECORDS
             && self.canonical_desired.len() == self.groups.len()
             && self.canonical_desired_index_is_exact()
+            && self.bearer_relations_are_exact()
+            && self.mark_profiles_are_disjoint()
             && self.reattach_sources.iter().all(|source|
                 matches!(self.groups.get(source), Some(GroupState::Retired { successor: Some(_), .. })))
             && self.unadmitted_groups.iter().all(|(fingerprint, sealed)| {
@@ -10631,6 +10781,7 @@ fn hmac_bytes(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    mod bearer_ledger;
     mod worker_lease;
 
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -14728,6 +14879,7 @@ mod tests {
             groups: BTreeMap::new(),
             unadmitted_groups: BTreeMap::new(),
             reattach_sources: BTreeSet::new(),
+            bearer_parents: BTreeMap::new(),
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
@@ -14918,6 +15070,7 @@ mod tests {
             groups: BTreeMap::new(),
             unadmitted_groups: BTreeMap::new(),
             reattach_sources: BTreeSet::new(),
+            bearer_parents: BTreeMap::new(),
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
