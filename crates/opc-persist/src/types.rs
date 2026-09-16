@@ -298,6 +298,15 @@ pub trait ConfigStore: Send + Sync {
         ))
     }
 
+    /// Authenticated oldest cursor when explicit history retention is active.
+    /// `None` means this adapter does not prune application history; `Some(0)`
+    /// activates the retention replay contract before the first pruning step.
+    /// A cursor equal to the floor retains its exact successor. This is neither
+    /// worker application nor a serving permit.
+    async fn retained_history_floor(&self) -> Result<Option<ConfigVersion>, PersistError> {
+        Ok(None)
+    }
+
     /// Wait until this local store may have applied a revision newer than
     /// `version`.
     ///

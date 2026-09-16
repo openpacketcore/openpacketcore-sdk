@@ -20,6 +20,10 @@ use super::{
 
 type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>, String);
 
+#[cfg(test)]
+#[path = "history_read_tests.rs"]
+mod history_read_tests;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ConfigStore implementation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,9 +31,7 @@ type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>, String
 #[async_trait]
 impl ConfigStore for SqliteBackend {
     async fn load_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
-        let conn = Arc::clone(&self.conn);
-        let guard = conn.lock_owned().await;
-        let res = Self::load_latest_impl(&guard, self.audit_key.as_ref());
+        let res = self.read_config_history(Self::load_latest_impl).await;
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_read_success
@@ -43,9 +45,9 @@ impl ConfigStore for SqliteBackend {
     }
 
     async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
-        let conn = Arc::clone(&self.conn);
-        let guard = conn.lock_owned().await;
-        let res = Self::load_committed_latest_impl(&guard, self.audit_key.as_ref());
+        let res = self
+            .read_config_history(Self::load_committed_latest_impl)
+            .await;
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_read_success
@@ -68,27 +70,31 @@ impl ConfigStore for SqliteBackend {
                 "config history page exceeds the contract bound",
             ));
         }
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
         let requested_version = version;
-        let Ok(version) = i64::try_from(version.get()) else {
-            return Ok(Vec::new());
-        };
+        let version = i64::try_from(version.get()).ok();
         let limit = i64::try_from(limit).map_err(|_| {
             PersistError::constraint_violation("config history page limit is invalid")
         })?;
-        let conn = Arc::clone(&self.conn);
-        let guard = conn.lock_owned().await;
-        let res = (|| {
-            let visible_head = Self::load_committed_latest_impl(&guard, self.audit_key.as_ref())?;
+        let res = self.read_config_history(move |conn, audit_key| {
+            crate::consensus::history::validate_cursor_sync(
+                conn,
+                audit_key,
+                requested_version,
+            )?;
+            let Some(version) = version else {
+                return Ok(Vec::new());
+            };
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let visible_head = Self::load_committed_latest_impl(conn, audit_key)?;
             if visible_head
                 .as_ref()
                 .is_none_or(|head| requested_version >= head.record.version)
             {
                 return Ok(Vec::new());
             }
-            let mut statement = guard
+            let mut statement = conn
                 .prepare(
                     "SELECT tx_id FROM config_history WHERE version > ?1 ORDER BY version ASC LIMIT ?2",
                 )
@@ -99,7 +105,7 @@ impl ConfigStore for SqliteBackend {
             let mut records = Vec::new();
             for row in rows {
                 let tx_id = row.map_err(|error| PersistError::sqlite(error.to_string()))?;
-                let record = Self::load_by_tx_id_bytes(&guard, &tx_id, self.audit_key.as_ref())?
+                let record = Self::load_by_tx_id_bytes(conn, &tx_id, audit_key)?
                     .ok_or_else(|| {
                         PersistError::inconsistent_state(
                             "config history row disappeared during a locked page read",
@@ -108,10 +114,28 @@ impl ConfigStore for SqliteBackend {
                 if crate::types::config_recovery_required(&record.record.principal)? {
                     break;
                 }
+                let expected = records
+                    .last()
+                    .map_or(requested_version, |previous: &StoredConfig| {
+                        previous.record.version
+                    })
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(PersistError::corrupt_blob)?;
+                if record.record.version.get() != expected {
+                    return Err(PersistError::corrupt_blob());
+                }
                 records.push(record);
             }
+            if records.is_empty()
+                && visible_head
+                    .as_ref()
+                    .is_some_and(|head| requested_version < head.record.version)
+            {
+                return Err(PersistError::corrupt_blob());
+            }
             Ok(records)
-        })();
+        }).await;
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_read_success
@@ -124,10 +148,17 @@ impl ConfigStore for SqliteBackend {
         res
     }
 
+    async fn retained_history_floor(&self) -> Result<Option<ConfigVersion>, PersistError> {
+        self.read_config_history(crate::consensus::history::floor_sync)
+            .await
+    }
+
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError> {
-        let conn = Arc::clone(&self.conn);
-        let guard = conn.lock_owned().await;
-        let res = Self::load_rollback_impl(&guard, &target, self.audit_key.as_ref());
+        let res = self
+            .read_config_history(move |conn, audit_key| {
+                Self::load_rollback_impl(conn, &target, audit_key)
+            })
+            .await;
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_read_success
@@ -145,12 +176,12 @@ impl ConfigStore for SqliteBackend {
         digest: &str,
     ) -> Result<Option<StoredConfig>, PersistError> {
         crate::types::validate_replay_lookup_digest(digest)?;
-        let conn = Arc::clone(&self.conn);
-        let guard = conn.lock_owned().await;
-        let res = (|| {
-            let tx_id: Option<Vec<u8>> = guard
-                .query_row(
-                    r#"SELECT tx_id
+        let digest = digest.to_owned();
+        let res = self
+            .read_config_history(move |conn, audit_key| {
+                let tx_id: Option<Vec<u8>> = conn
+                    .query_row(
+                        r#"SELECT tx_id
                        FROM config_history
                        WHERE CASE
                                WHEN json_valid(principal)
@@ -158,18 +189,19 @@ impl ConfigStore for SqliteBackend {
                                ELSE NULL
                              END = ?1
                        LIMIT 1"#,
-                    [digest],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| PersistError::sqlite(error.to_string()))?;
-            tx_id
-                .map(|tx_id| {
-                    Self::load_by_tx_id_bytes(&guard, &tx_id, self.audit_key.as_ref())
-                        .and_then(|record| record.ok_or_else(PersistError::rollback_not_found))
-                })
-                .transpose()
-        })();
+                        [digest],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                tx_id
+                    .map(|tx_id| {
+                        Self::load_by_tx_id_bytes(conn, &tx_id, audit_key)
+                            .and_then(|record| record.ok_or_else(PersistError::rollback_not_found))
+                    })
+                    .transpose()
+            })
+            .await;
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_read_success
@@ -189,9 +221,11 @@ impl ConfigStore for SqliteBackend {
     ) -> Result<(), PersistError> {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
-        let res = Self::ensure_standalone_write_authority(&guard).and_then(|()| {
-            Self::append_commit_impl(&guard, record, audit, None, self.audit_key.as_ref())
-        });
+        let res = self
+            .ensure_standalone_write_authority(&guard)
+            .and_then(|()| {
+                Self::append_commit_impl(&guard, record, audit, None, self.audit_key.as_ref())
+            });
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_write_success
@@ -212,15 +246,17 @@ impl ConfigStore for SqliteBackend {
     ) -> Result<(), PersistError> {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
-        let res = Self::ensure_standalone_write_authority(&guard).and_then(|()| {
-            Self::append_commit_impl(
-                &guard,
-                record,
-                audit,
-                Some(resolution),
-                self.audit_key.as_ref(),
-            )
-        });
+        let res = self
+            .ensure_standalone_write_authority(&guard)
+            .and_then(|()| {
+                Self::append_commit_impl(
+                    &guard,
+                    record,
+                    audit,
+                    Some(resolution),
+                    self.audit_key.as_ref(),
+                )
+            });
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_write_success
@@ -237,7 +273,7 @@ impl ConfigStore for SqliteBackend {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         let res = (|| -> Result<(), PersistError> {
-            Self::ensure_standalone_write_authority(&guard)?;
+            self.ensure_standalone_write_authority(&guard)?;
             let tx = guard
                 .unchecked_transaction()
                 .map_err(|error| PersistError::sqlite(error.to_string()))?;
@@ -294,7 +330,7 @@ impl ConfigStore for SqliteBackend {
         let now = Timestamp::now_utc().to_string();
 
         let res = (|| -> Result<(), PersistError> {
-            Self::ensure_standalone_write_authority(&guard)?;
+            self.ensure_standalone_write_authority(&guard)?;
             let tx = guard
                 .unchecked_transaction()
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
@@ -359,7 +395,7 @@ impl ConfigStore for SqliteBackend {
         let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
 
         let res = (|| -> Result<(), PersistError> {
-            Self::ensure_standalone_write_authority(&guard)?;
+            self.ensure_standalone_write_authority(&guard)?;
             let tx = guard
                 .unchecked_transaction()
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
@@ -441,21 +477,59 @@ impl ConfigStore for SqliteBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl SqliteBackend {
+    /// Verify mutable authority and consume it under one SQLite read snapshot.
+    /// The async mutex alone cannot exclude an independent SQLite connection.
+    /// Reuse the bounded blocking worker so full-chain verification observes
+    /// cancellation/deadline without blocking the async executor or allocating
+    /// an unbounded page. The retained requirement can only tighten.
+    async fn read_config_history<T, F>(&self, read: F) -> Result<T, PersistError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Connection, &AuditKey) -> Result<T, PersistError> + Send + 'static,
+    {
+        let audit_key = Arc::clone(&self.audit_key);
+        let required = Arc::clone(&self.config_consensus_history_required);
+        crate::consensus::run_backend_sqlite_with_timeout(
+            self,
+            crate::consensus::DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+            move |conn, cancellation| {
+                let tx = conn.unchecked_transaction().map_err(|_| {
+                    std::io::Error::other("config history read transaction unavailable")
+                })?;
+                let result = crate::consensus::history::validate_access_sync(
+                    &tx,
+                    audit_key.as_ref(),
+                    required.load(std::sync::atomic::Ordering::Acquire),
+                    cancellation,
+                )
+                .map_err(|_| PersistError::corrupt_blob())
+                .and_then(|()| read(&tx, audit_key.as_ref()));
+                tx.commit().map_err(|_| {
+                    std::io::Error::other("config history read transaction unavailable")
+                })?;
+                Ok(result)
+            },
+        )
+        .await
+        .map_err(|_| PersistError::unavailable())?
+    }
+
     /// Reject direct local mutation after the atomic Openraft authority claim.
     ///
     /// The consensus initializer and every standalone mutation share the same
     /// SQLite connection mutex and use an immediate transaction, so a racing
     /// local write is either included in the legacy-recovery check or observes
     /// this durable fence and fails closed.
-    fn ensure_standalone_write_authority(conn: &rusqlite::Connection) -> Result<(), PersistError> {
-        let claimed: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_raft_identity')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| PersistError::unavailable())?;
-        if claimed {
+    fn ensure_standalone_write_authority(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<(), PersistError> {
+        if self
+            .config_consensus_history_required
+            .load(std::sync::atomic::Ordering::Acquire)
+            || crate::consensus::history::has_consensus_metadata_sync(conn)
+                .map_err(|_| PersistError::unavailable())?
+        {
             return Err(PersistError::inconsistent_state(
                 "direct config mutation is disabled after Openraft authority claim",
             ));
@@ -483,6 +557,8 @@ impl SqliteBackend {
         conn: &rusqlite::Connection,
         audit_key: &AuditKey,
     ) -> Result<Option<StoredConfig>, PersistError> {
+        crate::consensus::history::validate_sync(conn, audit_key)
+            .map_err(|_| PersistError::corrupt_blob())?;
         // Find the highest version (absolute latest)
         let tx_id_bytes: Option<Vec<u8>> = conn
             .query_row(
@@ -508,6 +584,8 @@ impl SqliteBackend {
         conn: &rusqlite::Connection,
         audit_key: &AuditKey,
     ) -> Result<Option<StoredConfig>, PersistError> {
+        crate::consensus::history::validate_sync(conn, audit_key)
+            .map_err(|_| PersistError::corrupt_blob())?;
         let first_fenced: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
             .query_row(
                 r#"SELECT tx_id, parent_tx_id
@@ -920,6 +998,15 @@ impl SqliteBackend {
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(PersistError::sqlite(e.to_string())),
         };
+
+        let parent_tx_id_out = crate::consensus::history::original_parent_sync(
+            conn,
+            audit_key,
+            &tx_id_out,
+            version,
+            parent_tx_id_out,
+        )
+        .map_err(|_| PersistError::corrupt_blob())?;
 
         // Fail closed: validate fixed-size fields
         if tx_id_out.len() != 16 {

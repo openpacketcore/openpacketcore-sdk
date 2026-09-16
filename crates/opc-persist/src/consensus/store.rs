@@ -771,6 +771,19 @@ impl ConsensusConfigStore {
         result
     }
 
+    /// Apply an explicit acknowledged history-retention decision through the
+    /// existing consensus authority, retaining the same request ID for retries.
+    pub async fn retain_history_idempotent(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        retention: super::ConfigHistoryRetention,
+    ) -> Result<(), PersistError> {
+        retention.validate()?;
+        self.submit_request(request_id, ConfigMutationIntent::RetainHistory(retention))
+            .await?
+            .into_result()
+    }
+
     /// Stop this Openraft node and all of its engine tasks.
     pub async fn shutdown(&self) -> Result<(), PersistError> {
         self.inner
@@ -1795,6 +1808,12 @@ impl ConfigStore for ConsensusConfigStore {
 
     async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
         self.inner.backend.load_committed_latest().await
+    }
+
+    async fn retained_history_floor(
+        &self,
+    ) -> Result<Option<opc_types::ConfigVersion>, PersistError> {
+        self.inner.backend.retained_history_floor().await
     }
 
     async fn load_since(
