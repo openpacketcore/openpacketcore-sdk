@@ -67,6 +67,15 @@ Run the commands produced by
 Use the same Rust version as the CI run and set `CARGO_INCREMENTAL=0`,
 `CARGO_PROFILE_DEV_DEBUG=0`, and `CARGO_PROFILE_TEST_DEBUG=0`.
 
+The native IPsec, i686 session-net, and egress host-source jobs are separate
+profiles: use `CARGO_INCREMENTAL=0` and their workflow commands, but leave
+`CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` unset, as those jobs do.
+Run the protected prepared-transition contract alone with
+`CARGO_PROFILE_TEST_OPT_LEVEL=1` in the core, native, and i686 lanes. This keeps
+its 100 ms deadline, debug assertions, and overflow checks while measuring
+optimized execution. The selector's one-second contract retains its ordinary
+test profile. Do not replace either deadline or use RAM-backed database storage.
+
 The separate **Rust GTP-U unsupported-platform cfg tests** job in
 [ci.yml](.github/workflows/ci.yml) also uses
 `RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported"` and
