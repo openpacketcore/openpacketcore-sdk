@@ -10,9 +10,10 @@ schema is V19.2.0 and admits later extensions. The current scope is the v1
 subset documented in [CONFORMANCE.md](CONFORMANCE.md).
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
-or gNB procedure state, NAS handling, or semantic validation of NGAP IE
-contents. The typed boundary does validate top-level identifiers, criticality,
-cardinality, and configured decode policies.
+or gNB procedure state, or NAS message processing. Its optional `n3iwf`
+module validates the individual field subset below. The container boundary
+validates top-level identifiers, criticality, cardinality, and configured
+decode policies.
 
 ## API Shape
 
@@ -115,9 +116,9 @@ Canonical encoding uses explicit aligned-PER container framing instead of
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
 Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
 boundary cases. The caller supplies already-encoded IE values; typed N3IWF
-keys, locations, resource transfers and mandatory/conditional presence are
-still pending under #787. No live AMF exchange or full N3IWF send capability is
-claimed. Paging remains structurally covered only.
+resource transfers and mandatory/conditional presence remain pending under
+#787; the field codecs below cover IDs, NAS framing, keys and locations. No
+live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks
 depth, IE count and complete wire length before payload allocation. It returns
@@ -156,6 +157,35 @@ cargo check -p opc-proto-ngap --all-targets --all-features
 cargo test -p opc-proto-ngap --all-features
 (cd crates/opc-proto-ngap && cargo +nightly fuzz list)
 ```
+
+## N3IWF field codecs
+
+`n3iwf::{RanUeId, AmfUeId}` distinguish the local 32-bit and peer 40-bit
+identifiers. `NasPdu` borrows opaque NAS or coalesces fully checked fragments;
+it does not process NAS security or infer an association. `TrackingArea`
+reuses `opc_types::PlmnId` and carries a three-octet TAC. `N3iwfLocation`
+explicitly selects IPv4/IPv6, with/without a port, and optional TAI.
+
+Each field encodes an `EncodedValue` without its enclosing protocol-IE length.
+Borrow `as_bytes()` into `ProtocolIe::new` and use `Pdu::from_protocol_ies`.
+The latter remains a structural constructor: these field codecs do not check
+message-wide mandatory/conditional presence or authorize procedure triggers.
+51 independent Release 18 field vectors and two complete uplink NAS messages
+exercise the field-to-container composition.
+
+`SecurityKey` borrows exactly 32 octets. It is redacted, has no Clone/equality/
+hash/serialization implementation, and has no key-provider effects.
+`EncodedValue` clears its buffer on drop. The caller must protect the source
+key and all generic-PDU/wire copies: clearing one buffer does not clear copies.
+All field wrappers redact their contents in Debug; byte/identity getters are
+explicit disclosure boundaries.
+
+Field receive limits apply to the encoded field: `max_message_len`, depth one
+for simple fields or four for location, and `max_ies` for location extensions.
+The allocation budget is advisory. Location supports only the N3IWF choices
+and known with-port TAI extension. Other nested extensions/choices return an
+explicit error under every context policy, without changing generic PDU
+preservation or duplicate selection. TAI extension additions are unsupported.
 
 ## License
 

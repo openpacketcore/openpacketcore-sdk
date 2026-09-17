@@ -10,7 +10,8 @@
 //! encoding writes the typed root PDU and IE containers with explicit APER
 //! alignment and length fragmentation. [`Pdu::from_protocol_ies`] constructs
 //! those containers from pre-encoded, opaque IE values. Nested semantic
-//! validation and mandatory/conditional IE presence remain caller obligations.
+//! validation beyond the opt-in [`n3iwf`] field subset and message-level
+//! mandatory/conditional IE presence remain caller obligations.
 //! Raw-preserving encoding separately re-emits saved receive bytes exactly.
 //!
 //! For every typed procedure/outcome, decoding applies the caller's
@@ -38,6 +39,8 @@ mod aper;
 mod constructed;
 mod generated;
 mod policy;
+
+pub mod n3iwf;
 
 pub use constructed::{MessageType, ProtocolIe};
 pub use generated::ngap_common_data_types::{Criticality, ProcedureCode};
