@@ -30,6 +30,7 @@ jobs:
         crate:
           - opc-protocol
           - opc-proto-gtpu
+          - opc-proto-gre
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
@@ -82,6 +83,7 @@ jobs:
         crate:
           - opc-protocol
           - opc-proto-gtpu
+          - opc-proto-gre
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap

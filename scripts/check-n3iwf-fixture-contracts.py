@@ -115,6 +115,8 @@ def main() -> int:
             "--test",
             "wire_codecs",
             "--test",
+            "gre_packets",
+            "--test",
             "ngap_messages",
             "--test",
             "protocol_key_known_answers",

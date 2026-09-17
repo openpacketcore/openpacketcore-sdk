@@ -25,6 +25,34 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_gre_rejects_unsupported_legacy_flags(self):
+        manifest = json.loads((FIXTURES / "gre-qfi/positive-uplink.json").read_text())
+        original = wire("gre-qfi", "positive-uplink")
+        # RFC 2784 bit numbering starts at the most significant bit. K (2)
+        # is allowed by RFC 2890; routing (1), strict source (4), recursion
+        # (5), checksum (0), sequence (3), and version bits are not NWu.
+        for bit in [0, 1, 3, 4, 5, 13, 14, 15]:
+            data = bytearray(original)
+            data[bit // 8] |= 1 << (7 - bit % 8)
+            with self.subTest(bit=bit):
+                self.assertEqual(oracle.observe(manifest, data), ("reject", "flags"))
+
+    def test_gre_rqi_requires_downlink_direction(self):
+        manifest = json.loads((FIXTURES / "gre-qfi/positive-uplink.json").read_text())
+        data = wire("gre-qfi", "positive-downlink-rqi")
+        self.assertEqual(oracle.observe(manifest, data), ("reject", "uplink-rqi"))
+        manifest["direction"] = "n3iwf-to-ue"
+        self.assertEqual(oracle.observe(manifest, data), ("accept", None))
+
+    def test_gre_receives_reserved0_ignore_bits(self):
+        manifest = json.loads((FIXTURES / "gre-qfi/positive-uplink.json").read_text())
+        original = wire("gre-qfi", "positive-uplink")
+        for bit in range(6, 13):
+            data = bytearray(original)
+            data[bit // 8] |= 1 << (7 - bit % 8)
+            with self.subTest(bit=bit):
+                self.assertEqual(oracle.observe(manifest, data), ("accept", None))
+
     def test_key_reference_rejects_non_octet_known_answers(self):
         reference = key_reference.read_json(key_reference.REFERENCE)
         for value in (False, 0.0, "0", -1, 256):
