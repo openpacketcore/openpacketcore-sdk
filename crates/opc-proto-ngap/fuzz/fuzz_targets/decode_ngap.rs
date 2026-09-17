@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/response_diagnostics.rs"]
+mod response_diagnostics;
+
 #[path = "../../tests/support/applicability.rs"]
 mod applicability;
 
@@ -65,6 +68,7 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    response_diagnostics::exercise(data, decode, output);
     applicability::exercise(data, decode, output);
     modify_fields::exercise(data, decode, output);
     modify_request::exercise(data, decode, output);

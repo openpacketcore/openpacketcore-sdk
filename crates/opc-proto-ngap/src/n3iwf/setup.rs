@@ -39,6 +39,8 @@ pub struct NgSetupResponse {
     pub relative_capacity: u8,
     /// Advertised PLMNs and slices.
     pub plmns: PlmnSupportList,
+    /// Optional same-procedure diagnostics; absence and an empty root differ.
+    pub diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
 }
 redacted!(NgSetupResponse);
 /// Admitted failure fields, with optional root retry delay.
@@ -48,6 +50,8 @@ pub struct NgSetupFailure {
     pub cause: Cause,
     /// Optional delay; no timer is created by the codec.
     pub time_to_wait: Option<TimeToWait>,
+    /// Optional same-procedure diagnostics with no triggering procedure header.
+    pub diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
 }
 redacted!(NgSetupFailure);
 
@@ -114,49 +118,54 @@ impl NgSetupResponse {
     /// Construct the canonical response; requires message depth ten.
     pub fn construct(&self, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         crate::enforce_depth(10, ctx)?;
+        let diagnostics = super::reset_fields::encode_response_diagnostics(&self.diagnostics, ctx)?;
         check_items(
             self.served
                 .values()
                 .len()
                 .max(plmn_items(self.plmns.values()))
-                .max(4),
+                .max(4 + usize::from(diagnostics.is_some())),
             ctx,
         )?;
         let output = output_context(ctx);
-        construct(
-            MessageType::NgSetupResponse,
-            vec![
-                (
-                    1,
-                    Criticality::reject,
-                    self.name.encode(output).map_err(encode_error)?,
-                ),
-                (
-                    96,
-                    Criticality::reject,
-                    self.served.encode(output).map_err(encode_error)?,
-                ),
-                (
-                    86,
-                    Criticality::ignore,
-                    encode_leaf(&asn::RelativeAMFCapacity(self.relative_capacity), output)
-                        .map_err(encode_error)?,
-                ),
-                (
-                    80,
-                    Criticality::reject,
-                    self.plmns.encode(output).map_err(encode_error)?,
-                ),
-            ],
-            ctx,
-        )
+        let mut fields = vec![
+            (
+                1,
+                Criticality::reject,
+                self.name.encode(output).map_err(encode_error)?,
+            ),
+            (
+                96,
+                Criticality::reject,
+                self.served.encode(output).map_err(encode_error)?,
+            ),
+            (
+                86,
+                Criticality::ignore,
+                encode_leaf(&asn::RelativeAMFCapacity(self.relative_capacity), output)
+                    .map_err(encode_error)?,
+            ),
+            (
+                80,
+                Criticality::reject,
+                self.plmns.encode(output).map_err(encode_error)?,
+            ),
+        ];
+        if let Some(value) = diagnostics {
+            fields.push((19, Criticality::ignore, value));
+        }
+        construct(MessageType::NgSetupResponse, fields, ctx)
     }
 }
 impl NgSetupFailure {
     /// Construct the canonical failure; requires message depth six.
     pub fn construct(&self, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         crate::enforce_depth(6, ctx)?;
-        check_items(1 + usize::from(self.time_to_wait.is_some()), ctx)?;
+        let diagnostics = super::reset_fields::encode_response_diagnostics(&self.diagnostics, ctx)?;
+        check_items(
+            1 + usize::from(self.time_to_wait.is_some()) + usize::from(diagnostics.is_some()),
+            ctx,
+        )?;
         let output = output_context(ctx);
         let mut fields = vec![(
             15,
@@ -169,6 +178,9 @@ impl NgSetupFailure {
                 Criticality::ignore,
                 encode_leaf(&wait, output).map_err(encode_error)?,
             ));
+        }
+        if let Some(value) = diagnostics {
+            fields.push((19, Criticality::ignore, value));
         }
         construct(MessageType::NgSetupFailure, fields, ctx)
     }
@@ -257,8 +269,10 @@ fn admit<'a>(
 ) -> Result<AdmittedSetup, DecodeError> {
     let (profile, supported, ignored): (policy::IeProfile, &[u16], &[u16]) = match kind {
         MessageType::NgSetupRequest => (policy::NG_SETUP_REQUEST, &[27, 102], &[21, 204]),
-        MessageType::NgSetupResponse => (policy::NG_SETUP_RESPONSE, &[1, 96, 86, 80], &[200, 404]),
-        MessageType::NgSetupFailure => (policy::NG_SETUP_FAILURE, &[15, 107], &[]),
+        MessageType::NgSetupResponse => {
+            (policy::NG_SETUP_RESPONSE, &[1, 96, 86, 80, 19], &[200, 404])
+        }
+        MessageType::NgSetupFailure => (policy::NG_SETUP_FAILURE, &[15, 107, 19], &[]),
         _ => return Err(invalid("setup message outcome")),
     };
     let leaf = DecodeContext {
@@ -268,6 +282,7 @@ fn admit<'a>(
     let (mut global, mut tracking_areas, mut paging_present) = (None, None, false);
     let (mut name, mut served, mut relative_capacity, mut plmns) = (None, None, None, None);
     let (mut cause, mut time_to_wait) = (None, None);
+    let mut diagnostics = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     for (index, (id, crit, value)) in fields.enumerate() {
@@ -306,6 +321,11 @@ fn admit<'a>(
                 }
                 time_to_wait = Some(decode_leaf::<TimeToWait>(value)?);
             }
+            19 => {
+                diagnostics = Some(super::reset_fields::decode_response_diagnostics(
+                    value, leaf,
+                )?)
+            }
             _ => return Err(invalid("setup field dispatch")),
         }
     }
@@ -326,10 +346,12 @@ fn admit<'a>(
             relative_capacity: relative_capacity
                 .ok_or_else(|| invalid("missing relative amf capacity"))?,
             plmns: plmns.ok_or_else(|| invalid("missing plmn support"))?,
+            diagnostics,
         }),
         MessageType::NgSetupFailure => SetupMessage::Failure(NgSetupFailure {
             cause: cause.ok_or_else(|| invalid("missing setup failure cause"))?,
             time_to_wait,
+            diagnostics,
         }),
         _ => return Err(invalid("setup message outcome")),
     };

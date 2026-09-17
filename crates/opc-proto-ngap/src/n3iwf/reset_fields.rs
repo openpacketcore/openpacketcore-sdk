@@ -182,6 +182,47 @@ pub struct CriticalityDiagnostics {
     pub ies: Option<DiagnosticItems>,
 }
 redacted!(CriticalityDiagnostics);
+
+pub(super) fn response_diagnostics(value: &CriticalityDiagnostics) -> Result<(), DecodeError> {
+    if value.procedure_code.is_some() || value.triggering_outcome.is_some() {
+        return Err(invalid("response diagnostic header applicability"));
+    }
+    Ok(())
+}
+
+pub(super) fn decode_response_diagnostics(
+    input: &[u8],
+    ctx: DecodeContext,
+) -> Result<CriticalityDiagnostics, DecodeError> {
+    let value = CriticalityDiagnostics::decode(input, ctx)?;
+    response_diagnostics(&value)?;
+    Ok(value)
+}
+
+/// Message-local construction preflight, including four enclosing layers.
+pub(super) fn encode_response_diagnostics(
+    value: &Option<CriticalityDiagnostics>,
+    ctx: DecodeContext,
+) -> Result<Option<EncodedValue>, DecodeError> {
+    let Some(value) = value else { return Ok(None) };
+    response_diagnostics(value)?;
+    crate::enforce_depth(if value.ies.is_some() { 8 } else { 6 }, ctx)?;
+    if value
+        .ies
+        .as_ref()
+        .is_some_and(|items| items.values().len() > ctx.max_ies)
+    {
+        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, 0));
+    }
+    value
+        .encode(EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        })
+        .map(Some)
+        .map_err(|_| invalid("response diagnostic encoding or capacity"))
+}
+
 impl CriticalityDiagnostics {
     /// Encode the qualified root layout, preserving its parent bit offset and
     /// checking exact output capacity before allocation.

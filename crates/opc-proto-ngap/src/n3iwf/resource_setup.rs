@@ -45,6 +45,8 @@ pub struct InitialContextResponse {
     pub ran: RanUeId,
     /// Disjoint optional results. Empty is valid when no sessions were requested.
     pub sessions: SessionResults,
+    /// Optional same-procedure diagnostics; absence and an empty root differ.
+    pub diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
 }
 redacted!(InitialContextResponse);
 
@@ -58,6 +60,8 @@ pub struct InitialContextFailure {
     pub cause: Cause,
     /// Optional failed sessions with individual root Causes.
     pub failed: Option<FailedSessions>,
+    /// Optional same-procedure diagnostics with no triggering procedure header.
+    pub diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
 }
 redacted!(InitialContextFailure);
 
@@ -86,6 +90,8 @@ pub struct SessionResourceResponse {
     pub sessions: SessionResults,
     /// Optional N3IWF location; other access choices are unsupported.
     pub location: Option<N3iwfLocation>,
+    /// Optional same-procedure diagnostics with ordered, repeatable IE reports.
+    pub diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
 }
 redacted!(SessionResourceResponse);
 
@@ -183,9 +189,13 @@ impl InitialContextResponse {
     /// Construct a context response, including empty or partial session results.
     pub fn construct(&self, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         result_depth(&self.sessions, ctx)?;
+        let diagnostics = super::reset_fields::encode_response_diagnostics(&self.diagnostics, ctx)?;
         let output = output_context(ctx);
         let mut fields = id_fields(self.amf, self.ran, Criticality::ignore, output)?;
         result_fields(&mut fields, &self.sessions, 72, 55, output)?;
+        if let Some(value) = diagnostics {
+            fields.push((19, Criticality::ignore, value));
+        }
         construct(MessageType::InitialContextSetupResponse, fields, ctx)
     }
 }
@@ -194,6 +204,7 @@ impl InitialContextFailure {
     /// Construct failure, with optional individual failed-session results.
     pub fn construct(&self, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         crate::enforce_depth(if self.failed.is_some() { 10 } else { 6 }, ctx)?;
+        let diagnostics = super::reset_fields::encode_response_diagnostics(&self.diagnostics, ctx)?;
         let output = output_context(ctx);
         let mut fields = id_fields(self.amf, self.ran, Criticality::ignore, output)?;
         if let Some(failed) = &self.failed {
@@ -208,6 +219,9 @@ impl InitialContextFailure {
             Criticality::ignore,
             self.cause.encode(output).map_err(encode_error)?,
         ));
+        if let Some(value) = diagnostics {
+            fields.push((19, Criticality::ignore, value));
+        }
         construct(MessageType::InitialContextSetupFailure, fields, ctx)
     }
 }
@@ -250,9 +264,13 @@ impl SessionResourceResponse {
             return Err(invalid("missing session setup result"));
         }
         result_depth(&self.sessions, ctx)?;
+        let diagnostics = super::reset_fields::encode_response_diagnostics(&self.diagnostics, ctx)?;
         let output = output_context(ctx);
         let mut fields = id_fields(self.amf, self.ran, Criticality::ignore, output)?;
         result_fields(&mut fields, &self.sessions, 75, 58, output)?;
+        if let Some(value) = diagnostics {
+            fields.push((19, Criticality::ignore, value));
+        }
         if let Some(location) = &self.location {
             fields.push((
                 121,
@@ -401,12 +419,12 @@ fn admit<'a>(
         ),
         MessageType::InitialContextSetupResponse => (
             policy::INITIAL_CONTEXT_SETUP_RESPONSE,
-            &[10, 85, 72, 55],
+            &[10, 85, 72, 55, 19],
             &[],
         ),
         MessageType::InitialContextSetupFailure => (
             policy::INITIAL_CONTEXT_SETUP_FAILURE,
-            &[10, 85, 132, 15],
+            &[10, 85, 132, 15, 19],
             &[],
         ),
         MessageType::PduSessionResourceSetupRequest => (
@@ -416,7 +434,7 @@ fn admit<'a>(
         ),
         MessageType::PduSessionResourceSetupResponse => (
             policy::PDU_SESSION_RESOURCE_SETUP_RESPONSE,
-            &[10, 85, 75, 58, 121],
+            &[10, 85, 75, 58, 121, 19],
             &[],
         ),
         _ => return Err(invalid("resource setup message outcome")),
@@ -429,6 +447,7 @@ fn admit<'a>(
     let (mut guami, mut allowed, mut key, mut capabilities_present) = (None, None, None, false);
     let (mut aggregate_bit_rate, mut requests, mut nas) = (None, None, None);
     let (mut successful, mut failed, mut cause, mut location) = (None, None, None, None);
+    let mut diagnostics = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     let mut transfer_diagnostics = Vec::new();
@@ -469,6 +488,11 @@ fn admit<'a>(
             55 | 58 | 132 => failed = Some(FailedSessions::decode(value, leaf)?),
             15 => cause = Some(Cause::decode(value, leaf)?),
             121 => location = Some(N3iwfLocation::decode(value, leaf)?),
+            19 => {
+                diagnostics = Some(super::reset_fields::decode_response_diagnostics(
+                    value, leaf,
+                )?)
+            }
             _ => return Err(invalid("resource setup field dispatch")),
         }
     }
@@ -498,6 +522,7 @@ fn admit<'a>(
                 amf,
                 ran,
                 sessions: SessionResults::new(successful, failed)?,
+                diagnostics,
             })
         }
         MessageType::InitialContextSetupFailure => {
@@ -506,6 +531,7 @@ fn admit<'a>(
                 ran,
                 cause: cause.ok_or_else(|| invalid("missing context failure cause"))?,
                 failed,
+                diagnostics,
             })
         }
         MessageType::PduSessionResourceSetupRequest => {
@@ -527,6 +553,7 @@ fn admit<'a>(
                 ran,
                 sessions,
                 location,
+                diagnostics,
             })
         }
         _ => return Err(invalid("resource setup message outcome")),
