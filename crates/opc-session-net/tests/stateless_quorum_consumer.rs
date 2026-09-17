@@ -6850,7 +6850,7 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
 }
 
 #[cfg(feature = "test-control")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction() {
     const SNAPSHOT_COMMANDS: usize = 4_300;
     let pki = Arc::new(TestPki::new());
