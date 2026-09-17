@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- `opc-sctp`: preserve socket-owned partial DATA and its cumulative byte bound
+  across cancelled receives and interleaved non-lifecycle notifications. Clear
+  partial state on terminal errors and close, invalidate it on matching
+  association lifecycle events, and reject conflicting complete metadata or
+  ambiguous notifications. This receive reliability slice precedes the typed
+  N2 profile and does not establish protected transport (Refs #788).
 - Make the persistent-file identity qualification recognize actual reuse of
   any inode it previously deleted, retaining the 4,096-attempt bound and the
   generation-change assertion when another filesystem user takes the first inode.
