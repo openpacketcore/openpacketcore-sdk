@@ -528,6 +528,53 @@ local procedure triggers remain caller-owned. Other QoS profiles, optional
 fields and procedures under #787 are still pending; no live interoperability
 is established.
 
+## PDU Session Resource Release
+
+`n3iwf::resource_release` admits and constructs the two release outcomes from
+TS 38.413 V18.10.0 9.2.1.3–9.2.1.4 and the contained transfers from
+9.3.4.12 and 9.3.4.21. TS 29.413 V18.5.0 5.3 makes RAN Paging Priority
+receiver-ignored. The complete wire and typed leaf values are independently
+qualified for this root-only subset.
+
+| Boundary | Required fields / limits | Optional fields | Construction / receive |
+| --- | --- | --- | --- |
+| Release Command Transfer | One root Cause; depth 3; 1–2 bytes | None admitted | Qualified generated codec with exact framing/padding preflight |
+| Release Response Transfer | Empty root; depth 1; exactly one zero octet | None admitted | Qualified generated codec with exact framing/padding preflight |
+| Requested-session list | 1–256 unique session IDs and command transfers; depth 6 | None admitted | Qualified generated codec with physical count, duplicate, flag and length preflight |
+| Released-session list | 1–256 unique session IDs and empty response transfers; depth 4 | None admitted | Qualified generated codec with the same bounded preflight |
+| Release Command | AMF/RAN UE IDs and requested-session list; depth 10 | Opaque NAS; RAN Paging Priority contents ignored | Canonical / typed |
+| Release Response | AMF/RAN UE IDs and released-session list; depth 8 | N3IWF location | Canonical / typed |
+
+All top-level fields are singleton with existing procedure-specific criticality.
+There is no unsuccessful outcome. Required lists cannot be empty, and each
+contained transfer must be admitted before the complete list is returned.
+Known applicable unimplemented fields, including Criticality Diagnostics and
+transfer extensions, fail explicitly. Ordinary NAS borrows input; fragments
+are physically preflighted before coalescing. Unknown/duplicate policies are
+selected by generic decoding and remain authoritative; use the same context
+for typed admission. Mutable metadata, bytes, counts and remaining depth are
+rechecked. Diagnostics expose only ignored counts and unknown-notify IE IDs.
+
+The [independent oracle](tests/fixtures/n3iwf-resource-release.json) contains
+579 fields (577 admitted and two duplicate-ID negatives) and 28 complete
+messages (15 admitted and 13 negatives). Fields cover all 64 root Causes and
+every list length from 1 through 256; 1,154 independent generated encode/decode
+comparisons pass. Messages cover mandatory presence, duplicate selection,
+unknown criticality, ignored malformed priority, fragmented synthetic NAS and
+IPv4/IPv6 location. Regenerate with
+`scripts/generate-ngap-resource-release-fixtures.py --spec PATH --output PATH`
+using the pinned PDF and reference environment. Both reference encoders agree;
+structured decoding verifies reference values and wire bytes. All 607 cases
+seed fuzz/replay. Tests also corrupt every unused transfer padding bit, nested
+extensions, lengths, count/size/depth limits, metadata and sampled input bytes.
+
+Generated codecs are retained after independent qualification; this adds no
+new handwritten ASN.1 layout. Shared result-list and root-Cause helpers perform
+preflight. Exact output size is checked before allocating list encodings. Debug
+and errors redact values. Session ownership, request/response correlation,
+resource teardown, response triggering and live interoperability remain outside
+this codec boundary.
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):

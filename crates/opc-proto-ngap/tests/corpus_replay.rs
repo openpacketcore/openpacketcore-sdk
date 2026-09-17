@@ -9,6 +9,8 @@
 //! protection — if a future change makes the decode path panic on a known
 //! input, this test fails and names the offending input.
 
+#[path = "support/resource_release.rs"]
+mod resource_release;
 #[path = "support/resource_setup.rs"]
 mod resource_setup;
 
@@ -42,6 +44,14 @@ fn exercise(data: &[u8]) {
         ..DecodeContext::default()
     };
     resource_setup::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    resource_release::exercise(
         data,
         ctx,
         EncodeContext {

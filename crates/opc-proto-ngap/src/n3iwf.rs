@@ -121,6 +121,8 @@ pub mod context_fields;
 pub mod nas;
 pub mod release;
 pub mod resource_fields;
+/// Bounded PDU Session Resource Release transfers, lists and messages.
+pub mod resource_release;
 pub mod resource_request;
 pub mod resource_results;
 /// Initial Context Setup and PDU Session Resource Setup field admission.

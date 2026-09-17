@@ -122,6 +122,12 @@ partial results; these values do not configure a session or tunnel. Requests
 with resource lists require an explicit `DecodeContext::max_depth` of at least
 17. See the message matrix in [CONFORMANCE.md](CONFORMANCE.md).
 
+`resource_release` admits and constructs PDU Session Resource Release Command
+and Response. It includes unique session lists, per-session root Causes,
+empty response transfers, optional opaque NAS and optional N3IWF location.
+The caller correlates requests and performs cleanup; decoding a peer report
+does not prove that resources have been removed.
+
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413
@@ -143,7 +149,7 @@ one/two-octet lengths and 16K–64K open-type fragments. It matches the independ
 Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
 boundary cases. The caller supplies already-encoded IE values; typed N3IWF
 resource transfers and presence rules beyond the documented NAS, release, NG Setup
-and context/session setup subsets remain pending under #787. No
+and context/session setup and release subsets remain pending under #787. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks

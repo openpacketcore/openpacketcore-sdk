@@ -236,7 +236,7 @@ fn read_octets<const N: usize>(reader: &mut Reader<'_>) -> Result<[u8; N], Decod
     }
     Ok(bytes)
 }
-fn cause_width(class: CauseClass) -> usize {
+pub(super) fn cause_width(class: CauseClass) -> usize {
     match class {
         CauseClass::RadioNetwork => 6,
         CauseClass::Transport => 1,
@@ -256,7 +256,7 @@ fn write_cause(writer: &mut Writer, cause: Cause) -> Result<(), EncodeError> {
     writer.bits(0, 1)?;
     writer.bits(u16::from(cause.code()), cause_width(cause.class()))
 }
-fn read_cause(reader: &mut Reader<'_>) -> Result<Cause, DecodeError> {
+pub(super) fn read_cause(reader: &mut Reader<'_>) -> Result<Cause, DecodeError> {
     let class = match reader.bits(3)? {
         0 => CauseClass::RadioNetwork,
         1 => CauseClass::Transport,

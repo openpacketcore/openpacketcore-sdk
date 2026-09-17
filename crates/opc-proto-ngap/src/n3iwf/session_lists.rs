@@ -317,7 +317,10 @@ impl SessionResults {
     }
 }
 
-fn validate_ids(ids: impl Iterator<Item = SessionId>, count: usize) -> Result<(), DecodeError> {
+pub(super) fn validate_ids(
+    ids: impl Iterator<Item = SessionId>,
+    count: usize,
+) -> Result<(), DecodeError> {
     if count == 0 || count > 256 {
         return Err(invalid("session list count"));
     }
@@ -344,7 +347,10 @@ fn add_size(length: &mut usize, value: usize, ctx: EncodeContext) -> Result<(), 
     })?;
     capacity(*length, ctx)
 }
-fn encode_list<T: rasn::Encode>(value: &T, length: usize) -> Result<EncodedValue, EncodeError> {
+pub(super) fn encode_list<T: rasn::Encode>(
+    value: &T,
+    length: usize,
+) -> Result<EncodedValue, EncodeError> {
     let wire = Zeroizing::new(rasn::aper::encode(value).map_err(|_| {
         EncodeError::new(EncodeErrorCode::Structural {
             reason: "session list encoding",
@@ -357,7 +363,7 @@ fn encode_list<T: rasn::Encode>(value: &T, length: usize) -> Result<EncodedValue
     }
     Ok(EncodedValue(wire))
 }
-fn preflight_results(
+pub(super) fn preflight_results(
     input: &[u8],
     ctx: DecodeContext,
     depth: usize,

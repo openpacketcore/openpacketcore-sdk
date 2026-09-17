@@ -1,5 +1,7 @@
 #![no_main]
 
+#[path = "../../tests/support/resource_release.rs"]
+mod resource_release;
 #[path = "../../tests/support/resource_setup.rs"]
 mod resource_setup;
 
@@ -41,6 +43,7 @@ fuzz_target!(|data: &[u8]| {
         ..EncodeContext::default()
     };
     resource_setup::exercise(data, decode, output);
+    resource_release::exercise(data, decode, output);
     if let Ok(field) = AmfUeId::decode(data, decode) {
         let wire = field.encode(output).unwrap();
         assert!(AmfUeId::decode(wire.as_bytes(), decode).unwrap() == field);

@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: canonical PDU Session Resource Release Command/Response
+  construction and admission, with unique session lists, per-session root
+  Causes and bounded generated transfer codecs. Independent Release 18 evidence
+  covers every list length, optional NAS/location and receiver-ignore behavior;
+  correlation and resource cleanup remain caller-owned (Refs #787).
 - `opc-proto-ngap`: canonical construction and typed admission for all five
   Initial Context/PDU Session Resource Setup outcomes, with required and
   conditional presence, nested caller policies and disjoint partial results.
