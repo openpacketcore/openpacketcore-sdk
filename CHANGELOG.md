@@ -112,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: bounded context/PDU Setup session request/result lists
+  with optional borrowed NAS, S-NSSAI, unique session IDs and disjoint partial
+  results. Independent Release 18 vectors cover seven root layouts and nested
+  fragmentation; nested admission preserves caller IE policies (Refs #787).
 - `opc-proto-ngap`: construct/admit bounded setup response and unsuccessful
   transfers, with distinct downlink endpoints and unique, disjoint accepted/
   failed QFI results. Independent Release 18 vectors qualify the response
