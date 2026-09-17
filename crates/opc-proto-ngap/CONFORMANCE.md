@@ -197,7 +197,7 @@ metadata is corrected to those message clauses; its wire bytes are unchanged.
 | Outcome | Required typed IEs | Optional typed IEs | N3IWF disposition |
 |---|---|---|---|
 | UE Context Release Command (initiating 41) | UE NGAP IDs 114, Cause 15 | None | AMF/RAN pair or AMF-only when RAN ID is unavailable |
-| UE Context Release Complete (successful 41) | AMF UE ID 10, RAN UE ID 85 | N3IWF ULI 121, response diagnostics 19 | Ignore paging IEs 32/207; resource list 60 explicitly awaits a codec |
+| UE Context Release Complete (successful 41) | AMF UE ID 10, RAN UE ID 85 | N3IWF ULI 121, session reports 60, response diagnostics 19 | Ignore paging IEs 32/207; session transfer usage extensions remain unsupported |
 
 Both outcomes support canonical construction and receive admission. The generic
 decoder applies unknown/duplicate policies first; typed admission revalidates
@@ -225,9 +225,47 @@ Message byte/count limits are checked; fields start after four enclosing
 layers. Identifier choices need depth three, causes two and location four.
 The allocation budget is advisory. The caller resolves association/UE ownership,
 releases signaling and user-plane resources, orders completion, and handles
-applicable optional resource/diagnostic fields before selecting this subset.
-No resource effect or acknowledgement is performed here. UE Release Request
-and other procedure outcomes remain pending under #787.
+applicable optional fields before selecting this subset. No resource effect or
+acknowledgement is performed here. UE Release Request has its separate admitted
+boundary below; other pending procedure codecs remain tracked under #787.
+
+### UE Release Complete session reports
+
+`release_sessions::ContextReleasedSessions` qualifies optional message IE 60
+with reject criticality. The list contains 1–256 unique session IDs in wire
+order. Each item admits either no extensions or exactly one extension 145 with
+ignore criticality, containing the qualified empty Release Response Transfer.
+Absent transfers and present empty roots remain distinct. Other item extensions,
+duplicate extension entries, usage-report transfer extensions and wrong
+criticalities reject explicitly. This is a closed field subset; generic unknown
+IE policy does not expand it.
+
+The receive scan checks physical length, count, unique IDs, sequence flags,
+padding and both open-type/OCTET STRING framing layers before generated list
+allocation. The existing generated encoder and decoder both match all 1,280
+admitted independent field values. Encoding preflights the exact size
+`1 + 2 * items + 8 * transfers` before constructing generated values. Field depth
+is 3 without transfers and 6 with them; total message depth is at least 7 or 10,
+alongside existing location and diagnostic limits. `max_ies` bounds the session
+list as well as the outer message. Construction preflights count and depth
+before encoding the list.
+
+The [independent oracle](tests/fixtures/n3iwf-release-sessions.json) contains
+1,287 fields (1,280 admitted, 7 negative) and 1,308 complete messages (1,298
+admitted, 10 negative). It covers every list count 1–256 with absent, present and
+mixed transfers, every identifier with either transfer presence, and optional
+location/diagnostic combinations. Both unmodified reference encoders agree;
+structured decoding verifies their values. Existing release corpus bytes and
+the published fixture revision remain unchanged. Reproduce with
+`scripts/generate-ngap-release-session-fixtures.py --sdk-root DIR --spec PATH --output PATH`.
+Tests check exact construction/admission limits, singleton duplicate policies,
+malformed nested framing, wrapper mutation and shared bounded fuzz replay.
+
+`ReleaseMessage::Complete` gains an explicit optional `sessions` field; update
+struct literals and exhaustive destructuring. These are peer reports under
+38.413 8.3.3.2 and 9.2.2.6. Correlation, resource ownership and actual cleanup
+remain caller-owned. This field expansion adds no qualified outcome and does
+not close #787.
 
 ## N3IWF NG Setup admission
 
@@ -761,16 +799,17 @@ of notification reports, selects triggers and performs resource effects.
 Construction does not override TS 29.413's receiver-ignore rules for Notification
 Control in Setup/Modify or establish eligibility to generate a notification.
 Alternative QoS, feedback, RAT usage and other extensions remain explicitly
-unsupported. Remaining #787 work includes Modify, applicable optional fields,
-the broader procedure applicability/receive/error matrix and live interoperability.
+unsupported. Modify qualification follows below; the applicability, receive/error
+and trigger matrix is in [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md). Applicable
+optional field gaps and live interoperability evidence remain explicitly open.
 
 ## PDU Session Resource Modify root fields
 
 `n3iwf::modify_fields` adds four standalone root lists from TS 38.413 V18.10.0
 9.3.4.3–4, using the QFI, QoS and Cause definitions in 9.3.1.12–13 and 9.3.1.51.
 These are field codecs; the request-transfer composition is qualified below.
-Complete Modify messages and request/response conditions remain pending.
-No additional PDU outcome is admitted.
+Complete Modify messages and request/response conditions are qualified below.
+The standalone field boundary adds no PDU outcome.
 
 | Field | Qualified root | Required depth |
 | --- | --- | --- |
@@ -867,8 +906,9 @@ This is a transfer boundary, not an additional admitted NGAP PDU. The caller
 checks session/bearer ownership and conditional presence, correlates requests,
 constructs the abnormal-condition response required by 8.2.3.4, forwards NAS
 only after qualifying success and performs resource effects. A decode error
-alone is not that response. Enclosing Modify messages and other #787
-applicability/receive/error rules remain pending. Response/failure roots follow.
+alone is not that response. Response/failure roots and enclosing Modify messages
+follow below; [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md) defines routing, receive/error
+obligations and trigger gates for other applicable procedures.
 
 ## PDU Session Resource Modify result transfers
 

@@ -58,6 +58,7 @@ fn construct(row: &Value) -> ReleaseMessage {
             .unwrap(),
         },
         "UEContextReleaseComplete" => ReleaseMessage::Complete {
+            sessions: None,
             diagnostics: None,
             amf: AmfUeId::new(0x0102030405).unwrap(),
             ran: RanUeId::new(0x10203040),
@@ -96,18 +97,21 @@ fn same_fields(left: &ReleaseMessage, right: &ReleaseMessage) {
                 ran: b,
                 location: c,
                 diagnostics: d,
+                sessions: e,
             },
             ReleaseMessage::Complete {
                 amf: x,
                 ran: y,
                 location: z,
                 diagnostics: w,
+                sessions: q,
             },
         ) => {
             assert!(a == x);
             assert!(b == y);
             assert!(c == z);
             assert!(d == w);
+            assert!(e == q);
         }
         _ => panic!("release outcome differs"),
     }
@@ -290,7 +294,7 @@ fn crit_of(value: u8) -> Criticality {
 }
 
 #[test]
-fn ignored_fields_and_unimplemented_applicable_fields_stay_distinct() {
+fn ignored_fields_and_malformed_session_reports_stay_distinct() {
     let message = construct(&serde_json::json!({"message":"UEContextReleaseComplete"}));
     let base = message.construct(context()).unwrap();
     for id in [32, 207] {

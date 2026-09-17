@@ -1333,6 +1333,13 @@ identity.
 
 ### N3IWF response diagnostics field expansion (issue #787)
 
+UE Context Release Complete also qualifies optional unique session reports,
+including absent versus present empty release-response transfers. Independent
+evidence adds 1,287 fields and 1,308 complete messages, with all list counts and
+identifiers. Nested framing and depth/count limits are checked before generated
+allocation. The Complete variant gains optional `sessions`; transfer usage
+extensions remain unsupported and resource cleanup remains caller-owned.
+
 Seven existing NG Setup, Initial Context Setup, PDU Session Resource Setup/Release
 and UE Release response boundaries now admit and construct optional Criticality
 Diagnostics. Independent complete-message evidence covers 4,349 vectors, valid

@@ -177,8 +177,7 @@ impl UeIdentifiers {
     }
 }
 
-/// The admitted UE release field subset, with optional response diagnostics.
-/// Optional session-resource IEs require subsequent codecs and fail admission.
+/// The admitted UE release fields, with optional session reports and diagnostics.
 pub enum ReleaseMessage {
     /// Initiating Release Command, procedure 41.
     Command {
@@ -197,6 +196,8 @@ pub enum ReleaseMessage {
         location: Option<N3iwfLocation>,
         /// Optional same-procedure diagnostics, without triggering procedure fields.
         diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
+        /// Optional nonempty session reports, without proof of resource removal.
+        sessions: Option<super::release_sessions::ContextReleasedSessions>,
     },
 }
 redacted!(ReleaseMessage);
@@ -240,7 +241,11 @@ impl ReleaseMessage {
                 ran,
                 location,
                 diagnostics,
+                sessions,
             } => {
+                if let Some(sessions) = sessions {
+                    sessions.message_preflight(ctx)?;
+                }
                 let diagnostics =
                     super::reset_fields::encode_response_diagnostics(diagnostics, ctx)?;
                 fields.push((
@@ -258,6 +263,13 @@ impl ReleaseMessage {
                         121,
                         Criticality::ignore,
                         location.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(sessions) = sessions {
+                    fields.push((
+                        60,
+                        Criticality::reject,
+                        sessions.encode(output).map_err(encode_error)?,
                     ));
                 }
                 if let Some(value) = diagnostics {
@@ -328,7 +340,7 @@ fn admit<'a>(
     } else {
         (
             policy::UE_CONTEXT_RELEASE_COMPLETE,
-            &[10, 85, 121, 19],
+            &[10, 85, 121, 60, 19],
             &[32, 207],
         )
     };
@@ -339,6 +351,7 @@ fn admit<'a>(
     let (mut identifiers, mut cause, mut amf, mut ran, mut location) =
         (None, None, None, None, None);
     let mut diagnostics = None;
+    let mut sessions = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     for (index, (id, crit, value)) in fields.enumerate() {
@@ -366,6 +379,11 @@ fn admit<'a>(
             10 => amf = Some(AmfUeId::decode(value, leaf_ctx)?),
             85 => ran = Some(RanUeId::decode(value, leaf_ctx)?),
             121 => location = Some(N3iwfLocation::decode(value, leaf_ctx)?),
+            60 => {
+                sessions = Some(super::release_sessions::ContextReleasedSessions::decode(
+                    value, leaf_ctx,
+                )?)
+            }
             19 => {
                 diagnostics = Some(super::reset_fields::decode_response_diagnostics(
                     value, leaf_ctx,
@@ -385,6 +403,7 @@ fn admit<'a>(
             ran: ran.ok_or_else(|| invalid("missing ran ue id"))?,
             location,
             diagnostics,
+            sessions,
         }
     };
     Ok(AdmittedRelease {

@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: optional UE Context Release Complete session reports with
+  unique IDs and optional empty release-response transfers, backed by 1,287
+  independent fields and 1,308 complete messages. Preflight nested framing,
+  count and depth before allocation. Complete variant literals and exhaustive
+  patterns must include or allow the new `sessions` field.
 - `opc-proto-ngap`: optional Criticality Diagnostics in seven existing response
   types, backed by 4,349 independent complete-message vectors. Preserve absent
   versus empty diagnostics, enforce response header applicability and bound

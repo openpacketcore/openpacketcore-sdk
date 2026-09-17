@@ -126,6 +126,9 @@ pub mod modify_request;
 pub mod modify_results;
 pub mod nas;
 pub mod release;
+
+/// Bounded UE Context Release Complete session reports.
+pub mod release_sessions;
 /// NG Reset, Reset Acknowledge and Error Indication admission.
 pub mod reset;
 /// Bounded Reset and Criticality Diagnostics root fields.
