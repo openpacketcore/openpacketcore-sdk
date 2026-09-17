@@ -12,9 +12,9 @@ concurrency:
 
 jobs:
   diagnostic-856:
-    name: Bounded 856 recurrence investigation
+    name: Bounded 856 original shard context
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
@@ -25,6 +25,9 @@ jobs:
     steps:
       - name: Checkout diagnostic source
         uses: actions/checkout@v7
+        with:
+          # The driver restores the historical workflow as precheck input.
+          fetch-depth: 0
       - name: Install exact qualified Rust version
         uses: dtolnay/rust-toolchain@1.98.1
       - name: Prepare standard snapshot storage
@@ -34,9 +37,9 @@ jobs:
         with:
           shared-key: opc-rust-tests-misc
           save-if: false
-      - name: Run bounded recurrence experiment
+      - name: Run original miscellaneous shard prefix through target
         run: python3 ci/diagnose-856.py
-      - name: Preserve every sample and exact source metadata
+      - name: Preserve every command and exact source metadata
         if: always()
         uses: actions/upload-artifact@v7
         with:

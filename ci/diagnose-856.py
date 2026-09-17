@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Temporary, bounded #856 recurrence experiment; never retry a failed sample."""
+"""Temporary #856 original-shard-prefix experiment; never retry any failure."""
 import hashlib
 import json
 import os
 from pathlib import Path
 import signal
+import shlex
 import subprocess
 import time
 from contextlib import suppress
 
 out = Path("diagnostic-856")
 out.mkdir(exist_ok=False)
-experiment_deadline = time.monotonic() + 3000
+experiment_deadline = time.monotonic() + 3300
 
 
 def run_bounded(command, log, seconds):
@@ -44,42 +45,80 @@ metadata = {
     "source_baseline": "be7b580986b7efaf87b7aa79b13f55d5d32956c1",
     "observer": "separate_task_without_workload_repoll",
     "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
-    "command": base + ["--nocapture"],
+    "target_command": base,
+    "experiment": "original_misc_shard_prefix_through_target_once",
     "workload_guard_seconds": 300,
-    "maximum_samples": 8,
-    "outer_sample_guard_seconds": 600,
-    "outer_selection_guard_seconds": 1200,
-    "experiment_budget_seconds": 3000,
+    "maximum_target_samples": 1,
+    "outer_target_guard_seconds": 600,
+    "outer_precheck_guard_seconds": 1200,
+    "experiment_budget_seconds": 3300,
     "production_behavior_changed": False,
 }
+# Actions has already constructed this diagnostic-only job graph. Restore the
+# exact original workflow as file input to the unchanged original precheck;
+# this cannot dispatch the historical jobs. Retain the file and its hash so the
+# tested checkout's sole runtime source substitution is explicit in evidence.
+workflow_source = subprocess.check_output([
+    "git", "show", metadata["source_baseline"] + ":.github/workflows/ci.yml"
+])
+(out / "original-workflow.yml").write_bytes(workflow_source)
+Path(".github/workflows/ci.yml").write_bytes(workflow_source)
+metadata["runtime_workflow_substitution"] = {
+    "path": ".github/workflows/ci.yml",
+    "from_commit": metadata["source_baseline"],
+    "sha256": hashlib.sha256(workflow_source).hexdigest(),
+    "purpose": "unchanged_original_precheck_input_only",
+}
 (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-selection_log = out / "selection.log"
-selection_code, selection_timed_out = run_bounded(base + ["--list"], selection_log, 1200)
-(out / "selection.json").write_text(json.dumps({"exit_code": selection_code, "outer_timeout": selection_timed_out}, indent=2) + "\n")
-if selection_code or selection_log.read_text().splitlines().count(name + ": test") != 1:
-    raise SystemExit("exact test must resolve once before any sample")
 results = []
-for ordinal in range(1, 9):
-    log = out / f"sample-{ordinal}.log"
+
+
+def run_step(label, command, maximum_seconds, minimum_remaining=15):
+    """Stop at the first failed prefix command, preserving its exact evidence."""
+    log = out / f"{label}.log"
     start = time.monotonic()
-    print(f"sample {ordinal}/8 starting", flush=True)
-    if experiment_deadline - start < 610:
-        (out / "incomplete.json").write_text(json.dumps({"reason": "insufficient_remaining_experiment_budget", "next_sample": ordinal}) + "\n")
+    remaining = experiment_deadline - start
+    if remaining < minimum_remaining:
+        (out / "incomplete.json").write_text(json.dumps({"reason": "insufficient_remaining_experiment_budget", "next_step": label}) + "\n")
         raise SystemExit("Experiment budget exhausted; incomplete evidence, no retry")
-    (out / "current-sample.json").write_text(json.dumps({"sample": ordinal, "status": "running"}) + "\n")
-    code, outer_timeout = run_bounded(base + ["--nocapture"], log, 600)
+    guard = min(maximum_seconds, remaining - 10)
+    print(f"{label} starting: {shlex.join(command)}", flush=True)
+    (out / "current-step.json").write_text(json.dumps({"step": label, "status": "running", "command": command, "outer_guard_seconds": guard}) + "\n")
+    code, outer_timeout = run_bounded(command, log, guard)
     observation = {
-        "sample": ordinal,
+        "step": label,
+        "command": command,
         "exit_code": code,
         "outer_timeout": outer_timeout,
+        "outer_guard_seconds": guard,
         "seconds": round(time.monotonic() - start, 3),
         "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
     }
-    (out / "current-sample.json").write_text(json.dumps({"sample": ordinal, "status": "finished"}) + "\n")
+    (out / "current-step.json").write_text(json.dumps({"step": label, "status": "finished"}) + "\n")
     results.append(observation)
     (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps(observation), flush=True)
     if code:
-        print("Failure preserved; no further sample or retry.", flush=True)
+        print("Failure preserved; no further command or retry. A prefix failure is not a target recurrence.", flush=True)
         raise SystemExit(code)
-print("No recurrence in this bounded sample. This is not a root-cause or fix claim.", flush=True)
+    return log
+
+
+# Use exactly the original workflow's precheck before its generated commands.
+run_step("precheck", ["python3", "ci/test-shards.py", "precheck", "--shard", "misc"], 1200)
+plan_log = run_step("plan", ["python3", "ci/test-shards.py", "plan", "--shard", "misc"], 60)
+# The plan's manifest audit is on stderr, which the diagnostic log also retains.
+commands = [shlex.split(line) for line in plan_log.read_text().splitlines() if line.startswith("cargo ")]
+target_indices = [index for index, command in enumerate(commands) if command == base]
+if target_indices != [2] or len(commands) != 9:
+    raise SystemExit("original misc prefix shape changed; refusing an inferred workload")
+prefix = commands[:3]
+previous = base[:-1] + ["stateless_quorum_consumer::persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum"]
+if prefix[1] != previous or "--bins" not in prefix[0] or "--test-threads=4" not in prefix[0] or "--skip" not in prefix[0]:
+    raise SystemExit("original preceding commands changed; refusing an inferred workload")
+(out / "prefix.json").write_text(json.dumps(prefix, indent=2) + "\n")
+run_step("ordinary-libs-bins", prefix[0], 2400)
+run_step("preceding-isolated-contract", prefix[1], 600)
+# Preserve libtest's original captured-output mode, as well as its 300s guard.
+run_step("target", prefix[2], 600, minimum_remaining=610)
+print("Original shard prefix and target passed once. This is not a root-cause or fix claim.", flush=True)
