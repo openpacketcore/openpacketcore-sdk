@@ -34,7 +34,7 @@ until receive, close or drop.
 | Complete ancillary identity | Compare association, stream, PPID, delivery order and ordered SSN | TSN/cumulative TSN/context are not record identity; unordered SSN is ignored |
 | Truncated DATA metadata | Preserve existing truncation flags and first-chunk metadata | Not authoritative identity; strict profile admission must reject truncation |
 | Terminal error, explicit close or drop | Clear partial DATA; close can do so during pending I/O | No promise to retract a message already completed before close |
-| Recoverable readiness error | Return the error while preserving partial DATA | Native syscall errors remain terminal under the existing source contract |
+| Recoverable readiness error at the socket owner / one-to-many endpoint | Return the error while preserving partial DATA | The one-to-one association API closes on any returned receive error; native syscall errors remain terminal |
 
 No new outbound wire encoding or socket option is introduced. Existing SCTP
 association/endpoint APIs, host-order `NGAP_PPID` with network-order ancillary
@@ -63,7 +63,13 @@ execution; ordinary Cargo runs leave those tests ignored.
 The reviewed, merged `n2-sctp` fixture subset from
 [PR #830](https://github.com/openpacketcore/openpacketcore-sdk/pull/830) remains
 unchanged. Its wire/metadata inventory does not by itself prove cancellation
-correctness. Candidate evidence must retain exact base/head/tree, failing
+correctness. A later independent byte check found that four metadata vectors
+encode port 38428 while claiming 38412. [PR #896](https://github.com/openpacketcore/openpacketcore-sdk/pull/896)
+corrects those vectors and their semantic checks; its review and merge remain
+prerequisites for new N2 framing qualification. The receive schedules and native
+socket checks here do not depend on those metadata vectors.
+
+Candidate evidence must retain exact base/head/tree, failing
 baseline and removed-guard results, native checks, required repository gates
 and independent review separately. Round trips and synthetic schedules do not
 establish live N3IWF/AMF interoperability.

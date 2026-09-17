@@ -128,8 +128,11 @@ scratch allocation is released and fully cleared when the socket is dropped.
 
 Partial DATA belongs to the socket. Cancelling a receive, including while
 another receiver is queued, preserves every consumed prefix and the original
-cumulative byte bound for the next caller. Recoverable readiness errors also
-preserve the prefix. Terminal receive errors, explicit close, and socket drop
+cumulative byte bound for the next caller. The socket receive owner also
+preserves the prefix on recoverable readiness errors, as exposed by one-to-many
+endpoint receive. The one-to-one association API retains its existing policy
+of closing on any returned receive error, which clears that prefix. Terminal
+receive errors, explicit close, and socket drop
 clear partial data; close can clear it while receive I/O is pending. There is no
 background reader or automatic timeout: an idle partial record remains bounded
 and owned until receive resumes, the socket closes, or the socket is dropped.
