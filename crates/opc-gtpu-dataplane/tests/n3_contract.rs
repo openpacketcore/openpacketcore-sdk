@@ -5,9 +5,11 @@ use opc_gtpu_dataplane::n3::{
     LocalN3DownlinkTnl, N3Direction, N3FlowMarking, N3ForwardingIntent, N3ForwardingRole,
     N3PacketError, N3PacketView, N3Qfi, N3UplinkEncapsulation, ReceivedN3UplinkTnl,
 };
+#[cfg(target_os = "linux")]
+use opc_gtpu_dataplane::EbpfGtpuDataplaneBackend;
 use opc_gtpu_dataplane::{
-    EbpfGtpuDataplaneBackend, GtpBearerMark, GtpuCapability, GtpuDataplaneBackend,
-    LinuxGtpuDataplaneBackend, MockGtpuDataplaneBackend, Teid, UnsupportedGtpuDataplaneBackend,
+    GtpBearerMark, GtpuCapability, GtpuDataplaneBackend, LinuxGtpuDataplaneBackend,
+    MockGtpuDataplaneBackend, Teid, UnsupportedGtpuDataplaneBackend,
 };
 use opc_protocol::{DecodeContext, DuplicateIePolicy, UnknownIePolicy, ValidationLevel};
 use sha2::{Digest, Sha256};
@@ -390,6 +392,7 @@ fn every_shipped_backend_refuses_n3_forwarding_capability() {
     let backends: Vec<Box<dyn GtpuDataplaneBackend>> = vec![
         Box::new(MockGtpuDataplaneBackend::new()),
         Box::new(LinuxGtpuDataplaneBackend::new()),
+        #[cfg(target_os = "linux")]
         Box::new(EbpfGtpuDataplaneBackend::new()),
         Box::new(UnsupportedGtpuDataplaneBackend::new()),
     ];
