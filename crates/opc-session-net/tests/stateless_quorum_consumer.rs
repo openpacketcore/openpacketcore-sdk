@@ -6849,8 +6849,11 @@ async fn public_three_voter_fenced_recovery_survives_response_loss_and_full_rest
     fleet.quiesce().await;
 }
 
+// Use the SDK runtime flavor so these colocated voters can use the bounded
+// blocking handoff for SQLite commits. Keep one async worker to exercise
+// contention while the committing task retains transaction ownership.
 #[cfg(feature = "test-control")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction() {
     const SNAPSHOT_COMMANDS: usize = 4_300;
     let pki = Arc::new(TestPki::new());
