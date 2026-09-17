@@ -19,3 +19,8 @@ bytes = "1.8"
 name = "decode_nas"
 path = "fuzz_targets/decode_nas.rs"
 test = false
+
+[[bin]]
+name = "nas_tcp"
+path = "fuzz_targets/nas_tcp.rs"
+test = false
