@@ -112,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- Experimental NGAP N3IWF UE release field admission and construction, including
+  AMF/RAN and AMF-only identifier choices, all root Cause values and optional
+  location. Independent Release 18 messages qualify this bounded subset; resource
+  cleanup, association authorization and remaining procedure fields stay outside.
 - `opc-proto-ngap`: construct and admit bounded Initial UE and uplink/downlink
   NAS messages, enforce every required field, validate N3IWF-applicable UE
   AMBR, and report unknown-notify diagnostic IDs. Explicitly gate unsupported

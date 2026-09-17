@@ -11,6 +11,7 @@
 
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
+use opc_proto_ngap::n3iwf::release::{Cause, ReleaseMessage, UeIdentifiers};
 use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode, ValidationLevel};
@@ -32,7 +33,15 @@ fn exercise(data: &[u8]) {
     let _ = TrackingArea::decode(data, ctx);
     let _ = N3iwfLocation::decode(data, ctx);
     let _ = UeAggregateBitRate::decode(data, ctx);
+    let _ = Cause::decode(data, ctx);
+    let _ = UeIdentifiers::decode(data, ctx);
     if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), ctx) {
+        if let Ok(admitted) = ReleaseMessage::from_pdu(&pdu, ctx) {
+            let constructed = admitted.message.construct(ctx).unwrap();
+            let wire = encode(&constructed, EncodeContext::default()).unwrap();
+            let received = Pdu::decode_owned(Bytes::from(wire), ctx).unwrap();
+            assert!(ReleaseMessage::from_pdu(&received, ctx).is_ok());
+        }
         if let Ok(admitted) = NasMessage::from_pdu(&pdu, ctx) {
             let constructed = admitted.message.construct(ctx).unwrap();
             let wire = encode(&constructed, EncodeContext::default()).unwrap();

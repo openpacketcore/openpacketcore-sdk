@@ -11,7 +11,8 @@ subset documented in [CONFORMANCE.md](CONFORMANCE.md).
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
 or gNB procedure state, or NAS message processing. Its optional `n3iwf`
-module validates the individual fields and three NAS message outcomes below. The container boundary
+module validates the individual fields, three NAS outcomes and two UE release
+outcomes below. The container boundary
 validates top-level identifiers, criticality, cardinality, and configured
 decode policies.
 
@@ -117,7 +118,7 @@ Canonical encoding uses explicit aligned-PER container framing instead of
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
 Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
 boundary cases. The caller supplies already-encoded IE values; typed N3IWF
-resource transfers and presence rules beyond the admitted NAS subset remain
+resource transfers and presence rules beyond the admitted NAS/release subset remain
 pending under #787; the field codecs cover IDs, NAS framing, keys and locations. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
@@ -202,6 +203,18 @@ Downlink UE AMBR is applicable to N3IWF and is validated. Other recognized
 fields without a codec fail admission; they do not become a partial success.
 Caller-owned association, NAS security, access conditions, Error Indication
 and procedure side effects remain separate.
+
+## UE context release
+
+`n3iwf::release::ReleaseMessage` constructs and admits Release Command and
+Complete. `UeIdentifiers` supports both the AMF/RAN pair and the AMF-only form
+when the RAN identifier is unavailable. `Cause` admits the five standard root
+classes and their 64 root codes. Complete can carry an optional N3IWF location.
+
+The [release matrix](CONFORMANCE.md#n3iwf-ue-release-field-admission) records
+required, ignored and unsupported fields. Association lookup, resource cleanup
+and acknowledgement ordering remain caller-owned. No protocol/backend effect
+occurs when a message passes admission.
 
 ## License
 

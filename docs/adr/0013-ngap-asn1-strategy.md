@@ -201,6 +201,16 @@ missing-field and policy cases, mutation detectors and fuzzing qualify this
 subset. The API does not authorize procedure triggers or perform association,
 identifier binding, NAS security/delivery or backend effects.
 
+## UE release admission amendment (2026-09)
+
+The same opt-in boundary extends to UE Context Release Command and Complete.
+Independent Release 18 fields and complete messages qualify generated codecs
+for both UE identifier choices and all standard root Cause values. Fixed flags
+reject unsupported choice/SEQUENCE extensions before collection decoding; this
+does not add a handwritten ASN.1 encoder or a general decoder. Other applicable
+optional fields fail until qualified codecs exist. The boundary returns fields
+and diagnostics without releasing resources or acknowledging a procedure.
+
 ## Evidence
 
 - Gap register updated: `GAP-PROTO-003` now records the partially closed codec
