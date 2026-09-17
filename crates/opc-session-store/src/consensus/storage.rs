@@ -2856,7 +2856,15 @@ impl LiveTerminalRecoveryHandoffConsumer {
         let core = self.core.clone();
         let namespace = Arc::clone(&self.snapshot_directory_lease.namespace);
         let conn = Arc::clone(&core.conn).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "test-control")]
+        core.snapshot_observation
+            .record_phase_for_test("publication_connection_acquired");
+        #[cfg(feature = "test-control")]
+        let publication_observation = Arc::clone(&core.snapshot_observation);
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "test-control")]
+            core.snapshot_observation
+                .record_phase_for_test("publication_worker_entered");
             if core.terminal_recovery_handoff_pending()? {
                 return Err(SessionConsensusStorageError::BackendUnavailable);
             }
@@ -2879,7 +2887,12 @@ impl LiveTerminalRecoveryHandoffConsumer {
                     admitted_snapshot_file.as_ref(),
                 )? {
                 consensus::LiveTerminalRecoveryHandoffInstallOutcome::Clear
-                | consensus::LiveTerminalRecoveryHandoffInstallOutcome::AlreadyConsumed => Ok(conn),
+                | consensus::LiveTerminalRecoveryHandoffInstallOutcome::AlreadyConsumed => {
+                    #[cfg(feature = "test-control")]
+                    core.snapshot_observation
+                        .record_phase_for_test("publication_worker_completed");
+                    Ok(conn)
+                }
                 consensus::LiveTerminalRecoveryHandoffInstallOutcome::Active
                 | consensus::LiveTerminalRecoveryHandoffInstallOutcome::Installed => {
                     Err(SessionConsensusStorageError::BackendUnavailable)
@@ -2887,7 +2900,10 @@ impl LiveTerminalRecoveryHandoffConsumer {
             }
         })
         .await
-        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        #[cfg(feature = "test-control")]
+        publication_observation.record_phase_for_test("publication_join_consumed");
+        result
     }
 
     /// Strict recovery-manager entry point.  A manager invokes this only

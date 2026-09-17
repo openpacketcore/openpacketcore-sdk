@@ -7174,6 +7174,7 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     let mut completed_for_diagnostic = 0_u64;
     let mut failures_for_diagnostic = 0_u64;
     let workload_result = tokio::time::timeout(Duration::from_secs(5 * 60), async {
+        let workload = async {
         // Each command must finish before the next begins. Concurrent
         // logical-time reads intentionally share one bounded consensus
         // proposal, while this proof must cross the production snapshot-log
@@ -7215,6 +7216,17 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
                     tokio::task::yield_now().await;
                 }
                 Err(error) => panic!("snapshot qualification command was rejected: {error:?}"),
+            }
+        }
+        };
+        tokio::pin!(workload);
+        let mut probes = tokio::time::interval(Duration::from_secs(10));
+        probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        probes.tick().await;
+        loop {
+            tokio::select! {
+                () = &mut workload => break,
+                _ = probes.tick() => workload_diagnostic(),
             }
         }
     })
