@@ -55,10 +55,11 @@ pub use generated::ngap_common_data_types::{Criticality, ProcedureCode};
 pub mod messages {
     pub use super::generated::ngap_pdu_contents::{
         DownlinkNASTransport, InitialContextSetupFailure, InitialContextSetupRequest,
-        InitialContextSetupResponse, InitialUEMessage, NGSetupFailure, NGSetupRequest,
-        NGSetupResponse, PDUSessionResourceReleaseCommand, PDUSessionResourceReleaseResponse,
-        PDUSessionResourceSetupRequest, PDUSessionResourceSetupResponse, Paging,
-        UEContextReleaseCommand, UEContextReleaseComplete, UplinkNASTransport,
+        InitialContextSetupResponse, InitialUEMessage, NASNonDeliveryIndication, NGSetupFailure,
+        NGSetupRequest, NGSetupResponse, PDUSessionResourceReleaseCommand,
+        PDUSessionResourceReleaseResponse, PDUSessionResourceSetupRequest,
+        PDUSessionResourceSetupResponse, Paging, UEContextReleaseCommand, UEContextReleaseComplete,
+        UEContextReleaseRequest, UplinkNASTransport,
     };
 }
 
@@ -128,6 +129,10 @@ pub enum Message {
     DownlinkNasTransport(messages::DownlinkNASTransport),
     /// Uplink NAS Transport (initiating message, procedure code 46).
     UplinkNasTransport(messages::UplinkNASTransport),
+    /// NAS Non-Delivery Indication (initiating message, procedure code 19).
+    NasNonDeliveryIndication(messages::NASNonDeliveryIndication),
+    /// UE Context Release Request (initiating message, procedure code 42).
+    UeContextReleaseRequest(messages::UEContextReleaseRequest),
     /// Initial Context Setup Request (initiating message, procedure code 14).
     InitialContextSetupRequest(messages::InitialContextSetupRequest),
     /// Initial Context Setup Response (successful outcome, procedure code 14).
@@ -244,6 +249,8 @@ impl fmt::Debug for Message {
             Self::UeContextReleaseComplete(message) => {
                 typed!("UeContextReleaseComplete", message)
             }
+            Self::NasNonDeliveryIndication(message) => typed!("NasNonDeliveryIndication", message),
+            Self::UeContextReleaseRequest(message) => typed!("UeContextReleaseRequest", message),
             Self::Paging(message) => typed!("Paging", message),
             Self::Unknown(body) => formatter
                 .debug_struct("Unknown")
@@ -262,6 +269,8 @@ const PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE: u8 = 28;
 const PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP: u8 = 29;
 const PROCEDURE_CODE_UE_CONTEXT_RELEASE: u8 = 41;
 const PROCEDURE_CODE_UPLINK_NAS_TRANSPORT: u8 = 46;
+const PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION: u8 = 19;
+const PROCEDURE_CODE_UE_CONTEXT_RELEASE_REQUEST: u8 = 42;
 
 const NGAP_PDU_WRAPPER_DEPTH: usize = 2;
 const NGAP_UNKNOWN_MESSAGE_DEPTH: usize = 3;
@@ -467,6 +476,22 @@ fn decode_message(
             "uplink nas transport",
             Criticality::ignore,
             policy::UPLINK_NAS_TRANSPORT,
+            |ie| ie.id.0
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION) => decode_as!(
+            messages::NASNonDeliveryIndication,
+            NasNonDeliveryIndication,
+            "nas non delivery indication",
+            Criticality::ignore,
+            policy::NAS_NON_DELIVERY_INDICATION,
+            |ie| ie.id
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_UE_CONTEXT_RELEASE_REQUEST) => decode_as!(
+            messages::UEContextReleaseRequest,
+            UeContextReleaseRequest,
+            "ue context release request",
+            Criticality::ignore,
+            policy::UE_CONTEXT_RELEASE_REQUEST,
             |ie| ie.id.0
         ),
         (Outcome::Initiating, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP) => decode_as!(

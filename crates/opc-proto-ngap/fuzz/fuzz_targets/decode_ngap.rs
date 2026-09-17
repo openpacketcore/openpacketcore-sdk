@@ -5,6 +5,9 @@ mod resource_release;
 #[path = "../../tests/support/resource_setup.rs"]
 mod resource_setup;
 
+#[path = "../../tests/support/ue_requests.rs"]
+mod ue_requests;
+
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
@@ -42,6 +45,7 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    ue_requests::exercise(data, decode, output);
     resource_setup::exercise(data, decode, output);
     resource_release::exercise(data, decode, output);
     if let Ok(field) = AmfUeId::decode(data, decode) {

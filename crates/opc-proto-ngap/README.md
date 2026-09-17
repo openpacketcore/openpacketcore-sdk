@@ -11,8 +11,8 @@ subset documented in [CONFORMANCE.md](CONFORMANCE.md).
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
 or gNB procedure state, or NAS message processing. Its optional `n3iwf`
-module validates the individual fields, three NAS outcomes, two UE release
-outcomes and the three NG Setup outcomes below. The container boundary
+module validates the documented individual fields, NAS and UE requests,
+NG Setup, context/session setup and release subsets. The container boundary
 validates top-level identifiers, criticality, cardinality, and configured
 decode policies.
 
@@ -128,6 +128,12 @@ empty response transfers, optional opaque NAS and optional N3IWF location.
 The caller correlates requests and performs cleanup; decoding a peer report
 does not prove that resources have been removed.
 
+`ue_requests` admits and constructs NAS Non-Delivery Indication and UE Context
+Release Request, including mandatory root Cause and optional unique session IDs.
+NAS stays opaque and borrows contiguous input. Context correlation, deciding when
+to send a request and resource release remain caller-owned. Root Cause decoding
+now rejects nonzero final padding that the generated decoder previously ignored.
+
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413
@@ -146,10 +152,10 @@ the explicitly documented field and message subsets below. See the
 Canonical encoding uses explicit aligned-PER container framing instead of
 `rasn` 0.28's misaligned generated inner-container encoder. This includes
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
-Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
-boundary cases. The caller supplies already-encoded IE values; typed N3IWF
+Release 18 bytes for the 15 published-corpus outcomes, both additional UE request
+procedures, and 54 independent fragmentation boundary cases. The caller supplies already-encoded IE values; typed N3IWF
 resource transfers and presence rules beyond the documented NAS, release, NG Setup
-and context/session setup and release subsets remain pending under #787. No
+and context/session setup, release and UE request subsets remain pending under #787. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks

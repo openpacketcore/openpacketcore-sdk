@@ -16,7 +16,7 @@ internal semantics in the SDK.
 | Layer | Item | Status | Evidence |
 |---|---|---|---|
 | NGAP-PDU framing | All three outcomes | ✅ | Complete messages independently encoded from the Release 18.10 schema |
-| Constructed root containers | All 15 admitted outcomes | ✅ | 21 independent complete-message/order/extension cases built from oracle IE values without receive bytes |
+| Constructed root containers | 17 admitted outcomes | ✅ | 21 published-corpus construction cases plus 291 independent UE request cases below |
 | Constructed length determinants | All three outcomes; short, two-octet and fragmented open types | ✅ | 54 independent Pycrate cases, including inner/outer 128, 16384 and 65536 boundaries |
 | Typed IE mapping | NGSetup Request/Response/Failure | ✅ | Every IE compared with independent reference bytes |
 | Typed IE mapping | InitialUEMessage; Downlink/UplinkNASTransport | ✅ | Complete N3IWF messages, including IPv4/IPv6 location |
@@ -24,6 +24,7 @@ internal semantics in the SDK.
 | Typed IE mapping | PDUSessionResourceSetup Request/Response | ✅ | Nested setup transfers and partial resource results |
 | Typed IE mapping | PDUSessionResourceRelease Command/Response | ✅ | Nested release transfers |
 | Typed IE mapping | UEContextRelease Command/Complete | ✅ | UE identifier pair and N3IWF location |
+| Typed IE mapping | NASNonDeliveryIndication; UEContextReleaseRequest | ✅ | Independent complete requests, root Causes and session IDs |
 | Typed decode | Paging | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture |
 
 Dispatch is outcome-aware: procedure code 21 decodes as NGSetupRequest only
@@ -575,10 +576,59 @@ and errors redact values. Session ownership, request/response correlation,
 resource teardown, response triggering and live interoperability remain outside
 this codec boundary.
 
+## UE reports and context release requests
+
+`n3iwf::ue_requests` admits and constructs the two initiating messages in
+TS 38.413 V18.10.0 9.2.5.4 and 9.2.2.4. Their outer criticality is ignore;
+TS 29.413's N3IWF profile retains their listed fields.
+
+| Boundary | Mandatory fields | Optional fields | Required depth |
+| --- | --- | --- | --- |
+| NAS Non-Delivery Indication (19) | AMF/RAN UE IDs, opaque NAS, root Cause | None | 6 |
+| UE Context Release Request (42) | AMF/RAN UE IDs, root Cause | Session ID list | 6 without list; 7 with list |
+| Context release session list | 1–256 unique session IDs | None; root only | 3 |
+
+AMF/RAN IDs and the session list have reject criticality; NAS and Cause have
+ignore criticality. All fields are singleton. Optional list absence is valid;
+an empty list is invalid. NAS may be empty, borrows contiguous input, and
+physically preflights fragments before coalescing. The list uses independently
+qualified generated codecs with bounded physical counts, unique IDs, exact
+framing, zero padding and trailing-byte checks before generated allocation.
+Exact output capacity is checked before list encoding allocation. Unsupported
+extensions fail. Generic IE policies remain authoritative; use the same
+context for generic and semantic admission. Metadata, count, byte and remaining
+depth limits are rechecked. Unknown-ignore counts and unknown-notify identifiers
+are reported without exposing values.
+
+The [independent oracle](tests/fixtures/n3iwf-ue-requests.json) contains 257
+session lists (256 admitted, one duplicate negative) and 291 complete messages
+(144 admitted, 147 negative). It covers every list length, all 64 root Causes,
+nonzero Cause padding, missing fields, wrong criticality, duplicate policies,
+unknown policies, optional lists and distinct synthetic NAS at fragment
+boundaries. Both reference encoders agree; the structured reference decoder
+verifies values and framing. All 512 generated list constructor/typed-decoder
+comparisons pass. Regenerate with
+`scripts/generate-ngap-ue-request-fixtures.py --spec PATH --output PATH` using
+the pinned Release 18 PDF and reference environment. All 548 cases seed
+fuzz/replay, whose successful semantic round trips compare all admitted values.
+
+The shared `release::Cause` decoder previously accepted nonzero final padding.
+An explicit root framing check now rejects it before generated decoding.
+All 64 valid root Causes remain admitted, and all 297 independent single-bit
+padding mutations reject. This tightens malformed-input acceptance for every
+procedure using Cause. New `Message` and `MessageType` variants require updates
+to downstream exhaustive matches. No schema regeneration or dependency change
+is involved. Tests also cover every session-item flag/padding bit, capacity,
+depth, counts, metadata mutation, truncation and bounded hostile mutations.
+
+These APIs do not establish UE ownership, prove delivery status, choose local
+procedure triggers, or perform resource release. Remaining #787 procedures and
+live interoperability evidence are still pending.
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):
-  complete messages for all 15 admitted outcomes, encoded by Pycrate 0.8.1
+  complete messages for its 15 published outcomes, encoded by Pycrate 0.8.1
   compiled directly from the exact ETSI Release 18.10 publication. The
   [SDK field comparison](../opc-n3iwf-fixtures/tests/ngap_messages.rs) verifies
   every decoded IE and raw-preserving output. The separate reference gate

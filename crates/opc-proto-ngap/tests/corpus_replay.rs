@@ -14,6 +14,9 @@ mod resource_release;
 #[path = "support/resource_setup.rs"]
 mod resource_setup;
 
+#[path = "support/ue_requests.rs"]
+mod ue_requests;
+
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
@@ -43,6 +46,14 @@ fn exercise(data: &[u8]) {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
+    ue_requests::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     resource_setup::exercise(
         data,
         ctx,

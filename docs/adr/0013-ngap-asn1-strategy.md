@@ -350,3 +350,21 @@ Response, with optional opaque NAS and N3IWF location. Ignore RAN Paging Priorit
 contents under TS 29.413 while retaining generic criticality/cardinality checks;
 fail on recognized applicable unsupported fields. These APIs validate a peer's
 request or report, and do not correlate transactions or perform resource cleanup.
+
+## UE request and Cause framing amendment (2026-09)
+
+Retain generated codecs for the context-release session list after 512
+independent constructor/typed-receive comparisons covering every root count.
+Preflight physical counts, unique IDs, flags and padding before allocation;
+use exact output sizing. Compose both UE request procedures from qualified
+AMF/RAN IDs, root Cause, opaque NAS and the optional session list. Independent
+Release 18 metadata supplies the new container registrations and IE policies;
+291 complete-message vectors qualify presence, policy and fragment behavior.
+
+The generated root Cause decoder ignores unused final bits. Preserve generated
+value decoding but require exact root length and zero final padding first.
+The regression fails before this check and after its removal; all 64 valid
+Causes and 297 individual padding mutations qualify the check. This tightens
+malformed input handling across existing procedures. No new handwritten ASN.1
+codec is justified. Context ownership, delivery state, procedure triggers and
+resource release remain caller-owned.

@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: canonical NAS Non-Delivery Indication and UE Context
+  Release Request with required root Cause and optional unique session IDs,
+  backed by 548 independent field/message cases. Root Cause now rejects
+  nonzero final padding across all admitted procedures. Adds public message
+  variants; downstream exhaustive matches need updating (Refs #787).
 - `opc-proto-ngap`: canonical PDU Session Resource Release Command/Response
   construction and admission, with unique session lists, per-session root
   Causes and bounded generated transfer codecs. Independent Release 18 evidence

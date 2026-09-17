@@ -230,6 +230,20 @@ pub(super) const PDU_SESSION_RESOURCE_RELEASE_COMMAND: IeProfile = IeProfile::ne
     IeRule::singleton(79, CRITICALITY_REJECT), // id-PDUSessionResourceToReleaseListRelCmd
 ]);
 
+// TS 38.413 V18.10.0 9.2.5.4 and 9.2.2.4; all entries are singleton.
+pub(super) const NAS_NON_DELIVERY_INDICATION: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT), // id-AMF-UE-NGAP-ID
+    IeRule::singleton(85, CRITICALITY_REJECT), // id-RAN-UE-NGAP-ID
+    IeRule::singleton(38, CRITICALITY_IGNORE), // id-NAS-PDU
+    IeRule::singleton(15, CRITICALITY_IGNORE), // id-Cause
+]);
+pub(super) const UE_CONTEXT_RELEASE_REQUEST: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT), // id-AMF-UE-NGAP-ID
+    IeRule::singleton(85, CRITICALITY_REJECT), // id-RAN-UE-NGAP-ID
+    IeRule::singleton(133, CRITICALITY_REJECT), // id-PDUSessionResourceListCxtRelReq
+    IeRule::singleton(15, CRITICALITY_IGNORE), // id-Cause
+]);
+
 pub(super) const PDU_SESSION_RESOURCE_RELEASE_RESPONSE: IeProfile = IeProfile::new(&[
     IeRule::singleton(10, CRITICALITY_IGNORE), // id-AMF-UE-NGAP-ID
     IeRule::singleton(85, CRITICALITY_IGNORE), // id-RAN-UE-NGAP-ID
@@ -544,6 +558,8 @@ mod tests {
             INITIAL_UE_MESSAGE,
             DOWNLINK_NAS_TRANSPORT,
             UPLINK_NAS_TRANSPORT,
+            NAS_NON_DELIVERY_INDICATION,
+            UE_CONTEXT_RELEASE_REQUEST,
             NG_SETUP_REQUEST,
             NG_SETUP_RESPONSE,
             NG_SETUP_FAILURE,
