@@ -3,6 +3,7 @@
 //! conditional presence and resource effects belong to the enclosing procedure.
 
 use super::release::Cause;
+use super::reset_fields::Sink;
 use super::resource_fields::{DownlinkTransport, NonGbrFlow, QosFlowId, UplinkTransport};
 use super::resource_results::{cause_width, read_cause, unique};
 use super::session_lists::encode_list;
@@ -362,7 +363,11 @@ fn scan_tunnels(
     reader.finish()?;
     Ok(count)
 }
-fn write_transport(writer: &mut Writer, address: IpAddr, teid: u32) -> Result<(), EncodeError> {
+pub(super) fn write_transport(
+    writer: &mut dyn Sink,
+    address: IpAddr,
+    teid: u32,
+) -> Result<(), EncodeError> {
     writer.bits(0, 4)?;
     writer.bits(if address.is_ipv4() { 31 } else { 127 }, 8)?;
     writer.align();
@@ -372,7 +377,7 @@ fn write_transport(writer: &mut Writer, address: IpAddr, teid: u32) -> Result<()
     }
     write_octets(writer, &teid.to_be_bytes())
 }
-fn read_transport(reader: &mut Reader<'_>) -> Result<(IpAddr, u32), DecodeError> {
+pub(super) fn read_transport(reader: &mut Reader<'_>) -> Result<(IpAddr, u32), DecodeError> {
     reader.flags(4)?;
     let bits = reader.bits(8)? + 1;
     if !matches!(bits, 32 | 128) {
@@ -386,7 +391,7 @@ fn read_transport(reader: &mut Reader<'_>) -> Result<(IpAddr, u32), DecodeError>
     };
     Ok((address, u32::from_be_bytes(read_octets(reader)?)))
 }
-fn write_octets(writer: &mut Writer, bytes: &[u8]) -> Result<(), EncodeError> {
+fn write_octets(writer: &mut dyn Sink, bytes: &[u8]) -> Result<(), EncodeError> {
     for byte in bytes {
         writer.bits(u16::from(*byte), 8)?;
     }

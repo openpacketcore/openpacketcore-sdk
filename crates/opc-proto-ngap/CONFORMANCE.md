@@ -862,8 +862,71 @@ This is a transfer boundary, not an additional admitted NGAP PDU. The caller
 checks session/bearer ownership and conditional presence, correlates requests,
 constructs the abnormal-condition response required by 8.2.3.4, forwards NAS
 only after qualifying success and performs resource effects. A decode error
-alone is not that response. Further Modify response/failure transfers, enclosing
-messages and other #787 applicability/receive/error rules remain pending.
+alone is not that response. Enclosing Modify messages and other #787
+applicability/receive/error rules remain pending. Response/failure roots follow.
+
+## PDU Session Resource Modify result transfers
+
+`n3iwf::modify_results` qualifies the roots of TS 38.413 V18.10.0 8.2.3,
+9.3.4.4 and 9.3.4.17. `ModifyResponseTransfer` has independently optional
+N3IWF downlink and core uplink endpoints, accepted QFIs and failed QFI/Cause
+reports. QFIs are unique and disjoint; present lists contain 1–64 entries.
+An empty or failed-flow-only root can accompany a successful AMBR, tunnel or
+release change. The codec therefore preserves these shapes without asserting
+request correspondence or that an operation succeeded. Additional per-tunnel
+lists, non-root address choices and extensions remain unsupported.
+
+`ModifyFailureTransfer` carries a mandatory root Cause and optional root
+Criticality Diagnostics. Absent and empty diagnostics remain distinct. Diagnostic
+lists contain 1–256 items and preserve repeated identifiers. TS 38.413 9.3.1.3
+makes procedure code and triggering outcome inapplicable in same-procedure
+responses, so construction and admission reject them. The qualified diagnostic
+item type excludes ignore criticality; reported procedure criticality may still
+be ignore. A failed session belongs in a Modify Response session list, not an
+unsuccessful procedure-26 PDU.
+
+| Transfer shape | Required depth | Count bound |
+| --- | --- | --- |
+| Empty response | 1 | No list |
+| Response with tunnels and/or accepted QFIs | 4 | Accepted list 1–64 |
+| Response with failed QFIs | 5 | Each list 1–64; combined count uses caller budget |
+| Failure Cause and optional diagnostics without items | 3 | No list |
+| Failure with diagnostic items | 5 | 1–256, repeats retained |
+
+Complete flags, counts, enums, unique QFIs, padding and exact framing preflight
+precedes vector allocation. Exact output sizing precedes generated materialization
+or bounded output allocation. Nested layouts retain their actual parent bit
+offsets. The combined accepted/failed QFI count uses `max_ies`; allocation-budget targets remain
+advisory. Public formatting is redacted. Internal transport, Cause and diagnostic
+helpers are reused without changing their public field contracts.
+
+The [independent oracle](tests/fixtures/n3iwf-modify-results.json) supplies 1,436
+complete transfers: 852 responses and 584 unsuccessful transfers, with 1,423
+admissions and 13 negative cases. Both unmodified reference encoders agree;
+structured decoding verifies explicit models and admission classifications.
+Coverage includes all 16 response presence combinations, directional IPv4/IPv6
+endpoint bounds, all QFI counts and disjoint splits, every root Cause at eight
+list offsets, all diagnostic counts, repeated identifiers, absence, empty roots,
+inapplicable diagnostics and unsupported extensions/additional tunnels.
+Regenerate with `scripts/generate-ngap-modify-result-fixtures.py --spec PATH
+--output PATH` in the pinned Release 18 reference environment.
+
+Generated probes cover 1,433 modeled root cases, excluding the three explicit
+unsupported extension/additional-tunnel examples. The empty response passes
+both directions. All 773 QFI-only response encodings pass while all their
+decodings fail. Tunnel responses encode 4/76 and decode 55/76 correctly.
+Cause-only unsuccessful transfers pass all 64 in both directions; diagnostics
+encode 149/519 and decode 284/519 correctly. Keep generated encoding for
+responses without tunnels, empty-response decoding, and Cause-only failure
+encoding/decoding. Explicit bounded layouts handle the failed shapes. Schema,
+runtime and reference packages are unchanged.
+
+Tests compare independent values and exact output, constructor negatives,
+exact/one-short byte/depth/count bounds, unsupported flags, parent-offset padding,
+all truncations and bounded mutations. All 1,436 complete vectors seed shared
+replay and fuzz assertions. Enclosing session lists/messages, request correlation,
+conditional NAS forwarding, response selection, rollback and resource effects
+remain separate; this adds no admitted PDU outcome and does not complete #787.
 
 ## Fixtures
 

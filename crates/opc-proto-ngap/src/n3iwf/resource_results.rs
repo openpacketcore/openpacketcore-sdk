@@ -244,7 +244,10 @@ pub(super) fn cause_width(class: CauseClass) -> usize {
         CauseClass::Protocol | CauseClass::Misc => 3,
     }
 }
-fn write_cause(writer: &mut Writer, cause: Cause) -> Result<(), EncodeError> {
+pub(super) fn write_cause(
+    writer: &mut dyn super::reset_fields::Sink,
+    cause: Cause,
+) -> Result<(), EncodeError> {
     let class = match cause.class() {
         CauseClass::RadioNetwork => 0,
         CauseClass::Transport => 1,
