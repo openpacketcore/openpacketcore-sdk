@@ -763,8 +763,9 @@ the broader procedure applicability/receive/error matrix and live interoperabili
 
 `n3iwf::modify_fields` adds four standalone root lists from TS 38.413 V18.10.0
 9.3.4.3–4, using the QFI, QoS and Cause definitions in 9.3.1.12–13 and 9.3.1.51.
-These are field codecs; complete Modify transfers/messages and cross-list or
-request/response conditions remain pending. No additional PDU outcome is admitted.
+These are field codecs; the request-transfer composition is qualified below.
+Complete Modify messages and request/response conditions remain pending.
+No additional PDU outcome is admitted.
 
 | Field | Qualified root | Required depth |
 | --- | --- | --- |
@@ -808,6 +809,61 @@ mutations. Shared fuzz/replay assertions include all 687 complete independent
 seeds. Complete Modify request/response support must also enforce TS 29.413's
 receiver-ignore rules and retain caller-owned request correlation, conditional
 NAS forwarding, abnormal-condition responses and resource effects (#787).
+
+## PDU Session Resource Modify Request Transfer
+
+`n3iwf::modify_request::ModifyRequestTransfer` admits the bounded root subset
+of TS 38.413 V18.10.0 8.2.3 / 9.3.4.3. Session AMBR (130), uplink tunnel
+modifications (140), flow additions/modifications (135) and flow releases (137)
+are independently optional and reject-criticality. An empty root is preserved.
+Unlike Setup's non-GBR admission, Modify does not require a new AMBR: an existing
+session can retain its prior limits. Absent QoS parameters remain absent.
+The type neither asserts an existing session nor applies previous values.
+
+| Present root field | Required depth | Nested count bound |
+| --- | --- | --- |
+| None | 4 | Zero IEs is valid |
+| Session AMBR | 6 | No list |
+| Identifier-only add/modify requests | 7 | 1–64 |
+| Release QFI/Cause pairs | 8 | 1–64 |
+| UL/DL tunnel modification pairs | 9 | 1–4 |
+| Add/modify requests with parameters | 10 | 1–64 |
+
+All QFIs are unique and disjoint across add/modify and release lists. The
+container and each nested list separately use `max_ies`; byte/depth limits
+are explicit SDK caller limits and `allocation_budget` stays advisory.
+Complete container framing, flags, minimal determinants and zero padding are
+checked before allocating entries. Entries borrow original IE frames; discarded
+or unknown values are not coalesced. Shared duplicate/unknown/validation policies
+select fields before semantic admission. Retained unknown reject IEs fail;
+ignore IEs produce only a count and notify IEs only identifiers. Known optional
+fields outside the subset are recognized and fail explicitly even under Drop.
+SecurityIndication is ignore-criticality here, unlike Setup. Formatting is redacted.
+
+The [independent oracle](tests/fixtures/n3iwf-modify-request.json) supplies 380
+complete transfers: 363 admitted and 17 negative. Both unmodified reference
+encoders agree, and structured decoding verifies the container, nested values
+and classification. It covers all 16 presence combinations, every flow count,
+63 disjoint QFI splits, AMBR bounds, tunnel forms, distinct duplicate values,
+known unsupported fields, unknown criticalities and 16K/64K fragmentation.
+Regenerate with `scripts/generate-ngap-modify-request-fixtures.py --spec PATH
+--output PATH`; the separately qualified field corpus is hash-recorded as input.
+
+Generated enclosing encoding matches only the empty transfer (1/380), while
+receiving fails the two fragmented cases (378/380 pass). Reuse qualified bounded
+container framing and nested field codecs, without changing the schema or
+runtime. Exact field and complete-container sizing precede output allocation.
+Tests compare independent field values and canonical bytes, first/last selection,
+metadata, empty/absent values, exact/one-short limits, overlap, malformed framing,
+all truncations and bounded mutations. All 380 full vectors seed shared replay
+and fuzz assertions.
+
+This is a transfer boundary, not an additional admitted NGAP PDU. The caller
+checks session/bearer ownership and conditional presence, correlates requests,
+constructs the abnormal-condition response required by 8.2.3.4, forwards NAS
+only after qualifying success and performs resource effects. A decode error
+alone is not that response. Further Modify response/failure transfers, enclosing
+messages and other #787 applicability/receive/error rules remain pending.
 
 ## Fixtures
 

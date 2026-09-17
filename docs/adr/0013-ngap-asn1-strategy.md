@@ -440,3 +440,24 @@ parameters. Preserve directional endpoint types and repeated tunnel pairs;
 do not infer session state, defaults, bearer ownership or request correlation.
 The new lists are standalone fields, not complete Modify transfer/procedure
 admission. Additional profiles and optional fields require further qualification.
+
+
+## Modify Request Transfer amendment (2026-09)
+
+Independent Release 18 probes find 379/380 generated enclosing encode failures;
+the empty root is the only match. Receiving matches 378/380 but fails both
+fragmented unknown-IE cases. Reuse qualified bounded root-container framing
+and the qualified Modify fields. A no-allocation scan validates every physical
+IE before the entry vector; selected entries borrow original IE frames, so
+unknown and discarded values need no fragment materialization. Minimal lengths,
+zero padding, exact consumption and shared metadata/policies remain enforced.
+
+The 380 independent cases include 363 admissions and 17 negatives. Both
+unmodified reference encoders agree, and structured decode checks classifications.
+Retain optional AMBR and empty roots: Modify may keep prior session limits,
+and absent flow parameters supply no defaults. Cross-list QFI overlap fails
+typed admission and construction; it does not itself send the abnormal-condition
+response. Session correlation, conditional presence, NAS forwarding and resource
+effects belong to the caller. No enclosing PDU outcome, schema or dependency
+changes are introduced. Response/failure transfers and procedure admission
+still need independent qualification.
