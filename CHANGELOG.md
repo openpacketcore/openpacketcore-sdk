@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: construct and admit bounded Initial UE and uplink/downlink
+  NAS messages, enforce every required field, validate N3IWF-applicable UE
+  AMBR, and report unknown-notify diagnostic IDs. Explicitly gate unsupported
+  known fields and retain generic decode selection/raw preservation. Compare
+  with 44 independent complete-message cases (Refs #787).
 - `opc-proto-ngap`: typed, redacted N3IWF UE IDs, opaque NAS, borrowed Security
   Key, TAI and IPv4/IPv6 location values with canonical field encoding and
   bounded decoding. Correct TAI receive and without-port CHOICE alignment

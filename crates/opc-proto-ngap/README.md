@@ -11,7 +11,7 @@ subset documented in [CONFORMANCE.md](CONFORMANCE.md).
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
 or gNB procedure state, or NAS message processing. Its optional `n3iwf`
-module validates the individual field subset below. The container boundary
+module validates the individual fields and three NAS message outcomes below. The container boundary
 validates top-level identifiers, criticality, cardinality, and configured
 decode policies.
 
@@ -108,16 +108,17 @@ pdu.encode(
 The crate is experimental and `publish = false`. The independent N3IWF corpus
 proves framing and each decoded IE's identifier, criticality and opaque bytes
 for 15 admitted message outcomes. Its reference gate validates nested ASN.1
-values and enumerated N3IWF conditions; the SDK does not yet perform those
-semantic checks. See the [evidence guide](../../docs/n3iwf-fixture-contracts.md).
+values and enumerated N3IWF conditions; SDK semantic admission covers only
+the explicitly documented field and NAS subset below. See the
+[evidence guide](../../docs/n3iwf-fixture-contracts.md).
 
 Canonical encoding uses explicit aligned-PER container framing instead of
 `rasn` 0.28's misaligned generated inner-container encoder. This includes
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
 Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
 boundary cases. The caller supplies already-encoded IE values; typed N3IWF
-resource transfers and mandatory/conditional presence remain pending under
-#787; the field codecs below cover IDs, NAS framing, keys and locations. No
+resource transfers and presence rules beyond the admitted NAS subset remain
+pending under #787; the field codecs cover IDs, NAS framing, keys and locations. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks
@@ -186,6 +187,21 @@ The allocation budget is advisory. Location supports only the N3IWF choices
 and known with-port TAI extension. Other nested extensions/choices return an
 explicit error under every context policy, without changing generic PDU
 preservation or duplicate selection. TAI extension additions are unsupported.
+
+## Initial UE and NAS transport
+
+`n3iwf::nas::NasMessage` constructs and validates the admitted Initial UE,
+Downlink NAS and Uplink NAS fields. Call `from_pdu` on a generic decoded PDU to
+check mandatory fields and get typed values, an ignored-IE count, and any
+unknown-notify diagnostic identifiers. `construct` writes those typed fields
+into a canonical PDU. Both directions validate the same bounded field subset.
+
+The [NAS conformance matrix](CONFORMANCE.md#n3iwf-nas-message-admission) names
+supported optional fields, receiver-ignored IEs and explicit unsupported gates.
+Downlink UE AMBR is applicable to N3IWF and is validated. Other recognized
+fields without a codec fail admission; they do not become a partial success.
+Caller-owned association, NAS security, access conditions, Error Indication
+and procedure side effects remain separate.
 
 ## License
 

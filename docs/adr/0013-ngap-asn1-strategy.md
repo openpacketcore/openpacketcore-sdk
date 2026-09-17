@@ -185,6 +185,22 @@ have explicit narrower extension admission and field-local limits. The field
 oracle, complete uplink-message comparison, mutation tests and fuzz target
 qualify this exception; broader procedure admission remains open under #787.
 
+## Optional NAS message admission amendment (2026-09)
+
+An opt-in typed boundary validates the filtered generic PDU for Initial UE,
+Downlink NAS and Uplink NAS. It enforces their mandatory fields, admits a
+documented optional subset, and applies TS 29.413 receiver-ignore rules.
+Other recognized fields fail explicitly until their applicable codecs exist.
+Unknown-notify identifiers become caller-owned diagnostics; the generic
+decoder's preservation, duplicate selection and raw image remain unchanged.
+
+Construction and receive use the same field admission. Generated codecs handle
+the bounded establishment cause, context-request and AMBR fields; no further
+manual ASN.1 exception is introduced. Complete independent Release 18 bytes,
+missing-field and policy cases, mutation detectors and fuzzing qualify this
+subset. The API does not authorize procedure triggers or perform association,
+identifier binding, NAS security/delivery or backend effects.
+
 ## Evidence
 
 - Gap register updated: `GAP-PROTO-003` now records the partially closed codec

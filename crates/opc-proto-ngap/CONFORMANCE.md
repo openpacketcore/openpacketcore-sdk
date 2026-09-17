@@ -131,6 +131,52 @@ message-level presence remain caller responsibilities. Nested extensions other
 than the enumerated TAI fail explicitly regardless of context policy; the
 existing outer decoder's unknown/duplicate behavior is unchanged.
 
+## N3IWF NAS message admission
+
+`n3iwf::nas::NasMessage` adds complete field construction and required-field
+admission for Initial UE Message, Downlink NAS Transport and Uplink NAS
+Transport. It consumes the generic decoder's policy-filtered view, revalidates
+mutable wrapper/IE metadata, and retains the original PDU unchanged. It has no
+AMF-selection, identifier-binding, NAS-delivery, key or backend effects.
+
+| Outcome | Required typed IEs | Optional typed IEs | N3IWF disposition |
+|---|---|---|---|
+| Initial UE (initiating 15) | RAN UE ID 85, NAS 38, ULI 121, establishment cause 90 | Selected PLMN 174; UE context request 112 | Ignore 201/224/225/227/259/333/402/427 as required by TS 29.413 5.2 |
+| Downlink NAS (initiating 4) | AMF UE ID 10, RAN UE ID 85, NAS 38 | UE aggregate bit rate 110 | Ignore 83/36/31/177/205/206/209/222/117/228/226/264/334/400; **110 is applicable** for N3IWF |
+| Uplink NAS (initiating 46) | AMF UE ID 10, RAN UE ID 85, NAS 38, ULI 121 | None in this admitted subset | W-AGF/TNGF/TWIF identity IEs 239/246/247 fail this N3IWF boundary |
+
+Every other recognized IE fails admission explicitly. This includes applicable
+fields still awaiting codecs (Old AMF, Allowed/Partially Allowed NSSAI,
+5G-S-TMSI, AMF set, reroute information, Selected NID) and fields belonging to
+other access profiles. Those fields are not relabeled as unknown procedures
+and cannot silently disappear into an admitted NAS message. SNPN selection
+and other access conditions outside this subset must be handled by the caller
+before constructing these messages. The codec does not authorize a local
+procedure trigger or make an association/application decision.
+
+Unknown reject-criticality IEs fail. Preserved unknown-ignore IEs contribute
+to an ignored count; preserved unknown-notify IEs return identifier-only
+criticality-diagnostics obligations. The caller owns Error Indication and
+procedure processing. Generic Drop/First/Last selection still affects only the
+typed view; the raw PDU retains discarded entries. Known receiver-ignored
+values are not decoded. Downlink AMBR is decoded, with separate UL/DL values
+in bits/s and the ASN.1 root maximum of 4,000,000,000,000. Extended bitrate
+ranges and nested AMBR extensions are outside the admitted subset.
+
+Field depth starts after the four enclosing layers: simple messages need
+five, AMBR six, and location eight. Message byte/count bounds are also checked.
+The allocation budget remains advisory. Debug and errors expose no NAS, peer
+or identifier values. Application/subscriber authorization is separate.
+
+The [NAS oracle](tests/fixtures/n3iwf-nas.json) supplies 44 independently
+encoded complete messages and independent mandatory/duplicate validation.
+It includes 21 positive constructor cases, all 11 missing-mandatory cases,
+three duplicate cases and nine unknown-criticality cases. Tests verify the
+received typed values, constructor bytes, generic duplicate/unknown policies,
+receiver-ignored malformed fields, unsupported known fields and mutable
+wrapper rejection. Reproduce using `scripts/generate-ngap-nas-fixtures.py`
+with the pinned reference tools and PDF.
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):

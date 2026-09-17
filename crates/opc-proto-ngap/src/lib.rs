@@ -10,8 +10,8 @@
 //! encoding writes the typed root PDU and IE containers with explicit APER
 //! alignment and length fragmentation. [`Pdu::from_protocol_ies`] constructs
 //! those containers from pre-encoded, opaque IE values. Nested semantic
-//! validation beyond the opt-in [`n3iwf`] field subset and message-level
-//! mandatory/conditional IE presence remain caller obligations.
+//! validation beyond the opt-in [`n3iwf`] field and NAS message subset remains
+//! a caller obligation, including other mandatory/conditional IE presence.
 //! Raw-preserving encoding separately re-emits saved receive bytes exactly.
 //!
 //! For every typed procedure/outcome, decoding applies the caller's

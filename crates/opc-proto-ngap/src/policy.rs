@@ -31,6 +31,10 @@ pub(super) struct IeProfile {
 }
 
 impl IeProfile {
+    pub(super) fn recognizes(self, id: u16) -> bool {
+        self.rule(id).is_some()
+    }
+
     const fn new(rules: &'static [IeRule]) -> Self {
         Self { rules }
     }
