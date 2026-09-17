@@ -103,6 +103,16 @@ fn published_notify_vectors_and_receiver_protocol_id_rules() {
     wrong[0] = 0;
     assert_eq!(Notify::decode_body(&wrong), Err(Error::SpiShape));
     assert_eq!(EspSpi::new([0; 4]), Err(Error::InvalidValue));
+    // RFC 4555 section 4.2.1: receiver-ignored capability extension bytes.
+    let extended_capability = [0xff, 0, 0x40, 0x0c, 0xa5, 0x5a];
+    assert_eq!(
+        must(Notify::decode_body(&extended_capability)),
+        Some(Notify::MobikeSupported)
+    );
+    assert_eq!(
+        must(Notify::MobikeSupported.encode_body()),
+        [0, 0, 0x40, 0x0c]
+    );
 }
 
 #[test]

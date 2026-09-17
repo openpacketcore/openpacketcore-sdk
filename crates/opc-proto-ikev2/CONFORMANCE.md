@@ -235,8 +235,6 @@ exchange, correlates both protocol responses, commits the GTP response for
 exact replay, and then performs the corresponding Delete Bearer and IKEv2
 Child-SA deletion flow. Admission, identifier allocation, key installation,
 and dataplane programming remain explicit application responsibilities.
-
-
 ## NWu payload profile
 
 The `nwu` module implements opened payload boundaries from
@@ -287,7 +285,8 @@ authentication, key custody or XFRM installation is claimed.
   NWu Child Delete reports whole-IKE/all-children discard intent, not just the
   original SPI subset. IKE Delete is Protocol ID 1 without SPIs and uses an
   empty acknowledgement; its timeout has the same whole-IKE scope.
-- Conditional MOBIKE_SUPPORTED advertisement is covered. Authenticated
+- Conditional MOBIKE_SUPPORTED advertisement and receiver-ignored capability
+  extension data are covered. Authenticated
   UPDATE_SA_ADDRESSES, address advertisement processing, return-routability,
   replay/source rejection, and NAT-T migration are **not implemented by this
   change** and keep #786 open. The published additional-address vector is

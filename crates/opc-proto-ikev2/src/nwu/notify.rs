@@ -86,7 +86,7 @@ pub enum Notify<'a> {
     NasTcpPort(u16),
     /// Sender-owned inbound ESP SPI (55508). Future extension data is ignored on receive.
     UpSaInfo(EspSpi),
-    /// Empty MOBIKE_SUPPORTED status (16396).
+    /// MOBIKE_SUPPORTED status (16396); receive extension data is ignored.
     MobikeSupported,
 }
 impl fmt::Debug for Notify<'_> {
@@ -147,7 +147,9 @@ impl<'a> Notify<'a> {
                 data.try_into().map_err(|_| Error::InvalidValue)?,
             )),
             55_507 => return Err(Error::Unsupported),
-            16_396 if data.is_empty() => Self::MobikeSupported,
+            // RFC 4555 section 4.2.1 reserves extension data for future use;
+            // a receiver MUST ignore it while senders emit an empty field.
+            16_396 => Self::MobikeSupported,
             _ => return Err(Error::InvalidValue),
         }))
     }
