@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Temporary same-host #856 comparison; not a merge candidate or fix."""
+"""Temporary same-host #856 runtime comparison; not a merge candidate or fix."""
 
 import argparse
 import hashlib
@@ -17,12 +17,11 @@ spec = importlib.util.spec_from_file_location("external856", ROOT / "diagnose-85
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
 EXPECTED = {
-    "original": ("be7b580986b7efaf87b7aa79b13f55d5d32956c1", "f277ef078e5b44a5d57624b20d82366a44436f03"),
+    "runtime-1": ("64c2ccda4ee5714025f25a458019272349d5e3d1", "6fdb93bc1437986bda023d5aa97457d14749acca"),
     "current-main": ("75044f43852cd816d9734d03914515395bf20c69", "f7f9c93c476e18d69093f8fa49b0865f4932dde5"),
 }
 # Equal sample counts with both orders represented, specified before any result.
-PLAN = ["original", "current-main", "current-main", "original",
-        "current-main", "original", "original", "current-main"]
+PLAN = ["current-main", "runtime-1", "runtime-1", "current-main"]
 PASS = r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; 602 filtered out; finished in ([0-9.]+)s"
 
 
@@ -52,7 +51,8 @@ def run_plan(sources, output):
         "same_storage_setup": True,
         "separate_build_directories": True,
         "build_both_before_sampling": True,
-        "rust_source_modified": False,
+        "runtime_attribute_only_variant": True,
+        "all_other_source_bytes_identical": True,
         "observer": "external_proc_counters_and_outlier_only_stack",
         "outlier_probe_after_target_seen_seconds": 240,
         "harness_head": harness.git(ROOT.parent, "rev-parse", "HEAD"),
@@ -106,14 +106,24 @@ def run_plan(sources, output):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--original", type=Path, required=True)
+    parser.add_argument("--variant", type=Path, required=True)
     parser.add_argument("--current", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    sources = {"original": args.original.resolve(strict=True),
-               "current-main": args.current.resolve(strict=True)}
-    if sources["original"] == sources["current-main"]:
+    sources = {"current-main": args.current.resolve(strict=True),
+               "runtime-1": args.variant.resolve(strict=True)}
+    if sources["runtime-1"] == sources["current-main"]:
         parser.error("two distinct source checkouts are required")
+    changed = harness.git(sources["current-main"], "diff", "--name-only",
+                          EXPECTED["current-main"][0], EXPECTED["runtime-1"][0]).splitlines()
+    target_file = "crates/opc-session-net/tests/stateless_quorum_consumer.rs"
+    if changed != [target_file]:
+        parser.error("runtime variant changes additional source files")
+    baseline = (sources["current-main"] / target_file).read_bytes()
+    before = b'#[tokio::test]\nasync fn persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction()'
+    after = b'#[tokio::test(flavor = "multi_thread", worker_threads = 1)]\nasync fn persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction()'
+    if baseline.count(before) != 1 or baseline.replace(before, after) != (sources["runtime-1"] / target_file).read_bytes():
+        parser.error("runtime variant is not the exact expected attribute-only change")
     run_plan(sources, args.output.resolve())
 
 

@@ -7,14 +7,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: diagnostic-856-paired-${{ github.ref }}
+  group: diagnostic-856-runtime-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   diagnostic-856:
-    name: Paired 856 source comparison on one standard runner
+    name: Runtime comparison (${{ matrix.profile }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [paired-1, paired-2]
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
@@ -27,22 +31,22 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Prepare both fixed unmodified source trees
+      - name: Prepare fixed baseline and attribute-only runtime variant
         run: |
-          git worktree add --detach source-original be7b580986b7efaf87b7aa79b13f55d5d32956c1
           git worktree add --detach source-current-main 75044f43852cd816d9734d03914515395bf20c69
+          git worktree add --detach source-runtime-1 64c2ccda4ee5714025f25a458019272349d5e3d1
       - name: Install original qualified Rust version
         uses: dtolnay/rust-toolchain@1.98.1
       - name: Prepare shared standard snapshot storage
         run: |
-          cmp source-original/ci/setup-fsverity-tmp.sh source-current-main/ci/setup-fsverity-tmp.sh
+          cmp source-current-main/ci/setup-fsverity-tmp.sh source-runtime-1/ci/setup-fsverity-tmp.sh
           source-current-main/ci/setup-fsverity-tmp.sh
-      - name: Compile both sources then run the fixed alternating plan
-        run: python3 ci/diagnose-856-paired.py --original source-original --current source-current-main --output diagnostic-856-paired
-      - name: Preserve the paired results and first failure
+      - name: Compile both sources then run the fixed ABBA comparison
+        run: python3 ci/diagnose-856-paired.py --current source-current-main --variant source-runtime-1 --output diagnostic-856-runtime
+      - name: Preserve paired results and first failure
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: diagnostic-856-paired
-          path: diagnostic-856-paired/
+          name: diagnostic-856-runtime-${{ matrix.profile }}
+          path: diagnostic-856-runtime/
           if-no-files-found: error
