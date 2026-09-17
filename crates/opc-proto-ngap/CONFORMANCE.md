@@ -359,9 +359,51 @@ root reader/writer covers only the qualified 5QI 9 shape. The transfer reuses
 the existing canonical container framing. All 274 vectors seed fuzz/replay;
 ordinary tests exercise every truncation and bounded byte mutations.
 
-Remaining work includes outer session lists, partial success/failure results,
-response/unsuccessful transfers, additional applicable fields/QoS profiles and
-whole-message presence rules. No local procedure trigger is enabled here.
+Remaining work includes outer session lists, additional applicable fields/QoS
+profiles and whole-message presence rules. The qualified resource-result
+transfer subset is described below. No local procedure trigger is enabled here.
+
+## N3IWF resource setup-result transfers
+
+`n3iwf::resource_results` admits and constructs the following Release 18 roots
+(TS 38.413 9.3.4.2 and 9.3.4.16):
+
+| Transfer | Admitted contents | Explicitly unsupported |
+| --- | --- | --- |
+| Setup response | One downlink IPv4/IPv6 GTP tunnel; 1–64 accepted QFIs; optional failed QFIs with root Cause | Additional tunnels, security result, per-flow mapping indications, all extensions |
+| Setup unsuccessful | Root Cause in any of the five classes | Criticality diagnostics and extensions |
+
+Accepted/failed QFIs must be unique across both lists. The entirely failed case
+uses the unsuccessful transfer; the response always has at least one accepted
+flow. These are reports only. Request correlation, cause selection, supported
+security policy, endpoint ownership and resource changes remain caller-owned.
+An absent result/security field does not establish a successful security or
+QoS operation. No enclosing context/session procedure is admitted here.
+
+Response receive requires depth six. `max_ies` limits the combined result count;
+physical count feasibility is checked before each vector allocation. Fixed
+IPv4/IPv6 buffers avoid address allocation. Known optional/extension flags,
+nonzero padding and trailing bytes fail explicitly. Response construction
+checks its exact bounded length before allocating; the unsuccessful root is
+at most two bytes and has a capacity/framing check around generated encoding
+and decoding. Errors and Debug redact values; encoded buffers clear on drop.
+
+The [result oracle](tests/fixtures/n3iwf-resource-results.json) contains 547
+independent vectors: 539 admitted and eight negative/unsupported cases. It
+covers all 64 root Causes, all QFIs and accepted-list sizes, each partial-result
+split, Cause fields at every offset produced by the accepted list, IP/TEID
+boundaries, duplicate/conflicting results and recognized unsupported fields.
+Regenerate using `scripts/generate-ngap-resource-result-fixtures.py` with the
+same `--spec`/`--output` arguments and pinned Release 18 environment.
+
+Generated failure-transfer encode/decode matches all 128 positive probes;
+explicit final-padding validation closes its permissive padding behavior.
+Generated response transfer construction/receive fails 196 of 198 independent
+probes. The bounded qualified root writer/reader covers that response layout,
+including unaligned root Cause fields. All vectors seed fuzz/replay; ordinary
+tests exercise every truncation and three mutations of every reference byte,
+plus size/count/depth, extension, padding and redaction checks. This establishes
+neither additional profile coverage nor live peer interoperability.
 
 ## Fixtures
 

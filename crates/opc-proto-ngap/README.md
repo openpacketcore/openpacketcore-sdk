@@ -110,16 +110,17 @@ pdu.encode(
 nested request transfer for a bounded non-GBR 5QI 9 subset. It requires an UL
 tunnel, session AMBR, session type and unique QoS flows. `resource_fields`
 keeps uplink and downlink endpoint types separate. Other QoS profiles and
-recognized optional transfer fields fail explicitly. Outer resource lists,
-response/failure transfers and enclosing context/resource messages remain
-pending; the codec does not create a session or configure a tunnel.
+recognized optional transfer fields fail explicitly. `resource_results` adds
+a single-downlink setup response with unique accepted/failed QFI results and
+a root-Cause unsuccessful transfer. Outer resource lists and enclosing
+context/resource messages remain pending; no session or tunnel is configured.
 
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413
 requires N3IWF receivers to ignore UE Security Capabilities contents, so the
 mask helper adds no receive decoder. Initial Context Setup message admission
-and nested resource transfers remain pending. See the context-field boundary
+and outer resource-list admission remain pending. See the context-field boundary
 in [CONFORMANCE.md](CONFORMANCE.md).
 
 The crate is experimental and `publish = false`. The independent N3IWF corpus

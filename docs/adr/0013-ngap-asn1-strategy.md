@@ -270,3 +270,21 @@ unknown-notify diagnostics. Uplink and downlink transport have separate public
 types; session AMBR remains distinct from UE AMBR while reusing the qualified
 identical wire layout. This adds no session/tunnel effect or enclosing-message
 admission, and does not authorize a general handwritten ASN.1 codec.
+
+## Setup-result transfer amendment (2026-09)
+
+Independent Release 18 probes qualify generated unsuccessful-transfer
+construction and typed receive for every root Cause (128 comparisons). Keep
+that generated codec, with explicit fixed-shape preflight because generated
+receive does not reject final nonzero padding.
+
+The generated response-transfer codec fails 196 of 198 independent constructor
+and typed-value probes, including its nested transport/list layout. Extend the
+bounded root helper exception only to one IPv4/IPv6 downlink transport with
+1–64 accepted QFIs and optional failed QFIs/root Causes. Preflight exact output
+size, cumulative input counts and physical input; reject duplicates, overlap,
+unsupported optionals, extensions, padding and trailing bytes. The independent
+547-case oracle covers all root Causes at all four first-failure offsets, every
+accepted-list size and partial-result split. Reuse shared Cause values and
+distinct downlink transport, without adding general ASN.1 behavior or any
+resource/procedure side effect. Outer session-list admission remains pending.
