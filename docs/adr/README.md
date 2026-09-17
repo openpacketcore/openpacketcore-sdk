@@ -36,3 +36,4 @@ accepted.
 | [0021](0021-sequential-session-raft-wal.md) | Historical private segmented WAL and SQLite-projection design; its ordered durable implementation is preserved, while ADR 0022 supersedes application composition and public activation. |
 | [0022](0022-native-session-persistence-modes.md) | Native session storage supports explicit Durable and Async acknowledgement modes; Async restart requires a fresh live-quorum cut and fenced local catch-up before participation. |
 | [0023](0023-bounded-configuration-history.md) | Configuration history is pruned only by an acknowledged, exact-head consensus decision with authenticated boundaries, protected references, and atomic capacity rejection. |
+| [0024](0024-route-operation-conflict-exclusion.md) | Route operations exclude intersecting kernel keys while independent operations use bounded concurrent workers; dispatched inverses retain exclusion after cancellation. |

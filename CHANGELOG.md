@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- `opc-route-steering`: schedule independent exact route/rule operations and
+  non-overlapping owned collections concurrently with bounded workers. Retain
+  conflicting-key exclusion through dispatched verification and rollback after
+  cancellation, and align mock exact source-sibling readback with Linux (#894).
 - Make the persistent-file identity qualification recognize actual reuse of
   any inode it previously deleted, retaining the 4,096-attempt bound and the
   generation-change assertion when another filesystem user takes the first inode.
