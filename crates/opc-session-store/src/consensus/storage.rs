@@ -2856,7 +2856,15 @@ impl LiveTerminalRecoveryHandoffConsumer {
         let core = self.core.clone();
         let namespace = Arc::clone(&self.snapshot_directory_lease.namespace);
         let conn = Arc::clone(&core.conn).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "test-control")]
+        core.snapshot_observation
+            .record_phase_for_test("publication_connection_acquired");
+        #[cfg(feature = "test-control")]
+        let publication_observation = Arc::clone(&core.snapshot_observation);
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "test-control")]
+            core.snapshot_observation
+                .record_phase_for_test("publication_worker_entered");
             if core.terminal_recovery_handoff_pending()? {
                 return Err(SessionConsensusStorageError::BackendUnavailable);
             }
@@ -2879,7 +2887,12 @@ impl LiveTerminalRecoveryHandoffConsumer {
                     admitted_snapshot_file.as_ref(),
                 )? {
                 consensus::LiveTerminalRecoveryHandoffInstallOutcome::Clear
-                | consensus::LiveTerminalRecoveryHandoffInstallOutcome::AlreadyConsumed => Ok(conn),
+                | consensus::LiveTerminalRecoveryHandoffInstallOutcome::AlreadyConsumed => {
+                    #[cfg(feature = "test-control")]
+                    core.snapshot_observation
+                        .record_phase_for_test("publication_worker_completed");
+                    Ok(conn)
+                }
                 consensus::LiveTerminalRecoveryHandoffInstallOutcome::Active
                 | consensus::LiveTerminalRecoveryHandoffInstallOutcome::Installed => {
                     Err(SessionConsensusStorageError::BackendUnavailable)
@@ -2887,7 +2900,10 @@ impl LiveTerminalRecoveryHandoffConsumer {
             }
         })
         .await
-        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        #[cfg(feature = "test-control")]
+        publication_observation.record_phase_for_test("publication_join_consumed");
+        result
     }
 
     /// Strict recovery-manager entry point.  A manager invokes this only
@@ -6417,6 +6433,9 @@ async fn build_file_backed_snapshot_database(
         _snapshot_directory_lease: snapshot_directory_lease,
         _shutdown_guard: worker_shutdown_guard,
     };
+    #[cfg(feature = "test-control")]
+    core.snapshot_observation
+        .record_phase_for_test("waiting_source_cut");
     let source_cut = {
         let conn = core.conn.lock().await;
         core.with_application_cache_read(&conn, || {
@@ -6486,6 +6505,9 @@ async fn build_file_backed_snapshot_database(
         }
     };
 
+    #[cfg(feature = "test-control")]
+    core.snapshot_observation
+        .record_phase_for_test("source_pinned");
     let storage_identity = core.storage_identity;
     let authority_profile = core.authority_profile;
     let expected_members = core.expected_members.clone();
@@ -6497,7 +6519,11 @@ async fn build_file_backed_snapshot_database(
     // The owned gate guard moves into the worker and comes back with its
     // result. Cancellation of the async caller therefore cannot detach a
     // second snapshot worker or a second WAL-pinning reader for this core.
+    #[cfg(feature = "test-control")]
+    let capture_observation = Arc::clone(&core.snapshot_observation);
     let (captured, snapshot_guard) = tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "test-control")]
+        capture_observation.record_phase_for_test("worker_capturing");
         #[cfg(test)]
         snapshot_capture_gate.block_after_capture();
         let captured = consensus::capture_snapshot_database_from_reader_into_sync(
@@ -6516,6 +6542,8 @@ async fn build_file_backed_snapshot_database(
         let released = consensus::release_snapshot_read_sync(&worker.reader);
         let captured = match (captured, released) {
             (Ok(captured), Ok(())) => (|| {
+                #[cfg(feature = "test-control")]
+                capture_observation.record_phase_for_test("worker_finalizing");
                 let (captured_cut, raw_snapshot, wal_bytes) = captured;
                 let raw_snapshot = consensus::finalize_captured_snapshot_database_into_sync(
                     storage_identity,
@@ -6544,6 +6572,8 @@ async fn build_file_backed_snapshot_database(
         // closure capture must not detach its reader from the shutdown guard
         // that bounds the WAL-pinning SQLite owner's lifetime.
         drop(worker);
+        #[cfg(feature = "test-control")]
+        capture_observation.record_phase_for_test("worker_finished");
         (captured, snapshot_guard)
     })
     .await
@@ -6566,6 +6596,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
     async fn build_snapshot(
         &mut self,
     ) -> Result<Snapshot<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("waiting_gate");
         let live_terminal_consumer = LiveTerminalRecoveryHandoffConsumer::from_live_snapshot_owner(
             &self.core,
             &self._snapshot_directory_lease,
@@ -6580,6 +6614,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     io::Error::other(error),
                 )
             })?;
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("validating_directory");
         let integrity_work = SnapshotIntegrityWork {
             _gate: snapshot_guard.clone(),
             _lease: Arc::clone(&self._snapshot_directory_lease),
@@ -6606,6 +6644,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 io::Error::other("session consensus snapshot staging cleanup failed"),
             )
         })?;
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("directory_validated");
         reserve_snapshot_directory_entries(durable_survivors, SNAPSHOT_BUILD_RESERVATION_ENTRIES)
             .map_err(|_| {
             storage_error(
@@ -6704,6 +6746,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             // compacted inode. Seal that exact inode in place: copying it
             // into a third full-payload artifact would multiply peak snapshot
             // storage and leave a second publication boundary to defend.
+            #[cfg(feature = "test-control")]
+            self.core
+                .snapshot_observation
+                .record_phase_for_test("sealing");
             let sealed = seal_snapshot_database_in_place_in_namespace(
                 raw_snapshot,
                 Arc::clone(&self._snapshot_directory_lease.namespace),
@@ -6755,6 +6801,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .map_err(|error| {
                 storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
             })?;
+            #[cfg(feature = "test-control")]
+            self.core
+                .snapshot_observation
+                .record_phase_for_test("sealing");
             let sealed = seal_snapshot_database_in_place_in_namespace(
                 raw_snapshot,
                 Arc::clone(&self._snapshot_directory_lease.namespace),
@@ -6841,6 +6891,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // Fixed authority closes the final writable handle, seals an
         // O_RDONLY|O_NOFOLLOW descriptor, and performs its one full scan in a
         // blocking worker before the metadata mutex is acquired.
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("verifying_envelope");
         let (published_pin, snapshot_guard) = if self.core.authority_profile
             == ConsensusAuthorityProfile::FixedImmutable
         {
@@ -6935,6 +6989,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // serializes every publisher, but before taking either primary SQLite
         // writer guard. Fixed-profile authentication performs a bounded full
         // envelope scan and must not stall unrelated Raft work.
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("selecting_predecessor");
         let (previous, legacy_reseed_predecessor) = {
             let conn = self.core.conn.lock().await;
             let previous = self.core.read_selected_snapshot(&conn).map_err(|error| {
@@ -7006,6 +7064,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         };
         #[cfg(test)]
         wait_before_recovery_publication_fence(self.core.snapshot_dir.as_ref()).await;
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("waiting_publication_connection");
         let prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let conn = live_terminal_consumer
             .acquire_publication_connection(&snapshot_guard)
@@ -7044,6 +7106,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     )
                 })?;
         }
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("publishing_metadata");
         let publication = {
             let publish_legacy = |cleanup: &mut UnpublishedSnapshotArtifact| {
                 publish_snapshot_metadata_with_readback(
@@ -7107,6 +7173,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // publication boundary. Predecessor cleanup and descriptor return are
         // already serialized by `snapshot_guard`; retaining either primary
         // writer guard across their asynchronous work would stall Raft.
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("metadata_committed");
         drop(conn);
         drop(prune_preemption);
         #[cfg(test)]
@@ -7125,6 +7195,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     )
                 })?;
         }
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("preparing_return");
         let snapshot = if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
             // The descriptor was sealed, measured, scanned, and bound before
             // metadata publication. Return that exact descriptor: reopening
@@ -7208,6 +7282,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             })?;
             snapshot
         };
+        #[cfg(feature = "test-control")]
+        self.core
+            .snapshot_observation
+            .record_phase_for_test("completed");
         self.core
             .snapshot_observation
             .record_published(captured_wal_bytes.unwrap_or(0), snapshot_started.elapsed());

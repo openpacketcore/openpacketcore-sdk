@@ -7143,6 +7143,52 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     let target_log_index = transition_log_index + SNAPSHOT_COMMANDS as u64;
     let mut workload_leader = new_leader;
     let mut workload_term = fleet.stores[workload_leader].status().term;
+    let workload_started = tokio::time::Instant::now();
+    let diagnostic_stores = fleet.stores.clone();
+    let diagnostic_read_barriers = Arc::clone(&fleet.read_barrier_calls);
+    let diagnostic_append_decoded = Arc::clone(&fleet.append_entries_decoded);
+    let diagnostic_decode_failures = Arc::clone(&fleet.append_entries_decode_failures);
+    let diagnostic_paths = fleet.path_enabled.clone();
+    let workload_diagnostic = Arc::new(move || {
+        let observation = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+            let status = diagnostic_stores[index].status();
+            (
+                status.term,
+                status.leader_id == Some(status.node_id),
+                status.admitted,
+                consensus_local_durable_progress_for_test(&diagnostic_stores[index]),
+                opc_session_store::test_support::consensus_snapshot_build_phase_for_test(
+                    &diagnostic_stores[index],
+                ),
+                diagnostic_stores[index].diagnostic_snapshot(),
+            )
+        });
+        eprintln!(
+            "status_compaction_probe elapsed_ms={} read_barrier_attempts={} append_attempts_decoded={} append_decode_failures={} configured_enabled_paths={} progress={observation:?}",
+            workload_started.elapsed().as_millis(),
+            diagnostic_read_barriers.load(Ordering::Relaxed),
+            diagnostic_append_decoded.load(Ordering::Relaxed),
+            diagnostic_decode_failures.load(Ordering::Relaxed),
+            diagnostic_paths
+                .values()
+                .filter(|enabled| enabled.load(Ordering::Relaxed))
+                .count(),
+        );
+    });
+    let periodic_observer = tokio::spawn({
+        let diagnostic = Arc::clone(&workload_diagnostic);
+        async move {
+            let mut probes = tokio::time::interval(Duration::from_secs(10));
+            probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            probes.tick().await;
+            loop {
+                probes.tick().await;
+                diagnostic();
+            }
+        }
+    });
+    let mut completed_for_diagnostic = 0_u64;
+    let mut failures_for_diagnostic = 0_u64;
     let workload_result = tokio::time::timeout(Duration::from_secs(5 * 60), async {
         // Each command must finish before the next begins. Concurrent
         // logical-time reads intentionally share one bounded consensus
@@ -7157,8 +7203,19 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
                 .max_replication_sequence()
                 .await
             {
-                Ok(_) => {}
+                Ok(_) => {
+                    completed_for_diagnostic += 1;
+                    if completed_for_diagnostic <= 4096
+                        && completed_for_diagnostic.is_multiple_of(512)
+                    {
+                        workload_diagnostic();
+                    }
+                }
                 Err(StoreError::BackendUnavailable(_)) => {
+                    failures_for_diagnostic = failures_for_diagnostic.saturating_add(1);
+                    if failures_for_diagnostic <= 8 {
+                        workload_diagnostic();
+                    }
                     let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
                         consensus_local_durable_progress_for_test(&fleet.stores[index])
                     });
@@ -7178,7 +7235,10 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         }
     })
     .await;
+    periodic_observer.abort();
+    let _ = periodic_observer.await;
     if workload_result.is_err() {
+        workload_diagnostic();
         let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
             consensus_local_durable_progress_for_test(&fleet.stores[index])
         });

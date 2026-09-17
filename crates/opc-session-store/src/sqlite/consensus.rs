@@ -2811,9 +2811,27 @@ struct SnapshotBuildStatus {
 #[derive(Default)]
 pub(crate) struct SnapshotBuildObservation {
     status: Mutex<SnapshotBuildStatus>,
+    #[cfg(feature = "test-control")]
+    phase_for_test: Mutex<&'static str>,
 }
 
 impl SnapshotBuildObservation {
+    #[cfg(feature = "test-control")]
+    pub(crate) fn record_phase_for_test(&self, phase: &'static str) {
+        *self
+            .phase_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = phase;
+    }
+
+    #[cfg(feature = "test-control")]
+    pub(crate) fn phase_for_test(&self) -> &'static str {
+        *self
+            .phase_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Publish the complete successful-capture generation.
     pub(crate) fn record_published(&self, captured_wal_peak: u64, duration: std::time::Duration) {
         let mut status = match self.status.lock() {
