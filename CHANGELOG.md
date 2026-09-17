@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- `opc-n3iwf-fixtures`: correct N2 metadata port octets from `96 1c` (38428)
+  to the declared IANA NGAP service port `96 0c` (38412), refreshing four wire
+  digests. Independently verify numeric PPID/port claims in both metadata
+  orders and repeated tuples, plus DATA user length, so valid framing and
+  a refreshed digest cannot conceal a contradictory claim. Clarify the DATA
+  and caller-port-bound provenance without changing runtime scope (Refs #784, #788).
 - Make the persistent-file identity qualification recognize actual reuse of
   any inode it previously deleted, retaining the 4,096-attempt bound and the
   generation-change assertion when another filesystem user takes the first inode.

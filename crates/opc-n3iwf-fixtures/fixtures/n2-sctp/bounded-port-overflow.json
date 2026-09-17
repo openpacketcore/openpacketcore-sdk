@@ -24,7 +24,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Port field encoded as 0xffff after PPID; still a 16-bit value, used as overflow sentinel for a 15-bit caller bound"
+    "notes": "Port 65535 is a valid dynamic port but exceeds this fixture caller maximum of 65534"
   },
   "sanitized_fields": [
     {
