@@ -106,6 +106,14 @@ pdu.encode(
 
 ## Status And Limits
 
+`n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
+and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
+the codec validates their wire shape without authorizing any slice. TS 29.413
+requires N3IWF receivers to ignore UE Security Capabilities contents, so the
+mask helper adds no receive decoder. Initial Context Setup message admission
+and nested resource transfers remain pending. See the context-field boundary
+in [CONFORMANCE.md](CONFORMANCE.md).
+
 The crate is experimental and `publish = false`. The independent N3IWF corpus
 proves framing and each decoded IE's identifier, criticality and opaque bytes
 for 15 admitted message outcomes. Its reference gate validates nested ASN.1

@@ -235,3 +235,19 @@ presence and ignores its payload as TS 29.413 requires. Independent field and
 complete-message bytes, mutation detectors, maximum-count tests and fuzzing
 qualify the exception. Association state, selection and configuration effects
 remain caller-owned, and #787 remains incomplete beyond the admitted subset.
+
+## Initial-context individual-field amendment (2026-09)
+
+Standalone GUAMI reuses the qualified generated encoder and bounded PLMN
+reader. Independently compiled Allowed NSSAI bytes demonstrate the same
+generated nested-list defect: one slice with SD 010203 must encode as
+`02 01 01 02 03`, which the generated encoder does not produce. The bounded
+root list reader/writer may cover Allowed NSSAI with shared S-NSSAI values,
+1–8 elements, exact sizing, extension rejection and allocation preflight.
+The existing NG Setup list codecs share only their qualified internal root
+helpers; their independent vectors continue to apply.
+
+Generated UE Security Capabilities construction is qualified against every
+mask bit. TS 29.413 specifies receiver-ignore semantics for its contents;
+no receive codec or algorithm selection is added. The 98 independent fields
+do not establish Initial Context Setup or resource-transfer admission.

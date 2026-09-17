@@ -272,6 +272,35 @@ ordinary tests exercise every truncation and sampled byte mutations across
 large list vectors. No AMF selection, slice authorization, timer/retry,
 configuration application or live peer interoperability is established.
 
+## Initial context individual fields
+
+`n3iwf::context_fields` adds three individual fields needed by Initial Context
+Setup. This is not whole-message admission; the required-field, conditional
+AMBR, key custody and nested resource rules remain separate pending work.
+
+| Field | Construction | Receive | Bounds |
+| --- | --- | --- | --- |
+| GUAMI | Qualified generated encoder | Bounded root reader | PLMN, 8-bit region, 10-bit set, 6-bit pointer; depth 2 |
+| Allowed NSSAI | Bounded root writer | Bounded root reader | 1–8 shared S-NSSAI values; depth 4; count charged to `max_ies` before allocation |
+| UE Security Capabilities | Qualified generated encoder | Contents receiver-ignored under TS 29.413 5.3 | Four explicit 16-bit masks; no algorithm selection |
+
+All field encoders preflight the exact size against `max_message_len` before
+allocating encoded buffers. Receivers bound bytes/depth, require zero padding
+and reject SEQUENCE and IE extensions. Debug is redacted; value getters are
+explicit. Slice authorization and cryptographic policy remain caller-owned.
+
+The [context-field oracle](tests/fixtures/n3iwf-context-fields.json) contains
+98 independent Release 18 values: eight GUAMIs, 24 Allowed NSSAI combinations
+covering every root list length with absent/mixed/present SD, and 66 security
+mask cases including all 64 individual bits. Reproduce using
+`scripts/generate-ngap-context-field-fixtures.py --spec PATH --output PATH`
+with the same pinned PDF and Python reference environment as NG Setup.
+Generated GUAMI receive misaligns fixed PLMN octets; generated Allowed NSSAI
+receive and optional-SD construction differ from these independent bytes.
+The existing bounded root reader/writer is reused for those qualified shapes.
+The generated security-mask encoder is retained. All 98 vectors seed fuzz
+and replay; tests also cover every truncation and byte mutation.
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):

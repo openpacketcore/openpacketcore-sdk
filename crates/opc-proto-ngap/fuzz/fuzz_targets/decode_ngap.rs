@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
+use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
 use opc_proto_ngap::n3iwf::release::{Cause, ReleaseMessage, UeIdentifiers};
 use opc_proto_ngap::n3iwf::setup::{
@@ -65,6 +66,24 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(field) = UeIdentifiers::decode(data, decode) {
         let wire = field.encode(output).unwrap();
         assert!(UeIdentifiers::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
+    if let Ok(field) = Guami::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(Guami::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
+    if let Ok(field) = AllowedNssai::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(AllowedNssai::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
+    if let Some(bytes) = data.get(..8) {
+        let masks = bytes.as_chunks::<2>().0;
+        let value = SecurityAlgorithmMasks::new(
+            u16::from_be_bytes(masks[0]),
+            u16::from_be_bytes(masks[1]),
+            u16::from_be_bytes(masks[2]),
+            u16::from_be_bytes(masks[3]),
+        );
+        assert_eq!(value.encode(output).unwrap().as_bytes().len(), 9);
     }
     if let Ok(field) = GlobalN3iwfId::decode(data, decode) {
         let wire = field.encode(output).unwrap();
