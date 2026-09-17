@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
-/// An inner NAS/UP address with redacted diagnostics.
+/// A NAS/UP or advertised mobility address with redacted diagnostics.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Address(IpAddr);
 impl Address {
@@ -21,7 +21,7 @@ impl Address {
     pub const fn is_ipv4(self) -> bool {
         self.0.is_ipv4()
     }
-    fn from_wire(data: &[u8], ipv4: bool) -> Result<Self, Error> {
+    pub(super) fn from_wire(data: &[u8], ipv4: bool) -> Result<Self, Error> {
         Ok(Self(if ipv4 {
             IpAddr::V4(Ipv4Addr::from(
                 <[u8; 4]>::try_from(data).map_err(|_| Error::InvalidValue)?,

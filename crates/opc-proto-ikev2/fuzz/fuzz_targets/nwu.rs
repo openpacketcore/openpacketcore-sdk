@@ -14,6 +14,13 @@ fuzz_target!(|data: &[u8]| {
         entries: 128,
     };
     for body in [Some(data), data.get(4..)].into_iter().flatten() {
+        if let Ok(Some(value)) = mobike::Notify::decode_body(body) {
+            let canonical = value.encode_body().expect("mobility Notify encodes");
+            assert_eq!(
+                mobike::Notify::decode_body(&canonical).expect("mobility Notify parses"),
+                Some(value)
+            );
+        }
         if let Ok(Some(notify)) = Notify::decode_body(body) {
             let canonical = notify.encode_body().expect("accepted Notify encodes");
             let again = Notify::decode_body(&canonical)
@@ -59,6 +66,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         let _ = ConfigurationRequest::decode(first, data, limits);
+        let _ = mobike::Request::decode(first, data, limits);
         for families in [
             AddressFamilies::Ipv4,
             AddressFamilies::Ipv6,

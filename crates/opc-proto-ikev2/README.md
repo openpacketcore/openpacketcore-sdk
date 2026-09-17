@@ -36,14 +36,19 @@ all-packet selectors, full replacement modification, and explicit NWu deletion.
 `AeadPolicy` tries the caller's ordered `AeadSuite` list before peer proposal
 order and emits no integrity transform or fallback. Existing
 `Ikev2SaInitNegotiationPolicy` supplies ordered whole-IKE-suite selection.
-No default downstream suite list is included. Construction and receive helpers
+No default downstream suite list is included. Opened payload helpers
 return intent only; protection, key custody, replay admission, roster authority,
 retransmission scheduling and backend operations belong to their own boundaries.
 
 MOBIKE_SUPPORTED is conditional on the original IPv4 request and UE support.
-Authenticated MOBIKE address updates, return-routability, source/replay checks
-and NAT-T migration are still pending in #786. This payload change does not
-close that issue or establish external interoperability. See
+`nwu::mobike::Responder` authenticates exact UDP/500 or UDP/4500 datagrams using
+the concrete IKE provider, binds the established SA and shared message-ID
+windows, and checks explicit caller address policy. An update produces IKE
+path intent; Child-SA migration additionally requires an unpredictable COOKIE2
+probe answered on that exact path. Older probes cannot apply superseded
+updates. NAT detection reuses the admitted SHA-1 boundary; source addresses,
+cookies and crypto inputs remain absent from diagnostics.
+This does not close #786 or establish external interoperability. See
 [CONFORMANCE.md](CONFORMANCE.md#nwu-payload-profile) for exact scope and evidence.
 
 ## API Shape
