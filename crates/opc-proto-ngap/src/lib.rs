@@ -54,12 +54,13 @@ pub use generated::ngap_common_data_types::{Criticality, ProcedureCode};
 /// inspect typed decodes without depending on private module paths.
 pub mod messages {
     pub use super::generated::ngap_pdu_contents::{
-        DownlinkNASTransport, InitialContextSetupFailure, InitialContextSetupRequest,
-        InitialContextSetupResponse, InitialUEMessage, NASNonDeliveryIndication, NGSetupFailure,
-        NGSetupRequest, NGSetupResponse, PDUSessionResourceReleaseCommand,
-        PDUSessionResourceReleaseResponse, PDUSessionResourceSetupRequest,
-        PDUSessionResourceSetupResponse, Paging, UEContextReleaseCommand, UEContextReleaseComplete,
-        UEContextReleaseRequest, UplinkNASTransport,
+        DownlinkNASTransport, ErrorIndication, InitialContextSetupFailure,
+        InitialContextSetupRequest, InitialContextSetupResponse, InitialUEMessage,
+        NASNonDeliveryIndication, NGReset, NGResetAcknowledge, NGSetupFailure, NGSetupRequest,
+        NGSetupResponse, PDUSessionResourceReleaseCommand, PDUSessionResourceReleaseResponse,
+        PDUSessionResourceSetupRequest, PDUSessionResourceSetupResponse, Paging,
+        UEContextReleaseCommand, UEContextReleaseComplete, UEContextReleaseRequest,
+        UplinkNASTransport,
     };
 }
 
@@ -129,6 +130,12 @@ pub enum Message {
     DownlinkNasTransport(messages::DownlinkNASTransport),
     /// Uplink NAS Transport (initiating message, procedure code 46).
     UplinkNasTransport(messages::UplinkNASTransport),
+    /// NG Reset (initiating message, procedure code 20).
+    NgReset(messages::NGReset),
+    /// NG Reset Acknowledge (successful outcome, procedure code 20).
+    NgResetAcknowledge(messages::NGResetAcknowledge),
+    /// Error Indication (initiating message, procedure code 9).
+    ErrorIndication(messages::ErrorIndication),
     /// NAS Non-Delivery Indication (initiating message, procedure code 19).
     NasNonDeliveryIndication(messages::NASNonDeliveryIndication),
     /// UE Context Release Request (initiating message, procedure code 42).
@@ -249,6 +256,9 @@ impl fmt::Debug for Message {
             Self::UeContextReleaseComplete(message) => {
                 typed!("UeContextReleaseComplete", message)
             }
+            Self::NgReset(message) => typed!("NgReset", message),
+            Self::NgResetAcknowledge(message) => typed!("NgResetAcknowledge", message),
+            Self::ErrorIndication(message) => typed!("ErrorIndication", message),
             Self::NasNonDeliveryIndication(message) => typed!("NasNonDeliveryIndication", message),
             Self::UeContextReleaseRequest(message) => typed!("UeContextReleaseRequest", message),
             Self::Paging(message) => typed!("Paging", message),
@@ -269,6 +279,8 @@ const PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE: u8 = 28;
 const PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP: u8 = 29;
 const PROCEDURE_CODE_UE_CONTEXT_RELEASE: u8 = 41;
 const PROCEDURE_CODE_UPLINK_NAS_TRANSPORT: u8 = 46;
+const PROCEDURE_CODE_NG_RESET: u8 = 20;
+const PROCEDURE_CODE_ERROR_INDICATION: u8 = 9;
 const PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION: u8 = 19;
 const PROCEDURE_CODE_UE_CONTEXT_RELEASE_REQUEST: u8 = 42;
 
@@ -477,6 +489,30 @@ fn decode_message(
             Criticality::ignore,
             policy::UPLINK_NAS_TRANSPORT,
             |ie| ie.id.0
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_NG_RESET) => decode_as!(
+            messages::NGReset,
+            NgReset,
+            "ng reset",
+            Criticality::reject,
+            policy::NG_RESET,
+            |ie| ie.id
+        ),
+        (Outcome::Successful, PROCEDURE_CODE_NG_RESET) => decode_as!(
+            messages::NGResetAcknowledge,
+            NgResetAcknowledge,
+            "ng reset acknowledge",
+            Criticality::reject,
+            policy::NG_RESET_ACKNOWLEDGE,
+            |ie| ie.id
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_ERROR_INDICATION) => decode_as!(
+            messages::ErrorIndication,
+            ErrorIndication,
+            "error indication",
+            Criticality::ignore,
+            policy::ERROR_INDICATION,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION) => decode_as!(
             messages::NASNonDeliveryIndication,

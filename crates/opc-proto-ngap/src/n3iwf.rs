@@ -120,6 +120,10 @@ macro_rules! redacted {
 pub mod context_fields;
 pub mod nas;
 pub mod release;
+/// NG Reset, Reset Acknowledge and Error Indication admission.
+pub mod reset;
+/// Bounded Reset and Criticality Diagnostics root fields.
+pub mod reset_fields;
 pub mod resource_fields;
 /// Bounded PDU Session Resource Release transfers, lists and messages.
 pub mod resource_release;

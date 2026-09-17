@@ -509,6 +509,44 @@ impl<'a> Reader<'a> {
         }
         Ok(count)
     }
+    /// One aligned PER fragment of a SEQUENCE OF whose upper bound is at
+    /// least 65536. Counts are elements, never octets. Reserve the cumulative
+    /// caller budget and require physical minimum space before allocation.
+    pub(super) fn fragment_count(
+        &mut self,
+        maximum_remaining: usize,
+        minimum_bits: usize,
+    ) -> Result<(usize, bool), DecodeError> {
+        self.align()?;
+        let first = self.bits(8)?;
+        let (count, fragmented) = if first < 128 {
+            (usize::from(first), false)
+        } else if first < 192 {
+            let count = usize::from((first & 127) * 256 + self.bits(8)?);
+            if count < 128 {
+                return Err(invalid("nonminimal list determinant"));
+            }
+            (count, false)
+        } else {
+            let blocks = first & 63;
+            if !(1..=4).contains(&blocks) {
+                return Err(invalid("list fragment multiplier"));
+            }
+            (usize::from(blocks) * 16384, true)
+        };
+        if count > maximum_remaining {
+            return Err(invalid("list root count"));
+        }
+        self.items_left = self
+            .items_left
+            .checked_sub(count)
+            .ok_or_else(|| DecodeError::new(DecodeErrorCode::IeCountExceeded, 0))?;
+        let available = self.input.len().saturating_mul(8).saturating_sub(self.bit);
+        if count > available / minimum_bits {
+            return Err(invalid("truncated list fragment"));
+        }
+        Ok((count, fragmented))
+    }
     fn plmns(&mut self) -> Result<Vec<PlmnSlices>, DecodeError> {
         let count = self.count(4, 12, 55)?;
         let mut values = Vec::with_capacity(count);
