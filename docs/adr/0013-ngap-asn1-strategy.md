@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — amended 2026-06 with first implementation experience
+Accepted — amended 2026-06 with first implementation experience and 2026-09 with bounded container framing
 
 ## Date
 
@@ -26,7 +26,9 @@ structurally different from the existing binary codecs.
 
 ## Decision
 
-We will **not** hand-write NGAP APER parsing or code-generation.
+We will **not** hand-write general NGAP ASN.1 parsing or code-generation.
+The bounded root-container exception below covers proven runtime framing
+defects; nested ASN.1 schema types remain generated.
 
 Instead, we will evaluate and adopt a maintained Rust ASN.1 / APER toolchain
 that can consume the 3GPP ASN.1 modules directly. The evaluation criteria are:
@@ -137,6 +139,33 @@ Consequences acted on:
 - The Option A spike should be re-run against `rasn` on the raised MSRV before
   any consideration of Option B (`asn1-codecs`, which still carries its
   license-review gate per the comparison above).
+
+## Bounded container framing amendment (2026-09)
+
+Independent Release 18 message bytes demonstrate a `rasn` 0.28 generated
+inner-container encoder alignment defect. A separate 54-case Pycrate oracle
+also exposes the runtime decoder's handling of fragmented open types: it
+misreports the final determinant/remainder and can consume following fields.
+
+The SDK may explicitly frame the three root NGAP-PDU choices and their
+ProtocolIE-Containers. The exception is limited to aligned fixed headers,
+16-bit IE counts, open-type length determinants and fragmentation. Generated
+types still define the message/IE representation and decode fixed IE headers;
+the existing procedure-specific policy tables remain authoritative. Nested IE
+values stay opaque at this boundary. Fragmented SEQUENCE extension additions
+are outside the implemented root-container subset.
+
+Canonical SDK encoding writes the typed container, preserves its order and
+opaque values, and normalizes container padding and length determinants. It
+does not implement ASN.1 CANONICAL-PER or semantic N3IWF send admission.
+Raw-preserving encoding remains available for exact forwarding. Decoder limits
+and structural/strict, unknown-IE and duplicate policies continue to apply.
+Construction and output bounds precede payload allocation or destination writes.
+
+The exception requires independent bytes/digests, malformed-fragment tests,
+fuzz coverage, and an explicit conformance boundary. The broader generated
+schema strategy and experimental maturity are unchanged. Evidence is linked
+from `crates/opc-proto-ngap/CONFORMANCE.md`; Refs #787.
 
 ## Evidence
 

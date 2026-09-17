@@ -26,7 +26,11 @@ cardinality, and configured decode policies.
 - `Criticality` and `ProcedureCode` are re-exported from generated ASN.1 types.
 - `decode` and `Pdu::decode` parse one APER PDU. `Pdu::decode_owned` rejects
   trailing bytes after a complete PDU.
-- `encode` and the `Encode` implementation support raw-preserving output only.
+- `Pdu::from_protocol_ies(MessageType, &[ProtocolIe], DecodeContext)` builds a
+  supported container from borrowed, independently encoded IE values, with no
+  received packet. `MessageType` fixes the procedure/outcome/criticality tuple.
+- `encode` and `Encode` default to canonical root-container output. Explicit
+  `raw_preserving` mode replays the original receive bytes.
 
 ## Typed IE policy boundary
 
@@ -56,12 +60,16 @@ The remaining `DecodeContext` policies apply as follows:
 - Known procedures and IE identifiers must carry their TS 38.413 criticality.
   A mismatch fails with a stable, value-free structural error.
 
-Filtering changes only the typed view. `Pdu::raw` is never rewritten, and the
-only supported encoder is raw-preserving. Consequently, encoding a PDU decoded
-with `Drop`, `First`, or `Last` emits the original wire entries, not a
-sanitized reconstruction. A consumer that needs a sanitized canonical message
-must wait for or provide a canonical typed encoder; it must not treat
-raw-preserving encode as typed-view serialization.
+Filtering changes only the typed view. `Pdu::raw` is never rewritten.
+Raw-preserving encoding emits the original wire entries, including those
+filtered by `Drop`, `First`, or `Last`. Canonical encoding serializes the
+filtered typed view instead. It preserves that view's IE order and opaque IE
+value bytes, normalizes container padding and length determinants, and writes
+only root components (no SEQUENCE extension additions). It checks the mutable
+wrapper/message tuple, known IE criticality and singleton cardinality before
+allocating output, and rejects unknown reject-criticality IEs. Unknown
+ignore/notify IEs may be emitted; `Message::Unknown` requires raw preservation.
+This is container reconstruction, not semantic sanitization of nested values.
 
 `Debug` for `Pdu`, `PduKind`, and `Message` reports only outcome/procedure
 metadata, lengths, variant names, and IE counts. It never renders raw PDU
@@ -102,11 +110,21 @@ for 15 admitted message outcomes. Its reference gate validates nested ASN.1
 values and enumerated N3IWF conditions; the SDK does not yet perform those
 semantic checks. See the [evidence guide](../../docs/n3iwf-fixture-contracts.md).
 
-Canonical typed encode is intentionally unsupported. `rasn` 0.28 decodes the
-covered APER fixtures, but its encoder does not reproduce the byte alignment
-required by the SDK's byte-exact fixture policy for inner message bodies. For
-now, encode requires raw bytes captured during decode and
-`EncodeContext::raw_preserving = true`.
+Canonical encoding uses explicit aligned-PER container framing instead of
+`rasn` 0.28's misaligned generated inner-container encoder. This includes
+one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
+Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
+boundary cases. The caller supplies already-encoded IE values; typed N3IWF
+keys, locations, resource transfers and mandatory/conditional presence are
+still pending under #787. No live AMF exchange or full N3IWF send capability is
+claimed. Paging remains structurally covered only.
+
+`from_protocol_ies` applies the existing `DecodeContext` policies and checks
+depth, IE count and complete wire length before payload allocation. It returns
+empty `Pdu::raw`, so raw-preserving encoding fails. Canonical encoding checks
+`EncodeContext::max_message_len` before output allocation or destination writes;
+`wire_len` performs the same validation without heap allocation. The generic
+`allocation_budget` remains advisory.
 
 ## Generated types
 
@@ -124,8 +142,6 @@ deterministic for that commit.
 
 ## Roadmap
 
-- Resolve or work around the APER encoder alignment issue before enabling
-  constructed typed NGAP messages.
 - Add external field-level fixtures for Paging and further procedures.
 - Expand procedure coverage only with fixture evidence and raw-preserving
   regression tests.

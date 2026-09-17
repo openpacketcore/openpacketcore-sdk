@@ -112,6 +112,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: construct and canonically encode the supported root PDU/IE
+  containers from opaque encoded IE values; preserve existing receive policies
+  and raw replay. Correct open-type fragmentation boundaries, check complete
+  output bounds before writing, and compare all 15 admitted outcomes with the
+  independent Release 18 corpus. Typed N3IWF semantic IE admission and further
+  applicable procedures remain pending (Refs #787).
 - **Bounded acknowledged configuration history — `opc-persist`:** the existing
   consensus authority commits exact-head retention decisions with record and
   encoded-byte limits, authenticated cursor boundaries, and protected rollback
