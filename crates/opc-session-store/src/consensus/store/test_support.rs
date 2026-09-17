@@ -449,6 +449,11 @@ pub fn consensus_local_durable_progress_for_test(
     }
 }
 
+/// Passive value-free snapshot phase for bounded integration diagnostics.
+pub fn consensus_snapshot_build_phase_for_test(store: &ConsensusSessionStore) -> &'static str {
+    store.inner.backend.snapshot_observation().phase_for_test()
+}
+
 /// Return constant-space local WAL timing totals without issuing a read
 /// barrier or changing consensus state. The observation contains only fixed
 /// categories and numeric counters, with no payload, identity, or path.
