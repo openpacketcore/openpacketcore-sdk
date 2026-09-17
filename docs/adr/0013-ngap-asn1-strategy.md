@@ -419,3 +419,24 @@ at each message/transfer boundary. Caller-owned state determines association,
 session/QFI ownership and whether a notified QFI is an established GBR flow;
 the codec does not choose triggers or perform cleanup. Extension reports need
 separate independent qualification before admission.
+
+## PDU Session Resource Modify field amendment (2026-09)
+
+Independent root-field probes cover 687 cases. Generated request-list encoding
+fails 253/383 and decoding fails 380/383 cases; response-list encoding passes
+129/129 but decoding fails all; Cause-list encoding passes 130/130 while decoding
+fails 129/130. Tunnel-pair list encoding/decoding fails all 45 cases. Retain
+qualified generated response/Cause encoders and all 129 admitted identifier-only
+request encodings. Use explicit layouts only for parameter-bearing requests,
+tunnel-pair encoding and the failed receivers, preserving parent bit offsets.
+
+Complete physical preflight precedes vector allocation. Exact output sizing
+precedes generated-value materialization or zeroized buffer allocation. Both
+unmodified reference encoders agree; structured reference decoding verifies
+values. No schema, dependency or reference-package changes are needed.
+
+Represent absent request parameters distinctly from standardized non-GBR 5QI 9
+parameters. Preserve directional endpoint types and repeated tunnel pairs;
+do not infer session state, defaults, bearer ownership or request correlation.
+The new lists are standalone fields, not complete Modify transfer/procedure
+admission. Additional profiles and optional fields require further qualification.

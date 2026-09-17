@@ -150,6 +150,12 @@ flow; admission neither infers that state nor performs cleanup. The qualified
 root subset requires depth 10–12 depending on the contained reports. Alternative
 QoS, feedback and usage-report extensions remain unsupported.
 
+`modify_fields` supplies standalone add/modify QFI lists with absent or explicit
+non-GBR 5QI 9 parameters, successful QFI reports, QFI/Cause lists and ordered
+uplink/downlink tunnel modification pairs. Parameter absence is preserved;
+these fields do not infer existing state or supply defaults. Complete Modify
+transfers/messages and their procedure-specific conditions remain pending.
+
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413

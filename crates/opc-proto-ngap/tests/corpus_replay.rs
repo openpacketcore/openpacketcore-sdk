@@ -17,6 +17,9 @@ mod resource_setup;
 #[path = "support/ue_requests.rs"]
 mod ue_requests;
 
+#[path = "support/modify_fields.rs"]
+mod modify_fields;
+
 #[path = "support/notify.rs"]
 mod notify;
 
@@ -52,6 +55,14 @@ fn exercise(data: &[u8]) {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
+    modify_fields::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     notify::exercise(
         data,
         ctx,
