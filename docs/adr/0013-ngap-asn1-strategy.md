@@ -504,3 +504,32 @@ runtime change is needed. Correlation, ownership, NAS eligibility, prescribed
 abnormal-condition responses, trigger selection and resource effects remain
 caller-owned. #787's other optional fields and complete procedure matrix remain
 open; this is independent synthetic evidence, not live interoperability.
+
+
+## N3IWF applicability amendment (2026-09)
+
+Route a complete N3IWF envelope before the generic decoder: a listed procedure
+with a pending codec is an external-handler requirement, never a procedure
+absent from applicability. Enumerate all 40 TS 29.413 outcomes and retain the
+23 qualified field subsets. Keep the 17 pending outcomes' local triggers
+disabled, check interface direction, and document their required receive/error
+behavior and caller state effects in `N3IWF-PROCEDURES.md`. A codec-available
+result expresses wire capability only; no endpoint readiness or authorization
+is inferred.
+
+An allocation-free scanner validates complete outer fragments, padding and
+determinants. Check criticality and valid outcomes against all 81 procedures in
+the pinned Release 18 schema, including non-applicable ones; known malformed
+metadata cannot select an ignore fallback. Only absent procedures reach the
+5.4 ignore/report rules. Unknown future codes use received criticality. Build
+only the value-free diagnostic header prescribed by 38.413 10.3.4.1; caller
+code supplies signalling context and performs any Error Indication. Existing
+generic decoding and IE policies remain unchanged.
+
+Both unmodified independent encoders agree on 2,321 routing envelopes and the
+corresponding diagnostic headers. These are explicitly not complete-message
+admission vectors: bodies remain opaque, and the PrivateMessage body layout
+is unqualified. Preserve source hashes for both specifications, the complete
+applicability list and the 131 defined schema outcomes. No generated runtime
+change is justified or needed for metadata routing. Optional fields and pending
+procedure codecs remain open under #787; the matrix does not close the issue.

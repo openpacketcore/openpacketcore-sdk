@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- Add explicit N3IWF receive routing for all 40 applicable NGAP outcomes,
+  assigned metadata checks for all Release 18 procedures, disabled trigger gates
+  for pending codecs and value-free unsupported-procedure diagnostic headers.
+  Document each pending procedure's receive/error behavior and caller effects.
+  Envelope classification remains separate from typed field admission.
 - `opc-proto-ngap`: qualify complete PDU Session Resource Modify Request/Response
   with bounded session lists, optional NAS/S-NSSAI and partial failure diagnostics.
   Add two public message variants (exhaustive matches require updates), independent

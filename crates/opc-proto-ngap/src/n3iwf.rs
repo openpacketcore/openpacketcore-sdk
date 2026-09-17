@@ -117,6 +117,8 @@ macro_rules! redacted {
     };
 }
 
+/// Complete N3IWF applicability, receive routing and local wire-codec gates.
+pub mod applicability;
 pub mod context_fields;
 /// Bounded optional Modify Request Transfer root fields.
 pub mod modify_request;
