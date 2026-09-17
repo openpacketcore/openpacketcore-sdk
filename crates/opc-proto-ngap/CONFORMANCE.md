@@ -219,6 +219,59 @@ applicable optional resource/diagnostic fields before selecting this subset.
 No resource effect or acknowledgement is performed here. UE Release Request
 and other procedure outcomes remain pending under #787.
 
+## N3IWF NG Setup admission
+
+`n3iwf::setup` admits the Request, Response and Failure root subsets below
+(TS 38.413 V18.10.0 9.2.6.1–3; TS 29.413 V18.5.0 5.3). It validates the
+filtered generic PDU without changing its raw image or activating an association.
+
+| Outcome | Required fields | Optional fields admitted | Receiver-ignored IEs |
+|---|---|---|---|
+| Request | Global RAN Node ID 27 restricted to N3IWF; Supported TA List 102; presence of Default Paging DRX 21 | None | 21, 204 |
+| Response | AMF Name 1; Served GUAMI List 96; Relative AMF Capacity 86; PLMN Support List 80 | None | 200, 404 |
+| Failure | Cause 15 | Root Time To Wait 107 | None |
+
+Default Paging DRX remains mandatory on the wire, but its received contents
+are ignored. `NgSetupRequest::construct` takes an explicit `PagingDrx`;
+`SetupMessage::from_pdu` returns only the interpreted request fields and the
+ignored count. Unknown-notify IDs are caller-owned diagnostics. Other
+recognized optional IEs fail explicitly, including names/retention/diagnostics
+outside the table. Served GUAMI backup names and all nested extensions are
+unsupported; their values are never silently discarded into a successful view.
+
+`setup_fields` uses shared `PlmnId` and `Snssai` values. Root counts are
+TA/GUAMI 1..=256, PLMN 1..=12 and slices 1..=1024. Before each receive list
+allocation, its count must fit the remaining physical bits and the cumulative
+field-local `max_ies` item budget. Every TA, GUAMI, PLMN and slice consumes an
+item; this extra bound is an SDK admission choice, separate from the outer IE
+count. `allocation_budget` remains advisory. Field depth is four for global
+N3IWF ID/served GUAMIs, six for PLMN support, eight for supported TAs and one
+for AMF name. Message admission adds four enclosing layers: Request twelve,
+Response ten and Failure six. The conservative depth-eight context thus needs
+an explicit increase for Request/Response. Field bytes and complete-message
+bytes are bounded separately. Encode preflights exact sizes before allocating
+wire buffers or generated collections. Diagnostics expose no field values.
+
+Independent bytes expose the runtime's fixed-octet receive alignment defect
+in all four nested identity/list fields. The generated encoder also loses
+parent bit offsets in PLMN/slice lists (the single-PLMN vector is already
+wrong). Explicit root readers and the two list writers are qualified against
+the independent oracle; zero padding is required on this receive boundary.
+Generated encoders remain qualified for global N3IWF ID, served GUAMIs, AMF
+name, capacity and timers. General ASN.1 extensions remain outside this narrow
+exception, documented in ADR 0013.
+
+The [setup oracle](tests/fixtures/n3iwf-setup.json) contains 63 independent
+fields and 87 complete messages: 67 constructive cases, every missing
+mandatory field, duplicates and all unknown criticalities. It includes both
+MNC widths, integer limits, optional slice differentiators, maximum list
+counts and root name/timer values. Reproduce using
+`scripts/generate-ngap-setup-fixtures.py --spec PATH --output PATH` and the
+pinned Pycrate/pypdf reference environment. All 150 vectors seed fuzz/replay;
+ordinary tests exercise every truncation and sampled byte mutations across
+large list vectors. No AMF selection, slice authorization, timer/retry,
+configuration application or live peer interoperability is established.
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):
@@ -274,11 +327,11 @@ additional layers guard it:
 ## Codec Boundary (v1 subset)
 
 - Typed semantic encoding of IE values beyond the explicitly admitted
-  N3IWF field subset, including resource transfers and UE identifier pairs.
+  N3IWF field subset, including resource transfers.
 - External field-level fixtures for Paging and procedures outside the admitted
   N3IWF corpus.
 - Typed decode of procedures outside the first-CNF N2 subset above; preserved
   raw as `Message::Unknown`.
 - UPER encoding.
 - Semantic validation of IE contents or mandatory/conditional presence beyond
-  the top-level identifier, criticality, and cardinality contract above.
+  the explicitly documented field/message admission subsets above.

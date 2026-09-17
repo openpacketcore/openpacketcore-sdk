@@ -11,8 +11,8 @@ subset documented in [CONFORMANCE.md](CONFORMANCE.md).
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
 or gNB procedure state, or NAS message processing. Its optional `n3iwf`
-module validates the individual fields, three NAS outcomes and two UE release
-outcomes below. The container boundary
+module validates the individual fields, three NAS outcomes, two UE release
+outcomes and the three NG Setup outcomes below. The container boundary
 validates top-level identifiers, criticality, cardinality, and configured
 decode policies.
 
@@ -110,7 +110,7 @@ The crate is experimental and `publish = false`. The independent N3IWF corpus
 proves framing and each decoded IE's identifier, criticality and opaque bytes
 for 15 admitted message outcomes. Its reference gate validates nested ASN.1
 values and enumerated N3IWF conditions; SDK semantic admission covers only
-the explicitly documented field and NAS subset below. See the
+the explicitly documented field and message subsets below. See the
 [evidence guide](../../docs/n3iwf-fixture-contracts.md).
 
 Canonical encoding uses explicit aligned-PER container framing instead of
@@ -215,6 +215,19 @@ The [release matrix](CONFORMANCE.md#n3iwf-ue-release-field-admission) records
 required, ignored and unsupported fields. Association lookup, resource cleanup
 and acknowledgement ordering remain caller-owned. No protocol/backend effect
 occurs when a message passes admission.
+
+## NG Setup
+
+`n3iwf::setup` provides Request, Response and Failure construction and
+`SetupMessage::from_pdu` admission. Root identities, tracking areas, PLMNs,
+slices, AMF name/capacity and retry delay have independent field and complete
+message evidence. Request construction takes an explicit `PagingDrx`; receive
+checks that mandatory IE's presence and ignores its payload per TS 29.413.
+
+The [setup matrix](CONFORMANCE.md#n3iwf-ng-setup-admission) describes nested
+item/depth bounds, unsupported optional fields and the two list layouts that
+need explicit framing around proven runtime alignment defects. Admission does
+not select an AMF, authorize a slice or activate an association.
 
 ## License
 

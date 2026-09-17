@@ -12,6 +12,10 @@
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
 use opc_proto_ngap::n3iwf::release::{Cause, ReleaseMessage, UeIdentifiers};
+use opc_proto_ngap::n3iwf::setup::{
+    AmfName, GlobalN3iwfId, PagingDrx, PlmnSupportList, ServedGuamiList, SetupMessage,
+    SupportedTaList,
+};
 use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode, ValidationLevel};
@@ -35,7 +39,40 @@ fn exercise(data: &[u8]) {
     let _ = UeAggregateBitRate::decode(data, ctx);
     let _ = Cause::decode(data, ctx);
     let _ = UeIdentifiers::decode(data, ctx);
+    if let Ok(field) = GlobalN3iwfId::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(GlobalN3iwfId::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = ServedGuamiList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(ServedGuamiList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = PlmnSupportList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(PlmnSupportList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = SupportedTaList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(SupportedTaList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = AmfName::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(AmfName::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
     if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), ctx) {
+        if let Ok(admitted) = SetupMessage::from_pdu(&pdu, ctx) {
+            let constructed = match &admitted.message {
+                SetupMessage::Request(value) => value.construct(PagingDrx::v128, ctx),
+                SetupMessage::Response(value) => value.construct(ctx),
+                SetupMessage::Failure(value) => value.construct(ctx),
+            }
+            .unwrap();
+            let wire = encode(&constructed, EncodeContext::default()).unwrap();
+            let received = Pdu::decode_owned(Bytes::from(wire), ctx).unwrap();
+            let readmitted = SetupMessage::from_pdu(&received, ctx).unwrap();
+            assert!(readmitted.message == admitted.message);
+            assert!(readmitted.notify_ie_ids.is_empty());
+        }
         if let Ok(admitted) = ReleaseMessage::from_pdu(&pdu, ctx) {
             let constructed = admitted.message.construct(ctx).unwrap();
             let wire = encode(&constructed, EncodeContext::default()).unwrap();
