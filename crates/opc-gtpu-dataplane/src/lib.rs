@@ -8,6 +8,9 @@
 //! GTP-C/PFCP control plane, route steering, XFRM policy, namespace
 //! management, or deployment policy; GTP-U packet handling itself lives in
 //! the committed eBPF datapath object and `opc-gtpu-ebpf-common`.
+//! The experimental [`n3`] module adds software G-PDU/PSC packet helpers and
+//! directional intent types; all shipped backends report N3 forwarding as
+//! unavailable, independently of those packet helpers.
 //!
 //! The additive reconciliation contract provides typed lookup by local TEID or
 //! uplink identity, dual-selector classified install, and capability-gated
@@ -59,6 +62,7 @@ pub mod icmp;
 pub mod linux;
 pub mod mock;
 pub mod model;
+pub mod n3;
 pub mod reassembly;
 pub mod selector_namespace;
 mod selector_namespace_v2;

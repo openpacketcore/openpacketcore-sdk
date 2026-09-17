@@ -95,6 +95,9 @@ jobs:
           "${RUNNER_TEMP}/ngap-reference/bin/python" scripts/check-n3iwf-ngap-reference.py \
             --report "${RUNNER_TEMP}/ngap-reference-report.json"
 
+      - name: Check independent N3 packet vectors
+        run: python3 crates/opc-gtpu-dataplane/tests/n3_reference.py --check
+
       - name: Archive independent NGAP validation report
         uses: actions/upload-artifact@v7
         with:

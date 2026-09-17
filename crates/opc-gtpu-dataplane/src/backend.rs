@@ -1182,6 +1182,18 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         PdpContextReconciliationCapabilities::unsupported()
     }
 
+    /// Report support for the complete N3 forwarding role, separately from
+    /// software PSC parsing/construction and existing PDP reconciliation.
+    ///
+    /// All shipped adapters inherit `Missing`. Codec or mock packet success
+    /// cannot qualify production forwarding, exact generation readback,
+    /// stale-writer fencing, or removal/End Marker ordering. A future positive
+    /// report requires those contracts and qualified packet behaviour; this
+    /// coarse support query grants no attachment or mutation authority.
+    fn n3_forwarding_capability(&self, _role: crate::n3::N3ForwardingRole) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
     /// Report support for the authority-bearing durable restart-recovery
     /// request independently of generationless exact removal.
     fn pdp_restart_recovery_capability(&self) -> GtpuCapability {
