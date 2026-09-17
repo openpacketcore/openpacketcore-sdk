@@ -115,16 +115,20 @@ a single-downlink setup response with unique accepted/failed QFI results and
 a root-Cause unsuccessful transfer. `session_lists` adds bounded request,
 successful and failed session lists for context and PDU Setup procedures,
 with unique session IDs, optional NAS, slice values and disjoint partial
-results. Enclosing context/resource message admission remains pending;
-these values do not configure a session or tunnel.
+results. `resource_setup` composes these fields into Initial Context Setup
+Request/Response/Failure and PDU Session Resource Setup Request/Response.
+Admission checks required and conditional presence, contained transfers and
+partial results; these values do not configure a session or tunnel. Requests
+with resource lists require an explicit `DecodeContext::max_depth` of at least
+17. See the message matrix in [CONFORMANCE.md](CONFORMANCE.md).
 
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413
 requires N3IWF receivers to ignore UE Security Capabilities contents, so the
-mask helper adds no receive decoder. Initial Context Setup message admission
-remains pending. See the context-field boundary
-in [CONFORMANCE.md](CONFORMANCE.md).
+mask helper adds no receive decoder. Context-message admission checks mandatory
+capability presence while ignoring its contents; construction requires explicit
+masks. Keys remain borrowed, redacted values with no installation or use.
 
 The crate is experimental and `publish = false`. The independent N3IWF corpus
 proves framing and each decoded IE's identifier, criticality and opaque bytes
@@ -138,8 +142,8 @@ Canonical encoding uses explicit aligned-PER container framing instead of
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
 Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
 boundary cases. The caller supplies already-encoded IE values; typed N3IWF
-resource transfers and presence rules beyond the admitted NAS/release subset remain
-pending under #787; the field codecs cover IDs, NAS framing, keys and locations. No
+resource transfers and presence rules beyond the documented NAS, release, NG Setup
+and context/session setup subsets remain pending under #787. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks

@@ -275,8 +275,8 @@ configuration application or live peer interoperability is established.
 ## Initial context individual fields
 
 `n3iwf::context_fields` adds three individual fields needed by Initial Context
-Setup. This is not whole-message admission; the required-field, conditional
-AMBR, key custody and nested resource rules remain separate pending work.
+Setup. Whole-message presence, conditional AMBR, key custody and nested resource
+rules are composed separately by `resource_setup`, documented below.
 
 | Field | Construction | Receive | Bounds |
 | --- | --- | --- | --- |
@@ -305,8 +305,8 @@ and replay; tests also cover every truncation and byte mutation.
 
 TS 38.413 V18.10.0 9.3.4.1 defines this nested transfer. The opt-in
 `n3iwf::resource_request` boundary admits the independently qualified
-standardized non-GBR 5QI 9 subset; this does not admit an enclosing Initial
-Context Setup or PDU Session Resource Setup message.
+standardized non-GBR 5QI 9 subset. Enclosing Initial Context Setup and PDU Session
+Resource Setup admission is a separate `resource_setup` boundary below.
 
 | Field | IE | Criticality | Construction / receive |
 | --- | --- | --- | --- |
@@ -460,8 +460,73 @@ compiled Release 18 schema, never the SDK codec.
 
 All cases and the original fuzz reproducer seed fuzz/replay. Tests check independent semantic values and bytes,
 size/count/depth limits, borrowing, redaction, policy propagation, disjoint
-partial results, truncations and bounded byte mutations. This does not admit
-the enclosing Initial Context/PDU Setup procedures or enable resource effects.
+partial results, truncations and bounded byte mutations. Enclosing context/PDU
+Setup admission is documented below; no resource effects are enabled.
+
+## Initial Context and PDU Session Resource Setup messages
+
+`n3iwf::resource_setup` composes the qualified fields, lists and transfers.
+It admits five outcomes from a decoded `Pdu` and constructs canonical messages
+from typed fields. The matrix covers TS 38.413 V18.10.0 9.2.2.1–9.2.2.3 and
+9.2.1.1–9.2.1.2, with N3IWF receiver exceptions from TS 29.413 V18.5.0 5.3.
+
+| Outcome | Required fields | Admitted optional/conditional fields | Encode / receive |
+| --- | --- | --- | --- |
+| Initial Context Setup Request | AMF/RAN UE IDs, GUAMI, Allowed NSSAI, UE Security Capabilities presence, Security Key | Session setup requests, opaque NAS; UE AMBR required when session requests exist | Canonical / typed |
+| Initial Context Setup Response | AMF/RAN UE IDs | Disjoint successful and failed session lists; both may be absent | Canonical / typed |
+| Initial Context Setup Failure | AMF/RAN UE IDs, root Cause | Failed session list | Canonical / typed |
+| PDU Session Resource Setup Request | AMF/RAN UE IDs, session setup request list | Opaque NAS, UE AMBR | Canonical / typed |
+| PDU Session Resource Setup Response | AMF/RAN UE IDs, at least one result list | Successful/failed lists, N3IWF location | Canonical / typed |
+
+Every top-level IE is singleton with the existing procedure-specific criticality.
+Admission consumes the generic decoder's selected unknown/duplicate policy view
+and rechecks mutable wrapper metadata, criticality, bytes and counts. Use the
+same context for decoding and admission; filtering already performed by the
+generic decoder cannot be undone. Contained request transfers receive the
+same validation/unknown/duplicate policy and remaining depth. Unknown-ignore
+counts and unknown-notify identifiers are returned without opaque values.
+Strict unknown-critical rejection precedes Drop at both nesting levels.
+
+Context capability contents and the 39 other context IEs in the explicit
+TS 29.413 receiver-ignore list are skipped even if their opaque values are
+malformed. The capability IE must still exist; construction requires four
+caller-provided masks. RAN Paging Priority and UE Slice Maximum Bit Rate List
+are receiver-ignored on PDU setup requests. Trace Activation and UE AMBR are
+applicable to N3IWF under the non-trusted-access exceptions: bitrate is decoded,
+while Trace Activation fails explicitly until its contract is implemented.
+Other recognized applicable fields outside this subset, including Criticality
+Diagnostics, also fail explicitly. Ignored fields are omitted by construction,
+apart from mandatory capabilities. No ignored bytes are exposed as semantic data.
+
+Requests with a resource list need total depth 17; a context-only request needs
+8. Responses need 13 with successful results, 10 with only failures, or 5 for an
+empty context response. Context failure needs 10 with failed sessions and 6
+without them. These explicit limits exceed the default depth for resource
+requests. Each list and contained transfer uses the caller's field-local
+`max_ies`; complete input/output is bounded by `max_message_len`. Physical
+preflight, unique session IDs, disjoint partial results and fragment handling
+come from the qualified nested codecs. A failed-only PDU setup result still
+uses the successful outcome wrapper; there is no separate unsuccessful outcome.
+
+The [message oracle](tests/fixtures/n3iwf-resource-setup.json) has 122 independently
+encoded Release 18 cases: 83 admitted and 39 negative. It covers all required
+fields, conditional AMBR, empty/partial results, 256 sessions, 64 flows, absent/
+empty/fragmented NAS with distinct synthetic blocks, nested unknown policies,
+malformed receiver-ignored values, duplicate singleton/session IDs and result
+overlap. Canonical transfer IE ordering is derived from the independent schema.
+Regenerate with `scripts/generate-ngap-resource-setup-fixtures.py --spec PATH
+--output PATH` using the pinned PDF and reference environment. Both reference
+encoders must agree; structured decode validates the independently admitted
+values. Receiver-ignored malformed values intentionally need not decode as
+their ASN.1 leaf type. All cases seed fuzz/replay; tests add truncated/mutated
+nested framing, key lengths, metadata, bounds and policy changes.
+
+Security Key borrows exactly 32 bytes without installation or cryptographic
+use. NAS remains opaque; Debug and failures redact values. UE ownership,
+request/result correlation, slice authorization, tunnel/resource changes and
+local procedure triggers remain caller-owned. Other QoS profiles, optional
+fields and procedures under #787 are still pending; no live interoperability
+is established.
 
 ## Fixtures
 

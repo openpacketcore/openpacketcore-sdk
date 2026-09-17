@@ -9,6 +9,9 @@
 //! protection — if a future change makes the decode path panic on a known
 //! input, this test fails and names the offending input.
 
+#[path = "support/resource_setup.rs"]
+mod resource_setup;
+
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
@@ -38,6 +41,14 @@ fn exercise(data: &[u8]) {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
+    resource_setup::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     // Exercise all admitted field receivers on corpus/truncation inputs too.
     let _ = AmfUeId::decode(data, ctx);
     let _ = RanUeId::decode(data, ctx);

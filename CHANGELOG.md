@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: canonical construction and typed admission for all five
+  Initial Context/PDU Session Resource Setup outcomes, with required and
+  conditional presence, nested caller policies and disjoint partial results.
+  Independent Release 18 messages cover receiver-ignored capabilities, borrowed
+  keys and fragmented NAS; resource effects remain caller-owned (Refs #787).
 - `opc-proto-ngap`: bounded context/PDU Setup session request/result lists
   with optional borrowed NAS, S-NSSAI, unique session IDs and disjoint partial
   results. Independent Release 18 vectors cover seven root layouts and nested
@@ -129,7 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-proto-ngap`: bounded standalone GUAMI and Allowed NSSAI field codecs,
   plus construction-only UE security algorithm masks. Independent Release 18
   vectors cover every root list length, optional slice differentiators and
-  every mask bit. Context-message presence and resource admission remain pending.
+  every mask bit. Context-message composition is qualified separately above.
 - `opc-proto-ngap`: construct and admit all three NG Setup outcomes with bounded
   N3IWF identity, TA/PLMN/slice/GUAMI lists, AMF name/capacity and root retry
   delay. Preserve mandatory presence plus receiver-ignore behavior for DRX.
