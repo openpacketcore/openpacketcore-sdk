@@ -14,6 +14,8 @@ mod modify_fields;
 #[path = "../../tests/support/modify_request.rs"]
 mod modify_request;
 
+#[path = "../../tests/support/modify.rs"]
+mod modify;
 #[path = "../../tests/support/modify_results.rs"]
 mod modify_results;
 
@@ -63,6 +65,7 @@ fuzz_target!(|data: &[u8]| {
     modify_fields::exercise(data, decode, output);
     modify_request::exercise(data, decode, output);
     modify_results::exercise(data, decode, output);
+    modify::exercise(data, decode, output);
     notify::exercise(data, decode, output);
     reset::exercise(data, decode, output);
     ue_requests::exercise(data, decode, output);

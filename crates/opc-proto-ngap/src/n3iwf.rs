@@ -545,3 +545,8 @@ pub mod modify_fields;
 pub mod notify;
 /// Qualified PDU Session Resource Notify fields and bounded session lists.
 pub mod notify_fields;
+
+/// Complete qualified PDU Session Resource Modify messages.
+pub mod modify;
+/// Bounded session lists for the qualified Modify transfers.
+pub mod modify_lists;

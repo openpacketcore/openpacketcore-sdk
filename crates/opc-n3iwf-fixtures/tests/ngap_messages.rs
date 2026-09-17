@@ -30,6 +30,12 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::InitialUeMessage(value) => view!("InitialUEMessage", value),
         Message::DownlinkNasTransport(value) => view!("DownlinkNASTransport", value),
         Message::UplinkNasTransport(value) => view!("UplinkNASTransport", value, 0),
+        Message::PduSessionResourceModifyRequest(value) => {
+            view!("PDUSessionResourceModifyRequest", value)
+        }
+        Message::PduSessionResourceModifyResponse(value) => {
+            view!("PDUSessionResourceModifyResponse", value)
+        }
         Message::PduSessionResourceNotify(value) => view!("PDUSessionResourceNotify", value),
         Message::NgReset(value) => view!("NGReset", value),
         Message::NgResetAcknowledge(value) => view!("NGResetAcknowledge", value),

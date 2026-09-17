@@ -457,6 +457,21 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+    /// Borrow the determinant and all fragments after complete size preflight.
+    pub(super) fn framed_octets(&mut self, maximum: usize) -> Result<&'a [u8], DecodeError> {
+        self.align()?;
+        let start = self.bit / 8;
+        let tail = self
+            .input
+            .get(start..)
+            .ok_or_else(|| invalid("truncated octets"))?;
+        let (rest, length) = aper::scan_open_type(tail)?;
+        if length > maximum {
+            return Err(invalid("contained field length"));
+        }
+        self.bit = (self.input.len() - rest.len()) * 8;
+        Ok(&tail[..tail.len() - rest.len()])
+    }
     pub(super) fn open_octets(&mut self, maximum: usize) -> Result<Cow<'a, [u8]>, DecodeError> {
         self.align()?;
         let start = self.bit / 8;

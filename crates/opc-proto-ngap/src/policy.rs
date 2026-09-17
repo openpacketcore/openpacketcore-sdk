@@ -231,6 +231,21 @@ pub(super) const PDU_SESSION_RESOURCE_RELEASE_COMMAND: IeProfile = IeProfile::ne
 ]);
 
 // TS 38.413 V18.10.0 9.2.1.7; all fields are singleton.
+pub(super) const PDU_SESSION_RESOURCE_MODIFY_REQUEST: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT),
+    IeRule::singleton(85, CRITICALITY_REJECT),
+    IeRule::singleton(83, CRITICALITY_IGNORE),
+    IeRule::singleton(64, CRITICALITY_REJECT),
+]);
+pub(super) const PDU_SESSION_RESOURCE_MODIFY_RESPONSE: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_IGNORE),
+    IeRule::singleton(85, CRITICALITY_IGNORE),
+    IeRule::singleton(65, CRITICALITY_IGNORE),
+    IeRule::singleton(54, CRITICALITY_IGNORE),
+    IeRule::singleton(121, CRITICALITY_IGNORE),
+    IeRule::singleton(19, CRITICALITY_IGNORE),
+]);
+
 pub(super) const PDU_SESSION_RESOURCE_NOTIFY: IeProfile = IeProfile::new(&[
     IeRule::singleton(10, CRITICALITY_REJECT),  // AMF UE ID
     IeRule::singleton(85, CRITICALITY_REJECT),  // RAN UE ID
@@ -604,6 +619,8 @@ mod tests {
             DOWNLINK_NAS_TRANSPORT,
             UPLINK_NAS_TRANSPORT,
             PDU_SESSION_RESOURCE_NOTIFY,
+            PDU_SESSION_RESOURCE_MODIFY_REQUEST,
+            PDU_SESSION_RESOURCE_MODIFY_RESPONSE,
             NG_RESET,
             NG_RESET_ACKNOWLEDGE,
             ERROR_INDICATION,
