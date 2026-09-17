@@ -142,6 +142,14 @@ their procedure-specific applicability. Error Indication requires Cause or
 diagnostics, and both UE identifiers for UE-associated signalling. The caller
 chooses procedure triggers, correlates acknowledgements and performs cleanup.
 
+`notify` admits and constructs PDU Session Resource Notify with typed flow
+notifications, released flows and whole-session release reports. Present lists
+are nonempty, with unique and disjoint session/QFI domains. The caller verifies
+association, session ownership and whether a notified QFI is an established GBR
+flow; admission neither infers that state nor performs cleanup. The qualified
+root subset requires depth 10–12 depending on the contained reports. Alternative
+QoS, feedback and usage-report extensions remain unsupported.
+
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413
@@ -161,10 +169,12 @@ Canonical encoding uses explicit aligned-PER container framing instead of
 `rasn` 0.28's misaligned generated inner-container encoder. This includes
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
 Release 18 bytes for the 15 published-corpus outcomes, both additional UE request
-procedures, Reset/Reset Acknowledge/Error Indication, and 54 independent
+procedures, Reset/Reset Acknowledge/Error Indication, PDU Resource Notify, and 54 independent
 fragmentation boundary cases. The caller supplies already-encoded IE values; typed N3IWF
 resource transfers and presence rules beyond the documented NAS, release, NG Setup
-and context/session setup, release, UE request and Reset/Error subsets remain pending under #787. No
+and context/session setup, release, UE request, Reset/Error and Notify subsets
+remain pending under #787. The shared contained-field reader also rejects
+nonminimal length determinants for short values. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks

@@ -57,10 +57,10 @@ pub mod messages {
         DownlinkNASTransport, ErrorIndication, InitialContextSetupFailure,
         InitialContextSetupRequest, InitialContextSetupResponse, InitialUEMessage,
         NASNonDeliveryIndication, NGReset, NGResetAcknowledge, NGSetupFailure, NGSetupRequest,
-        NGSetupResponse, PDUSessionResourceReleaseCommand, PDUSessionResourceReleaseResponse,
-        PDUSessionResourceSetupRequest, PDUSessionResourceSetupResponse, Paging,
-        UEContextReleaseCommand, UEContextReleaseComplete, UEContextReleaseRequest,
-        UplinkNASTransport,
+        NGSetupResponse, PDUSessionResourceNotify, PDUSessionResourceReleaseCommand,
+        PDUSessionResourceReleaseResponse, PDUSessionResourceSetupRequest,
+        PDUSessionResourceSetupResponse, Paging, UEContextReleaseCommand, UEContextReleaseComplete,
+        UEContextReleaseRequest, UplinkNASTransport,
     };
 }
 
@@ -130,6 +130,8 @@ pub enum Message {
     DownlinkNasTransport(messages::DownlinkNASTransport),
     /// Uplink NAS Transport (initiating message, procedure code 46).
     UplinkNasTransport(messages::UplinkNASTransport),
+    /// PDU Session Resource Notify (initiating message, procedure code 30).
+    PduSessionResourceNotify(messages::PDUSessionResourceNotify),
     /// NG Reset (initiating message, procedure code 20).
     NgReset(messages::NGReset),
     /// NG Reset Acknowledge (successful outcome, procedure code 20).
@@ -256,6 +258,7 @@ impl fmt::Debug for Message {
             Self::UeContextReleaseComplete(message) => {
                 typed!("UeContextReleaseComplete", message)
             }
+            Self::PduSessionResourceNotify(message) => typed!("PduSessionResourceNotify", message),
             Self::NgReset(message) => typed!("NgReset", message),
             Self::NgResetAcknowledge(message) => typed!("NgResetAcknowledge", message),
             Self::ErrorIndication(message) => typed!("ErrorIndication", message),
@@ -279,6 +282,7 @@ const PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE: u8 = 28;
 const PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP: u8 = 29;
 const PROCEDURE_CODE_UE_CONTEXT_RELEASE: u8 = 41;
 const PROCEDURE_CODE_UPLINK_NAS_TRANSPORT: u8 = 46;
+const PROCEDURE_CODE_PDU_SESSION_RESOURCE_NOTIFY: u8 = 30;
 const PROCEDURE_CODE_NG_RESET: u8 = 20;
 const PROCEDURE_CODE_ERROR_INDICATION: u8 = 9;
 const PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION: u8 = 19;
@@ -489,6 +493,14 @@ fn decode_message(
             Criticality::ignore,
             policy::UPLINK_NAS_TRANSPORT,
             |ie| ie.id.0
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_NOTIFY) => decode_as!(
+            messages::PDUSessionResourceNotify,
+            PduSessionResourceNotify,
+            "pdu session resource notify",
+            Criticality::ignore,
+            policy::PDU_SESSION_RESOURCE_NOTIFY,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_NG_RESET) => decode_as!(
             messages::NGReset,

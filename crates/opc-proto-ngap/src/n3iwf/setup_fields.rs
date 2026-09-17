@@ -464,6 +464,9 @@ impl<'a> Reader<'a> {
             .input
             .get(start..)
             .ok_or_else(|| invalid("truncated octets"))?;
+        if matches!(tail, [0x80, second, ..] if *second < 128) {
+            return Err(invalid("nonminimal contained field length"));
+        }
         // A qualified small root cannot contain a 16K fragment. Reject before
         // the shared scanner would coalesce it; larger fields remain bounded
         // by the already checked enclosing input and physical fragment sizes.

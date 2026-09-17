@@ -534,3 +534,8 @@ fn decode_location(input: &[u8], ctx: DecodeContext) -> Result<N3iwfLocation, De
         Err(unsupported())
     }
 }
+
+/// Typed PDU Session Resource Notify construction and admission.
+pub mod notify;
+/// Qualified PDU Session Resource Notify fields and bounded session lists.
+pub mod notify_fields;

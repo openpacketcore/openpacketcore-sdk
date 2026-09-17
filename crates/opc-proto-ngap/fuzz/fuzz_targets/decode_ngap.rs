@@ -8,6 +8,9 @@ mod resource_setup;
 #[path = "../../tests/support/ue_requests.rs"]
 mod ue_requests;
 
+#[path = "../../tests/support/notify.rs"]
+mod notify;
+
 #[path = "../../tests/support/reset.rs"]
 mod reset;
 
@@ -48,6 +51,7 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    notify::exercise(data, decode, output);
     reset::exercise(data, decode, output);
     ue_requests::exercise(data, decode, output);
     resource_setup::exercise(data, decode, output);

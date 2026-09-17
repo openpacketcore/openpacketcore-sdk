@@ -394,3 +394,28 @@ Restrict diagnostic IE criticality to reject/notify and reject Error-only
 diagnostic header fields in Reset Acknowledge. These checks qualify fields;
 the caller still owns correlation, trigger selection, acknowledgement timing
 and resource effects.
+
+## PDU Session Resource Notify amendment (2026-09)
+
+Independent Release 18 probes qualify all 388 generated Notify-transfer
+encodings, but 387 nonempty generated decodes fail. The sole successful decode
+is an empty ASN.1 root without a report. Use a bounded explicit receiver only
+for that nested transfer, preserving generated encoding. Generated released
+transfers pass all 64 cases and both session-list roots pass all 262/257 cases
+in both directions; retain these paths with physical preflight.
+
+The independent oracle supplies 971 fields and 43 complete messages. Both
+unmodified reference encoders agree and the structured decoder checks the
+input values. Enforce complete root framing, zero padding, count/depth/byte
+budgets and unique, disjoint identifiers before materializing output vectors.
+Generated encoders receive an exact output-capacity check first. Reject
+nonminimal contained-field length determinants: an initial regression accepted
+the two-octet form for a short value, so this shared guard tightens existing
+contained-field readers too. Schema and dependencies remain unchanged.
+
+Expose root notification status, released QFI/Cause reports and whole-session
+release reports without inferring resource state. Require at least one report
+at each message/transfer boundary. Caller-owned state determines association,
+session/QFI ownership and whether a notified QFI is an established GBR flow;
+the codec does not choose triggers or perform cleanup. Extension reports need
+separate independent qualification before admission.
