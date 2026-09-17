@@ -116,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- **Consume-once N3IWF protocol-key custody — `opc-proto-ikev2`:** zeroizing
+  K_N3IWF import binds an opaque association, generation, pending operation
+  and negotiated profile. One attempt computes both directional AUTH MICs
+  through the admitted IKE module; cancellation, release, replacement and
+  drop revoke custody. The handle has no key-byte export or envelope-handle
+  conversion. Independent synthetic AUTH vectors and lifecycle/provider tests
+  cover this volatile software contract; sealing, restore and live peer
+  interoperability remain unsupported (Refs #791).
 - **Bounded acknowledged configuration history — `opc-persist`:** the existing
   consensus authority commits exact-head retention decisions with record and
   encoded-byte limits, authenticated cursor boundaries, and protected rollback
