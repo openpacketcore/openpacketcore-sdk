@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- Publish XFRM recovery-test readiness only after the complete record is
+  written and synced. Preserve exclusive publication and strict malformed
+  record refusal across the single-object, roster and SA relocation harnesses
+  (Refs #793).
 - `opc-route-steering`: schedule independent exact route/rule operations and
   non-overlapping owned collections concurrently with bounded workers. Retain
   conflicting-key exclusion through dispatched verification and rollback after
