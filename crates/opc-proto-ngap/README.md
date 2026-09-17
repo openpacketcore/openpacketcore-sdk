@@ -106,6 +106,14 @@ pdu.encode(
 
 ## Status And Limits
 
+`n3iwf::resource_request::SetupRequestTransfer` constructs and admits the
+nested request transfer for a bounded non-GBR 5QI 9 subset. It requires an UL
+tunnel, session AMBR, session type and unique QoS flows. `resource_fields`
+keeps uplink and downlink endpoint types separate. Other QoS profiles and
+recognized optional transfer fields fail explicitly. Outer resource lists,
+response/failure transfers and enclosing context/resource messages remain
+pending; the codec does not create a session or configure a tunnel.
+
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413

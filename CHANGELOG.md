@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: admit and construct a bounded PDU-session setup-request
+  transfer with distinct UL/DL tunnel fields, session AMBR, root session types
+  and unique non-GBR 5QI 9 flows. Preserve nested unknown/duplicate IE policies;
+  require conditional AMBR and reject unimplemented known fields. Independent
+  Release 18 vectors qualify the nested QoS framing fix (Refs #787).
 - `opc-proto-ngap`: bounded standalone GUAMI and Allowed NSSAI field codecs,
   plus construction-only UE security algorithm masks. Independent Release 18
   vectors cover every root list length, optional slice differentiators and

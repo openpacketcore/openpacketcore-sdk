@@ -288,12 +288,12 @@ pub(super) fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeErr
     Ok(result)
 }
 
-fn write_prefix(out: &mut Vec<u8>, count: usize) {
+pub(super) fn write_prefix(out: &mut Vec<u8>, count: usize) {
     out.push(0); // No SEQUENCE extension additions; zero alignment bits.
     out.extend_from_slice(&(count as u16).to_be_bytes()); // preflighted
 }
 
-fn write_ie(out: &mut Vec<u8>, id: u16, criticality: u8, value: &[u8]) {
+pub(super) fn write_ie(out: &mut Vec<u8>, id: u16, criticality: u8, value: &[u8]) {
     out.extend_from_slice(&id.to_be_bytes());
     out.push(criticality << 6);
     write_open_type(out, value);

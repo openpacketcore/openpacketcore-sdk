@@ -445,6 +445,28 @@ pub(super) const NG_SETUP_FAILURE: IeProfile = IeProfile::new(&[
     IeRule::singleton(19, CRITICALITY_IGNORE),  // id-CriticalityDiagnostics
 ]);
 
+// Nested transfer metadata is the independently compiled TS 38.413 V18.10.0
+// NGAP-IEs object set, recorded with its oracle. Optional known fields outside
+// the admitted resource subset remain recognized, so they fail explicitly.
+pub(super) const PDU_SESSION_RESOURCE_SETUP_REQUEST_TRANSFER: IeProfile = IeProfile::new(&[
+    IeRule::singleton(130, CRITICALITY_REJECT), // PDUSessionAggregateMaximumBitRate
+    IeRule::singleton(139, CRITICALITY_REJECT), // UPTransportLayerInformation
+    IeRule::singleton(126, CRITICALITY_REJECT), // UPTransportLayerInformationList
+    IeRule::singleton(127, CRITICALITY_REJECT), // DataForwardingNotPossible
+    IeRule::singleton(134, CRITICALITY_REJECT), // PDUSessionType
+    IeRule::singleton(138, CRITICALITY_REJECT), // SecurityIndication
+    IeRule::singleton(129, CRITICALITY_REJECT), // NetworkInstance
+    IeRule::singleton(136, CRITICALITY_REJECT), // QosFlowSetupRequestList
+    IeRule::singleton(166, CRITICALITY_IGNORE), // CommonNetworkInstance
+    IeRule::singleton(22, CRITICALITY_IGNORE),  // DirectForwardingPathAvailability
+    IeRule::singleton(195, CRITICALITY_IGNORE), // UPTransportLayerInformation
+    IeRule::singleton(186, CRITICALITY_IGNORE), // UPTransportLayerInformationList
+    IeRule::singleton(190, CRITICALITY_IGNORE), // CommonNetworkInstance
+    IeRule::singleton(197, CRITICALITY_IGNORE), // RedundantPDUSessionInformation
+    IeRule::singleton(318, CRITICALITY_IGNORE), // MBSSessionSetupRequestList
+    IeRule::singleton(394, CRITICALITY_IGNORE), // TLContainer
+]);
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

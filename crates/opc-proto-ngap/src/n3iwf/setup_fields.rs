@@ -450,7 +450,7 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
-    fn align(&mut self) -> Result<(), DecodeError> {
+    pub(super) fn align(&mut self) -> Result<(), DecodeError> {
         let padding = (8 - self.bit % 8) % 8;
         if self.bits(padding)? != 0 {
             return Err(invalid("setup field padding"));
@@ -540,7 +540,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-// Writes only the independently qualified PLMN/slice and Allowed NSSAI roots.
+// Writes only the independently qualified identity/slice and 5QI 9 list roots.
 // Buffer allocation follows exact sizing; checked writes fail if those layouts
 // ever diverge. It does not encode extension additions or arbitrary ASN.1.
 pub(super) struct Writer {
@@ -565,7 +565,7 @@ impl Writer {
         }
         Ok(())
     }
-    fn align(&mut self) {
+    pub(super) fn align(&mut self) {
         self.bit = self.bit.div_ceil(8) * 8;
     }
     fn octets(&mut self, value: [u8; 3]) -> Result<(), EncodeError> {
