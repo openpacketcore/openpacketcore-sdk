@@ -21,8 +21,9 @@
 //! their legacy static/untagged wire behavior. Exact cleanup therefore uses
 //! [`RouteSteeringBackend::remove_converged_route`] and
 //! [`RouteSteeringBackend::remove_converged_rule`], never a legacy delete.
-//! Every read/mutation is serialized across clones that share one backend
-//! instance. The protocol value is a namespace-local ownership reservation,
+//! Conflicting reads/mutations are serialized across clones of one backend;
+//! independent exact keys can progress concurrently with bounded workers.
+//! The protocol value is a namespace-local ownership reservation,
 //! not authentication: separate backend instances and external netlink writers
 //! still require one orchestration-level authority.
 //!
@@ -37,6 +38,7 @@ pub mod error;
 pub mod linux;
 pub mod mock;
 pub mod model;
+mod scheduling;
 pub mod unsupported;
 mod validation;
 
