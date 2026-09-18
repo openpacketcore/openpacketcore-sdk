@@ -14,7 +14,11 @@
 //! Async mutations still require real quorum replication and committed apply;
 //! disk persistence may lag success. Every existing Async root must rejoin a
 //! surviving live quorum through [`ConsensusSessionStore::initialize_cluster`].
-//! An all-cold quorum cannot recover authority from local generations alone.
+//! Losing a live majority, including a two-of-three restart with one survivor,
+//! currently prevents automatic recovery. An all-cold quorum has the same
+//! limitation. The lost tail can contain issued fencing credentials and lease
+//! revocations; local generations cannot safely reauthorize those effects.
+//! Remaining fenced preserves safety but does not constitute service recovery.
 //! Use [`ConsensusSessionStore::probe_fixed_quorum_readiness`] to gate traffic;
 //! [`SessionPersistenceHealth`] and an explicit local persistence drain are
 //! observations of local storage, not quorum-durability proofs.

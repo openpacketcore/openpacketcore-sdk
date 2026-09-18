@@ -449,6 +449,15 @@ successful initialization or traffic authority. An all-cold quorum stays
 closed; local disk progress, cached responses, and recreating storage do not
 supply a supported recovery authority.
 
+This includes a two-of-three restart with one process surviving: retained
+storage alone cannot currently restore service. A fenced installation is an
+availability failure. The lost Async tail can include issued fences and
+revocation of older leases, even when the survivor stayed alive. Selecting the
+highest local generation or waiting for a lease timeout cannot establish a
+safe successor. [SDK #908 recovery evidence](../../docs/async-majority-recovery-908.md)
+records the executable regression and the missing durable or external
+authority; no majority-loss recovery API is supplied by the current contract.
+
 If a restarted voter lost a previously acknowledged volatile tail, its
 certified live leader restores that prefix through ordinary snapshot
 installation and a real matching append. Recovery preserves the leader's vote

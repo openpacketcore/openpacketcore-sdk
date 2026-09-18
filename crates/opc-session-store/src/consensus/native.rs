@@ -835,6 +835,28 @@ impl NativeState {
         self.keys.get(key).map_or(0, |state| state.fence)
     }
 
+    /// Raw allocator frontiers, independent of traffic or lease admission.
+    #[cfg(test)]
+    pub(crate) fn authority_frontiers_for_test(&self) -> (u64, u64) {
+        (self.frontiers.next_fence, self.frontiers.next_credential)
+    }
+
+    /// Read a retained credential without applying the mutation validator.
+    #[cfg(test)]
+    pub(crate) fn retained_lease_for_test(&self, key: &SessionKey) -> Option<LeaseGuard> {
+        let lease = self.keys.get(key)?.lease.as_ref()?;
+        lease.active.then(|| {
+            Some(LeaseGuard::new(
+                key.clone(),
+                lease.owner.clone(),
+                lease.fence,
+                lease.acquired_at?,
+                lease.guard_expires_at,
+                lease.credential_id,
+            ))
+        })?
+    }
+
     /// Number of receipts whose response bytes reside in an admitted prefix.
     /// A positive count proves a cold witness actually exercised that path.
     #[cfg(test)]

@@ -148,7 +148,14 @@ impl Fleet {
     }
 }
 
-async fn retained_majority_returns(mode: SessionPersistenceMode) {
+#[derive(Clone, Copy)]
+enum Restart {
+    Sequential,
+    Majority,
+    AllCold,
+}
+
+async fn retained_roots_return(mode: SessionPersistenceMode, restart: Restart) {
     let mut fleet = Fleet::new(mode);
     let result = AssertUnwindSafe(async {
         for index in 0..3 {
@@ -204,33 +211,63 @@ async fn retained_majority_returns(mode: SessionPersistenceMode) {
                     .expect("fully persisted baseline");
             }
         }
-        let returning = (0..3)
-            .filter(|index| *index != survivor)
-            .collect::<Vec<_>>();
-        for index in &returning {
-            fleet.close(*index).await;
+        // A retired store clone still owns its backing handle. Keep the
+        // original handle only in the scenario that preserves that process.
+        let original = if matches!(restart, Restart::Majority) {
+            Some(original)
+        } else {
+            drop(original);
+            None
+        };
+        match restart {
+            Restart::Sequential => {
+                for index in 0..3 {
+                    fleet.close(index).await;
+                    fleet.open(index).await;
+                    assert!(
+                        fleet.admit().await,
+                        "each sequential return must recover authority"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+            }
+            Restart::Majority | Restart::AllCold => {
+                let returning = (0..3)
+                    .filter(|index| matches!(restart, Restart::AllCold) || *index != survivor)
+                    .collect::<Vec<_>>();
+                for index in &returning {
+                    fleet.close(*index).await;
+                }
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                if let Some(original) = &original {
+                    assert!(
+                        !original
+                            .probe_fixed_quorum_readiness()
+                            .await
+                            .traffic_authority()
+                            .is_granted(),
+                        "absence of a majority must withhold fresh quorum authority"
+                    );
+                } else {
+                    assert!(fleet.stores.iter().all(Option::is_none));
+                }
+                for index in &returning {
+                    fleet.open(*index).await;
+                }
+                assert!(
+                    fleet.admit().await,
+                    "retained voter return must recover safe usable authority"
+                );
+                if let Some(original) = &original {
+                    assert!(
+                        original.persistence_health().engine_running,
+                        "the original survivor must remain in the same engine incarnation"
+                    );
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(
-            !original
-                .probe_fixed_quorum_readiness()
-                .await
-                .traffic_authority()
-                .is_granted(),
-            "a lone survivor must not grant fresh quorum authority"
-        );
-        for index in &returning {
-            fleet.open(*index).await;
-        }
-        assert!(
-            fleet.admit().await,
-            "retained two-of-three return must recover safe usable authority"
-        );
-        assert!(
-            original.persistence_health().engine_running,
-            "the original survivor must remain in the same engine incarnation"
-        );
-        let next = original
+        let recovered = fleet.store(survivor);
+        let next = recovered
             .acquire(
                 &key,
                 OwnerId::new("after-restart").unwrap(),
@@ -248,7 +285,7 @@ async fn retained_majority_returns(mode: SessionPersistenceMode) {
             .await
             .unwrap();
         assert_eq!(
-            original
+            recovered
                 .compare_and_set(CompareAndSet {
                     key: key.clone(),
                     lease: next,
@@ -260,11 +297,11 @@ async fn retained_majority_returns(mode: SessionPersistenceMode) {
             CompareAndSetResult::Success
         );
         assert!(
-            original.delete_fenced(&old).await.is_err(),
+            recovered.delete_fenced(&old).await.is_err(),
             "old authority must not mutate its successor"
         );
         assert!(
-            original
+            recovered
                 .get(&key)
                 .await
                 .unwrap()
@@ -282,13 +319,40 @@ async fn retained_majority_returns(mode: SessionPersistenceMode) {
 
 #[test]
 fn async_two_of_three_retained_roots_recover_over_mtls() {
-    run_openraft_fleet_test(4, retained_majority_returns(SessionPersistenceMode::Async));
+    run_openraft_fleet_test(
+        4,
+        retained_roots_return(SessionPersistenceMode::Async, Restart::Majority),
+    );
 }
 
 #[test]
 fn durable_two_of_three_retained_roots_recover_over_mtls() {
     run_openraft_fleet_test(
         4,
-        retained_majority_returns(SessionPersistenceMode::Durable),
+        retained_roots_return(SessionPersistenceMode::Durable, Restart::Majority),
+    );
+}
+
+#[test]
+fn async_sequential_retained_roots_recover_over_mtls() {
+    run_openraft_fleet_test(
+        4,
+        retained_roots_return(SessionPersistenceMode::Async, Restart::Sequential),
+    );
+}
+
+#[test]
+fn async_all_cold_retained_roots_recover_over_mtls() {
+    run_openraft_fleet_test(
+        4,
+        retained_roots_return(SessionPersistenceMode::Async, Restart::AllCold),
+    );
+}
+
+#[test]
+fn durable_all_cold_retained_roots_recover_over_mtls() {
+    run_openraft_fleet_test(
+        4,
+        retained_roots_return(SessionPersistenceMode::Durable, Restart::AllCold),
     );
 }

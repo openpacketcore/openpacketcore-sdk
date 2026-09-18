@@ -238,6 +238,45 @@ snapshots, equal indices, or waiting longer do not manufacture a surviving
 quorum. Destroying/recreating backing is not a supported recovery workflow.
 Async can lose acknowledged results if the live volatile quorum is lost.
 
+### Majority-loss authority gap (SDK #908)
+
+This restriction also prevents an existing three-voter installation from
+recovering when two voters restart and one process survives. It is an
+availability limitation, not a successful recovery outcome. Fully persisted
+returning roots do not, under the current protocol, remove the restriction.
+
+Acknowledged loss includes authority state: a majority can issue higher lease
+fences and credentials, and revoke earlier credentials, while its generation
+writers lag. An isolated survivor can miss that entire committed tail. After
+the majority restarts, every available copy can contain the revoked predecessor
+credential and allocator frontiers below already issued values. Selecting the
+highest retained generation or promoting the survivor cannot reconstruct the
+missing upper bounds. Expiring a local timer does not reconstruct votes, revoke
+delayed external effects, or prove a new fence exceeds every old fence.
+
+Automatic recovery under the unchanged root and external-fence contract is
+therefore not established. A compatible implementation needs authority that
+survives *before* acknowledging work: either durable Raft vote/log evidence
+covering those effects, or a separately specified durable recovery protocol
+with reserved fence/credential bounds and an incarnation authority enforced at
+every affected effect boundary. Such a protocol must serialize competing
+recoveries, bind the exact retained roots and membership, retire old accepted
+work, and recover after interruption before admitting normal Openraft work.
+Installing new metadata after losing the tail cannot prove its missing bound.
+
+An explicit lossy recovery instead needs an external authority that can revoke
+the lost incarnation at all affected consumers and effects, select a successor
+scope, and authorize that exact transition. A confirmation of data loss or the
+existing topology/Recovery identity alone supplies none of these facts. The
+existing operator-recovery workflow commits credential invalidation using
+Openraft; it does not supply a missing live quorum for native Async admission.
+Neither a storage reset nor an unchecked epoch increment is a recovery API.
+
+The executable reproduction and counterexample are recorded in
+[`docs/async-majority-recovery-908.md`](../async-majority-recovery-908.md).
+They establish the missing authority and leave the availability assertions
+failing; they do not introduce a recovery mechanism or qualify product HA.
+
 ## Mode isolation and traffic authority
 
 The persistence choice is immutable for a root and must agree across all
