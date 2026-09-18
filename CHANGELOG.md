@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-sctp`: add an explicitly unprotected N2 profile and live adapter with
+  strict PPID 60, the default NGAP service port, bounded ordered records,
+  separate notification delivery and redacted diagnostics. Reuse existing
+  partial-receive ownership; reject PPID 66 and incomplete metadata before
+  exposing payloads. Generation fencing and restart remain separate work
+  (Refs #788).
 - `opc-proto-eap`: add bounded EAP-5G bootstrap envelopes with typed AN
   parameters, opaque NAS forwarding, explicit duplicate and presence policy,
   canonical construction and redacted diagnostics (Refs #785).
