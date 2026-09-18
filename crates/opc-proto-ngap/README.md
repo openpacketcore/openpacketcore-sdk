@@ -127,7 +127,11 @@ a single-downlink setup response with unique accepted/failed QFI results and
 a root-Cause unsuccessful transfer. `session_lists` adds bounded request,
 successful and failed session lists for context and PDU Setup procedures,
 with unique session IDs, optional NAS, slice values and disjoint partial
-results. `resource_setup` composes these fields into Initial Context Setup
+results. Initial Context Request also preserves optional old/extended AMF
+names, masked identity, partial slices and bounded root Trace Activation
+parameters. Partial slices retain combined-count and overlap checks; trace
+parameters do not start tracing. See the [field contract](CONFORMANCE.md#initial-context-and-pdu-session-resource-setup-messages).
+`resource_setup` composes these fields into Initial Context Setup
 Request/Response/Failure and PDU Session Resource Setup Request/Response.
 Admission checks required and conditional presence, contained transfers and
 partial results; these values do not configure a session or tunnel. Requests

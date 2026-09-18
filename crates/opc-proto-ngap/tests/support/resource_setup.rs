@@ -1,6 +1,9 @@
 //! Shared fuzz/replay assertions. Synthetic key and NAS comparisons never
 //! print values, including on failure.
 
+#[path = "context_optionals.rs"]
+pub mod context_optionals;
+
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::context_fields::SecurityAlgorithmMasks;
 use opc_proto_ngap::n3iwf::resource_setup::ResourceSetupMessage;
@@ -14,12 +17,20 @@ pub fn exercise(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
         max_ies: 256,
         ..ctx
     };
+    exercise_bounded(data, ctx, output);
+}
+
+pub fn exercise_bounded(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
+    context_optionals::exercise_leaf(data, ctx, output);
     let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), ctx) else {
         return;
     };
-    let Ok(admitted) = ResourceSetupMessage::from_pdu(&pdu, ctx) else {
+    let Ok(mut admitted) = ResourceSetupMessage::from_pdu(&pdu, ctx) else {
         return;
     };
+    if let ResourceSetupMessage::InitialRequest(value) = &mut admitted.message {
+        context_optionals::reconstruct(value);
+    }
     let constructed = match &admitted.message {
         ResourceSetupMessage::InitialRequest(value) => {
             value.construct(SecurityAlgorithmMasks::new(1, 2, 4, 8), ctx)
@@ -48,6 +59,9 @@ pub fn exercise(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
             assert!(a.guami == b.guami && a.allowed == b.allowed);
             assert!(a.key.expose_bytes() == b.key.expose_bytes());
             assert!(a.aggregate_bit_rate == b.aggregate_bit_rate);
+            assert!(a.old_amf == b.old_amf && a.extended_old_amf == b.extended_old_amf);
+            assert!(a.trace == b.trace && a.masked_imeisv == b.masked_imeisv);
+            assert!(a.partially_allowed_nssai == b.partially_allowed_nssai);
             assert!(a.nas.as_ref().map(|n| n.as_bytes()) == b.nas.as_ref().map(|n| n.as_bytes()));
             match (&a.sessions, &b.sessions) {
                 (Some(a), Some(b)) => same_requests(a, b),

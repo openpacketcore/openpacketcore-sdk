@@ -145,6 +145,8 @@ pub mod resource_setup;
 pub mod session_lists;
 pub mod setup;
 pub mod setup_fields;
+/// Bounded root Trace Activation parameters without trace authority.
+pub mod trace_fields;
 /// NAS Non-Delivery Indication and UE Context Release Request field admission.
 pub mod ue_requests;
 
