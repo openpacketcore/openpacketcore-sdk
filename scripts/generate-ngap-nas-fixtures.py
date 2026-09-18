@@ -165,6 +165,96 @@ def main():
         assert all(
             row["reference_error"] is None for row in cases if row.get("construct")
         )
+
+        # These independently encoded optional fields reuse existing SDK leaf
+        # contracts only after whole-message admission is qualified. Establish
+        # each binding directly from the pinned Release 18 object set.
+        for message, ident, name in (
+            ("InitialUEMessage", 0, "AllowedNSSAI"),
+            ("DownlinkNASTransport", 0, "AllowedNSSAI"),
+            ("DownlinkNASTransport", 48, "AMFName"),
+        ):
+            row = next(row for row in reference.rows(message) if row["id"] == ident)
+            assert row["presence"] == "optional"
+            assert row["criticality"] == "reject"
+            assert row["Value"]._typeref.called[1] == name
+
+        def allowed_field(model):
+            return {
+                "id": 0,
+                "criticality": "reject",
+                "value": {
+                    "type": "AllowedNSSAI",
+                    "value": [
+                        {
+                            "s-NSSAI": {
+                                "sST": {"hex": f"{item['sst']:02x}"},
+                                **({"sD": {"hex": item["sd"]}} if item["sd"] is not None else {}),
+                            }
+                        }
+                        for item in model
+                    ],
+                },
+            }
+
+        def old_amf_field(name):
+            return {"id": 48, "criticality": "reject", "value": {"type": "AMFName", "value": name}}
+
+        for message in ("InitialUEMessage", "DownlinkNASTransport"):
+            for count in range(1, 9):
+                for mode in range(3):
+                    model = [
+                        {"sst": (index * 37) % 256, "sd": (
+                            ("000000" if index % 2 == 0 else "ffffff")
+                            if mode == 2 or (mode == 1 and index % 2) else None
+                        )}
+                        for index in range(count)
+                    ]
+                    recipe = copy.deepcopy(recipes[message])
+                    fields(recipe).append(allowed_field(model))
+                    record(f"allowed-{message}-{count}-{mode}", recipe,
+                           construct=True, optional_fields=True, allowed_nssai=model)
+        for length in (1, 2, 127, 128, 149, 150):
+            name = "A" * length
+            recipe = copy.deepcopy(recipes["DownlinkNASTransport"])
+            fields(recipe).append(old_amf_field(name))
+            record(f"old-amf-{length}", recipe, construct=True, optional_fields=True, old_amf=name)
+        model = [{"sst": 255, "sd": "ffffff"}, {"sst": 0, "sd": None}]
+        recipe = copy.deepcopy(recipes["DownlinkNASTransport"])
+        fields(recipe).extend([allowed_field(model), old_amf_field("AMF-TEST-1")])
+        record("allowed-and-old-amf", recipe, construct=True, optional_fields=True,
+               allowed_nssai=model, old_amf="AMF-TEST-1")
+        fields(recipe).reverse()
+        record("allowed-and-old-amf-reordered", recipe, optional_fields=True,
+               allowed_nssai=model, old_amf="AMF-TEST-1")
+
+        for message, field in (
+            ("InitialUEMessage", allowed_field(model)),
+            ("DownlinkNASTransport", allowed_field(model)),
+            ("DownlinkNASTransport", old_amf_field("AMF-TEST-1")),
+        ):
+            for criticality in ("ignore", "notify"):
+                recipe = copy.deepcopy(recipes[message])
+                changed = copy.deepcopy(field)
+                changed["criticality"] = criticality
+                fields(recipe).append(changed)
+                record(f"optional-criticality-{message}-{field['id']}-{criticality}",
+                       recipe, optional_fields=True, invalid_optional_id=field["id"])
+                assert cases[-1]["reference_error"] == "ie-criticality"
+            recipe = copy.deepcopy(recipes[message])
+            first = copy.deepcopy(field)
+            if field["id"] == 0:
+                first_model = [{"sst": 1, "sd": "010203"}]
+                first = allowed_field(first_model)
+                expectations = {"first_allowed_nssai": first_model, "last_allowed_nssai": model}
+            else:
+                first = old_amf_field("AMF-OTHER")
+                expectations = {"first_old_amf": "AMF-OTHER", "last_old_amf": "AMF-TEST-1"}
+            fields(recipe).extend([first, copy.deepcopy(field)])
+            record(f"optional-duplicate-{message}-{field['id']}", recipe,
+                   optional_fields=True, duplicate_id=field["id"], **expectations)
+            assert cases[-1]["reference_error"] == "duplicate-ie"
+        assert all(row["reference_error"] is None for row in cases if row.get("construct"))
     args.output.write_text(
         json.dumps(
             {"source_sha256": SPEC_SHA256, "reference_tools": VERSIONS, "cases": cases},

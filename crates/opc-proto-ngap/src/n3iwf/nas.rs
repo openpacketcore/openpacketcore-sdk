@@ -8,6 +8,8 @@
 //! cannot silently enable a partial procedure. The source PDU retains all bytes
 //! required by its existing raw-preservation contract.
 
+use super::context_fields::AllowedNssai;
+use super::setup_fields::AmfName;
 use super::*;
 use crate::{policy, Message, MessageType, Pdu, PduKind, ProtocolIe};
 use opc_protocol::Encode;
@@ -86,6 +88,8 @@ pub enum NasMessage<'a> {
         selected_plmn: Option<PlmnId>,
         /// Whether UE context establishment is requested.
         context_requested: bool,
+        /// Optional advertised slices. Admission grants no slice authorization.
+        allowed_nssai: Option<AllowedNssai>,
     },
     /// Downlink NAS Transport (initiating procedure 4).
     Downlink {
@@ -97,6 +101,10 @@ pub enum NasMessage<'a> {
         nas: NasPdu<'a>,
         /// Applicable optional rate limit; never treated as a receiver-ignored IE.
         aggregate_bit_rate: Option<UeAggregateBitRate>,
+        /// Optional advertised slices. Admission grants no slice authorization.
+        allowed_nssai: Option<AllowedNssai>,
+        /// Previous AMF name, without selecting or authorizing an AMF.
+        old_amf: Option<AmfName>,
     },
     /// Uplink NAS Transport (initiating procedure 46).
     Uplink {
@@ -151,6 +159,7 @@ impl NasMessage<'_> {
                 cause,
                 selected_plmn,
                 context_requested,
+                allowed_nssai,
             } => {
                 fields.push((
                     85,
@@ -188,6 +197,13 @@ impl NasMessage<'_> {
                             .map_err(encode_error)?,
                     ));
                 }
+                if let Some(slices) = allowed_nssai {
+                    fields.push((
+                        0,
+                        Criticality::reject,
+                        slices.encode(output).map_err(encode_error)?,
+                    ));
+                }
                 MessageType::InitialUeMessage
             }
             Self::Downlink {
@@ -195,6 +211,8 @@ impl NasMessage<'_> {
                 ran,
                 nas,
                 aggregate_bit_rate,
+                allowed_nssai,
+                old_amf,
             } => {
                 fields.push((
                     10,
@@ -216,6 +234,20 @@ impl NasMessage<'_> {
                         110,
                         Criticality::ignore,
                         rate.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(slices) = allowed_nssai {
+                    fields.push((
+                        0,
+                        Criticality::reject,
+                        slices.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(name) = old_amf {
+                    fields.push((
+                        48,
+                        Criticality::reject,
+                        name.encode(output).map_err(encode_error)?,
                     ));
                 }
                 MessageType::DownlinkNasTransport
@@ -319,12 +351,12 @@ fn admit<'a>(
     let (profile, supported, ignored): (policy::IeProfile, &[u16], &[u16]) = match kind {
         MessageType::InitialUeMessage => (
             policy::INITIAL_UE_MESSAGE,
-            &[85, 38, 121, 90, 174, 112],
+            &[85, 38, 121, 90, 174, 112, 0],
             &[201, 224, 225, 227, 259, 333, 402, 427],
         ),
         MessageType::DownlinkNasTransport => (
             policy::DOWNLINK_NAS_TRANSPORT,
-            &[10, 85, 38, 110],
+            &[10, 85, 38, 110, 0, 48],
             &[
                 83, 36, 31, 177, 205, 206, 209, 222, 117, 228, 226, 264, 334, 400,
             ],
@@ -340,6 +372,8 @@ fn admit<'a>(
     let mut selected_plmn = None;
     let mut context_requested = false;
     let mut aggregate_bit_rate = None;
+    let mut allowed_nssai = None;
+    let mut old_amf = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     let leaf_ctx = DecodeContext {
@@ -366,6 +400,8 @@ fn admit<'a>(
             continue;
         }
         match id {
+            0 => allowed_nssai = Some(AllowedNssai::decode(value, leaf_ctx)?),
+            48 => old_amf = Some(AmfName::decode(value, leaf_ctx)?),
             10 => amf = Some(AmfUeId::decode(value, leaf_ctx)?),
             85 => ran = Some(RanUeId::decode(value, leaf_ctx)?),
             38 => nas = Some(NasPdu::decode(value, leaf_ctx)?),
@@ -397,12 +433,15 @@ fn admit<'a>(
             cause: cause.ok_or_else(|| invalid("missing establishment cause"))?,
             selected_plmn,
             context_requested,
+            allowed_nssai,
         },
         MessageType::DownlinkNasTransport => NasMessage::Downlink {
             amf: amf.ok_or_else(|| invalid("missing amf ue id"))?,
             ran,
             nas,
             aggregate_bit_rate,
+            allowed_nssai,
+            old_amf,
         },
         MessageType::UplinkNasTransport => NasMessage::Uplink {
             amf: amf.ok_or_else(|| invalid("missing amf ue id"))?,

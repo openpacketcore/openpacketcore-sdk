@@ -1,13 +1,20 @@
 //! Complete-message vectors from an independent Release 18 compiler.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/nas.rs"]
+mod shared;
+
+use bytes::Bytes;
+use opc_proto_ngap::n3iwf::context_fields::AllowedNssai;
 use opc_proto_ngap::n3iwf::nas::{EstablishmentCause, NasMessage, UeAggregateBitRate};
+use opc_proto_ngap::n3iwf::setup_fields::AmfName;
 use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, TrackingArea};
 use opc_proto_ngap::{decode, encode, Criticality, Message, MessageType, Pdu, PduKind, ProtocolIe};
 use opc_protocol::{
-    DecodeContext, DuplicateIePolicy, EncodeContext, UnknownIePolicy, ValidationLevel,
+    BorrowDecode, DecodeContext, DuplicateIePolicy, EncodeContext, OwnedDecode, UnknownIePolicy,
+    ValidationLevel,
 };
-use opc_types::PlmnId;
+use opc_types::{PlmnId, Snssai};
 use serde_json::Value;
 
 fn context() -> DecodeContext {
@@ -55,6 +62,21 @@ fn cause(value: &str) -> EstablishmentCause {
     }
 }
 
+fn allowed(value: &Value) -> Option<AllowedNssai> {
+    value.as_array().map(|values| {
+        AllowedNssai::new(
+            values
+                .iter()
+                .map(|v| match v["sd"].as_str() {
+                    Some(sd) => Snssai::with_sd(v["sst"].as_u64().unwrap() as u8, sd).unwrap(),
+                    None => Snssai::without_sd(v["sst"].as_u64().unwrap() as u8),
+                })
+                .collect(),
+        )
+        .unwrap()
+    })
+}
+
 fn construct(row: &Value) -> NasMessage<'static> {
     let amf = AmfUeId::new(0x0102030405).unwrap();
     let ran = RanUeId::new(0x10203040);
@@ -70,6 +92,7 @@ fn construct(row: &Value) -> NasMessage<'static> {
                 .unwrap_or(true)
                 .then(|| PlmnId::new("001", "01").unwrap()),
             context_requested: row["context_requested"].as_bool().unwrap_or(false),
+            allowed_nssai: allowed(&row["allowed_nssai"]),
         },
         "DownlinkNASTransport" => NasMessage::Downlink {
             amf,
@@ -78,6 +101,10 @@ fn construct(row: &Value) -> NasMessage<'static> {
             aggregate_bit_rate: row["downlink"]
                 .as_u64()
                 .map(|dl| UeAggregateBitRate::new(dl, row["uplink"].as_u64().unwrap()).unwrap()),
+            allowed_nssai: allowed(&row["allowed_nssai"]),
+            old_amf: row["old_amf"]
+                .as_str()
+                .map(|name| AmfName::new(name).unwrap()),
         },
         "UplinkNASTransport" => NasMessage::Uplink {
             amf,
@@ -87,6 +114,43 @@ fn construct(row: &Value) -> NasMessage<'static> {
         },
         _ => panic!("reference message"),
     }
+}
+
+#[test]
+fn independently_encoded_optional_fields_are_admitted() {
+    let oracle = oracle();
+    let mut checked = 0;
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["optional_fields"] == true && row["reference_error"].is_null())
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        let pdu = decode(&wire, context()).unwrap();
+        assert!(
+            NasMessage::from_pdu(&pdu, context()).is_ok(),
+            "independent applicable NAS optional field was not admitted"
+        );
+        let admitted = NasMessage::from_pdu(&pdu, context()).unwrap();
+        match admitted.message {
+            NasMessage::InitialUe { allowed_nssai, .. } => {
+                assert!(allowed_nssai == allowed(&row["allowed_nssai"]));
+            }
+            NasMessage::Downlink {
+                allowed_nssai,
+                old_amf,
+                ..
+            } => {
+                assert!(allowed_nssai == allowed(&row["allowed_nssai"]));
+                assert!(old_amf.as_ref().map(AmfName::as_str) == row["old_amf"].as_str());
+            }
+            _ => panic!("optional field oracle outcome"),
+        }
+        assert!(pdu.raw.as_ref() == wire);
+        checked += 1;
+    }
+    assert!(checked == 56, "optional field oracle coverage changed");
 }
 
 #[test]
@@ -119,6 +183,7 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                 cause: observed,
                 selected_plmn,
                 context_requested,
+                allowed_nssai,
             } => {
                 assert!(ran.value() == 0x10203040);
                 assert!(nas.as_bytes() == [0x7e, 0, 0x64, 0x14]);
@@ -133,12 +198,15 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                     *context_requested,
                     row["context_requested"].as_bool().unwrap_or(false)
                 );
+                assert!(*allowed_nssai == allowed(&row["allowed_nssai"]));
             }
             NasMessage::Downlink {
                 amf,
                 ran,
                 nas,
                 aggregate_bit_rate,
+                allowed_nssai,
+                old_amf,
             } => {
                 assert!(amf.value() == 0x0102030405);
                 assert!(ran.value() == 0x10203040);
@@ -150,6 +218,8 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                 assert!(
                     aggregate_bit_rate.map(UeAggregateBitRate::uplink) == row["uplink"].as_u64()
                 );
+                assert!(*allowed_nssai == allowed(&row["allowed_nssai"]));
+                assert!(old_amf.as_ref().map(AmfName::as_str) == row["old_amf"].as_str());
             }
             NasMessage::Uplink {
                 amf,
@@ -165,7 +235,7 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
         }
         assert!(received.raw.as_ref() == expected);
     }
-    assert_eq!(count, 21);
+    assert_eq!(count, 76);
 }
 
 #[test]
@@ -193,7 +263,7 @@ fn outer_duplicate_selection_and_unknown_policy_remain_authoritative() {
     let oracle = oracle();
     for row in oracle["cases"].as_array().unwrap() {
         let wire = octets(row["wire_hex"].as_str().unwrap());
-        if row.get("duplicate_id").is_some() {
+        if row.get("duplicate_id").is_some() && row["optional_fields"] != true {
             assert!(decode(&wire, context()).is_err());
             for duplicate_ie_policy in [DuplicateIePolicy::First, DuplicateIePolicy::Last] {
                 let ctx = DecodeContext {
@@ -339,7 +409,7 @@ fn n3iwf_ignored_fields_are_not_parsed_and_applicable_fields_do_not_disappear() 
                         (334, Criticality::ignore),
                         (400, Criticality::ignore),
                     ],
-                    48,
+                    414,
                 ),
                 "UplinkNASTransport" => (&[], 239),
                 _ => panic!("message"),
@@ -352,7 +422,7 @@ fn n3iwf_ignored_fields_are_not_parsed_and_applicable_fields_do_not_disappear() 
         let pdu = with_extra(
             &base,
             unsupported,
-            if unsupported == 371 {
+            if [371, 414].contains(&unsupported) {
                 Criticality::ignore
             } else {
                 Criticality::reject
@@ -412,6 +482,309 @@ fn capacity_depth_mutable_wrapper_and_redaction_are_enforced() {
         *procedure_code = 4;
     }
     assert!(NasMessage::from_pdu(&pdu, context()).is_err());
+}
+
+#[test]
+fn optional_singleton_selection_and_criticality_follow_the_generic_policy() {
+    let oracle = oracle();
+    let mut duplicate_cases = 0;
+    let mut wrong_criticality_cases = 0;
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["optional_fields"] == true)
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        if row.get("invalid_optional_id").is_some() {
+            assert!(row["reference_error"] == "ie-criticality");
+            assert!(decode(&wire, context()).is_err());
+            wrong_criticality_cases += 1;
+        }
+        if row.get("duplicate_id").is_none() {
+            continue;
+        }
+        duplicate_cases += 1;
+        assert!(row["reference_error"] == "duplicate-ie");
+        assert!(decode(&wire, context()).is_err());
+        for duplicate_ie_policy in [DuplicateIePolicy::First, DuplicateIePolicy::Last] {
+            let ctx = DecodeContext {
+                duplicate_ie_policy,
+                ..context()
+            };
+            let prefix = if duplicate_ie_policy == DuplicateIePolicy::First {
+                "first"
+            } else {
+                "last"
+            };
+            let pdu = decode(&wire, ctx).unwrap();
+            let admitted = NasMessage::from_pdu(&pdu, ctx).unwrap();
+            match admitted.message {
+                NasMessage::InitialUe { allowed_nssai, .. } => {
+                    assert!(allowed_nssai == allowed(&row[format!("{prefix}_allowed_nssai")]));
+                }
+                NasMessage::Downlink {
+                    allowed_nssai,
+                    old_amf,
+                    ..
+                } => {
+                    assert!(allowed_nssai == allowed(&row[format!("{prefix}_allowed_nssai")]));
+                    assert!(
+                        old_amf.as_ref().map(AmfName::as_str)
+                            == row[format!("{prefix}_old_amf")].as_str()
+                    );
+                }
+                _ => panic!("optional field oracle outcome"),
+            }
+            assert!(pdu.raw.as_ref() == wire);
+        }
+    }
+    assert_eq!(duplicate_cases, 3);
+    assert_eq!(wrong_criticality_cases, 6);
+}
+
+fn field_value(pdu: &Pdu, wanted: u16) -> Option<&[u8]> {
+    let PduKind::Initiating { message, .. } = &pdu.kind else {
+        panic!("NAS outcome")
+    };
+    match message {
+        Message::InitialUeMessage(m) => m
+            .protocol_ies
+            .0
+            .iter()
+            .find(|ie| ie.id == wanted)
+            .map(|ie| ie.value.as_bytes()),
+        Message::DownlinkNasTransport(m) => m
+            .protocol_ies
+            .0
+            .iter()
+            .find(|ie| ie.id == wanted)
+            .map(|ie| ie.value.as_bytes()),
+        _ => panic!("optional field outcome"),
+    }
+}
+
+#[test]
+fn optional_nested_fields_reject_truncation_trailing_bytes_and_extensions() {
+    let oracle = oracle();
+    let mut checked = 0;
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["optional_fields"] == true && row["reference_error"].is_null())
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        let pdu = decode(&wire, context()).unwrap();
+        let base = construct(&serde_json::json!({"message": row["message"]}))
+            .construct(context())
+            .unwrap();
+        for id in [0, 48] {
+            let Some(value) = field_value(&pdu, id) else {
+                continue;
+            };
+            for end in 0..value.len() {
+                let changed = with_extra(&base, id, Criticality::reject, &value[..end]);
+                assert!(
+                    NasMessage::from_pdu(&changed, context()).is_err(),
+                    "truncated optional field admitted"
+                );
+            }
+            let mut trailing = value.to_vec();
+            trailing.push(0);
+            let changed = with_extra(&base, id, Criticality::reject, &trailing);
+            assert!(
+                NasMessage::from_pdu(&changed, context()).is_err(),
+                "trailing optional field admitted"
+            );
+            // AllowedNSSAI: the three-bit list length is followed by item
+            // extension/optional flags. AMFName: bit zero is the length extension.
+            for flag in if id == 0 {
+                &[0x10, 0x08][..]
+            } else {
+                &[0x80][..]
+            } {
+                let mut extension = value.to_vec();
+                extension[0] |= flag;
+                let changed = with_extra(&base, id, Criticality::reject, &extension);
+                for unknown_ie_policy in [
+                    UnknownIePolicy::Preserve,
+                    UnknownIePolicy::Drop,
+                    UnknownIePolicy::Reject,
+                ] {
+                    let ctx = DecodeContext {
+                        unknown_ie_policy,
+                        ..context()
+                    };
+                    assert!(
+                        NasMessage::from_pdu(&changed, ctx).is_err(),
+                        "unsupported nested extension admitted"
+                    );
+                }
+            }
+            checked += 1;
+        }
+        for end in 0..wire.len() {
+            assert!(
+                decode(&wire[..end], context()).is_err(),
+                "truncated complete message decoded"
+            );
+        }
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        // Borrowed decoding intentionally reports the following record. Owned
+        // decoding is the complete-message boundary and must reject that tail.
+        let (remainder, prefix) = Pdu::decode(&trailing, context()).unwrap();
+        assert!(remainder == [0] && prefix.raw.as_ref() == wire);
+        assert!(Pdu::decode_owned(Bytes::from(trailing), context()).is_err());
+    }
+    assert_eq!(checked, 58);
+}
+
+#[test]
+fn optional_field_bounds_and_mutable_metadata_are_revalidated() {
+    let oracle = oracle();
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["optional_fields"] == true && row["construct"] == true)
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        let message = construct(row);
+        let pdu = decode(&wire, context()).unwrap();
+        let depth = if row["allowed_nssai"].is_array() || row["message"] == "InitialUEMessage" {
+            8
+        } else {
+            5
+        };
+        let base_count = if row["message"] == "InitialUEMessage" {
+            5
+        } else {
+            3
+        };
+        let count = (base_count
+            + usize::from(row["allowed_nssai"].is_array())
+            + usize::from(row["old_amf"].is_string()))
+        .max(row["allowed_nssai"].as_array().map_or(0, Vec::len));
+        let exact = DecodeContext {
+            max_message_len: wire.len(),
+            max_depth: depth,
+            max_ies: count,
+            ..context()
+        };
+        assert!(message.construct(exact).is_ok());
+        assert!(NasMessage::from_pdu(&pdu, exact).is_ok());
+        for short in [
+            DecodeContext {
+                max_depth: depth - 1,
+                ..exact
+            },
+            DecodeContext {
+                max_ies: count - 1,
+                ..exact
+            },
+            DecodeContext {
+                max_message_len: wire.len() - 1,
+                ..exact
+            },
+        ] {
+            assert!(
+                message.construct(short).is_err(),
+                "optional constructor bound ignored"
+            );
+            assert!(
+                NasMessage::from_pdu(&pdu, short).is_err(),
+                "optional receive bound ignored"
+            );
+        }
+        for id in [0, 48] {
+            if field_value(&pdu, id).is_none() {
+                continue;
+            }
+            let mut changed = decode(&wire, context()).unwrap();
+            if let PduKind::Initiating { message, .. } = &mut changed.kind {
+                match message {
+                    Message::InitialUeMessage(m) => {
+                        m.protocol_ies
+                            .0
+                            .iter_mut()
+                            .find(|ie| ie.id == id)
+                            .unwrap()
+                            .criticality = rasn::aper::decode(&[0x40]).unwrap()
+                    }
+                    Message::DownlinkNasTransport(m) => {
+                        m.protocol_ies
+                            .0
+                            .iter_mut()
+                            .find(|ie| ie.id == id)
+                            .unwrap()
+                            .criticality = rasn::aper::decode(&[0x40]).unwrap()
+                    }
+                    _ => panic!("optional field outcome"),
+                }
+            }
+            assert!(
+                NasMessage::from_pdu(&changed, context()).is_err(),
+                "mutated optional field metadata admitted"
+            );
+        }
+        let text = format!(
+            "{message:?} {:?}",
+            NasMessage::from_pdu(&pdu, context()).unwrap()
+        );
+        for value in [
+            "AMF-TEST",
+            "192.0.2.1",
+            "010203",
+            "ffffff",
+            "126, 0, 100, 20",
+            "4328719365",
+        ] {
+            assert!(!text.contains(value), "NAS diagnostics revealed a value");
+        }
+        if let Some(name) = row["old_amf"].as_str().filter(|name| name.len() >= 4) {
+            assert!(!text.contains(name), "NAS diagnostics revealed an AMF name");
+        }
+        assert!(pdu.raw.as_ref() == wire);
+    }
+}
+
+#[test]
+fn bounded_optional_message_mutations_replay_the_fuzz_boundary() {
+    let oracle = oracle();
+    let mut mutations = 0;
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["optional_fields"] == true)
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        for index in 0..wire.len() {
+            for bit in [1, 0x20, 0x80] {
+                let mut changed = wire.clone();
+                changed[index] ^= bit;
+                for ctx in [
+                    context(),
+                    DecodeContext {
+                        max_ies: 8,
+                        max_depth: 8,
+                        max_message_len: 256,
+                        ..context()
+                    },
+                ] {
+                    if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(&changed), ctx) {
+                        if let Ok(admitted) = NasMessage::from_pdu(&pdu, ctx) {
+                            shared::reconstruct(&admitted.message, ctx, EncodeContext::default());
+                        }
+                    }
+                }
+                mutations += 1;
+            }
+        }
+    }
+    assert!(mutations > 10_000);
 }
 
 fn crit_of(value: u8) -> Criticality {

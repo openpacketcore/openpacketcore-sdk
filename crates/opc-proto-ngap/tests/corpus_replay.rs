@@ -26,6 +26,9 @@ mod notify;
 #[path = "support/reset.rs"]
 mod reset;
 
+#[path = "support/nas.rs"]
+mod nas;
+
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
@@ -257,12 +260,7 @@ fn exercise(data: &[u8]) {
             assert!(ReleaseMessage::from_pdu(&received, ctx).is_ok());
         }
         if let Ok(admitted) = NasMessage::from_pdu(&pdu, ctx) {
-            let constructed = admitted.message.construct(ctx).unwrap();
-            let wire = encode(&constructed, EncodeContext::default()).unwrap();
-            let received = Pdu::decode_owned(Bytes::from(wire), ctx).unwrap();
-            let readmitted = NasMessage::from_pdu(&received, ctx).unwrap();
-            assert_eq!(readmitted.ignored_ie_count, 0);
-            assert!(readmitted.notify_ie_ids.is_empty());
+            nas::reconstruct(&admitted.message, ctx, EncodeContext::default());
         }
         if let Ok(wire) = encode(&pdu, EncodeContext::default()) {
             assert_eq!(pdu.wire_len(EncodeContext::default()).unwrap(), wire.len());

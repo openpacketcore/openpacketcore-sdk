@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: construct and admit optional Allowed NSSAI in Initial UE
+  and Downlink NAS messages and optional Old AMF in Downlink NAS. Reuse bounded,
+  redacted field types and qualify complete messages with independent Release 18
+  reference bytes, duplicate policies and adverse field/boundary tests (Refs #787).
 - `opc-sctp`: add an explicitly unprotected N2 profile and live adapter with
   strict PPID 60, the default NGAP service port, bounded ordered records,
   separate notification delivery and redacted diagnostics. Reuse existing

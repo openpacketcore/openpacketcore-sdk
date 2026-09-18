@@ -151,12 +151,12 @@ AMF-selection, identifier-binding, NAS-delivery, key or backend effects.
 
 | Outcome | Required typed IEs | Optional typed IEs | N3IWF disposition |
 |---|---|---|---|
-| Initial UE (initiating 15) | RAN UE ID 85, NAS 38, ULI 121, establishment cause 90 | Selected PLMN 174; UE context request 112 | Ignore 201/224/225/227/259/333/402/427 as required by TS 29.413 5.2 |
-| Downlink NAS (initiating 4) | AMF UE ID 10, RAN UE ID 85, NAS 38 | UE aggregate bit rate 110 | Ignore 83/36/31/177/205/206/209/222/117/228/226/264/334/400; **110 is applicable** for N3IWF |
+| Initial UE (initiating 15) | RAN UE ID 85, NAS 38, ULI 121, establishment cause 90 | Selected PLMN 174; UE context request 112; Allowed NSSAI 0 | Ignore 201/224/225/227/259/333/402/427 as required by TS 29.413 5.2 |
+| Downlink NAS (initiating 4) | AMF UE ID 10, RAN UE ID 85, NAS 38 | UE aggregate bit rate 110; Allowed NSSAI 0; Old AMF 48 | Ignore 83/36/31/177/205/206/209/222/117/228/226/264/334/400; **110 is applicable** for N3IWF |
 | Uplink NAS (initiating 46) | AMF UE ID 10, RAN UE ID 85, NAS 38, ULI 121 | None in this admitted subset | W-AGF/TNGF/TWIF identity IEs 239/246/247 fail this N3IWF boundary |
 
 Every other recognized IE fails admission explicitly. This includes applicable
-fields still awaiting codecs (Old AMF, Allowed/Partially Allowed NSSAI,
+fields still awaiting codecs (Partially Allowed NSSAI,
 5G-S-TMSI, AMF set, reroute information, Selected NID) and fields belonging to
 other access profiles. Those fields are not relabeled as unknown procedures
 and cannot silently disappear into an admitted NAS message. SNPN selection
@@ -178,14 +178,31 @@ five, AMBR six, and location eight. Message byte/count bounds are also checked.
 The allocation budget remains advisory. Debug and errors expose no NAS, peer
 or identifier values. Application/subscriber authorization is separate.
 
-The [NAS oracle](tests/fixtures/n3iwf-nas.json) supplies 44 independently
+Allowed NSSAI reuses `context_fields::AllowedNssai`: one through eight S-NSSAIs,
+with optional SD, preserved list order and explicit rejection of nested
+extensions. Old AMF reuses `setup_fields::AmfName`: the root PrintableString
+alphabet and 1–150 characters. Both are optional reject-criticality singletons;
+their type bindings are checked against the pinned Release 18 object sets.
+Neither field grants slice or AMF-selection authority. Their depths are eight
+and five respectively, including the four enclosing message layers. The list
+count also obeys `max_ies`; name extension lengths remain unsupported.
+
+The [NAS oracle](tests/fixtures/n3iwf-nas.json) supplies 109 independently
 encoded complete messages and independent mandatory/duplicate validation.
-It includes 21 positive constructor cases, all 11 missing-mandatory cases,
-three duplicate cases and nine unknown-criticality cases. Tests verify the
+The original 44 cases are unchanged. The 65 added optional-field cases cover
+every root slice count with absent/mixed/present SD, name lengths 1/2/127/128/149/150,
+combined fields, reversed IE order, different duplicate values and both wrong
+criticalities. They include 56 valid reference messages and nine independently
+rejected messages. Overall, 76 cases compare complete constructor bytes.
+Tests verify the
 received typed values, constructor bytes, generic duplicate/unknown policies,
 receiver-ignored malformed fields, unsupported known fields and mutable
-wrapper rejection. Reproduce using `scripts/generate-ngap-nas-fixtures.py`
-with the pinned reference tools and PDF.
+wrapper rejection. Every added valid field is checked for truncated prefixes,
+trailing bytes, unsupported extensions and exact/one-short byte/count/depth
+bounds. Ten independent messages also seed the shared semantic fuzz/replay
+checks, which preserve all admitted fields through reconstruction. These
+synthetic checks do not establish peer interoperability. Reproduce using
+`scripts/generate-ngap-nas-fixtures.py` with the pinned reference tools and PDF.
 
 ## N3IWF UE release field admission
 

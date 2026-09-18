@@ -305,6 +305,9 @@ The [NAS conformance matrix](CONFORMANCE.md#n3iwf-nas-message-admission) names
 supported optional fields, receiver-ignored IEs and explicit unsupported gates.
 Downlink UE AMBR is applicable to N3IWF and is validated. Other recognized
 fields without a codec fail admission; they do not become a partial success.
+Initial UE and Downlink NAS also accept optional root Allowed NSSAI; Downlink
+NAS accepts optional root Old AMF. They reuse the redacted `AllowedNssai` and
+`AmfName` leaf types, preserving generic duplicate selection and raw bytes.
 Caller-owned association, NAS security, access conditions, Error Indication
 and procedure side effects remain separate.
 
