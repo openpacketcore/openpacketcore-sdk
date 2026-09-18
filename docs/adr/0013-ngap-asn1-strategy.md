@@ -533,3 +533,28 @@ is unqualified. Preserve source hashes for both specifications, the complete
 applicability list and the 131 defined schema outcomes. No generated runtime
 change is justified or needed for metadata routing. Optional fields and pending
 procedure codecs remain open under #787; the matrix does not close the issue.
+
+## Existing response diagnostics amendment (2026-09)
+
+Compose the already-qualified root Criticality Diagnostics codec into seven
+existing response boundaries. Share the same-procedure header check with Modify
+results: procedure code and triggering outcome reject in responses under
+38.413 9.3.1.3. Preserve absent versus present-empty values and ordered repeated
+IE identifiers. Preflight list count and total message depth before diagnostic
+encoding, then run the same complete admission used for peer input.
+
+The unmodified Release 18 reference produces 4,349 complete message vectors
+(2,046 admitted, 2,303 negative), using hashed existing corpora as independently
+encoded base fields. Add valid same-procedure diagnostics at every list count
+from 1 through 256 and minimal message forms for exposed depth 6/8 boundaries.
+Both reference encoders agree and structured decoding verifies complete values.
+Shared diagnostic models reduce fixture repetition without changing byte
+answers. Legacy zero-octet diagnostic negatives remain invalid and their source
+corpora remain unchanged. No generated schema or dependency change is needed.
+
+Add an explicit optional public field to each existing response instead of
+silently ignoring peer diagnostic reports. Existing downstream struct literals
+and exhaustive Release Complete destructuring require adjustment. Caller-owned
+procedure selection, correlation and state effects remain outside the codec.
+The 23-outcome local qualification count and published fixture revision stay
+unchanged; this field expansion does not close #787.

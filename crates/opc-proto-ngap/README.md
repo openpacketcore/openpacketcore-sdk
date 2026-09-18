@@ -140,6 +140,14 @@ empty response transfers, optional opaque NAS and optional N3IWF location.
 The caller correlates requests and performs cleanup; decoding a peer report
 does not prove that resources have been removed.
 
+NG Setup Response/Failure, Initial Context Setup Response/Failure, PDU Session
+Resource Setup/Release Response and UE Context Release Complete accept optional
+`diagnostics`. Absence differs from a present empty root. Responses reject
+procedure code and triggering outcome, which belong only in Error Indication.
+Diagnostic lists preserve repeated IDs and need total message depth at least 8
+(6 without items), alongside existing field depth requirements. Affected public
+struct literals and the Release Complete variant now require the new field.
+
 `ue_requests` admits and constructs NAS Non-Delivery Indication and UE Context
 Release Request, including mandatory root Cause and optional unique session IDs.
 NAS stays opaque and borrows contiguous input. Context correlation, deciding when

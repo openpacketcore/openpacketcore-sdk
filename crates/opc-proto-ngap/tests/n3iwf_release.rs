@@ -58,6 +58,7 @@ fn construct(row: &Value) -> ReleaseMessage {
             .unwrap(),
         },
         "UEContextReleaseComplete" => ReleaseMessage::Complete {
+            diagnostics: None,
             amf: AmfUeId::new(0x0102030405).unwrap(),
             ran: RanUeId::new(0x10203040),
             location: (row["location"] != false).then(|| {
@@ -94,16 +95,19 @@ fn same_fields(left: &ReleaseMessage, right: &ReleaseMessage) {
                 amf: a,
                 ran: b,
                 location: c,
+                diagnostics: d,
             },
             ReleaseMessage::Complete {
                 amf: x,
                 ran: y,
                 location: z,
+                diagnostics: w,
             },
         ) => {
             assert!(a == x);
             assert!(b == y);
             assert!(c == z);
+            assert!(d == w);
         }
         _ => panic!("release outcome differs"),
     }
@@ -295,10 +299,8 @@ fn ignored_fields_and_unimplemented_applicable_fields_stay_distinct() {
         assert_eq!(admitted.ignored_ie_count, 1);
         same_fields(&message, &admitted.message);
     }
-    for (id, crit) in [(60, Criticality::reject), (19, Criticality::ignore)] {
-        let pdu = with_extra(&base, id, crit, &[0]);
-        assert!(ReleaseMessage::from_pdu(&pdu, context()).is_err());
-    }
+    let pdu = with_extra(&base, 60, Criticality::reject, &[0]);
+    assert!(ReleaseMessage::from_pdu(&pdu, context()).is_err());
 }
 
 #[test]

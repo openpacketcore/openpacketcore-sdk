@@ -197,7 +197,7 @@ metadata is corrected to those message clauses; its wire bytes are unchanged.
 | Outcome | Required typed IEs | Optional typed IEs | N3IWF disposition |
 |---|---|---|---|
 | UE Context Release Command (initiating 41) | UE NGAP IDs 114, Cause 15 | None | AMF/RAN pair or AMF-only when RAN ID is unavailable |
-| UE Context Release Complete (successful 41) | AMF UE ID 10, RAN UE ID 85 | N3IWF ULI 121 | Ignore paging IEs 32/207; resource list 60 and diagnostics 19 explicitly await codecs |
+| UE Context Release Complete (successful 41) | AMF UE ID 10, RAN UE ID 85 | N3IWF ULI 121, response diagnostics 19 | Ignore paging IEs 32/207; resource list 60 explicitly awaits a codec |
 
 Both outcomes support canonical construction and receive admission. The generic
 decoder applies unknown/duplicate policies first; typed admission revalidates
@@ -238,14 +238,14 @@ filtered generic PDU without changing its raw image or activating an association
 | Outcome | Required fields | Optional fields admitted | Receiver-ignored IEs |
 |---|---|---|---|
 | Request | Global RAN Node ID 27 restricted to N3IWF; Supported TA List 102; presence of Default Paging DRX 21 | None | 21, 204 |
-| Response | AMF Name 1; Served GUAMI List 96; Relative AMF Capacity 86; PLMN Support List 80 | None | 200, 404 |
-| Failure | Cause 15 | Root Time To Wait 107 | None |
+| Response | AMF Name 1; Served GUAMI List 96; Relative AMF Capacity 86; PLMN Support List 80 | Response diagnostics 19 | 200, 404 |
+| Failure | Cause 15 | Root Time To Wait 107, response diagnostics 19 | None |
 
 Default Paging DRX remains mandatory on the wire, but its received contents
 are ignored. `NgSetupRequest::construct` takes an explicit `PagingDrx`;
 `SetupMessage::from_pdu` returns only the interpreted request fields and the
 ignored count. Unknown-notify IDs are caller-owned diagnostics. Other
-recognized optional IEs fail explicitly, including names/retention/diagnostics
+recognized optional IEs fail explicitly, including names/retention
 outside the table. Served GUAMI backup names and all nested extensions are
 unsupported; their values are never silently discarded into a successful view.
 
@@ -483,10 +483,10 @@ from typed fields. The matrix covers TS 38.413 V18.10.0 9.2.2.1–9.2.2.3 and
 | Outcome | Required fields | Admitted optional/conditional fields | Encode / receive |
 | --- | --- | --- | --- |
 | Initial Context Setup Request | AMF/RAN UE IDs, GUAMI, Allowed NSSAI, UE Security Capabilities presence, Security Key | Session setup requests, opaque NAS; UE AMBR required when session requests exist | Canonical / typed |
-| Initial Context Setup Response | AMF/RAN UE IDs | Disjoint successful and failed session lists; both may be absent | Canonical / typed |
-| Initial Context Setup Failure | AMF/RAN UE IDs, root Cause | Failed session list | Canonical / typed |
+| Initial Context Setup Response | AMF/RAN UE IDs | Disjoint successful and failed session lists; both may be absent; response diagnostics | Canonical / typed |
+| Initial Context Setup Failure | AMF/RAN UE IDs, root Cause | Failed session list, response diagnostics | Canonical / typed |
 | PDU Session Resource Setup Request | AMF/RAN UE IDs, session setup request list | Opaque NAS, UE AMBR | Canonical / typed |
-| PDU Session Resource Setup Response | AMF/RAN UE IDs, at least one result list | Successful/failed lists, N3IWF location | Canonical / typed |
+| PDU Session Resource Setup Response | AMF/RAN UE IDs, at least one result list | Successful/failed lists, N3IWF location, response diagnostics | Canonical / typed |
 
 Every top-level IE is singleton with the existing procedure-specific criticality.
 Admission consumes the generic decoder's selected unknown/duplicate policy view
@@ -504,8 +504,7 @@ caller-provided masks. RAN Paging Priority and UE Slice Maximum Bit Rate List
 are receiver-ignored on PDU setup requests. Trace Activation and UE AMBR are
 applicable to N3IWF under the non-trusted-access exceptions: bitrate is decoded,
 while Trace Activation fails explicitly until its contract is implemented.
-Other recognized applicable fields outside this subset, including Criticality
-Diagnostics, also fail explicitly. Ignored fields are omitted by construction,
+Other recognized applicable fields outside this subset fail explicitly. Ignored fields are omitted by construction,
 apart from mandatory capabilities. No ignored bytes are exposed as semantic data.
 
 Requests with a resource list need total depth 17; a context-only request needs
@@ -553,13 +552,12 @@ qualified for this root-only subset.
 | Requested-session list | 1–256 unique session IDs and command transfers; depth 6 | None admitted | Qualified generated codec with physical count, duplicate, flag and length preflight |
 | Released-session list | 1–256 unique session IDs and empty response transfers; depth 4 | None admitted | Qualified generated codec with the same bounded preflight |
 | Release Command | AMF/RAN UE IDs and requested-session list; depth 10 | Opaque NAS; RAN Paging Priority contents ignored | Canonical / typed |
-| Release Response | AMF/RAN UE IDs and released-session list; depth 8 | N3IWF location | Canonical / typed |
+| Release Response | AMF/RAN UE IDs and released-session list; depth 8 | N3IWF location, response diagnostics | Canonical / typed |
 
 All top-level fields are singleton with existing procedure-specific criticality.
 There is no unsuccessful outcome. Required lists cannot be empty, and each
 contained transfer must be admitted before the complete list is returned.
-Known applicable unimplemented fields, including Criticality Diagnostics and
-transfer extensions, fail explicitly. Ordinary NAS borrows input; fragments
+Known applicable unimplemented fields, including transfer extensions, fail explicitly. Ordinary NAS borrows input; fragments
 are physically preflighted before coalescing. Unknown/duplicate policies are
 selected by generic decoding and remain authoritative; use the same context
 for typed admission. Mutable metadata, bytes, counts and remaining depth are
@@ -1004,6 +1002,46 @@ session state; it selects and constructs the abnormal-condition responses of
 resource modifications, rollback and procedure triggers remain outside the codec.
 Additional applicable fields and the broader applicability/receive/error/trigger
 matrix remain open under #787. This evidence does not claim live interoperability.
+
+## Optional diagnostics in existing responses
+
+The seven existing NG Setup Response/Failure, Initial Context Setup
+Response/Failure, PDU Session Resource Setup/Release Response and UE Context
+Release Complete boundaries admit and construct optional IE 19 with ignore
+criticality. This extends their field subsets without adding outcomes to the
+23 locally qualified messages or changing the published 15-outcome corpus.
+Sources: TS 38.413 V18.10.0 message tables and 9.3.1.3; TS 29.413 V18.5.0 5.3.
+
+Absent diagnostics and a present empty root remain distinct. Procedure code
+and triggering outcome belong to Error Indication and fail both response
+admission and construction. Procedure criticality remains optional, including
+ignore. An optional IE list has 1–256 entries with reject/notify criticality;
+repeated identifiers retain order. Diagnostic values remain redacted. A caller
+selects the response and correlates these reports with its triggering procedure.
+
+Each constructor checks diagnostic count and remaining depth before encoding.
+The enclosing message needs at least depth 6 for diagnostics without items, or
+8 with items, in addition to any deeper existing fields. Byte, count and depth
+limits use the same context for generic decoding, admission and construction.
+Generic duplicate First/Last/Reject and unknown Preserve/Drop/Reject policies
+remain authoritative; the new supported IE is never counted as receiver-ignored.
+Unimplemented extensions and malformed flags, lengths or padding still fail.
+
+The [independent response oracle](tests/fixtures/n3iwf-response-diagnostics.json)
+contains 4,349 complete messages: 2,046 admitted and 2,303 negative. Every outcome
+covers all 1–256 valid diagnostic list counts; minimal message forms separately
+expose exact depth 6/8 boundaries, absent/empty roots and maximum item counts.
+Header applicability, invalid item criticality, duplicate selection and outer
+criticality negatives accompany model-to-byte construction and receive checks.
+Historical zero-octet diagnostics negatives remain malformed; the prior hashed
+corpora are unchanged. Both unmodified reference encoders agree and structured
+reference decoding verifies values. Regenerate using
+`scripts/generate-ngap-response-diagnostics-fixtures.py --sdk-root DIR --spec PATH --output PATH`.
+All complete vectors seed shared bounded replay/fuzz assertions. These additions
+require `diagnostics: None` (or an explicit value) in affected public struct
+literals and the Release Complete variant; exhaustive destructuring must allow
+the new field. Remaining applicable fields and procedure codecs stay open in
+#787; these tests do not establish live peer interoperability.
 
 ## Fixtures
 

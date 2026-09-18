@@ -292,12 +292,7 @@ impl ModifyFailureTransfer {
         Ok(value)
     }
 }
-pub(super) fn response_diagnostics(value: &CriticalityDiagnostics) -> Result<(), DecodeError> {
-    if value.procedure_code.is_some() || value.triggering_outcome.is_some() {
-        return Err(invalid("response diagnostic header applicability"));
-    }
-    Ok(())
-}
+pub(super) use super::reset_fields::response_diagnostics;
 fn scan_failure(
     input: &[u8],
     ctx: DecodeContext,

@@ -226,6 +226,8 @@ pub struct SessionReleaseResponse {
     pub sessions: ReleasedSessions,
     /// Optional N3IWF location; other access choices are unsupported.
     pub location: Option<N3iwfLocation>,
+    /// Optional same-procedure diagnostics, without triggering procedure fields.
+    pub diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
 }
 redacted!(SessionReleaseResponse);
 
@@ -268,11 +270,16 @@ impl ResourceReleaseMessage<'_> {
             }
             Self::Response(value) => {
                 crate::enforce_depth(8, ctx)?;
+                let diagnostics =
+                    super::reset_fields::encode_response_diagnostics(&value.diagnostics, ctx)?;
                 fields.push((10, Criticality::ignore, value.amf.encode(output)));
                 fields.push((85, Criticality::ignore, value.ran.encode(output)));
                 fields.push((70, Criticality::ignore, value.sessions.encode(output)));
                 if let Some(location) = &value.location {
                     fields.push((121, Criticality::ignore, location.encode(output)));
+                }
+                if let Some(value) = diagnostics {
+                    fields.push((19, Criticality::ignore, Ok(value)));
                 }
                 MessageType::PduSessionResourceReleaseResponse
             }
@@ -353,7 +360,7 @@ fn admit<'a>(
     } else {
         (
             policy::PDU_SESSION_RESOURCE_RELEASE_RESPONSE,
-            &[10, 85, 70, 121],
+            &[10, 85, 70, 121, 19],
         )
     };
     let leaf = DecodeContext {
@@ -362,6 +369,7 @@ fn admit<'a>(
     };
     let (mut amf, mut ran, mut nas, mut location) = (None, None, None, None);
     let (mut requested, mut released) = (None, None);
+    let mut diagnostics = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     for (index, (id, criticality, value)) in fields.enumerate() {
@@ -391,6 +399,11 @@ fn admit<'a>(
             79 => requested = Some(SessionReleaseRequests::decode(value, leaf)?),
             70 => released = Some(ReleasedSessions::decode(value, leaf)?),
             121 => location = Some(N3iwfLocation::decode(value, leaf)?),
+            19 => {
+                diagnostics = Some(super::reset_fields::decode_response_diagnostics(
+                    value, leaf,
+                )?)
+            }
             _ => return Err(invalid("resource release field dispatch")),
         }
     }
@@ -409,6 +422,7 @@ fn admit<'a>(
             ran,
             sessions: released.ok_or_else(|| invalid("missing resource release result"))?,
             location,
+            diagnostics,
         })
     };
     Ok(AdmittedResourceRelease {

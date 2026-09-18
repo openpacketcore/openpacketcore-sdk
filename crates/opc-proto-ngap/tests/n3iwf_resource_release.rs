@@ -273,6 +273,7 @@ fn construct_row(row: &Value, ctx: DecodeContext) -> Result<Pdu, opc_protocol::D
         })
     } else {
         ResourceReleaseMessage::Response(SessionReleaseResponse {
+            diagnostics: None,
             amf,
             ran,
             sessions: ReleasedSessions::decode(get(70).unwrap(), context())?,

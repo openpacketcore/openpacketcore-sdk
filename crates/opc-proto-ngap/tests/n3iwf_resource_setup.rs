@@ -121,12 +121,14 @@ fn construct_row(row: &Value, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         }
         .construct(masks(row), ctx),
         MessageType::InitialContextSetupResponse => InitialContextResponse {
+            diagnostics: None,
             amf,
             ran,
             sessions: results(&values, 72, 55),
         }
         .construct(ctx),
         MessageType::InitialContextSetupFailure => InitialContextFailure {
+            diagnostics: None,
             amf,
             ran,
             cause: Cause::decode(field(&values, 15).unwrap(), context()).unwrap(),
@@ -144,6 +146,7 @@ fn construct_row(row: &Value, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         }
         .construct(ctx),
         MessageType::PduSessionResourceSetupResponse => SessionResourceResponse {
+            diagnostics: None,
             amf,
             ran,
             sessions: results(&values, 75, 58),
@@ -426,6 +429,7 @@ fn conditional_presence_key_custody_and_constructor_guards_are_explicit() {
     value.sessions = SessionResults::new(None, None).unwrap();
     assert!(value.construct(context()).is_err());
     let empty = InitialContextResponse {
+        diagnostics: None,
         amf: value.amf,
         ran: value.ran,
         sessions: SessionResults::new(None, None).unwrap(),

@@ -190,6 +190,7 @@ fn base_request() -> NgSetupRequest {
 }
 fn base_response() -> NgSetupResponse {
     NgSetupResponse {
+        diagnostics: None,
         name: AmfName::new("synthetic-amf.example").unwrap(),
         served: ServedGuamiList::new(vec![Guami::new("001-01".parse().unwrap(), 1, 1, 1).unwrap()])
             .unwrap(),
@@ -207,6 +208,7 @@ fn expected(row: &Value, oracle: &Value) -> (SetupMessage, PagingDrx) {
         "NGSetupRequest" => SetupMessage::Request(base_request()),
         "NGSetupResponse" => SetupMessage::Response(base_response()),
         "NGSetupFailure" => SetupMessage::Failure(NgSetupFailure {
+            diagnostics: None,
             cause: Cause::new(CauseClass::Misc, 5).unwrap(),
             time_to_wait: if row["no_wait"] == true {
                 None
@@ -474,13 +476,13 @@ fn receiver_ignore_rules_preserve_mandatory_presence_and_other_fields_fail_expli
             "base-NGSetupResponse",
             MessageType::NgSetupResponse,
             &[200, 404][..],
-            &[19, 147, 274][..],
+            &[147, 274][..],
         ),
         (
             "base-NGSetupFailure",
             MessageType::NgSetupFailure,
             &[][..],
-            &[19][..],
+            &[][..],
         ),
     ] {
         let row = reference["messages"]

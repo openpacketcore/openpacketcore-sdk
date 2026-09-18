@@ -127,6 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: optional Criticality Diagnostics in seven existing response
+  types, backed by 4,349 independent complete-message vectors. Preserve absent
+  versus empty diagnostics, enforce response header applicability and bound
+  diagnostic lists before allocation. Affected struct literals and Release
+  Complete patterns must include or allow the new `diagnostics` field.
 - Add explicit N3IWF receive routing for all 40 applicable NGAP outcomes,
   assigned metadata checks for all Release 18 procedures, disabled trigger gates
   for pending codecs and value-free unsupported-procedure diagnostic headers.
