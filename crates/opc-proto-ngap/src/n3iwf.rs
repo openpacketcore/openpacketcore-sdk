@@ -2,8 +2,9 @@
 //!
 //! Values encode without the enclosing ProtocolIE open-type determinant and
 //! can be borrowed by [`crate::ProtocolIe`]. This boundary validates individual
-//! fields. The optional [`nas`] and [`release`] modules admit required fields
-//! for their documented outcomes; association authority and policy stay outside.
+//! fields. The optional [`nas`], [`release`] and [`setup`] modules admit
+//! required fields for their documented outcomes; association authority and
+//! policy stay outside.
 //! Independently qualified generated ASN.1 encoders handle bounded leaf
 //! structures. Explicit receive layout avoids the runtime's TAI alignment
 //! defect; the without-port CHOICE wrapper also needs aligned framing. NAS
@@ -18,7 +19,8 @@
 //! and bound their extension count by `max_ies`. Other fields require depth
 //! one. The remaining context policies do not broaden this admitted subset;
 //! `allocation_budget` remains advisory. These are field-local limits, not a
-//! cumulative budget for an enclosing message.
+//! cumulative budget for an enclosing message. [`setup_fields`] documents its
+//! additional nested-list counts, depth requirements and root layout exception.
 
 use std::{borrow::Cow, fmt, net::IpAddr};
 
@@ -117,6 +119,8 @@ macro_rules! redacted {
 
 pub mod nas;
 pub mod release;
+pub mod setup;
+pub mod setup_fields;
 
 /// The locally assigned, 32-bit RAN UE NGAP identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

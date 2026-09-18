@@ -127,6 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: construct and admit all three NG Setup outcomes with bounded
+  N3IWF identity, TA/PLMN/slice/GUAMI lists, AMF name/capacity and root retry
+  delay. Preserve mandatory presence plus receiver-ignore behavior for DRX.
+  Independent Release 18 vectors qualify fixes for nested APER alignment;
+  association activation and selection remain caller-owned (Refs #787).
 - Experimental NGAP N3IWF UE release field admission and construction, including
   AMF/RAN and AMF-only identifier choices, all root Cause values and optional
   location. Independent Release 18 messages qualify this bounded subset; resource

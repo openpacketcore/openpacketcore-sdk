@@ -216,3 +216,22 @@ and diagnostics without releasing resources or acknowledging a procedure.
 - Gap register updated: `GAP-PROTO-003` now records the partially closed codec
   boundary.
 - `docs/implementation-status.md` linked.
+
+## Bounded NG Setup field amendment (2026-09)
+
+Independent Release 18 vectors extend the fixed-octet receive defect to Global
+N3IWF ID, served GUAMIs, supported TAs and PLMN/slice lists. In addition, the
+`rasn` 0.28 SEQUENCE OF encoder loses the parent bit offset: even one PLMN with
+one slice differs from the independently compiled reference. The field layer
+may explicitly read these root shapes and write the two PLMN/slice list shapes.
+It bounds counts before each allocation, rejects every unsupported extension,
+requires zero padding, and preflights exact encoded size. Generated encoders
+remain in use for global identity, served GUAMIs, AMF name, capacity and timers.
+This exception does not authorize a general handwritten ASN.1 implementation.
+
+All three setup outcomes admit mandatory fields and a documented optional
+subset. Mandatory DRX is supplied explicitly for construction; receive checks
+presence and ignores its payload as TS 29.413 requires. Independent field and
+complete-message bytes, mutation detectors, maximum-count tests and fuzzing
+qualify the exception. Association state, selection and configuration effects
+remain caller-owned, and #787 remains incomplete beyond the admitted subset.
