@@ -6,11 +6,12 @@
 //!
 //! Scope (see CONFORMANCE.md): NGAP-PDU framing (initiating / successful /
 //! unsuccessful outcomes), fixture-proven NGSetupRequest decoding, and
-//! structural typed dispatch for the first AMF N2 procedure subset. Encoding is
-//! raw-preserving only: the PDU bytes captured during decoding are re-emitted
-//! byte-identically. This works around an APER encoder alignment issue in
-//! `rasn` 0.28 that prevents canonical typed encoding from meeting ADR 0015
-//! byte-exact requirements.
+//! structural typed dispatch for the first AMF N2 procedure subset. Canonical
+//! encoding writes the typed root PDU and IE containers with explicit APER
+//! alignment and length fragmentation. [`Pdu::from_protocol_ies`] constructs
+//! those containers from pre-encoded, opaque IE values. Nested semantic
+//! validation and mandatory/conditional IE presence remain caller obligations.
+//! Raw-preserving encoding separately re-emits saved receive bytes exactly.
 //!
 //! For every typed procedure/outcome, decoding applies the caller's
 //! [`DecodeContext`] to the inner `ProtocolIE-Container`: the element count is
@@ -33,16 +34,19 @@ use opc_protocol::{
     EncodeError, EncodeErrorCode, OwnedDecode, UnknownIePolicy, ValidationLevel,
 };
 
+mod aper;
+mod constructed;
 mod generated;
 mod policy;
 
+pub use constructed::{MessageType, ProtocolIe};
 pub use generated::ngap_common_data_types::{Criticality, ProcedureCode};
 
 /// Generated NGAP message types that can appear in [`Message`].
 ///
 /// These are generated from the pinned TS 38.413 V19.2.0 ASN.1 source. The
 /// independently validated N3IWF fixture profile targets V18.10.0. The SDK
-/// wrapper controls dispatch, error handling, and raw-preserving encode policy;
+/// wrapper controls dispatch, error handling, and container encode policy;
 /// this module exposes the selected generated types so downstream code can
 /// inspect typed decodes without depending on private module paths.
 pub mod messages {
@@ -55,14 +59,15 @@ pub mod messages {
     };
 }
 
-/// A decoded NGAP PDU with a policy-filtered typed view and raw re-encode.
+/// A constructed or decoded NGAP PDU with a policy-filtered typed view.
 ///
-/// [`Self::raw`] always contains the immutable received PDU. When decoding with
+/// For received PDUs, [`Self::raw`] contains the immutable received PDU. A
+/// constructed PDU has empty `raw` and can use canonical encoding. When decoding with
 /// [`UnknownIePolicy::Drop`] or a duplicate policy that selects one occurrence,
 /// the typed [`Self::kind`] may omit entries that remain present in `raw`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Pdu {
-    /// Original PDU bytes, preserved for byte-exact re-emission.
+    /// Original receive bytes for byte-exact re-emission, or empty on construction.
     pub raw: Bytes,
     /// Decoded PDU kind and message body.
     pub kind: PduKind,
@@ -288,69 +293,51 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
     }
     enforce_depth(NGAP_PDU_WRAPPER_DEPTH, ctx)?;
 
-    // Decode a single PDU and capture the unconsumed remainder. `raw` must
-    // cover ONLY the bytes this PDU actually consumed: copying the whole input
-    // would make `encode` re-emit any trailing attacker-controlled bytes
-    // byte-for-byte, a parse-vs-forward (request-smuggling) discrepancy.
-    let (pdu, remainder): (generated::ngap_pdu_descriptions::NGAPPDU, &[u8]) =
-        rasn::aper::decode_with_remainder(buf)
-            .map_err(|_| DecodeError::new(DecodeErrorCode::Structural { reason: "ngap pdu" }, 0))?;
-    let consumed = buf.len() - remainder.len();
-    let raw = Bytes::copy_from_slice(&buf[..consumed]);
-
-    match pdu {
-        generated::ngap_pdu_descriptions::NGAPPDU::initiatingMessage(im) => {
-            let message = decode_message(
-                Outcome::Initiating,
-                im.procedure_code.0,
-                im.criticality,
-                im.value.as_bytes(),
-                ctx,
-            )?;
-            Ok(Pdu {
-                raw,
-                kind: PduKind::Initiating {
-                    procedure_code: im.procedure_code.0,
-                    criticality: im.criticality,
-                    message,
-                },
-            })
-        }
-        generated::ngap_pdu_descriptions::NGAPPDU::successfulOutcome(so) => {
-            let message = decode_message(
-                Outcome::Successful,
-                so.procedure_code.0,
-                so.criticality,
-                so.value.as_bytes(),
-                ctx,
-            )?;
-            Ok(Pdu {
-                raw,
-                kind: PduKind::Successful {
-                    procedure_code: so.procedure_code.0,
-                    criticality: so.criticality,
-                    message,
-                },
-            })
-        }
-        generated::ngap_pdu_descriptions::NGAPPDU::unsuccessfulOutcome(uo) => {
-            let message = decode_message(
-                Outcome::Unsuccessful,
-                uo.procedure_code.0,
-                uo.criticality,
-                uo.value.as_bytes(),
-                ctx,
-            )?;
-            Ok(Pdu {
-                raw,
-                kind: PduKind::Unsuccessful {
-                    procedure_code: uo.procedure_code.0,
-                    criticality: uo.criticality,
-                    message,
-                },
-            })
-        }
+    // Frame the open type before handing leaf/header types to rasn. Its 0.28
+    // fragmented-length decoder mishandles the final determinant/remainder.
+    // Only the three root NGAP-PDU choices are admitted by the current schema.
+    let invalid = || DecodeError::new(DecodeErrorCode::Structural { reason: "ngap pdu" }, 0);
+    let prefix = buf.get(..3).ok_or_else(invalid)?;
+    if prefix[0] & 0x80 != 0 {
+        return Err(invalid());
     }
+    let outcome = match prefix[0] >> 5 {
+        0 => Outcome::Initiating,
+        1 => Outcome::Successful,
+        2 => Outcome::Unsuccessful,
+        _ => return Err(invalid()),
+    };
+    let criticality = match prefix[2] >> 6 {
+        0 => Criticality::reject,
+        1 => Criticality::ignore,
+        2 => Criticality::notify,
+        _ => return Err(invalid()),
+    };
+    let procedure_code = prefix[1];
+    let (remainder, value) = aper::open_type(&buf[3..])?;
+    let consumed = buf.len() - remainder.len();
+    // Capture exactly this PDU, including every fragment terminator, never
+    // trailing input belonging to a subsequent message.
+    let raw = Bytes::copy_from_slice(&buf[..consumed]);
+    let message = decode_message(outcome, procedure_code, criticality, &value, ctx)?;
+    let kind = match outcome {
+        Outcome::Initiating => PduKind::Initiating {
+            procedure_code,
+            criticality,
+            message,
+        },
+        Outcome::Successful => PduKind::Successful {
+            procedure_code,
+            criticality,
+            message,
+        },
+        Outcome::Unsuccessful => PduKind::Unsuccessful {
+            procedure_code,
+            criticality,
+            message,
+        },
+    };
+    Ok(Pdu { raw, kind })
 }
 
 /// NGAP-PDU outcome class, used to dispatch message-body decoding: the same
@@ -389,9 +376,35 @@ fn decode_message(
             }
             enforce_depth(NGAP_TYPED_MESSAGE_DEPTH, ctx)?;
             let declared_count = policy::preflight_ie_count(value, ctx, $reason)?;
-            let mut msg: $ty = rasn::aper::decode(value).map_err(|_| {
-                DecodeError::new(DecodeErrorCode::Structural { reason: $reason }, 0)
-            })?;
+            let invalid = || DecodeError::new(DecodeErrorCode::Structural { reason: $reason }, 0);
+            let mut msg: $ty = if value[0] & 0x80 != 0 {
+                // Retain generated handling of SEQUENCE extension additions.
+                // Fragmented additions are outside this root-container subset.
+                rasn::aper::decode(value).map_err(|_| invalid())?
+            } else {
+                let mut msg: $ty = rasn::aper::decode(&[0, 0, 0]).map_err(|_| invalid())?;
+                let mut remaining = &value[3..];
+                for _ in 0..declared_count {
+                    let aper::FramedIe {
+                        remainder: next,
+                        header,
+                        value: payload,
+                    } = aper::ie(remaining)?;
+                    // Type inference selects the generated anonymous IE type.
+                    // Push before filling so its concrete type is known here.
+                    msg.protocol_ies
+                        .0
+                        .push(rasn::aper::decode(&header).map_err(|_| invalid())?);
+                    if let Some(ie) = msg.protocol_ies.0.last_mut() {
+                        ie.value = rasn::types::Any::new(payload.into_owned());
+                    }
+                    remaining = next;
+                }
+                if !remaining.is_empty() {
+                    return Err(invalid());
+                }
+                msg
+            };
             policy::apply_ie_policy(
                 &mut msg.protocol_ies.0,
                 declared_count,
@@ -566,14 +579,24 @@ fn unknown_message_error(criticality: Criticality) -> DecodeError {
 
 /// Encode a [`Pdu`] back to APER bytes.
 ///
-/// The v1 subset only supports raw-preserving mode; any other mode returns an error
-/// because `rasn` 0.28's APER encoder does not reproduce the byte alignment
-/// used by the external fixtures for the inner message types.
+/// Canonical mode (the default) encodes the supported typed root containers,
+/// checking the wrapper/message tuple, IE criticality and singleton cardinality
+/// before allocating output. It preserves typed IE order and opaque value bytes;
+/// it normalizes container padding and length determinants. Unknown critical
+/// IEs and [`Message::Unknown`] cannot be constructed in this mode. Nested ASN.1
+/// values and mandatory/conditional presence are not semantically validated.
+///
+/// With `raw_preserving = true`, only the original `raw` bytes are emitted,
+/// even if the typed view was filtered or mutated. Empty `raw` is an error.
+/// Both modes check the complete output bound before writing.
 ///
 /// @spec 3GPP TS38413 R18 9.1
 /// @req REQ-3GPP-TS38413-R18-9.1-002
 /// @conformance v1-subset
 pub fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeError> {
+    if !ctx.raw_preserving {
+        return constructed::encode(pdu, ctx);
+    }
     let len = checked_raw_preserving_len(pdu, ctx)?;
     Ok(pdu.raw[..len].to_vec())
 }
@@ -629,7 +652,11 @@ impl Encode for Pdu {
     }
 
     fn wire_len(&self, ctx: EncodeContext) -> Result<usize, EncodeError> {
-        checked_raw_preserving_len(self, ctx)
+        if ctx.raw_preserving {
+            checked_raw_preserving_len(self, ctx)
+        } else {
+            constructed::checked_len(self, ctx)
+        }
     }
 }
 
@@ -1523,16 +1550,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_wire_len_is_rejected_like_canonical_encode() {
+    fn canonical_wire_len_matches_canonical_encode() {
         let bytes = ngsetup_request_fixture();
         let pdu = decode(&bytes, DecodeContext::default()).unwrap();
         assert_eq!(pdu.wire_len(raw_preserving_context()).unwrap(), bytes.len());
 
-        let err = pdu.wire_len(EncodeContext::default()).unwrap_err();
-        assert!(matches!(
-            err.code(),
-            EncodeErrorCode::Structural { reason } if reason.contains("raw-preserving")
-        ));
+        assert_eq!(pdu.wire_len(EncodeContext::default()).unwrap(), bytes.len());
+        assert!(encode(&pdu, EncodeContext::default()).unwrap() == bytes);
     }
 
     #[test]

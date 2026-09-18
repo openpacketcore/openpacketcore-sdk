@@ -38,6 +38,25 @@ impl IeProfile {
     fn rule(self, id: u16) -> Option<IeRule> {
         self.rules.iter().copied().find(|rule| rule.id == id)
     }
+
+    pub(super) fn validate_send_ie(
+        self,
+        id: u16,
+        criticality: u8,
+    ) -> Result<(), opc_protocol::EncodeError> {
+        let reason = match self.rule(id) {
+            Some(rule) if rule.criticality != criticality => {
+                "ngap protocol ie criticality mismatch"
+            }
+            None if criticality == CRITICALITY_REJECT => {
+                "cannot construct an unknown critical ngap protocol ie"
+            }
+            _ => return Ok(()),
+        };
+        Err(opc_protocol::EncodeError::new(
+            opc_protocol::EncodeErrorCode::Structural { reason },
+        ))
+    }
 }
 
 /// Read the root `ProtocolIE-Container` count before `rasn` can allocate its

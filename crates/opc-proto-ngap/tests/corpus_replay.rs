@@ -10,13 +10,44 @@
 //! input, this test fails and names the offending input.
 
 use bytes::Bytes;
-use opc_proto_ngap::Pdu;
-use opc_protocol::{DecodeContext, OwnedDecode};
+use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
+use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode, ValidationLevel};
 
 /// The decode entry point the fuzz target exercises. Must never panic,
 /// regardless of input. Decode returning `Err` is expected and fine.
 fn exercise(data: &[u8]) {
-    let _ = Pdu::decode_owned(Bytes::copy_from_slice(data), DecodeContext::default());
+    let ctx = DecodeContext {
+        max_message_len: 200_000,
+        max_ies: 32,
+        validation_level: ValidationLevel::Strict,
+        ..DecodeContext::default()
+    };
+    if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), ctx) {
+        if let Ok(wire) = encode(&pdu, EncodeContext::default()) {
+            assert_eq!(pdu.wire_len(EncodeContext::default()).unwrap(), wire.len());
+            assert!(Pdu::decode_owned(Bytes::from(wire), ctx).unwrap().kind == pdu.kind);
+        }
+    }
+    let ies: Vec<_> = data
+        .chunks(256)
+        .take(32)
+        .filter(|chunk| chunk.len() >= 3)
+        .map(|chunk| {
+            ProtocolIe::new(
+                u16::from_be_bytes([chunk[0], chunk[1]]),
+                if chunk[2] & 1 == 0 {
+                    Criticality::reject
+                } else {
+                    Criticality::ignore
+                },
+                &chunk[3..],
+            )
+        })
+        .collect();
+    if let Ok(pdu) = Pdu::from_protocol_ies(MessageType::NgSetupRequest, &ies, ctx) {
+        let wire = encode(&pdu, EncodeContext::default()).unwrap();
+        assert!(Pdu::decode_owned(Bytes::from(wire), ctx).unwrap().kind == pdu.kind);
+    }
 }
 
 // --- shared replay harness (kept self-contained per crate) ---------------
