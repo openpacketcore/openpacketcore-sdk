@@ -13,6 +13,10 @@ use bytes::Bytes;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
 use opc_proto_ngap::n3iwf::release::{Cause, ReleaseMessage, UeIdentifiers};
+use opc_proto_ngap::n3iwf::resource_fields::{
+    DownlinkTransport, QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
+};
+use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
 use opc_proto_ngap::n3iwf::setup::{
     AmfName, GlobalN3iwfId, PagingDrx, PlmnSupportList, ServedGuamiList, SetupMessage,
     SupportedTaList,
@@ -40,6 +44,33 @@ fn exercise(data: &[u8]) {
     let _ = UeAggregateBitRate::decode(data, ctx);
     let _ = Cause::decode(data, ctx);
     let _ = UeIdentifiers::decode(data, ctx);
+    if let Ok(field) = UplinkTransport::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(UplinkTransport::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = DownlinkTransport::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(DownlinkTransport::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = SessionAggregateBitRate::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(SessionAggregateBitRate::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = SessionType::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(SessionType::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = QosFlowSetupList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(QosFlowSetupList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(admitted) = SetupRequestTransfer::decode(data, ctx) {
+        let wire = admitted.transfer.encode(EncodeContext::default()).unwrap();
+        let received = SetupRequestTransfer::decode(wire.as_bytes(), ctx).unwrap();
+        assert!(received.transfer == admitted.transfer);
+        assert_eq!(received.ignored_ie_count, 0);
+        assert!(received.notify_ie_ids.is_empty());
+    }
     if let Ok(field) = Guami::decode(data, ctx) {
         let wire = field.encode(EncodeContext::default()).unwrap();
         assert!(Guami::decode(wire.as_bytes(), ctx).unwrap() == field);

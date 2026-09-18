@@ -251,3 +251,22 @@ Generated UE Security Capabilities construction is qualified against every
 mask bit. TS 29.413 specifies receiver-ignore semantics for its contents;
 no receive codec or algorithm selection is added. The 98 independent fields
 do not establish Initial Context Setup or resource-transfer admission.
+
+## Non-GBR setup-request transfer amendment (2026-09)
+
+Independent constructor and typed-value probes qualify the generated GTP
+tunnel codec for IPv4/IPv6 and TEID boundaries. The same probes show generated
+QoS setup-list construction differs even for one standardized non-GBR 5QI 9
+flow; most generated receive values differ too. The bounded root reader/writer
+may cover only this proven list shape, with 1–64 unique QFIs, root ARP values,
+exact sizing, physical count preflight and rejection of all other choices,
+optional fields and extensions. Independent vectors cover every root length,
+QFI, ARP priority and flag combination. Other QoS profiles remain unsupported.
+
+Nested request transfers reuse the existing fragment framing and IE policy
+implementation, with independently compiled Release 18 metadata. They require
+the conditional AMBR for admitted non-GBR flows and return identifier-only
+unknown-notify diagnostics. Uplink and downlink transport have separate public
+types; session AMBR remains distinct from UE AMBR while reusing the qualified
+identical wire layout. This adds no session/tunnel effect or enclosing-message
+admission, and does not authorize a general handwritten ASN.1 codec.

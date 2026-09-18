@@ -120,6 +120,8 @@ macro_rules! redacted {
 pub mod context_fields;
 pub mod nas;
 pub mod release;
+pub mod resource_fields;
+pub mod resource_request;
 pub mod setup;
 pub mod setup_fields;
 

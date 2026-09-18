@@ -301,6 +301,68 @@ The existing bounded root reader/writer is reused for those qualified shapes.
 The generated security-mask encoder is retained. All 98 vectors seed fuzz
 and replay; tests also cover every truncation and byte mutation.
 
+## N3IWF resource setup-request transfer
+
+TS 38.413 V18.10.0 9.3.4.1 defines this nested transfer. The opt-in
+`n3iwf::resource_request` boundary admits the independently qualified
+standardized non-GBR 5QI 9 subset; this does not admit an enclosing Initial
+Context Setup or PDU Session Resource Setup message.
+
+| Field | IE | Criticality | Construction / receive |
+| --- | --- | --- | --- |
+| Session aggregate maximum bit rate | 130 | reject | Required for this non-GBR subset by 8.2.1.4; distinct UL/DL root rates |
+| UL NG-U UP transport information | 139 | reject | Mandatory single IPv4/IPv6 GTP tunnel |
+| PDU session type | 134 | reject | Mandatory; all five root payload kinds |
+| QoS flow setup request list | 136 | reject | Mandatory 1–64 unique root QFIs; 5QI 9 and root ARP priority/flags |
+
+All recognized optional transfer IEs outside these four fail explicitly,
+including extra/redundant tunnels, security indication and network instance.
+The shared IE policy implementation handles unknown criticality and
+Drop/Preserve/Reject and duplicate First/Last/Reject before field admission.
+Retained unknown-ignore entries are counted; notify IDs are returned without
+values; retained unknown-reject entries prevent semantic admission. Structural
+Drop keeps its existing generic behavior, including discarding unknown-reject
+entries. Strict/ProcedureAware contexts reject them before dropping.
+Typed construction emits the four admitted fields; callers retaining original
+transfer bytes retain custody of that separate input.
+
+`resource_fields` exposes distinct UplinkTransport and DownlinkTransport types
+with explicit address and 32-bit TEID getters. IPv4/IPv6 roots are qualified;
+dual-address bit strings and extensions are unsupported. The codec permits
+all wire address/TEID values; endpoint validation and installation are external.
+Session AMBR reuses the byte-identical two-BitRate root layout with a distinct
+public type, qualified by independent session vectors. Root QFI values are
+0–63; allocation policy is external. Other QoS descriptors, optional flow
+parameters, E-RAB fields and nested extensions fail explicitly.
+
+Transfer receive requires depth ten, with four levels subtracted before leaf
+decoding. Flow lists require depth six and enforce `max_ies` and physical
+count feasibility before allocation. Byte limits apply to the entire input
+and each leaf. Container/list counts use separate field-local limits;
+`allocation_budget` remains advisory. Known constructed roots are below
+512 bytes; all fields are bounded and complete framing is checked before the
+final allocation. Fragmented unknown values use the existing physical-length
+preflight before coalescing. Debug/errors redact values; encoded buffers clear
+on drop. No NAS/key processing, resource allocation, endpoint assignment,
+pre-emption action, backend effect or live interoperability is established.
+
+The [request oracle](tests/fixtures/n3iwf-resource-request.json) contains 225
+fields and 49 transfers, including 30 complete constructions, every missing
+required/conditional field, duplicates, wrong criticalities, duplicate QFIs,
+unknown policies and independent 16K/64K fragments. It covers both address
+families, TEID/rate boundaries, every QFI, all ARP values/flag combinations and
+every flow-list length. Regenerate with
+`scripts/generate-ngap-resource-request-fixtures.py --spec PATH --output PATH`
+in the pinned Release 18 reference environment. Generated tunnel codecs match
+the independent values and bytes. Generated QoS list codecs differ; a bounded
+root reader/writer covers only the qualified 5QI 9 shape. The transfer reuses
+the existing canonical container framing. All 274 vectors seed fuzz/replay;
+ordinary tests exercise every truncation and bounded byte mutations.
+
+Remaining work includes outer session lists, partial success/failure results,
+response/unsuccessful transfers, additional applicable fields/QoS profiles and
+whole-message presence rules. No local procedure trigger is enabled here.
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):
