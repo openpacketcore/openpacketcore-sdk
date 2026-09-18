@@ -661,6 +661,9 @@ pub(crate) fn retain_sync(
     {
         return Ok(Err(ConfigMutationFailure::Conflict));
     }
+    if super::audit::protects_config_prefix(conn, key, decision.retain_from.get())? {
+        return Ok(Err(ConfigMutationFailure::HistoryProtected));
+    }
     let from = i64::try_from(decision.retain_from.get()).map_err(|_| corrupt())?;
     let (first_tx, parent, encrypted): (Vec<u8>, Option<Vec<u8>>, Vec<u8>) = conn
         .query_row(

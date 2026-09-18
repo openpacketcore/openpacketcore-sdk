@@ -1,3 +1,5 @@
+mod management_audit_authority;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -56,6 +58,9 @@ struct LoopbackPeer {
     drop_forward_responses: Arc<AtomicUsize>,
     stall_forward_mutation: Arc<AtomicBool>,
     stall_read_barrier: Arc<AtomicBool>,
+    pause_forward_response: Arc<AtomicBool>,
+    forward_response_ready: Arc<tokio::sync::Notify>,
+    release_forward_response: Arc<tokio::sync::Notify>,
     captured_payloads: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
 
@@ -68,6 +73,9 @@ impl LoopbackPeer {
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
             stall_forward_mutation: Arc::new(AtomicBool::new(false)),
             stall_read_barrier: Arc::new(AtomicBool::new(false)),
+            pause_forward_response: Arc::new(AtomicBool::new(false)),
+            forward_response_ready: Arc::new(tokio::sync::Notify::new()),
+            release_forward_response: Arc::new(tokio::sync::Notify::new()),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
         }
     }
@@ -144,6 +152,12 @@ impl ConsensusPeer for LoopbackPeer {
         let sender = request.sender;
         let family = request.family;
         let response = handler.handle(sender, request).await;
+        if family == ConsensusRpcFamily::ForwardMutation
+            && self.pause_forward_response.load(Ordering::SeqCst)
+        {
+            self.forward_response_ready.notify_one();
+            self.release_forward_response.notified().await;
+        }
         if family == ConsensusRpcFamily::ForwardMutation
             && self
                 .drop_forward_responses

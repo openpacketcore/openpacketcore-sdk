@@ -1,5 +1,6 @@
 //! Durable management-plane audit storage over the reference SQLite profile.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use rusqlite::types::ValueRef;
@@ -70,7 +71,8 @@ pub enum ManagementAuditRetentionError {
 }
 
 /// Stable persisted transport code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ManagementAuditTransportCode {
     /// gNMI.
     Gnmi,
@@ -109,7 +111,8 @@ impl ManagementAuditTransportCode {
 }
 
 /// Stable persisted authority for a management audit event's UTC wall clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ManagementAuditTimeSourceCode {
     /// Node wall clock with no synchronisation assurance.
     NodeClock,
@@ -203,7 +206,8 @@ pub enum ManagementAuditInstantError {
 }
 
 /// Stable persisted management-operation code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ManagementAuditOperationCode {
     /// Capability/schema discovery.
     Capabilities,
@@ -266,7 +270,8 @@ impl ManagementAuditOperationCode {
 }
 
 /// Stable persisted management-audit outcome class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ManagementAuditOutcomeCode {
     /// Pre-side-effect intent.
     Intent,

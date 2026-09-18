@@ -1,5 +1,7 @@
 //! ConfigStore implementation coordinated exclusively by Openraft.
 
+mod audit;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
