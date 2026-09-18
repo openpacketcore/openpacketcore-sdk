@@ -1,5 +1,7 @@
 //! One OS process per voter; the test process owns only clients and workload.
 
+#[path = "isolated_scale/majority_recovery.rs"]
+mod majority_recovery;
 #[path = "isolated_scale/original.rs"]
 mod original;
 
@@ -102,11 +104,25 @@ impl Fleet {
 
     fn wait_isolated_scale_ready(&mut self, scale: QualificationIsolatedScaleConfig) -> usize {
         let deadline = Instant::now() + Duration::from_secs(10);
-        let expected_ids = self
-            .stateless_consumer_voter_authorities()
-            .iter()
-            .map(|authority| authority.node_id().get())
-            .collect::<Vec<_>>();
+        let expected_ids =
+            if scale.workload == QualificationIsolatedScaleWorkload::RetainedRecoveryControl {
+                let topology =
+                    fixed_voter_topology_for_configuration_with_root(&self.members, "v1", 1, None);
+                self.members
+                    .iter()
+                    .map(|member| {
+                        topology
+                            .consensus_node_id(&ReplicaId::new(member.replica_id.clone()).unwrap())
+                            .unwrap()
+                            .get()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                self.stateless_consumer_voter_authorities()
+                    .iter()
+                    .map(|authority| authority.node_id().get())
+                    .collect::<Vec<_>>()
+            };
         let mut expected_ids = expected_ids;
         expected_ids.sort_unstable();
         loop {

@@ -1258,6 +1258,13 @@ impl QualificationNode {
             })
             .collect::<Result<Vec<_>, NodeFailure>>()?;
         let roster_attestation_root = QualificationRosterIngressSigner::root()?;
+        let bound_roster_root = if config.isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::RetainedRecoveryControl
+        }) {
+            None
+        } else {
+            Some(roster_attestation_root.clone())
+        };
         let manifest = Arc::new(
             SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
@@ -1266,7 +1273,7 @@ impl QualificationNode {
                 SessionConfigurationEpoch::new(config.configuration_epoch)
                     .map_err(|_| NodeFailure)?,
                 descriptors.clone(),
-                Some(roster_attestation_root.clone()),
+                bound_roster_root.clone(),
             )
             .map_err(|_| NodeFailure)?,
         );
@@ -1289,15 +1296,16 @@ impl QualificationNode {
             .collect::<Result<Vec<_>, _>>()?;
         configured_voter_ids.sort_unstable();
         let fixed_consensus_identity = manifest.fixed_durable_quorum_consensus_identity();
-        let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum(
-            QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
-                local_replica,
-                descriptors,
-                fixed_consensus_identity,
-                roster_attestation_root.clone(),
-            ),
-        )
-        .map_err(|_| NodeFailure)?;
+        let mut topology = QuorumTopologyConfig::new_consensus(
+            local_replica,
+            descriptors,
+            fixed_consensus_identity,
+        );
+        if let Some(root) = bound_roster_root {
+            topology = topology.with_roster_attestation_trust_root(root);
+        }
+        let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum(topology)
+            .map_err(|_| NodeFailure)?;
         let rpc_gate = QualificationConsensusRpcGate::available();
         let (peers, server_transport, transport) = prepare_transport(
             config,

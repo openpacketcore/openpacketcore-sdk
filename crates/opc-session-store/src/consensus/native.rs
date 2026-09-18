@@ -465,10 +465,14 @@ pub(crate) struct NativeStorage {
 }
 
 impl NativeStorage {
+    /// Outside the shared State lock: selected log bodies retain bounded,
+    /// independently validated disk ranges and need not be resident at reopen.
     pub(crate) fn check_async_reservation(
         &self,
         reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+        check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        check()?;
         self.business
             .frontiers
             .check_async_reservation(reservation)?;
@@ -482,7 +486,16 @@ impl NativeStorage {
             reservation.check(id.leader_id.term)?;
             reservation.check(id.index)?;
         }
-        Ok(())
+        for entry in self.log.entries.values() {
+            let input = entry.read_owned(
+                entry.id().index,
+                self.business.identity,
+                &self.business.members,
+                check,
+            )?;
+            async_recovery::check_log_reservation(input.entry(), reservation)?;
+        }
+        check()
     }
 
     pub(crate) fn empty(
@@ -542,11 +555,10 @@ impl NativeFrontiers {
         &self,
         reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
     ) -> io::Result<()> {
-        if self
-            .async_recovery
-            .as_ref()
-            .is_some_and(|boundary| boundary.era > reservation.era())
-        {
+        if self.async_recovery.as_ref().is_some_and(|boundary| {
+            boundary.era > reservation.era()
+                || (boundary.era == reservation.era() && boundary.plan != reservation.plan())
+        }) {
             return Err(invalid("native asynchronous boundary reservation differs"));
         }
         self.validate_async_boundary()?;

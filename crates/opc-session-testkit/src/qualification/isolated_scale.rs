@@ -43,6 +43,9 @@ pub enum QualificationIsolatedScaleWorkload {
     Original,
     /// Functional construction, operation, shutdown and reconstruction control.
     BoundaryControl,
+    /// Abrupt retained-root recovery under ordinary fixed-quorum authority.
+    /// This opt-in fixture has no protected-roster trust root from creation.
+    RetainedRecoveryControl,
 }
 
 /// Opt-in configuration; omission preserves every legacy Durable node.
@@ -63,6 +66,9 @@ impl QualificationIsolatedScaleConfig {
                 "sessions=50000;preload=50000;steady=500x1800;burst=1000x60;epochs=8"
             }
             QualificationIsolatedScaleWorkload::BoundaryControl => "boundary-control",
+            QualificationIsolatedScaleWorkload::RetainedRecoveryControl => {
+                "retained-recovery-control;roster=none"
+            }
         };
         let descriptor = format!(
             "opc-session-isolated-scale/v1;voters=3;mode={};clock={QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS};{workload}",
@@ -107,11 +113,13 @@ pub struct QualificationIsolatedScaleReadiness {
     /// Whether the asynchronous persistence backlog is saturated.
     pub saturated: bool,
     /// Whether Async may participate after fresh creation, completed live-quorum
-    /// repair, or validated one-use evidence of completed consensus shutdown.
+    /// repair, unanimous retained-owner retirement, or validated one-use
+    /// evidence of completed consensus shutdown.
     pub async_active: bool,
     /// Completed automatic consensus snapshot publications.
     pub completed_snapshot_count: u64,
-    /// Whether an existing Async root still requires a surviving live quorum.
+    /// Whether the passive Async stage is awaiting a live-quorum cut. Other
+    /// recovery stages and repair requirements also withhold `async_active`.
     pub awaiting_live_quorum: bool,
     /// Currently detached Async generation, if any.
     pub captured_generation: Option<u64>,

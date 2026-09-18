@@ -449,6 +449,12 @@ impl Publication {
             reservation.check(id.leader_id.term)?;
             reservation.check(id.index)?;
         }
+        for row in self.rows.values().filter_map(|row| row.after.as_ref()) {
+            super::super::async_recovery::check_log_reservation(
+                &row.resident()?.entry,
+                reservation,
+            )?;
+        }
         Ok(())
     }
 

@@ -200,6 +200,10 @@ impl NativeState {
                     .map_err(|_| unavailable())?;
             }
             if row.response.is_none()
+                || row
+                    .response
+                    .as_deref()
+                    .is_some_and(|response| self.frontiers.async_retires_response(response))
                 || self
                     .frontiers
                     .logical_time
@@ -340,7 +344,12 @@ impl NativeDelta<'_> {
                                 request, response,
                             )?;
                         }
-                        if row.response.is_none() || row.retained_until <= now {
+                        if row.response.is_none()
+                            || row.retained_until <= now
+                            || row.response.as_deref().is_some_and(|response| {
+                                self.frontiers.async_retires_response(response)
+                            })
+                        {
                             let response = self
                                 .response(index, Err(StoreError::FencedTransitionRequestExpired));
                             self.compact_v1(command.request_id, now)?;

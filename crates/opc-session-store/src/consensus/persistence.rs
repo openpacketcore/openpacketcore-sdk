@@ -15,6 +15,11 @@ pub enum SessionPersistenceMode {
     /// and application. Background persistence may lag acknowledged results.
     /// Loss of the volatile quorum can lose those results; a completed local
     /// generation alone is not proof of current quorum authority.
+    /// New roots reserve finite authority ranges before volatile issuance.
+    /// Majority/all-cold recovery requires every retained fixed member and
+    /// synchronizes a committed retirement boundary before issuing new leases.
+    /// Legacy roots and protected-roster authority need separate recovery
+    /// authority when no compatible live majority survives.
     Async,
 }
 
@@ -136,17 +141,39 @@ pub struct SessionPersistenceHealth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum SessionAsyncRecoveryState {
-    /// A fresh member, a caught-up member, or a member with a validated
-    /// one-use proof of completed consensus shutdown may participate.
+    /// A fresh member, a caught-up member, or a member with validated shutdown
+    /// evidence or a persisted unanimous recovery boundary may participate.
     /// Application traffic still needs the ordinary exact quorum checks.
     Active,
-    /// An existing root without a completed shutdown proof awaits a new
-    /// commit by a surviving live quorum.
+    /// An existing root without a completed shutdown proof awaits a fresh
+    /// live-quorum cut or preparation by all exact retained owners.
     /// Votes, elections and replication acknowledgements are withheld.
     AwaitingLiveQuorum,
     /// A live quorum supplied a fresh cut; only its leader may repair this
     /// member. Votes, elections and application traffic remain withheld.
     CatchingUp,
+    /// The exact fixed roster is durably preparing a successor authority range.
+    /// Ordinary application admission remains closed.
+    PreparingRecovery,
+    /// Prepared members are electing and applying a real recovery boundary.
+    /// Application admission awaits every member's persisted boundary.
+    ReformingQuorum,
+    /// A retained legacy root lacks a pre-loss authority reservation.
+    LegacyAuthorityRequired,
+    /// Configured or retained protected authority requires an explicit
+    /// retirement contract, including when its activation was volatile.
+    ProtectedAuthorityRequired,
+    /// No compatible live majority is available; all retained configured
+    /// owners must return before a successor range can be prepared.
+    AwaitingRecoveryParticipants,
+    /// The retained root has no applied fixed membership. This protocol
+    /// cannot reconstruct lost formation authority from configuration alone.
+    RetainedMembershipRequired,
+    /// Retained committed prefixes cannot be covered by one selected history.
+    /// Independent repair authority is required; retrying cannot choose a fork.
+    RetainedHistoryConflict,
+    /// The finite pre-reserved authority domain has no successor range.
+    AuthorityRangeExhausted,
 }
 
 /// Passive progress of the single coalescing background persistence owner.

@@ -4,6 +4,7 @@
 //! adapter in `consensus::storage` owns async locking and maps these coarse,
 //! redaction-safe failures into Openraft storage errors.
 
+#[cfg(target_os = "linux")]
 pub(crate) mod async_recovery;
 pub(crate) mod consumer_receipts;
 #[cfg(target_os = "linux")]

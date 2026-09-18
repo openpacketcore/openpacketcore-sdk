@@ -424,7 +424,7 @@ Both constructors are Linux-only and require file-backed storage.
 |:--|:--|:--|
 | Successful mutation | Durable log acknowledgement, real quorum replication, and committed application. | Validated resident storage, real quorum replication, and committed application. |
 | Disk progress | Required before the durable storage acknowledgement. | One coalescing writer persists and selects complete local generations after resident acknowledgement. |
-| Ordinary restart | Reopens the validated durable state under the existing admission checks. | A new-format root with completed SDK shutdown evidence can resume ordinary consensus. Otherwise it requires catch-up from a surviving live quorum. |
+| Ordinary restart | Reopens the validated durable state under the existing admission checks. | A new-format root with completed SDK shutdown evidence can resume ordinary consensus. Otherwise it uses live-quorum catch-up or the unanimous retained-owner recovery below. |
 | Readiness API | Existing durable probes or `probe_fixed_quorum_readiness`. | `probe_fixed_quorum_readiness`; durable probes return `PersistenceNotDurable`. |
 
 An Async success can precede disk persistence. Loss of the live volatile quorum
@@ -436,26 +436,55 @@ reject mixed modes. Changing snapshot integrity does not select persistence.
 No automatic conversion or cross-mode recovery is provided.
 
 Install `rpc_handler()` before calling `initialize_cluster()` on every startup.
-For an uncertified existing Async root, this call obtains a genuinely new committed entry
-from the other live voters, admits repair only from its certified leader, and
-waits for exact local application before allowing votes. An incomplete cold
-recovery attempt or missing live majority returns `RecoveryRequired`; a later
-call may continue validated catch-up or obtain a fresh attempt. Once recovery
-becomes active, the remaining ordinary initialization and membership admission
-checks still share that call's original operation deadline. Their timeout can
-return `ClusterFormationRejected`, which also covers genuine scope rejection
-and is not a general retry signal. Active recovery health does not establish
-successful initialization or traffic authority. An all-cold quorum without
-completed shutdown proofs stays closed; local disk progress, cached responses,
-and recreating storage do not supply a supported recovery authority.
+A cold voter first uses a compatible surviving live majority when available.
+That path obtains a genuinely new committed entry, admits repair only from
+its certified leader, and requires matching replication and local application.
+When that majority is unavailable, new-format roots can recover automatically
+once **every configured retained voter** returns, including the surviving
+process. Three and five fixed voters are supported; membership, storage roots,
+configuration epoch, persistence mode and application Recovery authority stay
+unchanged.
 
 New Async roots use format `OPCNA003`. Before the first volatile operation,
-the owner syncs a separate, exact-root-bound authority reservation. It bounds
-vote terms, log indices and issued business frontiers independently of the
-session generation writer. Ordinary operations compare resident values with
-this reservation; they never rewrite it or wait for it. Missing or invalid
-reservation evidence rejects reopening, and exhaustion fails closed.
-This reservation is preparation for unclean recovery, not an admission proof.
+the owner syncs a separate, exact-root-bound authority reservation. Its finite
+range bounds votes, log positions, lease fences, credentials and business
+frontiers independently of the session-generation writer. Ordinary operations
+compare resident values with that reservation: they never rewrite it or wait
+for its disk I/O. Missing or invalid reservation evidence rejects reopening;
+range exhaustion fails closed.
+
+Recovery performs disk work explicitly:
+
+1. Every exact retained owner fences ordinary work and durably promises the
+   same higher range, bound to all roots, boot incarnations and a fresh round.
+   Accepted earlier effects are joined; votes and selected generations persist.
+2. The selected candidate must cover all retained committed cuts. Actual Raft
+   election, replication and committed application install a recovery boundary.
+   Neither a local snapshot nor a coordinator reply substitutes for those checks.
+3. Every member must apply and persist that boundary under the exact full vote,
+   membership and round before normal participation resumes. Snapshot receipt
+   alone is insufficient. Initialization and traffic still require their usual
+   current-authority checks.
+
+The boundary retires the entire prior reserved range, including authority
+issued in a lost acknowledged tail. Old lease credentials cannot mutate a
+successor; newly issued fences exceed the old range even for absent keys.
+Retained ordinary/V1 receipts keep their immutable request bindings but cannot
+return retired ownership as current authority. V2 receipt history and watch
+cursors are retired; callers must observe the new history/compaction boundary
+and reacquire authority. Surviving records are retained subject to Async's
+acknowledged-data-loss contract. Recovery does not promise preservation of
+sessions, calls, exact old outcomes, or effects outside SDK fencing enforcement.
+
+Each call keeps its original operation deadline. `RecoveryRequired` can mean
+an incomplete bounded attempt: retry initialization while consulting passive
+`persistence_health().recovery`. Fixed reasons distinguish preparation,
+quorum reformation, unavailable participants, legacy authority, missing retained
+membership, incompatible committed history and exhausted authority. Accepted
+disk/engine work retains its owner after cancellation; an interrupted round
+prepares a strictly newer range where necessary. No timeout is raised to make
+recovery succeed. `Active` permits consensus participation, not traffic by
+itself; ordinary admission can still return `ClusterFormationRejected`.
 
 After the RPC handler is removed,
 `shutdown()` joins the active consensus engine and every storage owner, drains
@@ -473,14 +502,22 @@ migrated to an authority reservation. Older SDK versions reject the new
 format, so they cannot leave a stale close proof beside new volatile work.
 This change does not recover already-fenced legacy installations.
 
-Unclean two-of-three restart with one process surviving remains unsupported
-without a live majority: retained storage alone is insufficient. A fenced installation is an
-availability failure. The lost Async tail can include issued fences and
-revocation of older leases, even when the survivor stayed alive. Selecting the
-highest local generation or waiting for a lease timeout cannot establish a
-safe successor. [SDK #908 recovery evidence](../../docs/async-majority-recovery-908.md)
-records the executed orderly-restart correction and the separate missing
-authority for acknowledged volatile-tail recovery.
+Automatic unanimous recovery requires retained reservations and an applied
+exact fixed membership on every participant. It cannot replace a missing or
+corrupt root, reconstruct formation when every selected generation predates
+membership, select between conflicting committed histories, or retire protected
+roster authority. A configured protected-roster trust root disables this path,
+even if its volatile activation was lost. Those conditions require a separately
+specified repair/retirement authority; waiting or resetting storage supplies
+none. A permanently fenced installation is an availability failure.
+
+Async transport now uses `OPC-ASYNC-2`; older Async peers reject the protocol,
+and current peers reject older Async frames. Durable wire encoding is unchanged.
+Upgrade the whole Async membership and consumers together; rolling mixed-version
+recovery is unsupported. An already-fenced legacy installation cannot gain its
+missing pre-loss authority bound by repinning alone.
+[SDK #908 recovery evidence](../../docs/async-majority-recovery-908.md) separates
+executed SDK tests from the outstanding product integration and CRC validation.
 
 If a restarted voter lost a previously acknowledged volatile tail, its
 certified live leader restores that prefix through ordinary snapshot

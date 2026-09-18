@@ -1,7 +1,8 @@
 //! Mode-bound transport and the cold asynchronous voter admission fence.
 //!
-//! An uncertified reopened volatile voter cannot participate in Raft until an already-live
-//! quorum has committed a new nonce-bound entry without it. Only that leader's
+//! An uncertified reopened volatile voter requires either a fresh live-quorum
+//! cut or the unanimous retained-owner recovery protocol in `recovery`. The
+//! live-quorum path commits a new nonce-bound entry without the cold voter. Only that leader's
 //! term may then repair it. A successful matching AppendEntries through the
 //! new entry, local application, and the ordinary exact authority checks must
 //! all complete before votes or elections resume. No persisted generation,
@@ -9,11 +10,13 @@
 //! A new-format root may instead consume one-use evidence that its previous
 //! consensus incarnation stopped and persisted every accepted effect. This
 //! permits ordinary Raft restart, subject to the same current quorum checks.
+//! Unanimous recovery additionally requires durable range promises and every
+//! participant's persisted, actually committed retirement boundary.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use opc_consensus::engine::raft::{AppendEntriesRequest, InstallSnapshotRequest};
+use opc_consensus::engine::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use opc_consensus::engine::{LogId, Vote};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, Semaphore};
@@ -28,7 +31,11 @@ use super::{
 // Eleven continuation bytes cannot encode a Postcard u64 or enum tag. Older
 // durable engine/forward handlers therefore reject this prefix too. The
 // entire prefix consumes the existing family payload budget.
-const ASYNC_WIRE: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-ASYNC-1\0";
+const ASYNC_WIRE: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-ASYNC-2\0";
+
+mod recovery;
+#[cfg(target_os = "linux")]
+pub(super) use recovery::{Coordinator, LocalRecovery};
 pub(super) const COLD_BARRIER_WIRE: &[u8; 22] =
     b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-COLD-1\0";
 pub(super) const COLD_REPAIR_WIRE: &[u8; 24] =
@@ -178,6 +185,18 @@ enum Admission {
         confirmed: AtomicBool,
         repair_needed: AtomicBool,
     },
+    #[cfg(target_os = "linux")]
+    Preparing {
+        plan: [u8; 32],
+        era: u64,
+    },
+    #[cfg(target_os = "linux")]
+    Reforming {
+        plan: [u8; 32],
+        era: u64,
+        vote: Vote<SessionConsensusNodeId>,
+        matched: std::sync::Mutex<Option<LogId<SessionConsensusNodeId>>>,
+    },
 }
 
 #[cfg(test)]
@@ -195,6 +214,11 @@ pub(crate) struct PersistenceProtocol {
     active: Arc<AtomicBool>,
     admission: Arc<RwLock<Admission>>,
     pub recovery_attempt: Arc<Mutex<()>>,
+    #[cfg(target_os = "linux")]
+    pub(super) recovery_coordinator: Arc<Mutex<Option<Coordinator>>>,
+    #[cfg(target_os = "linux")]
+    pub(super) recovery_local: Arc<Mutex<Option<LocalRecovery>>>,
+    recovery_limit: Arc<std::sync::atomic::AtomicU8>,
     pub progress: Arc<Notify>,
     /// Bound cancellation-safe cold RPC supervisors. The original engine
     /// request/response remains intact; no synthetic acknowledgement is made.
@@ -223,6 +247,11 @@ impl PersistenceProtocol {
                 Admission::Quarantined { request: None }
             })),
             recovery_attempt: Arc::new(Mutex::new(())),
+            #[cfg(target_os = "linux")]
+            recovery_coordinator: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "linux")]
+            recovery_local: Arc::new(Mutex::new(None)),
+            recovery_limit: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             progress: Arc::new(Notify::new()),
             cold_rpc_admission: Arc::new(Semaphore::new(16)),
             #[cfg(test)]
@@ -257,8 +286,30 @@ impl PersistenceProtocol {
         if self.is_active() {
             return Some(SessionAsyncRecoveryState::Active);
         }
+        // A repair requirement takes precedence over the stage at which it
+        // was discovered. Reporting only Preparing here would hide the reason
+        // an otherwise bounded retry cannot make progress.
+        match self.recovery_limit.load(Ordering::Acquire) {
+            4 => return Some(SessionAsyncRecoveryState::RetainedMembershipRequired),
+            5 => return Some(SessionAsyncRecoveryState::RetainedHistoryConflict),
+            6 => return Some(SessionAsyncRecoveryState::AuthorityRangeExhausted),
+            _ => {}
+        }
         Some(match self.admission.try_read().as_deref() {
             Ok(Admission::CatchingUp { .. }) => SessionAsyncRecoveryState::CatchingUp,
+            #[cfg(target_os = "linux")]
+            Ok(Admission::Preparing { .. }) => SessionAsyncRecoveryState::PreparingRecovery,
+            #[cfg(target_os = "linux")]
+            Ok(Admission::Reforming { .. }) => SessionAsyncRecoveryState::ReformingQuorum,
+            _ if self.recovery_limit.load(Ordering::Acquire) == 1 => {
+                SessionAsyncRecoveryState::LegacyAuthorityRequired
+            }
+            _ if self.recovery_limit.load(Ordering::Acquire) == 2 => {
+                SessionAsyncRecoveryState::ProtectedAuthorityRequired
+            }
+            _ if self.recovery_limit.load(Ordering::Acquire) == 3 => {
+                SessionAsyncRecoveryState::AwaitingRecoveryParticipants
+            }
             _ => SessionAsyncRecoveryState::AwaitingLiveQuorum,
         })
     }
@@ -410,14 +461,25 @@ impl EngineAdmission {
         }
     }
 
-    pub(super) fn permits_vote(&self) -> bool {
-        matches!(*self.guard, Admission::Active)
+    pub(super) fn permits_vote(&self, rpc: &VoteRequest<SessionConsensusNodeId>) -> bool {
+        match &*self.guard {
+            Admission::Active => true,
+            #[cfg(target_os = "linux")]
+            Admission::Reforming { vote, .. } => rpc.vote == *vote,
+            _ => false,
+        }
     }
 
     pub(super) fn permits_append(&self, rpc: &AppendEntriesRequest<SessionRaftTypeConfig>) -> bool {
         match &*self.guard {
             Admission::Active => true,
             Admission::Quarantined { .. } => false,
+            #[cfg(target_os = "linux")]
+            Admission::Preparing { .. } => false,
+            #[cfg(target_os = "linux")]
+            Admission::Reforming { vote, .. } => {
+                rpc.vote.is_committed() && rpc.vote.leader_id == vote.leader_id
+            }
             Admission::CatchingUp { cut, .. } => {
                 rpc.vote == cut.vote
                     && rpc
@@ -434,6 +496,12 @@ impl EngineAdmission {
         match &*self.guard {
             Admission::Active => true,
             Admission::Quarantined { .. } => false,
+            #[cfg(target_os = "linux")]
+            Admission::Preparing { .. } => false,
+            #[cfg(target_os = "linux")]
+            Admission::Reforming { vote, .. } => {
+                rpc.vote.is_committed() && rpc.vote.leader_id == vote.leader_id
+            }
             Admission::CatchingUp { cut, .. } => {
                 rpc.vote == cut.vote
                     && *rpc.meta.last_membership.log_id() == cut.membership
@@ -448,6 +516,30 @@ impl EngineAdmission {
     // leader. Snapshot metadata alone is never the activation witness: after
     // snapshot catch-up the leader must still match a prefix through the cut.
     pub(super) fn confirm_append(&self, matched: Option<LogId<SessionConsensusNodeId>>) {
+        #[cfg(target_os = "linux")]
+        if let Admission::Reforming {
+            vote,
+            matched: confirmed,
+            ..
+        } = &*self.guard
+        {
+            if let Some(matched) = matched.filter(|id| {
+                vote.leader_id.voted_for().is_some_and(|leader| {
+                    id.leader_id
+                        == opc_consensus::engine::CommittedLeaderId::new(
+                            vote.leader_id.term,
+                            leader,
+                        )
+                })
+            }) {
+                if let Ok(mut confirmed) = confirmed.lock() {
+                    if confirmed.is_none_or(|prior| prior.index < matched.index) {
+                        *confirmed = Some(matched);
+                        self.progress.notify_one();
+                    }
+                }
+            }
+        }
         if let Admission::CatchingUp { cut, confirmed, .. } = &*self.guard {
             if matched.is_some_and(|matched| covers(matched, cut.barrier))
                 && !confirmed.swap(true, Ordering::AcqRel)

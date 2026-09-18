@@ -180,6 +180,73 @@ fn native_async_boundary_invalidates_a_prepared_old_application() {
 }
 
 #[test]
+fn native_async_boundary_rejects_retained_ordinary_receipt_as_new_authority() {
+    let mut storage = fixture();
+    let old = acquire(&mut storage, 1, 1);
+    let old_id = SessionConsensusRequestId::from_bytes(101u128.to_be_bytes());
+    let term = recover(&mut storage, 2);
+    {
+        use crate::sqlite::consensus::consumer_receipts::ConsumerReceiptStore;
+        let receipts = storage.business.consumer_receipts().unwrap();
+        assert!(receipts
+            .outcome(storage.business.identity, old_id)
+            .unwrap()
+            .is_none());
+        assert!(receipts
+            .occupied(storage.business.identity, old_id)
+            .unwrap());
+    }
+    // Re-submit the exact old acquisition after retirement. It must not
+    // replay its still-unexpired credential as a successful current result.
+    let mut replay = command(
+        &storage,
+        term,
+        3,
+        SessionMutationIntent::AcquireLease {
+            key: old.key().clone(),
+            owner: old.owner().clone(),
+            ttl: Duration::from_secs(60),
+        },
+    );
+    let EntryPayload::Normal(ref mut command) = replay.payload else {
+        unreachable!()
+    };
+    command.request_id = old_id;
+    assert!(
+        matches!(
+            apply(&mut storage, &[replay]).responses[0].result,
+            Err(StoreError::TopologyAuthorityRevoked)
+        ),
+        "retired receipt must never reissue old authority"
+    );
+    storage.validate_image().unwrap();
+}
+
+#[test]
+fn native_async_boundary_retires_v1_receipt_without_clearing_its_binding() {
+    let (mut storage, request, old) = v1::tests::fixture();
+    let id = SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes());
+    let retained = serde_json::to_vec(&storage.business.generic_receipts[&id]).unwrap();
+    let term = recover(&mut storage, 2);
+    assert!(old.lease().expires_at() > time(2));
+    assert!(matches!(
+        storage.business.status_v1(&request).unwrap(),
+        crate::FencedTransitionStatus::Expired
+    ));
+    let mut replay = v1::tests::command(3, &request, time(2), false);
+    replay.log_id = log_id(term, 3);
+    assert!(matches!(
+        apply(&mut storage, &[replay]).responses[0].result,
+        Err(StoreError::FencedTransitionRequestExpired)
+    ));
+    assert_eq!(
+        serde_json::to_vec(&storage.business.generic_receipts[&id]).unwrap(),
+        retained
+    );
+    storage.validate_image().unwrap();
+}
+
+#[test]
 fn native_async_boundary_requires_successor_term_and_preserves_named_header() {
     let mut storage = fixture();
     let old = acquire(&mut storage, 1, 1);
@@ -204,10 +271,10 @@ fn native_async_boundary_requires_successor_term_and_preserves_named_header() {
     assert!(decoded == storage.business.frontiers);
     assert!(postcard::to_stdvec(&decoded).is_err());
     assert!(storage
-        .check_async_reservation(Reservation::initial())
+        .check_async_reservation(Reservation::initial(), &|| Ok(()))
         .is_err());
     storage
-        .check_async_reservation(Reservation::from_era(2).unwrap())
+        .check_async_reservation(Reservation::recovery(2, [0xB1; 32]).unwrap(), &|| Ok(()))
         .unwrap();
     let duplicate = command(
         &storage,

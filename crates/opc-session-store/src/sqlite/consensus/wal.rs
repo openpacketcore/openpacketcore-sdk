@@ -339,6 +339,7 @@ pub(crate) enum Point {
     AfterAsyncClosedConsumeSync,
     BeforeAsyncAuthorityWrite,
     AfterAsyncAuthorityFileSync,
+    AfterAsyncAuthorityRename,
     AfterAsyncAuthorityDirectorySync,
     BeforeBasisCreate,
     AfterBasisCreate,
@@ -909,7 +910,7 @@ impl Wal {
                 .native
                 .as_ref()
                 .ok_or_else(|| invalid_data("asynchronous authority native owner missing"))?
-                .check_async_reservation(reservation)?;
+                .check_async_reservation(reservation, &|| Ok(()))?;
             state.async_authority = Some(reservation);
         }
         // Bootstrap replaces its prospective state with the admitted Catalog.

@@ -23,7 +23,9 @@ struct Story {
     cut: ColdQuorumCut,
 }
 
-async fn snapshot(store: &ConsensusSessionStore) -> InstallSnapshotRequest<SessionRaftTypeConfig> {
+pub(super) async fn snapshot(
+    store: &ConsensusSessionStore,
+) -> InstallSnapshotRequest<SessionRaftTypeConfig> {
     let applied = store.inner.raft.metrics().borrow().last_applied.unwrap();
     store.inner.raft.trigger().snapshot().await.unwrap();
     store
@@ -51,7 +53,7 @@ async fn snapshot(store: &ConsensusSessionStore) -> InstallSnapshotRequest<Sessi
     }
 }
 
-async fn send_snapshot(
+pub(super) async fn send_snapshot(
     cold: &ConsensusSessionStore,
     sender: SessionConsensusNodeId,
     request: &InstallSnapshotRequest<SessionRaftTypeConfig>,
@@ -75,7 +77,7 @@ async fn send_snapshot(
     response
 }
 
-fn decode_snapshot(
+pub(super) fn decode_snapshot(
     response: SessionConsensusWireResponse,
     stage: &str,
 ) -> Result<

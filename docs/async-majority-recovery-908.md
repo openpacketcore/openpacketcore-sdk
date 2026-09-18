@@ -1,9 +1,19 @@
 # Async majority-restart recovery: SDK #908
 
-The SDK now supports majority and all-voter restart after completed shutdown
-of new-format Async roots. Normal session acknowledgements still do not wait
-for disk. Unclean loss of acknowledged volatile state and recovery of already
-fenced legacy roots remain unresolved; #908 is not complete.
+The implementation adds automatic majority/all-cold recovery for new-format
+Async roots once every configured retained owner returns. Normal session
+acknowledgements still do not wait for disk. Recovery durably prepares a new
+reserved authority range, performs real Raft election/replication, and requires
+every member's committed boundary to persist before activation. Lost volatile
+lease authority is retired rather than reconstructed from an old snapshot.
+
+Focused lost-tail, adversarial and abrupt mTLS process-loss tests pass. These
+results are distinct from full SDK/platform qualification; the current gate
+status is recorded in [draft PR #910](https://github.com/openpacketcore/openpacketcore-sdk/pull/910).
+Legacy roots and
+protected-roster retirement require authority absent from this protocol;
+repinning the already-fenced legacy CRC installation is not a supported repair.
+No live cluster action has been performed and no product recovery is claimed.
 
 ## Executed baseline
 
@@ -100,8 +110,20 @@ Two additional positive tests require recovery after the acknowledged volatile
 tail described below. Both were executed before production edits and failed at
 usable-authority recovery; log SHA-256:
 `3ba242d01464c56efb7562f53500d907605b735a7d7b26c32d5238a6fb25a0c4`.
-They remain enabled and failing. They prevent the completed-shutdown component
-from being mistaken for full #908 acceptance.
+The same two tests now pass through usable authority, rejection of both retained
+and lost old credentials, and a valid successor operation. Command:
+
+```sh
+cargo test --locked -p opc-session-store --all-features --lib \
+  volatile_tail_recovers_successor_authority -- --test-threads=1
+```
+
+GREEN log SHA-256:
+`72402bb75b98d356da995ba5e354f0aac637582e98f8746b7552c52db428fc10`.
+These use the real storage/engine and authenticated fixture boundary, not the
+production mTLS adapter. The retained roots differ and the live survivor lacks
+the later majority prefix. The tests keep the lost credentials unexpired;
+local expiry is not the recovery authority.
 
 ## Missing authority, beyond the cold-barrier dependency
 
@@ -137,9 +159,8 @@ Both controls pass; log SHA-256:
 acknowledgement after resident projection. That includes the log adapter's
 vote, append and commit operations. Generation selection happens later.
 `consensus/native/ordinary.rs` advances `next_fence` and `next_credential` in
-that same resident state when issuing leases. The retained root identifies the
-storage lineage and mode; it does not reserve an upper bound for future
-volatile allocations. Legacy roots do not identify a durably closed consensus
+that same resident state when issuing leases. A legacy retained root identifies storage lineage and mode; it does not
+reserve an upper bound for future volatile allocations. Legacy roots do not identify a durably closed consensus
 incarnation either.
 
 Without completed-shutdown evidence, the cold protocol cannot distinguish a fully persisted safe cut from
@@ -170,37 +191,95 @@ higher issued fence after expiry. For example, the XDP owner-install path
 adopts persisted fencing evidence and rejects an older generation. Waiting
 longer therefore cannot establish the required successor ordering.
 
-## Required contract change
+## Implemented contract and limits
 
-A future automatic protocol must establish durable authority before volatile
-acknowledgement. Durable vote/log storage is one option, with different I/O and
-data-loss semantics. A separate recovery-incarnation protocol would need
-durable exclusive promises, authority allocation bounds, an authenticated
-state-selection rule, and cancellation-safe retirement of accepted old work.
-Its counter and epoch semantics must also be enforceable by downstream effect
-consumers. These are requirements, not an implemented or proven protocol.
+[ADR 0022](adr/0022-native-session-persistence-modes.md#unanimous-retained-owner-recovery-sdk-908)
+and the [public README](../crates/opc-session-store/README.md#fixed-quorum-asynchronous-persistence)
+specify the protocol and data-loss boundary. New `OPCNA003` roots reserve a
+finite ceiling before volatile issuance; recovery alone synchronizes successor
+promises and complete generations. No per-operation durable journal is added.
+Every retained participant must bind the same exact membership/root/boot/round,
+finish its accepted effects, and prepare above all old ranges. The selected
+candidate covers retained committed cuts; real election and committed
+application install the retirement boundary. All members persist that boundary
+before admission. Current application Recovery authority remains an independent
+gate; the protocol never clears it or changes configuration epochs.
 
-For roots that already lost such evidence, an explicit recovery capability
-needs an independent authority able to revoke the lost scope and authorize the
-successor, including external effects. It cannot derive that permission from a
-local snapshot, the existing product Recovery object, an operator's acceptance
-of data loss, or a fabricated quorum response. Retrospective metadata cannot
-recover the missing issued-fence bound.
+Old receipts cannot supply new lease authority, and old leases cannot mutate a
+successor. V1/V2 history and watch retirement retain independently validated
+accounting and immutable request bindings. Incoming/outgoing engine operations
+and disk promises retain accepted responsibility after timeout/cancellation.
+Replacement rejects stale completion sets. Retrying an interrupted election
+prepares a newer durable range rather than forging or replaying a vote.
 
-The missing transition must own four responsibilities: durably retire the
-old authority scope, finish or revoke already accepted effects, authorize one
-selected state under the exact retained membership/root/mode, and establish
-successor authority that every affected consumer can enforce. Cancellation
-after any accepted responsibility must leave a resumable owner; delayed
-replies or an old process cannot complete the successor's transition. A new
-SDK API would need authenticated evidence for these responsibilities, not an
-unchecked operator flag. This draft implements neither that capability nor a
-migration protocol for existing roots.
+Executed adversarial REDs found and corrected a missing owner fence after
+promise I/O failure, retired lease visibility in cached receipts, activation
+retry after a real leader change, and an interrupted election with no retry
+transition. Twelve reservation/protocol tests passed, log SHA-256:
+`e51f98d39679503619862f39ecd917271d8601647c7ee8bc97080ad4d366e4fc`.
+The expanded Async module suite passed 46 tests, including cancellation during
+an accepted disk promise, repeated five-voter recovery and sequential rejoin
+with another voter unavailable. Log SHA-256:
+`2050bbcc5ebc5261ec3842444c14b854ef7e65aa6aced2f98fee8f7f7fa8dcee`.
+Two additional tests passed for partial/complete snapshot installation followed
+by actual matching append, and a protected trust root whose activation was not
+retained. Log SHA-256:
+`a29825724fbd192a8b7b772676784f78c93cabcf754abd824a92f9ce530872e5`.
 
-The production change covers completed shutdown only. Full SDK qualification
-remains incomplete while the volatile-tail recovery acceptance tests fail.
-After a recovery contract is implemented and SDK gates pass, the product must
-repin the reviewed SDK and repeat Durable/Async retained-majority recovery
-with its original worker and Recovery authority, followed by the common
-service suite. This repository evidence makes no CRC recovery, all-cold
-product, packet-continuity, audio, or production-HA claim.
+The production-mTLS process fixture separately kills two of three actual
+voters, retaining the original survivor, and kills all three. It reopens the
+same roots and addresses without completed-shutdown evidence. Both cases
+recovered traffic authority, acquired a higher fence, committed a successor
+mutation and read it from every voter; the survivor's old lease was rejected.
+The fixture selects ordinary fixed authority at initial creation; it does not
+remove a protected trust root from existing storage. Command:
+
+```sh
+cargo test --locked -p opc-session-testkit --all-features \
+  --test qualification_mtls_multiprocess isolated_scale::majority_recovery \
+  -- --test-threads=1 --nocapture
+```
+
+Both tests passed; log SHA-256:
+`920ea367e9b4bd47edc4d646101990372c7efc3aa55f4fc2e57bce0e8f940ff6`.
+Disabling only the call to the unanimous recovery path caused the unchanged
+two tests to fail at their original recovery deadline (exit 101), log SHA-256:
+`83ce5fe33e2f56054e944d86b1997e2cb6a621817c28eafc632006c3e37d2686`.
+The implementation was restored byte-for-byte afterward. These focused results
+are not a final full-gate pass, disk hardware failure qualification or CRC proof.
+
+The restored implementation also passed both process tests after adding an
+explicit assertion that stale-lease rejection precedes expiry; log SHA-256:
+`c52deb58fc834d5ad64a39f672ba3991564e6636b7cdcad0d8faf36c42bd250f`.
+An additional diagnostic RED exposed an unsupported protected authority reason
+being hidden by an unavailable peer. Its corrected test and 16 native log
+admission controls passed; log SHA-256:
+`0b716232aea6fb68503cec38cba7961ba82c91a2dfb3dbb189b04305d30e8a54`.
+Package all-target/all-feature Clippy passed; log SHA-256:
+`73c5f09b556223a452ee6181be6687423a35cbd675490e41b5327935801f75c8`.
+
+Automatic recovery still requires every exact retained configured owner and
+an applied fixed membership. Missing/corrupt roots, formation lost before the
+first persisted membership, conflicting committed histories and exhausted
+ranges are explicit repair boundaries. A protected-roster trust root disables
+this retirement path, including when its activation was volatile and lost.
+Async peers/consumers must understand `OPC-ASYNC-2`; mixed old/new Async peers
+are rejected. Durable encoding and semantics are unchanged.
+
+Already-fenced `OPCNA001`/`OPCNA002` roots cannot gain the missing ceiling
+retroactively. Their existing live-quorum/closed-proof paths remain applicable,
+but an unclean lost majority needs independent authority that can durably retire
+the lost scope, finish or revoke accepted external effects, select an exact
+successor and establish authority all affected consumers enforce. Neither a
+local snapshot, data-loss acceptance, the existing product Recovery object,
+nor an unchecked flag proves those obligations. This change does not provide
+that separate migration/repair capability, and a permanent fence is not a fix
+for those installations.
+
+The downstream product must qualify its consumer retry/history behavior and
+fence enforcement, then repin a reviewed SDK and repeat Durable/Async majority
+return with the original worker, retained exact storage and Recovery authority.
+The legacy CRC installation first needs a separately reviewed supported
+migration/repair contract; it must not be reset to manufacture a recovery pass.
+After an applicable integration, run the common service suite. SDK tests make
+no CRC, call-continuity, audio or production-HA claim.

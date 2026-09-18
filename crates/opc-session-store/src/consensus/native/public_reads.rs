@@ -33,6 +33,12 @@ impl ConsumerReceiptStore for ConsumerReceipts<'_> {
             return Ok(None);
         };
         validation::validate_generic(&id, receipt, &self.state.frontiers)?;
+        if receipt
+            .response()
+            .is_some_and(|response| self.state.frontiers.async_retires_response(response))
+        {
+            return Ok(None);
+        }
         match &**receipt {
             NativeGenericReceipt::Ordinary(row) => Ok(Some((
                 row.payload_digest,

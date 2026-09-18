@@ -779,6 +779,8 @@ enum ConsensusSubmissionEffect {
 struct LocalProposalAuthority {
     origin: SessionConsensusNodeId,
     allows_operator_recovery: bool,
+    /// Admission incarnation captured before any asynchronous authority read.
+    persistence_stamp: u64,
     /// An activated raw V2 mutation already consumed the final fixed-quorum
     /// authority, recovery, activation, and logical-time snapshot after its
     /// direct leader barrier. No asynchronous authority read may be inserted
@@ -792,6 +794,7 @@ struct LocalProposalAuthority {
 struct LocalProposalExecution {
     proposal_permit: tokio::sync::OwnedSemaphorePermit,
     operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    persistence_submission: Option<persistence_protocol::EngineAdmission>,
     cohort_freeze: Option<Arc<AtomicBool>>,
     /// Private observation of this exact accepted client-write completion.
     /// Never serialized in the ordinary mutation forwarding contract.
@@ -7712,6 +7715,7 @@ impl ConsensusSessionStore {
             tokio::sync::oneshot::Sender<async_persistence::ColdProposalCompletion>,
         >,
     ) -> ForwardMutationReply {
+        let persistence_stamp = self.inner.persistence_protocol.operation_stamp();
         if let Err(error) =
             validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
         {
@@ -7921,6 +7925,23 @@ impl ConsensusSessionStore {
                 return reply;
             }
         }
+
+        // Acquire the Async incarnation fence before the final acceptance
+        // snapshot, preserving its no-further-authority-await contract.
+        let persistence_submission =
+            if fixed_raw_v2_mutation && self.persistence_mode() == SessionPersistenceMode::Async {
+                match self
+                    .inner
+                    .persistence_protocol
+                    .submission_before(persistence_stamp, deadline)
+                    .await
+                {
+                    Ok(guard) => Some(guard),
+                    Err(_) => return ForwardMutationReply::Unavailable,
+                }
+            } else {
+                None
+            };
 
         // An already-activated fixed raw V2 mutation has one final, uncached
         // SQLite acceptance snapshot after the direct same-term/read-index
@@ -8324,12 +8345,14 @@ impl ConsensusSessionStore {
                 LocalProposalAuthority {
                     origin,
                     allows_operator_recovery: allow_operator_recovery,
+                    persistence_stamp,
                     fixed_raw_v2_snapshot: fixed_v2_snapshot_logical_time.is_some(),
                 },
                 logical_time,
                 LocalProposalExecution {
                     proposal_permit,
                     operation_guard,
+                    persistence_submission,
                     cohort_freeze,
                     cold_completion,
                 },
@@ -8381,6 +8404,7 @@ impl ConsensusSessionStore {
         let LocalProposalExecution {
             proposal_permit,
             operation_guard,
+            persistence_submission,
             cohort_freeze,
             cold_completion,
         } = execution;
@@ -8523,6 +8547,21 @@ impl ConsensusSessionStore {
             )
         });
         let committed_request_id = command.request_id;
+        let persistence_submission = if persistence_submission.is_some() {
+            persistence_submission
+        } else if self.inner.persistence_protocol.mode() == SessionPersistenceMode::Async {
+            match self
+                .inner
+                .persistence_protocol
+                .submission_before(authority.persistence_stamp, deadline)
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(_) => return ForwardMutationReply::Unavailable,
+            }
+        } else {
+            None
+        };
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
@@ -8550,6 +8589,7 @@ impl ConsensusSessionStore {
                     response
                 }
             };
+        drop(persistence_submission);
         #[cfg(test)]
         let accepted_receiver_test_outcome = self
             .inner
@@ -8650,6 +8690,7 @@ impl ConsensusSessionStore {
         origin: SessionConsensusNodeId,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
+        let persistence_stamp = self.inner.persistence_protocol.operation_stamp();
         if let Err(error) = validate_record_expiry_preflights_profile(&preflights) {
             return ForwardMutationReply::RecordExpiryPreflight(Err(error));
         }
@@ -8781,12 +8822,14 @@ impl ConsensusSessionStore {
                 LocalProposalAuthority {
                     origin,
                     allows_operator_recovery: false,
+                    persistence_stamp,
                     fixed_raw_v2_snapshot: false,
                 },
                 authority_time,
                 LocalProposalExecution {
                     proposal_permit,
                     operation_guard,
+                    persistence_submission: None,
                     cohort_freeze: None,
                     cold_completion: None,
                 },
@@ -11489,6 +11532,23 @@ impl SessionConsensusService {
         authenticated_sender: SessionConsensusNodeId,
         request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
+        #[cfg(target_os = "linux")]
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && request.payload.starts_with(super::recovery_types::WIRE)
+        {
+            if !self
+                .store
+                .current_application_scope_matches(authenticated_sender, request.identity)
+            {
+                return SessionConsensusWireResponse {
+                    result: Err(SessionConsensusPeerError::ScopeMismatch),
+                };
+            }
+            return self
+                .store
+                .handle_majority_recovery(authenticated_sender, &request.payload)
+                .await;
+        }
         // A cold replica can request a live witness from a different active
         // member, but it cannot itself serve application or capability RPCs.
         if !self.store.inner.persistence_protocol.is_active() {
@@ -19657,12 +19717,14 @@ mod membership_tests {
                 LocalProposalAuthority {
                     origin: store.inner.local_node_id,
                     allows_operator_recovery: false,
+                    persistence_stamp: store.inner.persistence_protocol.operation_stamp(),
                     fixed_raw_v2_snapshot: false,
                 },
                 store.inner.clock.now_utc(),
                 LocalProposalExecution {
                     proposal_permit,
                     operation_guard,
+                    persistence_submission: None,
                     cohort_freeze: None,
                     cold_completion: None,
                 },
@@ -23689,12 +23751,14 @@ mod membership_tests {
                 LocalProposalAuthority {
                     origin: store.inner.local_node_id,
                     allows_operator_recovery: false,
+                    persistence_stamp: store.inner.persistence_protocol.operation_stamp(),
                     fixed_raw_v2_snapshot: false,
                 },
                 store.inner.clock.now_utc(),
                 LocalProposalExecution {
                     proposal_permit,
                     operation_guard,
+                    persistence_submission: None,
                     cohort_freeze: None,
                     cold_completion: None,
                 },

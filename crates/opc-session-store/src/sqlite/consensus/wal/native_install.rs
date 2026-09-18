@@ -398,8 +398,9 @@ fn advance_inner(
     }
     (control.hook)(Point::AfterNativeBasisAdmission)?;
     let mut native = catalog.into_storage(&check)?;
-    if let Some(reservation) = lock_state(shared)?.async_authority {
-        native.check_async_reservation(reservation)?;
+    let reservation = lock_state(shared)?.async_authority;
+    if let Some(reservation) = reservation {
+        native.check_async_reservation(reservation, &check)?;
     }
     let mut selected = native_basis::Selected::admitted(append, &native)?;
     selected.repair(&final_path, &check)?;

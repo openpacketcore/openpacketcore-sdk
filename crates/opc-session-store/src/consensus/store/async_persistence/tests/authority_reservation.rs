@@ -1,8 +1,144 @@
 //! An authority ceiling must survive independently of lagging generations.
 
 use super::*;
+use crate::sqlite::consensus::wal::async_authority::Reservation;
 use crate::sqlite::consensus::wal::Point;
 use std::path::PathBuf;
+
+async fn freeze(store: &ConsensusSessionStore) {
+    store.inner.raft.runtime_config().elect(false);
+    store.inner.raft.runtime_config().heartbeat(false);
+    store
+        .inner
+        .persistence_protocol
+        .quarantine_before(store.operation_deadline_from(tokio::time::Instant::now()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_authority_promise_is_durable_idempotent_and_monotonic() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let result = AssertUnwindSafe(async {
+        fleet.start().await;
+        let index = (fleet.leader() + 1) % 3;
+        freeze(fleet.store(index)).await;
+        let wal = fleet.store(index).inner.private_wal.as_ref().unwrap();
+        let (root, before) = wal.async_authority().unwrap().unwrap();
+        assert!(before == Reservation::initial());
+        let after = Reservation::recovery(2, [0xD1; 32]).unwrap();
+        wal.promise_async_authority(before, after).unwrap();
+        let selected = std::fs::read(authority(&fleet, index)).unwrap();
+        wal.promise_async_authority(before, after).unwrap();
+        assert_eq!(selected, std::fs::read(authority(&fleet, index)).unwrap());
+        assert!(wal
+            .promise_async_authority(before, Reservation::recovery(2, [0xD2; 32]).unwrap())
+            .is_err());
+        assert!(wal.promise_async_authority(after, before).is_err());
+        assert!(wal.async_authority().unwrap() == Some((root, after)));
+        fleet.close(index).await;
+        fleet
+            .open(index, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
+        assert!(
+            fleet
+                .store(index)
+                .inner
+                .private_wal
+                .as_ref()
+                .unwrap()
+                .async_authority()
+                .unwrap()
+                == Some((root, after))
+        );
+        assert!(
+            !fleet.store(index).inner.persistence_protocol.is_active(),
+            "a persisted reservation is never an admission proof"
+        );
+    })
+    .catch_unwind()
+    .await;
+    for index in 0..3 {
+        let _ = fleet.close_result(index).await;
+    }
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_authority_interrupted_promise_never_grants_old_owner_new_range() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    for point in [
+        Point::BeforeAsyncAuthorityWrite,
+        Point::AfterAsyncAuthorityFileSync,
+        Point::AfterAsyncAuthorityRename,
+        Point::AfterAsyncAuthorityDirectorySync,
+    ] {
+        let mut fleet = Fleet::new(3);
+        let armed = Arc::new(AtomicBool::new(false));
+        let result = AssertUnwindSafe(async {
+            let fault = Arc::clone(&armed);
+            fleet
+                .open_with_io_hook(
+                    0,
+                    Arc::new(move |at| {
+                        if at == point && fault.load(Ordering::Acquire) {
+                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                        }
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            for index in 1..3 {
+                fleet
+                    .open(index, SessionPersistenceMode::Async)
+                    .await
+                    .unwrap();
+            }
+            fleet.form().await;
+            freeze(fleet.store(0)).await;
+            fleet.store(0).drain_async_persistence().await.unwrap();
+            let before = Reservation::initial();
+            let after = Reservation::recovery(2, [0xD3; 32]).unwrap();
+            armed.store(true, Ordering::Release);
+            let wal = fleet.store(0).inner.private_wal.as_ref().unwrap();
+            assert!(wal.promise_async_authority(before, after).is_err());
+            assert!(wal.async_authority().is_err());
+            assert!(wal.promise_async_authority(before, after).is_err());
+            assert!(fleet.close_result(0).await.is_err());
+            fleet.open(0, SessionPersistenceMode::Async).await.unwrap();
+            let (_, selected) = fleet
+                .store(0)
+                .inner
+                .private_wal
+                .as_ref()
+                .unwrap()
+                .async_authority()
+                .unwrap()
+                .unwrap();
+            assert!(
+                selected
+                    == if matches!(
+                        point,
+                        Point::AfterAsyncAuthorityRename | Point::AfterAsyncAuthorityDirectorySync
+                    ) {
+                        after
+                    } else {
+                        before
+                    }
+            );
+            assert!(!fleet.store(0).inner.persistence_protocol.is_active());
+        })
+        .catch_unwind()
+        .await;
+        for index in 0..3 {
+            let _ = fleet.close_result(index).await;
+        }
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}
 
 fn authority(fleet: &Fleet, index: usize) -> PathBuf {
     fleet

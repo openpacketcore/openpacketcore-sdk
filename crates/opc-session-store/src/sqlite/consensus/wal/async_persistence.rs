@@ -168,7 +168,10 @@ pub(super) fn write_loop(
                 state = lock_state(shared)?;
                 continue;
             }
-            if state.status != Status::Running && progress.caught_up() {
+            if state.status != Status::Running
+                && progress.caught_up()
+                && state.native_operations == 0
+            {
                 if state.consensus_closed {
                     if let Err(error) = async_closed::publish(&state, disk, binding, control) {
                         application::record_failure(

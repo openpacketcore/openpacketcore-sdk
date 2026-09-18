@@ -10,6 +10,8 @@ pub mod network;
 mod persistence;
 mod persistence_protocol;
 pub(crate) mod raft_adapter;
+#[cfg(target_os = "linux")]
+pub(crate) mod recovery_types;
 pub(crate) mod snapshot;
 mod snapshot_directory;
 mod snapshot_integrity;

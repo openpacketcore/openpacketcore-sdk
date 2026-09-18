@@ -321,8 +321,10 @@ async fn exercise_lost_authority(
         assert!(store.get(&key).await.unwrap().is_none());
         return;
     }
-    // The current SDK correctly withholds authority. This is a safety
-    // control proving missing recovery input, never an availability pass.
+    // The lost scalar evidence alone is insufficient. Withhold one exact
+    // retained owner: neither the surviving process nor a disk majority can
+    // authorize retirement of the absent owner's volatile range.
+    fleet.close(survivor).await;
     for index in majority {
         assert_eq!(
             fleet.store(index).initialize_cluster().await,
@@ -330,6 +332,24 @@ async fn exercise_lost_authority(
         );
         assert!(fleet.store(index).delete_fenced(&issued).await.is_err());
     }
+    fleet
+        .open(survivor, SessionPersistenceMode::Async)
+        .await
+        .unwrap();
+    super::majority_protocol::recover(fleet).await;
+    let store = fleet.store(fleet.leader());
+    let successor = store
+        .acquire(&key, owner, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(successor.fence() > issued.fence());
+    for predecessor in [&old, &issued] {
+        assert!(matches!(
+            store.delete_fenced(predecessor).await,
+            Err(StoreError::StaleFence)
+        ));
+    }
+    store.delete_fenced(&successor).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

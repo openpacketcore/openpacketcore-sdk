@@ -5,6 +5,20 @@
 use super::*;
 use crate::sqlite::consensus::wal::async_authority::Reservation;
 
+pub(super) fn check_log_reservation(
+    entry: &Entry<SessionRaftTypeConfig>,
+    reservation: Reservation,
+) -> io::Result<()> {
+    if let EntryPayload::Normal(command) = &entry.payload {
+        if let SessionMutationIntent::AsyncRecoveryBoundary { era, plan } = command.intent {
+            if era > reservation.era() || (era == reservation.era() && plan != reservation.plan()) {
+                return Err(invalid("native asynchronous log reservation differs"));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Boundary {
@@ -72,6 +86,12 @@ impl Boundary {
 }
 
 impl NativeFrontierValues {
+    pub(super) fn async_retires_response(&self, response: &SessionConsensusResponse) -> bool {
+        self.async_recovery
+            .as_ref()
+            .is_some_and(|boundary| response.raft_log_index < boundary.applied.index)
+    }
+
     pub(super) fn async_fence_floor(&self) -> u64 {
         self.async_recovery.as_ref().map_or(0, Boundary::floor)
     }
@@ -147,6 +167,25 @@ impl NativeKeyState {
     }
 }
 
+impl NativeState {
+    pub(crate) fn async_recovery_supported(&self) -> bool {
+        self.roster_root.is_none()
+            && !self.frontiers.roster_v1_namespace
+            && self.frontiers.roster_v2_activation.is_none()
+            && self.roster.rows.is_empty()
+            && self.roster.partitions.is_empty()
+    }
+
+    pub(crate) fn async_recovery_boundary(
+        &self,
+    ) -> Option<(u64, [u8; 32], LogId<SessionConsensusNodeId>)> {
+        self.frontiers
+            .async_recovery
+            .as_ref()
+            .map(|boundary| (boundary.era, boundary.plan, boundary.applied))
+    }
+}
+
 #[cfg(test)]
 #[path = "async_recovery_tests.rs"]
 mod tests;
@@ -174,7 +213,8 @@ impl NativeDelta<'_> {
         // A recovery capability must account for every activated authority
         // vocabulary before it prepares a round. Do not partially retire an
         // unsupported protected history or roster.
-        if self.frontiers.roster_v1_namespace
+        if self.base.roster_root.is_some()
+            || self.frontiers.roster_v1_namespace
             || self.frontiers.roster_v2_activation.is_some()
             || !self.roster.rows.is_empty()
             || !self.roster.partitions.is_empty()
