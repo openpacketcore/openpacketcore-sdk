@@ -202,6 +202,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod child_sa;
 pub mod composite;
 mod counter_resume;
 mod dscp;

@@ -143,6 +143,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-ipsec-xfrm::child_sa`: bounded, immutable caller-selected class/default
+  intentions with exact directional ESP identities and explicit rekey overlap.
+  Refuse ambiguous Linux SA lookup domains and stale incarnation metadata;
+  keep live publication, authentication and relocation authority separate
+  (Refs #793).
 - `opc-proto-nas`: bounded, opaque NAS-over-TCP envelopes with exact
   caller-storage encoding, borrowed first-frame receive, incremental framing
   across arbitrary reads, caller-owned coalesced tails and explicit terminal

@@ -1,5 +1,11 @@
 # opc-ipsec-xfrm
 
+Caller-selected traffic classes can use the immutable
+[`child_sa` selection contract](CHILD_SA_SELECTION.md) to name exact outbound
+SPIs, retain inbound identities during rekey overlap, and select one explicit
+default. These are validated intentions; live packet provenance, grouped
+publication and whole-roster relocation remain separate work.
+
 ## Purpose
 
 `opc-ipsec-xfrm` is the safe Rust control surface for Linux XFRM IPsec state in
