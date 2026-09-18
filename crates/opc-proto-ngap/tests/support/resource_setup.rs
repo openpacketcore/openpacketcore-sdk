@@ -3,6 +3,8 @@
 
 #[path = "context_optionals.rs"]
 pub mod context_optionals;
+#[path = "resource_security.rs"]
+pub mod resource_security;
 
 use bytes::Bytes;
 use opc_proto_ngap::n3iwf::context_fields::SecurityAlgorithmMasks;
@@ -22,6 +24,7 @@ pub fn exercise(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
 
 pub fn exercise_bounded(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
     context_optionals::exercise_leaf(data, ctx, output);
+    resource_security::exercise(data, ctx, output);
     let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), ctx) else {
         return;
     };
@@ -31,6 +34,7 @@ pub fn exercise_bounded(data: &[u8], ctx: DecodeContext, output: EncodeContext) 
     if let ResourceSetupMessage::InitialRequest(value) = &mut admitted.message {
         context_optionals::reconstruct(value);
     }
+    resource_security::outer(&admitted.message);
     let constructed = match &admitted.message {
         ResourceSetupMessage::InitialRequest(value) => {
             value.construct(SecurityAlgorithmMasks::new(1, 2, 4, 8), ctx)

@@ -47,7 +47,7 @@ redacted!(SessionSetupRequests<'_>);
 pub struct SessionTransferDiagnostics {
     /// Session whose contained transfer produced the evidence.
     pub session: SessionId,
-    /// Unknown-ignore entries retained by the selected shared policy.
+    /// Receiver-ignored and unknown-ignore entries retained by shared selection.
     pub ignored_ie_count: usize,
     /// Unknown-notify IE identifiers, never their values.
     pub notify_ie_ids: Vec<u16>,

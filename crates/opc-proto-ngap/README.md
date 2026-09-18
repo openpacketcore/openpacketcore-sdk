@@ -121,9 +121,14 @@ pdu.encode(
 `n3iwf::resource_request::SetupRequestTransfer` constructs and admits the
 nested request transfer for a bounded non-GBR 5QI 9 subset. It requires an UL
 tunnel, session AMBR, session type and unique QoS flows. `resource_fields`
-keeps uplink and downlink endpoint types separate. Other QoS profiles and
-recognized optional transfer fields fail explicitly. `resource_results` adds
-a single-downlink setup response with unique accepted/failed QFI results and
+keeps uplink and downlink endpoint types separate. Optional `security` and
+`network_instance` fields use bounded `security_fields` roots. Integrity
+Required/Preferred requires an explicit UL rate; decoding installs no protection.
+Data Forwarding Not Possible is receiver-ignored outside handover and omitted
+from semantic reconstruction. Other QoS profiles and unqualified optional
+transfer fields fail explicitly. `resource_results` adds
+a single-downlink setup response with unique accepted/failed QFI results,
+an optional peer report through `with_security_result` / `security_result`, and
 a root-Cause unsuccessful transfer. `session_lists` adds bounded request,
 successful and failed session lists for context and PDU Setup procedures,
 with unique session IDs, optional NAS, slice values and disjoint partial

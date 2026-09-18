@@ -465,18 +465,24 @@ Resource Setup admission is a separate `resource_setup` boundary below.
 | Session aggregate maximum bit rate | 130 | reject | Required for this non-GBR subset by 8.2.1.4; distinct UL/DL root rates |
 | UL NG-U UP transport information | 139 | reject | Mandatory single IPv4/IPv6 GTP tunnel |
 | PDU session type | 134 | reject | Mandatory; all five root payload kinds |
+| Security Indication | 138 | reject | Optional three-root integrity/confidentiality requirements; conditional UL rate |
+| Network Instance | 129 | reject | Optional root 1–256; Common Network Instance remains unsupported |
+| Data Forwarding Not Possible | 127 | reject | Receiver-ignored outside Handover Request (9.3.4.1); never emitted by this setup constructor |
 | QoS flow setup request list | 136 | reject | Mandatory 1–64 unique root QFIs; 5QI 9 and root ARP priority/flags |
 
-All recognized optional transfer IEs outside these four fail explicitly,
-including extra/redundant tunnels, security indication and network instance.
+Recognized optional transfer IEs outside this table fail explicitly,
+including extra/redundant tunnels and Common Network Instance.
 The shared IE policy implementation handles unknown criticality and
 Drop/Preserve/Reject and duplicate First/Last/Reject before field admission.
 Retained unknown-ignore entries are counted; notify IDs are returned without
 values; retained unknown-reject entries prevent semantic admission. Structural
 Drop keeps its existing generic behavior, including discarding unknown-reject
 entries. Strict/ProcedureAware contexts reject them before dropping.
-Typed construction emits the four admitted fields; callers retaining original
+Typed construction emits required and supplied admitted fields; callers retaining original
 transfer bytes retain custody of that separate input.
+Data Forwarding Not Possible contributes to `ignored_ie_count` after shared
+criticality and duplicate selection. Its value is never decoded, including
+malformed/extended payloads, because this boundary does not handle handover.
 
 `resource_fields` exposes distinct UplinkTransport and DownlinkTransport types
 with explicit address and 32-bit TEID getters. IPv4/IPv6 roots are qualified;
@@ -522,7 +528,7 @@ outer session lists are described below. No local procedure trigger is enabled h
 
 | Transfer | Admitted contents | Explicitly unsupported |
 | --- | --- | --- |
-| Setup response | One downlink IPv4/IPv6 GTP tunnel; 1–64 accepted QFIs; optional failed QFIs with root Cause | Additional tunnels, security result, per-flow mapping indications, all extensions |
+| Setup response | One downlink IPv4/IPv6 GTP tunnel; 1–64 accepted QFIs; optional failed QFIs with root Cause; optional root Security Result | Additional tunnels, per-flow mapping indications, all extensions |
 | Setup unsuccessful | Root Cause in any of the five classes | Criticality diagnostics and extensions |
 
 Accepted/failed QFIs must be unique across both lists. The entirely failed case
@@ -541,12 +547,16 @@ at most two bytes and has a capacity/framing check around generated encoding
 and decoding. Errors and Debug redact values; encoded buffers clear on drop.
 
 The [result oracle](tests/fixtures/n3iwf-resource-results.json) contains 547
-independent vectors: 539 admitted and eight negative/unsupported cases. It
+independent vectors, originally labeled 539 admitted and eight negative/unsupported cases. It
 covers all 64 root Causes, all QFIs and accepted-list sizes, each partial-result
 split, Cause fields at every offset produced by the accepted list, IP/TEID
 boundaries, duplicate/conflicting results and recognized unsupported fields.
 Regenerate using `scripts/generate-ngap-resource-result-fixtures.py` with the
 same `--spec`/`--output` arguments and pinned Release 18 environment.
+Its original bytes and labels are preserved. The historical
+`unsupported-security-result` vector now admits and is compared with an
+explicit constructor in the harness, giving 540 admitted and seven rejected
+vectors under the expanded boundary.
 
 Generated failure-transfer encode/decode matches all 128 positive probes;
 explicit final-padding validation closes its permissive padding behavior.
@@ -556,6 +566,51 @@ including unaligned root Cause fields. All vectors seed fuzz/replay; ordinary
 tests exercise every truncation and three mutations of every reference byte,
 plus size/count/depth, extension, padding and redaction checks. This establishes
 neither additional profile coverage nor live peer interoperability.
+
+### Session security and network-instance roots
+
+`security_fields` qualifies Security Indication (9.3.1.27), Security Result
+(9.3.1.59) and Network Instance (9.3.1.113). Integrity and confidentiality each
+retain Required/Preferred/NotNeeded independently. Required or Preferred
+integrity requires the UL rate; NotNeeded preserves an optional supplied rate.
+The two UL roots are 64 kbit/s and maximum UE rate. The separate DL-rate
+extension remains unsupported. Root security values require depth two,
+Network Instance depth one; all reject extensions, nonzero padding and trailing
+bytes. Encoders preflight their exact one- or two-octet extent and then use the
+independently qualified generated leaf encoders.
+
+`SetupRequestTransfer` literals gain `security` and `network_instance` options.
+`SetupResponseTransfer::new` retains its existing arguments; use
+`with_security_result` to supply or clear the optional peer report. The embedded
+result occupies six bits at the parent's current offset, before the failed-flow
+list, with no standalone leaf padding. Existing request/response depth and
+combined flow-count bounds remain unchanged. A reported result does not prove
+installed integrity or confidentiality protection, and this boundary performs
+no cryptographic operation or network selection.
+
+The separate [resource-security corpus](tests/fixtures/n3iwf-resource-security.json)
+has SHA-256 `ab44434d9744a119496647471367b5fcc04fd312f54bf63ea708b05cf78fe3fd`.
+It contains 287 leaf cases (281 admitted, six conditional failures), 375 request
+transfers (348 admitted), 1,536 response transfers and 108 complete Initial
+Context/PDU Session Setup messages (96 admitted). Both Pycrate 0.8.1 APER
+encoders agree using the same pinned ETSI Release 18.10.0 publication. The
+independent generator applies 9.3.4.1 receiver-ignore before interpreting Data
+Forwarding Not Possible; its canonical oracle omits that field. Regenerate
+with `scripts/generate-ngap-resource-security.py --spec PATH --output PATH`.
+The original 274 request, 547 result and 122 outer resource-message vectors
+remain byte-identical.
+
+Qualification covers all security requirement/rate combinations, all 256
+network-instance values, four security results, every accepted/failed flow
+count, every root Cause at all four result bit offsets, IPv4/IPv6, criticality,
+duplicate selection including invalid Last, receiver-ignore, exact limits,
+constructor bytes and redacted semantic reconstruction. Exhaustive comparison
+checks all 131,328 fixed-width leaf patterns against independently admitted
+sets. Shared fuzz/replay logic checks all new cases and 244,616 deterministic
+mutations across two bounded contexts; 21 representative seeds are committed.
+These deterministic checks are separate from hosted PR fuzz smoke and do not
+claim a new local libFuzzer campaign. Additional QoS profiles, extensions and
+applicable fields remain tracked in #787.
 
 ## N3IWF session setup lists
 

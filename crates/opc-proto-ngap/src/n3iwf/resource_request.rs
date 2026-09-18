@@ -2,11 +2,14 @@
 //!
 //! This initial root subset admits one uplink tunnel and unique standardized
 //! non-GBR 5QI 9 flows. Session AMBR is required for these flows (TS 38.413
-//! 8.2.1.4). Other recognized optional fields and QoS profiles fail explicitly.
+//! 8.2.1.4). Optional root Security Indication and Network Instance are admitted.
+//! Data Forwarding Not Possible is receiver-ignored outside Handover Request
+//! (9.3.4.1). Other recognized optional fields and QoS profiles fail explicitly.
 //! No session, QoS, tunnel or datapath state is created here.
 use super::resource_fields::{
     QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
 };
+use super::security_fields::{NetworkInstance, SecurityIndication};
 use super::*;
 use crate::policy;
 
@@ -22,6 +25,10 @@ pub struct SetupRequestTransfer {
     pub session_type: SessionType,
     /// Unique bounded 5QI 9 flows.
     pub flows: QosFlowSetupList,
+    /// Optional peer security requirements; no protection is installed.
+    pub security: Option<SecurityIndication>,
+    /// Optional root network instance; no local network is selected.
+    pub network_instance: Option<NetworkInstance>,
 }
 redacted!(SetupRequestTransfer);
 
@@ -30,24 +37,32 @@ redacted!(SetupRequestTransfer);
 pub struct AdmittedRequestTransfer {
     /// Admitted fields; no backend or authorization effect occurred.
     pub transfer: SetupRequestTransfer,
-    /// Unknown ignore-criticality IEs retained after configured selection.
+    /// Receiver-ignored Data Forwarding Not Possible and retained unknown-ignore IEs.
     pub ignored_ie_count: usize,
     /// Unknown notify-criticality IDs for caller-owned criticality diagnostics.
     pub notify_ie_ids: Vec<u16>,
 }
 
 impl SetupRequestTransfer {
-    /// Encode four canonical root IEs. Individual fields are bounded before
+    /// Encode required and supplied optional root IEs in schema order.
+    /// Receiver-ignored Data Forwarding Not Possible is not emitted.
+    /// Individual fields are bounded before
     /// their allocation and complete framing before the final buffer allocation.
     /// Diagnostics and unknown retained values are not emitted by this typed
     /// constructor. The caller may retain the original input separately.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        let fields = [
+        let mut fields = vec![
             (130, self.aggregate_bit_rate.encode(ctx)?),
             (139, self.uplink.encode(ctx)?),
             (134, self.session_type.encode(ctx)?),
-            (136, self.flows.encode(ctx)?),
         ];
+        if let Some(security) = self.security {
+            fields.push((138, security.encode(ctx)?));
+        }
+        if let Some(network) = self.network_instance {
+            fields.push((129, network.encode(ctx)?));
+        }
+        fields.push((136, self.flows.encode(ctx)?));
         let mut length = 3;
         for (_, value) in &fields {
             // Every constructor is bounded; the largest complete root is
@@ -114,6 +129,8 @@ impl SetupRequestTransfer {
         let mut aggregate_bit_rate = None;
         let mut session_type = None;
         let mut flows = None;
+        let mut security = None;
+        let mut network_instance = None;
         let mut ignored_ie_count = 0;
         let mut notify_ie_ids = Vec::new();
         for entry in &entries {
@@ -124,6 +141,12 @@ impl SetupRequestTransfer {
                 }
                 134 => session_type = Some(SessionType::decode(&entry.value, leaf)?),
                 136 => flows = Some(QosFlowSetupList::decode(&entry.value, leaf)?),
+                138 => security = Some(SecurityIndication::decode(&entry.value, leaf)?),
+                129 => network_instance = Some(NetworkInstance::decode(&entry.value, leaf)?),
+                // This N3IWF boundary handles Initial Context/PDU Session
+                // setup, not Handover Request. Ignore the value after shared
+                // container criticality and duplicate selection (9.3.4.1).
+                127 => ignored_ie_count += 1,
                 id if profile.recognizes(id) => return Err(unsupported()),
                 _ => match entry.criticality {
                     0 => return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, 0)),
@@ -139,6 +162,8 @@ impl SetupRequestTransfer {
                     .ok_or_else(|| invalid("missing non-gbr session ambr"))?,
                 session_type: session_type.ok_or_else(|| invalid("missing pdu session type"))?,
                 flows: flows.ok_or_else(|| invalid("missing qos flow setup list"))?,
+                security,
+                network_instance,
             },
             ignored_ie_count,
             notify_ie_ids,

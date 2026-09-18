@@ -120,6 +120,8 @@ fn context() -> DecodeContext {
 }
 fn transfer(model: &Value) -> SetupRequestTransfer {
     SetupRequestTransfer {
+        security: None,
+        network_instance: None,
         uplink: UplinkTransport::new(
             model["uplink"]["address"]
                 .as_str()
@@ -221,7 +223,7 @@ fn append_ie(input: &[u8], id: u16, criticality: u8, value: &[u8]) -> Vec<u8> {
     wire
 }
 #[test]
-fn selection_precedes_field_admission_and_known_optional_fields_fail() {
+fn selection_precedes_field_admission_and_unqualified_optional_fields_fail() {
     let reference = oracle();
     let base = &reference["transfers"][0];
     let wire = bytes(base["wire_hex"].as_str().unwrap());
@@ -264,7 +266,7 @@ fn selection_precedes_field_admission_and_known_optional_fields_fail() {
     .is_err());
     for row in reference["request_ie_metadata"].as_array().unwrap() {
         let id = row["id"].as_u64().unwrap() as u16;
-        if [130, 139, 134, 136].contains(&id) {
+        if [130, 139, 134, 136, 127].contains(&id) {
             continue;
         }
         let crit = if row["criticality"] == "reject" { 0 } else { 1 };

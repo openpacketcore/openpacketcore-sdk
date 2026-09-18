@@ -142,6 +142,8 @@ pub mod resource_request;
 pub mod resource_results;
 /// Initial Context Setup and PDU Session Resource Setup field admission.
 pub mod resource_setup;
+/// Bounded security requirements, results and network-instance root values.
+pub mod security_fields;
 pub mod session_lists;
 pub mod setup;
 pub mod setup_fields;

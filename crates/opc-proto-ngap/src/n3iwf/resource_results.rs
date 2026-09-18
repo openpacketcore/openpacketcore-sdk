@@ -4,6 +4,7 @@
 
 use super::release::{Cause, CauseClass};
 use super::resource_fields::{DownlinkTransport, QosFlowId};
+use super::security_fields::SecurityResult;
 use super::setup_fields::{Reader, Writer};
 use super::*;
 
@@ -19,13 +20,15 @@ redacted!(FailedQosFlow);
 
 /// One downlink transport with 1–64 accepted flows and optional failed flows.
 /// Duplicate QFIs and overlap between accepted/failed results are rejected.
-/// Additional tunnels, mapping indications, security results and extensions
+/// Optional Security Result preserves the peer's report without proving it.
+/// Additional tunnels, mapping indications and extensions
 /// require further qualification and are explicitly unsupported here.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SetupResponseTransfer {
     downlink: DownlinkTransport,
     accepted: Vec<QosFlowId>,
     failed: Vec<FailedQosFlow>,
+    security: Option<SecurityResult>,
 }
 redacted!(SetupResponseTransfer);
 
@@ -48,6 +51,7 @@ impl SetupResponseTransfer {
             downlink,
             accepted,
             failed,
+            security: None,
         })
     }
     /// Explicit downlink endpoint, distinct from the request's uplink value.
@@ -62,6 +66,15 @@ impl SetupResponseTransfer {
     pub fn failed(&self) -> &[FailedQosFlow] {
         &self.failed
     }
+    /// Bind or remove the optional peer security report.
+    pub fn with_security_result(mut self, security: Option<SecurityResult>) -> Self {
+        self.security = security;
+        self
+    }
+    /// Explicit peer report; this is not proof of installed protection.
+    pub const fn security_result(&self) -> Option<SecurityResult> {
+        self.security
+    }
     /// Encode only the independently qualified root layout. Exact capacity
     /// is checked before allocating the bounded result buffer.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
@@ -73,6 +86,9 @@ impl SetupResponseTransfer {
             128
         };
         let mut bits = 24 + address_bits + 32 + 6 + self.accepted.len() * 10;
+        if self.security.is_some() {
+            bits += 6;
+        }
         if !self.failed.is_empty() {
             bits += 6 + self
                 .failed
@@ -83,7 +99,10 @@ impl SetupResponseTransfer {
         let length = bits.div_ceil(8);
         capacity(length, ctx)?;
         let mut writer = Writer::new(length);
-        writer.bits(if self.failed.is_empty() { 0 } else { 2 }, 5)?;
+        writer.bits(
+            u16::from(!self.failed.is_empty()) * 2 + u16::from(self.security.is_some()) * 4,
+            5,
+        )?;
         writer.bits(0, 2)?;
         writer.bits(0, 4)?;
         writer.bits((address_bits - 1) as u16, 8)?;
@@ -97,6 +116,9 @@ impl SetupResponseTransfer {
         for qfi in &self.accepted {
             writer.bits(0, 4)?;
             writer.bits(u16::from(qfi.value()), 6)?;
+        }
+        if let Some(security) = self.security {
+            security.write(&mut writer)?;
         }
         if !self.failed.is_empty() {
             writer.bits((self.failed.len() - 1) as u16, 6)?;
@@ -115,7 +137,7 @@ impl SetupResponseTransfer {
         bound(input, ctx, 6)?;
         let mut reader = Reader::new(input, ctx);
         let flags = reader.bits(5)?;
-        if flags & !2 != 0 {
+        if flags & !6 != 0 {
             return Err(unsupported());
         }
         reader.flags(2)?;
@@ -142,6 +164,11 @@ impl SetupResponseTransfer {
             accepted.push(qfi);
         }
         let mut failed = Vec::new();
+        let security = if flags & 4 != 0 {
+            Some(SecurityResult::read(&mut reader)?)
+        } else {
+            None
+        };
         if flags & 2 != 0 {
             let count = reader.count(6, 64, 14)?;
             failed = Vec::with_capacity(count);
@@ -160,6 +187,7 @@ impl SetupResponseTransfer {
             downlink,
             accepted,
             failed,
+            security,
         })
     }
 }

@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: admit session-setup Security Indication and Network Instance,
+  preserve response Security Result at unaligned bit offsets, and enforce the
+  conditional UL integrity rate. Apply the specified receiver-ignore rule for
+  Data Forwarding Not Possible outside handover; qualify independent leaf,
+  transfer and complete-message construction without security side effects
+  (Refs #787).
 - `opc-proto-ngap`: admit and construct Initial Context Setup optional old/extended
   AMF names, masked identity, partial slices and bounded root trace parameters.
   Preserve message-specific criticality and combined slice constraints with
