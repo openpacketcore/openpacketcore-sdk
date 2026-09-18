@@ -334,3 +334,19 @@ this composition; no additional generated-code workaround is needed. Bounded
 fuzz/replay compares every admitted field, including synthetic NAS/key bytes
 without rendering them. Admission establishes neither request correlation nor
 resource effects, and does not enable local procedure triggers.
+
+## Resource release amendment (2026-09)
+
+Retain generated construction and receive for release command/response
+transfers and their two session-list roots. All 1,154 independent encode/decode
+comparisons pass across every root Cause and list length. Reuse the qualified
+result-list and root-Cause preflight helpers to reject duplicate session IDs,
+unbounded counts, extensions, malformed nested lengths, trailing bytes and
+nonzero padding before materialization. Exact list size precedes encoding
+allocation. No new handwritten ASN.1 codec is justified or introduced.
+
+Compose the mandatory AMF/RAN IDs and nonempty lists into Release Command and
+Response, with optional opaque NAS and N3IWF location. Ignore RAN Paging Priority
+contents under TS 29.413 while retaining generic criticality/cardinality checks;
+fail on recognized applicable unsupported fields. These APIs validate a peer's
+request or report, and do not correlate transactions or perform resource cleanup.
