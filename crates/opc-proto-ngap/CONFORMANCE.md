@@ -759,6 +759,56 @@ Alternative QoS, feedback, RAT usage and other extensions remain explicitly
 unsupported. Remaining #787 work includes Modify, applicable optional fields,
 the broader procedure applicability/receive/error matrix and live interoperability.
 
+## PDU Session Resource Modify root fields
+
+`n3iwf::modify_fields` adds four standalone root lists from TS 38.413 V18.10.0
+9.3.4.3–4, using the QFI, QoS and Cause definitions in 9.3.1.12–13 and 9.3.1.51.
+These are field codecs; complete Modify transfers/messages and cross-list or
+request/response conditions remain pending. No additional PDU outcome is admitted.
+
+| Field | Qualified root | Required depth |
+| --- | --- | --- |
+| `QosFlowModifications` | 1–64 unique QFIs; absent parameters or explicit standardized non-GBR 5QI 9 with root ARP | 3 for identifiers only; 6 with parameters |
+| `ModifiedQosFlows` | 1–64 unique reported QFIs | 3 |
+| `QosFlowCauses` | 1–64 unique QFI/root-Cause pairs | 4 |
+| `UplinkModifications` | 1–4 ordered UL/DL GTP-tunnel pairs; IPv4 or IPv6 per endpoint | 5 |
+
+Request parameter absence is represented separately from supplied parameters;
+it does not establish that a flow exists or provide default QoS. Root ARP has
+priority 1–15 and explicit pre-emption flags. E-RAB identifiers, other QoS
+profiles and optional/extension fields are unsupported in this initial subset.
+QFI values 0–63 and all wire endpoint/TEID values are representable; reservation,
+ownership and endpoint policy are caller duties. Directional endpoint types stay
+distinct. Tunnel pairs preserve repetition and order without inventing a
+uniqueness requirement. Each list uses `max_ies` and exact byte/depth limits.
+Public formatting is redacted.
+
+The [independent oracle](tests/fixtures/n3iwf-modify-fields.json) contains 687
+cases (682 admitted, three duplicate negatives and two unsupported profiles).
+It covers every list count, every QFI with and without parameters, all root
+Causes, all ARP priorities/pre-emption combinations, mixed parameter presence,
+both IP families, endpoint/TEID boundaries and repeated tunnel pairs. Both
+unmodified reference encoders agree and structured reference decoding verifies
+values. Regenerate with `scripts/generate-ngap-modify-field-fixtures.py
+--spec PATH --output PATH` and the pinned Release 18 PDF/reference environment.
+
+Generated probes across all 687 cases find 253/383 request-list encode failures
+and 380/383 decode failures, 0/129 response-list encode and 129/129 decode
+failures, 0/130 Cause-list encode and 129/130 decode failures, and 45/45 tunnel
+list failures in both directions. Retain the generated response/Cause encoders
+and all 129 admitted identifier-only request encodings. Only request lists
+containing parameters, tunnel encoding and the failed receivers use explicit
+bounded layouts. Two-pass decoding checks all physical framing, root flags,
+zero padding, counts and uniqueness before allocating vectors. Exact sizing
+precedes output allocation; schema and dependencies are unchanged.
+
+Tests compare all admitted values and exact independent bytes, exact/one-short
+limits, unsupported fields, truncations, trailing bytes and flag/padding
+mutations. Shared fuzz/replay assertions include all 687 complete independent
+seeds. Complete Modify request/response support must also enforce TS 29.413's
+receiver-ignore rules and retain caller-owned request correlation, conditional
+NAS forwarding, abnormal-condition responses and resource effects (#787).
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):
