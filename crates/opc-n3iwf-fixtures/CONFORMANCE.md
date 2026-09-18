@@ -143,9 +143,10 @@ and [RFC 6335 section 6](https://www.rfc-editor.org/rfc/rfc6335.html#section-6).
 ## Executable protocol-key custody schedules
 
 Twenty-five independently authored `protocol-key-lifecycle` records replay the
-existing volatile `opc-proto-ikev2::protocol_key` API. They use only a 32-zero-octet
-synthetic placeholder and the existing independent RFC 7296 initiator/responder
-AUTH answers. Every successful consumption must match both answers. A successful
+existing volatile `opc-proto-ikev2::protocol_key` API. Valid imports use a
+32-zero-octet synthetic placeholder; invalid-width tests use bounded zero-only
+variants. Successful consumption uses the existing independent RFC 7296
+initiator/responder AUTH answers and must match both. A successful
 scenario means all expected results match, including the refusals inside it;
 it does not mean every requested key operation succeeded.
 
