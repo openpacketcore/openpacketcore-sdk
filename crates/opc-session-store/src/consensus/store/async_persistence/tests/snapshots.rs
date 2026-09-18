@@ -70,13 +70,7 @@ async fn send_snapshot(
         )
         .await;
     if response.result.is_err() {
-        eprintln!(
-            "async snapshot response: index={:?} result={:?} health={:?} engine={:?}",
-            request.meta.last_log_id,
-            response.result.as_ref().err(),
-            cold.persistence_health(),
-            cold.inner.raft.metrics().borrow().running_state
-        );
+        eprintln!("async_snapshot stage=response success=false");
     }
     response
 }
@@ -520,6 +514,22 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
         );
         installing.abort();
         assert!(installing.await.unwrap_err().is_cancelled());
+        // The first replacement must expire under the unchanged operation
+        // deadline while accepted installation still owns the pre-publication
+        // hold. Expiry must neither retire that work nor allocate an attempt.
+        assert!(matches!(
+            cold.inner
+                .persistence_protocol
+                .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
+                .await,
+            Err(SessionConsensusPeerError::Timeout)
+        ));
+        assert_eq!(fleet.selector(story.follower), selected_base);
+        assert!(!cold.inner.persistence_protocol.is_active());
+        before.release();
+        tokio::time::timeout(Duration::from_secs(3), after.wait_started())
+            .await
+            .expect("cancelled caller leaves actual installation owned through publication");
         let new_request = {
             let replacement = cold
                 .inner
@@ -528,10 +538,6 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
             tokio::pin!(replacement);
             assert!(futures_util::poll!(replacement.as_mut()).is_pending());
 
-            before.release();
-            tokio::time::timeout(Duration::from_secs(3), after.wait_started())
-                .await
-                .expect("cancelled caller leaves actual installation owned through publication");
             assert_eq!(
                 cold.inner
                     .private_wal

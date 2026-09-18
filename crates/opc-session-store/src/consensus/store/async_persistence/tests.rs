@@ -104,16 +104,18 @@ impl SessionConsensusPeer for Peer {
         }
         let hold = self.held_reply.lock().unwrap().clone();
         let held_request = hold.as_ref().map(|_| request.clone());
-        let handler = self
-            .handler
-            .read()
-            .await
+        // Retiring this transport must join accepted handler calls, as the
+        // real server's abort_and_wait does. Keep this read lease until the
+        // handler returns; a detached cached reply owns no store handle.
+        let installed = self.handler.read().await;
+        let handler = installed
             .clone()
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         let mut response = handler.handle(request.sender, request).await;
         // A cached network response must not retain the predecessor store
         // while the test closes and reopens that ordinary public owner.
         drop(handler);
+        drop(installed);
         if let (Some(hold), Some(request)) = (hold, held_request) {
             hold.after_response(request, &response).await;
         }

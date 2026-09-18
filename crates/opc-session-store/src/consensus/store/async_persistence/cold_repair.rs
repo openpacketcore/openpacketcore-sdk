@@ -31,7 +31,11 @@ impl ConsensusSessionStore {
         )
         .await;
         #[cfg(test)]
-        eprintln!("async_cold_repair result={result:?}");
+        eprintln!(
+            "async_cold_repair stage=completion success={} deadline_elapsed={}",
+            matches!(result, Ok(Ok(()))),
+            result.is_err()
+        );
         match result {
             Ok(Ok(())) => encode_service_reply(&()),
             _ => SessionConsensusWireResponse {
@@ -96,10 +100,7 @@ impl ConsensusSessionStore {
         loop {
             let current_snapshot = metrics.borrow_and_update().snapshot;
             #[cfg(test)]
-            eprintln!(
-                "async_cold_repair stage=snapshot_wait selected={current_snapshot:?} cut={:?}",
-                cut.barrier
-            );
+            eprintln!("async_cold_repair stage=snapshot_wait");
             if !self.async_repair_leader_matches(cut) {
                 return Err(SessionConsensusPeerError::Rejected);
             }
@@ -129,10 +130,7 @@ impl ConsensusSessionStore {
             .map_err(|_| SessionConsensusPeerError::Unavailable)?
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         #[cfg(test)]
-        eprintln!(
-            "async_cold_repair stage=snapshot_open selected={:?}",
-            snapshot.meta.last_log_id
-        );
+        eprintln!("async_cold_repair stage=snapshot_open");
         if *snapshot.meta.last_membership.log_id() != cut.membership
             || !exact_uniform_voter_membership(
                 &snapshot.meta.last_membership,
