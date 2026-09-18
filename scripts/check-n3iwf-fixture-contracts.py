@@ -107,6 +107,7 @@ def main() -> int:
         run(sys.executable, "scripts/n3iwf_key_reference.py")
         run(sys.executable, "scripts/n3iwf_key_lifecycle_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_roster_lifecycle_reference.py", "--check")
+        run(sys.executable, "scripts/n3iwf_dtls_lifecycle_reference.py", "--check")
         run(sys.executable, "crates/opc-gtpu-dataplane/tests/n3_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_gtpu_reference.py")
         run(

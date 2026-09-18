@@ -84,6 +84,21 @@ actual decrypted record with authenticated SCTP metadata, not FIFO position.
 
 ## Evidence and reproduction
 
+The fixture catalog now adds ten independently checked lifecycle families at
+`rfc6083-stream-zero-lifecycle`: eight existing client-certificate cases plus
+78 authored schedules for both endpoint roles. The lifecycle model pins the
+contract above and the unchanged certificate TSV. It records expected labels,
+lengths and transitions without importing the SDK or catalog writer. The Rust
+replay uses real mutual DTLS at PPID 66 over the private in-memory carrier;
+certificate cases also execute at PPID 47. Metadata fault tests preserve real
+handshake/encrypted bytes and change only their stream, ordering, truncation,
+notification or PPID metadata. No key or packet values enter the fixture log.
+
+```sh
+python3 scripts/n3iwf_dtls_lifecycle_reference.py --check
+cargo test --locked -p opc-diameter-transport --lib independent_ngap_dtls_lifecycle
+```
+
 Reviewed fixture prerequisite: n2-dtls in #830, source
 `b1570ed8dc03ca9aaa23bd0b281f8d3d13341a8d`, merge
 `987246c8be773b19304f059231c39baa8d54d123`, subtree

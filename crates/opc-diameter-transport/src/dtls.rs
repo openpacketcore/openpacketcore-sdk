@@ -462,6 +462,20 @@ impl SctpWireLog {
             self.shared.notify.notify_waiters();
         }
     }
+
+    /// Replace only the metadata of the next genuine DTLS emission. The
+    /// encrypted record remains untouched, so rejection cannot be attributed
+    /// to a malformed synthetic handshake or application payload.
+    pub(crate) fn set_next_dtls_metadata(&self, a_to_b: bool, metadata: SctpUserMessage) {
+        let direction = if a_to_b {
+            &self.shared.next_a_to_b_metadata
+        } else {
+            &self.shared.next_b_to_a_metadata
+        };
+        let mut slot = direction.lock().expect("private metadata fault lock");
+        assert!(slot.is_none(), "one pending metadata fault per direction");
+        *slot = Some(metadata);
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +500,8 @@ struct InMemoryShared {
     closed: AtomicBool,
     block_a_to_b_dtls: AtomicBool,
     block_b_to_a_dtls: AtomicBool,
+    next_a_to_b_metadata: Mutex<Option<SctpUserMessage>>,
+    next_b_to_a_metadata: Mutex<Option<SctpUserMessage>>,
     notify: Notify,
     log: Arc<Mutex<Vec<SctpWireRecord>>>,
 }
@@ -738,11 +754,20 @@ impl SctpMessageIo for InMemorySctpEndpoint {
             self.phase.ensure_dtls()?;
             validate_outbound_dtls_record(record)?;
             self.wait_for_dtls_send().await?;
-            self.emit(SctpUserMessage::ordered_record(
-                Bytes::copy_from_slice(record),
-                self.protected_ppid,
-            ))
-            .await
+            let direction = if self.a_side {
+                &self.shared.next_a_to_b_metadata
+            } else {
+                &self.shared.next_b_to_a_metadata
+            };
+            let mut message = direction
+                .lock()
+                .expect("private metadata fault lock")
+                .take()
+                .unwrap_or_else(|| {
+                    SctpUserMessage::ordered_record(Bytes::new(), self.protected_ppid)
+                });
+            message.payload = Bytes::copy_from_slice(record);
+            self.emit(message).await
         })
     }
 
@@ -853,6 +878,8 @@ pub fn in_memory_sctp_link(
         closed: AtomicBool::new(false),
         block_a_to_b_dtls: AtomicBool::new(false),
         block_b_to_a_dtls: AtomicBool::new(false),
+        next_a_to_b_metadata: Mutex::new(None),
+        next_b_to_a_metadata: Mutex::new(None),
         notify: Notify::new(),
         log: Arc::new(Mutex::new(Vec::new())),
     });

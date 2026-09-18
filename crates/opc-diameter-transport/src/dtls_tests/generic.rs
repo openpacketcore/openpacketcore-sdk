@@ -1,5 +1,7 @@
 //! Exercise the public generic boundary without constructing a Diameter session.
 
+mod independent;
+
 use super::*;
 use crate::rfc6083::{
     Acceptor, Connection, Connector, Error, ExpectedPeer, PayloadProtocol, Policy, Role, Transport,
@@ -983,70 +985,75 @@ async fn generic_independent_certificate_vectors_enforce_signature_identity_time
         .filter(|line| !line.starts_with('#'))
         .collect();
     assert_eq!(rows.len(), 8);
-    for row in rows {
-        let columns: Vec<_> = row.split('\t').collect();
-        assert_eq!(columns.len(), 6);
-        let local_ca = test_ca();
-        let state = identity_state_with_trust(
-            SERVER_ID,
-            &local_ca,
-            vec![
-                local_ca.der().clone(),
-                CertificateDer::from(independent_der(columns[5])),
-            ],
-        );
-        let (_source, rx) = watch::channel(Some(state));
-        let controller = material_controller(&rx, SERVER_ID);
-        let acceptor = Acceptor::new(
-            controller,
-            peer(CLIENT_ID),
-            generic_policy(PayloadProtocol::Diameter),
-        )
-        .expect("independent-vector acceptor");
-        let certificate = dimpl::DtlsCertificate {
-            certificate: independent_der(columns[2]),
-            private_key: independent_der(columns[3]),
-            intermediates: vec![independent_der(columns[4])],
-        };
-        let mut engine =
-            dimpl::Dtls::new_12(raw_rfc6083_config(), certificate, std::time::Instant::now());
-        engine.set_active(true);
-        let (client, server, _) = in_memory_sctp_link(64);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let raw = tokio::spawn(drive_raw_engine(engine, client, deadline));
-        let connection = acceptor
-            .accept(
-                Transport::in_memory(server, PayloadProtocol::Diameter),
+    for protocol in [PayloadProtocol::Ngap, PayloadProtocol::Diameter] {
+        for row in &rows {
+            let columns: Vec<_> = row.split('\t').collect();
+            assert_eq!(columns.len(), 6);
+            let local_ca = test_ca();
+            let state = identity_state_with_trust(
+                SERVER_ID,
+                &local_ca,
+                vec![
+                    local_ca.der().clone(),
+                    CertificateDer::from(independent_der(columns[5])),
+                ],
+            );
+            let (_source, rx) = watch::channel(Some(state));
+            let controller = material_controller(&rx, SERVER_ID);
+            let acceptor = Acceptor::new(controller, peer(CLIENT_ID), generic_policy(protocol))
+                .expect("independent-vector acceptor");
+            let certificate = dimpl::DtlsCertificate {
+                certificate: independent_der(columns[2]),
+                private_key: independent_der(columns[3]),
+                intermediates: vec![independent_der(columns[4])],
+            };
+            let mut engine =
+                dimpl::Dtls::new_12(raw_rfc6083_config(), certificate, std::time::Instant::now());
+            engine.set_active(true);
+            let (client, server, log) = in_memory_sctp_link(64);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let raw = tokio::spawn(drive_raw_engine_with_ppid(
+                engine,
+                client,
                 deadline,
-            )
-            .await;
-        match columns[1] {
-            "admit" => {
-                let connection = connection.expect("independently signed valid client admitted");
-                assert_eq!(
-                    connection
-                        .readback()
-                        .expect("active readback")
-                        .expected_peer(),
-                    &peer(CLIENT_ID)
-                );
-                drop(connection);
+                protocol.ppid(),
+            ));
+            let connection = acceptor
+                .accept(Transport::in_memory(server, protocol), deadline)
+                .await;
+            match columns[1] {
+                "admit" => {
+                    let connection =
+                        connection.expect("independently signed valid client admitted");
+                    assert_eq!(
+                        connection
+                            .readback()
+                            .expect("active readback")
+                            .expected_peer(),
+                        &peer(CLIENT_ID)
+                    );
+                    drop(connection);
+                }
+                "identity" => assert_eq!(
+                    connection.err(),
+                    Some(Error::PeerIdentityMismatch),
+                    "{}",
+                    columns[0]
+                ),
+                "authentication" => assert_eq!(
+                    connection.err(),
+                    Some(Error::Authentication),
+                    "{}",
+                    columns[0]
+                ),
+                _ => panic!("unknown independent expectation"),
             }
-            "identity" => assert_eq!(
-                connection.err(),
-                Some(Error::PeerIdentityMismatch),
-                "{}",
-                columns[0]
-            ),
-            "authentication" => assert_eq!(
-                connection.err(),
-                Some(Error::Authentication),
-                "{}",
-                columns[0]
-            ),
-            _ => panic!("unknown independent expectation"),
+            assert!(raw.await.expect("raw client joined").is_err());
+            assert!(log
+                .records()
+                .iter()
+                .all(|record| record.ppid == protocol.ppid()));
         }
-        assert!(raw.await.expect("raw client joined").is_err());
     }
 }
 

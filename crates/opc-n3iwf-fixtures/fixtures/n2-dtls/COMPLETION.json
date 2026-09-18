@@ -29,14 +29,25 @@
     "opc.n3iwf.n2-dtls.v1.bounded-record-overflow",
     "opc.n3iwf.n2-dtls.v1.redacted-error",
     "opc.n3iwf.n2-dtls.v1.reliable-delivery-data",
-    "opc.n3iwf.n2-dtls.v1.rotation-generation-3"
+    "opc.n3iwf.n2-dtls.v1.rotation-generation-3",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-cancellation",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-carrier",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-certificate",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-cleartext",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-close",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-deadline",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-limits",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-metadata",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-records",
+    "opc.n3iwf.n2-dtls.v1.lifecycle-retirement"
   ],
   "constructed": [
     "PPID 66",
     "handshake header",
     "expected-peer identity label",
     "SCTP-AUTH length label",
-    "SCTP DATA B/E PPID 66"
+    "SCTP DATA B/E PPID 66",
+    "86 independent stream-zero lifecycle and certificate schedules"
   ],
   "receive": [
     "rekey",
@@ -46,6 +57,9 @@
   "unsupported": [
     "PPID 60 as protection",
     "NGAP procedure state",
-    "certificate dumps"
+    "certificate dumps",
+    "in-place rekey and multistream",
+    "CRL/OCSP and full 3GPP PKI",
+    "restart/multihoming and external interoperability"
   ]
 }

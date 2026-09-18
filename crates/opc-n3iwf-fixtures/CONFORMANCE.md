@@ -98,14 +98,52 @@ Round trips alone do not prove external interoperability.
   K_AMF hierarchy derivation, hardware-backed custody, key export, and external
   memory-zeroization observation. The executable volatile custody and private
   audit evidence below qualifies its explicitly bounded SDK contract.
-- Established DTLS sessions, verified peer certificates, actual exporter
-  output, SCTP reliability, restart recovery, and authenticated relocation.
+- In-place DTLS rekey, multistream, CRL/OCSP and the full 3GPP PKI profile,
+  restart recovery and authenticated relocation. The stream-zero replay
+  below qualifies its bounded existing SDK profile; catalog bytes alone
+  authenticate no peer and expose no exporter secret.
 - Kernel XFRM installation, live dataplane, AMF selection, deployment,
   readiness, and product claims. Issue 795 remains tracking-only.
 
 The [README](README.md) maps each subset to its exact evidence boundary.
 The [maintenance guide](../../docs/n3iwf-fixture-contracts.md) describes
 publication history and the independently executable gates.
+
+## Executable DTLS stream-zero schedules
+
+Ten `rfc6083-stream-zero-lifecycle` records bind eight existing independent
+client-certificate cases and 78 authored SDK lifecycle schedules to the
+[generic transport contract](../../docs/rfc6083-generic-transport.md). The model
+pins that unchanged contract and the unchanged independent certificate corpus;
+it imports neither the runtime nor the catalog writer. Its reference SHA-256
+is `2375cc860d06a3f9ed2b18310e890135ce6889fb2a7ee88836694be41f4a6fbc`.
+
+The transport crate replays the schedules with real mutual DTLS and the private
+in-memory SCTP harness, using protected PPID 66 and ordered stream zero. Both
+endpoint roles exercise empty/bounded records, one record per SCTP message,
+send/receive limits, unpolled versus polled cancellation, deadlines, credential
+and trust replacement, withdrawal, observed carrier abort, queued-delivery
+refusal and reciprocal/silent/pending-data close. The initial AUTH key transition
+and Finished record epoch are checked without recording key values. Invalid
+metadata and PPIDs 0/47/60 alter only the carrier metadata of real handshake or
+encrypted application records, before or after authentication; their rejection
+cannot be explained by unrelated malformed payload bytes.
+
+The eight client-certificate vectors are checked by their independent Python
+signature/URI/time/EKU classifier and presented to the actual acceptor verifier
+at both protected PPIDs 66 and 47. The reference includes valid, wrong/missing
+identity, expired/not-yet-valid, wrong-role, untrusted and corrupt-signature
+cases. These are public synthetic test credentials. The catalog records only
+their labels, expectations and pinned reference path; no credentials, packets
+or exporter values are duplicated in lifecycle records.
+
+The catalog gate rejects altered expectations with refreshed local digests,
+changed scope/provenance claims and missing families. All 274 prior wire files
+are unchanged. Four existing ignored Linux tests are separately executable in
+an isolated SCTP-AUTH network namespace; ordinary in-memory replay does not
+qualify the kernel. Neither source establishes in-place rekey, multistream,
+revocation, restart/multihoming recovery or external peer interoperability.
+Those runtime requirements remain in #794.
 
 ## Executable durable object-roster schedules
 

@@ -18,6 +18,7 @@ import n3iwf_key_reference as key_reference
 import n3iwf_gtpu_reference as gtpu_reference
 import n3iwf_key_lifecycle_reference as key_lifecycle
 import n3iwf_roster_lifecycle_reference as roster_lifecycle
+import n3iwf_dtls_lifecycle_reference as dtls_lifecycle
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -28,6 +29,56 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_dtls_catalog_cannot_rewrite_obligations_or_promote_scope(self):
+        original = json.loads((FIXTURES / "n2-dtls/lifecycle-cancellation.json").read_text())
+        data = wire("n2-dtls", "lifecycle-cancellation")
+        dtls_lifecycle.validate(original, data)
+        for mutation, reason in (
+            ("path", "dtls-reference-path"), ("digest", "dtls-reference-digest"),
+            ("family", "dtls-reference-family"), ("wire-order", "dtls-reference-wire"),
+            ("wire-effect", "dtls-reference-wire"), ("wire-truncated", "dtls-reference-wire"),
+            ("count", "dtls-reference-context"), ("carrier", "dtls-reference-context"),
+            ("protected_ppid", "dtls-reference-context"), ("ordered_stream", "dtls-reference-context"),
+            ("kernel_validation", "dtls-reference-context"), ("in_place_rekey", "dtls-reference-context"),
+            ("revocation", "dtls-reference-context"), ("external_interoperability", "dtls-reference-context"),
+            ("bool-type", "dtls-reference-context"), ("scope", "dtls-reference-scope"),
+            ("authority", "dtls-reference-authority"), ("claims", "dtls-reference-claims"),
+            ("direction", "dtls-reference-direction"), ("provenance", "dtls-reference-provenance"),
+            ("outcome", "dtls-reference-outcome"), ("runtime_claim", "dtls-reference-outcome"),
+        ):
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(original))
+                payload = data
+                source = changed["context"]["source_vector"]
+                if mutation == "path": source["path"] = "../outside.json"
+                elif mutation == "digest": source["sha256"] = "0" * 64
+                elif mutation == "family": source["case"] = "records"
+                elif mutation in ("wire-order", "wire-effect"):
+                    schedule = json.loads(data)
+                    if mutation == "wire-order": schedule["cases"].reverse()
+                    else: schedule["cases"][0]["expected"] = "rfc6083_connection_closed"
+                    payload = (json.dumps(schedule, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation == "wire-truncated":
+                    payload = payload[:-1]
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation == "count": changed["context"]["schedules"] -= 1
+                elif mutation == "carrier": changed["context"]["carrier"] = "linux"
+                elif mutation == "protected_ppid": changed["context"][mutation] = 60
+                elif mutation == "ordered_stream": changed["context"][mutation] = 1
+                elif mutation in ("kernel_validation", "in_place_rekey", "revocation", "external_interoperability"):
+                    changed["context"][mutation] = True
+                elif mutation == "bool-type": changed["context"]["sdk_transport_validation"] = 1
+                elif mutation == "scope": changed["validation_scope"] = "lifecycle-label"
+                elif mutation == "authority": changed["source"]["clauses"][-1] = "RFC application maximum 16347"
+                elif mutation == "claims": changed["semantic_assertions"][-1] = "external_interoperability=true"
+                elif mutation == "direction": changed["direction"] = "ue-to-n3iwf"
+                elif mutation == "provenance": changed["provenance"]["independent_capture"] = True
+                elif mutation == "outcome": changed["expected_outcome"] = "receive"
+                else: changed["runtime_claim"] = True
+                with self.assertRaisesRegex(dtls_lifecycle.Invalid, "^" + reason + "$"):
+                    dtls_lifecycle.validate(changed, payload)
+
     def test_roster_catalog_cannot_rewrite_schedules_or_promote_authority(self):
         original = json.loads((FIXTURES / "xfrm-roster/lifecycle-install-failure.json").read_text())
         data = wire("xfrm-roster", "lifecycle-install-failure")
