@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
-        assert_eq!(4, CONFIG_CONSENSUS_WIRE_VERSION);
+        assert_eq!(5, CONFIG_CONSENSUS_WIRE_VERSION);
         let current = encode_config_wire(&7_u64).expect("current wire");
         assert_eq!(
             7,
@@ -884,11 +884,18 @@ mod tests {
             intent: ConfigMutationIntent::RetainHistory(retention.clone()),
         };
         assert!(command.validate(identity).is_ok());
-        for schema_version in 1..CONFIG_CONSENSUS_COMMAND_VERSION {
+        for schema_version in 1..4 {
             command.schema_version = schema_version;
             assert!(command.validate(identity).is_err());
         }
+        command.schema_version = 4;
+        assert!(command.validate(identity).is_ok());
+        let original_digest = command.payload_digest().expect("revision-four digest");
         command.schema_version = CONFIG_CONSENSUS_COMMAND_VERSION;
+        assert_eq!(
+            original_digest,
+            command.payload_digest().expect("current digest")
+        );
         let original = serde_json::to_value(retention).expect("received decision");
         for limits in [
             serde_json::json!({"max_records": 1, "max_bytes": 1_048_576}),
@@ -910,8 +917,37 @@ mod tests {
     }
 
     #[test]
+    fn management_audit_requires_revision_five_without_reinterpreting_old_commands() {
+        let identity = ConfigConsensusIdentity::new(
+            ConfigConsensusClusterId::new("management-audit-revision-test").unwrap(),
+            ConfigConsensusConfigurationId::from_bytes([0xC5; 32]),
+            ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let mut command = ConfigConsensusCommand {
+            schema_version: 5,
+            identity,
+            request_id: ConfigConsensusRequestId::from_bytes([0xC6; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: ConfigMutationIntent::ManagementAudit(
+                super::super::audit::AuditCommand::Initialize {
+                    projection: crate::audit_authority::AuditToken::from_keyed_projection(
+                        [0xC7; 32],
+                    )
+                    .unwrap(),
+                    limits: crate::audit_authority::AuditLedgerLimits::new(3, 1).unwrap(),
+                },
+            ),
+        };
+        assert!(command.validate(identity).is_ok());
+        for revision in 1..5 {
+            command.schema_version = revision;
+            assert!(command.validate(identity).is_err());
+        }
+    }
+
+    #[test]
     fn older_persisted_commands_decode_but_cannot_claim_newer_intents() {
-        assert_eq!(4, CONFIG_CONSENSUS_COMMAND_VERSION);
+        assert_eq!(5, CONFIG_CONSENSUS_COMMAND_VERSION);
         let identity = ConfigConsensusIdentity::new(
             ConfigConsensusClusterId::new("config-command-v1-replay-test").expect("cluster"),
             ConfigConsensusConfigurationId::from_bytes([0xB1; 32]),
