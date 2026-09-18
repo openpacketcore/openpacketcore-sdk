@@ -24,20 +24,30 @@
     "opc.n3iwf.xfrm-roster.v1.ordering-old-then-new",
     "opc.n3iwf.xfrm-roster.v1.malformed-version",
     "opc.n3iwf.xfrm-roster.v1.truncated-record",
-    "opc.n3iwf.xfrm-roster.v1.bounded-generation-overflow"
+    "opc.n3iwf.xfrm-roster.v1.bounded-generation-overflow",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-adopt",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-finalize",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-foreign-conflict",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-install-failure",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-issuing-after",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-issuing-before",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-recover-applied",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-recover-prepared",
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-sweep-failure"
   ],
   "constructed": [
-    "single pair",
-    "overlap",
-    "rekey"
+    "legacy single-pair/overlap/rekey scenario records",
+    "636 independent durable object-roster schedules"
   ],
   "receive": [
-    "relocation",
-    "old-then-new order"
+    "legacy relocation/order labels",
+    "scripted apply/rollback and authenticated-store recovery verdicts"
   ],
   "unsupported": [
     "PDU/QFI policy",
     "IKE notify parsing",
-    "key material"
+    "key material",
+    "installed Child-SA selection and packet provenance",
+    "complete-roster relocation"
   ]
 }
