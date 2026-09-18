@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- Publish XFRM recovery-test readiness only after the complete record is
+  written and synced. Preserve exclusive publication and strict malformed
+  record refusal across the single-object, roster and SA relocation harnesses
+  (Refs #793).
 - `opc-n3iwf-fixtures`: correct N2 metadata port octets from `96 1c` (38428)
   to the declared IANA NGAP service port `96 0c` (38412), refreshing four wire
   digests. Independently verify numeric PPID/port claims in both metadata

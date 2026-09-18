@@ -7,6 +7,10 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/readiness.rs"]
+mod readiness;
+use readiness::publish as publish_readiness;
+
 use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -826,21 +830,6 @@ fn cleanup_owned_resources(
         ),
         Err(error) => record_first_error(first_error, error),
     }
-}
-
-fn publish_readiness(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    File::open(
-        path.parent()
-            .ok_or_else(|| io::Error::other("readiness path has no parent"))?,
-    )?
-    .sync_all()
 }
 
 struct TestChild {
