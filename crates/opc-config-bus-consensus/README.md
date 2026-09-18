@@ -45,6 +45,21 @@ Authoritative buses use `RaftManagedDatastore::new_local_authority`, which
 rejects a mutation after deposition instead of forwarding it. The existing
 `new` constructor retains forwarding for non-authoritative SDK clients.
 
+For required replicated management audit, explicitly initialize the same
+store's audit authority and instead use
+`RaftManagedDatastore::new_audited_local_authority(store, ConfigAuditPolicy)`.
+Keep encryption and the local projection gate in the positions shown above.
+Every configuration append then requires an acknowledged Intent and atomically
+retains its authoritative outcome plus a reserved terminal obligation. A
+terminal-recording failure cannot change a known successful result. The
+management supervisor must run `reconcile_audit_obligations` at startup and
+during bounded maintenance. Missing audit authority, invalid privacy projection
+or exhausted capacity never falls back to an unaudited write; a deposed local
+writer never forwards a mutation. See the
+[replicated management audit contract](../../docs/replicated-management-audit.md)
+for protocol-sink scope, caller privacy, response-loss recovery and the separate
+external-checkpoint composition.
+
 `RaftManagedDatastore::config_authority()` returns a
 `ConsensusConfigAuthority` over that exact `ConsensusConfigStore`. The adapter
 uses its local-only Openraft read-index/apply barrier, never a second leader

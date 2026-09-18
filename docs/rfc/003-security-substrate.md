@@ -646,10 +646,16 @@ After an authoritative configuration commit, terminal audit failure MUST NOT
 turn the known commit into an ordinary failed-write reply. A terminal audit
 failure also MUST NOT replace the original authorization or validation
 rejection. Servers report this degradation with bounded, value-free diagnostics.
-The server fixes tracked by #796 enforce this ordering and reply behavior;
-recoverable terminal obligations, cancellation recovery, and fleet operation
-receipts still require the replicated authority tracked by #797. A failure
-counter is not a durable recovery record.
+The server fixes tracked by #796 enforce this ordering and reply behavior.
+Required fleet durability uses #797's replicated authority through
+`RaftManagedDatastore::new_audited_local_authority`, below the existing
+encryption adapter. Its acknowledged Intent precedes the configuration write;
+the authoritative result and reserved terminal obligation are atomic with that
+write. The supervisor reconciles obligations at startup and during bounded
+maintenance. Local candidate/startup stores and standalone protocol
+observations keep their separate persistence contracts. A failure counter or
+local `AuditSink` is not a durable fleet recovery record. See the
+[composition contract](../replicated-management-audit.md).
 
 Carrier profiles SHOULD stream audit events to an external append-only system.
 Local SQLite audit is necessary for recovery and debugging but is not sufficient

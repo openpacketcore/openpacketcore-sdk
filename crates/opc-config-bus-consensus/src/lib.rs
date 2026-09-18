@@ -15,7 +15,9 @@
 //! bind the product schema and reject authoritative buses; they never implement
 //! a consensus peer, accept a mutation, or forward reads to the leader.
 
+mod audit;
 pub mod remote_watch;
+pub use audit::ConfigAuditPolicy;
 
 pub use remote_watch::consumer::{
     ConfigAcceptanceOutcome, ConfigApplyIntent, ConfigApplyOutcome, ConfigConsumerApplyPort,
@@ -402,79 +404,7 @@ where
         &self,
         commit: BusCommitWrite<SealedConfig<C>>,
     ) -> Result<(), StoreError> {
-        let (commit, resolution) = commit.into_parts();
-        validate_replay_lookup_digest(commit.idempotency_key.as_ref())?;
-        validate_rollback_label(commit.rollback_label.as_deref())?;
-        if commit.apply_plan.is_some()
-            || commit.request_fingerprint.is_some()
-            || commit.request_id.is_some()
-        {
-            return Err(StoreError::internal(
-                "sealed config adapter received plaintext replay metadata",
-            ));
-        }
-        let aad_principal = serde_json::to_string(&commit.principal)
-            .map_err(|_| StoreError::internal("authenticated principal serialization failed"))?;
-        let principal = serde_json::to_string(&PersistedBusMetadata {
-            principal: aad_principal,
-            replay_lookup_digest: commit.idempotency_key,
-            recovery_required: commit.recovery_required,
-            rollback_label: commit.rollback_label.clone(),
-        })
-        .map_err(|_| StoreError::internal("sealed config metadata serialization failed"))?;
-        let source = match commit.source {
-            RequestSource::Northbound => CommitSource::Gnmi,
-            RequestSource::StartupRecovery => CommitSource::StartupRestore,
-            _ => CommitSource::LocalOperator,
-        };
-        let record = CommitRecord {
-            tx_id: commit.tx_id,
-            parent_tx_id: commit.parent_tx_id,
-            version: commit.version,
-            committed_at: commit.committed_at,
-            principal,
-            source,
-            schema_digest: commit.schema_digest,
-            plaintext_digest: commit
-                .plaintext_digest
-                .map(|digest| digest.to_vec())
-                .unwrap_or_default(),
-            encrypted_blob: commit.encrypted_blob,
-            rollback_point: commit.rollback_label.is_some(),
-            confirmed_deadline: commit.confirmed_deadline,
-        };
-        let claim = commit.config.claim_fresh_envelope()?;
-        if !claim.matches(&record.encrypted_blob) {
-            return Err(StoreError::crypto(
-                "fresh config envelope bytes do not match durable record",
-            ));
-        }
-        if !claim.matches_plaintext_digest(&record.plaintext_digest) {
-            return Err(StoreError::crypto(
-                "fresh config envelope digest does not match durable record",
-            ));
-        }
-        let audit = root_audit_record(record.tx_id);
-        let commit = match resolution {
-            Some(BusConfirmedCommitResolution::Confirm { pending_tx_id }) => {
-                AttestedConfigCommit::try_new_resolving(
-                    record,
-                    audit,
-                    claim,
-                    PersistConfirmedCommitResolution::Confirm { pending_tx_id },
-                )
-            }
-            Some(BusConfirmedCommitResolution::Rollback { pending_tx_id }) => {
-                AttestedConfigCommit::try_new_resolving(
-                    record,
-                    audit,
-                    claim,
-                    PersistConfirmedCommitResolution::Rollback { pending_tx_id },
-                )
-            }
-            None => AttestedConfigCommit::try_new(record, audit, claim),
-        }
-        .map_err(map_persist_error)?;
+        let commit = attested_bus_commit(commit)?;
         self.inner
             .append_attested_commit(commit)
             .await
@@ -494,6 +424,85 @@ where
             .await
             .map_err(map_persist_error)
     }
+}
+
+fn attested_bus_commit<C: OpcConfig>(
+    commit: BusCommitWrite<SealedConfig<C>>,
+) -> Result<AttestedConfigCommit, StoreError> {
+    let (commit, resolution) = commit.into_parts();
+    validate_replay_lookup_digest(commit.idempotency_key.as_ref())?;
+    validate_rollback_label(commit.rollback_label.as_deref())?;
+    if commit.apply_plan.is_some()
+        || commit.request_fingerprint.is_some()
+        || commit.request_id.is_some()
+    {
+        return Err(StoreError::internal(
+            "sealed config adapter received plaintext replay metadata",
+        ));
+    }
+    let aad_principal = serde_json::to_string(&commit.principal)
+        .map_err(|_| StoreError::internal("authenticated principal serialization failed"))?;
+    let principal = serde_json::to_string(&PersistedBusMetadata {
+        principal: aad_principal,
+        replay_lookup_digest: commit.idempotency_key,
+        recovery_required: commit.recovery_required,
+        rollback_label: commit.rollback_label.clone(),
+    })
+    .map_err(|_| StoreError::internal("sealed config metadata serialization failed"))?;
+    let source = match commit.source {
+        RequestSource::Northbound => CommitSource::Gnmi,
+        RequestSource::StartupRecovery => CommitSource::StartupRestore,
+        _ => CommitSource::LocalOperator,
+    };
+    let record = CommitRecord {
+        tx_id: commit.tx_id,
+        parent_tx_id: commit.parent_tx_id,
+        version: commit.version,
+        committed_at: commit.committed_at,
+        principal,
+        source,
+        schema_digest: commit.schema_digest,
+        plaintext_digest: commit
+            .plaintext_digest
+            .map(|digest| digest.to_vec())
+            .unwrap_or_default(),
+        encrypted_blob: commit.encrypted_blob,
+        rollback_point: commit.rollback_label.is_some(),
+        confirmed_deadline: commit.confirmed_deadline,
+    };
+    let claim = commit.config.claim_fresh_envelope()?;
+    if !claim.matches(&record.encrypted_blob) {
+        return Err(StoreError::crypto(
+            "fresh config envelope bytes do not match durable record",
+        ));
+    }
+    if !claim.matches_plaintext_digest(&record.plaintext_digest) {
+        return Err(StoreError::crypto(
+            "fresh config envelope digest does not match durable record",
+        ));
+    }
+    let audit = root_audit_record(record.tx_id);
+    let commit = match resolution {
+        Some(BusConfirmedCommitResolution::Confirm { pending_tx_id }) => {
+            AttestedConfigCommit::try_new_resolving(
+                record,
+                audit,
+                claim,
+                PersistConfirmedCommitResolution::Confirm { pending_tx_id },
+            )
+        }
+        Some(BusConfirmedCommitResolution::Rollback { pending_tx_id }) => {
+            AttestedConfigCommit::try_new_resolving(
+                record,
+                audit,
+                claim,
+                PersistConfirmedCommitResolution::Rollback { pending_tx_id },
+            )
+        }
+        None => AttestedConfigCommit::try_new(record, audit, claim),
+    }
+    .map_err(map_persist_error)?;
+    Ok(commit)
 }
 
 #[derive(Clone, Copy)]
@@ -643,6 +652,7 @@ impl ConfigStore for ConsensusConfigStoreAdapter {
 /// authority gate.
 pub struct RaftManagedDatastore<C> {
     adapter: PersistManagedDatastore<C, ConsensusConfigStoreAdapter>,
+    audit: Option<ConfigAuditPolicy>,
 }
 
 /// Management authority port backed directly by the config Openraft store.
@@ -834,6 +844,7 @@ impl<C> RaftManagedDatastore<C> {
                 store,
                 MutationRoute::ForwardToLeader,
             ))),
+            audit: None,
         }
     }
 
@@ -847,7 +858,23 @@ impl<C> RaftManagedDatastore<C> {
                 store,
                 MutationRoute::LocalLeaderOnly,
             ))),
+            audit: None,
         }
+    }
+
+    /// Require consensus-audited configuration writes on the local leader.
+    /// Provision the same store's audit authority before constructing the bus.
+    /// Every append, including bootstrap and confirmed-resolution successors,
+    /// requires acknowledged Intent and atomically records the authoritative
+    /// result. A failed terminal write cannot undo a known result; lifecycle
+    /// code must periodically call `reconcile_audit_obligations` on this store.
+    pub fn new_audited_local_authority(
+        store: Arc<ConsensusConfigStore>,
+        audit: ConfigAuditPolicy,
+    ) -> Self {
+        let mut adapter = Self::new_local_authority(store);
+        adapter.audit = Some(audit);
+        adapter
     }
 
     /// Return the sole underlying config consensus authority for lifecycle,
@@ -867,6 +894,7 @@ impl<C> Clone for RaftManagedDatastore<C> {
     fn clone(&self) -> Self {
         Self {
             adapter: self.adapter.clone(),
+            audit: self.audit.clone(),
         }
     }
 }
@@ -945,7 +973,10 @@ where
         &self,
         commit: BusCommitWrite<SealedConfig<C>>,
     ) -> Result<(), StoreError> {
-        self.adapter.append_commit_write(commit).await
+        match &self.audit {
+            Some(audit) => audit.append(self.consensus_store(), commit).await,
+            None => self.adapter.append_commit_write(commit).await,
+        }
     }
 
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError> {
@@ -953,6 +984,11 @@ where
     }
 
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError> {
+        if self.audit.is_some() {
+            return Err(StoreError::unavailable(
+                "audited confirmation requires an atomic config-bus successor",
+            ));
+        }
         self.adapter.mark_confirmed(tx_id).await
     }
 }

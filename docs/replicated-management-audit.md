@@ -1,8 +1,8 @@
 # Replicated management audit and operation recovery
 
-Tracking: #796, #797, #798. This document describes the configuration-authority
-slice of #797. Protocol-server composition and #798's multi-epoch,
-export/checkpoint and safe-pruning contracts remain separate acceptance work.
+Tracking: #796, #797, #798. This document describes the replicated audit
+authority and its required-audit ConfigBus composition. Multi-epoch signing,
+export/checkpoint and safe-pruning behavior is specified separately below.
 
 The optional required-continuity composition is now specified by
 [ADR 0025](adr/0025-management-audit-continuity.md). It extends this original
@@ -94,6 +94,52 @@ acknowledged configuration retention remain their existing typed operations.
 Consumers must compose the audited API before enabling this ledger; simply
 replacing a local `AuditSink` does not upgrade an existing config-bus adapter.
 
+## ConfigBus composition
+
+Use `RaftManagedDatastore::new_audited_local_authority` with an explicit
+`ConfigAuditPolicy` and the same initialized `ConsensusConfigStore`. Keep
+`EncryptingManagedDatastore` above it and the existing
+`ConsensusConfigBusProjection` local-authority gate around the bus. This
+constructor does not initialize a ledger, select keys or permit unaudited
+fallback. A missing ledger, incorrect projection provider or full ledger
+refuses configuration submission.
+
+Encryption carries a non-serializable `CommitAuditContext` to this adapter for
+keyed projection. It preserves the original request identity, transport and
+operation without putting plaintext replay metadata in the consensus command.
+Northbound writes without that context fail closed. Internal bootstrap and
+startup recovery receive an SDK-created internal request identity. Exact
+content, base, confirmation mode and resolution remain bound by the sealed
+commit; the coarse audit operation is not their authority.
+
+Each ConfigBus append admits Intent on the local leader before submitting the
+exact encrypted mutation. Neither step forwards a deposed writer's mutation to
+another voter. Only the authenticated committed receipt for the expected
+version returns success. The authoritative outcome and reserved terminal
+obligation are atomic with configuration. No terminal write or additional
+quorum read is required to retain that known result. A possibly admitted result
+returns `OutcomeUnknown` and follows existing ConfigBus fencing/recovery.
+
+Bootstrap, ordinary commits, confirmed commits, confirmation, cancellation and
+rollback all use this append boundary. Confirmation/cancellation must use the
+ConfigBus atomic successor, not the older direct `mark_confirmed` API. Recover
+client response loss through the existing idempotency-key contract; a request
+identifier alone is not permission to reapply a mutation. The supervisor must
+run bounded `reconcile_audit_obligations` at startup and during maintenance;
+it can recover committed terminal obligations without a client-held handle.
+
+Protocol `AuditSink` observations still provide authorization/validation
+denials and protocol-level audit policy. gNMI/NETCONF required Intent errors,
+panics or cancellation forbid their guarded mutation, and terminal failures
+preserve the original committed result or original rejection while exposing
+bounded degradation. NETCONF candidate/startup edits, copy/discard/delete and
+session-exit rollback follow that ordering too. Candidate and startup stores
+remain their existing local stores; this composition does not turn those
+stores or arbitrary protocol observations into replicated configuration. Use
+the standalone replicated observation/receipt ports when those observations
+require fleet history. A local sink alone does not supply recoverable fleet
+obligations.
+
 ## Recovery and bounded work
 
 The existing proposal supervisor retains accepted work after caller
@@ -142,6 +188,14 @@ Other detectors cover changed handles/payloads, unauthorized lookup, standalone
 denials, hard capacity, stale bases, fixed expiry, recovery fairness, protected
 config-history references and missing durable authority. Model tests cover
 purpose separation, authenticated fields and order/roster corruption.
+
+ConfigBus integration tests compose encryption with three real voters and
+independently check the client result, durable configuration and recovered
+terminal obligations. They cover retained idempotent reply recovery, exhausted
+audit capacity, invalid projection, missing Northbound context, follower-write
+refusal and atomic confirmed-commit confirmation/cancellation. Protocol tests
+separately exercise sync/async sink failures, panics and cancellation around
+local and running mutation paths.
 
 These tests do not prove deployed storage/network behavior, a product release,
 key rotation, rollback resistance against whole-database restore, or complete
