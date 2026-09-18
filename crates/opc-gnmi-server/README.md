@@ -53,6 +53,19 @@ retract the append. An error, timeout, or dropped RPC after admission can leave
 the durable outcome unknown; the server never treats that as proof that no
 record was written.
 
+Set requires an acknowledged intent before submitting an ordinary commit,
+commit-confirmed begin, confirm, or cancel. Failed or unknown intent recording
+prevents submission. Once the config bus returns success, a failed terminal
+audit write does not turn that commit into a failed Set. Terminal recording
+also preserves the original authorization or validation rejection. Sink errors
+and construction/polling unwinds produce a value-free diagnostic and the
+label-free, saturating `opc_gnmi_terminal_audit_failures_total` counter.
+
+That counter is an audit-degradation signal, not a durable operation receipt.
+Restart-safe terminal obligations and cross-leader reconciliation remain the
+separate issue #797 dependency of #796. The legacy `AuditSink` contract alone
+cannot establish those guarantees after RPC cancellation or process loss.
+
 ## HA config authority opt-in
 
 Install one authority port on the server core to make Set and Get requests
